@@ -11,8 +11,8 @@ without a terminal or a browser. A human can use the same contracts through an
 exceptional Charm-based terminal interface. Neither client owns execution lifetime.
 
 This is a dependency-ordered plan, not a delivery-date estimate. Checkboxes denote
-verified deliverables, not the presence of placeholder commands. Nothing below is
-implemented yet; the browser sketches use synthetic fixtures only.
+verified deliverables, not the presence of placeholder commands. M0.1 is implemented;
+later milestones remain planned. The browser sketches use synthetic fixtures only.
 
 ## Constraints that apply to every milestone
 
@@ -35,19 +35,23 @@ implemented yet; the browser sketches use synthetic fixtures only.
 
 ### M0.1 — Repository and agent contracts
 
-- [ ] Initialize the Go module, executable, formatting/lint/test commands, and CI.
-- [ ] Adapt eru's command registry, metadata validator, output envelope, structured
+- [x] Initialize the Go module, executable, formatting/lint/test commands, and CI.
+- [x] Adapt eru's command registry, metadata validator, output envelope, structured
   errors, and secret redaction. Choose one schema name and document compatibility.
-- [ ] Add implemented commands only; advertise planned capabilities separately.
-- [ ] Define operation IDs, actor identity, submission idempotency keys, state
+- [x] Add implemented commands only; advertise planned capabilities separately.
+- [x] Define operation IDs, actor identity, submission idempotency keys, state
   transitions, event sequence/cursor, and confirmation binding.
-- [ ] Specify machine modes: one JSON result for reads/submissions, NDJSON for
+- [x] Specify machine modes: one JSON result for reads/submissions, NDJSON for
   event-following, deterministic exit codes, no ANSI or prompts in machine output.
-- [ ] Extract a small shared client/service boundary; keep transport and rendering
+- [x] Extract a small shared client/service boundary; keep transport and rendering
   adapters separate. Do not copy entire frameworks without a demonstrated need.
 
 **Gate:** command metadata and output contract tests pass, including redirected
 output, invalid arguments, no-TTY operation, and redaction.
+
+**Delivered:** local `commands`, `help`, and `version`; `eregion/v1` contracts and
+JSON Schema; a future operations service interface and NDJSON serializer, not a
+running service. See [contracts](contracts.md) for invariants and deferred behavior.
 
 ### M0.2 — PostgreSQL, River, and the API
 
@@ -214,7 +218,7 @@ These are unresolved, not silently approved by the sketches:
 
 ## First implementation batch
 
-Begin with **M0.1**, then **M0.2**, keeping commits reviewable. Use synthetic operation
+M0.1 is complete; begin **M0.2** next, keeping commits reviewable. Use synthetic operation
 fixtures from the sketches to test output and reducer contracts while PostgreSQL
 integration is built. Add the real Charm operation viewer in M0.4, not a separate
 demo CLI that grows its own business logic.

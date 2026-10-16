@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mbvlabs/eregion/schema/eregion-v1.json",
+  "title": "eregion/v1 results and event stream records",
+  "oneOf": [
+    { "$ref": "#/$defs/envelope" },
+    { "$ref": "#/$defs/eventRecord" },
+    { "$ref": "#/$defs/resultRecord" }
+  ],
+  "$defs": {
+    "code": {
+      "enum": ["usage_error", "invalid_output_mode", "input_required", "validation_failed", "not_found", "unauthenticated", "forbidden", "precondition_failed", "confirmation_required", "conflict", "unavailable", "cancelled", "internal_error"]
+    },
+    "fault": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "$ref": "#/$defs/code" },
+        "message": { "type": "string", "minLength": 1 },
+        "hint": { "type": "string" },
+        "details": { "type": "object" }
+      }
+    },
+    "envelope": {
+      "type": "object",
+      "required": ["schema", "ok", "command"],
+      "properties": {
+        "schema": { "const": "eregion/v1" },
+        "ok": { "type": "boolean" },
+        "command": { "type": "string", "minLength": 1 },
+        "data": true,
+        "error": { "$ref": "#/$defs/fault" },
+        "next": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "if": { "properties": { "ok": { "const": true } } },
+      "then": { "not": { "required": ["error"] } },
+      "else": { "required": ["error"], "not": { "required": ["data"] } }
+    },
+    "operationID": { "type": "string", "pattern": "^op_[0-9a-f]{32}$" },
+    "sequence": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$", "maxLength": 20 },
+    "positiveSequence": { "type": "string", "pattern": "^[1-9][0-9]*$", "maxLength": 20 },
+    "state": { "enum": ["queued", "running", "cancelling", "succeeded", "failed", "cancelled"] },
+    "actor": {
+      "type": "object", "required": ["kind", "subject"],
+      "properties": {
+        "kind": { "enum": ["operator", "ci", "webhook", "system"] },
+        "subject": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "\\S" }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "required": ["id", "kind", "target", "actor", "state", "attempt", "last_sequence", "created_at", "updated_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/operationID" },
+        "kind": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "actor": { "$ref": "#/$defs/actor" },
+        "state": { "$ref": "#/$defs/state" },
+        "attempt": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "last_sequence": { "$ref": "#/$defs/sequence" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "cursor": {
+      "type": "object", "required": ["operation_id", "after"],
+      "properties": { "operation_id": { "$ref": "#/$defs/operationID" }, "after": { "$ref": "#/$defs/sequence" } }
+    },
+    "progress": {
+      "type": "object", "required": ["current", "total", "unit"],
+      "properties": {
+        "current": { "$ref": "#/$defs/sequence" },
+        "total": { "$ref": "#/$defs/positiveSequence" },
+        "unit": { "type": "string", "minLength": 1 }
+      }
+    },
+    "event": {
+      "type": "object",
+      "required": ["operation_id", "sequence", "at", "kind", "attempt"],
+      "properties": {
+        "operation_id": { "$ref": "#/$defs/operationID" },
+        "sequence": { "$ref": "#/$defs/positiveSequence" },
+        "at": { "type": "string", "format": "date-time" },
+        "kind": { "enum": ["state", "step", "log", "warning", "progress"] },
+        "attempt": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "state": { "$ref": "#/$defs/state" },
+        "stage": { "type": "string", "minLength": 1 },
+        "message": { "type": "string" },
+        "progress": { "$ref": "#/$defs/progress" }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "state" } } }, "then": { "required": ["state"] }, "else": { "not": { "required": ["state"] } } },
+        { "if": { "properties": { "kind": { "const": "step" } } }, "then": { "required": ["stage"] } },
+        { "if": { "properties": { "kind": { "const": "progress" } } }, "then": { "required": ["progress"] }, "else": { "not": { "required": ["progress"] } } }
+      ]
+    },
+    "eventRecord": {
+      "type": "object", "required": ["schema", "type", "event"],
+      "properties": { "schema": { "const": "eregion/v1" }, "type": { "const": "event" }, "event": { "$ref": "#/$defs/event" } },
+      "not": { "required": ["result"] }
+    },
+    "resultRecord": {
+      "type": "object", "required": ["schema", "type", "result"],
+      "properties": { "schema": { "const": "eregion/v1" }, "type": { "const": "result" }, "result": { "$ref": "#/$defs/envelope" } },
+      "not": { "required": ["event"] }
+    }
+  }
+}
