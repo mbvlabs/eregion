@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>eregion — terminal direction</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%230d1520'/%3E%3Cpath d='M8 10h16M8 16h12M8 22h16' stroke='%23ffb547' stroke-width='3'/%3E%3C/svg%3E">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap');
+:root{color-scheme:dark light;--bg:#0d1520;--surface:#132031;--border:#22324a;--border-bright:#596b87;--text:#e3ecf5;--text-dim:#92a6bb;--accent:#ffb547;--ok:#6fd3a0;--warn:#e8d36a;--risk:#ff7b6b;--info:#7cc0f0;--s1:.25rem;--s2:.5rem;--s3:.75rem;--s4:1rem;--s5:1.5rem;--s6:2rem;--s7:3rem;--s8:4.5rem;--r:4px;--mono:'IBM Plex Mono',ui-monospace,monospace;--sans:'IBM Plex Sans',sans-serif}
+@media(prefers-color-scheme:light){:root{--bg:#f2f6fa;--surface:#fff;--border:#d6e0ea;--border-bright:#818f9e;--text:#0f1a26;--text-dim:#4d6074;--accent:#a34700;--ok:#1c7443;--warn:#776300;--risk:#b0341e;--info:#145f99}}
+*{box-sizing:border-box}html{font-size:17px}body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.55;font-kerning:normal;font-synthesis:none}main{max-width:72rem;margin:auto;padding:var(--s6) var(--s5) var(--s8)}h1,h2,p,figure{margin:0}h1{font-size:clamp(2.25rem,5.5vw,4rem);line-height:1.1;letter-spacing:-.04em;font-weight:600;max-width:20ch;text-wrap:balance}h2{font-size:1.625rem;letter-spacing:-.01em;line-height:1.2;font-weight:600}p{max-width:65ch}a{color:var(--info);text-underline-offset:.2em}button,select{font-family:var(--mono);font-size:.875rem;color:var(--text);background:var(--surface);border:1px solid var(--border-bright);border-radius:var(--r);padding:var(--s2) var(--s3);cursor:pointer}button:hover,select:hover{border-color:var(--accent)}button[aria-pressed=true]{border-color:var(--accent);color:var(--accent)}button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:4px}button:disabled{cursor:default;color:var(--text-dim)}.kicker,.eyebrow{font-family:var(--mono);font-size:.75rem;color:var(--text-dim);letter-spacing:.08em;text-transform:uppercase}.kicker{margin-bottom:var(--s4)}.intro{display:flex;justify-content:space-between;align-items:flex-end;gap:var(--s6);margin-bottom:var(--s6)}.intro p{max-width:32ch;color:var(--text-dim)}.controls{display:flex;flex-wrap:wrap;align-items:center;gap:var(--s2);margin:var(--s4) 0}.controls label{font: .875rem var(--mono);color:var(--text-dim)}.control-spacer{flex:1}.note{color:var(--text-dim);font-size:.875rem}.section{margin-top:var(--s8);padding-top:var(--s5);border-top:1px solid var(--border)}.section-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--s5);margin-bottom:var(--s5)}.section-head .eyebrow{white-space:nowrap}figcaption{margin-top:var(--s3);color:var(--text-dim);max-width:68ch}figcaption span{font-family:var(--mono);font-size:.875rem;color:var(--text);margin-right:var(--s2)}.terminal-scroll{overflow:auto;border-radius:var(--r);border:1px solid var(--border-bright);background:#0d1520}.terminal{--text:#e3ecf5;--text-dim:#92a6bb;--accent:#ffb547;--ok:#6fd3a0;--warn:#e8d36a;--risk:#ff7b6b;--info:#7cc0f0;--border:#22324a;--border-bright:#596b87;color-scheme:dark;background:#0d1520;color:var(--text);padding:var(--s5);font-family:var(--mono);font-size:.875rem;line-height:1.65;min-width:54rem;font-variant-numeric:tabular-nums}.terminal .dim{color:var(--text-dim)}.terminal .accent{color:var(--accent)}.terminal .ok{color:var(--ok)}.terminal .risk{color:var(--risk)}.terminal .warn{color:var(--warn)}.terminal .info{color:var(--info)}.term-top{display:flex;justify-content:space-between;gap:var(--s5);padding-bottom:var(--s3);border-bottom:1px solid var(--border-bright)}.brand{font-weight:600;letter-spacing:.08em}.term-context{color:var(--text-dim)}.term-heading{display:flex;justify-content:space-between;align-items:baseline;margin:var(--s5) 0 var(--s2);gap:var(--s5)}.term-title{font-size:1rem;font-weight:600}.term-meta{color:var(--text-dim);margin-bottom:var(--s5)}.badge{font-weight:600;white-space:nowrap}.operation-grid{display:grid;grid-template-columns:16rem minmax(0,1fr);gap:var(--s5);min-height:20rem}.operation-grid>*{min-width:0}.stages{border-right:1px solid var(--border);padding-right:var(--s5)}.stage{display:flex;gap:var(--s3);padding:var(--s1) 0;white-space:pre}.stage-symbol{display:inline-block;min-width:1ch}.stage.active .stage-symbol{animation:pulse 1.2s ease-in-out infinite}.stage.active{color:var(--accent)}.stage.done{color:var(--ok)}.stage.pending{color:var(--text-dim)}.stage.failed{color:var(--risk)}.pane-label{color:var(--text-dim);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:var(--s3)}.stage-summary{color:var(--text-dim);margin-top:var(--s4);font-size:.75rem}.log{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;min-height:12rem;font:inherit;color:var(--text-dim)}.log span{display:block}.event-message{padding-top:var(--s3);border-top:1px solid var(--border);margin-top:var(--s3)}.connection{margin-top:var(--s5);padding:var(--s2) 0;border-top:1px solid var(--border-bright)}.footer{display:flex;justify-content:space-between;gap:var(--s5);margin-top:var(--s2);color:var(--text-dim);font-size:.75rem}.terminal kbd{font:inherit;color:var(--text);padding-right:var(--s1)}.terminal.compact{min-width:0;max-width:45rem}.compact .operation-grid{grid-template-columns:minmax(0,1fr);min-height:0}.compact .stages{border-right:0;border-bottom:1px solid var(--border);padding:0 0 var(--s4)}.compact .stage.pending{display:none}.compact .term-top,.compact .term-heading,.compact .footer{flex-wrap:wrap;gap:var(--s2)}.compact .log{min-height:8rem}.compact .term-context{font-size:.75rem}.inline-demo{margin-top:var(--s5);padding:var(--s3) 0;border-top:1px solid var(--border);white-space:pre-wrap;color:var(--text-dim)}.inline-demo strong{font-weight:400;color:var(--accent)}.inline-demo .cmd{color:var(--text)}.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:var(--s5);margin-top:var(--s5)}.split>*{min-width:0}.chart{border-top:1px solid var(--border);padding-top:var(--s3);min-height:8rem}.spark{font-size:1.625rem;letter-spacing:.08em;line-height:1.5;overflow:hidden;white-space:nowrap}.chart-note{font-size:.75rem;color:var(--text-dim)}.table-wrap{overflow:auto}.fleet{border-collapse:collapse;width:100%;white-space:nowrap;margin-top:var(--s3)}.fleet th{text-align:left;color:var(--text-dim);font-size:.75rem;font-weight:400;padding:var(--s2)}.fleet td{padding:var(--s2);border-top:1px solid var(--border)}.fleet tr.selected{background:#132031}.fleet td:first-child{padding-left:0}.fleet th:first-child{padding-left:0}.plan-line{display:flex;gap:var(--s3);padding:var(--s1) 0}.plan-detail{margin:var(--s4) 0;white-space:pre-wrap;color:var(--text-dim)}.confirmation{border:1px solid var(--border-bright);padding:var(--s4);margin:var(--s5) 0}.principles{display:grid;grid-template-columns:repeat(auto-fit,minmax(14.5rem,1fr));gap:var(--s5);margin-top:var(--s5)}.principle{border-top:1px solid var(--border-bright);padding-top:var(--s3)}.principle strong{font-weight:600}.principle p{margin-top:var(--s2);color:var(--text-dim)}.end{margin-top:var(--s7);font-size:.875rem;color:var(--text-dim)}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}[hidden]{display:none!important}@keyframes pulse{50%{opacity:.4}}
+@media(max-width:800px){main{padding:var(--s5) var(--s4) var(--s7)}.intro{display:block}.intro p{margin-top:var(--s4);max-width:55ch}.section-head{display:block}.section-head .eyebrow{display:block;margin-bottom:var(--s3)}.control-spacer{display:none}.terminal{padding:var(--s4)}.terminal.compact .term-meta{overflow-wrap:anywhere}.terminal.compact .split{grid-template-columns:minmax(0,1fr)}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+@media print{body{background:white;color:#0f1a26}.controls,.end button{display:none}.terminal-scroll{break-inside:avoid}.section{break-before:page}.note,figcaption{color:#4d6074}}
+</style>
+</head>
+<body>
+<main>
+  <header class="intro">
+    <div><div class="kicker">eregion / terminal study / proposal</div><h1>Every operation.<br>A clear next step.</h1></div>
+    <p>Agent-first contracts. A precise, expressive Charm interface for humans. These are terminal sketches—not a web application.</p>
+  </header>
+
+  <figure>
+    <div class="controls" aria-label="Operation sketch controls">
+      <label for="scene">Operation state</label>
+      <select id="scene">
+        <option value="loading">Connecting / loading</option>
+        <option value="queued">Accepted / queued</option>
+        <option value="running" selected>Running / build</option>
+        <option value="health">Waiting / health</option>
+        <option value="reconnecting">Stale / reconnecting</option>
+        <option value="failed">Failed / serving unchanged</option>
+        <option value="succeeded">Succeeded / serving new release</option>
+      </select>
+      <button type="button" id="next">Next state →</button>
+      <span class="control-spacer"></span>
+      <button type="button" id="compact" aria-pressed="false">Compact layout</button>
+      <button type="button" id="pause" aria-pressed="false">Pause local follow</button>
+    </div>
+    <div class="terminal-scroll">
+      <div class="terminal" id="operation" role="img" aria-label="Illustrative eregion deployment operation viewer">
+        <div class="term-top"><span><span class="brand">eregion</span><span class="dim"> / operations</span></span><span class="term-context">eu-west · production · FIXTURE</span></div>
+        <div class="term-heading"><span class="term-title">payments / production</span><span class="badge accent" id="status">◐ RUNNING</span></div>
+        <div class="term-meta" id="meta">op_demo_7k2 · deploy · requested by ci/release</div>
+        <div class="operation-grid">
+          <div class="stages"><div class="pane-label">Execution stages</div><div id="stages"></div><div class="stage-summary" id="stage-summary"></div></div>
+          <div><div class="pane-label" id="log-label">Build output · build-01</div><pre class="log" id="log"></pre><div class="event-message" id="message"></div></div>
+        </div>
+        <div class="connection" id="connection"></div>
+        <div class="footer"><span><kbd>q</kbd>detach &nbsp; <kbd>space</kbd>pause follow &nbsp; <kbd>?</kbd>help</span><span id="follow">following · operation continues on server</span></div>
+        <div class="inline-demo" id="inline"></div>
+      </div>
+    </div>
+    <figcaption><span>Fig. 1</span>Work state and connection state stay separate; the compact inline summary uses the same operation data.</figcaption>
+    <p class="note" style="margin-top:var(--s3)">Synthetic snapshots, not real progress. Change state to inspect the lifecycle. Inside the preview, Space pauses local follow, ? shows help, and q demonstrates detach.</p>
+    <p id="announcement" class="sr-only" aria-live="polite"></p>
+  </figure>
+
+  <section class="section" aria-labelledby="fleet-title">
+    <div class="section-head"><span class="eyebrow">Fleet / role first</span><h2 id="fleet-title">Know where the work runs.</h2></div>
+    <figure>
+      <div class="controls"><button type="button" id="telemetry" aria-pressed="true">Demo telemetry connected</button><span class="note">Toggle to inspect the unconfigured state.</span></div>
+      <div class="terminal-scroll"><div class="terminal" role="img" aria-label="Illustrative fleet with control-plane, application, and build servers, and optional telemetry">
+        <div class="term-top"><span><span class="brand">eregion</span><span class="dim"> / fleet</span></span><span class="term-context">eu-west · last observation just now · FIXTURE</span></div>
+        <div class="term-heading"><span class="term-title">Servers</span><span class="ok">● all observed hosts ready</span></div>
+        <div class="table-wrap"><table class="fleet"><thead><tr><th>Server / focus</th><th>Role</th><th>Health</th><th>Current work</th></tr></thead><tbody>
+          <tr><td>  control-01</td><td>control-plane</td><td class="ok">● ready</td><td class="dim">API / workers</td></tr>
+          <tr><td>  control-02</td><td>control-plane</td><td class="ok">● ready</td><td class="dim">API / workers</td></tr>
+          <tr class="selected"><td class="accent">› app-01</td><td>application</td><td class="ok">● ready</td><td>payments / production</td></tr>
+          <tr><td>  app-02</td><td>application</td><td class="ok">● ready</td><td>payments / production</td></tr>
+          <tr><td>  build-01</td><td>build</td><td class="ok">● ready</td><td class="accent">◐ payments / build</td></tr>
+        </tbody></table></div>
+        <div class="split" id="charts">
+          <div class="chart"><div>app-01 / CPU usage</div><div class="spark accent" aria-hidden="true">▁▂▂▃▂▂▃▄▆▅▄▃▃▂▂▂▃▂▂▁</div><div>18% <span class="dim">· sample trend stabilizing</span></div><div class="chart-note">fixture backend · 5 min window · last sample 2 s ago</div></div>
+          <div class="chart"><div>payments / request latency p95</div><div class="spark info" aria-hidden="true">▂▂▃▂▂▃▃▅▆▇▅▄▃▂▂▂▂▃▂▂</div><div>42 ms <span class="dim">· sample trend stabilizing</span></div><div class="chart-note">fixture backend · 5 min window · last sample 2 s ago</div></div>
+        </div>
+        <div class="event-message" id="no-telemetry" hidden><span class="warn">— Telemetry backend not configured</span><br><span class="dim">No metric samples available. Operation history is still accessible.</span><br><span class="info">Next: configure an external collector/backend integration.</span></div>
+        <div class="connection dim">Focused host: app-01 · application role · Debian · private connectivity verified</div>
+        <div class="footer"><span><kbd>↑↓</kbd>select &nbsp; <kbd>enter</kbd>details &nbsp; <kbd>/</kbd>filter &nbsp; <kbd>?</kbd>help</span><span>navigation labels are illustrative</span></div>
+      </div></div>
+      <figcaption><span>Fig. 2</span>Roles explain placement; graphs identify their source and disappear honestly when no backend is configured.</figcaption>
+    </figure>
+  </section>
+
+  <section class="section" aria-labelledby="plan-title">
+    <div class="section-head"><span class="eyebrow">Plan / explicit consent</span><h2 id="plan-title">Make the consequence visible.</h2></div>
+    <figure>
+      <div class="terminal-scroll"><div class="terminal" role="img" aria-label="Illustrative rollback plan with explicit environment, revision, and confirmation scope">
+        <div class="term-top"><span><span class="brand">eregion</span><span class="dim"> / plan</span></span><span class="term-context">eu-west · production · FIXTURE</span></div>
+        <div class="term-heading"><span class="term-title">Rollback payments / production</span><span class="warn">◆ PREVIEW ONLY</span></div>
+        <div class="term-meta">Desired state revision rev_demo_19 · no changes applied</div>
+        <div class="plan-line"><span class="dim">−</span><span>Serving release <span class="dim">rel_demo_new</span></span></div>
+        <div class="plan-line"><span class="accent">+</span><span>Requested release <span class="accent">rel_demo_previous</span></span></div>
+        <div class="plan-line"><span class="dim">↳</span><span>Targets app-01, app-02 · application servers</span></div>
+        <div class="plan-detail">Prepare candidates → verify health → switch traffic → verify serving state
+
+Scope: application release and routing only.
+Database schema and external side effects are NOT rolled back.</div>
+        <div class="confirmation"><span class="warn">▲ Confirmation required before execution</span><br><span class="dim">Bind approval to this plan, environment, and current revision.</span><br><span class="dim">Revalidate server-side; a changed plan requires a new approval.</span></div>
+        <div class="info">Agent equivalent: submit the reviewed plan with its exact confirmation token.</div>
+        <div class="footer"><span>No executable token or destructive control in this sketch.</span><span>flag spelling not finalized</span></div>
+      </div></div>
+      <figcaption><span>Fig. 3</span>A useful confirmation explains both the proposed effect and what it cannot undo.</figcaption>
+    </figure>
+    <div class="principles">
+      <div class="principle"><strong>No invented percentage.</strong><p>Stages show observed work. Bars are reserved for measurable quantities such as transferred bytes.</p></div>
+      <div class="principle"><strong>Detach is not cancel.</strong><p>Leaving the terminal does not stop a deployment. Cancellation is a distinct authorized operation.</p></div>
+      <div class="principle"><strong>Same state, every mode.</strong><p>JSON, plain text, and Charm views consume the same authoritative operation model.</p></div>
+    </div>
+  </section>
+  <footer class="end">Design proposal · synthetic data only · no API calls, credentials, or mutations.<br>Implementation targets Bubble Tea v2, Bubbles v2, and Lip Gloss v2. Read <a href="../tui-design.md">the interaction specification</a> and <a href="../roadmap.md">the implementation roadmap</a>.</footer>
+</main>
+<script>
+'use strict';
+const scenes={
+ loading:{status:'◐ CONNECTING',tone:'accent',done:0,active:-1,meta:'Requesting the operation snapshot · no server status received yet',label:'Connection',logs:['Opening authenticated control-plane connection…','Waiting for the first authoritative snapshot.'],message:'Loading is a client state, not evidence that a deployment is running.',connection:'◐ Connecting · no observation yet',summary:'Execution state unknown',inline:'◐ Connecting to eu-west…\n  Waiting for an authoritative operation snapshot.'},
+ queued:{status:'◇ QUEUED',tone:'info',done:0,active:-1,meta:'op_demo_7k2 · deploy · requested by ci/release',label:'Operation events',logs:['12:04:00  Operation accepted and durably recorded.','12:04:00  Build work queued for an eligible build server.'],message:'Waiting for a worker. Queue position is not known.',connection:'● Connected · snapshot received just now',summary:'No stages completed',inline:'◇ Queued  payments / production  op_demo_7k2\n  Accepted by the control plane. Safe to detach.'},
+ running:{status:'◐ RUNNING',tone:'accent',done:2,active:2,meta:'op_demo_7k2 · deploy · requested by ci/release',label:'Build output · build-01',logs:['12:04:01  preflight  Configuration and placement validated.','12:04:03  source     Fetched revision a93e7c1.','12:04:04  build      Assigned to build-01.','12:04:05  pack       Restoring Go dependency cache.','12:04:08  pack       Running go build ./cmd/server…'],message:'Building image · elapsed 8 s · duration unknown',connection:'● Connected · last event just now',summary:'2 stages completed · 1 active',inline:'◐ Building  payments / production  op_demo_7k2\n  ✓ Preflight  ✓ Source  ◐ Build on build-01\n  Elapsed 8 s · q detaches; work continues.'},
+ health:{status:'◐ WAITING FOR HEALTH',tone:'accent',done:5,active:5,meta:'op_demo_7k2 · deploy · requested by ci/release',label:'Candidate health · app-01 / app-02',logs:['12:04:21  build      Image published to the registry.','12:04:24  candidate  app-01 started rel_demo_new.','12:04:25  candidate  app-02 started rel_demo_new.','12:04:26  health     app-01 /health returned 200.','12:04:27  health     app-02 connection not ready; retry scheduled.'],message:'Traffic still serves rel_demo_previous. Waiting for app-02 health.',connection:'● Connected · last observation just now',summary:'5 stages completed · checking candidates',inline:'◐ Checking candidates  payments / production\n  app-01: ready · app-02: waiting\n  Serving rel_demo_previous · no traffic switch yet.'},
+ reconnecting:{status:'? LAST KNOWN: RUNNING',tone:'warn',done:2,active:-1,meta:'op_demo_7k2 · last observed at 12:04:08 · current status unknown',label:'Last received output · cached',logs:['12:04:04  build      Assigned to build-01.','12:04:05  pack       Restoring Go dependency cache.','12:04:08  pack       Running go build ./cmd/server…','','— Connection interrupted. These are cached observations.'],message:'Reconnecting from event cursor evt_demo_42. Do not resubmit the deployment.',connection:'▲ Stale · last observation 18 s ago · reconnecting',summary:'2 stages last observed complete',inline:'? Reconnecting  op_demo_7k2\n  Last known: building · observed 18 s ago\n  Execution status unknown; do not submit again.'},
+ failed:{status:'■ FAILED',tone:'risk',done:5,active:5,meta:'op_demo_7k2 · deploy · attempt 1 · terminal result observed',label:'Failure · candidate health',logs:['12:04:26  health     app-01 /health returned 200.','12:04:27  health     app-02 connection not ready.','12:05:27  health     app-02 exceeded the health deadline.','12:05:28  reconcile  Candidate removed; serving route verified.','12:05:28  result     health_check_failed'],message:'Serving rel_demo_previous verified unchanged. Inspect candidate logs before retrying.',connection:'● Connected · terminal result received',summary:'Failed at candidate health · traffic not switched',inline:'■ Failed  payments / production  health_check_failed\n  Serving rel_demo_previous verified unchanged.\n  Next: inspect operation details and candidate logs.'},
+ succeeded:{status:'● SUCCEEDED',tone:'ok',done:8,active:-1,meta:'op_demo_7k2 · deploy · terminal result observed',label:'Deployment result',logs:['12:04:28  health     Both candidates passed health checks.','12:04:29  traffic    Switched route to rel_demo_new.','12:04:31  verify     Serving health verified on both targets.','12:04:34  cleanup    Previous candidates cleaned up.','12:04:35  result     Deployment succeeded.'],message:'Now serving rel_demo_new on app-01 and app-02. Previous release remains rollback-eligible.',connection:'● Connected · terminal result received',summary:'8 stages completed',inline:'✓ Deployed  payments / production  rel_demo_new\n  Targets: app-01, app-02 · serving health verified\n  Operation: op_demo_7k2'}
+};
+const stageNames=['Preflight','Fetch source','Build image','Publish image','Start candidates','Health checks','Switch traffic','Verify / cleanup'];
+const byId=id=>document.getElementById(id);
+let paused=false;
+let detached=false;
+function render(){
+ const scene=byId('scene').value,s=scenes[scene];
+ byId('status').textContent=s.status;byId('status').className='badge '+s.tone;
+ byId('meta').textContent=s.meta;byId('log-label').textContent=s.label;
+ byId('stages').replaceChildren();
+ stageNames.forEach((name,i)=>{
+  const row=document.createElement('div');
+  const failed=scene==='failed'&&i===s.active;
+  const state=i<s.done?'done':failed?'failed':i===s.active?'active':'pending';
+  row.className='stage '+state;
+  const symbol=document.createElement('span');symbol.className='stage-symbol';symbol.textContent={done:'✓',failed:'■',active:'◐',pending:'·'}[state];
+  const label=document.createElement('span');label.textContent=name;
+  row.append(symbol,label);byId('stages').append(row);
+ });
+ byId('stage-summary').textContent=s.summary;
+ byId('log').textContent=s.logs.join('\n');
+ byId('message').textContent=s.message;byId('message').className='event-message '+s.tone;
+ byId('connection').textContent=detached?(scene==='loading'?'— Viewer closed · no operation snapshot was received':'— Viewer detached · operation was not cancelled · resume using op_demo_7k2'):s.connection;
+ byId('connection').className='connection '+(detached?'warn':scene==='reconnecting'?'warn':'dim');
+ byId('follow').textContent=detached?'detached · no cancellation requested':paused?'local follow paused · server operation unaffected':'following · operation continues on server';
+ byId('inline').textContent='$ eregion deploy payments --env production  [illustrative command]\n\n'+s.inline;
+ byId('operation').setAttribute('aria-label','Illustrative deployment viewer: '+s.status+'. '+s.message);
+ byId('announcement').textContent=s.status+'. '+s.message;
+}
+byId('scene').addEventListener('change',()=>{paused=false;detached=false;byId('pause').setAttribute('aria-pressed','false');byId('pause').textContent='Pause local follow';render()});
+byId('next').addEventListener('click',()=>{const select=byId('scene');select.selectedIndex=(select.selectedIndex+1)%select.options.length;select.dispatchEvent(new Event('change'))});
+byId('compact').addEventListener('click',()=>{const compact=byId('operation').classList.toggle('compact');byId('compact').setAttribute('aria-pressed',String(compact));byId('compact').textContent=compact?'Wide layout':'Compact layout'});
+byId('pause').addEventListener('click',()=>{paused=!paused;byId('pause').setAttribute('aria-pressed',String(paused));byId('pause').textContent=paused?'Resume local follow':'Pause local follow';render()});
+byId('telemetry').addEventListener('click',()=>{const connected=byId('telemetry').getAttribute('aria-pressed')!=='true';byId('telemetry').setAttribute('aria-pressed',String(connected));byId('telemetry').textContent=connected?'Demo telemetry connected':'No telemetry backend';byId('charts').hidden=!connected;byId('no-telemetry').hidden=connected});
+byId('operation').tabIndex=0;
+byId('operation').addEventListener('keydown',event=>{
+ if(event.key===' '){event.preventDefault();byId('pause').click()}
+ if(event.key==='q'){detached=true;render()}
+ if(event.key==='?'){byId('connection').textContent='Help · Space: pause local follow · q: detach only · use state controls to inspect fixtures.'}
+});
+render();
+</script>
+</body>
+</html>
