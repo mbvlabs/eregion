@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -43,16 +45,24 @@ func upgradeMeta(summary string, when, examples []string, next ...string) Comman
 // upgradeSpecs is attached by the root orchestrator. It only advertises the
 // upgrade commands implemented here; no roadmap capability is inferred.
 func (a *app) upgradeSpecs() []spec {
-	groupMeta := upgradeMeta("Verify, apply, and roll back signed releases",
+	groupMeta := upgradeMeta("Verify, plan, apply, and roll back signed releases",
 		[]string{"Discover the signed release workflow before replacing an operator or node binary."},
-		[]string{"eregion upgrade --help", "eregion upgrade guide --json"}, "eregion upgrade guide --format markdown")
+		[]string{"eregion upgrade --help", "eregion guide --json"}, "eregion guide --format markdown")
 
 	checkMeta := upgradeMeta("Verify a signed release and print a dry-run diff",
 		[]string{"Check signature, artifact SHA256, platform, contract, node protocol, and forward-only schema compatibility before downloading."},
 		[]string{"eregion upgrade check --manifest release.json --target operator --schema-version 3 --json"}, "eregion upgrade apply --manifest release.json --dry-run --json")
 	checkMeta.InputFlags = []string{"manifest", "target", "schema-version", "current-version"}
+	planMeta := upgradeMeta("Print the documented rolling order without changing anything",
+		[]string{"Review the migrate -> workers -> API -> nodes order, database schema direction, and optional control-plane inventory before a coordinated rollout."},
+		[]string{"eregion upgrade plan --manifest release.json --schema-version 3 --json", "eregion upgrade plan --manifest release.json --inventory control-plane.json --json"})
+	planMeta.InputFlags = []string{"manifest", "target", "schema-version", "current-version", "inventory"}
+	verifyMeta := upgradeMeta("Verify a signed release manifest without touching an installation",
+		[]string{"Check the Ed25519 signature and manifest structure before downloading or extracting any artifact."},
+		[]string{"eregion upgrade verify --manifest release.json --public-key-file release.pub --json"})
+	verifyMeta.InputFlags = []string{"manifest", "public-key-file"}
 	applyMeta := upgradeMeta("Atomically replace an operator or node binary from a signed release",
-		[]string{"Apply a verified release after reviewing a plan-bound dry-run. The command never executes the new binary."},
+		[]string{"Apply a verified release after reviewing a plan-bound dry-run. The new binary is health-checked and the previous binary is restored automatically when that probe fails."},
 		[]string{"eregion upgrade apply --manifest release.json --target operator --schema-version 3 --dry-run --json", "eregion upgrade apply --manifest release.json --target operator --schema-version 3 --confirm TOKEN --json"})
 	applyMeta.Mutating, applyMeta.Destructive, applyMeta.DryRun = true, true, true
 	applyMeta.Confirmation = "plan-bound"
@@ -73,7 +83,9 @@ func (a *app) upgradeSpecs() []spec {
 
 	guideMeta := upgradeMeta("Generate the versioned agent guide from implemented commands",
 		[]string{"Produce discovery text or JSON that matches this binary's implemented command registry."},
-		[]string{"eregion upgrade guide --format markdown", "eregion upgrade guide --format json --json"})
+		[]string{"eregion guide --format markdown", "eregion guide --format json --json"})
+	rootGuideMeta := guideMeta
+	rootGuideMeta.Summary = "Generate the versioned agent guide from every implemented command"
 
 	return []spec{{
 		use:  "upgrade",
@@ -89,12 +101,32 @@ func (a *app) upgradeSpecs() []spec {
 				run: a.upgradeCheck,
 			},
 			{
+				use:  "plan",
+				meta: planMeta,
+				flags: func(cmd *cobra.Command) {
+					upgradeManifestFlags(cmd)
+					cmd.Flags().String("inventory", "", "Optional JSON inventory of running control-plane instances for compatibility checks")
+				},
+				run: a.upgradePlan,
+			},
+			{
+				use:  "verify",
+				meta: verifyMeta,
+				flags: func(cmd *cobra.Command) {
+					cmd.Flags().String("manifest", "", "Signed release manifest path or direct HTTPS URL")
+					cmd.Flags().String("public-key-file", "", "Trusted Ed25519 public key file (defaults to EREGION_UPGRADE_PUBLIC_KEY_FILE)")
+				},
+				run: a.upgradeVerify,
+			},
+			{
 				use:  "apply",
 				meta: applyMeta,
 				flags: func(cmd *cobra.Command) {
 					upgradeManifestFlags(cmd)
 					cmd.Flags().Bool("dry-run", false, "Print the verified plan and confirmation token without downloading or replacing")
 					cmd.Flags().String("confirm", "", "Plan-bound confirmation token from --dry-run")
+					cmd.Flags().Bool("health-check", true, "Run the new binary's version/readiness probe and restore the backup on failure")
+					cmd.Flags().Duration("health-timeout", 20*time.Second, "Maximum time for one health probe")
 				},
 				run: a.upgradeApply,
 			},
@@ -126,6 +158,13 @@ func (a *app) upgradeSpecs() []spec {
 				run: a.upgradeGuide,
 			},
 		},
+	}, {
+		use:  "guide",
+		meta: rootGuideMeta,
+		flags: func(cmd *cobra.Command) {
+			cmd.Flags().String("format", "markdown", "Output format: markdown or json")
+		},
+		run: a.upgradeGuide,
 	}}
 }
 
@@ -150,6 +189,7 @@ type upgradeOptions struct {
 	binary   string
 	manager  *upgrade.Manager
 	manifest upgrade.Manifest
+	database upgrade.DatabasePlan
 }
 
 func (a *app) upgradeOptions(cmd *cobra.Command, manifest upgrade.Manifest) (upgradeOptions, error) {
@@ -169,7 +209,7 @@ func (a *app) upgradeOptions(cmd *cobra.Command, manifest upgrade.Manifest) (upg
 	if err != nil {
 		return upgradeOptions{}, err
 	}
-	env, err := a.upgradeEnvironment(cmd, target)
+	env, database, err := a.upgradeEnvironment(cmd, target)
 	if err != nil {
 		return upgradeOptions{}, err
 	}
@@ -178,13 +218,13 @@ func (a *app) upgradeOptions(cmd *cobra.Command, manifest upgrade.Manifest) (upg
 		StateDir: stateDir, Target: target, BinaryPath: binary, Env: env,
 		Downloader: upgrade.NewDownloader(allowed), ArtifactDir: upgradeFlag(cmd, "artifact-dir"),
 	}
-	return upgradeOptions{target: target, stateDir: stateDir, binary: binary, manager: manager, manifest: manifest}, nil
+	return upgradeOptions{target: target, stateDir: stateDir, binary: binary, manager: manager, manifest: manifest, database: database}, nil
 }
 
-func (a *app) upgradeEnvironment(cmd *cobra.Command, target upgrade.Target) (upgrade.Environment, error) {
-	schema, err := a.upgradeSchemaVersion(cmd)
+func (a *app) upgradeEnvironment(cmd *cobra.Command, target upgrade.Target) (upgrade.Environment, upgrade.DatabasePlan, error) {
+	database, err := a.upgradeDatabasePlan(cmd)
 	if err != nil {
-		return upgrade.Environment{}, err
+		return upgrade.Environment{}, upgrade.DatabasePlan{}, err
 	}
 	version := buildinfo.Current().Version
 	if target == upgrade.TargetNode {
@@ -195,36 +235,41 @@ func (a *app) upgradeEnvironment(cmd *cobra.Command, target upgrade.Target) (upg
 	}
 	return upgrade.Environment{
 		Target: target, OS: runtime.GOOS, Arch: runtime.GOARCH, Version: version,
-		Contract: contract.Schema, NodeProtocol: node.ProtocolVersion, SchemaVersion: schema,
-	}, nil
+		Contract: contract.Schema, NodeProtocol: node.ProtocolVersion, SchemaVersion: database.Current,
+	}, database, nil
 }
 
-func (a *app) upgradeSchemaVersion(cmd *cobra.Command) (int, error) {
+// upgradeDatabasePlan reads the current schema through the same read-only
+// migration plan that `system migrate --dry-run` uses. It never applies DDL.
+func (a *app) upgradeDatabasePlan(cmd *cobra.Command) (upgrade.DatabasePlan, error) {
 	if cmd.Flags().Lookup("schema-version") == nil {
-		return 0, nil
+		return upgrade.DatabasePlan{}, nil
 	}
 	value, _ := cmd.Flags().GetInt("schema-version")
 	if cmd.Flags().Changed("schema-version") {
 		if value < 1 {
-			return 0, contract.NewFault(contract.ValidationFailed, "--schema-version must be positive", "Pass the current eregion database schema version.")
+			return upgrade.DatabasePlan{}, contract.NewFault(contract.ValidationFailed, "--schema-version must be positive", "Pass the current eregion database schema version.")
 		}
-		return value, nil
+		return upgrade.DatabasePlan{Current: value}, nil
 	}
 	if os.Getenv("EREGION_DATABASE_URL") == "" {
-		return 0, contract.NewFault(contract.InputRequired, "current database schema version is required", "Pass --schema-version N or set EREGION_DATABASE_URL so migrations can be inspected without applying them.")
+		return upgrade.DatabasePlan{}, contract.NewFault(contract.InputRequired, "current database schema version is required", "Pass --schema-version N or set EREGION_DATABASE_URL so migrations can be inspected without applying them.")
 	}
 	ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
 	defer cancel()
 	pool, err := a.database(ctx)
 	if err != nil {
-		return 0, err
+		return upgrade.DatabasePlan{}, err
 	}
 	defer pool.Close()
 	plan, err := controlplane.PlanMigrations(ctx, pool)
 	if err != nil {
-		return 0, err
+		return upgrade.DatabasePlan{}, err
 	}
-	return plan.Current, nil
+	return upgrade.DatabasePlan{
+		Current: plan.Current, Required: plan.Required,
+		RiverCurrent: plan.RiverCurrent, RiverRequired: plan.RiverRequired,
+	}, nil
 }
 
 func upgradeBinaryPath(cmd *cobra.Command, target upgrade.Target) (string, error) {
@@ -321,6 +366,101 @@ func (a *app) upgradeCheck(cmd *cobra.Command, _ []string) (result, error) {
 	return result{data: plan, plain: renderUpgradePlan(plan)}, nil
 }
 
+func (a *app) upgradeVerify(cmd *cobra.Command, _ []string) (result, error) {
+	manifest, _, err := a.upgradeManifest(cmd)
+	if err != nil {
+		return result{}, err
+	}
+	type artifact struct {
+		Name   string         `json:"name"`
+		Target upgrade.Target `json:"target"`
+		OS     string         `json:"os"`
+		Arch   string         `json:"arch"`
+		Size   int64          `json:"size"`
+		SHA256 string         `json:"sha256"`
+	}
+	verified := struct {
+		Schema        string     `json:"schema"`
+		Version       string     `json:"version"`
+		Channel       string     `json:"channel"`
+		PublishedAt   string     `json:"published_at"`
+		Contract      string     `json:"contract"`
+		NodeProtocol  int        `json:"node_protocol"`
+		SchemaVersion int        `json:"schema_version"`
+		UpgradeFrom   []string   `json:"upgrade_from,omitempty"`
+		Artifacts     []artifact `json:"artifacts"`
+	}{
+		Schema: upgrade.ManifestSchema, Version: manifest.Version, Channel: manifest.Channel,
+		PublishedAt: manifest.PublishedAt, Contract: manifest.Contract,
+		NodeProtocol: manifest.NodeProtocol, SchemaVersion: manifest.SchemaVersion,
+		UpgradeFrom: manifest.UpgradeFrom, Artifacts: make([]artifact, 0, len(manifest.Artifacts)),
+	}
+	for _, item := range manifest.Artifacts {
+		verified.Artifacts = append(verified.Artifacts, artifact{
+			Name: item.Name, Target: item.Target, OS: item.OS, Arch: item.Arch, Size: item.Size, SHA256: item.SHA256,
+		})
+	}
+	var plain strings.Builder
+	fmt.Fprintf(&plain, "Verified signed release %s (%s)\ncontract: %s\nnode protocol: %d\ndatabase schema: %d\npublished: %s\nartifacts:\n", manifest.Version, manifest.Channel, manifest.Contract, manifest.NodeProtocol, manifest.SchemaVersion, manifest.PublishedAt)
+	for _, item := range verified.Artifacts {
+		fmt.Fprintf(&plain, "  %s %s/%s %s %s\n", item.Target, item.OS, item.Arch, upgradeSize(item.Size), item.SHA256)
+	}
+	return result{data: verified, plain: plain.String()}, nil
+}
+
+func (a *app) upgradePlan(cmd *cobra.Command, _ []string) (result, error) {
+	manifest, _, err := a.upgradeManifest(cmd)
+	if err != nil {
+		return result{}, err
+	}
+	options, err := a.upgradeOptions(cmd, manifest)
+	if err != nil {
+		return result{}, err
+	}
+	if options.target != upgrade.TargetOperator {
+		return result{}, contract.NewFault(contract.ValidationFailed, "coordinated rollout planning applies to the operator target", "Use --target operator; node artifacts are rolled last in the same plan.")
+	}
+	inventory, err := a.upgradeInventory(upgradeFlag(cmd, "inventory"))
+	if err != nil {
+		return result{}, err
+	}
+	plan, err := upgrade.BuildRolloutPlan(manifest, options.manager.Env, options.database, inventory)
+	if err != nil {
+		return result{}, err
+	}
+	return result{data: plan, plain: upgrade.RenderRolloutPlan(plan)}, nil
+}
+
+func (a *app) upgradeInventory(path string) ([]upgrade.ControlPlaneInstance, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, contract.NewFault(contract.NotFound, "control-plane inventory file could not be read", "Pass a regular JSON file or omit --inventory.")
+	}
+	if info.Size() > upgrade.MaxManifestBytes {
+		return nil, contract.NewFault(contract.PreconditionFailed, "control-plane inventory file is too large", "Keep the inventory under 1 MiB.")
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: operator-selected inventory path.
+	if err != nil {
+		return nil, contract.NewFault(contract.NotFound, "control-plane inventory file could not be read", "Pass a regular JSON file or omit --inventory.")
+	}
+	var inventory []upgrade.ControlPlaneInstance
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&inventory); err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "control-plane inventory is not a strict JSON array", "Use id, version, contract, node_protocol, and schema_version fields only.")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, contract.NewFault(contract.ValidationFailed, "control-plane inventory has trailing JSON", "Use exactly one JSON array.")
+	}
+	if err := upgrade.ValidateRolloutInventory(inventory); err != nil {
+		return nil, err
+	}
+	return inventory, nil
+}
+
 func (a *app) upgradeApply(cmd *cobra.Command, _ []string) (result, error) {
 	manifest, _, err := a.upgradeManifest(cmd)
 	if err != nil {
@@ -338,13 +478,28 @@ func (a *app) upgradeApply(cmd *cobra.Command, _ []string) (result, error) {
 		}
 		return result{data: plan, plain: renderUpgradePlan(plan)}, nil
 	}
+	healthCheck, _ := cmd.Flags().GetBool("health-check")
+	if healthCheck {
+		timeout, _ := cmd.Flags().GetDuration("health-timeout")
+		options.manager.HealthProbe = upgrade.NewHealthProbe(upgrade.ProbeConfig{
+			Target: options.target, Manifest: manifest,
+			DatabaseURL: os.Getenv("EREGION_DATABASE_URL"), Timeout: timeout,
+		})
+		options.manager.HealthTimeout = timeout
+	}
 	confirm, _ := cmd.Flags().GetString("confirm")
 	applied, err := options.manager.Apply(cmd.Context(), manifest, confirm)
 	if err != nil {
 		return result{}, err
 	}
 	journal := applied.Journal
-	plain := fmt.Sprintf("Installed %s %s at %s.\nprevious binary: %s\nbackup: %s\njournal: %s\nRestart the service to use the new binary; rollback is explicit.", options.target, journal.ToVersion, journal.BinaryPath, journal.FromVersion, journal.BackupPath, journal.OperationID)
+	plain := fmt.Sprintf("Installed %s %s at %s.\nprevious binary: %s\nbackup: %s\njournal: %s\n", options.target, journal.ToVersion, journal.BinaryPath, journal.FromVersion, journal.BackupPath, journal.OperationID)
+	if applied.HealthCheck != "" {
+		plain += "health: " + applied.HealthCheck + "\n"
+	} else {
+		plain += "health: not checked (--health-check=false)\n"
+	}
+	plain += "Restart the service to use the new binary; rollback is explicit."
 	return result{data: applied, plain: plain}, nil
 }
 

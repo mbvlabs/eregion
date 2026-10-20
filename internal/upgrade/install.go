@@ -47,6 +47,12 @@ type Manager struct {
 	// ArtifactDir is an optional operator-supplied offline mirror. Files are
 	// still checked against the signed size and SHA256; no path traversal.
 	ArtifactDir string
+	// HealthProbe runs the newly installed binary after the atomic rename. A
+	// failure automatically restores the verified backup; nil skips the probe
+	// (used only by callers that perform their own verification).
+	HealthProbe HealthProbe
+	// HealthTimeout bounds one health probe. Zero selects 20 seconds.
+	HealthTimeout time.Duration
 }
 
 // Plan is the dry-run diff and the confirmation binding for an install.
@@ -88,9 +94,10 @@ type RollbackPlan struct {
 
 // Result is one completed replacement and its journal.
 type Result struct {
-	Plan      any       `json:"plan"`
-	Journal   Journal   `json:"journal"`
-	Recovered *Recovery `json:"recovered,omitempty"`
+	Plan        any       `json:"plan"`
+	Journal     Journal   `json:"journal"`
+	Recovered   *Recovery `json:"recovered,omitempty"`
+	HealthCheck string    `json:"health_check,omitempty"`
 }
 
 // Recovery describes what an interrupted journal reconciliation did.
@@ -272,8 +279,15 @@ func (m *Manager) Apply(ctx context.Context, manifest Manifest, confirm string) 
 	if err := m.recordBackup(plan); err != nil {
 		return Result{}, err
 	}
+	status := StatusInstalling
+	if m.HealthProbe != nil {
+		// A crash during a required health probe must never be mistaken for a
+		// completed activation. Recovery of a "verifying" journal restores the
+		// previous binary instead of finishing the install.
+		status = StatusVerifying
+	}
 	journal := Journal{
-		Schema: JournalSchema, Target: m.Target, Status: StatusInstalling, OperationID: operationID(),
+		Schema: JournalSchema, Target: m.Target, Status: status, OperationID: operationID(),
 		BinaryPath: plan.BinaryPath, FromVersion: plan.CurrentVersion, FromSHA256: plan.CurrentSHA256,
 		ToVersion: plan.NextVersion, ToSHA256: stagedSHA,
 		BackupPath: plan.BackupPath, BackupSHA256: plan.CurrentSHA256, StagedPath: staged,
@@ -292,12 +306,82 @@ func (m *Manager) Apply(ctx context.Context, manifest Manifest, confirm string) 
 	if err := os.Chmod(m.BinaryPath, 0o755); err != nil {
 		return Result{}, contract.NewFault(contract.Unavailable, "installed binary permissions could not be set", "Restore the recorded backup and inspect the filesystem.")
 	}
+	health, healthErr := m.probeHealth(ctx, plan)
+	if healthErr != nil {
+		restoreErr := m.restoreAfterFailedHealth(path, plan, &journal, healthErr)
+		if restoreErr != nil {
+			return Result{Plan: plan, Journal: journal, Recovered: &recovery}, restoreErr
+		}
+		fault := contract.NewFault(contract.PreconditionFailed, "the new binary failed its health check and the previous binary was restored", "Do not activate this release. Inspect the health probe detail, fix the artifact, and rerun the dry run.")
+		fault.Details = map[string]any{"health_check": healthErr.Error(), "restored": plan.CurrentVersion, "journal": journal.OperationID}
+		return Result{Plan: plan, Journal: journal, Recovered: &recovery}, fault
+	}
 	journal.Status = StatusInstalled
 	journal.StagedPath = ""
+	journal.HealthCheck = health
 	if err := saveJournal(path, journal); err != nil {
 		return Result{}, contract.NewFault(contract.Unavailable, "upgrade journal could not record completion", "Run upgrade apply or rollback again to reconcile from the journal.")
 	}
-	return Result{Plan: plan, Journal: journal, Recovered: &recovery}, nil
+	return Result{Plan: plan, Journal: journal, Recovered: &recovery, HealthCheck: health}, nil
+}
+
+// probeHealth runs one bounded health probe after the atomic rename. A caller
+// that supplies no probe has explicitly opted out of local health checking.
+func (m *Manager) probeHealth(ctx context.Context, plan Plan) (string, error) {
+	if m.HealthProbe == nil {
+		return "", nil
+	}
+	timeout := m.HealthTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+	detail, err := m.HealthProbe(probeCtx, plan.BinaryPath)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(detail) == "" {
+		detail = "probe passed"
+	}
+	return detail, nil
+}
+
+// restoreAfterFailedHealth puts the verified previous binary back while the
+// journal still describes the install. It never guesses: a backup that does not
+// match the recorded hash is a failed recovery.
+func (m *Manager) restoreAfterFailedHealth(path string, plan Plan, journal *Journal, healthErr error) error {
+	reason := "health check failed: " + healthErr.Error()
+	sha, _, _, err := fileSHA256(plan.BackupPath, MaxArtifactBytes)
+	if err != nil || sha != plan.CurrentSHA256 {
+		journal.Status = StatusFailed
+		journal.Error = reason + "; the recorded backup is missing or does not match its hash"
+		_ = saveJournal(path, *journal)
+		return contract.NewFault(contract.PreconditionFailed, "the new binary failed its health check and automatic restore could not verify the backup", "Restore the backup manually from the upgrade state directory and inspect the journal.")
+	}
+	staged, err := stageCopy(plan.BackupPath, filepath.Dir(m.BinaryPath), m.Target)
+	if err == nil {
+		err = os.Rename(staged, m.BinaryPath)
+	}
+	if err != nil {
+		if staged != "" {
+			_ = os.Remove(staged)
+		}
+		journal.Status = StatusFailed
+		journal.Error = reason + "; restoring the backup failed"
+		_ = saveJournal(path, *journal)
+		return contract.NewFault(contract.PreconditionFailed, "the new binary failed its health check and automatic restore failed", "Restore the backup manually from the upgrade state directory and inspect the journal.")
+	}
+	_ = chmodExecutable(m.BinaryPath)
+	_ = syncDir(filepath.Dir(m.BinaryPath))
+	journal.Status = StatusRolledBack
+	journal.StagedPath = ""
+	journal.HealthCheck = reason
+	journal.Error = reason + "; restored " + plan.CurrentVersion
+	if err := saveJournal(path, *journal); err != nil {
+		return contract.NewFault(contract.Unavailable, "the backup was restored but the journal could not record it", "Inspect the journal and confirm the current binary hash before retrying.")
+	}
+	return nil
 }
 
 func (m *Manager) obtain(ctx context.Context, plan Plan) (string, error) {
@@ -395,6 +479,8 @@ func (m *Manager) recoverLocked() (Recovery, error) {
 	switch journal.Status {
 	case StatusInstalling:
 		return m.recoverInstall(path, journal)
+	case StatusVerifying:
+		return m.recoverVerifying(path, journal)
 	case StatusRollingBack:
 		return m.recoverRollback(path, journal)
 	default:
@@ -440,6 +526,44 @@ func (m *Manager) recoverInstall(path string, journal *Journal) (Recovery, error
 		}
 	}
 	return Recovery{}, m.failedRecovery(path, journal, "neither the new binary, the staged binary, nor the recorded backup could be reconciled")
+}
+
+// recoverVerifying handles a crash after the journal was marked verifying but
+// before the health probe confirmed the release. An unconfirmed binary is never
+// promoted to installed: the verified previous binary is restored instead.
+func (m *Manager) recoverVerifying(path string, journal *Journal) (Recovery, error) {
+	current, _, _, currentErr := fileSHA256(m.BinaryPath, MaxArtifactBytes)
+	if currentErr == nil && current == journal.FromSHA256 {
+		if journal.StagedPath != "" {
+			_ = os.Remove(journal.StagedPath)
+		}
+		journal.Status = StatusRolledBack
+		journal.StagedPath = ""
+		journal.Error = "health check did not complete; the previous binary was still in place"
+		return m.finishRecovery(path, journal, "rolled_back", "the previous binary was still in place; health verification did not complete")
+	}
+	backupSHA, _, _, backupErr := fileSHA256(journal.BackupPath, MaxArtifactBytes)
+	if backupErr == nil && backupSHA == journal.BackupSHA256 {
+		staged, err := stageCopy(journal.BackupPath, filepath.Dir(m.BinaryPath), m.Target)
+		if err == nil {
+			err = os.Rename(staged, m.BinaryPath)
+		}
+		if err == nil {
+			_ = chmodExecutable(m.BinaryPath)
+			_ = syncDir(filepath.Dir(m.BinaryPath))
+			if journal.StagedPath != "" {
+				_ = os.Remove(journal.StagedPath)
+			}
+			journal.Status = StatusRolledBack
+			journal.StagedPath = ""
+			journal.Error = "health check did not complete before the process stopped; restored " + journal.FromVersion
+			return m.finishRecovery(path, journal, "rolled_back", "restored the previous binary after an interrupted health check")
+		}
+		if staged != "" {
+			_ = os.Remove(staged)
+		}
+	}
+	return Recovery{}, m.failedRecovery(path, journal, "an interrupted health check left no verified backup to restore")
 }
 
 func (m *Manager) recoverRollback(path string, journal *Journal) (Recovery, error) {

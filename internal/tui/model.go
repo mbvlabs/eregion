@@ -152,7 +152,7 @@ func newModel(initial viewer.Model, opts Options) Model {
 	helpModel := help.New()
 	if opts.NoColor {
 		helpModel.Styles = help.Styles{}
-		helpModel.ShortSeparator = " · "
+		helpModel.ShortSeparator = glyphs{ascii: opts.ASCII}.separator()
 		helpModel.FullSeparator = "    "
 	}
 	m := Model{
@@ -420,7 +420,7 @@ func (m Model) stageView(index int, stage viewer.Stage) string {
 	symbol := m.glyphs.stage(stage.Status)
 	status := string(stage.Status)
 	if stage.Status == viewer.StageRunning && stage.Attempt > 0 {
-		status += fmt.Sprintf(" · attempt %d", stage.Attempt)
+		status += fmt.Sprintf("%sattempt %d", m.glyphs.separator(), stage.Attempt)
 	}
 	line := fmt.Sprintf("%s%s %-18s %s", prefix, symbol, stage.Name, status)
 	if selected {

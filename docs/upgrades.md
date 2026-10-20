@@ -4,8 +4,10 @@
 `eregion upgrade` command group. This is not a claim that the M7 roadmap gate or
 high availability is complete. The upgrade path replaces one already-installed
 binary on one host, records a journal and backups, and can roll that replacement
-back. It does not restart services, drain traffic, coordinate a live
-control-plane rollout, or prove failover.
+back. After replacement it runs the new binary's version/readiness probe and
+restores the verified backup automatically when that probe fails. It does not
+restart services, drain traffic, coordinate a live control-plane rollout, or
+prove failover.
 
 ## Trust model
 
@@ -144,17 +146,25 @@ database restore outside this tool.
 
 | Command | Behavior |
 | --- | --- |
+| `upgrade verify` | Verify the manifest signature and structure without an installed binary, download, or compatibility decision. |
 | `upgrade check` | Verify the manifest signature, compatibility, current binary hash, and print the plan diff. No download or replacement. |
+| `upgrade plan` | Print the documented `migrate → workers → API → nodes` order, schema direction, and optional control-plane inventory checks. Read-only. |
 | `upgrade apply --dry-run` | Same plan plus a plan-bound confirmation token. |
-| `upgrade apply --confirm TOKEN` | Verify the token against a freshly computed plan, acquire the lock, recover an interrupted journal, verify the artifact, back up the current binary, write the journal, and atomically rename the staged binary into place. |
+| `upgrade apply --confirm TOKEN` | Verify the token against a freshly computed plan, acquire the lock, recover an interrupted journal, verify the artifact, back up the current binary, write the journal, atomically rename the staged binary into place, and run the health probe. A failed probe restores the recorded backup. |
 | `upgrade rollback --dry-run` | Select the journal's last backup (or `--backup`) and print the verified restore plan and token. |
 | `upgrade rollback --confirm TOKEN` | Safety-copy the current binary, verify the recorded backup, write the rollback journal, and atomically restore the backup. |
 | `upgrade status` | Read the binary hash, journal-confirmed installed version, process version, interrupted state, and retained backups. Never mutates. |
-| `upgrade guide` | Generate the versioned agent guide (`eregion/guide/v1`) from the implemented command registry, in Markdown or JSON. |
+| `guide` (also `upgrade guide`) | Generate the versioned agent guide (`eregion/guide/v1`) from every implemented command in the live registry, in Markdown or JSON. |
 
 Common flags: `--target operator|node`, `--binary`, `--state-dir`,
 `--manifest`, `--artifact-dir`, `--public-key-file`, `--schema-version`,
-`--current-version`, `--dry-run`, `--confirm`, `--backup`, `--format`.
+`--current-version`, `--dry-run`, `--confirm`, `--backup`, `--format`,
+`--inventory` (`upgrade plan`), `--health-check`, and `--health-timeout`.
+The health probe runs the newly installed binary with `version --json`; when
+`EREGION_DATABASE_URL` is set it also runs the read-only
+`system migrate --dry-run` and requires `current == required == manifest
+schema_version`. Pass `--health-check=false` only when another system performs
+the verification.
 
 `--schema-version` may be omitted when `EREGION_DATABASE_URL` is set; the CLI
 then inspects pending migrations with `system migrate`'s read-only plan and
@@ -207,12 +217,14 @@ reconciles under the lock:
 
 | Journal status | Condition | Recovery |
 | --- | --- | --- |
-| `installing` | destination already matches the staged binary hash | mark `installed` |
-| `installing` | staged binary still matches the recorded hash | finish the atomic rename, mark `installed` |
-| `installing` | staged binary is gone and the recorded backup matches the original hash | mark `rolled_back`; the original binary remains or is restored |
+| `installing` (no health probe) | destination already matches the staged binary hash | mark `installed` |
+| `installing` (no health probe) | staged binary still matches the recorded hash | finish the atomic rename, mark `installed` |
+| `installing` (no health probe) | staged binary is gone and the recorded backup matches the original hash | mark `rolled_back`; the original binary remains or is restored |
+| `verifying` | destination still matches the original binary | mark `rolled_back`; nothing is replaced |
+| `verifying` | destination matches the new binary, or is otherwise unknown | verify and restore the recorded backup, mark `rolled_back`; an unconfirmed health check is never promoted to `installed` |
 | `rolling_back` | destination already matches the backup hash | mark `rolled_back` |
 | `rolling_back` | the recorded source backup matches its hash | stage and finish the restore, mark `rolled_back` |
-| either | nothing matches | mark `failed`, refuse to guess, and require explicit operator recovery |
+| any | nothing matches | mark `failed`, refuse to guess, and require explicit operator recovery |
 
 `upgrade status` reports `interrupted: true` for a nonterminal journal. A
 corrupt journal fails closed as `precondition_failed`; it is never reset
@@ -295,13 +307,17 @@ as part of the drill.
 
 ## Limitations
 
-- This is one-host, one-binary replacement. It does not restart, drain, or
-  health-check a service.
+- This is one-host, one-binary replacement. It health-checks the binary it
+  installs, but it does not restart, drain, or probe a running service.
 - `CheckControlPlaneCompatibility` validates a supplied inventory. It does not
   observe live processes, hold a cluster-wide lock, or prove HA.
 - Multiple workers and a shared database are not proof of HA; the roadmap gate
   remains open until the agreed failover and outage drills are actually run.
-- There is no automatic rollback on process crash or failed health check.
+- A failed health probe restores the previous binary automatically, but an
+  interrupted unverified install is only reconciled on the next apply or
+  rollback; nothing watches the installed binary after the command exits.
+- `upgrade plan` documents the rolling order but does not execute it or hold a
+  cluster-wide lock.
 - There is no database down-migration. Forward-only schema policy is deliberate.
 - Redirecting downloads are refused, so a release mirror must serve objects
   directly or the operator must use `--artifact-dir`.

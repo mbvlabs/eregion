@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 )
@@ -276,5 +277,29 @@ func TestReducerSanitizesAndRedactsEventText(t *testing.T) {
 	}
 	if !strings.Contains(message, `\u001b`) {
 		t.Fatalf("control character was not made visible: %q", message)
+	}
+}
+
+// Wide labels must survive sanitization intact; truncation belongs to the
+// renderer, which measures display width rather than bytes.
+func TestWideLabelsAndEmojiArePreservedAndSafe(t *testing.T) {
+	at := baseTime()
+	model := New(testID, Options{})
+	step := stepEvent(1, at, "部署-数据库 ✅")
+	step.Message = "起動中 🚀"
+	log := logEvent(2, at.Add(time.Second), "文字幅のテスト 🧪")
+	if err := model.Page([]contract.Event{step, log}, at.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(model.Stages) != 1 || model.Stages[0].Name != "部署-数据库 ✅" {
+		t.Fatalf("stages = %+v", model.Stages)
+	}
+	if model.EventLines[0].Message != "起動中 🚀" || model.EventLines[1].Message != "文字幅のテスト 🧪" {
+		t.Fatalf("event text = %+v", model.EventLines)
+	}
+	for _, text := range []string{model.Stages[0].Name, model.EventLines[0].Message, model.EventLines[1].Message} {
+		if !utf8.ValidString(text) || strings.ContainsRune(text, '\x1b') {
+			t.Fatalf("unsafe wide text: %q", text)
+		}
 	}
 }

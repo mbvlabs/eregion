@@ -1,0 +1,24 @@
+eregion · 127.0.0.1:8080 · diagnostic.test
+control-plane
+op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+⠋ RUNNING · attempt 1 · elapsed 10.0s
+serving release: not applicable to diagnostic.test
+EXECUTION STAGES
+> ✓ preflight          completed
+  ✓ build              completed
+  ◐ 部署-数据库 ✅           running · attempt 1
+
+2 completed · 1 active
+2/5 steps ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌░░░░░░░░░░░░░░░░░░░░░░░░
+active: 部署-数据库 ✅
+TARGETS
+✓ preflight              completed
+✓ build                  completed
+────────────────────────────────────────────────────────────────────────────────
+EVENTS · 8 shown · 8 observed · build log 1
+12:00:04     5 progress 2/5 steps effect acknowledged durably                   
+12:00:05     6 log build building image                                         
+12:00:10     7 step 部署-数据库 ✅ 起動中 🚀                                    
+12:00:10     8 log 部署-数据库 ✅ 文字幅のテスト 🧪                             
+● live · last observation 0ms ago · following · 8 events
+space pause scroll · tab pane · ? help · q detach

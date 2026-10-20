@@ -265,3 +265,168 @@ func TestUpgradeGuideFormatValidation(t *testing.T) {
 		t.Fatalf("json guide: %v %q", err, result.plain)
 	}
 }
+
+func TestGuideCoversEveryImplementedCommand(t *testing.T) {
+	a := newApp()
+	if err := a.meta.validate(a.root); err != nil {
+		t.Fatal(err)
+	}
+	guide := a.currentUpgradeGuide()
+	covered := make(map[string]upgrade.GuideCommand, len(guide.Commands))
+	for _, command := range guide.Commands {
+		covered[command.Path] = command
+	}
+	for _, cmd := range walk(a.root) {
+		if _, ok := covered[cmd.CommandPath()]; !ok {
+			t.Fatalf("guide does not cover implemented command %q", cmd.CommandPath())
+		}
+	}
+	for path, command := range covered {
+		if strings.TrimSpace(command.Summary) == "" || len(command.Examples) == 0 || len(command.ErrorCodes) == 0 {
+			t.Fatalf("guide entry %q is incomplete: %+v", path, command)
+		}
+	}
+	if _, _, err := a.root.Find([]string{"guide"}); err != nil {
+		t.Fatalf("top-level guide command is missing: %v", err)
+	}
+}
+
+func TestUpgradePlanPrintsRollingOrder(t *testing.T) {
+	root := t.TempDir()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "eregion_1.1.0_" + runtime.GOOS + "_" + runtime.GOARCH + ".tar.gz"
+	manifest := upgrade.Manifest{
+		Schema: upgrade.ManifestSchema, Version: "1.1.0", Channel: "stable",
+		PublishedAt: "2026-10-20T00:00:00Z", Contract: "eregion/v1",
+		NodeProtocol: 1, SchemaVersion: 3,
+		Artifacts: []upgrade.Artifact{{
+			Name: name, Target: upgrade.TargetOperator, OS: runtime.GOOS, Arch: runtime.GOARCH, Entry: "eregion",
+			URL: "https://releases.example.com/" + name, Size: 10, SHA256: strings.Repeat("a", 64),
+		}},
+	}
+	if err := manifest.Sign(private); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(manifest)
+	manifestPath := filepath.Join(root, "manifest.json")
+	if err := os.WriteFile(manifestPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(root, "release.pub")
+	if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(public)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inventoryPath := filepath.Join(root, "inventory.json")
+	if err := os.WriteFile(inventoryPath, []byte(`[{"id":"api-1","version":"1.0.0","contract":"eregion/v1","node_protocol":1,"schema_version":3}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := attachUpgrade(t)
+	cmd, _, err := a.root.Find([]string{"upgrade", "plan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"manifest":        manifestPath,
+		"public-key-file": keyPath,
+		"inventory":       inventoryPath,
+		"schema-version":  "3",
+		"current-version": "1.0.0",
+	} {
+		if err := cmd.Flags().Set(name, value); err != nil {
+			t.Fatalf("set --%s: %v", name, err)
+		}
+	}
+	result, err := a.upgradePlan(cmd, nil)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	plan, ok := result.data.(upgrade.RolloutPlan)
+	if !ok || len(plan.Steps) != 4 {
+		t.Fatalf("unexpected plan result: %#v", result.data)
+	}
+	for index, stage := range []string{"migrate", "workers", "api", "nodes"} {
+		if plan.Steps[index].Stage != stage {
+			t.Fatalf("step %d = %q, want %q", index, plan.Steps[index].Stage, stage)
+		}
+	}
+	if !strings.Contains(result.plain, "migrate") || !strings.Contains(result.plain, "nodes") {
+		t.Fatalf("plain plan lost the rolling order:\n%s", result.plain)
+	}
+}
+
+func TestUpgradeInventoryIsStrict(t *testing.T) {
+	a := attachUpgrade(t)
+	path := filepath.Join(t.TempDir(), "inventory.json")
+	if err := os.WriteFile(path, []byte(`[{"id":"api-1","version":"1.0.0","contract":"eregion/v1","node_protocol":1,"schema_version":3,"role":"api"}]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.upgradeInventory(path); err == nil {
+		t.Fatal("inventory with an unknown field was accepted")
+	}
+	if err := os.WriteFile(path, []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := a.upgradeInventory(path)
+	if err != nil || len(inventory) != 0 {
+		t.Fatalf("empty inventory: %v %+v", err, inventory)
+	}
+}
+
+func TestUpgradeVerifySignedManifestWithoutInstallation(t *testing.T) {
+	a := attachUpgrade(t)
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := upgrade.Manifest{
+		Schema: upgrade.ManifestSchema, Version: "1.1.0", Channel: "stable",
+		PublishedAt: "2026-10-20T00:00:00Z", Contract: "eregion/v1",
+		NodeProtocol: 1, SchemaVersion: 3,
+		Artifacts: []upgrade.Artifact{{
+			Name: "eregion_1.1.0_linux_amd64.tar.gz", Target: upgrade.TargetOperator,
+			OS: "linux", Arch: "amd64", Entry: "eregion",
+			URL:  "https://releases.example.com/eregion_1.1.0_linux_amd64.tar.gz",
+			Size: 10, SHA256: strings.Repeat("a", 64),
+		}},
+	}
+	if err := manifest.Sign(private); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	manifestPath := filepath.Join(root, "manifest.json")
+	raw, _ := json.Marshal(manifest)
+	if err := os.WriteFile(manifestPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(root, "release.pub")
+	if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(public)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, err := a.root.Find([]string{"upgrade", "verify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("manifest", manifestPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("public-key-file", keyPath); err != nil {
+		t.Fatal(err)
+	}
+	result, err := a.upgradeVerify(cmd, nil)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !strings.Contains(result.plain, "Verified signed release 1.1.0") {
+		t.Fatalf("plain = %q", result.plain)
+	}
+	raw[0] = ' '
+	if err := os.WriteFile(manifestPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.upgradeVerify(cmd, nil); err == nil {
+		t.Fatal("tampered manifest verified")
+	}
+}

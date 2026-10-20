@@ -106,3 +106,15 @@ wireguard:
 
 # Check formatting, static analysis, and tests.
 check: fmt-check lint test dev-test
+
+# Run the offline v0.1 release gate (no live dev environment required).
+release-check:
+    just fmt-check
+    go vet ./...
+    go test ./...
+    go -C examples/hello test ./...
+    python3 -m unittest discover -s scripts -p 'test_*.py'
+
+# Run the interactive terminal TERM matrix (requires just dev-up).
+terminal-matrix:
+    python3 scripts/terminal_smoke.py
