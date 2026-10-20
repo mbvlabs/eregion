@@ -10,6 +10,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/resources"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
 
@@ -24,12 +25,24 @@ type ExtensionConfig struct {
 	// Resources configures one application host. Nil leaves resource actions
 	// registered but failing with "resource host is not configured".
 	Resources *resources.Config
-	// AccessAdmins are the actor subjects allowed to run DNS and access-grant
-	// actions and to administer private-device grants. Empty leaves those
-	// actions registered but fail-closed.
+	// AccessAdmins are the actor subjects allowed to administer private-device
+	// grants. Empty leaves access actions registered but fail-closed.
 	AccessAdmins []string
+	// DNSAdmins are the actor subjects allowed to reconcile managed DNS. When
+	// empty they fall back to AccessAdmins, preserving the earlier single-admin
+	// configuration. DNS authorization is otherwise independent of private
+	// access grants.
+	DNSAdmins []string
+	// DNSZones is the explicit read-only Cloudflare inventory configuration.
+	// Reconcile actions must name one of these zones; with no zones configured,
+	// DNS actions fail closed instead of accepting an arbitrary zone.
+	DNSZones []integrations.DNSZone
 	// CloudflareBaseURL is a test seam; empty uses the real API.
 	CloudflareBaseURL string
+	// NodeTransports resolves the authenticated transport for each target node.
+	// Telemetry installs and agents need it because one worker process may target
+	// several nodes. Nil leaves telemetry actions registered but fail-closed.
+	NodeTransports telemetry.TransportResolver
 }
 
 // Extensions is what RegisterExtensions built, for the caller to mount.
@@ -80,21 +93,28 @@ func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
 		return nil, err
 	}
 	extensions := &Extensions{}
-	runtime := integrations.RuntimeConfig{Audit: audit, CloudflareBaseURL: config.CloudflareBaseURL}
-	if len(config.AccessAdmins) > 0 {
-		access, err := integrations.NewAccessController(integrations.AccessConfig{AdminSubjects: config.AccessAdmins, Audit: audit, Store: grants})
-		if err != nil {
-			return nil, err
-		}
+	runtime := integrations.RuntimeConfig{Audit: audit, CloudflareBaseURL: config.CloudflareBaseURL, DNSZones: config.DNSZones}
+	dnsAdmins := config.DNSAdmins
+	if len(dnsAdmins) == 0 {
+		dnsAdmins = config.AccessAdmins
+	}
+	if len(dnsAdmins) > 0 {
 		allow := map[string][]string{}
-		for _, subject := range config.AccessAdmins {
+		for _, subject := range dnsAdmins {
 			allow[subject] = []string{"*"}
 		}
 		authorizer, err := integrations.NewStaticAuthorizer(allow)
 		if err != nil {
 			return nil, err
 		}
-		runtime.Access, runtime.Authorizer, extensions.Access = access, authorizer, access
+		runtime.Authorizer = authorizer
+	}
+	if len(config.AccessAdmins) > 0 {
+		access, err := integrations.NewAccessController(integrations.AccessConfig{AdminSubjects: config.AccessAdmins, Audit: audit, Store: grants})
+		if err != nil {
+			return nil, err
+		}
+		runtime.Access, extensions.Access = access, access
 	}
 	if _, registered := registry.Lookup(integrations.KindAccessGrant); !registered {
 		if err := integrations.Configure(registry, runtime); err != nil {
@@ -102,7 +122,20 @@ func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
 		}
 	}
 
-	// TODO(telemetry): call telemetry.ConfigureProduction(registry, config.Pool, transport) here once it lands.
+	if _, registered := registry.Lookup(telemetry.KindInstall); !registered {
+		if config.NodeTransports != nil {
+			if err := telemetry.ConfigureProductionWithResolver(registry, config.Pool, config.NodeTransports); err != nil {
+				return nil, err
+			}
+		} else {
+			// Tests and local embedders call RegisterExtensions without a worker
+			// transport. Registration still succeeds, and every dispatch attempt
+			// fails with an explicit unavailable fault rather than a local install.
+			if err := telemetry.Configure(registry, telemetry.RuntimeConfig{}); err != nil {
+				return nil, err
+			}
+		}
+	}
 	return extensions, nil
 }
 

@@ -57,6 +57,7 @@ func RenderPlan(prepared Prepared) (Plan, error) {
 		{Path: filepath.Join(stackDir, "grafana", "grafana.env"), Data: []byte(renderGrafanaEnv(cfg)), Mode: 0600, Secret: true},
 		{Path: filepath.Join(stackDir, "grafana", "provisioning", "datasources", "datasources.yaml"), Data: []byte(renderDatasources(cfg, prepared.MetricsReadToken())), Mode: 0600, Secret: true},
 		{Path: filepath.Join(stackDir, "grafana", "provisioning", "dashboards", "provider.yaml"), Data: []byte(renderDashboardProvider()), Mode: 0640},
+		{Path: filepath.Join(stackDir, "grafana", "provisioning", "alerting", "eregion-alerts.yaml"), Data: []byte(renderAlertRules()), Mode: 0640},
 		{Path: filepath.Join(stackDir, "grafana", "dashboards", "eregion-telemetry.json"), Data: []byte(renderDashboard(cfg)), Mode: 0640},
 	}
 	if cfg.EnableTraces {
@@ -411,6 +412,7 @@ func renderDatasources(cfg Config, metricsToken string) string {
 
 datasources:
   - name: VictoriaMetrics
+    uid: VictoriaMetrics
     type: prometheus
     access: proxy
     url: http://vmauth-metrics:8427
@@ -443,6 +445,71 @@ providers:
     editable: false
     options:
       path: /var/lib/grafana/dashboards
+`
+}
+
+// renderAlertRules provisions one upstream-format Grafana alert rule file. The
+// rules watch VictoriaMetrics self-monitoring data that the stack actually
+// produces; they do not assume an application already exports a metric.
+func renderAlertRules() string {
+	return `apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: eregion-telemetry
+    folder: eregion
+    interval: 1m
+    rules:
+      - uid: eregion-telemetry-disk-low
+        title: Telemetry storage has less than 5 GiB free
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: VictoriaMetrics
+            model:
+              editorMode: code
+              expr: vm_free_disk_space_bytes < 5e9
+              instant: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              range: true
+              refId: A
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: Telemetry node storage is below the 5 GiB safety margin.
+          description: Free space reported by VictoriaMetrics has stayed below 5 GiB for ten minutes. Retention or disk size needs operator attention.
+      - uid: eregion-telemetry-scrape-missing
+        title: Telemetry storage self-monitoring is absent
+        condition: A
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: VictoriaMetrics
+            model:
+              editorMode: code
+              expr: absent(vm_app_start_time_seconds)
+              instant: false
+              intervalMs: 60000
+              maxDataPoints: 43200
+              range: true
+              refId: A
+        noDataState: Alerting
+        execErrState: Error
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: VictoriaMetrics self-monitoring data is absent.
+          description: The telemetry storage backend has not reported its own metrics for five minutes; this is not proof that application telemetry is healthy.
 `
 }
 

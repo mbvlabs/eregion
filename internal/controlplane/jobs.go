@@ -89,6 +89,11 @@ type WorkerConfig struct {
 	// uses EREGION_NODE_NAME, then "local" for compatibility. A fresh main
 	// node bootstrap writes "main".
 	LocalNodeName string
+	// Resolver is an already-built per-node transport resolver. A process that
+	// also registers extensions (telemetry) builds one resolver and shares it, so
+	// there is exactly one cache and one WireGuard key lock per node. Nil builds
+	// the resolver from Nodes and Transport.
+	Resolver *NodeResolver
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
@@ -121,7 +126,10 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		// EREGION_NODE_NAME is also set.
 		service.localNode = local.NodeIdentity()
 	}
-	service.resolver = NewNodeResolver(pool, config.Nodes, func() node.Transport { return service.transport })
+	service.resolver = config.Resolver
+	if service.resolver == nil {
+		service.resolver = NewNodeResolver(pool, config.Nodes, func() node.Transport { return service.transport })
+	}
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &platformWorker{service: service})

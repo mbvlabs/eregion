@@ -12,20 +12,30 @@ and `platform.telemetry.agent` are ordinary platform actions: one durable
 `eregion_operations` row, one River job, the shared event cursor, cancellation,
 and idempotency contract. The control plane does not open its own queue.
 
-The production adapters are registered by:
+The production adapters are registered by `controlplane.RegisterExtensions` from
+both `serve` and `worker`. The process builds one PostgreSQL-backed
+`controlplane.NodeTransports` resolver and passes it to telemetry through
+`ExtensionConfig.NodeTransports`; the same resolver instance is also used by the
+worker, so there is one transport cache and one WireGuard key lock per node:
 
 ```go
-telemetry.ConfigureProduction(registry, pool, nodeTransport)
+telemetry.ConfigureProductionWithResolver(registry, pool, nodes)
 ```
+
+`ConfigureProduction(registry, pool, transport)` remains for local and
+single-node workers; it adapts one already-selected transport to the same
+resolver interface. A resolver may return only the transport that authenticates
+as the requested node, and the pinned host identity recorded in placement must
+match before any step runs.
 
 - **Placement** reads `eregion_platform_nodes` (`roles`, `address`). A node with
   `telemetry` plus `control-plane` is refused. The address must be a literal
   private `IP:port`. The dispatch identity is derived from that recorded address;
   the table has no host-key column, so pinned SSH host keys remain the
   transport's responsibility (`EREGION_NODE_SSH_KNOWN_HOSTS`).
-- **Dispatch** sends bounded, versioned `telemetry-*` steps through the existing
-  `node.Transport`. The node protocol has no arbitrary shell or filesystem
-  request, so `internal/telemetry/remote` adds only three step shapes:
+- **Dispatch** sends bounded, versioned `telemetry-*` steps through the resolved
+  `node.Transport` for the target node. The node protocol has no arbitrary shell
+  or filesystem request, so `internal/telemetry/remote` adds only three step shapes:
   `mkdir` beneath a declared root, atomic `file` writes beneath that root, and a
   narrow `docker compose` argv (`pull`, `up --detach --remove-orphans --wait`,
   or `ps --format json`). Every step is journaled under the operation's stable
@@ -63,6 +73,33 @@ action input, operation events, River arguments, or command lines. Per-node OTLP
 ingest tokens are generated per application/builder node and written only to a
 `0600` token file on the telemetry node.
 
+### Issuing per-node ingest credentials
+
+`platform.telemetry.credential` issues one token and appends it to the protected
+credential array consumed by `platform.telemetry.install`. The operation input
+names only the target node and credential file; the result contains the node,
+the file path, and the token's SHA-256 digest. The token itself never appears in
+action input, operation events, River arguments, command lines, or the result.
+
+```sh
+eregion platform submit \
+  --kind platform.telemetry.credential \
+  --target node/app-1 \
+  --input-file telemetry-credential.json \
+  --idempotency-key ci:telemetry-credential-app-1 --json
+```
+
+```json
+{"credentials_file": "/etc/eregion/telemetry/ingest-tokens.json"}
+```
+
+Repeating the action for the same node rotates that node's token in the file
+(keeping every other node's entry) and records the new digest. The file must be
+absent or a regular `0600` file; symlinks and group/world-readable files are
+refused. The install action reads the same file from the control-plane host,
+renders it into the telemetry node's `0600` token file, and keeps credential
+values out of every event and command.
+
 ## Storage and license decision
 
 The default stack is deliberately small and self-hosted:
@@ -81,7 +118,15 @@ flags. The default footprint is one telemetry node with Docker volumes and
 memory limits in the collector (512 MiB with a 128 MiB spike allowance).
 Retention defaults are 15 days metrics, 14 days logs, and 7 days traces, capped
 by validation at 90/90/30 days. Grafana is shipped unmodified; eregion supplies
-provisioning and dashboards. There is no bundled ClickHouse.
+provisioning, dashboards, and alerting defaults. There is no bundled ClickHouse.
+
+Alerting defaults are rendered into
+`grafana/provisioning/alerting/eregion-alerts.yaml` and mounted through the same
+`grafana/provisioning` volume as the datasource and dashboard provider. The
+provisioned rules watch VictoriaMetrics self-monitoring data that the rendered
+stack actually produces: low free disk space and absent self-monitoring. They do
+not assume an application metric exists; absent data stays `NoData` rather than
+being treated as healthy.
 
 Metrics and logs read paths go through `vmauth` gateways on the private address.
 Ingest tokens are not reused for reads; read tokens are derived from the Grafana
@@ -147,25 +192,44 @@ Time windows use `--since`/`--end` or an absolute `--start`/`--end`; missing
 configuration is the explicit `absent` state, not zero samples. `tail` stops on
 interrupt (exit 130) and supports `--once` for a bounded read.
 
+`eregion ui --interactive` accepts the same `--telemetry-url`, `--logs-url`,
+`--metrics-url`, and token-file flags (and the same `EREGION_TELEMETRY_*`
+environment) and adapts `telemetry.DataSource` to the workspace graph boundary.
+With no telemetry configuration the fleet/env detail view says no telemetry node
+is configured rather than drawing an empty graph. A configured source still
+distinguishes no samples, stale data, and an unavailable backend. The workspace
+never queries PostgreSQL or the telemetry node to invent missing values.
+
 ## Verified here vs not verified
 
-Verified by unit tests in this increment:
+Verified by unit and integration tests in this increment:
 
 - placement parsing/refusal against a fake and (when
   `EREGION_TEST_DATABASE_URL` is set) a real migrated PostgreSQL database;
+- registration and dispatch through a fake per-node resolver, including refusal
+  of a resolved transport whose pinned identity names another node;
 - file/mkdir steps dispatched through the real node protocol, including
   convergent retry and changed-input refusal;
+- credential issuance writes one 0600 array, rotates/replaces one node entry,
+  reports only a digest, and rejects a token in action input;
 - external export rendering, file-reference mounts, and credential-free output;
+- Grafana alerting provisioning is rendered with a datasource UID that matches
+  the provisioned datasource, and the provisioning directory is mounted;
 - CLI search/tail/query envelopes, NDJSON tail, plain output, explicit
-  absent/no-data states, terminal-escape sanitization, and unavailable backends.
+  absent/no-data/stale states, terminal-escape sanitization, and unavailable
+  backends;
+- workspace graph adapter mapping from `telemetry.DataSource`, including absent,
+  stale, and window handling, and the CLI's no-configuration nil source.
 
 Not verified in this increment, and not claimed:
 
 - a real telemetry VM receiving production OTLP data or serving Grafana;
+- Grafana actually evaluating the provisioned alert rules, or delivering
+  notifications (no contact point is configured);
 - `docker compose` actually converging on a fresh host, package installation, or
   node enrollment/bootstrap;
 - true service health, HA, backup/restore, or retention enforcement under load;
-- external-only export without a local telemetry node;
+- external-only export without a local telemetry node; export is additive only;
 - SSH/WireGuard transport identity beyond the pinned key configuration; the
   node table records an address, not a host key.
 

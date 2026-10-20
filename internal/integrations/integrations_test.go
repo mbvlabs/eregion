@@ -302,6 +302,7 @@ func TestIntegrationActionsConfiguredAndSecretFree(t *testing.T) {
 	registry := platform.NewRegistry()
 	if err := Configure(registry, RuntimeConfig{
 		Authorizer: authz, Audit: audit, Access: access,
+		DNSZones:          []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: tokenPath}},
 		CloudflareBaseURL: server.URL + "/client/v4", CloudflareClient: server.Client(),
 	}); err != nil {
 		t.Fatal(err)

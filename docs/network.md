@@ -32,6 +32,40 @@ Zone identity is explicit:
 --zone-name example.com (lowercase, no trailing dot)
 ```
 
+### Serve configuration
+
+The API/worker process needs an explicit zone allowlist before `dns list` or
+`dns reconcile` can run:
+
+| Environment | Meaning |
+| --- | --- |
+| `EREGION_CLOUDFLARE_ZONES` | comma-separated `zoneID=zoneName` pairs (either side may be the 32-character ID) |
+| `EREGION_CLOUDFLARE_TOKEN_FILE` | absolute root-owned `0600` API-token file used by the read-only inventory |
+| `EREGION_DNS_ADMINS` | comma-separated actor subjects allowed to reconcile DNS |
+| `EREGION_ACCESS_ADMINS` | private-access administrators; also the DNS-admin fallback when `EREGION_DNS_ADMINS` is empty |
+
+Example:
+
+```text
+EREGION_CLOUDFLARE_ZONES=0123456789abcdef0123456789abcdef=example.com
+EREGION_CLOUDFLARE_TOKEN_FILE=/run/secrets/cloudflare-token
+EREGION_DNS_ADMINS=ops@example.com
+```
+
+A zone name or ID alone is refused: the service does not resolve or guess the
+missing half from the network. The configured pairs become the DNS inventory and
+the allowlist for `platform.dns.reconcile`; a reconcile naming another zone fails
+with `precondition_failed` before the token is read or Cloudflare is contacted.
+If no zones are configured, both `dns list` and `dns reconcile` fail closed with
+an `input_required` configuration error rather than returning an empty or
+arbitrary zone.
+
+DNS authorization is independent of private-access administration:
+`EREGION_DNS_ADMINS` controls only DNS reconciliation, while
+`EREGION_ACCESS_ADMINS` controls grants and the private proxy. When
+`EREGION_DNS_ADMINS` is unset, the access list is reused for compatibility.
+Both paths use the durable PostgreSQL audit sink.
+
 ### Desired records
 
 Describe desired records as JSON objects. The CLI accepts one `--record` per
@@ -163,7 +197,12 @@ and exercise the real `Cloudflare` client:
 - audit failure before mutation and audit failure after a mutation;
 - the token never appearing in canonical action input or the result;
 - DNS inventory reads from configured zones (including the token file path
-  handling) without a live Cloudflare account.
+  handling) without a live Cloudflare account;
+- a reconcile for an unconfigured zone is refused before the token is read or
+  the fake Cloudflare endpoint is contacted, and an unconfigured control plane
+  fails `dns list`/`dns reconcile` closed;
+- `EREGION_CLOUDFLARE_ZONES` parsing (both `=` and `:` separators, either side
+  as the ID), duplicate/invalid entries, and the required token-file reference.
 
 The fake also exercises the same `platform.Registry` normalization and executor
 path used by the API and worker, including the operation identity in ownership

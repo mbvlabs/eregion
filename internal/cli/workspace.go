@@ -7,9 +7,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/workspaceui"
 	"github.com/spf13/cobra"
 )
@@ -34,7 +36,9 @@ func (a *app) workspaceSpecs() []spec {
 		"eregion ui --interactive",
 		"eregion ui --interactive --tab apps --ascii --no-color --reduced-motion",
 		"eregion ui --interactive --tab deployments",
+		"eregion ui --interactive --tab fleet --telemetry-url http://10.77.0.10",
 	}
+	meta.Environment = append(meta.Environment, telemetryEnvironment...)
 	return []spec{{
 		use:  "ui",
 		meta: meta,
@@ -45,6 +49,7 @@ func (a *app) workspaceSpecs() []spec {
 			cmd.Flags().Bool("ascii", false, "Use ASCII glyphs instead of Unicode")
 			cmd.Flags().Bool("no-color", false, "Disable colour (NO_COLOR is also honoured)")
 			cmd.Flags().Bool("reduced-motion", false, "Replace spinners with a static loading label (EREGION_REDUCED_MOTION=1 is also honoured)")
+			addTelemetrySourceFlags(cmd)
 		},
 		run: a.workspaceUI,
 	}}
@@ -80,8 +85,13 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	ascii, _ := cmd.Flags().GetBool("ascii")
 	noColor, _ := cmd.Flags().GetBool("no-color")
 	reduced, _ := cmd.Flags().GetBool("reduced-motion")
+	metrics, err := a.workspaceMetricsSource(cmd)
+	if err != nil {
+		return result{}, err
+	}
 	summary, err := workspaceui.Run(cmd.Context(), workspaceui.Options{
 		API:           workspaceAPI,
+		Metrics:       metrics,
 		Host:          workspaceHost(cmd),
 		Secrets:       a.secrets,
 		ASCII:         ascii || strings.EqualFold(os.Getenv("TERM"), "dumb"),
@@ -171,4 +181,95 @@ func (w workspaceLiveAPI) Get(ctx context.Context, id contract.OperationID) (jso
 
 func (w workspaceLiveAPI) Events(ctx context.Context, cursor contract.Cursor, limit int) (json.RawMessage, error) {
 	return w.client.Events(ctx, cursor, limit)
+}
+
+// workspaceMetricsSource adapts the same telemetry read configuration used by
+// `logs` and `metrics` to the workspace graph boundary. No telemetry
+// configuration is the explicit nil source, so the UI renders "no telemetry
+// node" instead of an empty graph.
+func (a *app) workspaceMetricsSource(cmd *cobra.Command) (workspaceui.MetricsSource, error) {
+	if strings.TrimSpace(flagOrEnvironment(cmd, "telemetry-url", "EREGION_TELEMETRY_URL")) == "" &&
+		strings.TrimSpace(flagOrEnvironment(cmd, "logs-url", "EREGION_TELEMETRY_LOGS_URL")) == "" &&
+		strings.TrimSpace(flagOrEnvironment(cmd, "metrics-url", "EREGION_TELEMETRY_METRICS_URL")) == "" {
+		return nil, nil
+	}
+	source, err := a.telemetryDataSource(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return workspaceMetrics{source: source, now: time.Now}, nil
+}
+
+type workspaceMetrics struct {
+	source telemetry.DataSource
+	now    func() time.Time
+}
+
+func (w workspaceMetrics) Query(ctx context.Context, query workspaceui.MetricsQuery) (workspaceui.MetricsSeries, error) {
+	window := query.Window
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	now := time.Now
+	if w.now != nil {
+		now = w.now
+	}
+	end := now().UTC()
+	expression, unit := workspaceMetricExpression(query.Metric)
+	source := query.App
+	if source == "" {
+		source = query.Node
+	}
+	if source == "" {
+		source = "workspace"
+	}
+	result, err := w.source.Metrics(ctx, telemetry.MetricQuery{
+		Window: telemetry.Window{Start: end.Add(-window), End: end},
+		Source: source, Expression: expression, Unit: unit,
+	})
+	if err != nil {
+		return workspaceui.MetricsSeries{}, err
+	}
+	if result.State == telemetry.StateAbsent {
+		return workspaceui.MetricsSeries{Source: result.Source, Metric: query.Metric, Unit: result.Unit, Window: window}, nil
+	}
+	if result.State == telemetry.StateError {
+		return workspaceui.MetricsSeries{}, contract.NewFault(contract.Unavailable, "telemetry metrics query failed", result.Message)
+	}
+	series := workspaceui.MetricsSeries{
+		Source: result.Source, Metric: query.Metric, Unit: result.Unit, Window: window,
+		ObservedAt: result.ObservedAt, Stale: result.State == telemetry.StateStale,
+	}
+	if series.Unit == "" {
+		series.Unit = unit
+	}
+	if len(result.Series) > 0 {
+		for _, sample := range result.Series[0].Samples {
+			series.Samples = append(series.Samples, workspaceui.MetricsSample{At: sample.Timestamp, Value: sample.Value})
+		}
+	}
+	if len(series.Samples) > 0 {
+		last := series.Samples[len(series.Samples)-1].At
+		if series.ObservedAt.IsZero() || last.After(series.ObservedAt) {
+			series.ObservedAt = last
+		}
+	}
+	if !series.ObservedAt.IsZero() && end.Sub(series.ObservedAt) > window {
+		series.Stale = true
+	}
+	return series, nil
+}
+
+// workspaceMetricExpression maps the workspace's stable observation names to
+// explicit PromQL. An unknown name is passed through as an expression: the
+// caller can ask for a real metric without the UI inventing a unit.
+func workspaceMetricExpression(metric string) (string, string) {
+	switch metric {
+	case "node.cpu.utilization":
+		return `100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])))`, "percent"
+	case "http.request.duration.p95":
+		return `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))`, "seconds"
+	default:
+		return metric, ""
+	}
 }

@@ -203,18 +203,46 @@ restore → failed-restore recovery against disposable PostgreSQL containers it
 creates and removes. It refuses to touch `eregion-dev-*`, `dev-postgres`, or
 `eregion-platform-test-pg`.
 
-## Backup policy declarations
+## Backup policy declarations and automatic backups
 
 `resources schedule set` validates an interval or five-field cron expression, a
 timezone, and at least one retention bound (`--keep-last`,
-`--max-age-seconds`), then writes a secret-free policy declaration to the
-protected resource state directory. The result includes the exact
-`platform.backup.create` declaration key, kind, target, schedule, and policy.
+`--max-age-seconds`), then submits `platform.backup.schedule`. The action writes
+a secret-free policy declaration to the protected resource state directory and
+records the same policy in the durable operation input. The result includes the
+exact `platform.backup.create` declaration key, kind, target, schedule, and
+policy.
 
-This command records policy only. It does not execute a backup and does not start
-a scheduler or a second queue. Registering the returned declaration as a River
-periodic job belongs to the orchestrator; until that registration exists, no
-automatic run is claimed.
+The worker's existing River periodic job evaluates declarations every minute:
+
+- a due window submits one `platform.backup.create` with reason `scheduled`;
+- the idempotency key is derived from the resource and the exact schedule
+  slot, so a restart, a concurrent worker, or a repeated tick resolves to the
+  same operation instead of a duplicate backup for that window;
+- the most recent attempt advances the next window. A worker that was down
+  does not backfill every missed window in one tick; it submits the next window
+  and advances one window per tick;
+- `verify_after` submits `platform.backup.verify` once for each completed
+  scheduled backup whose archive can be read, keyed from the backup operation
+  ID;
+- the declared retention bounds are applied with `SelectRetained` to the
+  manifests in the configured backup directory. Expired archives and their
+  manifests are removed; the newest `keep_last` artifacts and anything inside
+  `max_age_seconds` are kept;
+- a later successful `platform.resource.destroy` stops the schedule.
+
+Policies embedded in an earlier `platform.backup.create` input keep working as a
+compatibility path; an explicit `platform.backup.schedule` declaration for the
+same resource takes precedence. Automatic execution requires the worker to have
+`EREGION_RESOURCES_HOST`, `EREGION_RESOURCES_STATE_DIR`, and
+`EREGION_RESOURCES_BACKUP_DIR` configured. Without the resource host, scheduled
+backup operations are still accepted durably but fail in the worker with
+"resource host is not configured", and no archive is pruned; the scheduler does
+not pretend the policy ran.
+
+There is no second queue and no in-process scheduler beyond this periodic job.
+Verification is submitted, not awaited by the scheduler: the verification
+operation has its own durable state, retries, and event history.
 
 ## Control-plane database exclusion
 
@@ -305,9 +333,14 @@ actions must not have.
 gofmt -l cmd internal schema examples
 go vet ./...
 go test ./...
+EREGION_TEST_DATABASE_URL=... go test -count=1 ./internal/controlplane -run 'TestIntegrationDeclaredBackupSchedule' -v
 EREGION_TEST_RESOURCES_DOCKER=1 go test -count=1 ./internal/resources -run Integration -v
 python3 scripts/recovery_drill.py
 ```
 
-The Docker integration test is opt-in and creates uniquely named containers and
+The scheduler integration test declares a policy, runs one tick, asserts exactly
+one scheduled backup, marks its archive readable, runs a second tick, and asserts
+the verify-after submission and retention pruning. The fake host cannot dump a
+real database, so the test does not claim a real archive was produced. The
+Docker integration test is opt-in and creates uniquely named containers and
 volumes. It never uses an existing database, container, or volume.

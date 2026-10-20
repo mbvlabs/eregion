@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -109,7 +110,7 @@ func TestTableStatusAbsentAndUnknownAreHonest(t *testing.T) {
 
 func TestTransportDispatchRequiresAnOperationIdentity(t *testing.T) {
 	identity := TargetIdentity{Node: "telemetry-1", PrivateAddress: "10.77.0.10", HostID: hostIdentity("10.77.0.10:22")}
-	dispatch := &transportDispatch{transport: nil}
+	dispatch := &transportDispatch{}
 	if _, err := dispatch.Open(context.Background(), identity); contract.Classify(err).Code != contract.Unavailable {
 		t.Fatalf("Open without a durable identity = %v", err)
 	}
@@ -129,7 +130,7 @@ func TestTransportDispatchAppliesFileStepsThroughTheNodeProtocol(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "stack", "collector", "config.yaml")
 	run := func(data string) error {
-		executor, err := (&transportDispatch{transport: local}).OpenOperation(context.Background(), identity, operation, 1, root)
+		executor, err := (&transportDispatch{resolver: staticTransportResolver{transport: local}}).OpenOperation(context.Background(), identity, operation, 1, root)
 		if err != nil {
 			return err
 		}
@@ -153,6 +154,156 @@ func TestTransportDispatchAppliesFileStepsThroughTheNodeProtocol(t *testing.T) {
 	// failure, never a silent overwrite.
 	if err := run("receivers: {changed: true}\n"); contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("changed inputs = %v", err)
+	}
+}
+
+type fakeResolver struct {
+	transports map[string]node.Transport
+	calls      []string
+	err        error
+}
+
+func (r *fakeResolver) TransportFor(_ context.Context, nodeName string) (node.Transport, error) {
+	r.calls = append(r.calls, nodeName)
+	if r.err != nil {
+		return nil, r.err
+	}
+	transport, ok := r.transports[nodeName]
+	if !ok {
+		return nil, errors.New("no transport for " + nodeName)
+	}
+	return transport, nil
+}
+
+func TestTransportDispatchResolvesTheTargetNode(t *testing.T) {
+	stateDir := t.TempDir()
+	telemetryTransport, err := node.NewLocal(stateDir, "telemetry-1", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTransport, err := node.NewLocal(t.TempDir(), "app-1", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &fakeResolver{transports: map[string]node.Transport{
+		"telemetry-1": telemetryTransport, "app-1": otherTransport,
+	}}
+	identity := TargetIdentity{Node: "telemetry-1", PrivateAddress: "10.77.0.10", HostID: hostIdentity("10.77.0.10:22")}
+	root := t.TempDir()
+	executor, err := (&transportDispatch{resolver: resolver}).OpenOperation(context.Background(), identity, contract.OperationID("op_"+strings.Repeat("b", 32)), 1, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, "collector", "config.yaml")
+	if err := executor.MkdirAll(context.Background(), filepath.Dir(path), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.WriteFile(context.Background(), path, []byte("receivers: {}\n"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if len(resolver.calls) != 1 || resolver.calls[0] != "telemetry-1" {
+		t.Fatalf("dispatch did not resolve the target node: %+v", resolver.calls)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("the resolved transport did not execute the step")
+	}
+}
+
+func TestTransportDispatchRejectsAResolverForAnotherIdentity(t *testing.T) {
+	transport, err := node.NewLocal(t.TempDir(), "app-1", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := &fakeResolver{transports: map[string]node.Transport{"telemetry-1": transport}}
+	identity := TargetIdentity{Node: "telemetry-1", PrivateAddress: "10.77.0.10", HostID: hostIdentity("10.77.0.10:22")}
+	_, err = (&transportDispatch{resolver: resolver}).OpenOperation(context.Background(), identity, contract.OperationID("op_"+strings.Repeat("c", 32)), 1, t.TempDir())
+	if contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("an unpinned resolver identity was accepted: %v", err)
+	}
+}
+
+func TestConfigureProductionWithResolverRegistersDurableActions(t *testing.T) {
+	registry := platform.NewRegistry()
+	resolver := &fakeResolver{transports: map[string]node.Transport{"telemetry-1": &noopTransport{name: "telemetry-1"}}}
+	if err := ConfigureProductionWithResolver(registry, fakePool(t), resolver); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{KindInstall, KindAgent, KindCredential} {
+		def, ok := registry.Lookup(kind)
+		if !ok || def.Executor == nil {
+			t.Fatalf("action %s was not registered with a real executor", kind)
+		}
+	}
+	if _, ok := registry.InventoryProvider(InventoryCollection); !ok {
+		t.Fatal("telemetry inventory was not registered")
+	}
+}
+
+func TestCredentialActionIssuesATokenWithoutLeakingIt(t *testing.T) {
+	registry := platform.NewRegistry()
+	if err := Configure(registry, RuntimeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "ingest-tokens.json")
+	target, _ := platform.NewNodeTarget("app-1")
+	raw, _ := json.Marshal(map[string]string{"credentials_file": path})
+	normalized, err := registry.Normalize(KindCredential, target.String(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := normalized.Executor().Execute(context.Background(), platform.Execution{
+		OperationID: contract.OperationID("op_" + strings.Repeat("d", 32)), Attempt: 1,
+		Kind: KindCredential, Target: target.String(), Actor: contract.Actor{Kind: "operator", Subject: "ops"},
+		Input: normalized.Canonical,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("credential file mode = %v, %v", info, err)
+	}
+	credentials, err := readOrEmptyCredentials(path)
+	if err != nil || len(credentials) != 1 || credentials[0].Node != "app-1" {
+		t.Fatalf("credential file content = %+v, %v", credentials, err)
+	}
+	encoded, _ := json.Marshal(result)
+	if strings.Contains(string(encoded), credentials[0].Token) {
+		t.Fatal("action result leaked the ingest token")
+	}
+	if !strings.Contains(string(encoded), "token_sha256") {
+		t.Fatal("action result did not report the token digest")
+	}
+
+	// A second node is added, preserving the first entry.
+	build, _ := platform.NewNodeTarget("build-1")
+	raw, _ = json.Marshal(map[string]string{"credentials_file": path})
+	normalized, err = registry.Normalize(KindCredential, build.String(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := normalized.Executor().Execute(context.Background(), platform.Execution{
+		OperationID: contract.OperationID("op_" + strings.Repeat("e", 32)), Attempt: 1,
+		Kind: KindCredential, Target: build.String(), Actor: contract.Actor{Kind: "operator", Subject: "ops"},
+		Input: normalized.Canonical,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err = readOrEmptyCredentials(path)
+	if err != nil || len(credentials) != 2 {
+		t.Fatalf("credentials after a second issue = %+v, %v", credentials, err)
+	}
+}
+
+func TestCredentialActionRejectsTokenInput(t *testing.T) {
+	registry := platform.NewRegistry()
+	if err := Configure(registry, RuntimeConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	target, _ := platform.NewNodeTarget("app-1")
+	raw := json.RawMessage(`{"credentials_file":"/etc/eregion/ingest.json","token":"plaintext"}`)
+	if _, err := registry.Normalize(KindCredential, target.String(), raw); err == nil {
+		t.Fatal("credential action accepted a token in its input")
 	}
 }
 
