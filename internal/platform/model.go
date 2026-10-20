@@ -42,6 +42,24 @@ type Node struct {
 	LastSeenAt   *time.Time `json:"last_seen_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
+
+	// Enrollment facts. A node that is only "registered" has declared facts and
+	// nothing verified; only an "enrolled" node receives remote work.
+	EnrollmentState     EnrollmentState `json:"enrollment_state"`
+	EnrollmentError     string          `json:"enrollment_error,omitempty"`
+	Transport           string          `json:"transport"`
+	SSHUser             string          `json:"ssh_user,omitempty"`
+	HostKeyFingerprint  string          `json:"host_key_fingerprint,omitempty"`
+	IdentityFingerprint string          `json:"identity_fingerprint,omitempty"`
+	OS                  string          `json:"os,omitempty"`
+	Arch                string          `json:"arch,omitempty"`
+	BuildConcurrency    int             `json:"build_concurrency,omitempty"`
+	WireGuard           *NodeWireGuard  `json:"wireguard,omitempty"`
+	EnrolledAt          *time.Time      `json:"enrolled_at,omitempty"`
+	// LastCheckAt is the freshness of the last authenticated observation.
+	LastCheckAt     *time.Time `json:"last_check_at,omitempty"`
+	LastCheckState  string     `json:"last_check_state,omitempty"`
+	LastCheckDetail string     `json:"last_check_detail,omitempty"`
 }
 
 type App struct {

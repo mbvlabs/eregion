@@ -2,6 +2,7 @@ package noded
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,7 +43,7 @@ func RunTask(config Config) error {
 		return err
 	}
 	nodeEngine.SecretValues = request.Secrets
-	step, err := node.DefaultRegistry().Build(request.Execution, request.Payload)
+	step, err := node.NewStepRegistryWithHost(config.HostSettings()).Build(request.Execution, request.Payload)
 	if err != nil {
 		return err
 	}
@@ -66,4 +67,15 @@ func RunTask(config Config) error {
 // Compact bounds the node journal.
 func Compact(config Config) (int, error) {
 	return engine.Compact(context.Background(), config.StateDir, engine.DefaultRetention())
+}
+
+// Identity creates the node's identity key if needed and returns its public
+// fingerprint. An operator compares it with the fingerprint the control plane
+// shows, out of band, before trusting an enrollment.
+func Identity(config Config) (string, error) {
+	key, err := node.LoadOrCreateIdentity(config.StateDir)
+	if err != nil {
+		return "", err
+	}
+	return node.Fingerprint(key.Public().(ed25519.PublicKey)), nil
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -128,31 +129,43 @@ func (a *app) platformSpecs() []spec {
 func (a *app) platformNodesSpec() spec {
 	return spec{
 		use:  "nodes",
-		meta: platformMeta("Inspect registered nodes and request node checks", "eregion platform nodes list --json"),
+		meta: platformMeta("Inspect nodes, enroll them, and check them", "eregion platform nodes list --json"),
 		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{
 			{
 				use:  "list",
-				meta: platformMeta("List registered nodes and their declared placement facts", "eregion platform nodes list --state ready --json"),
+				meta: platformMeta("List nodes with enrollment state, identity fingerprint, WireGuard state, and check freshness", "eregion platform nodes list --state enrolled --json"),
 				args: platformReadArgs,
 				flags: func(cmd *cobra.Command) {
 					addInventoryFlags(cmd)
 				},
 				run: func(cmd *cobra.Command, _ []string) (result, error) {
-					return a.platformInventoryCollection(cmd, "nodes")
+					raw, err := a.platformReadInventory(cmd, "nodes")
+					if err != nil {
+						return result{}, err
+					}
+					return result{data: raw, plain: platformNodesPlain(raw, time.Now())}, nil
 				},
 			},
 			{
 				use:  "status <node>",
-				meta: platformMeta("Show the current inventory observation for one node", "eregion platform nodes status main --json"),
+				meta: platformMeta("Show one node: enrollment, pinned identity, probed capabilities, WireGuard peers, and when it was last checked", "eregion platform nodes status builder-1 --json"),
 				args: platformOneName("node"),
 				run: func(cmd *cobra.Command, args []string) (result, error) {
-					return a.platformInventoryItem(cmd, "nodes", "node", args[0])
+					raw, err := a.platformReadInventoryWith(cmd, "nodes", url.Values{"node": {args[0]}})
+					if err != nil {
+						return result{}, err
+					}
+					item, err := platformSelectItem(raw, args[0])
+					if err != nil {
+						return result{}, err
+					}
+					return result{data: item, plain: platformNodeDetail(item, time.Now())}, nil
 				},
 			},
 			{
 				use:  "check <node>",
-				meta: platformMutationMeta("Submit a read-only node Docker/buildpacks availability check", "eregion platform nodes check main --idempotency-key ci:node-check-1 --json"),
+				meta: platformMutationMeta("Submit a node check: for an enrolled node, re-verify its identity and re-probe its capabilities", "eregion platform nodes check main --idempotency-key ci:node-check-1 --json"),
 				args: platformOneName("node"),
 				flags: func(cmd *cobra.Command) {
 					addSubmissionFlags(cmd)
@@ -167,7 +180,62 @@ func (a *app) platformNodesSpec() spec {
 			},
 			{
 				use:  "enroll <node>",
-				meta: platformMutationMeta("Register node identity, roles, capabilities, and address facts", "eregion platform nodes enroll main --role application --role builder --capability docker --capability buildpacks --address 10.77.0.1:22 --idempotency-key ci:enroll-main --json"),
+				meta: platformMutationMeta("Enroll a node over pinned SSH: verify its identity, probe it, and configure its roles", "eregion platform nodes enroll builder-1 --role builder --address 203.0.113.10:22 --host-key-file builder-1.pub --idempotency-key ci:enroll-builder-1 --json"),
+				args: platformOneName("node"),
+				flags: func(cmd *cobra.Command) {
+					addSubmissionFlags(cmd)
+					cmd.Flags().StringArray("role", nil, "Node role (repeatable): application, builder, edge, registry, telemetry")
+					cmd.Flags().String("address", "", "SSH host:port the control plane dials")
+					cmd.Flags().String("user", "", "Unprivileged node account (default eregion)")
+					cmd.Flags().String("host-key", "", "Pinned SSH host public key, one authorized_keys line (from ssh-keyscan; verify it out of band)")
+					cmd.Flags().String("host-key-file", "", "File holding the pinned SSH host public key")
+					cmd.Flags().String("host-key-fingerprint", "", "Optional SHA256:... fingerprint that must match the host key")
+					cmd.Flags().String("identity-fingerprint", "", "Optional SHA256:... fingerprint of the node identity key (eregion-node identity); pinned on first verification when omitted")
+					cmd.Flags().Int("build-concurrency", 0, "Builder nodes: concurrent builds (1–16, default 1)")
+					cmd.Flags().String("build-user", "", "Builder nodes: dedicated build account that must already exist")
+					cmd.Flags().String("private-network-endpoint", "", "Join the WireGuard private network; the node's public host:port (UDP)")
+				},
+				run: a.nodesEnroll,
+			},
+			{
+				use:  "retry <node>",
+				meta: platformMutationMeta("Re-run the recorded enrollment of a pending or failed node; completed steps are not repeated", "eregion platform nodes retry builder-1 --idempotency-key ci:retry-builder-1 --json"),
+				args: platformOneName("node"),
+				flags: func(cmd *cobra.Command) {
+					addSubmissionFlags(cmd)
+				},
+				run: func(cmd *cobra.Command, args []string) (result, error) {
+					target, err := platform.NewNodeTarget(args[0])
+					if err != nil {
+						return result{}, err
+					}
+					return a.submitPlatform(cmd, platform.KindNodeEnroll, target.String(), platform.NodeEnrollInput{Retry: true})
+				},
+			},
+			{
+				use:  "reconcile <node>",
+				meta: platformMutationMeta("Converge a node's role configuration and WireGuard peers; rerunning changes nothing when it already matches", "eregion platform nodes reconcile builder-1 --idempotency-key ci:reconcile-builder-1 --json"),
+				args: platformOneName("node"),
+				flags: func(cmd *cobra.Command) {
+					addSubmissionFlags(cmd)
+					cmd.Flags().Bool("direct", false, "Use the direct SSH address instead of the tunnel, to repair a broken tunnel")
+				},
+				run: func(cmd *cobra.Command, args []string) (result, error) {
+					target, err := platform.NewNodeTarget(args[0])
+					if err != nil {
+						return result{}, err
+					}
+					direct, _ := cmd.Flags().GetBool("direct")
+					input := platform.NodeReconcileInput{}
+					if direct {
+						input.Via = "direct"
+					}
+					return a.submitPlatform(cmd, platform.KindNodeReconcile, target.String(), input)
+				},
+			},
+			{
+				use:  "register <node>",
+				meta: platformMutationMeta("Record declared node roles and capabilities without verifying anything (development and the local node only)", "eregion platform nodes register main --role application --role builder --capability docker --capability buildpacks --address 10.77.0.1:22 --idempotency-key ci:register-main --json"),
 				args: platformOneName("node"),
 				flags: func(cmd *cobra.Command) {
 					addSubmissionFlags(cmd)
@@ -186,6 +254,162 @@ func (a *app) platformNodesSpec() spec {
 			},
 		},
 	}
+}
+
+// nodesEnroll submits platform.node.enroll. The pinned host key is required: an
+// address alone is never enough to enroll a node.
+func (a *app) nodesEnroll(cmd *cobra.Command, args []string) (result, error) {
+	target, err := platform.NewNodeTarget(args[0])
+	if err != nil {
+		return result{}, err
+	}
+	roles, _ := cmd.Flags().GetStringArray("role")
+	address, _ := cmd.Flags().GetString("address")
+	user, _ := cmd.Flags().GetString("user")
+	hostKey, _ := cmd.Flags().GetString("host-key")
+	hostKeyFile, _ := cmd.Flags().GetString("host-key-file")
+	if hostKeyFile != "" {
+		if hostKey != "" {
+			return result{}, contract.NewFault(contract.Usage, "use either --host-key or --host-key-file", "Supply the pinned host key once.")
+		}
+		raw, err := os.ReadFile(hostKeyFile)
+		if err != nil {
+			return result{}, contract.NewFault(contract.ValidationFailed, "could not read --host-key-file", "Check the path; it must contain one public key line.")
+		}
+		hostKey = string(raw)
+	}
+	if hostKey == "" {
+		return result{}, contract.NewFault(contract.InputRequired, "--host-key or --host-key-file is required", "Pin the node's SSH host public key (for example from ssh-keyscan after verifying it out of band); enrollment never trusts a key on first use.")
+	}
+	input := platform.NodeEnrollInput{Roles: roles, Address: address, User: user, HostKey: hostKey}
+	input.HostKeyFingerprint, _ = cmd.Flags().GetString("host-key-fingerprint")
+	input.IdentityFingerprint, _ = cmd.Flags().GetString("identity-fingerprint")
+	input.BuildConcurrency, _ = cmd.Flags().GetInt("build-concurrency")
+	input.BuildUser, _ = cmd.Flags().GetString("build-user")
+	if endpoint, _ := cmd.Flags().GetString("private-network-endpoint"); endpoint != "" {
+		input.PrivateNetwork = &platform.PrivateNetworkInput{Endpoint: endpoint}
+	}
+	return a.submitPlatform(cmd, platform.KindNodeEnroll, target.String(), input)
+}
+
+// platformNodesPlain renders the node inventory with the facts an operator
+// needs to trust it: enrollment state, identity, tunnel, and how fresh the last
+// authenticated observation is.
+func platformNodesPlain(raw json.RawMessage, now time.Time) string {
+	var page struct {
+		Items []platform.Node `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil || len(page.Items) == 0 {
+		return "(no nodes)\n"
+	}
+	rows := [][]string{{"NAME", "ROLES", "ENROLLMENT", "STATUS", "IDENTITY", "WIREGUARD", "CHECKED"}}
+	for _, n := range page.Items {
+		identity := n.IdentityFingerprint
+		if identity == "" {
+			identity = "-"
+		}
+		wg := "-"
+		if n.WireGuard != nil {
+			wg = string(n.WireGuard.State)
+			if n.WireGuard.Address != "" {
+				wg += " " + n.WireGuard.Address
+			}
+		}
+		rows = append(rows, []string{n.Name, strings.Join(n.Roles, ","), string(n.EnrollmentState), string(n.Status), identity, wg, platformFreshness(n.LastCheckAt, n.LastCheckState, now)})
+	}
+	return nodeAlignRows(rows)
+}
+
+// platformFreshness says when a node was last checked and whether that is
+// recent. A node that was never checked is stated, not guessed.
+func platformFreshness(at *time.Time, state string, now time.Time) string {
+	if at == nil {
+		return "never checked"
+	}
+	age := now.Sub(*at).Round(time.Second)
+	if age < 0 {
+		age = 0
+	}
+	label := fmt.Sprintf("%s %s ago", state, age)
+	if age > 15*time.Minute {
+		label += " (stale)"
+	}
+	return label
+}
+
+func platformNodeDetail(item json.RawMessage, now time.Time) string {
+	var n platform.Node
+	if err := json.Unmarshal(item, &n); err != nil {
+		return platformPretty(item)
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, "Node %s\n", n.Name)
+	fmt.Fprintf(&out, "  roles:          %s\n", strings.Join(n.Roles, ","))
+	fmt.Fprintf(&out, "  capabilities:   %s\n", strings.Join(n.Capabilities, ","))
+	fmt.Fprintf(&out, "  enrollment:     %s\n", n.EnrollmentState)
+	if n.EnrollmentError != "" {
+		fmt.Fprintf(&out, "  error:          %s\n", n.EnrollmentError)
+	}
+	fmt.Fprintf(&out, "  transport:      %s", n.Transport)
+	if n.Address != "" {
+		fmt.Fprintf(&out, " %s@%s", n.SSHUser, n.Address)
+	}
+	out.WriteString("\n")
+	if n.HostKeyFingerprint != "" {
+		fmt.Fprintf(&out, "  host key:       %s (pinned)\n", n.HostKeyFingerprint)
+	}
+	if n.IdentityFingerprint != "" {
+		fmt.Fprintf(&out, "  identity:       %s (node-generated, pinned)\n", n.IdentityFingerprint)
+	}
+	if n.OS != "" {
+		fmt.Fprintf(&out, "  host:           %s %s\n", n.OS, n.Arch)
+	}
+	if n.BuildConcurrency > 0 && nodeHasRole(n.Roles, platform.RoleBuilder) {
+		fmt.Fprintf(&out, "  build slots:    %d\n", n.BuildConcurrency)
+	}
+	if n.WireGuard != nil {
+		fmt.Fprintf(&out, "  wireguard:      %s %s endpoint=%s\n", n.WireGuard.State, n.WireGuard.Address, n.WireGuard.Endpoint)
+		if n.WireGuard.PublicKey != "" {
+			fmt.Fprintf(&out, "  wg public key:  %s\n", n.WireGuard.PublicKey)
+		}
+	}
+	fmt.Fprintf(&out, "  last check:     %s\n", platformFreshness(n.LastCheckAt, n.LastCheckState, now))
+	if n.LastCheckDetail != "" {
+		fmt.Fprintf(&out, "  detail:         %s\n", n.LastCheckDetail)
+	}
+	return out.String()
+}
+
+func nodeHasRole(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func nodeAlignRows(rows [][]string) string {
+	widths := make([]int, len(rows[0]))
+	for _, row := range rows {
+		for i, cell := range row {
+			if len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+	var out strings.Builder
+	for _, row := range rows {
+		for i, cell := range row {
+			if i == len(row)-1 {
+				out.WriteString(cell)
+			} else {
+				fmt.Fprintf(&out, "%-*s", widths[i]+2, cell)
+			}
+		}
+		out.WriteString("\n")
+	}
+	return out.String()
 }
 
 func (a *app) platformAppsSpec() spec {

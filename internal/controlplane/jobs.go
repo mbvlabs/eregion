@@ -53,6 +53,16 @@ func (reconcileArgs) Kind() string { return "operation_reconcile" }
 type Runtime struct {
 	Service *Service
 	Jobs    *river.Client[pgx.Tx]
+	// Nodes resolves the transport of any node. Extensions that dispatch node
+	// work (telemetry, resources) take it instead of a single transport.
+	Nodes NodeTransports
+}
+
+// Close releases the per-node tunnels. Call it after the workers stopped.
+func (r *Runtime) Close() {
+	if r != nil && r.Service != nil && r.Service.resolver != nil {
+		r.Service.resolver.Close()
+	}
 }
 
 type WorkerConfig struct {
@@ -71,6 +81,9 @@ type WorkerConfig struct {
 	// SourceRoots is the directory-build allowlist. Empty uses
 	// EREGION_BUILD_SOURCE_ROOTS (or /srv/eregion/sources).
 	SourceRoots []string
+	// Nodes configures how enrolled nodes are reached (SSH identity, WireGuard
+	// key directory). The zero value serves only the fallback Transport.
+	Nodes ResolverConfig
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
@@ -90,6 +103,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		}
 		service.transport = local
 	}
+	service.resolver = NewNodeResolver(pool, config.Nodes, func() node.Transport { return service.transport })
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &platformWorker{service: service})
@@ -135,7 +149,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		}
 		return inserted.Job.ID, nil
 	}
-	return &Runtime{Service: service, Jobs: client}, nil
+	return &Runtime{Service: service, Jobs: client, Nodes: service.resolver}, nil
 }
 
 type testWorker struct {

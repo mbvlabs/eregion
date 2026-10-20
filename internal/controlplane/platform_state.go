@@ -113,6 +113,10 @@ func platformAcceptedMessage(kind string) string {
 		return "Node placement facts accepted durably. This does not install or verify host state."
 	case platform.KindNodeCheck:
 		return "Node check accepted durably."
+	case platform.KindNodeEnroll:
+		return "Node enrollment accepted durably; the host key is pinned, but nothing is trusted until the node proves its identity."
+	case platform.KindNodeReconcile:
+		return "Node reconciliation accepted durably."
 	default:
 		return "Platform action accepted durably."
 	}
@@ -129,12 +133,19 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return platformWriteError(err, "application name already exists")
 		}
 	case *platform.NodeRegisterInput:
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities,address,status)
+		// Registration records declared facts. It can never overwrite a node that
+		// is enrolling or enrolled: verified facts are not replaced by a claim.
+		tag, err := tx.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities,address,status)
             VALUES($1,$2,$3,$4,'registered')
             ON CONFLICT (name) DO UPDATE SET roles=EXCLUDED.roles, capabilities=EXCLUDED.capabilities,
-                address=EXCLUDED.address, updated_at=clock_timestamp()`,
-			input.Name, input.Roles, input.Capabilities, input.Address); err != nil {
+                address=EXCLUDED.address, updated_at=clock_timestamp()
+                WHERE eregion_platform_nodes.enrollment_state='registered'`,
+			input.Name, input.Roles, input.Capabilities, input.Address)
+		if err != nil {
 			return platformWriteError(err, "node registration conflicts")
+		}
+		if tag.RowsAffected() == 0 {
+			return contract.NewFault(contract.Conflict, "node is enrolling or enrolled; declared facts cannot overwrite verified ones", "Use platform nodes enroll or platform nodes retry to change an enrolled node.")
 		}
 	case *platform.EnvironmentCreateInput:
 		app, err := appByNameTx(ctx, tx, input.App)
@@ -288,6 +299,12 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if _, err := nodeByNameTx(ctx, tx, input.Node); err != nil {
 			return err
 		}
+	case *platform.NodeEnrollInput:
+		return s.prepareNodeEnroll(ctx, tx, id, input)
+	case *platform.NodeReconcileInput:
+		if _, err := nodeByNameTx(ctx, tx, input.Node); err != nil {
+			return err
+		}
 	default:
 		// Extension actions own their domain rows. The operation row, idempotency,
 		// River job, event history, and target lock remain shared.
@@ -358,32 +375,6 @@ func (s *Service) transportIdentity() (string, bool) {
 	}
 	identity := strings.TrimSpace(provider.NodeIdentity())
 	return identity, identity != ""
-}
-
-// checkPlacement enforces declared roles/capabilities and the transport's
-// authenticated node identity. A hostname is never authorization.
-func (s *Service) checkPlacement(node platform.Node, role, capability string) error {
-	return s.checkPlacementIdentity(node, role, capability)
-}
-
-func (s *Service) checkPlacementIdentity(node platform.Node, role, capability string) error {
-	if !contains(node.Roles, role) {
-		return contract.NewFault(contract.PreconditionFailed, "node lacks the required role", "Register the node with the "+role+" role and reconcile host configuration first.")
-	}
-	if capability != "" && !contains(node.Capabilities, capability) {
-		return contract.NewFault(contract.PreconditionFailed, "node lacks the required capability", "Install or enable "+capability+" on the node, then register the capability.")
-	}
-	identity, known := s.transportIdentity()
-	if !known {
-		if s.transport != nil {
-			return contract.NewFault(contract.PreconditionFailed, "node transport identity is not pinned", "Configure the transport's expected node name so placement is verified, not inferred from a hostname.")
-		}
-		return nil // Insert-only API process: the worker rechecks before dispatch.
-	}
-	if identity != node.Name {
-		return contract.NewFault(contract.PreconditionFailed, "environment is pinned to another node", fmt.Sprintf("The authenticated transport identifies %q, but this work targets %q. Hostnames are not authorization.", identity, node.Name))
-	}
-	return nil
 }
 
 func (s *Service) checkPlacementByTx(ctx context.Context, tx pgx.Tx, nodeName, role, capability string) error {
@@ -538,15 +529,14 @@ func (s *Service) inventorySummary(ctx context.Context) (map[string]int64, error
 
 func (s *Service) inventoryNodes(ctx context.Context, query platform.InventoryQuery) ([]platform.Node, error) {
 	items := []platform.Node{}
-	rows, err := s.pool.Query(ctx, `SELECT name,roles,capabilities,address,status,last_seen_at,created_at,updated_at
-        FROM eregion_platform_nodes ORDER BY name LIMIT $1`, query.Limit)
+	rows, err := s.pool.Query(ctx, nodeSelect+` WHERE ($2='' OR name=$2) AND ($3='' OR status=$3 OR enrollment_state=$3) ORDER BY name LIMIT $1`, query.Limit, query.Node, query.State)
 	if err != nil {
 		return nil, unavailable()
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var node platform.Node
-		if err := rows.Scan(&node.Name, &node.Roles, &node.Capabilities, &node.Address, &node.Status, &node.LastSeenAt, &node.CreatedAt, &node.UpdatedAt); err != nil {
+		node, err := scanNode(rows)
+		if err != nil {
 			return nil, unavailable()
 		}
 		items = append(items, node)
@@ -873,17 +863,7 @@ func appByNameTx(ctx context.Context, tx pgx.Tx, name string) (platform.App, err
 }
 
 func nodeByNameTx(ctx context.Context, tx pgx.Tx, name string) (platform.Node, error) {
-	var node platform.Node
-	err := tx.QueryRow(ctx, `SELECT name,roles,capabilities,address,status,last_seen_at,created_at,updated_at
-        FROM eregion_platform_nodes WHERE name=$1`, name).
-		Scan(&node.Name, &node.Roles, &node.Capabilities, &node.Address, &node.Status, &node.LastSeenAt, &node.CreatedAt, &node.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return node, contract.NewFault(contract.NotFound, "node not found", "Register the node's placement facts before placing work on it.")
-	}
-	if err != nil {
-		return node, unavailable()
-	}
-	return node, nil
+	return loadNode(ctx, tx, name)
 }
 
 func environmentByNameTx(ctx context.Context, tx pgx.Tx, app, name string) (platform.Environment, error) {
@@ -963,6 +943,18 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Summary = "Observe runtime availability on node " + input.Node + "."
 	case *platform.NodeRegisterInput:
 		preview.Summary = "Record placement facts for node " + input.Name + "; this does not install or verify host state."
+	case *platform.NodeEnrollInput:
+		preview.Steps = []string{"pin SSH host key", "verify node identity", "probe host capabilities", "configure role directories", "record enrollment"}
+		preview.Summary = "Enroll node " + input.Node + " over pinned SSH; it receives work only after it proves its identity and the probe satisfies its roles."
+		if input.Retry {
+			preview.Summary = "Re-run the recorded enrollment of node " + input.Node + "; completed steps are not repeated."
+		}
+		if input.PrivateNetwork != nil {
+			preview.Warnings = append(preview.Warnings, "Private network keys are generated on the node and reconciled by platform.node.reconcile; enrollment itself does not change WireGuard.")
+		}
+	case *platform.NodeReconcileInput:
+		preview.Steps = []string{"converge role directories", "generate node WireGuard key", "render peer configuration", "apply peers"}
+		preview.Summary = "Converge host configuration and WireGuard peers on node " + input.Node + "; rerunning changes nothing when the node already matches."
 	default:
 		if preview.Summary == "" {
 			preview.Summary = "Execute registered platform action " + normalized.Kind + "."
@@ -1035,15 +1027,5 @@ func (s *Service) releaseByID(ctx context.Context, id platform.ReleaseID) (platf
 }
 
 func (s *Service) node(ctx context.Context, name string) (platform.Node, error) {
-	var node platform.Node
-	err := s.pool.QueryRow(ctx, `SELECT name,roles,capabilities,address,status,last_seen_at,created_at,updated_at
-        FROM eregion_platform_nodes WHERE name=$1`, name).
-		Scan(&node.Name, &node.Roles, &node.Capabilities, &node.Address, &node.Status, &node.LastSeenAt, &node.CreatedAt, &node.UpdatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return node, contract.NewFault(contract.NotFound, "node not found", "Register the node's placement facts before placing work on it.")
-	}
-	if err != nil {
-		return node, unavailable()
-	}
-	return node, nil
+	return loadNode(ctx, s.pool, name)
 }

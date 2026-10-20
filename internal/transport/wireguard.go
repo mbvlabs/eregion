@@ -153,6 +153,10 @@ func ReadWireGuardKey(path string) (WireGuardKey, error) {
 	return key, nil
 }
 
+// Encode returns the wg base64 form for writing the key to its protected file.
+// It is the only way to persist a key; never log or return the result.
+func (k WireGuardKey) Encode() string { return base64.StdEncoding.EncodeToString(k.raw[:]) }
+
 // IsZero reports an unset key.
 func (k WireGuardKey) IsZero() bool { return !k.set }
 

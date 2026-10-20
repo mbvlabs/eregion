@@ -20,7 +20,7 @@ func TestMigration005MatchesVaultSchema(t *testing.T) {
 			t.Fatalf("migration %d is out of order at index %d", m.version, index)
 		}
 	}
-	if requiredVersion() != 6 {
+	if requiredVersion() != 7 {
 		t.Fatalf("required schema version = %d", requiredVersion())
 	}
 }

@@ -23,7 +23,7 @@ func main() {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: eregion-node <serve|task|compact|version>")
+		fmt.Fprintln(stderr, "usage: eregion-node <serve|task|compact|identity|version>")
 		return 2
 	}
 	switch args[0] {
@@ -33,6 +33,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return report(stderr, taskCommand(args[1:]))
 	case "compact":
 		return report(stderr, compactCommand(args[1:], stdout))
+	case "identity":
+		return report(stderr, identityCommand(args[1:], stdout))
 	case "version":
 		fmt.Fprintln(stdout, "eregion-node dev")
 		return 0
@@ -94,5 +96,24 @@ func compactCommand(args []string, stdout io.Writer) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "removed %d journal tasks\n", removed)
+	return nil
+}
+
+func identityCommand(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("identity", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	path := flags.String("config", "", "node configuration file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	config, err := noded.LoadConfig(*path)
+	if err != nil {
+		return err
+	}
+	fingerprint, err := noded.Identity(config)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, fingerprint)
 	return nil
 }
