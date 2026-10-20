@@ -101,6 +101,9 @@ type NodeEnrollInput struct {
 type PrivateNetworkInput struct {
 	// Endpoint is the node's public WireGuard host:port (UDP).
 	Endpoint string `json:"endpoint"`
+	// SSHPort is the node's SSH port on its tunnel address; it defaults to the
+	// port of the enrollment address.
+	SSHPort int `json:"ssh_port,omitempty"`
 }
 
 func (in *NodeEnrollInput) Target() Target { return Target{Kind: TargetNode, Node: in.Node} }
@@ -186,6 +189,9 @@ func normalizeNodeEnroll(target Target, raw json.RawMessage) (ActionInput, error
 		return nil, invalid("build user", "Use a plain account name.")
 	}
 	if input.PrivateNetwork != nil {
+		if input.PrivateNetwork.SSHPort < 0 || input.PrivateNetwork.SSHPort > 65535 {
+			return nil, invalid("private network ssh port", "Use a port from 1 to 65535, or omit it.")
+		}
 		if endpointHost, endpointPort, err := net.SplitHostPort(input.PrivateNetwork.Endpoint); err != nil || endpointHost == "" || endpointPort == "" || strings.ContainsAny(input.PrivateNetwork.Endpoint, " \t\r\n/@") {
 			return nil, invalid("private network endpoint", "Use the node's public WireGuard host:port (UDP).")
 		}

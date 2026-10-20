@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -150,7 +151,7 @@ func (r *NodeResolver) TransportFor(ctx context.Context, nodeName string) (node.
 // ignoring any tunnel. Enrollment and tunnel repair use it, so a broken tunnel
 // cannot lock the control plane out of the node. The caller closes it.
 func (r *NodeResolver) Direct(rec nodeConn) (node.Transport, func(), error) {
-	return r.build(rec, false)
+	return r.build(rec, true)
 }
 
 // fallbackFor returns the worker's own transport when it authenticates as the
@@ -200,7 +201,7 @@ func (r *NodeResolver) cached(rec nodeConn, direct bool) (node.Transport, error)
 }
 
 func connectionKey(rec nodeConn, tunnel bool) string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{rec.SSHAddress, rec.SSHUser, rec.HostKey, rec.WGAddress, rec.WGEndpoint, rec.WGPublicKey, rec.ControlWGPublicKey, fmt.Sprint(tunnel)}, "\x00")))
+	sum := sha256.Sum256([]byte(strings.Join([]string{rec.SSHAddress, rec.SSHUser, rec.HostKey, rec.WGAddress, rec.WGEndpoint, strconv.Itoa(rec.WGSSHPort), rec.WGPublicKey, rec.ControlWGPublicKey, fmt.Sprint(tunnel)}, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -236,6 +237,9 @@ func (r *NodeResolver) build(rec nodeConn, direct bool) (node.Transport, func(),
 		_, port, err := net.SplitHostPort(rec.SSHAddress)
 		if err != nil {
 			return nil, noop, contract.NewFault(contract.PreconditionFailed, "node SSH address is invalid", "Re-run the enrollment.")
+		}
+		if rec.WGSSHPort != 0 {
+			port = strconv.Itoa(rec.WGSSHPort)
 		}
 		address = net.JoinHostPort(rec.WGAddress, port)
 		dialer, err := r.tunnel(rec)

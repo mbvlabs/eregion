@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"sort"
 	"strconv"
@@ -85,16 +84,16 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.
 			unchanged := existing.SSHAddress == in.Address && existing.SSHUser == in.User &&
 				joinSorted(existing.Roles) == joinSorted(in.Roles) && existing.BuildConcurrency == in.BuildConcurrency &&
 				existing.BuildUser == in.BuildUser && existing.WGEnabled == (in.PrivateNetwork != nil) &&
-				(in.PrivateNetwork == nil || existing.WGEndpoint == in.PrivateNetwork.Endpoint)
+				(in.PrivateNetwork == nil || (existing.WGEndpoint == in.PrivateNetwork.Endpoint && existing.WGSSHPort == in.PrivateNetwork.SSHPort))
 			if unchanged {
 				state = platform.EnrollmentEnrolled
 			}
 		}
 		wgAddress = existing.WGAddress
 	}
-	wgEndpoint := ""
+	wgEndpoint, wgSSHPort := "", 0
 	if in.PrivateNetwork != nil {
-		wgEndpoint = in.PrivateNetwork.Endpoint
+		wgEndpoint, wgSSHPort = in.PrivateNetwork.Endpoint, in.PrivateNetwork.SSHPort
 		if wgAddress == "" {
 			if wgAddress, err = s.allocateWireGuardAddress(ctx, tx); err != nil {
 				return err
@@ -103,17 +102,17 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO eregion_platform_nodes
         (name,roles,capabilities,address,status,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key,
-         ssh_host_key_fingerprint,expected_identity_fingerprint,build_concurrency,build_user,wg_enabled,wg_address,wg_endpoint,enroll_operation_id)
-        VALUES($1,$2,$3,$4,'registered',$5,'ssh',$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ssh_host_key_fingerprint,expected_identity_fingerprint,build_concurrency,build_user,wg_enabled,wg_address,wg_endpoint,wg_ssh_port,enroll_operation_id)
+        VALUES($1,$2,$3,$4,'registered',$5,'ssh',$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
         ON CONFLICT (name) DO UPDATE SET roles=EXCLUDED.roles, address=EXCLUDED.address, enrollment_state=EXCLUDED.enrollment_state,
             enrollment_error='', transport='ssh', ssh_address=EXCLUDED.ssh_address, ssh_user=EXCLUDED.ssh_user,
             ssh_host_key=EXCLUDED.ssh_host_key, ssh_host_key_fingerprint=EXCLUDED.ssh_host_key_fingerprint,
             expected_identity_fingerprint=CASE WHEN EXCLUDED.expected_identity_fingerprint<>'' THEN EXCLUDED.expected_identity_fingerprint ELSE eregion_platform_nodes.expected_identity_fingerprint END,
             build_concurrency=EXCLUDED.build_concurrency, build_user=EXCLUDED.build_user, wg_enabled=EXCLUDED.wg_enabled,
-            wg_address=EXCLUDED.wg_address, wg_endpoint=EXCLUDED.wg_endpoint, enroll_operation_id=EXCLUDED.enroll_operation_id,
+            wg_address=EXCLUDED.wg_address, wg_endpoint=EXCLUDED.wg_endpoint, wg_ssh_port=EXCLUDED.wg_ssh_port, enroll_operation_id=EXCLUDED.enroll_operation_id,
             updated_at=clock_timestamp()`,
 		in.Node, in.Roles, capabilities, in.Address, string(state), in.User, in.HostKey, in.HostKeyFingerprint,
-		in.IdentityFingerprint, in.BuildConcurrency, in.BuildUser, in.PrivateNetwork != nil, wgAddress, wgEndpoint, string(id))
+		in.IdentityFingerprint, in.BuildConcurrency, in.BuildUser, in.PrivateNetwork != nil, wgAddress, wgEndpoint, wgSSHPort, string(id))
 	if err != nil {
 		return platformWriteError(err, "node enrollment conflicts with another node")
 	}
@@ -447,7 +446,7 @@ func (w *platformWorker) runNodeReconcile(ctx context.Context, id contract.Opera
 	payload := node.WireGuardPayload{
 		Step: "node-wireguard-02-v1", Action: "apply",
 		Address:    fmt.Sprintf("%s/%d", rec.WGAddress, prefix.Bits()),
-		ListenPort: wireGuardPortOf(rec.WGEndpoint),
+		ListenPort: wireGuardListenPort, // the endpoint may be a NAT or published port; the node always listens here
 		Peers:      peers,
 	}
 	var applied node.WireGuardResult
@@ -485,18 +484,6 @@ func (w *platformWorker) finishReconcile(ctx context.Context, id contract.Operat
 		return w.settle(ctx, id, attempt, err)
 	}
 	return nil
-}
-
-func wireGuardPortOf(endpoint string) int {
-	_, port, err := net.SplitHostPort(endpoint)
-	if err != nil {
-		return wireGuardListenPort
-	}
-	value, err := strconv.Atoi(port)
-	if err != nil || value < 1 || value > 65535 {
-		return wireGuardListenPort
-	}
-	return value
 }
 
 // wireGuardPeers is the desired peer set of one node: the control plane (which

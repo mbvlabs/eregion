@@ -73,6 +73,7 @@ type nodeConn struct {
 	WGEnabled          bool
 	WGAddress          string
 	WGEndpoint         string
+	WGSSHPort          int
 	WGPublicKey        string
 	ControlWGPublicKey string
 	WGState            platform.WireGuardState
@@ -83,11 +84,11 @@ func loadNodeConn(ctx context.Context, q rowQuerier, name string) (nodeConn, err
 	var wgState string
 	err := q.QueryRow(ctx, `SELECT name,roles,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key,
         expected_identity_fingerprint,identity_public_key,identity_fingerprint,build_concurrency,build_user,
-        wg_enabled,wg_address,wg_endpoint,wg_public_key,control_wg_public_key,wg_state
+        wg_enabled,wg_address,wg_endpoint,wg_ssh_port,wg_public_key,control_wg_public_key,wg_state
         FROM eregion_platform_nodes WHERE name=$1`, name).
 		Scan(&rec.Name, &rec.Roles, &rec.Enrollment, &rec.Transport, &rec.SSHAddress, &rec.SSHUser, &rec.HostKey,
 			&rec.ExpectedIdentityFP, &rec.IdentityKey, &rec.IdentityFP, &rec.BuildConcurrency, &rec.BuildUser,
-			&rec.WGEnabled, &rec.WGAddress, &rec.WGEndpoint, &rec.WGPublicKey, &rec.ControlWGPublicKey, &wgState)
+			&rec.WGEnabled, &rec.WGAddress, &rec.WGEndpoint, &rec.WGSSHPort, &rec.WGPublicKey, &rec.ControlWGPublicKey, &wgState)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return rec, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
 	}
@@ -148,6 +149,12 @@ func nodePlacement(n platform.Node, role, capability string) error {
 	case platform.EnrollmentPending, platform.EnrollmentFailed:
 		return placementViolation(ReasonNotEnrolled, n.Name, fmt.Sprintf("node %q is not enrolled (%s)", n.Name, n.EnrollmentState),
 			"Finish enrollment with platform nodes enroll or platform nodes retry, then submit the work again.", nil)
+	}
+	if n.EnrollmentState == platform.EnrollmentEnrolled && n.LastCheckState == ReasonIdentityMismatch {
+		// The last authenticated check found a different identity key on this
+		// host. It is quarantined until a check verifies the pinned identity again.
+		return placementViolation(ReasonIdentityMismatch, n.Name, fmt.Sprintf("node %q failed its last identity check and is quarantined", n.Name),
+			"Investigate the host; the node receives work again only after platform nodes check verifies its pinned identity.", nil)
 	}
 	if !contains(n.Roles, role) {
 		if role == platform.RoleBuilder && contains(n.Roles, platform.RoleApplication) {

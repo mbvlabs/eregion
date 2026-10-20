@@ -51,6 +51,10 @@ func TestNodePlacementRules(t *testing.T) {
 	// A role without the probed capability is not enough.
 	noPack := testNode("build-2", platform.EnrollmentEnrolled, []string{platform.RoleBuilder}, platform.CapabilityDocker)
 	wantViolation(t, nodePlacement(noPack, platform.RoleBuilder, platform.CapabilityBuildpacks), ReasonCapabilityMissing)
+	// A node whose last check found another identity key is quarantined.
+	swapped := testNode("app-9", platform.EnrollmentEnrolled, []string{platform.RoleApplication}, platform.CapabilityDocker)
+	swapped.LastCheckState = ReasonIdentityMismatch
+	wantViolation(t, nodePlacement(swapped, platform.RoleApplication, platform.CapabilityDocker), ReasonIdentityMismatch)
 	// An unfinished or failed enrollment receives nothing.
 	for _, state := range []platform.EnrollmentState{platform.EnrollmentPending, platform.EnrollmentFailed} {
 		wantViolation(t, nodePlacement(testNode("new", state, []string{platform.RoleApplication}, platform.CapabilityDocker), platform.RoleApplication, platform.CapabilityDocker), ReasonNotEnrolled)

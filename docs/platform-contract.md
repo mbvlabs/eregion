@@ -83,6 +83,8 @@ when measured. A client detaching never cancels the operation.
 | `platform.app.create` | `platform` | `platform` |
 | `platform.node.register` | `platform` | `platform` |
 | `platform.node.check` | `node/<node>` | `node/main` |
+| `platform.node.enroll` | `node/<node>` | `node/builder-1` |
+| `platform.node.reconcile` | `node/<node>` | `node/builder-1` |
 | `platform.environment.create` | `app/<app>` | `app/api` |
 | `platform.release.create` | `env/<app>/<env>` | `env/api/production` |
 | `platform.deploy` | `env/<app>/<env>` | `env/api/production` |
@@ -120,6 +122,54 @@ change host state; bootstrap owns that. Roles are
 only be placed on a node that has the `application` role and `docker` capability,
 and a build only on a node with `builder` + `buildpacks` (or Docker for an image
 release). A hostname is never authorization.
+
+A registered node is declared, not verified. It is served only by the worker's
+own configured transport, and only when that transport authenticates as exactly
+that node. Remote nodes are enrolled (below); registration can never overwrite an
+enrolling or enrolled node (`conflict`).
+
+### `platform.node.enroll`
+
+```json
+{
+  "roles": ["builder"],
+  "address": "203.0.113.10:22",
+  "user": "eregion",
+  "host_key": "ssh-ed25519 AAAA...",
+  "host_key_fingerprint": "SHA256:...",
+  "identity_fingerprint": "SHA256:...",
+  "build_concurrency": 2,
+  "build_user": "eregion-build",
+  "private_network": { "endpoint": "203.0.113.10:51820", "ssh_port": 22 }
+}
+```
+
+`{"retry": true}` re-runs the recorded enrollment and accepts no other field.
+`roles`, `address`, and `host_key` are required otherwise. The canonical input is
+public material only. Enrollment is one durable operation with these steps, each a
+Check/Apply node step: `node-identity-01-v1` (the node signs a challenge with a
+key it generated; the key is pinned on first verification or checked against
+`identity_fingerprint`), `node-probe-01-v1` (distribution, architecture, docker,
+pack, wg), `node-hostcfg-01-v1` (role directories). The pinned `host_key` is the
+SSH trust anchor; there is no trust on first use. The node ends `enrolled` with
+its probed capabilities, or `failed` with `enrollment_error`; a transient failure
+leaves it `pending` and River retries. Allowed role sets for an enrolled node:
+application, edge, application+edge, builder, registry, builder+registry,
+telemetry. `control-plane` is never enrollable. Only an `enrolled` node receives
+remote work; a refusal is a `precondition_failed` fault whose message starts
+`placement_violation:` with `details.reason` in `not_enrolled`, `role_missing`,
+`capability_missing`, `builder_required`, `identity_mismatch`,
+`transport_unpinned`, `registry_scope`, or `build_capacity`, and a
+`placement_violation` operation event.
+
+### `platform.node.reconcile`
+
+`{}` or `{"via":"direct"}`. Converges the role directories and, for a node with
+a private network, generates the WireGuard key on the node, stores the public
+keys and allowed IPs in PostgreSQL, and renders (and, with a privileged helper,
+applies) the peer set: the control plane plus every other enrolled node with a
+key and endpoint. Rerunning it changes nothing when the node already matches.
+`via: direct` forces the direct SSH address, which repairs a broken tunnel.
 
 ### `platform.environment.create`
 
@@ -183,8 +233,14 @@ release. Rollback is a normal deploy of that release and keeps change history.
 
 ### `platform.node.check`
 
-`{}` — runs a read-only Docker (and, when present, `pack`) availability check on
-the node and reports observations in operation events.
+`{}` — for a registered node, runs a read-only Docker (and, when present, `pack`)
+availability check through the worker's own transport. For an enrolled node it
+re-verifies the pinned identity key, re-probes the host, and re-checks that the
+declared roles are still backed by probed capabilities. Either way it records
+`last_check_at`, `last_check_state`, and the detail, so clients can show
+freshness. A host that answers with a different identity key is quarantined: its
+state is `identity_mismatch` and it receives no work until a check verifies the
+pinned identity again.
 
 ## 4. Domain state and guarantees
 
@@ -325,6 +381,7 @@ submission path.
 - Revisioned secret storage and injection. Use non-secret `env` for now.
 - Docker registry credentials, remote source upload, build caches, and release
   commands. A remote directory/git build requires the source on that node.
-- Host bootstrap, package installation, WireGuard enrollment, and telemetry
-  placement. Node registration records facts; other agents own those effects.
+- Host bootstrap, package installation, and telemetry placement. Node
+  enrollment provisions nothing on the host beyond role directories; see
+  [nodes](nodes.md) for what the operator installs first.
 - Webhooks and web UI. Both will call the same submission path.

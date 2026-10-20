@@ -27,6 +27,7 @@ ALTER TABLE eregion_platform_nodes
     ADD COLUMN wg_enabled boolean NOT NULL DEFAULT false,
     ADD COLUMN wg_address text NOT NULL DEFAULT '',
     ADD COLUMN wg_endpoint text NOT NULL DEFAULT '',
+    ADD COLUMN wg_ssh_port integer NOT NULL DEFAULT 0 CHECK (wg_ssh_port BETWEEN 0 AND 65535),
     ADD COLUMN wg_public_key text NOT NULL DEFAULT '',
     ADD COLUMN control_wg_public_key text NOT NULL DEFAULT '',
     ADD COLUMN wg_state text NOT NULL DEFAULT 'none' CHECK (wg_state IN ('none','keyed','rendered','applied','failed')),
