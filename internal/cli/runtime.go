@@ -346,6 +346,14 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
+	// A fresh installation must list its local node before the first platform
+	// submission. This is idempotent and a no-op for remote-only workers.
+	if err := run.EnsureLocalNode(cmd.Context()); err != nil {
+		run.Close()
+		closeTransport()
+		pool.Close()
+		return nil, nil, extensionRuntime{}, nil, err
+	}
 	// The per-node tunnels are released with the transport, after the workers.
 	return pool, run, parts, func() { run.Close(); closeTransport() }, nil
 }

@@ -59,6 +59,17 @@ type Runtime struct {
 	Nodes NodeTransports
 }
 
+// EnsureLocalNode records the in-process local host as a platform node before
+// the API serves inventory. Without this, a fresh installation lists no node
+// until the first platform submission. It is idempotent and does nothing when
+// the process has no local transport (a pure remote/SSH worker).
+func (r *Runtime) EnsureLocalNode(ctx context.Context) error {
+	if r == nil || r.Service == nil {
+		return nil
+	}
+	return r.Service.ensureLocalNode(ctx)
+}
+
 // Close releases the per-node tunnels. Call it after the workers stopped.
 func (r *Runtime) Close() {
 	if r != nil && r.Service != nil && r.Service.resolver != nil {

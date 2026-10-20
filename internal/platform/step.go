@@ -742,8 +742,13 @@ func validateArgv(argv []string) error {
 			}
 		}
 	case "pack":
+		// `pack version` is the read-only availability probe used by node
+		// checks. Builds are the only mutating pack operation.
+		if len(argv) == 2 && argv[1] == "version" {
+			break
+		}
 		if len(argv) < 2 || argv[1] != "build" {
-			return errors.New("only pack build is supported")
+			return errors.New("only pack build and pack version are supported")
 		}
 	case "git":
 		subcommand := 1
