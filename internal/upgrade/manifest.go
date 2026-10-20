@@ -1,11 +1,13 @@
 package upgrade
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path"
 	"runtime"
@@ -76,6 +78,23 @@ type Manifest struct {
 	UpgradeFrom   []string   `json:"upgrade_from,omitempty"`
 	Artifacts     []Artifact `json:"artifacts"`
 	Signature     string     `json:"signature"`
+}
+
+// ParseManifest decodes one signed manifest strictly. Unknown fields are
+// rejected so a future schema cannot be silently interpreted with today's
+// fields; a forward-incompatible format must publish a new schema name and a
+// binary that understands it. The signature is not checked here.
+func ParseManifest(raw []byte) (Manifest, error) {
+	var manifest Manifest
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return manifest, contract.NewFault(contract.ValidationFailed, "signed manifest is not valid strict JSON", "Publish exactly the documented fields for "+ManifestSchema+"; unknown fields are refused.")
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return manifest, contract.NewFault(contract.ValidationFailed, "signed manifest has trailing JSON", "Publish exactly one manifest object.")
+	}
+	return manifest, nil
 }
 
 // Validate checks the unsigned structure. Signature verification is separate so

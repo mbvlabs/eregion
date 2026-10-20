@@ -13,13 +13,13 @@ failed gate blocks the release; it is never waived by prose.
 | G1 Formatting and static checks | `just fmt-check`, `go vet ./...` | Runnable locally; must be recorded for the tag |
 | G2 Unit/contract/schema tests | `go test ./...`, examples tests, script tests | Runnable locally; must be recorded for the tag |
 | G3 PostgreSQL/River integration | isolated test DB, `go test -count=1 ./internal/controlplane -run TestIntegration` | Requires a disposable database; not run in a plain checkout |
-| G4 Signed release artifacts | `upgrade verify` with the published key; manifest/artifact hashes | Requires the release workflow and signing secret |
-| G5 Upgrade and rollback drills | recovery drills in [upgrades.md](upgrades.md#recovery-drills) | Must be run on disposable hosts; not proven by unit tests |
-| G6 Terminal compatibility | `just terminal-smoke` under the TERM matrix | Requires `just dev-up`; see below |
-| G7 Security review | [security-review.md](security-review.md), findings triaged | Review performed; S1–S4 remain open |
+| G4 Signed release artifacts | `upgrade verify` with the published key; manifest/artifact hashes | Workflow now uploads to S3 and fails without a destination; requires the release workflow, signing secret, and object-store credentials. Not executed here |
+| G5 Upgrade and rollback drills | `just upgrade-drill`, `just recovery-drill`, plus [upgrades.md](upgrades.md#recovery-drills) | Automated drills are runnable; full disposable-host drills still need an operator |
+| G6 Terminal compatibility | `just release-terminal` under the TERM matrix | Runs when `just dev-up` is ready; otherwise prints a clear skip |
+| G7 Security review | [security-review.md](security-review.md), findings triaged | S4 fixed; S1–S3 accepted for v0.1 with owner and mitigation; S5–S6 accepted |
 | G8 Fresh-VM install | documented matrix on clean Debian/Ubuntu VMs | **Unproven here** |
 | G9 Real Cloudflare | real zone/token, DNS and private-access path | **Unproven here** |
-| G10 Multi-host HA/failover | drilled loss/outage scenarios | **Unproven here** |
+| G10 Multi-host HA/failover | drilled loss/outage scenarios | **Unproven here**; connection-level database-outage and node-loss-during-deploy integration drills exist, not multi-host failover |
 
 ## G1 — Formatting and static checks
 
@@ -41,11 +41,18 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 Pass criteria: all packages pass with no skipped release-blocking test. The
-upgrade suite must include the compatibility, health-probe restore, and
-interruption-recovery tests:
+upgrade suite must include the compatibility, health-probe restore,
+interruption-recovery, and strict-manifest tests:
 
 ```sh
-go test ./internal/upgrade ./internal/cli -run 'Upgrade|Rollout|Health|Guide' -count=1
+go test ./internal/upgrade ./internal/cli -run 'Upgrade|Rollout|Health|Guide|Manifest' -count=1
+```
+
+Webhook replay durability has a unit test and a PostgreSQL integration test:
+
+```sh
+go test ./internal/api -run 'Webhook' -count=1
+go test -count=1 ./internal/controlplane -run TestIntegrationWebhookDeliverySurvivesOperationRetention
 ```
 
 ## G3 — PostgreSQL, River, and process integration
@@ -61,6 +68,21 @@ Pass criteria: the suite creates isolated databases and passes. Do not run this
 against a shared application database. If CGO is unavailable, omit `-race`; the
 release record must say which variant ran.
 
+The HA/outage drills are part of the same suite and skip without
+`EREGION_TEST_DATABASE_URL`:
+
+```sh
+go test -count=1 ./internal/controlplane -run 'TestIntegration(DatabaseOutage|NodeLossDuringDeploy|CompetingSubmissions)' -timeout 300s
+```
+
+`DatabaseOutage` places a test-only TCP proxy in front of the disposable
+database, drops every connection, and requires the operation to remain visible
+and recover without duplicate effects. This is connection-level fault injection
+against a local disposable server, not a PostgreSQL primary failover.
+`NodeLossDuringDeploy` uses a scripted node transport that commits the serving
+switch and loses the response; it requires one switch effect and no serving
+claim until verification commits.
+
 ## G4 — Signed release artifacts
 
 The release workflow must have:
@@ -69,8 +91,18 @@ The release workflow must have:
    version metadata;
 2. produced a manifest whose artifacts have exact sizes and SHA256 values;
 3. signed the manifest with the release Ed25519 key and self-verified it;
-4. published the manifest, public key, archives, and (unauthenticated)
-   `SHA256SUMS`.
+4. uploaded the archives, manifest, public key, and (unauthenticated)
+   `SHA256SUMS` to the configured S3-compatible destination so the signed URLs
+   resolve;
+5. published the same files as GitHub release assets for convenience.
+
+The workflow fails if `EREGION_RELEASE_SIGNING_KEY`,
+`EREGION_RELEASE_BASE_URL`, or `EREGION_RELEASE_S3_URI` is missing, or if any
+upload/verification fails. It never publishes a signed manifest whose objects
+were not uploaded. Configure `EREGION_RELEASE_S3_ENDPOINT` for a non-AWS
+S3-compatible provider; use OIDC (`EREGION_RELEASE_AWS_ROLE_ARN`) or the
+`EREGION_RELEASE_AWS_*` secrets. Both `push` tags and `workflow_dispatch` with
+an existing `v*` tag run the same path.
 
 Verify from a trusted install:
 
@@ -100,7 +132,15 @@ verified offline mirror (`--artifact-dir`).
 ## G5 — Upgrade and recovery drills
 
 Run every drill in [upgrades.md](upgrades.md#recovery-drills) on disposable
-hosts and test roots:
+hosts and test roots. Two drills are automated:
+
+```sh
+just upgrade-drill     # signed manifest, verify/check/apply/rollback/health
+just recovery-drill    # backup/verify/restore/failed restore; Docker required
+just release-drill     # both, with explicit skips when prerequisites are absent
+```
+
+The remaining operator drills:
 
 1. tampered signature;
 2. tampered artifact (size and SHA256);
@@ -115,7 +155,8 @@ hosts and test roots:
     automatically and the journal must record the failure).
 
 Pass criteria: each drill leaves the expected binary, journal state, and
-backup; no drill silently replaces a binary or guesses an outcome.
+backup; no drill silently replaces a binary or guesses an outcome. A skip is
+recorded as not run, not as a pass.
 
 ## G6 — Terminal compatibility
 
@@ -123,8 +164,9 @@ Requires a running development environment:
 
 ```sh
 just dev-up
-just dev-status          # must report ready
-just terminal-smoke      # runs the TERM matrix
+just dev-status           # must report ready
+just release-terminal     # runs the TERM matrix, or prints a clear skip
+just terminal-smoke       # direct run when the environment is known ready
 ```
 
 The matrix is `TERM=dumb`, `xterm-256color`, `screen-256color`, `NO_COLOR`,
@@ -154,9 +196,13 @@ Review [security-review.md](security-review.md). Before tagging:
 - host-key pinning, webhook HMAC, vault route authorization, and command
   construction are re-checked against the tagged commit.
 
-At the time of this document S1 (Medium, git build SSRF) is open, and S2–S4
-(Low) are open. v0.1 may ship only if those are explicitly accepted in the
-release record; they must not be described as fixed.
+At the time of this document S4 (webhook replay retention) is **fixed** with a
+durable delivery table and unit/PostgreSQL tests. S1 (Medium, git build SSRF) is
+accepted for v0.1 with the owner and scoped mitigation in the security review;
+S2 and S3 (Low) are accepted for v0.1 with owners. S5–S6 are informational and
+accepted. The release record must repeat those decisions; S1 must not be
+described as fixed or as safe for untrusted builder credentials. Fixing S1 is
+release-blocking before any shared/multi-tenant builder claim.
 
 ## G8 — Fresh-VM install matrix (explicitly unproven)
 
@@ -195,13 +241,24 @@ Multiple workers sharing PostgreSQL, or a second control-plane process, are not
 by themselves high availability. The following are **unproven** in this tree:
 
 - control-plane process loss with a load balancer and in-flight submissions;
-- worker loss while a node effect is running, including remote acknowledgement
-  loss;
-- PostgreSQL primary outage, failover, reconnect, and advisory-lock behavior;
-- competing operations on different control-plane processes;
-- node loss and recovery during a deploy;
+- PostgreSQL primary outage, failover, and split-brain behavior;
 - schema migration under a live mixed-version control plane;
-- backup/restore of the database plus vault key.
+- backup/restore of the database plus vault key;
+- any multi-host failover or recovery-time claim.
+
+Integration-level drills now cover narrower cases with
+`EREGION_TEST_DATABASE_URL`:
+
+- a connection-level database outage (test-only TCP proxy drops every backend)
+  with operation visibility, reconnect, and exactly one effect per step;
+- worker response loss during a deploy in which the node committed the serving
+  switch, requiring status recovery instead of a duplicate switch and no
+  serving claim before verification;
+- competing duplicate submissions through two control planes on one database.
+
+These are single-host test drills against a disposable database. They do not
+prove a PostgreSQL primary failover, a load-balanced multi-host rollout, or a
+recovery SLA.
 
 The upgrade plan's `migrate → workers → API → nodes` order is a documented
 procedure, not evidence that a live rollout was coordinated. Inventory checks
@@ -214,14 +271,37 @@ Use exactly this scope, filling in only what was drilled:
 > v0.1 is an experimental single-control-plane release. Tested: durable
 > operations and River jobs in PostgreSQL, local and pinned-SSH node execution,
 > process-crash reconciliation on one host, explicit upgrade/rollback with
-> journal recovery, and the terminal/API behavior covered by the gates above.
-> Not tested: multi-host failover, PostgreSQL primary failover, real Cloudflare,
-> and a fresh-VM install matrix. Multiple workers are not a high-availability
-> guarantee.
+> journal recovery, connection-level database-outage recovery and
+> node-response-loss deploy drills in the integration suite, and the
+> terminal/API behavior covered by the gates above. Not tested: multi-host
+> failover, PostgreSQL primary failover, real Cloudflare, and a fresh-VM install
+> matrix. Multiple workers are not a high-availability guarantee.
 
 If a failover drill is later completed, add one sentence per tested scenario
 with the date, topology, and observed recovery time. Never generalize from a
 single-host drill to a multi-host HA claim.
+
+## Release evidence table
+
+Copy this table into the release record and fill every row for the tagged
+commit. A skipped row is recorded as `not run`, never as `pass`.
+
+| Gate | Command to run | Result | Evidence (commit, toolchain, log/URL) |
+| --- | --- | --- | --- |
+| G1/G2 offline gate | `just release-check` | | |
+| G2 upgrade suite | `go test ./internal/upgrade ./internal/cli -run 'Upgrade\|Rollout\|Health\|Guide\|Manifest' -count=1` | | |
+| G2 webhook unit | `go test ./internal/api -run Webhook -count=1` | | |
+| G3 integration | `just integration` (or `integration-norace`) | | |
+| G3 outage/node-loss drills | `go test -count=1 ./internal/controlplane -run 'TestIntegration(DatabaseOutage\|NodeLossDuringDeploy\|CompetingSubmissions)'` | | |
+| G4 signed manifest | `eregion upgrade verify --manifest ... --json` | | |
+| G4 publish | release workflow run URL and object-store prefix | | |
+| G5 signed upgrade drill | `just upgrade-drill` | | |
+| G5 recovery drill | `just recovery-drill` | | |
+| G6 terminal matrix | `just release-terminal` | | |
+| G7 security decisions | [security-review.md](security-review.md) | | |
+| G8 fresh VM | external matrix | not run | |
+| G9 Cloudflare | external account drill | not run | |
+| G10 multi-host HA | external failover drill | not run | |
 
 ## Release record template
 
@@ -236,10 +316,10 @@ G3: pass|fail|not run  evidence:
 G4: pass|fail|not run  evidence:
 G5: pass|fail|not run  evidence:
 G6: pass|fail|not run  evidence:
-G7: pass|scoped acceptance  findings: S1..Sn
+G7: pass|scoped acceptance  findings: S1–S3 accepted, S4 fixed, S5–S6 accepted
 G8: not run (unproven)
 G9: not run (unproven)
-G10: not run (unproven)
+G10: not run (unproven; integration drill evidence attached)
 HA statement: <the paragraph above, unedited except for tested items>
 Known limitations: <links to upgrades.md#limitations and security-review.md>
 ```

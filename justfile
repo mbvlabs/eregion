@@ -38,6 +38,29 @@ bootstrap-matrix:
 terminal-smoke:
     python3 scripts/terminal_smoke.py
 
+# Run the disposable PostgreSQL backup/restore drill. Prerequisites: Docker is
+# installed and reachable, and the image below is available locally. Without
+# them this target prints a skip and exits successfully.
+recovery-drill:
+    @if ! command -v docker >/dev/null 2>&1; then echo "skip: Docker is not installed"; elif ! docker info >/dev/null 2>&1; then echo "skip: Docker daemon is not reachable"; elif ! docker image inspect postgres:17 >/dev/null 2>&1; then echo "skip: postgres:17 is not available locally; pull it explicitly to run this drill"; else python3 scripts/recovery_drill.py; fi
+
+# Run the signed upgrade drill: build disposable 1.0.0/1.1.0 binaries and a
+# signed manifest, then exercise verify/check/apply/rollback/status and the
+# automatic restore after a failed health probe.
+upgrade-drill:
+    python3 scripts/upgrade_drill.py
+
+# Run every release drill. Container prerequisites skip clearly and never
+# silently pass a failed drill.
+release-drill:
+    @just recovery-drill
+    @just upgrade-drill
+
+# Run the interactive TERM matrix when a development environment is ready;
+# otherwise print a clear skip.
+release-terminal:
+    @if python3 scripts/dev.py status >/dev/null 2>&1; then python3 scripts/terminal_smoke.py; else echo "skip: development environment is not ready; run just dev-up"; fi
+
 # Build the operator CLI.
 build:
     go build -trimpath -o bin/eregion ./cmd/eregion
@@ -107,13 +130,16 @@ wireguard:
 # Check formatting, static analysis, and tests.
 check: fmt-check lint test dev-test
 
-# Run the offline v0.1 release gate (no live dev environment required).
+# Run the v0.1 release gate. Drills and the terminal matrix skip explicitly when
+# Docker or a dev environment is unavailable; skipped evidence is not a pass.
 release-check:
     just fmt-check
     go vet ./...
     go test ./...
     go -C examples/hello test ./...
     python3 -m unittest discover -s scripts -p 'test_*.py'
+    @just release-drill
+    @just release-terminal
 
 # Run the interactive terminal TERM matrix (requires just dev-up).
 terminal-matrix:

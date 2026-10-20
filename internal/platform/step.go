@@ -237,7 +237,14 @@ func buildContainerStep(exec engine.Execution, raw json.RawMessage) (engine.Step
 		}
 	}
 	for key, value := range payload.Labels {
-		if !strings.Contains(key, "/") {
+		// Docker accepts both reverse-DNS keys (io.eregion.app) and
+		// namespace/name keys (io.eregion/app). Require a nonempty prefix and
+		// name so an arbitrary unqualified key is still refused.
+		prefix, name, qualified := strings.Cut(key, "/")
+		if !qualified {
+			prefix, name, qualified = strings.Cut(key, ".")
+		}
+		if !qualified || prefix == "" || name == "" {
 			return nil, fmt.Errorf("container label %q must have a DNS-style prefix", key)
 		}
 		if len(value) > 128 {

@@ -74,6 +74,36 @@ func TestSignVerifyRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseManifestRejectsUnknownFieldsAndTrailingJSON(t *testing.T) {
+	manifest, public := signedManifest(t)
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseManifest(raw)
+	if err != nil {
+		t.Fatalf("valid manifest: %v", err)
+	}
+	if err := parsed.Verify(public); err != nil {
+		t.Fatalf("valid manifest did not verify: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields["future_field"] = true
+	withUnknown, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseManifest(withUnknown); err == nil {
+		t.Fatal("unknown manifest field was accepted")
+	}
+	if _, err := ParseManifest(append(raw, []byte("{}")...)); err == nil {
+		t.Fatal("trailing JSON was accepted")
+	}
+}
+
 func TestTamperedManifestAndSignatureFail(t *testing.T) {
 	manifest, public := signedManifest(t)
 	otherPublic, _ := testKey(t)

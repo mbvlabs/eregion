@@ -4,12 +4,18 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated tag to build and publish, for example v0.1.0
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -27,6 +33,8 @@ jobs:
           - { goos: windows, goarch: arm64, node: false }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -36,11 +44,15 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           WITH_NODE: ${{ matrix.node }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          case "$RELEASE_TAG" in
+            v*) version="${RELEASE_TAG#v}" ;;
+            *) echo "release ref must be a v* tag, got: ${RELEASE_TAG}" >&2; exit 1 ;;
+          esac
           case "$version" in
-            ''|*[!0-9A-Za-z.+-]*) echo "invalid release tag: ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+            ''|*[!0-9A-Za-z.+-]*) echo "invalid release tag: ${RELEASE_TAG}" >&2; exit 1 ;;
           esac
           mkdir -p dist
           stage="$(mktemp -d)"
@@ -66,8 +78,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -84,19 +99,32 @@ jobs:
           go vet ./...
           go test ./...
           go -C examples/hello test ./...
+      - name: Configure AWS credentials from OIDC
+        if: ${{ vars.EREGION_RELEASE_AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.EREGION_RELEASE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.EREGION_RELEASE_AWS_REGION }}
       - name: Sign release manifest
         env:
           EREGION_RELEASE_SIGNING_KEY: ${{ secrets.EREGION_RELEASE_SIGNING_KEY }}
           UPGRADE_FROM: ${{ vars.EREGION_UPGRADE_FROM }}
           RELEASE_CHANNEL: ${{ vars.EREGION_RELEASE_CHANNEL }}
           RELEASE_BASE_URL: ${{ vars.EREGION_RELEASE_BASE_URL }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           if [ -z "${EREGION_RELEASE_SIGNING_KEY:-}" ]; then
             echo "EREGION_RELEASE_SIGNING_KEY is not configured; refusing to publish an unsigned release" >&2
             exit 1
           fi
-          version="${GITHUB_REF_NAME#v}"
+          case "$RELEASE_TAG" in
+            v*) version="${RELEASE_TAG#v}" ;;
+            *) echo "release ref must be a v* tag, got: ${RELEASE_TAG}" >&2; exit 1 ;;
+          esac
+          case "$version" in
+            ''|*[!0-9A-Za-z.+-]*) echo "invalid release tag: ${RELEASE_TAG}" >&2; exit 1 ;;
+          esac
           channel="${RELEASE_CHANNEL:-stable}"
           base_url="${RELEASE_BASE_URL:-}"
           if [ -z "$base_url" ]; then
@@ -122,16 +150,58 @@ jobs:
             -upgrade-from "${UPGRADE_FROM:-}" \
             -checksums dist/SHA256SUMS \
             -public-key-out dist/release.pub
-      - name: Publish release
+      - name: Publish signed artifacts to the object store
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.EREGION_RELEASE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.EREGION_RELEASE_AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.EREGION_RELEASE_AWS_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.EREGION_RELEASE_S3_ENDPOINT }}
+          S3_URI: ${{ vars.EREGION_RELEASE_S3_URI }}
+          RELEASE_BASE_URL: ${{ vars.EREGION_RELEASE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "the AWS CLI is required to publish signed artifacts" >&2
+            exit 1
+          fi
+          if [ -z "${S3_URI:-}" ]; then
+            echo "EREGION_RELEASE_S3_URI is not configured; refusing to sign artifacts that are never published" >&2
+            exit 1
+          fi
+          case "$S3_URI" in
+            s3://*) ;;
+            *) echo "EREGION_RELEASE_S3_URI must start with s3://" >&2; exit 1 ;;
+          esac
+          if [ -z "${RELEASE_BASE_URL:-}" ]; then
+            echo "EREGION_RELEASE_BASE_URL is not configured" >&2
+            exit 1
+          fi
+          prefix="${S3_URI%/}"
+          global=()
+          if [ -n "${AWS_ENDPOINT_URL:-}" ]; then
+            global+=(--endpoint-url "$AWS_ENDPOINT_URL")
+          fi
+          files=(dist/*.tar.gz dist/manifest.json dist/SHA256SUMS dist/release.pub)
+          for file in "${files[@]}"; do
+            aws "${global[@]}" s3 cp "$file" "$prefix/$(basename "$file")" --only-show-errors
+          done
+          for file in "${files[@]}"; do
+            aws "${global[@]}" s3 ls "$prefix/$(basename "$file")" >/dev/null
+          done
+          echo "Published ${#files[@]} signed artifacts below ${prefix}; the manifest uses ${RELEASE_BASE_URL}."
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           UPGRADE_FROM: ${{ vars.EREGION_UPGRADE_FROM }}
+          RELEASE_BASE_URL: ${{ vars.EREGION_RELEASE_BASE_URL }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           {
             echo "Signed eregion ${version}."
             echo
+            echo "Download artifacts from ${RELEASE_BASE_URL} (the GitHub assets below are a convenience copy)."
             echo "Verify dist/manifest.json against the published Ed25519 public key in dist/release.pub before installing."
             echo "SHA256SUMS is an integrity listing, not a signature."
             echo
@@ -140,7 +210,7 @@ jobs:
             fi
             echo "This release does not claim high availability or a tested failover SLA."
           } > dist/RELEASE_NOTES.md
-          gh release create "${GITHUB_REF_NAME}" \
+          gh release create "${RELEASE_TAG}" \
             dist/*.tar.gz \
             dist/manifest.json \
             dist/SHA256SUMS \

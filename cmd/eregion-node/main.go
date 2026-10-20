@@ -9,11 +9,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 
+	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/noded"
 )
 
@@ -36,8 +38,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "identity":
 		return report(stderr, identityCommand(args[1:], stdout))
 	case "version":
-		fmt.Fprintln(stdout, "eregion-node dev")
-		return 0
+		return report(stderr, versionCommand(args[1:], stdout))
 	default:
 		fmt.Fprintf(stderr, "unknown node command %q\n", args[0])
 		return 2
@@ -50,6 +51,33 @@ func report(stderr io.Writer, err error) int {
 	}
 	fmt.Fprintf(stderr, "eregion-node: %v\n", err)
 	return 1
+}
+
+// versionCommand reports the build metadata injected by the release workflow.
+// The JSON form is the upgrade health probe's primary identity check, so a
+// signed node artifact proves the exact semantic version it was built from.
+func versionCommand(args []string, stdout io.Writer) error {
+	flags := flag.NewFlagSet("version", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	jsonOutput := flags.Bool("json", false, "Print build information as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("version takes no arguments")
+	}
+	info := buildinfo.Current()
+	if *jsonOutput {
+		raw, err := json.Marshal(info)
+		if err != nil {
+			return fmt.Errorf("build information could not be rendered: %w", err)
+		}
+		fmt.Fprintln(stdout, string(raw))
+		return nil
+	}
+	fmt.Fprintf(stdout, "eregion-node %s\ncommit: %s\nplatform: %s/%s\ngo: %s\ndirty: %t\n",
+		info.Version, info.Commit, info.OS, info.Arch, info.Go, info.Dirty)
+	return nil
 }
 
 func serveCommand(args []string, stdin io.Reader, stdout io.Writer) error {

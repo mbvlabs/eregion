@@ -28,6 +28,12 @@ The Ed25519 signature covers the manifest, including every artifact name, size,
 and SHA256. `SHA256SUMS` is an unauthenticated convenience listing, not a
 signature.
 
+The release workflow uploads the archives, manifest, checksum listing, and
+public key to the configured S3-compatible object store before publishing the
+manifest. Download artifacts from the direct HTTPS object prefix recorded as
+`EREGION_RELEASE_BASE_URL`; GitHub release assets are a convenience copy whose
+redirecting URLs the upgrade downloader refuses.
+
 Pin the public key out of band (configuration management, a previously
 trusted install, or a published fingerprint you can compare). Then verify the
 manifest:
@@ -81,7 +87,12 @@ sudo install -m 0755 /tmp/eregion-release/eregion-node /usr/local/bin/eregion-no
 sudo install -d -m 0700 -o eregion-node -g eregion-node /var/lib/eregion/node
 sudo install -m 0600 -o root -g root node.json /etc/eregion/node.json
 /usr/local/bin/eregion-node version
+/usr/local/bin/eregion-node version --json
 ```
+
+The JSON form is also the upgrade health probe's identity check: a signed node
+artifact must report the exact version in the manifest. A release build that
+still prints `dev` will not be accepted by `upgrade apply --target node`.
 
 Minimal `/etc/eregion/node.json`:
 

@@ -326,8 +326,9 @@ func (a *app) upgradeManifest(cmd *cobra.Command) (upgrade.Manifest, ed25519.Pub
 		return upgrade.Manifest{}, nil, err
 	}
 	var manifest upgrade.Manifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return upgrade.Manifest{}, nil, contract.NewFault(contract.ValidationFailed, "signed manifest is not valid JSON", "Republish the manifest and verify the trusted key.")
+	manifest, err = upgrade.ParseManifest(raw)
+	if err != nil {
+		return upgrade.Manifest{}, nil, err
 	}
 	if err := manifest.Verify(public); err != nil {
 		return upgrade.Manifest{}, nil, err
