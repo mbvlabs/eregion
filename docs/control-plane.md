@@ -33,14 +33,16 @@ changes run.
   Events are not pruned yet; missing history returns an explicit cursor precondition
   error.
 
-These guarantees cover the local node boundary. Pinned SSH and userspace WireGuard
-transports, remote node supervision, and distributed leases remain future work.
+These guarantees cover the local node boundary and the pinned SSH transport.
+Userspace WireGuard, remote node enrollment, and distributed leases remain future
+work.
 
 ## Local node execution and recovery
 
-The worker calls a `node.Transport`, not a shell or SSH directly. The only implemented
-adapter is in-process `local`; pinned SSH and userspace WireGuard will implement the
-same `Call(ctx, Request, onEvent)` interface.
+The worker calls a `node.Transport`, not a shell or SSH directly. Two adapters
+implement the same `Call(ctx, Request, onEvent)` interface: the in-process
+`local` dispatcher and the pinned `ssh` transport. Userspace WireGuard will
+implement the same interface.
 
 Execution identity is `op_<id>:<attempt>:<step>`; the stable effect key is
 `op_<id>:<step>`. The attempt changes on retry, the effect key does not. Before every
@@ -63,10 +65,18 @@ root-owned path such as `/var/lib/eregion/node`. Layout:
 
 The journal records `running|completed|failed`, `inputs_hash`, attempt, execution ID,
 request ID, owner diagnostics, and the attempt that actually applied the effect. A
+recovered effect keeps the attempt that applied it, reported by the step through
+`CheckResult.AppliedAttempt`; `0` is the documented "not known" sentinel. A
 corrupt journal is an explicit `precondition_failed`; it is never reset silently. All
 writes use temp+chmod+fsync+rename+directory-sync. The diagnostic marker uses
 create-once (temp + hard link), so a duplicate application cannot overwrite which
 attempt produced the effect.
+
+The journal is an index and is compacted: terminal tasks older than the retention
+window are dropped unless they are among the most recent ones, and the node
+compacts at startup. The effect records are the durable exactly-once evidence and
+are **not** compacted automatically; pruning them is an explicit operator action,
+because dropping one would let a stale retry re-apply an effect.
 
 `flock` coordinates processes on **one host only**. The effect lock is the liveness
 fence: the kernel releases it when an owner dies. Status tries the lock without waiting;
@@ -99,6 +109,49 @@ but lets an in-flight step finish and acknowledges it. Completed effects are not
 back. If all steps finished, the honest terminal state is `succeeded`; otherwise
 `cancelled`. River job timeout or process shutdown is not a cancellation request; it
 may leave a `running` journal entry that the next attempt reconciles through Check.
+
+## Remote node execution over pinned SSH
+
+The worker dispatches to a remote node through the same `Transport` interface. The
+worker, the operation contract, the River arguments, and the PostgreSQL step model
+do not change; only the adapter does.
+
+```sh
+export EREGION_NODE_TRANSPORT=ssh
+export EREGION_NODE_SSH_ADDRESS='node-1.example:22'
+export EREGION_NODE_SSH_USER='eregion-node'
+export EREGION_NODE_SSH_IDENTITY='/etc/eregion/control-plane-key'   # mode 0600
+export EREGION_NODE_SSH_KNOWN_HOSTS='/etc/eregion/known_hosts'       # the pinned host key
+# Optional: the node name the handshake must report, and a non-default remote command.
+export EREGION_NODE_SSH_NODE='app-1'
+```
+
+The node side needs the node binary and its configuration:
+
+```sh
+just build-node
+install -m 0755 bin/eregion-node /usr/local/bin/eregion-node
+install -d -m 0700 -o eregion-node -g eregion-node /var/lib/eregion/node
+install -m 0600 -o root -g root node.json /etc/eregion/node.json
+```
+
+`/etc/eregion/node.json` holds the node name and its state directory:
+
+```json
+{"node": "app-1", "state_dir": "/var/lib/eregion/node"}
+```
+
+The node account is unprivileged and owns only its state directory. The control
+plane pins the node's host key; a missing pin, a changed key, or a protocol
+version mismatch fails closed and ends the operation with
+`precondition_failed` instead of retrying forever. A lost stream is an explicit
+unknown outcome: the node task keeps running, and the retry asks the node for its
+status before it runs anything.
+
+The node runs each step as a detached task, so the task outlives the connection
+that started it and the control plane polls the node's status. The full decisions,
+including the privilege policy, the state directory layout, and the retention
+policy, are in [the M0.3 SSH plan](m0.3-ssh-plan.md).
 
 ## Start a local development control plane
 
@@ -185,7 +238,8 @@ shutdown waits up to fifteen seconds. Viewer interruption never calls cancellati
 Non-loopback API listeners require both `--tls-cert` and `--tls-key`. Clients require
 HTTPS except for literal loopback HTTP and verify certificates through normal
 system trust. No insecure TLS bypass or credential-bearing redirects are allowed.
-Private WireGuard/SSH transport is not implemented yet.
+Userspace WireGuard is not implemented yet; the SSH transport reaches its node over
+plain TCP today and over a userspace tunnel once the WireGuard dialer lands.
 
 ## API contract
 
@@ -240,9 +294,17 @@ shutdown. Recovery tests inject a failure between the node effect and its databa
 acknowledgement, drop a transport response after dispatch, and kill a separate worker
 process. Each asserts exactly one marker file, one completed step row, and one
 progress event per step. Reconciliation is also tested not to fail an operation while
-its node effect still holds a live local lock. This does not simulate remote host
-execution or prove full fleet HA.
+its node effect still holds a live local lock.
 
-The `local` transport is in-process. There is no SSH, WireGuard, node enrollment,
-remote supervision, or multi-host conflict scope yet; see
+The pinned SSH transport has its own fixture: a throwaway `sshd` container with a
+generated host key and one authorized key. `just ssh-fixture` builds its image and
+`just transport` runs the transport tests. The same scenarios run against the
+disposable SSH endpoint in the integration suite, including a lost response injected
+at the transport boundary, a killed worker, a duplicate submission, a cancellation at
+a step boundary, and a node task that outliving its caller. The SSH tests skip
+cleanly when Docker or the fixture image is unavailable; they never fail the rest of
+the suite.
+
+The `local` transport is in-process. There is no userspace WireGuard, node
+enrollment, remote mesh reconciliation, or multi-host conflict scope yet; see
 [next transport increments](ssh-wireguard-next.md).

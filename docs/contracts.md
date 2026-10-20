@@ -1,11 +1,11 @@
 # Agent and operation contracts
 
-**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts, M0.2 diagnostic execution, and the M0.3 local node boundary.
+**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts, M0.2 diagnostic execution, the M0.3 local node boundary, and the M0.3 pinned SSH transport.
 
 CLI discovery, operation persistence, HTTP transport, scoped authorization,
-transactional River insertion, and local node dispatch are implemented. Token
-issuance, destructive-operation confirmations, pinned SSH/WireGuard transports, and
-interactive viewing are not. See
+transactional River insertion, local node dispatch, and the pinned SSH node
+transport are implemented. Token issuance, destructive-operation confirmations,
+userspace WireGuard, and interactive viewing are not. See
 [control-plane setup](control-plane.md) for the current API and limitations.
 
 ## Compatibility
@@ -175,8 +175,52 @@ operation and therefore a different effect; future corrected retries of terminal
 must make their steps convergent rather than assuming the old effect is reused.
 
 The local transport uses node-local `flock` plus a journal. It coordinates processes
-on one host; it is not a distributed lock. SSH and userspace WireGuard transports are
-future increments and will not change the worker's decision procedure.
+on one host; it is not a distributed lock. The pinned SSH transport reuses the same
+journal, effect records, and node-local locks on the node; the control plane's
+decision procedure does not change. Userspace WireGuard is a future increment and
+will not change the worker's decision procedure either.
+
+## Terminal failure codes
+
+A failed operation carries a machine-readable `error_code` in the `eregion/v1`
+operation snapshot and on its terminal state event. It uses the same code
+taxonomy the CLI and API already use, so a caller never has to parse the
+message text:
+
+| Code | Meaning for a failed operation |
+| --- | --- |
+| `precondition_failed` | The node can never converge this effect: the effect was recorded under other inputs, the node journal is corrupt, the node reported a permanent failure, or the transport refused the request (for example a host-key mismatch). |
+| `unavailable` | The work could not be completed in time: the node was unreachable, the step kept failing, or the execution ended without an acknowledged result. |
+| `internal_error` | An unexpected failure without a more specific classification. |
+
+The code is optional and additive: an operation that fails without a code is
+still valid, and every other state carries no code. The PostgreSQL operation row
+and the step rows store the same code, so a reader does not have to reconstruct
+it from the event history.
+
+## Remote node execution
+
+A node answers two requests: `run` and `status`. Both carry the request ID, the
+execution identity, the effect key inputs, and optional transient secrets. The
+node owns its state directory and has no database access and no credential for
+the control plane.
+
+- A run request starts a **detached** node task. The task outlives the
+  connection that started it; the transport asks for the task's status until it
+  is terminal.
+- A lost stream is an explicit outcome. It never means the node stopped, and the
+  retry path asks for status before it runs anything.
+- The node protocol version is exchanged before any request is accepted. A
+  mismatch fails closed.
+- Request secrets are registered with a per-request redaction registry before
+  any event, log, error, or journal write. The secrets travel to the node over
+  the encrypted channel and reach a detached task through an inherited pipe, so
+  they never touch the node's disk.
+- The control plane pins the node's host key and refuses a node without a
+  pinned key. No request value is ever placed in a command line or interpreted
+  by a shell.
+
+The [M0.3 SSH plan](m0.3-ssh-plan.md) records the full decisions.
 
 ## Events, cursors, and NDJSON
 

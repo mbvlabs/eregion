@@ -6,9 +6,9 @@ planned on top of the same machine-readable contracts. A web UI can come later.
 
 **Current state: M0.3 — node execution and recovery boundary (local transport).**
 The authenticated API, external PostgreSQL state, versioned migrations, River
-workers, a Check/Apply step engine, a durable node journal, and a local node-dispatch
-transport are implemented. The diagnostic operation writes only marker files under
-the node state directory. Pinned SSH and userspace WireGuard transports, host
+workers, a Check/Apply step engine, a durable node journal, a local node-dispatch
+transport, and a pinned SSH node transport are implemented. The diagnostic operation
+writes only marker files under the node state directory. Userspace WireGuard, host
 bootstrap, deployments, and the Charm viewer are not implemented yet.
 
 ## Build and explore
@@ -38,6 +38,8 @@ just race     # race-detector tests
 For the first live operation, see [control-plane setup](docs/control-plane.md).
 `just integration` runs PostgreSQL/River/API/process-crash tests when
 `EREGION_TEST_DATABASE_URL` points to a disposable PostgreSQL server.
+`just transport` runs the transport tests, including a disposable SSH node
+container; they skip cleanly when Docker is unavailable.
 
 Linux CI runs unit/race checks and a separate PostgreSQL 17 integration job;
 macOS and Windows CI test the portable operator CLI.
@@ -47,6 +49,7 @@ Server support will be a separate Debian/Ubuntu VM matrix once host operations e
 
 - [Implementation roadmap](docs/roadmap.md)
 - [M0.3 execution plan](docs/m0.3-plan.md)
+- [M0.3 SSH transport plan](docs/m0.3-ssh-plan.md)
 - [Next transport increments](docs/ssh-wireguard-next.md)
 - [Agent/wire contracts and exit codes](docs/contracts.md)
 - [Control-plane setup and API](docs/control-plane.md)
@@ -56,4 +59,5 @@ Server support will be a separate Debian/Ubuntu VM matrix once host operations e
 
 The intended control plane uses external PostgreSQL and River, role-focused
 servers, an early automation API, and external telemetry integrations. M0.3 proves
-durable local node execution and recovery; it is not a production PaaS yet.
+durable local node execution and recovery, and its pinned SSH transport; it is not a
+production PaaS yet.

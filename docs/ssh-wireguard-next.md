@@ -1,7 +1,13 @@
 # Next transport increments: pinned SSH, then userspace WireGuard
 
-**Status:** Planned, not implemented. This document lists what remains after M0.3's
-local node-dispatch boundary. It is not evidence that remote execution works.
+**Status:** Increment A (pinned SSH) implemented · 2026-10-20
+**Increment B (userspace WireGuard):** Planned, not implemented.
+This document lists what remains after M0.3's
+local node-dispatch boundary. It is not evidence that userspace WireGuard works.
+
+The decisions that the SSH increment had to make are recorded in
+[the M0.3 SSH plan](m0.3-ssh-plan.md). This document keeps the increments and
+their tests visible.
 
 ## What is already fixed
 
@@ -24,30 +30,50 @@ The node journal, effect records, create-once diagnostic marker, canonical input
 hash, redacted shell, and node-local `flock` live in `internal/engine` and
 `internal/node`. They are transport-independent.
 
-## Increment A: pinned SSH
+## Increment A: pinned SSH — done
 
-Deliverables:
+Implemented. The worker, the operation contract, the River arguments, and the
+PostgreSQL step model did not change: the SSH adapter implements the existing
+`Transport` interface and the existing worker decision procedure.
 
-- An SSH transport that dials one configured node, verifies a pinned host key, runs a
-  fixed node command, and exchanges the existing request/event/response shapes.
-- Version/handshake compatibility before any request is accepted.
-- A bounded stderr tail and an explicit "stream lost" outcome that does not imply the
-  node stopped. The retry path must call `status` before `run`.
-- Request secrets registered with a per-request redaction registry before events,
-  logs, errors, or journal writes.
-- Authentication and privilege policy documented (root/sudo, key ownership, file
-  modes). No shell interpolation of untrusted values.
-- Tests against a disposable SSH endpoint in CI or a documented local fixture:
-  - successful run + status;
-  - host-key mismatch aborts before execution;
-  - version mismatch fails closed;
-  - connection drops after dispatch, retry recovers through status;
-  - duplicate requests produce one effect;
-  - cancellation while connected never kills a step mid-effect.
-- Failure injection for lost responses at the transport boundary, not only locally.
+What shipped:
 
-Non-goals for this increment: node enrollment, SSH CA, public-IP hardening, mesh
-reconciliation, multi-node placement, and distributed leases.
+- `internal/transport`: a pinned SSH transport. It dials one configured node
+  through a `Dialer` seam (a `net.Conn` source), verifies a pinned host key
+  before any request, runs the fixed node command, and exchanges the existing
+  request/event/response shapes.
+- `internal/noded` and `cmd/eregion-node`: the node binary. It answers node
+  requests over the channel's standard input and output, dispatches by step name
+  through a step registry, and runs each step as a **detached** task that
+  outlives its caller. The request reaches the task through an inherited pipe,
+  so a transient secret never touches the node's disk.
+- A protocol-version handshake that fails closed before any request is accepted.
+- A bounded (8 KiB), redacted stderr tail and an explicit "stream lost"
+  outcome that never implies the node stopped. The retry path calls `status`
+  before `run`.
+- A documented authentication and privilege policy: key-only authentication to a
+  dedicated unprivileged account, a pinned host key, no root/sudo, no agent
+  forwarding, no PTY, and no shell interpolation of any request value.
+- Node-side journal compaction with a retention policy.
+- A machine-readable error code on the terminal state of a failed operation.
+
+Delivered tests (all green):
+
+| Scenario | Where |
+| --- | --- |
+| successful run + status | `internal/transport` (in-process node and the disposable container) |
+| host-key mismatch aborts before execution | `internal/transport` |
+| version mismatch fails closed | `internal/transport` |
+| connection drops after dispatch, retry recovers through status | `internal/transport` and `internal/controlplane` |
+| duplicate requests produce one effect | `internal/transport` and `internal/controlplane` |
+| cancellation while connected never kills a step mid-effect | `internal/transport` and `internal/controlplane` |
+| failure injection for a lost response at the transport boundary | `internal/transport` (cut proxy in front of the container) |
+| killed worker, duplicate submission, cancellation at a step boundary | `internal/controlplane` against the disposable SSH endpoint |
+
+The disposable SSH endpoint is a throwaway `sshd` container with a generated host
+key; `just ssh-fixture` builds its image and the tests skip cleanly when Docker
+is unavailable. See [the M0.3 SSH plan](m0.3-ssh-plan.md) for the fixture
+details and the exact decisions.
 
 ## Increment B: userspace WireGuard
 
@@ -71,32 +97,38 @@ Deliverables:
   is queried by status, or the transport reports the task as unknown. Do not assume
   the SSH session owns execution lifetime.
 
-## Remote supervision and reattachment still to decide
+The dialer seam is in place: the SSH transport asks a `Dialer` for a `net.Conn`
+and never dials a socket itself. The SSH transport, the host-key pinning, the
+node protocol, and the node binary do not change when the dialer does.
+
+## Remote supervision and reattachment — decided for SSH
 
 The local implementation uses process lifetime plus `flock` as its liveness fence.
-Before remote SSH/WG ships, decide and test:
+These questions are decided for SSH in
+[the M0.3 SSH plan](m0.3-ssh-plan.md); the short answers are:
 
-1. **Node execution lifetime:** one-shot dispatch with a durable journal (current
-   local model) versus a supervised node service. Either way, the stream is not the
-   source of truth.
-2. **Ownership fencing:** whether a remote effect needs a lease/fencing token in
-   addition to the node-local lock. The local lock cannot coordinate multiple
-   control-plane instances or multiple hosts.
-3. **Conflict scopes:** which steps may mutate the same resource across nodes, and
-   how those scopes are represented in PostgreSQL. River concurrency is not a
-   distributed environment lock.
-4. **Cancellation:** which remote steps are cooperative/interruptible, and how a
-   cancel request reaches a detached node task. The current `after_apply` boundary
-   remains the default until a step proves a safe cooperative boundary.
-5. **State directory:** the remote node's root-owned journal/effect directory,
-   backup/upgrade behavior, and retention/cleanup policy.
-6. **Observability:** correlation ID propagation, node-side log retention, and how a
-   lost stream is surfaced without claiming work stopped.
+1. **Node execution lifetime:** a detached node task plus a durable journal
+   queried by `status`. The SSH session is a transport, not the owner of
+   execution lifetime.
+2. **Ownership fencing:** the node-local effect lock and the durable effect
+   record remain the effect fence; the transport adds a request fence (the
+   execution identity), not a distributed lease. Conflict scopes between
+   different nodes and cross-host leases stay open for node enrollment.
+3. **Cancellation:** there is no remote kill. A cancellation request is honoured
+   at the step boundary; a detached task is left to finish and reconciled through
+   `status`.
+4. **State directory:** `/var/lib/eregion/node`, owned by a dedicated
+   unprivileged account, mode 0700, files 0600. The journal is compacted; the
+   effect records are the durable exactly-once evidence and are not compacted
+   automatically.
+5. **Observability:** the request ID and the execution identity cross the
+   boundary; a lost stream is surfaced as an explicit unknown outcome that never
+   claims the work stopped.
 
 ## Gate for the remote half
 
-Do not tick the remote M0.3 gate until an SSH test endpoint and then a WireGuard
-endpoint pass the same exactly-once scenarios as the local suite, including a lost
-response, a killed worker, a duplicate submission, cancellation at a step boundary,
-and a node task that outlives its caller. Until then, advertise only the local test
-path.
+The remote M0.3 gate is open for the pinned SSH endpoint: it passes the same
+exactly-once scenarios as the local suite, including a lost response, a killed
+worker, a duplicate submission, cancellation at a step boundary, and a node task
+that outlives its caller. The gate stays closed for userspace WireGuard until a
+WireGuard endpoint passes the same scenarios. Advertise only the tested path.
