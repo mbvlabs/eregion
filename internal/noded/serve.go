@@ -261,6 +261,11 @@ func runResponse(config Config, steps *node.StepRegistry, request node.Request) 
 // channel neither signals it nor writes into the channel. The request reaches
 // the child through an inherited pipe, so a transient secret never touches
 // the node's disk.
+//
+// The request is written before this function returns, so a serving process
+// that exits as soon as the channel closes never drops it. A failed write is
+// an explicit error: the child is stopped instead of running without a
+// request.
 func SpawnTask(config Config, request node.Request) error {
 	readEnd, writeEnd, err := os.Pipe()
 	if err != nil {
@@ -295,10 +300,22 @@ func SpawnTask(config Config, request node.Request) error {
 		_ = writeEnd.Close()
 		return err
 	}
-	go func() {
-		defer func() { _ = writeEnd.Close() }()
-		_, _ = writeEnd.Write(raw)
-	}()
+	// The child owns its own copy of the read end; this process does not need
+	// it and must not hold the request pipe open.
+	_ = readEnd.Close()
+	// The request is written synchronously. The child reads it immediately,
+	// and a serving process that exits when the channel closes must never
+	// drop it. The request is bounded by the protocol's frame limit.
+	if _, err := writeEnd.Write(raw); err != nil {
+		_ = writeEnd.Close()
+		// The child never received the request, so it cannot do anything
+		// useful. It is stopped instead of being left behind.
+		_ = command.Process.Kill()
+		go func() { _ = command.Wait() }()
+		return fmt.Errorf("write the node task request: %w", err)
+	}
+	// The write end is closed so the child sees the end of the request.
+	_ = writeEnd.Close()
 	go func() { _ = command.Wait() }()
 	return nil
 }

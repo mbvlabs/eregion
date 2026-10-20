@@ -112,5 +112,11 @@ func (c Config) taskCommand() []string {
 	if len(c.TaskCommand) > 0 {
 		return c.TaskCommand
 	}
-	return []string{os.Args[0], "task", "--config", c.Path}
+	// The executable path is resolved, not the argument vector: the argument
+	// vector may name the binary in a way the detached child cannot start.
+	executable, err := os.Executable()
+	if err != nil {
+		executable = os.Args[0]
+	}
+	return []string{executable, "task", "--config", c.Path}
 }
