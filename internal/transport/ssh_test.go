@@ -257,6 +257,30 @@ func TestSSHTransportRefusesARevokedHostKey(t *testing.T) {
 	}
 }
 
+// TestSSHTransportWaitFollowsTheContextDeadline proves that the wait for a
+// detached node task ends with the caller's deadline and not with the
+// transport's own bound.
+func TestSSHTransportWaitFollowsTheContextDeadline(t *testing.T) {
+	server := newTestServer(t)
+	client := server.transport(t, nil)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := client.Call(ctx, runRequest(t, exec, 1000), nil)
+	if err == nil {
+		t.Fatal("a wait that ended with the deadline reported success")
+	}
+	if !node.IsStreamLost(err) {
+		t.Fatalf("the wait that ended with the deadline is not explicit: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Fatalf("the wait did not follow the deadline: %s", elapsed)
+	}
+}
+
+// TestSSHTransportRequiresAPinnedHostKey proves that a node without a pinned
+// host key is refused.
 func TestSSHTransportRequiresAPinnedHostKey(t *testing.T) {
 	server := newTestServer(t)
 	_, err := NewSSHTransport(SSHConfig{

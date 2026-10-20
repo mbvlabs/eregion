@@ -31,7 +31,12 @@ const DefaultPollInterval = 200 * time.Millisecond
 
 // DefaultMaxWait bounds how long one call waits for a detached node task.
 // The node task itself keeps running; only the control plane's wait ends.
-const DefaultMaxWait = 10 * time.Minute
+//
+// The wait also ends with the caller's deadline, and that deadline is the
+// effective one in a worker: the River job timeout is one minute. This
+// default stays below that timeout, so the transport's own bound is the
+// visible one and a worker never waits longer than its job.
+const DefaultMaxWait = 45 * time.Second
 
 // DefaultAbsentGrace is how long the transport waits for a node task to appear
 // in the node journal after the node reported that it started. A task that

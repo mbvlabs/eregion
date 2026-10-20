@@ -23,6 +23,11 @@ import (
 
 const diagnosticQueue = "diagnostic"
 
+// jobTimeout is the deadline one River job gets. It is the effective bound
+// for a wait on a detached node task: the transport's own wait bound stays
+// below it, so a worker never waits longer than its job.
+const jobTimeout = time.Minute
+
 // Job arguments deliberately contain an operation reference only, not input or secrets.
 type testArgs struct {
 	OperationID contract.OperationID `json:"operation_id"`
@@ -73,7 +78,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	river.AddWorker(workers, &reconcileWorker{service: service})
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
-		JobTimeout: time.Minute, RescueStuckJobsAfter: 2 * time.Minute,
+		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
 		SoftStopTimeout: 5 * time.Second, TestOnly: config.TestOnly,
 	}
 	if config.Concurrency > 0 {
