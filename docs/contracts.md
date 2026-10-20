@@ -1,11 +1,11 @@
-# M0.1 agent and operation contracts
+# Agent and operation contracts
 
-**Schema:** `eregion/v1` · **Scope:** local CLI foundation and shared domain types.
+**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts and M0.2 diagnostic execution.
 
-The CLI behavior here is implemented. Operation persistence, HTTP transport, token
-issuance, authorization enforcement, River insertion, and remote execution are not.
-Their shared types and invariants are defined now so adapters do not invent separate
-contracts. See [the roadmap](roadmap.md) for implementation order.
+CLI discovery, operation persistence, HTTP transport, scoped authorization, and
+transactional River insertion are implemented. Token issuance, destructive-operation
+confirmations, remote execution, and interactive viewing are not. See
+[control-plane setup](control-plane.md) for the current API and limitations.
 
 ## Compatibility
 
@@ -27,9 +27,10 @@ counts are wire-encoded decimal strings.
 
 ## Implemented command surface
 
-`eregion`, `eregion commands`, `eregion help [command...]`, and `eregion version`.
-The root provides orientation. There are no deployment stubs or implicitly installed
-completion commands. Planned capabilities appear in the roadmap, not the catalog.
+The root, `commands`, `help`, and `version` provide discovery. M0.2 adds `serve`,
+`worker`, `system migrate`, and `operations test/get/events/cancel`, plus their
+help-only groups. There are no deployment stubs or implicit completion commands.
+Planned capabilities appear in the roadmap, not the catalog.
 
 `commands --path version` returns the exact command descriptor, including inherited
 flags. `commands --json` lists the complete implemented tree, including root/help.
@@ -43,7 +44,7 @@ is a build/test gate, not an authorization mechanism or proof of handler safety.
 
 ## Output and noninteractive behavior
 
-- `--output plain` is the default for both terminals and pipes in M0.1. It is
+- `--output plain` is the default for both terminals and pipes. It is
   append-only text: successful output on stdout; errors and hints on stderr.
 - `--output json` / `--json` emits exactly one newline-terminated result envelope
   on stdout. Expected failures do not also print usage, diagnostics, or a second
@@ -57,7 +58,9 @@ is a build/test gate, not an authorization mechanism or proof of handler safety.
 - Output I/O failure exits 70. A partial write cannot be repaired by appending
   another envelope; the CLI emits only a fixed safe diagnostic on stderr.
 - `NO_COLOR` and `TERM=dumb` require no special handling yet because output is
-  already unstyled. Interactive presentation is reserved for M0.4.
+  already unstyled. Interactive presentation is reserved for M0.4. Foreground
+  service commands log lifecycle information to stderr and emit their final result
+  only on shutdown; request commands retain the one-envelope behavior.
 
 Success example (build information abbreviated):
 
@@ -104,15 +107,16 @@ text. Cobra argument/flag errors become typed usage/input errors.
   a digest of normalized validated inputs.
 - The same scoped key/input returns the original operation; the same scoped key
   with different input fails with `conflict`. Database constraints and transactional
-  insertion must enforce this across control planes in M0.2.
+  insertion enforce this across control-plane processes in M0.2.
 - A timed-out submission is ambiguous: reuse its idempotency key to discover the
   original outcome. Never blindly submit again with a fresh key.
 
 The `operations.Service` interface is shared by future application/transport/UI
 adapters. It defines submit/get/events/request-cancel without coupling consumers
-to River, PostgreSQL, Cobra, or Charm. Submission inputs and job arguments reference
-secrets; they must not contain credential plaintext. There is no service
-implementation or externally exposed operation endpoint in M0.1.
+to River, PostgreSQL, Cobra, or Charm. Submission inputs and job arguments must not
+contain credential plaintext. The implemented diagnostic accepts bounded numeric
+input only; River arguments contain only the operation ID. The PostgreSQL service
+and HTTP client/handler are concrete adapters, not separate business-logic paths.
 
 ## State transitions and retry
 
@@ -128,7 +132,7 @@ cancelling -> cancelled | succeeded | failed
 constitute state transitions. River retries within a still-running operation
 increment `attempt`; they do not rewrite terminal state. Attempt 0 means execution
 has not started. An explicit retry of terminal work creates a new linked operation;
-the corrective-link persistence model comes with the domain schema in M0.2/M3.
+the corrective-link persistence model and terminal retry command remain future work.
 
 A cancellation request is not an acknowledgement. Work can complete while a
 request is in flight or after reaching a noninterruptible boundary. Leaving a
@@ -143,7 +147,8 @@ has stopped or is still healthy.
 Events have operation ID, monotonically increasing per-operation sequence,
 timestamp, kind, and attempt, with optional stage/message/state/measurement fields.
 Timestamps are RFC 3339; producers use UTC. Sequences—not timestamps—define order.
-Sequence starts at 1. Snapshot `last_sequence` and cursor `after` may be 0.
+Sequence starts at 1. Cursor `after` may be 0. Accepted M0.2 snapshots contain at
+least their accepted-event sequence; zero represents pre-acceptance in shared types.
 
 64-bit counters (`sequence`, `last_sequence`, `after`, progress counts) are canonical
 decimal **strings** on the wire to avoid JavaScript precision loss. Readers must
@@ -160,8 +165,9 @@ A cursor is `{operation_id, after}`. Fetch returns bounded ascending events stri
 after `after`. Reconnect reuses it and refreshes the snapshot. Clients deduplicate
 by operation ID/sequence. The service must report expired retention cursors as
 `precondition_failed`, not silently skip history. Sequence allocation, event/snapshot
-transactionality, retention, authorization, limits, and wake-up transport arrive in
-M0.2; the types do not claim persistence is implemented.
+transactionality, authorization, and bounded paging are implemented in M0.2.
+Events are not pruned yet, gaps are explicit errors, and no live event-stream
+transport or wake-up mechanism is exposed yet.
 
 The tested NDJSON serializer emits records shaped as:
 
@@ -177,8 +183,8 @@ rejects invalid events, mixed operation IDs, nonincreasing sequences, and writes
 after the final record. It never appends after a partial write.
 
 There is **no `operations follow` command yet**. The example specifies its future
-wire shape only. `--output ndjson` is deliberately rejected by current read commands;
-event-following commands will opt into streaming when implemented.
+wire shape only. `operations events` currently returns a bounded JSON page.
+`--output ndjson` remains rejected; future following commands will opt into streaming.
 
 ## Confirmation binding
 
@@ -186,11 +192,11 @@ event-following commands will opt into streaming when implemented.
 revision, normalized input SHA-256, and expiry (canonicalized to UTC). Changing any
 bound value changes the digest. **The digest is not an authorization token.**
 
-M0.2's authenticated service must issue unforgeable confirmations, enforce expiry,
+A future destructive-operation service must issue unforgeable confirmations, enforce expiry,
 re-resolve identity, revalidate the current revision/inputs, and compare the binding
 before enqueueing a confirmed operation. Token signing/key distribution and replay
 policy need design before destructive commands ship. There is no `--yes` bypass,
-token issuer, or destructive command in M0.1.
+token issuer, or destructive operation command in M0.2.
 
 ## Redaction and safe terminal text
 
@@ -210,5 +216,7 @@ terminal control and bidi-format characters visible; it does not execute ANSI/OS
 
 Redaction is a final defense, not permission to place secrets in domain history.
 It only recognizes registered exact values; encoded/transformed variants must be
-registered explicitly or omitted. Each authenticated request/worker will need its
-own registry and safe logging boundary when those components are added.
+registered explicitly or omitted. CLI environment credentials are registered before
+parsing; API response registries include the request's Bearer credential; service
+logs use a redacting, terminal-safe writer. Diagnostic jobs/events never accept
+arbitrary secret material.

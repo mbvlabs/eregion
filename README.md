@@ -4,14 +4,15 @@ An **agent-first** self-hosted application platform for user-owned Debian and Ub
 servers. Human terminal experiences come second, with a rich Charm-based interface
 planned on top of the same machine-readable contracts. A web UI can come later.
 
-**Current state: M0.1 — CLI foundation.** Discovery, help, version information, and
-shared operation/output contracts are implemented. There is no running control
-plane, database connection, job worker, bootstrap, or deployment command yet.
+**Current state: M0.2 — durable diagnostic operations.** The authenticated API,
+external PostgreSQL state, explicit migrations, and River workers are implemented.
+The diagnostic operation changes only database records/events. Host bootstrap,
+deployments, remote node execution, and the Charm viewer are not implemented yet.
 
 ## Build and explore
 
 Requires Go 1.27.1 or newer and [just](https://just.systems/). No database or
-credentials are needed for this milestone.
+credentials are needed for local discovery and help.
 
 ```sh
 just build
@@ -32,17 +33,23 @@ just check    # formatting, go vet, unit/contract/schema/executable tests
 just race     # race-detector tests
 ```
 
-Linux CI runs all checks; macOS and Windows CI test the portable operator CLI.
+For the first live operation, see [control-plane setup](docs/control-plane.md).
+`just integration` runs PostgreSQL/River/API/process-crash tests when
+`EREGION_TEST_DATABASE_URL` points to a disposable PostgreSQL server.
+
+Linux CI runs unit/race checks and a separate PostgreSQL 17 integration job;
+macOS and Windows CI test the portable operator CLI.
 Server support will be a separate Debian/Ubuntu VM matrix once host operations exist.
 
 ## Design and contracts
 
 - [Implementation roadmap](docs/roadmap.md)
 - [Agent/wire contracts and exit codes](docs/contracts.md)
+- [Control-plane setup and API](docs/control-plane.md)
 - [Research and architecture](docs/initial_research.md)
 - [TUI design](docs/tui-design.md) and [interactive sketches](docs/design/tui-sketches.html)
 - [Versioned JSON Schema](schema/eregion-v1.json)
 
 The intended control plane uses external PostgreSQL and River, role-focused
-servers, an early automation API, and external telemetry integrations. M0.2 adds
-the first durable operation; the current operation service is an interface only.
+servers, an early automation API, and external telemetry integrations. M0.2 proves
+durable execution with database-only diagnostics; it is not a production PaaS yet.

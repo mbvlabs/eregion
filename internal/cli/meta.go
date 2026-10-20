@@ -30,6 +30,7 @@ type CommandMeta struct {
 	Prompts          bool            `json:"prompts"`
 	InputFlags       []string        `json:"input_flags,omitempty"`
 	Remote           bool            `json:"remote"`
+	Environment      []string        `json:"environment,omitempty"`
 	NeedsRestart     string          `json:"needs_restart"`
 	Output           string          `json:"output"`
 	ErrorCodes       []contract.Code `json:"error_codes"`

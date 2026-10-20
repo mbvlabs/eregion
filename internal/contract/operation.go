@@ -100,6 +100,19 @@ type Operation struct {
 	UpdatedAt    time.Time   `json:"updated_at"`
 }
 
+func (o Operation) Validate() error {
+	if err := o.ID.Validate(); err != nil {
+		return err
+	}
+	if err := o.Actor.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(o.Kind) == "" || strings.TrimSpace(o.Target) == "" || !o.State.Valid() || o.CreatedAt.IsZero() || o.UpdatedAt.IsZero() || o.LastSequence == 0 || ((o.State == Running || o.State == Succeeded) && o.Attempt == 0) {
+		return NewFault(ValidationFailed, "invalid operation snapshot", "Require authoritative identity, state, timestamps, attempt, and accepted-event sequence.")
+	}
+	return nil
+}
+
 // Cursor is scoped to an operation. After is exclusive. String-encoded sequence
 // numbers survive JavaScript clients without losing integer precision.
 type Cursor struct {

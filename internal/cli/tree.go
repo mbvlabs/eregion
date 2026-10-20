@@ -7,6 +7,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -19,11 +20,12 @@ type result struct {
 }
 
 type spec struct {
-	use   string
-	meta  CommandMeta
-	args  cobra.PositionalArgs
-	flags func(*cobra.Command)
-	run   func(*cobra.Command, []string) (result, error)
+	use      string
+	meta     CommandMeta
+	args     cobra.PositionalArgs
+	flags    func(*cobra.Command)
+	run      func(*cobra.Command, []string) (result, error)
+	children []spec
 }
 
 type app struct {
@@ -31,6 +33,7 @@ type app struct {
 	meta    registry
 	result  result
 	started bool
+	secrets *secrets.Registry
 }
 
 func readMeta(summary string, when, examples []string, next ...string) CommandMeta {
@@ -43,7 +46,7 @@ func readMeta(summary string, when, examples []string, next ...string) CommandMe
 }
 
 func newApp() *app {
-	a := &app{meta: make(registry)}
+	a := &app{meta: make(registry), secrets: &secrets.Registry{}}
 	rootSpec := spec{
 		use: "eregion",
 		meta: readMeta("Agent-first application platform",
@@ -51,8 +54,8 @@ func newApp() *app {
 			[]string{"eregion commands --json", "eregion --help"}, "eregion commands --json"),
 		run: func(cmd *cobra.Command, _ []string) (result, error) {
 			return result{
-				data:  map[string]any{"version": buildinfo.Current().Version, "commands": []string{"commands", "help", "version"}, "stage": "M0.1 — CLI contracts only"},
-				plain: "eregion — agent-first application platform\n\nImplemented: commands, help, version\nM0.1: CLI contracts only; no control-plane or deployment commands yet.\n\nNext: eregion commands --json",
+				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "M0.2 — durable diagnostic operations", "commands": a.meta.catalog(a.root)},
+				plain: "eregion — agent-first application platform\n\nM0.2: PostgreSQL/River diagnostic operations and automation API.\nNo host bootstrap or application deployment commands yet.\n\nNext: eregion commands --json",
 			}, nil
 		},
 	}
@@ -69,12 +72,8 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, spec := range a.specs() {
-		cmd := a.command(spec)
-		a.root.AddCommand(cmd)
-		if cmd.Name() == "help" {
-			a.root.SetHelpCommand(cmd)
-		}
+	for _, s := range append(a.specs(), a.runtimeSpecs()...) {
+		a.attach(a.root, s)
 	}
 	a.root.SetHelpFunc(func(cmd *cobra.Command, _ []string) {
 		a.started = true
@@ -95,6 +94,10 @@ func (a *app) command(s spec) *cobra.Command {
 	}
 	cmd.Args = func(cmd *cobra.Command, values []string) error {
 		if err := args(cmd, values); err != nil {
+			var fault *contract.Fault
+			if errors.As(err, &fault) {
+				return err
+			}
 			return contract.NewFault(contract.Usage, err.Error(), "Inspect the command with --help --json.")
 		}
 		return nil
@@ -114,6 +117,31 @@ func (a *app) command(s spec) *cobra.Command {
 	}
 	a.meta[cmd] = s.meta
 	return cmd
+}
+
+func (a *app) attach(parent *cobra.Command, s spec) {
+	cmd := a.command(s)
+	parent.AddCommand(cmd)
+	if parent == a.root && cmd.Name() == "help" {
+		a.root.SetHelpCommand(cmd)
+	}
+	for _, child := range s.children {
+		a.attach(cmd, child)
+	}
+}
+
+func (a *app) valueFlags() []string {
+	var names []string
+	for _, cmd := range walk(a.root) {
+		for _, flags := range []*pflag.FlagSet{cmd.LocalFlags(), cmd.PersistentFlags()} {
+			flags.VisitAll(func(flag *pflag.Flag) {
+				if flag.NoOptDefVal == "" && flag.Name != "output" {
+					names = append(names, flag.Name)
+				}
+			})
+		}
+	}
+	return names
 }
 
 func (a *app) specs() []spec {

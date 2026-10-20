@@ -11,8 +11,8 @@ without a terminal or a browser. A human can use the same contracts through an
 exceptional Charm-based terminal interface. Neither client owns execution lifetime.
 
 This is a dependency-ordered plan, not a delivery-date estimate. Checkboxes denote
-verified deliverables, not the presence of placeholder commands. M0.1 is implemented;
-later milestones remain planned. The browser sketches use synthetic fixtures only.
+verified deliverables, not the presence of placeholder commands. M0.1 and M0.2 are
+implemented; later milestones remain planned. Browser sketches use synthetic data.
 
 ## Constraints that apply to every milestone
 
@@ -55,21 +55,26 @@ running service. See [contracts](contracts.md) for invariants and deferred behav
 
 ### M0.2 — PostgreSQL, River, and the API
 
-- [ ] Decide the database driver/transaction interface by inspecting deploycrate's
+- [x] Decide the database driver/transaction interface by inspecting deploycrate's
   `queue/queue.go`, storage abstraction, and transaction boundaries. Reuse River
   patterns, not unreviewed global queue limits or worker counts.
-- [ ] Add explicit migrations for a minimal operation/event model and River schema.
-- [ ] Implement a harmless, explicitly named test operation. Domain state and job
+- [x] Add explicit migrations for a minimal operation/event model and River schema.
+- [x] Implement a harmless, explicitly named test operation. Domain state and job
   insertion commit together; an injected transaction failure commits neither.
-- [ ] Add authenticated submission, operation read, and cursor-based event access.
+- [x] Add authenticated submission, operation read, and cursor-based event access.
   Define authorization, limits, timeouts, readiness, and graceful shutdown.
-- [ ] Implement durable progress, bounded retries, and visible terminal failure.
+- [x] Implement durable progress, bounded retries, and visible terminal failure.
   A client timeout must not silently resubmit an operation with a new identity.
-- [ ] Introduce API/worker service entry points. Keep their lifecycle separable even
+- [x] Introduce API/worker service entry points. Keep their lifecycle separable even
   if the initial deployment uses one supervised process.
 
 **Gate:** a CLI or API client submits once, disconnects, and reconnects to the same
 operation. Two worker instances can run; a worker crash does not lose accepted work.
+
+**Delivered:** native pgx/River transactions, explicit migrations, scoped hashed-token
+API auth, diagnostic submission/read/events/cancel commands, separate API/worker
+entry points, and PostgreSQL/process integration tests. See [setup and limitations](control-plane.md).
+No remote host execution, deployment, interactive viewer, or complete HA claim yet.
 
 ### M0.3 — Node execution and recovery boundary
 
@@ -218,7 +223,7 @@ These are unresolved, not silently approved by the sketches:
 
 ## First implementation batch
 
-M0.1 is complete; begin **M0.2** next, keeping commits reviewable. Use synthetic operation
+M0.1 and M0.2 are complete; begin **M0.3** next, keeping commits reviewable. Use synthetic operation
 fixtures from the sketches to test output and reducer contracts while PostgreSQL
 integration is built. Add the real Charm operation viewer in M0.4, not a separate
 demo CLI that grows its own business logic.

@@ -19,10 +19,12 @@ func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 }
 
 func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer, registry *secrets.Registry) int {
-	mode, err := output.OptionsFromArgs(args, "path")
+	registerEnvironmentSecrets(registry)
+	a := newApp()
+	a.secrets = registry
+	mode, err := output.OptionsFromArgs(args, a.valueFlags()...)
 	writer := output.Writer{Out: out, Err: stderr, Mode: mode, Secrets: registry}
 	command := "eregion"
-	a := newApp()
 	if err == nil {
 		err = a.meta.validate(a.root)
 	}
@@ -32,7 +34,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 	if err == nil {
 		a.root.SetIn(in)
 		a.root.SetOut(io.Discard)
-		a.root.SetErr(io.Discard)
+		a.root.SetErr(stderr)
 		a.root.SetArgs(args)
 		cmd, executeErr := a.root.ExecuteContextC(ctx)
 		if cmd != nil {

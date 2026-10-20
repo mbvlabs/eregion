@@ -118,12 +118,15 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 	if err := json.Unmarshal(raw, &data); err != nil {
 		t.Fatal(err)
 	}
-	if len(data.Commands) != 4 {
+	if len(data.Commands) != 13 {
 		t.Fatalf("unexpected command catalog: %s", raw)
 	}
 	for _, command := range data.Commands {
-		if command.Mutating || command.Prompts || command.Output != "result" {
+		if command.Prompts || command.Output != "result" || command.Destructive {
 			t.Fatalf("advertised unimplemented behavior: %+v", command)
+		}
+		if command.Mutating && !command.DryRun && command.DryRunReason == "" {
+			t.Fatalf("mutation lacks preview/exemption: %+v", command)
 		}
 		flags := map[string]bool{}
 		for _, flag := range command.Flags {
