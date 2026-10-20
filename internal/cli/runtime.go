@@ -167,16 +167,7 @@ func apiResult(raw json.RawMessage) result {
 }
 
 func (a *app) client(cmd *cobra.Command) (*api.Client, error) {
-	endpoint, _ := cmd.Flags().GetString("api-url")
-	if endpoint == "" {
-		endpoint = os.Getenv("EREGION_API_URL")
-	}
-	if endpoint == "" {
-		endpoint = "http://127.0.0.1:8080"
-	}
-	token := os.Getenv("EREGION_API_TOKEN")
-	a.secrets.Add(token)
-	return api.NewClient(endpoint, token)
+	return a.contextClient(cmd)
 }
 
 func (a *app) submitTest(cmd *cobra.Command, _ []string) (result, error) {

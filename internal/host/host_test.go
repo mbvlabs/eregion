@@ -192,6 +192,48 @@ func (o outputExec) Run(context.Context, string, string, map[string]string, engi
 	return errors.New("unexpected apply")
 }
 
+func TestRoleAwareStepsInstallMainStackWithoutTelemetry(t *testing.T) {
+	main := fixture(t, RoleMain)
+	main.PlatformPath = filepath.Join(t.TempDir(), "os-release")
+	put(t, main.PlatformPath, "ID=ubuntu\nVERSION_ID=24.04\n", 0o600)
+	runner := testRunner(t, main, newFakeExec())
+	steps, err := runner.steps(Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, step := range steps {
+		ids[step.ID()] = true
+	}
+	for _, required := range []string{"host-platform-v1", "host-packages-v1", "host-docker-v1", "host-buildpacks-v1", "host-registry-v1", "host-database-v1", "host-api-service-v1", "host-worker-service-v1"} {
+		if !ids[required] {
+			t.Fatalf("main role is missing %s: %v", required, ids)
+		}
+	}
+	role, _ := main.RoleConfig()
+	if role.Telemetry {
+		t.Fatal("main role must not install telemetry")
+	}
+	application := fixture(t, RoleApplication)
+	appRunner := testRunner(t, application, newFakeExec())
+	appSteps, err := appRunner.steps(Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range appSteps {
+		switch step.ID() {
+		case "host-buildpacks-v1", "host-registry-v1", "host-database-v1", "host-api-service-v1", "host-worker-service-v1":
+			t.Fatalf("application role must not run %s", step.ID())
+		}
+		if step.ID() == "host-docker-v1" || step.ID() == "host-binary-v1" || step.ID() == "host-node-config-v1" {
+			ids[step.ID()] = true
+		}
+	}
+	if !ids["host-docker-v1"] || !ids["host-binary-v1"] || !ids["host-node-config-v1"] {
+		t.Fatal("application role lacks its runtime, node binary, or node config")
+	}
+}
+
 func TestPlanResumeAndDrift(t *testing.T) {
 	ctx := context.Background()
 	cfg := fixture(t, RoleApplication)
@@ -268,42 +310,113 @@ func TestPlanResumeAndDrift(t *testing.T) {
 	}
 }
 
-func TestAccessChangesFailClosedWithoutWrites(t *testing.T) {
-	for _, variant := range []string{"ssh", "public-api", "tls", "live-main", "binary-update", "node-config"} {
-		t.Run(variant, func(t *testing.T) {
-			role := RoleMain
-			if variant == "ssh" || variant == "binary-update" || variant == "node-config" {
-				role = RoleApplication
-			}
-			cfg := fixture(t, role)
-			switch variant {
-			case "ssh":
-				cfg.NodeAuthorizedKeysFile = filepath.Join(t.TempDir(), "keys")
-				put(t, cfg.NodeAuthorizedKeysFile, "ssh-ed25519 AAAA fixture", 0o600)
-			case "public-api":
-				cfg.APIListen, cfg.APITLSCert, cfg.APITLSKey = "0.0.0.0:8080", "cert", "key"
-			case "tls":
-				cfg.APITLSCert, cfg.APITLSKey = "cert", "key"
-			case "live-main":
-				put(t, filepath.Join(cfg.Layout.SystemdDir, "eregion-api.service"), "old unit", 0o644)
-			case "binary-update":
-				put(t, filepath.Join(cfg.Layout.BinDir, "eregion-node"), "old binary", 0o755)
-			case "node-config":
-				put(t, filepath.Join(cfg.Layout.ConfigDir, "node.json"), "old identity", 0o600)
-			}
-			exec := newFakeExec()
-			runner := testRunner(t, cfg, exec)
-			_, err := runner.Apply(context.Background(), "anything", true)
-			if err == nil || !strings.Contains(err.Error(), "not implemented") {
-				t.Fatalf("access risk bypassed gate: %v", err)
-			}
-			if len(exec.scripts) != 0 {
-				t.Fatal("access gate mutated host")
-			}
-			if _, err := os.Stat(cfg.Layout.StateDir); !os.IsNotExist(err) {
-				t.Fatal("access gate wrote state")
-			}
-		})
+func TestAccessChangeRequiresCommitAndRollsBack(t *testing.T) {
+	ctx := context.Background()
+	cfg := fixture(t, RoleApplication)
+	// An existing different node binary is an access-changing update.
+	dest := filepath.Join(cfg.Layout.BinDir, "eregion-node")
+	put(t, dest, "old node binary", 0o755)
+	exec := newFakeExec()
+	runner := testRunner(t, cfg, exec)
+	var scriptPath string
+	runner.SpawnWatchdog = func(path string) error { scriptPath = path; return nil }
+	plan, err := runner.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.AccessChanges) == 0 {
+		t.Fatal("binary update was not reported as an access change")
+	}
+	report, err := runner.Apply(ctx, plan.Confirmation.Token, false)
+	var fault *contract.Fault
+	if !errors.As(err, &fault) || fault.Code != contract.ConfirmationRequired {
+		t.Fatalf("access-changing apply did not require commit: %v", err)
+	}
+	if !report.Pending || report.OperationID == "" {
+		t.Fatalf("no pending commit identity: %+v", report)
+	}
+	state, exists, err := loadState(cfg)
+	if err != nil || !exists || state.CommitID != report.OperationID || !state.Active {
+		t.Fatalf("pending commit not journaled: %+v %v", state, err)
+	}
+	if scriptPath == "" {
+		t.Fatal("watchdog was not armed")
+	}
+	raw, err := os.ReadFile(scriptPath)
+	if err != nil || !bytes.Contains(raw, []byte("confirmed")) || !bytes.Contains(raw, []byte("rolled-back")) {
+		t.Fatalf("watchdog script does not implement commit-confirm: %q %v", raw, err)
+	}
+	if err := runner.rollbackCommit(report.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	restored, _, _, err := fileState(dest)
+	if err != nil || string(restored) != "old node binary" {
+		t.Fatalf("rollback did not restore the previous binary: %q %v", restored, err)
+	}
+	if _, err := os.Stat(commitRolledBackPath(cfg, report.OperationID)); err != nil {
+		t.Fatal("rollback marker missing", err)
+	}
+}
+
+func TestCommitConfirmClosesWindow(t *testing.T) {
+	ctx := context.Background()
+	cfg := fixture(t, RoleApplication)
+	put(t, filepath.Join(cfg.Layout.BinDir, "eregion-node"), "old node binary", 0o755)
+	exec := newFakeExec()
+	runner := testRunner(t, cfg, exec)
+	runner.SpawnWatchdog = func(string) error { return nil }
+	plan, err := runner.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := runner.Apply(ctx, plan.Confirmation.Token, false)
+	if err == nil || report.OperationID == "" {
+		t.Fatalf("expected pending commit: %v", err)
+	}
+	confirmed, err := runner.Confirm(ctx, report.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed.AlreadyConfirmed || confirmed.OperationID != report.OperationID {
+		t.Fatalf("bad confirmation: %+v", confirmed)
+	}
+	state, _, err := loadState(cfg)
+	if err != nil || state.Active || state.CommitID != "" || state.CompletedAt.IsZero() {
+		t.Fatalf("commit did not finish state: %+v %v", state, err)
+	}
+	if _, err := os.Stat(commitConfirmedPath(cfg, report.OperationID)); err != nil {
+		t.Fatal("confirmation marker missing", err)
+	}
+	if again, err := runner.Confirm(ctx, report.OperationID); err != nil || !again.AlreadyConfirmed {
+		t.Fatalf("repeat confirmation: %+v %v", again, err)
+	}
+}
+
+func TestCommitConfirmRejectsExpiredWindow(t *testing.T) {
+	ctx := context.Background()
+	cfg := fixture(t, RoleApplication)
+	put(t, filepath.Join(cfg.Layout.BinDir, "eregion-node"), "old node binary", 0o755)
+	runner := testRunner(t, cfg, newFakeExec())
+	runner.SpawnWatchdog = func(string) error { return nil }
+	plan, err := runner.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := runner.Apply(ctx, plan.Confirmation.Token, false)
+	if err == nil || report.OperationID == "" {
+		t.Fatalf("expected pending commit: %v", err)
+	}
+	runner.Now = func() time.Time { return time.Unix(1800000000, 0).Add(DefaultCommitConfirmWindow + time.Second) }
+	if _, err := runner.Confirm(ctx, report.OperationID); err == nil {
+		t.Fatal("expired confirmation accepted")
+	}
+	hash, err := cfg.ConfigHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	projected, err := projectState(cfg, hash, runner.Now())
+	if err != nil || projected.CommitID != "" || !projected.Active {
+		t.Fatalf("expired window did not clear for a fresh plan: %+v %v", projected, err)
 	}
 }
 

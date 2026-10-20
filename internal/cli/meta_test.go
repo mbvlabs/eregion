@@ -50,7 +50,9 @@ func TestMetadataGate(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			a := newApp()
-			c := a.root.Commands()[0]
+			// Use a portable command so the metadata gate test exercises the
+			// validator, not the first Linux-only command added to the tree.
+			c, _, _ := a.root.Find([]string{"version"})
 			meta := a.meta[c]
 			test.change(a, c, &meta)
 			if test.name != "missing" {
@@ -74,7 +76,7 @@ func TestMetadataGate(t *testing.T) {
 
 func TestValidMutationMetadata(t *testing.T) {
 	a := newApp()
-	c := a.root.Commands()[0]
+	c, _, _ := a.root.Find([]string{"version"})
 	meta := a.meta[c]
 	meta.Mutating, meta.Destructive, meta.DryRun = true, true, true
 	meta.Confirmation = "plan-bound"

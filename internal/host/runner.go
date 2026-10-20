@@ -25,6 +25,12 @@ type Runner struct {
 	Secrets    *secrets.Registry
 	Now        func() time.Time
 
+	// Reporter receives redacted step progress. The CLI writes it to stderr so
+	// a remote apply can be followed while the final envelope stays on stdout.
+	Reporter engine.Reporter
+	// SpawnWatchdog exists for tests; production starts a detached shell.
+	SpawnWatchdog func(string) error
+
 	// SkipRootCheck exists only for unit tests. Real apply is root-only.
 	SkipRootCheck bool
 }
@@ -32,21 +38,22 @@ type Runner struct {
 // Plan is a read-only preview. It is also the source of the confirmation
 // token required by Apply.
 type Plan struct {
-	Node         string       `json:"node"`
-	Role         Role         `json:"role"`
-	Platform     Platform     `json:"platform"`
-	Supported    bool         `json:"supported"`
-	ConfigHash   string       `json:"config_hash"`
-	Generation   uint32       `json:"generation"`
-	OperationID  string       `json:"operation_id"`
-	Resumed      bool         `json:"resumed"`
-	Ready        bool         `json:"ready"`
-	AccessRisks  []string     `json:"access_risks,omitempty"`
-	Steps        []PlanEntry  `json:"steps"`
-	Confirmation Confirmation `json:"confirmation"`
-	Journal      string       `json:"journal"`
-	StateFile    string       `json:"state_file"`
-	ApplyBlocked string       `json:"apply_blocked,omitempty"`
+	Node          string         `json:"node"`
+	Role          Role           `json:"role"`
+	Platform      Platform       `json:"platform"`
+	Supported     bool           `json:"supported"`
+	ConfigHash    string         `json:"config_hash"`
+	Generation    uint32         `json:"generation"`
+	OperationID   string         `json:"operation_id"`
+	Resumed       bool           `json:"resumed"`
+	Ready         bool           `json:"ready"`
+	AccessRisks   []string       `json:"access_risks,omitempty"`
+	AccessChanges []AccessChange `json:"access_changes,omitempty"`
+	Steps         []PlanEntry    `json:"steps"`
+	Confirmation  Confirmation   `json:"confirmation"`
+	Journal       string         `json:"journal"`
+	StateFile     string         `json:"state_file"`
+	ApplyBlocked  string         `json:"apply_blocked,omitempty"`
 }
 
 // ApplyReport is returned after a successful convergence. A failed apply is a
@@ -59,6 +66,11 @@ type ApplyReport struct {
 	Steps       []ApplyEntry `json:"steps"`
 	Resumed     bool         `json:"resumed"`
 	CompletedAt time.Time    `json:"completed_at"`
+	// Pending is true when an access-changing apply is live but not yet
+	// committed by bootstrap confirm.
+	Pending        bool           `json:"pending,omitempty"`
+	CommitDeadline time.Time      `json:"commit_deadline,omitempty"`
+	AccessChanges  []AccessChange `json:"access_changes,omitempty"`
 }
 
 // ApplyEntry reports one step's engine outcome. Executed is false when a
@@ -83,6 +95,20 @@ func NewRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	return newRunner(cfg, registry), nil
+}
+
+// NewConfirmRunner is the narrow constructor for `bootstrap confirm`. It needs
+// only the host layout, not the database URL or credential outputs that the
+// original apply used; those values are in the journal.
+func NewConfirmRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
+	if err := cfg.Layout.Validate(); err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, err.Error(), "Use the default bootstrap layout or the layout used by the original apply.")
+	}
+	return newRunner(cfg, registry), nil
+}
+
+func newRunner(cfg Config, registry *secrets.Registry) *Runner {
 	if registry == nil {
 		registry = &secrets.Registry{}
 	}
@@ -95,7 +121,7 @@ func NewRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
 		Now:      time.Now,
 	}
 	runner.Downloader = HTTPDownloader{}
-	return runner, nil
+	return runner
 }
 
 func (r *Runner) now() time.Time {
@@ -103,6 +129,13 @@ func (r *Runner) now() time.Time {
 		return time.Now()
 	}
 	return r.Now()
+}
+
+func (r *Runner) spawnWatchdog(path string) error {
+	if r.SpawnWatchdog != nil {
+		return r.SpawnWatchdog(path)
+	}
+	return spawnDetached(path)
 }
 
 func (r *Runner) steps(credentials Credentials) ([]Step, error) {
@@ -160,9 +193,6 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 		return plan, nil
 	}
 	plan.Supported = true
-	if err := accessGate(r.Config); err != nil {
-		plan.ApplyBlocked = safeError(err)
-	}
 	configHash, err := r.Config.ConfigHash()
 	if err != nil {
 		return Plan{}, err
@@ -179,6 +209,11 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 	if err != nil {
 		return Plan{}, err
 	}
+	changes, err := AccessChanges(r.Config, credentials)
+	if err != nil {
+		return Plan{}, err
+	}
+	plan.AccessChanges = changes
 	r.registerSecrets(credentials)
 	steps, err := r.steps(credentials)
 	if err != nil {
@@ -200,12 +235,13 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 	}
 	risks := r.Config.AccessRisks()
 	plan.AccessRisks = risks
+	bindingRisks := append(append([]string(nil), risks...), changeStrings(changes)...)
 	plan.ConfigHash = configHash
 	plan.Generation = projected.Generation
 	plan.OperationID = projected.OperationID
 	plan.Resumed = exists && state.Active && state.OperationID == projected.OperationID
 	plan.Ready = ready
-	confirmation, err := issueConfirmation("host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, risks), r.now())
+	confirmation, err := issueConfirmation("host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, bindingRisks), r.now())
 	if err != nil {
 		return Plan{}, err
 	}
@@ -215,12 +251,11 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 
 // Apply converges the host after validating the exact plan token. The engine
 // journal is written before the database step, so an interrupted first contact
-// resumes without the platform store.
+// resumes without the platform store. An access-changing apply also arms a
+// detached rollback watchdog and returns confirmation_required; it is not
+// complete until Confirm arrives before the deadline.
 func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRisk bool) (ApplyReport, error) {
 	if err := r.Config.Validate(); err != nil {
-		return ApplyReport{}, err
-	}
-	if err := accessGate(r.Config); err != nil {
 		return ApplyReport{}, err
 	}
 	if !r.SkipRootCheck {
@@ -228,8 +263,8 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 			return ApplyReport{}, err
 		}
 	}
-	risks := r.Config.AccessRisks()
-	// Kept for adapter compatibility, never a bypass for the access gate.
+	// Kept for adapter compatibility; the plan/confirmation binding is the
+	// acknowledgement. No flag bypasses the commit-confirm window.
 	_ = acceptAccessRisk
 	configHash, err := r.Config.ConfigHash()
 	if err != nil {
@@ -239,6 +274,15 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	if err != nil {
 		return ApplyReport{}, err
 	}
+	preview, err := LoadCredentials(r.Config, false)
+	if err != nil {
+		return ApplyReport{}, err
+	}
+	changes, err := AccessChanges(r.Config, preview)
+	if err != nil {
+		return ApplyReport{}, err
+	}
+	risks := append(append([]string(nil), r.Config.AccessRisks()...), changeStrings(changes)...)
 	if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, risks), r.now()); err != nil {
 		return ApplyReport{}, err
 	}
@@ -251,9 +295,6 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	}
 	defer releaseApply()
 	// Revalidate under the whole-apply lock, not just per-effect locks.
-	if err := accessGate(r.Config); err != nil {
-		return ApplyReport{}, err
-	}
 	projected, err = projectState(r.Config, configHash, r.now())
 	if err != nil {
 		return ApplyReport{}, err
@@ -274,6 +315,13 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 		if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, state.Generation, risks), r.now()); err != nil {
 			return ApplyReport{}, err
 		}
+	}
+	if state.CommitID != "" {
+		report := ApplyReport{Node: r.Config.Node, Role: r.Config.Role, OperationID: state.OperationID, Generation: state.Generation, Pending: true, CommitDeadline: state.CommitDeadline}
+		if r.now().Before(state.CommitDeadline) {
+			return report, pendingCommitFault(report, "this access-changing apply is already waiting for confirmation")
+		}
+		return report, contract.NewFault(contract.PreconditionFailed, "the previous rollback window has expired", "Inspect the host, then run bootstrap plan again. Do not assume the pending access change is live.")
 	}
 	if err := ensureState(r.Config); err != nil {
 		return ApplyReport{}, err
@@ -301,24 +349,68 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	if err != nil {
 		return ApplyReport{}, err
 	}
-	report := ApplyReport{Node: r.Config.Node, Role: r.Config.Role, OperationID: state.OperationID, Generation: state.Generation}
+	report := ApplyReport{Node: r.Config.Node, Role: r.Config.Role, OperationID: state.OperationID, Generation: state.Generation, AccessChanges: changes}
+	commit := CommitState{}
+	if len(changes) > 0 {
+		commit, err = r.armCommit(state.OperationID, changes)
+		if err != nil {
+			return report, contract.NewFault(contract.PreconditionFailed, "could not arm the rollback watchdog", "No host mutation was started. Check that the bootstrap state directory is writable and the host can start a detached process; then re-run apply.")
+		}
+		report.CommitDeadline = commit.Deadline
+	}
 	for _, step := range steps {
 		execution := engine.Execution{OperationID: contract.OperationID(state.OperationID), Attempt: state.Generation, Step: step.ID(), RequestID: fmt.Sprintf("bootstrap-%d", state.Generation)}
-		status, runErr := hostEngine.Run(ctx, step, execution, nil)
+		status, runErr := hostEngine.Run(ctx, step, execution, r.Reporter)
 		if runErr != nil {
+			if len(changes) > 0 {
+				_ = r.rollbackCommit(state.OperationID)
+			}
 			return report, r.applyFault(step, execution, status, report, runErr)
 		}
 		entry := ApplyEntry{ID: step.ID(), Complete: status.Status == engine.StatusCompleted, Executed: status.Executed, Detail: status.Detail}
 		report.Steps = append(report.Steps, entry)
 		if !entry.Complete {
+			if len(changes) > 0 {
+				_ = r.rollbackCommit(state.OperationID)
+			}
 			return report, contract.NewFault(contract.Internal, "host step did not complete", "Inspect the bootstrap journal and re-run apply with a fresh plan.")
 		}
+	}
+	if len(changes) > 0 {
+		if err := markCommitPending(r.Config, state.OperationID, commit); err != nil {
+			return report, err
+		}
+		report.Pending = true
+		return report, pendingCommitFault(report, "access-changing apply is live and waiting for commit confirmation")
 	}
 	if err := finishState(r.Config, state.OperationID, r.now()); err != nil {
 		return report, err
 	}
 	report.CompletedAt = r.now().UTC()
 	return report, nil
+}
+
+func changeStrings(changes []AccessChange) []string {
+	out := make([]string, 0, len(changes))
+	for _, change := range changes {
+		out = append(out, change.String())
+	}
+	return out
+}
+
+func pendingCommitFault(report ApplyReport, message string) error {
+	return &contract.Fault{
+		Code:    contract.ConfirmationRequired,
+		Message: message,
+		Hint:    "Verify the host is reachable over the new access path, then run: eregion bootstrap confirm " + report.OperationID,
+		Details: map[string]any{
+			"operation_id":   report.OperationID,
+			"deadline":       report.CommitDeadline.UTC().Format(time.RFC3339),
+			"pending":        true,
+			"access_changes": report.AccessChanges,
+			"completed":      report.Steps,
+		},
+	}
 }
 
 func (r *Runner) applyFault(step Step, execution engine.Execution, status engine.TaskStatus, report ApplyReport, cause error) error {

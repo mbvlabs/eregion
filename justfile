@@ -29,6 +29,11 @@ dev-buildpacks:
 smoke:
     python3 scripts/smoke.py
 
+# Run bootstrap check/plan and journaled apply/resume/idempotency in disposable
+# Debian/Ubuntu containers. This is a proxy: no systemd, Docker daemon, or apt.
+bootstrap-matrix:
+    python3 scripts/bootstrap_matrix.py
+
 # Exercise the real interactive viewer in a resizable pseudo-terminal (requires dev-up).
 terminal-smoke:
     python3 scripts/terminal_smoke.py

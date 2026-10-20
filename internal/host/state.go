@@ -27,6 +27,11 @@ type State struct {
 	Active      bool      `json:"active"`
 	StartedAt   time.Time `json:"started_at"`
 	CompletedAt time.Time `json:"completed_at,omitempty"`
+	// CommitID and CommitDeadline are set after an access-changing apply and
+	// cleared by bootstrap confirm. They are intentionally in the node-local
+	// journal, not in PostgreSQL.
+	CommitID       string    `json:"commit_id,omitempty"`
+	CommitDeadline time.Time `json:"commit_deadline,omitempty"`
 }
 
 func statePath(cfg Config) string { return filepath.Join(cfg.Layout.StateDir, "state.json") }
@@ -58,6 +63,13 @@ func projectState(cfg Config, configHash string, now time.Time) (State, error) {
 	state, exists, err := loadState(cfg)
 	if err != nil {
 		return State{}, err
+	}
+	// A pending commit whose deadline passed has been (or should have been)
+	// rolled back by the watchdog. Clear the window so a fresh plan can retry;
+	// the journal still decides which effects need re-applying.
+	if exists && state.CommitID != "" && !now.Before(state.CommitDeadline) {
+		state.CommitID = ""
+		state.CommitDeadline = time.Time{}
 	}
 	if exists && state.Active && state.Node == cfg.Node && state.Role == cfg.Role && state.ConfigHash == configHash {
 		return state, nil
