@@ -250,6 +250,10 @@ func WriteAuthFile(path string, principals []api.Principal, owner, group string)
 // ReadTokenFile is the CLI adapter for explicit token inputs.
 func ReadTokenFile(path string) (string, error) { return readTokenFile(path) }
 
+// ValidToken reports whether a handed-off value has the API token shape. It
+// does not prove the token is authorized; the first authenticated request does.
+func ValidToken(token string) bool { return tokenPattern.MatchString(strings.TrimSpace(token)) }
+
 // GenerateToken returns a new 256-bit API credential.
 func GenerateToken() (string, error) { return generateToken() }
 

@@ -76,7 +76,7 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.platformSpecs(), a.secretSpecs(), a.upgradeSpecs(), a.workspaceSpecs()} {
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.bootstrapSpecs(), a.contextSpecs(), a.platformSpecs(), a.secretSpecs(), a.upgradeSpecs(), a.workspaceSpecs()} {
 		for _, s := range specs {
 			a.attach(a.root, s)
 		}

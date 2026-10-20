@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -16,34 +17,43 @@ func hostResult(data any) result {
 	return result{data: data, plain: string(raw)}
 }
 
-// contextClient is the integration hook for a.client in runtime.go: replace
-// its body with `return a.contextClient(cmd)`. Explicit flags/environment win;
-// missing endpoint/token values fall back to the active saved context.
+// contextClient is the integration hook for a.client in runtime.go. Precedence
+// is explicit: --api-url, then EREGION_API_URL, then the active saved context.
+// A saved credential is never sent to a different explicit origin.
 func (a *app) contextClient(cmd *cobra.Command) (*api.Client, error) {
-	endpoint, _ := cmd.Flags().GetString("api-url")
-	if endpoint == "" {
-		endpoint = os.Getenv("EREGION_API_URL")
+	flagEndpoint := ""
+	if cmd != nil && cmd.Flags().Lookup("api-url") != nil {
+		flagEndpoint, _ = cmd.Flags().GetString("api-url")
 	}
+	envEndpoint := os.Getenv("EREGION_API_URL")
 	token := os.Getenv("EREGION_API_TOKEN")
-	if endpoint == "" || token == "" {
-		store, err := host.LoadContextStore("")
+	endpoint := flagEndpoint
+	explicitOrigin := endpoint != ""
+	if endpoint == "" {
+		endpoint = envEndpoint
+		explicitOrigin = endpoint != ""
+	}
+	if endpoint != "" && token != "" {
+		a.secrets.Add(token)
+		return api.NewClient(endpoint, token)
+	}
+	store, err := host.LoadContextStore("")
+	if err != nil {
+		return nil, err
+	}
+	if store.Current != "" {
+		current, err := store.Get("")
 		if err != nil {
 			return nil, err
 		}
-		if store.Current != "" {
-			current, err := store.Get("")
-			if err != nil {
-				return nil, err
-			}
-			// Never send a saved credential to an explicitly different origin.
-			if endpoint != "" && strings.TrimRight(endpoint, "/") != current.APIURL && token == "" {
-				return nil, contract.NewFault(contract.InputRequired, "the explicit API origin differs from the active context", "Supply EREGION_API_TOKEN for that origin or select the matching context.")
-			}
-			if endpoint == "" {
-				endpoint = current.APIURL
-			}
-			if token == "" {
+		if endpoint == "" {
+			endpoint = current.APIURL
+		}
+		if token == "" {
+			if sameOrigin(endpoint, current.APIURL) {
 				token = current.Token
+			} else if explicitOrigin {
+				return nil, contract.NewFault(contract.InputRequired, "the explicit API origin differs from the active context", "Supply EREGION_API_TOKEN for that origin or select the matching context with eregion context use.")
 			}
 		}
 	}
@@ -54,6 +64,10 @@ func (a *app) contextClient(cmd *cobra.Command) (*api.Client, error) {
 	return api.NewClient(endpoint, token)
 }
 
+func sameOrigin(left, right string) bool {
+	return strings.EqualFold(strings.TrimRight(strings.TrimSpace(left), "/"), strings.TrimRight(strings.TrimSpace(right), "/"))
+}
+
 func (a *app) contextSpecs() []spec {
 	meta := func(summary, example string, mutating bool) CommandMeta {
 		m := readMeta(summary, []string{summary + ". Never prints credentials; no interactive prompts."}, []string{example})
@@ -61,7 +75,7 @@ func (a *app) contextSpecs() []spec {
 		if mutating {
 			m.DryRunReason = "Local credential-store edits have no remote effect; inspect context show/list before changing them."
 		}
-		m.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_API_TOKEN"}
+		m.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_API_TOKEN", "EREGION_API_URL"}
 		m.ErrorCodes = append(m.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.NotFound)
 		return m
 	}
@@ -145,7 +159,65 @@ func (a *app) contextSpecs() []spec {
 				report, err := store.Export(name, path, replace)
 				return hostResult(report), err
 			}},
+			a.contextCredentialSpec(meta),
 		}}}
+}
+
+// contextCredentialSpec adds a scoped automation actor to an existing server
+// auth file. It is a plan-bound mutation: dry-run returns the revision and
+// token, and apply requires that exact token. The credential is written once to
+// an owner-only file; neither the plan nor the result prints it.
+func (a *app) contextCredentialSpec(meta func(string, string, bool) CommandMeta) spec {
+	credentialMeta := meta("Add a scoped automation credential to the server auth file", "eregion context credential add --auth-file /etc/eregion/auth.json --subject ci-deploy --scope operations:submit --token-out /root/ci.token --dry-run --json", true)
+	credentialMeta.Mutating, credentialMeta.DryRun, credentialMeta.Confirmation = true, true, "plan-bound"
+	credentialMeta.DryRunReason = ""
+	return spec{use: "credential", meta: meta("Manage scoped automation credentials", "eregion context credential add --dry-run --json", false),
+		run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
+		children: []spec{
+			{use: "add", meta: credentialMeta, flags: func(cmd *cobra.Command) {
+				cmd.Flags().String("auth-file", "/etc/eregion/auth.json", "Server auth file containing token hashes")
+				cmd.Flags().String("subject", "", "Stable CI actor subject")
+				cmd.Flags().StringSlice("scope", nil, "Explicit scopes (operations:submit, operations:read, operations:cancel, system:read)")
+				cmd.Flags().String("token-out", "", "Absolute owner-only token output; never printed")
+				cmd.Flags().Bool("dry-run", false, "Show the base revision and confirmation token without writing")
+				cmd.Flags().String("confirm", "", "Exact plan-bound confirmation token")
+			}, run: func(cmd *cobra.Command, _ []string) (result, error) {
+				authFile, _ := cmd.Flags().GetString("auth-file")
+				subject, _ := cmd.Flags().GetString("subject")
+				scopes, _ := cmd.Flags().GetStringSlice("scope")
+				tokenOut, _ := cmd.Flags().GetString("token-out")
+				request := host.CredentialAddRequest{
+					AuthFile: authFile, Actor: contract.Actor{Kind: "ci", Subject: subject},
+					Scopes: scopes, TokenOut: tokenOut,
+				}
+				if err := request.Validate(); err != nil {
+					return result{}, err
+				}
+				revision, err := host.AuthRevision(authFile)
+				if err != nil {
+					return result{}, err
+				}
+				now := time.Now()
+				plan, err := request.Confirmation(now)
+				if err != nil {
+					return result{}, err
+				}
+				dryRun, _ := cmd.Flags().GetBool("dry-run")
+				if dryRun {
+					return hostResult(map[string]any{
+						"auth_file": authFile, "actor_kind": "ci", "actor_subject": subject,
+						"scopes": scopes, "base_revision": revision,
+						"confirmation": plan, "dry_run": true,
+					}), nil
+				}
+				confirmation, _ := cmd.Flags().GetString("confirm")
+				if confirmation == "" {
+					return result{}, contract.NewFault(contract.ConfirmationRequired, "--confirm is required to add a credential", "Run context credential add --dry-run and pass its confirmation token.")
+				}
+				report, err := request.Apply(confirmation, now)
+				return hostResult(report), err
+			}},
+		}}
 }
 
 func contextNameFlag(cmd *cobra.Command) {

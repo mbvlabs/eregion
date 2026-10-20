@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -111,6 +112,9 @@ type Config struct {
 	APITLSKey         string `json:"api_tls_key,omitempty"`
 	WorkerConcurrency int    `json:"worker_concurrency"`
 	RegistryListen    string `json:"registry_listen"`
+	// CommitConfirmSeconds bounds how long an access-changing apply may leave
+	// the new access state live before a detached watchdog reverts it.
+	CommitConfirmSeconds int `json:"commit_confirm_seconds,omitempty"`
 
 	// BinaryPath is the eregion CLI/API binary. NodeBinaryPath is the
 	// eregion-node binary for application and builder roles.
@@ -130,13 +134,14 @@ func DefaultConfig(role Role, node string) Config {
 		node = "local"
 	}
 	return Config{
-		Node:              node,
-		Role:              role,
-		Layout:            DefaultLayout(),
-		PlatformPath:      "/etc/os-release",
-		APIListen:         "127.0.0.1:8080",
-		WorkerConcurrency: 2,
-		RegistryListen:    "127.0.0.1:5000",
+		Node:                 node,
+		Role:                 role,
+		Layout:               DefaultLayout(),
+		PlatformPath:         "/etc/os-release",
+		APIListen:            "127.0.0.1:8080",
+		WorkerConcurrency:    2,
+		RegistryListen:       "127.0.0.1:5000",
+		CommitConfirmSeconds: int(DefaultCommitConfirmWindow / time.Second),
 	}
 }
 
@@ -194,6 +199,9 @@ func (c Config) Validate() error {
 		}
 		if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 16 {
 			return contract.NewFault(contract.ValidationFailed, "worker concurrency out of range", "Use --worker-concurrency 1–16.")
+		}
+		if c.CommitConfirmSeconds != 0 && (c.CommitConfirmSeconds < 30 || c.CommitConfirmSeconds > 900) {
+			return contract.NewFault(contract.ValidationFailed, "commit-confirm window out of range", "Use --commit-confirm-seconds 30–900.")
 		}
 		if c.AutomationTokenOut != "" && len(c.AutomationScopes) == 0 {
 			return contract.NewFault(contract.ValidationFailed, "an automation token needs at least one scope", "Use --automation-scope operations:submit and other explicit scopes.")
@@ -318,6 +326,7 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 		APITLSKey          string   `json:"api_tls_key"`
 		WorkerConcurrency  int      `json:"worker_concurrency"`
 		RegistryListen     string   `json:"registry_listen"`
+		CommitConfirm      int      `json:"commit_confirm_seconds"`
 		BinaryPath         string   `json:"binary_path"`
 		NodeBinaryPath     string   `json:"node_binary_path"`
 		NodeAuthorizedKeys string   `json:"node_authorized_keys"`
@@ -330,7 +339,8 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 		AutomationScopes: scopes, AutomationTokenOut: c.AutomationTokenOut,
 		APIListen: c.APIListen, APITLSCert: c.APITLSCert, APITLSKey: c.APITLSKey,
 		WorkerConcurrency: c.WorkerConcurrency, RegistryListen: c.RegistryListen,
-		BinaryPath: c.BinaryPath, NodeBinaryPath: c.NodeBinaryPath,
+		CommitConfirm: c.CommitConfirmSeconds,
+		BinaryPath:    c.BinaryPath, NodeBinaryPath: c.NodeBinaryPath,
 		NodeAuthorizedKeys: c.NodeAuthorizedKeysFile,
 	}
 	return json.Marshal(value)
