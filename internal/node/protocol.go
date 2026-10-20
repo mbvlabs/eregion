@@ -48,6 +48,10 @@ type Frame struct {
 // running, and the retry path must ask for status before it runs anything.
 var ErrStreamLost = errors.New("node stream lost")
 
+// ErrProtocol marks a malformed or unsupported node frame. It is not a lost
+// stream: the node answered, but not with something this side understands.
+var ErrProtocol = errors.New("invalid node protocol")
+
 // IsStreamLost reports whether err is an explicit lost-stream outcome.
 func IsStreamLost(err error) bool { return errors.Is(err, ErrStreamLost) }
 
@@ -75,10 +79,10 @@ func ReadFrame(r *bufio.Reader) (Frame, error) {
 	}
 	var frame Frame
 	if err := json.Unmarshal(line, &frame); err != nil {
-		return Frame{}, fmt.Errorf("invalid node frame: %w", err)
+		return Frame{}, fmt.Errorf("%w: %w", ErrProtocol, err)
 	}
 	if frame.Type == "" {
-		return Frame{}, errors.New("node frame has no type")
+		return Frame{}, fmt.Errorf("%w: the frame has no type", ErrProtocol)
 	}
 	return frame, nil
 }

@@ -66,7 +66,7 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 		if err != nil {
 			return Response{}, err
 		}
-		return responseFromStatus(status), nil
+		return ResponseFromStatus(status), nil
 	case MethodRun:
 		if d.hooks.BeforeRun != nil {
 			if err := d.hooks.BeforeRun(ctx, request.Execution); err != nil {
@@ -98,7 +98,7 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 				Detail:         registry.Redact(err.Error()),
 			}, nil
 		}
-		return responseFromStatus(status), nil
+		return ResponseFromStatus(status), nil
 	default:
 		return Response{}, fmt.Errorf("unknown node method %q", request.Method)
 	}
@@ -121,7 +121,8 @@ func errorCode(err error) contract.Code {
 	}
 }
 
-func responseFromStatus(status engine.TaskStatus) Response {
+// ResponseFromStatus maps a node status observation to a transport response.
+func ResponseFromStatus(status engine.TaskStatus) Response {
 	return Response{
 		Status:         status.Status,
 		ExecutionID:    status.ExecutionID,
