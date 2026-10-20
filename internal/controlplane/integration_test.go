@@ -953,3 +953,51 @@ func TestIntegrationUpgradeFromVersion1(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestIntegrationShutdownMidStepRecoversOnce(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	ctx := context.Background()
+	run := testRuntime(t, pool, 1, nodeDir)
+	if err := run.Jobs.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if stopped {
+			return
+		}
+		stopCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stop()
+		_ = run.Jobs.Stop(stopCtx)
+	})
+	op, err := run.Service.Submit(ctx, submission("shutdown-mid-step", `{"steps":3,"step_delay_ms":400}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	await(t, 10*time.Second, func() bool {
+		var completed int
+		err := pool.QueryRow(ctx, "SELECT completed_steps FROM eregion_operations WHERE id=$1", op.ID).Scan(&completed)
+		return err == nil && completed > 0
+	})
+	// Interrupt the active step through River's shutdown path, not a SIGKILL.
+	stopCtx, stop := context.WithTimeout(context.Background(), time.Second)
+	_ = run.Jobs.StopAndCancel(stopCtx)
+	stop()
+	stopped = true
+
+	startWorkers(t, testRuntime(t, pool, 2, nodeDir))
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, op.ID)
+		return err == nil && current.State == contract.Succeeded
+	})
+	if got := effectCount(t, nodeDir, op.ID, 3); got != 3 {
+		t.Fatalf("shutdown duplicated or lost effects: %d", got)
+	}
+	if got := completedStepRows(t, pool, op.ID); got != 3 {
+		t.Fatalf("shutdown duplicated or lost step rows: %d", got)
+	}
+	if got := progressEventCount(t, run.Service, op.ID); got != 3 {
+		t.Fatalf("shutdown duplicated or lost progress: %d", got)
+	}
+}
