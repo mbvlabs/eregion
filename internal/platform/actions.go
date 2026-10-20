@@ -30,9 +30,13 @@ type HealthInput struct {
 }
 
 type EnvironmentCreateInput struct {
-	App           string            `json:"app,omitempty"`
-	Name          string            `json:"name"`
-	Node          string            `json:"node"`
+	App  string `json:"app,omitempty"`
+	Name string `json:"name"`
+	// Node runs application containers. It must have application + docker.
+	Node string `json:"node"`
+	// BuildNode optionally runs Buildpacks for releases of this environment. It
+	// must have builder + buildpacks. When empty, Node is the build node.
+	BuildNode     string            `json:"build_node,omitempty"`
 	ContainerPort int               `json:"container_port,omitempty"`
 	HostPort      int               `json:"host_port,omitempty"`
 	Bind          string            `json:"bind,omitempty"`
@@ -192,6 +196,11 @@ func normalizeEnvironmentCreate(target Target, raw json.RawMessage) (ActionInput
 	}
 	if err := ValidateName(input.Node); err != nil {
 		return nil, err
+	}
+	if input.BuildNode != "" {
+		if err := ValidateName(input.BuildNode); err != nil {
+			return nil, err
+		}
 	}
 	if input.ContainerPort == 0 {
 		input.ContainerPort = DefaultContainerPort

@@ -100,6 +100,17 @@ func formatEvent(event contract.Event, clean Cleaner) string {
 	if event.Progress != nil {
 		line += fmt.Sprintf(" %d/%d %s", event.Progress.Current, event.Progress.Total, clean(event.Progress.Unit))
 	}
+	if event.DurationMS != nil {
+		line += " " + FormatDuration(time.Duration(*event.DurationMS)*time.Millisecond)
+	}
+	if event.ServingReleaseID != "" {
+		line += " serving=" + clean(event.ServingReleaseID)
+	} else if event.ReleaseID != "" {
+		line += " release=" + clean(event.ReleaseID)
+	}
+	if event.Health != nil {
+		line += fmt.Sprintf(" health=%t checks=%d", event.Health.Passed, event.Health.Checks)
+	}
 	if event.Message != "" {
 		line += " " + clean(event.Message)
 	}
@@ -144,6 +155,15 @@ func (p *Plain) Finish(summary Summary, err error, resume string, now time.Time)
 		code = " [" + string(summary.ErrorCode) + "]"
 	}
 	line := stateWord(summary.State) + code + " " + string(summary.OperationID) + elapsed + " · " + fmt.Sprintf("%d", summary.Events) + " events"
+	if summary.Serving.Observed && summary.Serving.ReleaseID != "" {
+		line += " · serving release " + summary.Serving.ReleaseID
+		if summary.Serving.Health != "" {
+			line += " (" + summary.Serving.Health + " health)"
+		}
+	}
+	if summary.Cleanup.Observed {
+		line += " · candidate cleanup " + string(summary.Cleanup.Status)
+	}
 	return p.line(p.clean()(line))
 }
 

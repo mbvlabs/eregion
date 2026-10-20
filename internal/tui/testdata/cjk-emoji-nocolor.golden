@@ -10,10 +10,10 @@ EXECUTION STAGES
 
 2 completed · 1 active
 2/5 steps ▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌▌░░░░░░░░░░░░░░░░░░░░░░░░
-active: 部署-数据库 ✅
 TARGETS
 ✓ preflight              completed
 ✓ build                  completed
+◐ 部署-数据库 ✅               running
 ────────────────────────────────────────────────────────────────────────────────
 EVENTS · 8 shown · 8 observed · build log 1
 12:00:04     5 progress 2/5 steps effect acknowledged durably                   

@@ -100,6 +100,79 @@ func TestPlatformFailureRestoresPreviousReleaseAndHealth(t *testing.T) {
 	}
 }
 
+func TestStructuredEventsNameServingReleaseHealthAndCleanup(t *testing.T) {
+	id := contract.OperationID("op_" + strings.Repeat("b", 32))
+	start := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	model := New(id, Options{})
+	model.Snapshot(contract.Operation{
+		ID: id, Kind: "platform.deploy", Target: "env/api/production",
+		Actor: contract.Actor{Kind: "ci", Subject: "release"}, State: contract.Running,
+		Attempt: 2, LastSequence: 8, CreatedAt: start, UpdatedAt: start,
+	}, start)
+	duration := int64(412)
+	events := []contract.Event{
+		platformEvent(1, start, "step", "platform-health-01-v1", "Node step started."),
+		platformEvent(2, start.Add(time.Second), "log", "platform-health-01-v1", "Health observation"),
+		platformEvent(3, start.Add(2*time.Second), "step", "platform-container-02-v1", "Node step started."),
+		platformEvent(4, start.Add(3*time.Second), "log", "platform-container-02-v1", "Traffic switch acknowledged"),
+		platformEvent(5, start.Add(4*time.Second), "step", "platform-cleanup-01-v1", "Node step started."),
+		platformEvent(6, start.Add(5*time.Second), "log", "platform-cleanup-01-v1", "cleanup completed"),
+		platformEvent(7, start.Add(6*time.Second), "log", "deploy", "Deployment succeeded"),
+		platformEvent(8, start.Add(7*time.Second), "state", "", "succeeded"),
+	}
+	events[1].Health = &contract.HealthObservation{Target: "http://127.0.0.1:30000/healthz", Type: "http", Passed: true, Checks: 4, TimeoutSeconds: 30, Detail: "http status 200"}
+	events[1].Step = "platform-health-01-v1"
+	events[3].ReleaseID = "rel_00000000000000000000000000000001"
+	events[3].ServingReleaseID = "rel_00000000000000000000000000000001"
+	events[5].Step = "platform-cleanup-01-v1"
+	events[5].DurationMS = &duration
+	events[6].ReleaseID = "rel_00000000000000000000000000000001"
+	events[6].ServingReleaseID = "rel_00000000000000000000000000000001"
+	events[7].State = contract.Succeeded
+	events[7].ServingReleaseID = "rel_00000000000000000000000000000001"
+	if err := model.Page(events, start.Add(8*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if model.Serving.ReleaseID != "rel_00000000000000000000000000000001" {
+		t.Fatalf("serving release was not taken from structured events: %+v", model.Serving)
+	}
+	if line := model.ServingLine(); !strings.Contains(line, "rel_00000000000000000000000000000001") {
+		t.Fatalf("serving line does not name the release: %q", line)
+	}
+	if len(model.Health) != 1 || model.Health[0].Checks != 4 || model.Health[0].Target == "" || model.Health[0].TimeoutSeconds != 30 {
+		t.Fatalf("structured health was not preserved: %+v", model.Health)
+	}
+	if !model.Cleanup.Observed || model.Cleanup.Status != StageCompleted || model.Cleanup.Duration != 412*time.Millisecond {
+		t.Fatalf("cleanup was not visible: %+v", model.Cleanup)
+	}
+	if line := model.CleanupLine(); !strings.Contains(line, "completed") || !strings.Contains(line, "412ms") {
+		t.Fatalf("cleanup line = %q", line)
+	}
+}
+
+func TestStructuredHealthReplacesFailureWarning(t *testing.T) {
+	id := contract.OperationID("op_" + strings.Repeat("b", 32))
+	start := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	model := New(id, Options{})
+	model.Snapshot(contract.Operation{
+		ID: id, Kind: "platform.deploy", Target: "env/api/production",
+		Actor: contract.Actor{Kind: "ci", Subject: "release"}, State: contract.Running,
+		Attempt: 1, LastSequence: 2, CreatedAt: start, UpdatedAt: start,
+	}, start)
+	events := []contract.Event{
+		platformEvent(1, start, "warning", "platform-health-02-v1", "Node step failed: health check did not pass"),
+		platformEvent(2, start.Add(time.Second), "log", "platform-health-02-v1", "Health observation"),
+	}
+	events[1].Step = "platform-health-02-v1"
+	events[1].Health = &contract.HealthObservation{Target: "http://127.0.0.1:20000/healthz", Passed: false, Checks: 60, TimeoutSeconds: 30, Detail: "health check did not pass within 30s"}
+	if err := model.Page(events, start.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if len(model.Health) != 1 || model.Health[0].Passed || model.Health[0].Checks != 60 || model.Health[0].Target == "" {
+		t.Fatalf("structured failure did not replace the message-derived observation: %+v", model.Health)
+	}
+}
+
 func TestServingLineIsHonestWithoutServingEvents(t *testing.T) {
 	model := New("op_"+contract.OperationID(strings.Repeat("b", 32)), Options{})
 	model.Kind = "platform.deploy"

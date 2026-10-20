@@ -166,16 +166,21 @@ with `precondition_failed`, a message starting `placement_violation:`,
 | `registry_scope` | a push-scoped registry credential for a node without the builder role |
 | `build_capacity` | all build slots of a node stayed busy for 10 minutes |
 
-Build isolation: builds run only on a node with `builder`+`buildpacks` (today:
-the environment's node, which for an enrolled fleet means the main node, because
-an environment needs the `application` role and an enrolled node cannot be both).
-Each node admits `build_concurrency` builds at a time through PostgreSQL session
-advisory locks (a dead worker frees its slot); a queued build emits a
-`build_queued` event. Registry credentials follow roles
+Build isolation: builds run only on a node with `builder` + `buildpacks`.
+Environment creation accepts an optional `build_node`; it is role- and
+capability-checked separately from the `application` + `docker` runtime node.
+An omitted `build_node` means builds run on the environment's node, which is the
+working co-located development path (the main node keeps `application`,
+`control-plane`, and `builder` when `pack` exists). Each build node admits
+`build_concurrency` builds at a time through PostgreSQL session advisory locks (a
+dead worker frees its slot); waiting emits `build_queued` and taking a slot emits
+`build_running`. Release creation refuses a build node distinct from the
+application node with an explicit shared-registry `precondition_failed`; a local
+Docker image on one node is not visible on another, and pretending otherwise
+would record a release that cannot be deployed. Registry credentials follow roles
 (`platform.RegistryScopeFor`: builders push, everything else pulls) and
-`checkRegistryCredential` refuses a mismatch. Registry credentials and moving
-images from a builder to application nodes arrive with M3's registry work; the
-scope rule and the slot limit are in place now.
+`checkRegistryCredential` refuses a mismatch. Registry transfer and credentials
+remain future work; the scope rule and slot enforcement are in place now.
 
 ## Per-node transport resolution
 
@@ -264,8 +269,10 @@ durable surface for them.
   SSH into the `sshfixture` containers and shows work landing on the right node
   and refused elsewhere; wrong host key, wrong node name, wrong identity,
   cloned identity, retry, check-time identity swap and quarantine; build slots;
-  and WireGuard reconcile of two nodes followed by a node check that crosses the
-  real userspace-to-kernel tunnel.
+  release builds that queue and run under a slot; environment `build_node`
+  role/capability enforcement and the distinct-node gate; and WireGuard reconcile
+  of two nodes followed by a node check that crosses the real userspace-to-kernel
+  tunnel.
 
 ## Not tested, and honest limits
 
@@ -287,9 +294,12 @@ durable surface for them.
   switching the build to that OS user is not implemented.
 - **Edge and registry roles** are enrollable and get no host configuration yet;
   their services arrive with M3/M5.
-- **Cross-node placement of a build.** The environment's node is the build node;
-  an application-only node refuses builds (`builder_required`) instead of
-  building elsewhere and shipping the image.
+- **Cross-node image transfer.** `build_node` is recorded and placement-checked,
+  but a distinct build node is refused with `precondition_failed` before `pack`
+  runs because there is no shared registry credential/transfer path. A
+  co-located builder (`build_node` omitted or equal to `node`) builds and deploys
+  on one node. An application-only node still refuses builds
+  (`builder_required`) rather than silently building elsewhere.
 - Failure modes not exercised: SSH key rotation on a live fleet, host-key
   rotation (deliberately a remove-and-re-enroll), subnet exhaustion, and two
   workers contending for one node tunnel.

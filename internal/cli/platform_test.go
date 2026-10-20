@@ -42,6 +42,7 @@ func newPlatformServer(t *testing.T) (*platformServer, *httptest.Server) {
 		"nodes":        json.RawMessage(`[{"name":"main","status":"ready","roles":["application"],"capabilities":["docker"],"last_seen_at":"2026-10-20T12:00:00Z"}]`),
 		"apps":         json.RawMessage(`[{"id":"app_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","name":"api","created_at":"2026-10-20T12:00:00Z","updated_at":"2026-10-20T12:00:00Z"}]`),
 		"environments": json.RawMessage(`[{"id":"env_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app":"api","name":"production","node":"main","serving_release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","health":"healthy","updated_at":"2026-10-20T12:00:00Z"}]`),
+		"deployments":  json.RawMessage(`[{"id":"dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app":"api","environment":"production","action":"deploy","release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"failed","created_at":"2026-10-20T12:00:00Z","updated_at":"2026-10-20T12:00:00Z"}]`),
 	}}
 	p.handler = http.HandlerFunc(p.serve)
 	server := httptest.NewServer(p.handler)
@@ -153,7 +154,7 @@ func TestPlatformCommandMetadata(t *testing.T) {
 		{"platform", "submit"}, {"platform", "inventory"}, {"platform", "fleet"},
 		{"platform", "nodes", "enroll"}, {"platform", "nodes", "retry"}, {"platform", "nodes", "reconcile"}, {"platform", "nodes", "register"}, {"platform", "nodes", "list"}, {"platform", "nodes", "status"}, {"platform", "nodes", "check"},
 		{"platform", "apps", "create"}, {"platform", "apps", "list"}, {"platform", "apps", "status"},
-		{"platform", "environments", "create"}, {"platform", "deployments", "rollback"},
+		{"platform", "environments", "create"}, {"platform", "deployments", "retry"}, {"platform", "deployments", "rollback"},
 	} {
 		cmd, remaining, err := a.root.Find(path)
 		if err != nil || len(remaining) != 0 || cmd.RunE == nil {
@@ -384,6 +385,78 @@ func TestPlatformRollbackNeedsMatchingPlanConfirmation(t *testing.T) {
 	decodePlatformEnvelope(t, stdout)
 	if len(state.calls) != 2 || state.calls[1].kind != "platform.rollback" || state.calls[1].key != "ci:rollback-1" {
 		t.Fatalf("confirmed rollback did not submit: %+v", state.calls)
+	}
+}
+
+func TestPlatformEnvironmentCreateSendsBuildNode(t *testing.T) {
+	state, server := newPlatformServer(t)
+	platformTestEnvironment(t, server)
+	code, stdout, stderr := invokePlatform(t, "platform", "environments", "create", "api", "production",
+		"--node", "main", "--build-node", "builder-1", "--idempotency-key", "ci:env-build-node", "--json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("code=%d stderr=%q stdout=%s", code, stderr, stdout)
+	}
+	if len(state.calls) != 1 || state.calls[0].kind != platform.KindEnvironmentCreate {
+		t.Fatalf("unexpected call: %+v", state.calls)
+	}
+	var input platform.EnvironmentCreateInput
+	if err := json.Unmarshal(state.calls[0].input, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.Node != "main" || input.BuildNode != "builder-1" {
+		t.Fatalf("build placement was not sent: %+v", input)
+	}
+}
+
+func TestPlatformDeploymentRetryResubmitsFailedDeployment(t *testing.T) {
+	state, server := newPlatformServer(t)
+	platformTestEnvironment(t, server)
+
+	code, stdout, stderr := invokePlatform(t, "platform", "deployments", "retry", "--deployment", "dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--dry-run", "--json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("retry dry-run code=%d stderr=%q stdout=%s", code, stderr, stdout)
+	}
+	decodePlatformEnvelope(t, stdout)
+	if len(state.calls) != 2 {
+		t.Fatalf("expected inventory read and preview, got %+v", state.calls)
+	}
+	if state.calls[0].method != http.MethodGet || state.calls[0].query.Get("collection") != "deployments" {
+		t.Fatalf("retry did not read deployment inventory: %+v", state.calls[0])
+	}
+	preview := state.calls[1]
+	if !preview.dryRun || preview.kind != "platform.deploy" || preview.target != "env/api/production" {
+		t.Fatalf("retry preview did not preserve target/action: %+v", preview)
+	}
+	if string(preview.input) != `{"release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}` {
+		t.Fatalf("retry preview did not preserve the release: %s", preview.input)
+	}
+
+	code, stdout, stderr = invokePlatform(t, "platform", "deployments", "retry", "--deployment", "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--idempotency-key", "ci:retry-deploy-1", "--json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("retry code=%d stderr=%q stdout=%s", code, stderr, stdout)
+	}
+	decodePlatformEnvelope(t, stdout)
+	if len(state.calls) != 4 {
+		t.Fatalf("retry did not read inventory and submit: %+v", state.calls)
+	}
+	submit := state.calls[3]
+	if submit.method != http.MethodPost || submit.kind != "platform.deploy" || submit.target != "env/api/production" || submit.key != "ci:retry-deploy-1" {
+		t.Fatalf("retry did not use the shared submission path: %+v", submit)
+	}
+	if string(submit.input) != `{"release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}` {
+		t.Fatalf("retry changed the release: %s", submit.input)
+	}
+}
+
+func TestPlatformDeploymentRetryRefusesNonFailedDeployment(t *testing.T) {
+	state, server := newPlatformServer(t)
+	state.items["deployments"] = json.RawMessage(`[{"id":"dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app":"api","environment":"production","action":"deploy","release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"succeeded"}]`)
+	platformTestEnvironment(t, server)
+
+	code, stdout, stderr := invokePlatform(t, "platform", "deployments", "retry", "--deployment", "dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--idempotency-key", "ci:retry-deploy-2", "--json")
+	assertPlatformJSONFault(t, code, stdout, stderr, contract.PreconditionFailed, "only a terminally failed deployment")
+	if len(state.calls) != 1 {
+		t.Fatalf("a non-failed retry reached submission: %+v", state.calls)
 	}
 }
 

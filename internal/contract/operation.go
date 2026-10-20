@@ -14,6 +14,7 @@ type OperationID string
 var operationIDPattern = regexp.MustCompile(`^op_[0-9a-f]{32}$`)
 var keyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 var executionIDPattern = regexp.MustCompile(`^op_[0-9a-f]{32}:[0-9]+:[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$`)
+var releaseIDPattern = regexp.MustCompile(`^rel_[0-9a-f]{32}$`)
 
 func NewOperationID() (OperationID, error) {
 	var value [16]byte
@@ -138,6 +139,18 @@ type Progress struct {
 	Unit    string `json:"unit"`
 }
 
+// HealthObservation is a structured probe result. It is emitted beside the
+// human-readable message so clients never have to parse log text to learn what
+// was probed, how many attempts it took, and what deadline applied.
+type HealthObservation struct {
+	Target         string `json:"target,omitempty"`
+	Type           string `json:"type,omitempty"`
+	Passed         bool   `json:"passed"`
+	Checks         int    `json:"checks,omitempty"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+}
+
 type Event struct {
 	OperationID OperationID `json:"operation_id"`
 	Sequence    uint64      `json:"sequence,string"`
@@ -147,6 +160,21 @@ type Event struct {
 	State       State       `json:"state,omitempty"`
 	Stage       string      `json:"stage,omitempty"`
 	ExecutionID string      `json:"execution_id,omitempty"`
+	// Step names the durable node step an observation belongs to. It is present
+	// on log and warning events emitted by the platform worker, so build and
+	// health lines are attributed without guessing from the last step.
+	Step string `json:"step,omitempty"`
+	// ReleaseID names the release this event is about. A successful deployment
+	// and a traffic-switch acknowledgement name the release that serves; a
+	// failed deployment names the release that failed.
+	ReleaseID string `json:"release_id,omitempty"`
+	// ServingReleaseID names the release the environment actually serves after
+	// the observation, when the worker can prove it.
+	ServingReleaseID string `json:"serving_release_id,omitempty"`
+	// DurationMS is the measured duration of one completed step.
+	DurationMS *int64 `json:"duration_ms,omitempty"`
+	// Health is a structured probe observation.
+	Health *HealthObservation `json:"health,omitempty"`
 	// ErrorCode classifies a failed terminal state. It is only valid on a
 	// state event that reports the failed state.
 	ErrorCode Code      `json:"error_code,omitempty"`
@@ -193,6 +221,26 @@ func (e Event) Validate() error {
 		}
 	} else if e.Progress != nil {
 		return NewFault(ValidationFailed, "only progress events carry measurements", "Emit a separate progress event.")
+	}
+	if e.ReleaseID != "" && !releaseIDPattern.MatchString(e.ReleaseID) {
+		return NewFault(ValidationFailed, "invalid event release identity", "Use the release ID returned by inventory.")
+	}
+	if e.ServingReleaseID != "" && !releaseIDPattern.MatchString(e.ServingReleaseID) {
+		return NewFault(ValidationFailed, "invalid serving release identity", "Use the release ID returned by inventory.")
+	}
+	if e.Step != "" && (len(e.Step) > 128 || strings.ContainsAny(e.Step, " \t\r\n\x00")) {
+		return NewFault(ValidationFailed, "invalid event step", "Name one durable node step without whitespace.")
+	}
+	if e.DurationMS != nil && *e.DurationMS < 0 {
+		return NewFault(ValidationFailed, "invalid event duration", "Step durations cannot be negative.")
+	}
+	if e.Health != nil {
+		if strings.ContainsAny(e.Health.Target, "\r\n\x00") || strings.ContainsAny(e.Health.Detail, "\r\n\x00") {
+			return NewFault(ValidationFailed, "invalid health observation", "Health targets and details cannot contain control characters.")
+		}
+		if e.Health.Checks < 0 || e.Health.TimeoutSeconds < 0 {
+			return NewFault(ValidationFailed, "invalid health observation", "Probe counts and deadlines cannot be negative.")
+		}
 	}
 	return nil
 }

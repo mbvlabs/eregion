@@ -337,6 +337,14 @@ func (m Model) eventLine(event contract.Event) string {
 	if event.Progress != nil {
 		parts = append(parts, m.info().Render(fmt.Sprintf("%d/%d %s", event.Progress.Current, event.Progress.Total, event.Progress.Unit)))
 	}
+	if event.DurationMS != nil {
+		parts = append(parts, m.info().Render(viewer.FormatDuration(time.Duration(*event.DurationMS)*time.Millisecond)))
+	}
+	if event.ServingReleaseID != "" {
+		parts = append(parts, m.okStyle().Render("serving "+event.ServingReleaseID))
+	} else if event.ReleaseID != "" {
+		parts = append(parts, m.dim().Render("release "+event.ReleaseID))
+	}
 	line := strings.Join(parts, " ")
 	if event.Message != "" {
 		line += " " + event.Message

@@ -92,6 +92,8 @@ type Summary struct {
 	Observation  ObservationState
 	Detached     bool
 	Operation    contract.Operation
+	Serving      ServingRelease
+	Cleanup      CleanupObservation
 }
 
 // Follow polls the authoritative snapshot and event pages until the operation
@@ -300,6 +302,8 @@ func modelSummary(model *Model) Summary {
 			CreatedAt:    model.CreatedAt,
 			UpdatedAt:    model.UpdatedAt,
 		},
+		Serving: model.Serving,
+		Cleanup: model.Cleanup,
 	}
 }
 

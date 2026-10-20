@@ -61,6 +61,47 @@ func TestNodePlacementRules(t *testing.T) {
 	}
 }
 
+func TestBuildNodePlacementRequiresBuilderAndBuildpacks(t *testing.T) {
+	builder := testNode("build-1", platform.EnrollmentEnrolled, []string{platform.RoleBuilder}, platform.CapabilityDocker, platform.CapabilityBuildpacks)
+	runtime := testNode("app-1", platform.EnrollmentEnrolled, []string{platform.RoleApplication}, platform.CapabilityDocker)
+	if err := nodePlacement(builder, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
+		t.Fatalf("a builder node accepts a build: %v", err)
+	}
+	wantViolation(t, nodePlacement(runtime, platform.RoleBuilder, platform.CapabilityBuildpacks), ReasonBuilderRequired)
+	noPack := testNode("build-2", platform.EnrollmentEnrolled, []string{platform.RoleBuilder}, platform.CapabilityDocker)
+	wantViolation(t, nodePlacement(noPack, platform.RoleBuilder, platform.CapabilityBuildpacks), ReasonCapabilityMissing)
+	env := platform.Environment{Node: runtime.Name, BuildNode: builder.Name}
+	if env.BuildNodeName() != "build-1" {
+		t.Fatalf("build node resolution=%s", env.BuildNodeName())
+	}
+	if (platform.Environment{Node: "app-1"}).BuildNodeName() != "app-1" {
+		t.Fatal("an omitted build node must use the application node for co-located development")
+	}
+}
+
+func TestDistinctBuildNodeIsGatedHonestly(t *testing.T) {
+	coLocated := platform.Environment{Node: "main", BuildNode: "main"}
+	if err := crossNodeBuildUnsupported(coLocated, "directory"); err != nil {
+		t.Fatalf("co-located builds work: %v", err)
+	}
+	implicit := platform.Environment{Node: "main"}
+	if err := crossNodeBuildUnsupported(implicit, "git"); err != nil {
+		t.Fatalf("an omitted build node uses the runtime node: %v", err)
+	}
+	distinct := platform.Environment{Node: "app-1", BuildNode: "build-1"}
+	err := crossNodeBuildUnsupported(distinct, "directory")
+	if err == nil {
+		t.Fatal("a distinct build node was pretended to work")
+	}
+	fault := contract.Classify(err)
+	if fault.Code != contract.PreconditionFailed || !strings.Contains(fault.Message, "shared registry") || fault.Hint == "" {
+		t.Fatalf("the gate is not explicit: %+v", fault)
+	}
+	if err := crossNodeBuildUnsupported(distinct, "image"); err != nil {
+		t.Fatalf("an image release does not need a build node: %v", err)
+	}
+}
+
 func TestRegistryCredentialScopeFollowsRoles(t *testing.T) {
 	app := testNode("app-1", platform.EnrollmentEnrolled, []string{platform.RoleApplication})
 	builder := testNode("build-1", platform.EnrollmentEnrolled, []string{platform.RoleBuilder})

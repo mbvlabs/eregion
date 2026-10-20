@@ -84,10 +84,14 @@ const (
 )
 
 type Environment struct {
-	ID              EnvironmentID     `json:"id"`
-	App             string            `json:"app"`
-	Name            string            `json:"name"`
-	Node            string            `json:"node"`
+	ID   EnvironmentID `json:"id"`
+	App  string        `json:"app"`
+	Name string        `json:"name"`
+	Node string        `json:"node"`
+	// BuildNode optionally places Buildpacks execution on a distinct builder
+	// node. When empty, builds run on Node. It must have builder + buildpacks,
+	// and it is always authenticated through the node transport, never a name.
+	BuildNode       string            `json:"build_node,omitempty"`
 	HostPort        int               `json:"host_port"`
 	CandidatePort   int               `json:"candidate_port"`
 	ContainerPort   int               `json:"container_port"`
@@ -104,6 +108,17 @@ type Environment struct {
 	HealthCheckedAt *time.Time        `json:"health_checked_at,omitempty"`
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
+}
+
+// BuildNodeName is where a build source for this environment runs. An empty
+// build_node means the environment's application node, which works for the
+// co-located main node in development. A distinct build node is accepted and
+// validated, but an artifact cannot cross nodes without a shared registry.
+func (e Environment) BuildNodeName() string {
+	if e.BuildNode != "" {
+		return e.BuildNode
+	}
+	return e.Node
 }
 
 type ReleaseStatus string

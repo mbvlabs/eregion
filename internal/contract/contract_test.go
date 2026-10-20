@@ -105,6 +105,45 @@ func TestEventValidation(t *testing.T) {
 	}
 }
 
+func TestStructuredPlatformEventValidation(t *testing.T) {
+	event := sampleEvent()
+	event.Kind, event.State = "log", ""
+	event.Step = "platform-health-01-v1"
+	event.ReleaseID = "rel_" + strings.Repeat("b", 32)
+	event.ServingReleaseID = "rel_" + strings.Repeat("c", 32)
+	duration := int64(12)
+	event.DurationMS = &duration
+	event.Health = &HealthObservation{Target: "http://127.0.0.1:20000/", Type: "http", Passed: true, Checks: 2, TimeoutSeconds: 30, Detail: "http status 200"}
+	if err := event.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"step":"platform-health-01-v1"`, `"release_id":"rel_`, `"serving_release_id":"rel_`, `"duration_ms":12`, `"health":{`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("structured field %s is not on the wire: %s", want, raw)
+		}
+	}
+	for name, change := range map[string]func(*Event){
+		"bad release":         func(e *Event) { e.ReleaseID = "release-1" },
+		"bad serving release": func(e *Event) { e.ServingReleaseID = "rel_x" },
+		"bad step":            func(e *Event) { e.Step = "two words" },
+		"negative duration":   func(e *Event) { value := int64(-1); e.DurationMS = &value },
+		"negative checks":     func(e *Event) { e.Health.Checks = -1 },
+		"control health":      func(e *Event) { e.Health.Detail = "line\nbreak" },
+	} {
+		bad := event
+		health := *event.Health
+		bad.Health = &health
+		change(&bad)
+		if bad.Validate() == nil {
+			t.Errorf("%s: accepted invalid structured event", name)
+		}
+	}
+}
+
 func TestOperationErrorCodeIsMachineReadable(t *testing.T) {
 	operation := Operation{
 		ID: "op_" + OperationID(strings.Repeat("a", 32)), Kind: "diagnostic.test", Target: "control-plane",

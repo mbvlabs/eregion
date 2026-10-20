@@ -35,7 +35,7 @@ type Family struct {
 }
 
 var (
-	argvStepPattern      = regexp.MustCompile(`^platform-(argv|node|pull|image|command|cleanup)-[0-9]{2}-v1$`)
+	argvStepPattern      = regexp.MustCompile(`^platform-(argv|node|pull|image|command|cleanup|preflight)-[0-9]{2}-v1$`)
 	containerStepPattern = regexp.MustCompile(`^platform-container-[0-9]{2}-v1$`)
 	healthStepPattern    = regexp.MustCompile(`^platform-health-[0-9]{2}-v1$`)
 	packStepPattern      = regexp.MustCompile(`^platform-pack-[0-9]{2}-v1$`)
