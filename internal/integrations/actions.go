@@ -151,6 +151,15 @@ func Configure(reg *platform.Registry, cfg RuntimeConfig) error {
 	return reg.RegisterInventory(accessInventory{access: cfg.Access})
 }
 
+func configuredZone(zones []DNSZone, zoneID, zoneName string) bool {
+	for _, zone := range zones {
+		if zone.ZoneID == zoneID && zone.ZoneName == zoneName {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeDNS(target platform.Target, raw json.RawMessage) (platform.ActionInput, error) {
 	if target.Kind != platform.TargetPlatform {
 		return nil, contract.NewFault(contract.ValidationFailed, "DNS reconciliation target must be platform", "Use platform; the zone and records belong to the action input.")
@@ -258,6 +267,9 @@ func (e *actionExecutor) Execute(ctx context.Context, exec platform.Execution) (
 }
 
 func (e *actionExecutor) dns(ctx context.Context, exec platform.Execution) (platform.Result, error) {
+	if len(e.runtime.DNSZones) == 0 {
+		return platform.Result{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES (zoneID=zoneName pairs) and EREGION_CLOUDFLARE_TOKEN_FILE before reconciling DNS.")
+	}
 	if e.runtime.Authorizer == nil || e.runtime.Audit == nil {
 		return platform.Result{}, contract.NewFault(contract.Unavailable, "DNS reconciliation is not configured", "Wire explicit authorization and a durable audit sink; DNS changes fail closed.")
 	}
@@ -270,6 +282,9 @@ func (e *actionExecutor) dns(ctx context.Context, exec platform.Execution) (plat
 		return platform.Result{}, contract.NewFault(contract.ValidationFailed, "invalid DNS target", "Use platform.")
 	}
 	input.target = target
+	if !configuredZone(e.runtime.DNSZones, input.ZoneID, input.ZoneName) {
+		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "Cloudflare zone is not configured on this control plane", "Add the exact zone ID and name to EREGION_CLOUDFLARE_ZONES; reconcile never accepts a zone that the service was not configured to manage.")
+	}
 	raw, err := ReadSecretFile(input.TokenFile, 4096)
 	if err != nil {
 		return platform.Result{}, err
@@ -388,6 +403,9 @@ type dnsInventory struct {
 func (dnsInventory) Collection() string { return InventoryCollectionDNS }
 
 func (p dnsInventory) Read(ctx context.Context, query platform.InventoryQuery) (any, error) {
+	if len(p.zones) == 0 {
+		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES (zoneID=zoneName pairs) and EREGION_CLOUDFLARE_TOKEN_FILE; the DNS inventory does not guess a zone.")
+	}
 	limit := boundedLimit(query.Limit)
 	routes := make([]DNSRoute, 0)
 	for _, zone := range p.zones {

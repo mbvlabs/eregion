@@ -311,19 +311,33 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 			pool.Close()
 			return nil, nil, extensionRuntime{}, nil, err
 		}
+		// The local transport is the default. Build it here so the shared
+		// per-node resolver sees the same authenticated transport the worker
+		// uses; controlplane.New is given this instance and does not replace it.
+		if nodeTransport == nil {
+			local, localErr := node.NewLocal(node.DefaultStateDir(), "local", &secrets.Registry{})
+			if localErr != nil {
+				pool.Close()
+				return nil, nil, extensionRuntime{}, nil, contract.NewFault(contract.ValidationFailed, "could not initialise the local node transport", "Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.")
+			}
+			nodeTransport = local
+		}
 	}
+	logger := a.logger(cmd)
+	// One resolver serves both extension dispatch (telemetry) and the worker.
+	// Sharing it keeps one transport cache and one WireGuard key lock per node.
+	nodes := controlplane.NewNodeResolver(pool, a.fleetResolverConfig(logger), func() node.Transport { return nodeTransport })
 	// Extensions register before New so the registry is complete before any
 	// action can be normalized, submitted, or executed.
-	parts, resolver, err := a.startExtensions(pool, concurrency > 0)
+	parts, secretResolver, err := a.startExtensions(pool, concurrency > 0, nodes)
 	if err != nil {
 		closeTransport()
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
-	logger := a.logger(cmd)
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
-		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: resolver,
-		Nodes: a.fleetResolverConfig(logger),
+		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
+		Nodes: a.fleetResolverConfig(logger), Resolver: nodes,
 	})
 	if err != nil {
 		closeTransport()

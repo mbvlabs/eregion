@@ -41,21 +41,60 @@ type NodeQueryer interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
+// TransportResolver returns the authenticated transport that reaches one node.
+// The control plane already has this boundary for enrolled-node dispatch
+// (controlplane.NodeTransports); telemetry accepts the same shape so one worker
+// process can dispatch to many nodes without a process-wide transport.
+type TransportResolver interface {
+	TransportFor(ctx context.Context, nodeName string) (node.Transport, error)
+}
+
+// staticTransportResolver adapts one already-selected transport to the resolver
+// interface. It is the compatibility path for local workers and tests; a single
+// transport is still matched against the authoritative placement identity before
+// any step runs.
+type staticTransportResolver struct {
+	transport node.Transport
+}
+
+func (r staticTransportResolver) TransportFor(context.Context, string) (node.Transport, error) {
+	if r.transport == nil {
+		return nil, contract.NewFault(contract.Unavailable, "telemetry node transport is not configured", "Configure a pinned node transport before dispatching telemetry work.")
+	}
+	return r.transport, nil
+}
+
 // ConfigureProduction builds the database- and transport-backed adapters and
 // registers the durable telemetry actions on reg. It does not add migrations and
 // never installs anything locally: every mutation is dispatched to the target
 // node through transport.
+//
+// A single transport cannot serve a multi-node installation. Keep this
+// constructor for a local or single-node worker and use
+// ConfigureProductionWithResolver with the process-wide NodeTransports in a real
+// serve/worker deployment.
 func ConfigureProduction(reg *platform.Registry, pool *pgxpool.Pool, transport node.Transport) error {
+	if transport == nil {
+		return contract.NewFault(contract.ValidationFailed, "telemetry production runtime needs a node transport", "Configure the pinned node transport before registering telemetry actions; there is no local fallback.")
+	}
+	return ConfigureProductionWithResolver(reg, pool, staticTransportResolver{transport: transport})
+}
+
+// ConfigureProductionWithResolver is the multi-node production constructor. It
+// resolves the transport per target node, so a worker can install on the
+// telemetry node and an agent on an application or builder node in the same
+// process.
+func ConfigureProductionWithResolver(reg *platform.Registry, pool *pgxpool.Pool, resolver TransportResolver) error {
 	if pool == nil {
 		return contract.NewFault(contract.ValidationFailed, "telemetry production runtime needs a database pool", "Open the external PostgreSQL pool before registering telemetry actions.")
 	}
-	if transport == nil {
-		return contract.NewFault(contract.ValidationFailed, "telemetry production runtime needs a node transport", "Configure the pinned node transport before registering telemetry actions; there is no local fallback.")
+	if resolver == nil {
+		return contract.NewFault(contract.ValidationFailed, "telemetry production runtime needs a node transport resolver", "Pass the control plane's per-node transport resolver; there is no local fallback.")
 	}
 	if reg == nil {
 		reg = platform.Default()
 	}
-	dispatch := &transportDispatch{transport: transport}
+	dispatch := &transportDispatch{resolver: resolver}
 	return Configure(reg, RuntimeConfig{
 		Placement: &tablePlacement{pool: pool},
 		Dispatch:  dispatch,
@@ -114,7 +153,7 @@ func hostIdentity(address string) string {
 // The protocol has no arbitrary command or file request, so the install plan is
 // expressed as the narrow telemetry-* step family in internal/telemetry/remote.
 type transportDispatch struct {
-	transport node.Transport
+	resolver TransportResolver
 }
 
 var _ Dispatch = (*transportDispatch)(nil)
@@ -124,9 +163,9 @@ func (d *transportDispatch) Open(context.Context, TargetIdentity) (NodeExecutor,
 	return nil, contract.NewFault(contract.Unavailable, "telemetry dispatch needs a durable operation identity", "Execute the action through the platform worker so node effects carry an operation ID and attempt.")
 }
 
-func (d *transportDispatch) OpenOperation(_ context.Context, identity TargetIdentity, operationID contract.OperationID, attempt uint32, root string) (NodeExecutor, error) {
-	if d == nil || d.transport == nil {
-		return nil, contract.NewFault(contract.Unavailable, "telemetry node transport is not configured", "Configure the pinned node transport before submitting telemetry work.")
+func (d *transportDispatch) OpenOperation(ctx context.Context, identity TargetIdentity, operationID contract.OperationID, attempt uint32, root string) (NodeExecutor, error) {
+	if d == nil || d.resolver == nil {
+		return nil, contract.NewFault(contract.Unavailable, "telemetry node transport resolver is not configured", "Configure the pinned node transport resolver before submitting telemetry work.")
 	}
 	if err := identity.Validate(); err != nil {
 		return nil, err
@@ -137,10 +176,17 @@ func (d *transportDispatch) OpenOperation(_ context.Context, identity TargetIden
 	if !filepath.IsAbs(root) || filepath.Clean(root) == string(filepath.Separator) {
 		return nil, contract.NewFault(contract.ValidationFailed, "telemetry install root must be an absolute non-root directory", "Use a root-owned absolute directory beneath /var/lib/eregion.")
 	}
-	if err := nodeTransportIdentity(d.transport, identity.Node); err != nil {
+	transport, err := d.resolver.TransportFor(ctx, identity.Node)
+	if err != nil {
 		return nil, err
 	}
-	return &transportExecutor{dispatch: d, identity: identity, operationID: operationID, attempt: attempt, root: filepath.Clean(root)}, nil
+	if transport == nil {
+		return nil, contract.NewFault(contract.Unavailable, "no node transport resolved for telemetry", "Enroll the node or configure the worker's fallback transport; there is no local fallback.")
+	}
+	if err := nodeTransportIdentity(transport, identity.Node); err != nil {
+		return nil, err
+	}
+	return &transportExecutor{transport: transport, identity: identity, operationID: operationID, attempt: attempt, root: filepath.Clean(root)}, nil
 }
 
 // nodeTransportIdentity uses the optional identity method implemented by the
@@ -160,7 +206,7 @@ func nodeTransportIdentity(transport node.Transport, expected string) error {
 }
 
 type transportExecutor struct {
-	dispatch    *transportDispatch
+	transport   node.Transport
 	identity    TargetIdentity
 	operationID contract.OperationID
 	attempt     uint32
@@ -213,7 +259,7 @@ func (e *transportExecutor) call(ctx context.Context, step string, payload any) 
 		return contract.NewFault(contract.Internal, "could not encode telemetry node step", "Report the command and binary version.")
 	}
 	exec := engineExecution(e.operationID, e.attempt, step)
-	response, err := e.dispatch.transport.Call(ctx, node.Request{
+	response, err := e.transport.Call(ctx, node.Request{
 		Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec, Payload: raw,
 	}, nil)
 	if err != nil {

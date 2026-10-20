@@ -65,6 +65,48 @@ func TestExternalExportRendersReferencesNotCredentials(t *testing.T) {
 	}
 }
 
+func TestRenderPlanProvisionsAlertingDefaults(t *testing.T) {
+	cfg := validConfig(t)
+	prepared, err := Prepare(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderPlan(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var alerts, provider, datasources, compose string
+	for _, file := range plan.Files {
+		switch {
+		case strings.HasSuffix(file.Path, "alerting/eregion-alerts.yaml"):
+			alerts = string(file.Data)
+		case strings.HasSuffix(file.Path, "dashboards/provider.yaml"):
+			provider = string(file.Data)
+		case strings.HasSuffix(file.Path, "datasources/datasources.yaml"):
+			datasources = string(file.Data)
+		case strings.HasSuffix(file.Path, "compose.yaml"):
+			compose = string(file.Data)
+		}
+	}
+	if alerts == "" {
+		t.Fatal("no provisioned Grafana alert rule file was rendered")
+	}
+	for _, want := range []string{"apiVersion: 1", "uid: eregion-telemetry-disk-low", "datasourceUid: VictoriaMetrics", "noDataState: NoData"} {
+		if !strings.Contains(alerts, want) {
+			t.Fatalf("alert rule file missing %q:\n%s", want, alerts)
+		}
+	}
+	if !strings.Contains(provider, "path: /var/lib/grafana/dashboards") {
+		t.Fatal("dashboard provider is not provisioned")
+	}
+	if !strings.Contains(datasources, "uid: VictoriaMetrics") {
+		t.Fatal("datasource UID does not match the alert rule reference")
+	}
+	if !strings.Contains(compose, "./grafana/provisioning:/etc/grafana/provisioning:ro") {
+		t.Fatal("Grafana provisioning is not mounted into the container")
+	}
+}
+
 func TestExternalExportValidation(t *testing.T) {
 	bad := []ExternalExport{
 		{},

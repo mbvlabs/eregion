@@ -3,11 +3,14 @@ package telemetry
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +23,10 @@ const (
 	KindInstall = "platform.telemetry.install"
 	// KindAgent installs the exporter collector on an application/builder node.
 	KindAgent = "platform.telemetry.agent"
+	// KindCredential issues one per-node OTLP ingest token and appends it to the
+	// protected credential file consumed by an install. Only a digest and the
+	// file path are returned; the token never enters operation input or events.
+	KindCredential = "platform.telemetry.credential"
 	// InventoryCollection exposes configured telemetry status.
 	InventoryCollection = "telemetry"
 )
@@ -101,6 +108,19 @@ func (i installInput) Preview() any {
 	}
 }
 
+type credentialInput struct {
+	target          platform.Target
+	CredentialsFile string `json:"credentials_file"`
+}
+
+func (i credentialInput) Target() platform.Target { return i.target }
+func (i credentialInput) Preview() any {
+	return map[string]any{
+		"node": i.target.Node, "credentials_file": i.CredentialsFile,
+		"note": "A new token is generated and written only to the referenced 0600 file; the token is never part of action input, events, or results.",
+	}
+}
+
 type agentInput struct {
 	target           platform.Target
 	PrivateAddress   string   `json:"private_address,omitempty"`
@@ -138,6 +158,12 @@ func Configure(reg *platform.Registry, cfg RuntimeConfig) error {
 	if err := reg.Register(platform.Definition{
 		Kind: KindAgent, Summary: "Install the OTLP exporter agent on an application or builder node",
 		Normalize: normalizeAgent, Executor: executor,
+	}); err != nil {
+		return err
+	}
+	if err := reg.Register(platform.Definition{
+		Kind: KindCredential, Summary: "Issue one node's OTLP ingest token into a protected credential file",
+		Normalize: normalizeCredential, Executor: executor,
 	}); err != nil {
 		return err
 	}
@@ -181,6 +207,24 @@ func normalizeInstall(target platform.Target, raw json.RawMessage) (platform.Act
 			return nil, err
 		}
 		input.ExternalExport = &external
+	}
+	return input, nil
+}
+
+func normalizeCredential(target platform.Target, raw json.RawMessage) (platform.ActionInput, error) {
+	if target.Kind != platform.TargetNode {
+		return nil, contract.NewFault(contract.ValidationFailed, "telemetry credential target must be node/<node>", "Name the application or builder node that will authenticate to the collector.")
+	}
+	var input credentialInput
+	input.target = target
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if !nodeNamePattern.MatchString(target.Node) {
+		return nil, contract.NewFault(contract.ValidationFailed, "invalid telemetry credential node name", "Use a lowercase DNS label of at most 63 characters.")
+	}
+	if err := validateSecretReference(input.CredentialsFile); err != nil {
+		return nil, err
 	}
 	return input, nil
 }
@@ -268,9 +312,144 @@ func (e *actionExecutor) Execute(ctx context.Context, exec platform.Execution) (
 		return e.install(ctx, exec)
 	case KindAgent:
 		return e.agent(ctx, exec)
+	case KindCredential:
+		return e.credential(ctx, exec)
 	default:
-		return platform.Result{}, contract.NewFault(contract.ValidationFailed, "unsupported telemetry action", "Use platform.telemetry.install or platform.telemetry.agent.")
+		return platform.Result{}, contract.NewFault(contract.ValidationFailed, "unsupported telemetry action", "Use platform.telemetry.install, platform.telemetry.agent, or platform.telemetry.credential.")
 	}
+}
+
+// credential issues one per-node token into the shared credential file. The
+// result carries a digest, never the token, so it is safe to put in an operation
+// event. The file is rewritten atomically and stays 0600.
+func (e *actionExecutor) credential(_ context.Context, exec platform.Execution) (platform.Result, error) {
+	var input credentialInput
+	if err := strictDecode(exec.Input, &input); err != nil {
+		return platform.Result{}, err
+	}
+	target, err := platform.ParseTarget(exec.Target)
+	if err != nil || target.Kind != platform.TargetNode {
+		return platform.Result{}, contract.NewFault(contract.ValidationFailed, "invalid telemetry credential target", "Use node/<node>.")
+	}
+	input.target = target
+	if !nodeNamePattern.MatchString(target.Node) {
+		return platform.Result{}, contract.NewFault(contract.ValidationFailed, "invalid telemetry credential node name", "Use a lowercase DNS label of at most 63 characters.")
+	}
+	credentials, err := readOrEmptyCredentials(input.CredentialsFile)
+	if err != nil {
+		return platform.Result{}, err
+	}
+	token, err := GenerateIngestToken()
+	if err != nil {
+		return platform.Result{}, contract.NewFault(contract.Internal, "could not generate a telemetry ingest token", "Report the command and binary version; no credential was issued.")
+	}
+	replaced := false
+	for index := range credentials {
+		if credentials[index].Node == target.Node {
+			credentials[index].Token = token
+			replaced = true
+		}
+	}
+	if !replaced {
+		credentials = append(credentials, IngestCredential{Node: target.Node, Token: token})
+	}
+	if err := writeCredentialsFile(input.CredentialsFile, credentials); err != nil {
+		return platform.Result{}, err
+	}
+	digest := sha256.Sum256([]byte(token))
+	return platform.Result{
+		Message: "Issued an OTLP ingest credential for " + target.Node + " in " + input.CredentialsFile + "; only its SHA-256 digest is recorded.",
+		Data: map[string]any{
+			"node": target.Node, "credentials_file": input.CredentialsFile,
+			"token_sha256": hex.EncodeToString(digest[:]), "credentials": len(credentials),
+		},
+	}, nil
+}
+
+func readOrEmptyCredentials(path string) ([]IngestCredential, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []IngestCredential{}, nil
+		}
+		return nil, contract.NewFault(contract.Unavailable, "credential file is unavailable", "Check permissions on the referenced credential file.")
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0077 != 0 {
+		return nil, contract.NewFault(contract.PreconditionFailed, "credential file is not a safe 0600 regular file", "Use a regular file readable only by its owner; symlinks and group/world access are refused.")
+	}
+	if info.Size() > 64*1024 {
+		return nil, contract.NewFault(contract.PreconditionFailed, "credential file is too large", "Keep the per-node credential array below 64 KiB.")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "credential file could not be read", "Check permissions on the referenced credential file.")
+	}
+	var credentials []IngestCredential
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&credentials); err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "credential file is invalid", "Use a JSON array of node and token entries in a root-owned 0600 file.")
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, contract.NewFault(contract.ValidationFailed, "credential file has trailing data", "Use exactly one JSON array.")
+	}
+	for _, credential := range credentials {
+		if err := credential.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	return credentials, nil
+}
+
+func writeCredentialsFile(path string, credentials []IngestCredential) error {
+	sort.Slice(credentials, func(i, j int) bool { return credentials[i].Node < credentials[j].Node })
+	seen := map[string]bool{}
+	for _, credential := range credentials {
+		if err := credential.Validate(); err != nil {
+			return err
+		}
+		if seen[credential.Node] {
+			return contract.NewFault(contract.ValidationFailed, "duplicate ingest credential node", "Keep exactly one current credential per node.")
+		}
+		seen[credential.Node] = true
+	}
+	encoded, err := json.MarshalIndent(credentials, "", "  ")
+	if err != nil {
+		return contract.NewFault(contract.Internal, "could not encode the credential file", "Report the command and binary version.")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return contract.NewFault(contract.Unavailable, "credential directory is not writable", "Check permissions on the credential file's directory.")
+	}
+	file, err := os.CreateTemp(filepath.Dir(path), ".ingest-tokens-*")
+	if err != nil {
+		return contract.NewFault(contract.Unavailable, "credential file could not be written", "Check permissions and free space on the credential file's directory.")
+	}
+	temp := file.Name()
+	cleanup := func() {
+		_ = file.Close()
+		_ = os.Remove(temp)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		cleanup()
+		return contract.NewFault(contract.Unavailable, "credential file permissions could not be set", "Check the filesystem's permission support.")
+	}
+	if _, err := file.Write(append(encoded, '\n')); err != nil {
+		cleanup()
+		return contract.NewFault(contract.Unavailable, "credential file could not be written", "Check free space on the credential file's directory.")
+	}
+	if err := file.Sync(); err != nil {
+		cleanup()
+		return contract.NewFault(contract.Unavailable, "credential file could not be flushed", "Check the filesystem and free space.")
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(temp)
+		return contract.NewFault(contract.Unavailable, "credential file could not be closed", "Check the filesystem and free space.")
+	}
+	if err := os.Rename(temp, path); err != nil {
+		_ = os.Remove(temp)
+		return contract.NewFault(contract.Unavailable, "credential file could not be published", "Check permissions on the credential file's directory.")
+	}
+	return nil
 }
 
 func (e *actionExecutor) install(ctx context.Context, exec platform.Execution) (platform.Result, error) {

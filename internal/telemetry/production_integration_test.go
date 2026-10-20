@@ -1,7 +1,8 @@
-package telemetry
+package telemetry_test
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
@@ -11,8 +12,18 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
+
+type noopTransport struct{ name string }
+
+func (n *noopTransport) Name() string         { return "noop" }
+func (n *noopTransport) NodeIdentity() string { return n.name }
+func (n *noopTransport) Call(context.Context, node.Request, func(node.Event)) (node.Response, error) {
+	return node.Response{}, errors.New("noop transport")
+}
 
 // TestIntegrationProductionPlacement uses the real migration and table shape.
 // It is skipped unless EREGION_TEST_DATABASE_URL points at a PostgreSQL server
@@ -57,21 +68,21 @@ func TestIntegrationProductionPlacement(t *testing.T) {
         VALUES ('telemetry-1',ARRAY['telemetry'],ARRAY['docker'],'10.77.0.10:22')`); err != nil {
 		t.Fatal(err)
 	}
-	placement, err := (&tablePlacement{pool: pool}).ResolveNode(ctx, "telemetry-1")
+	placement, err := telemetry.TablePlacementForTest(pool).ResolveNode(ctx, "telemetry-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if placement.PrivateAddress != "10.77.0.10" || placement.IsControlPlane || placement.IsMain {
 		t.Fatalf("unexpected placement from the real table: %+v", placement)
 	}
-	status, err := newTableStatus(pool, nil).TelemetryStatus(ctx)
+	status, err := telemetry.TableStatusForTest(pool).TelemetryStatus(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !status.Configured || status.State != StatusUnknown || status.Endpoints["logs"] != "10.77.0.10:9427" {
+	if !status.Configured || status.State != telemetry.StatusUnknown || status.Endpoints["logs"] != "10.77.0.10:9427" {
 		t.Fatalf("unexpected status from the real table: %+v", status)
 	}
-	if err := ConfigureProduction(platform.NewRegistry(), pool, &noopTransport{name: "telemetry-1"}); err != nil {
+	if err := telemetry.ConfigureProduction(platform.NewRegistry(), pool, &noopTransport{name: "telemetry-1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,7 +90,7 @@ func TestIntegrationProductionPlacement(t *testing.T) {
         VALUES ('main',ARRAY['control-plane','telemetry'],ARRAY['docker'],'10.77.0.1:22')`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (&tablePlacement{pool: pool}).ResolveNode(ctx, "main"); contract.Classify(err).Code != contract.PreconditionFailed {
+	if _, err := telemetry.TablePlacementForTest(pool).ResolveNode(ctx, "main"); contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("telemetry on the control plane was not refused: %v", err)
 	}
 }
