@@ -172,7 +172,7 @@ func (r *NodeResolver) fallbackFor(name string) (node.Transport, error) {
 	if identity == "" {
 		return nil, placementViolation(ReasonTransportUnpinned, name, "node transport identity is not pinned", "Configure the transport's expected node name so placement is verified, not inferred from a hostname.", nil)
 	}
-	if identity != name {
+	if !localNodeNamesMatch(identity, name) {
 		return nil, placementViolation(ReasonIdentityMismatch, name, fmt.Sprintf("this worker's authenticated transport identifies %q, not %q", identity, name),
 			"Enroll the node so the control plane reaches it over its own pinned SSH transport. Hostnames are not authorization.", map[string]any{"transport_identity": identity})
 	}

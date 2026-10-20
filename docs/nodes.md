@@ -43,9 +43,13 @@ control plane deliberately never needs root on a node):
    The `node` name must equal the name you enroll; the handshake enforces it.
    Optional `"wireguard_apply": ["/usr/local/sbin/eregion-wg-apply"]` names a
    privileged helper (see Private connectivity).
-3. Install what the roles need: Docker for `application` and `builder`
-   (the account must reach the daemon), `pack` for `builder`, `wireguard-tools`
-   for the private network. Enrollment verifies these; it does not install them.
+3. Install what the roles need: Docker for `application`, `builder`, and
+   `telemetry` (the account must reach the daemon), `pack` for `builder`, `git`
+   for builder-capable hosts, `wireguard-tools` for the private network, and
+   Docker Compose for `telemetry`. Enrollment verifies Docker/`pack`/`wg`; it
+   does not install them. `eregion bootstrap` installs the matching role
+   packages (`git` for `main`/`builder`, `wireguard-tools` for node roles,
+   `docker-compose` for `telemetry`) but never a telemetry stack.
 4. Optional but recommended: print the node's identity fingerprint and verify it
    out of band: `eregion-node identity --config /etc/eregion/node.json` prints
    `SHA256:...` and creates the key if needed. Also verify the host key
@@ -55,7 +59,12 @@ On the control plane set `EREGION_NODE_SSH_IDENTITY` (the private key authorized
 on every node) and, for the private network, `EREGION_NODE_WG_KEY_DIR`,
 `EREGION_NODE_WG_ADDRESS` (default `10.77.0.1`), and `EREGION_NODE_WG_SUBNET`
 (default `10.77.0.0/24`). `serve` and `worker` read them; they are listed in
-`eregion help serve --json`.
+`eregion help serve --json`. `bootstrap` writes these keys (and
+`EREGION_NODE_SSH_KNOWN_HOSTS`) into `/etc/eregion/control-plane.env` with the
+paths shown in [bootstrap](bootstrap.md#local-workflow); the operator still
+installs the private key and pins the host keys. Re-applying bootstrap preserves
+operator-added environment lines and `node.json` keys such as
+`wireguard_apply`.
 
 ## Enrolling
 
@@ -105,6 +114,20 @@ how fresh the last check is ("ok 3m0s ago", "(stale)" after 15 minutes, "never
 checked"). A host that answers with a different identity key is **quarantined**
 (`last_check_state=identity_mismatch`): it receives no work until a check
 verifies the pinned identity again.
+
+## Main node identity
+
+The control plane's in-process transport identifies itself as a node. `local`
+is the original development identity; `main` is the documented main-node name.
+Both name the same local transport, so an environment created with
+`--node main` works on a deployment that still has a `local` node row, and the
+reverse also holds. The database row keeps its original name; new environments
+reference the actual row instead of creating a duplicate.
+
+`EREGION_NODE_NAME` selects the identity (default `local` for compatibility).
+Fresh bootstrap writes the requested `--node` value into
+`/etc/eregion/control-plane.env`. A remote or enrolled transport is never treated
+as an alias: its authenticated node name must match exactly.
 
 ## Role combinations (the decision)
 
@@ -230,8 +253,11 @@ durable surface for them.
   rejection, probe against fake os-release/tools, role directories and drift
   repair, WireGuard key generation, deterministic rendering, idempotent apply,
   payload injection refusal), `internal/controlplane` (placement rules,
-  quarantine, registry scope, fallback identity), `internal/cli` (enroll needs a
-  pinned host key, plain node table with freshness).
+  quarantine, registry scope, fallback identity, `local`/`main` aliasing),
+  `internal/cli` (enroll needs a pinned host key, plain node table with
+  freshness, remote bundle stability, once-only credential handoff),
+  `internal/host` (status without apply inputs, env/node-config merge,
+  action-grant credentials, the generated watchdog script).
 - Integration (`EREGION_TEST_DATABASE_URL`, Docker):
   `go test -count=1 ./internal/controlplane -run TestIntegration -timeout 600s`.
   `integration_nodes_test.go` enrolls an application node and a builder node over
@@ -250,7 +276,8 @@ durable surface for them.
 - **Real Docker and `pack` on enrolled nodes.** The fixture's `docker` and `pack`
   are small stand-ins; they prove the probe, the capability gate, and dispatch,
   not a build or a deployment on a remote node. Remote builds and image movement
-  are M3.
+  are M3. `bootstrap remote` apply is exercised against the SSH fixture with fake
+  package/daemon tools; it is not a fresh-VM proof.
 - **The WireGuard apply helper.** The test's root loop stands in for the
   production helper (sudo rule or systemd path unit). No shipped helper or unit
   file exists yet; installing one is part of bootstrap.

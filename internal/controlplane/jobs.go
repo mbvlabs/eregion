@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -84,6 +85,10 @@ type WorkerConfig struct {
 	// Nodes configures how enrolled nodes are reached (SSH identity, WireGuard
 	// key directory). The zero value serves only the fallback Transport.
 	Nodes ResolverConfig
+	// LocalNodeName is the identity of the in-process local transport. Empty
+	// uses EREGION_NODE_NAME, then "local" for compatibility. A fresh main
+	// node bootstrap writes "main".
+	LocalNodeName string
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
@@ -97,11 +102,24 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		if stateDir == "" {
 			stateDir = node.DefaultStateDir()
 		}
-		local, err := node.NewLocal(stateDir, "local", &secrets.Registry{})
+		localName := config.LocalNodeName
+		if localName == "" {
+			localName = strings.TrimSpace(os.Getenv("EREGION_NODE_NAME"))
+		}
+		if localName == "" {
+			localName = "local"
+		}
+		local, err := node.NewLocal(stateDir, localName, &secrets.Registry{})
 		if err != nil {
 			return nil, contract.NewFault(contract.ValidationFailed, "could not initialise the local node transport", "Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.")
 		}
 		service.transport = local
+		service.localNode = localName
+	} else if local, ok := service.transport.(*node.Local); ok {
+		// Tests and embedders inject the local transport directly. An SSH
+		// transport is never mistaken for a local node merely because
+		// EREGION_NODE_NAME is also set.
+		service.localNode = local.NodeIdentity()
 	}
 	service.resolver = NewNodeResolver(pool, config.Nodes, func() node.Transport { return service.transport })
 	workers := river.NewWorkers()

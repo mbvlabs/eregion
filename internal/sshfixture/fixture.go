@@ -69,6 +69,10 @@ type Options struct {
 	// reconcile flow. Without the host's wireguard module Start reports
 	// ErrUnavailable.
 	NetAdmin bool
+	// Root authorizes the root account for SSH. It is for bootstrap integration
+	// tests that must run the real root-only apply path; it is not a production
+	// fixture mode.
+	Root bool
 }
 
 // NewClientKey writes a fresh SSH client identity into dir and returns its path.
@@ -158,7 +162,9 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		nodeName = "fixture-node"
 	}
 	user := options.User
-	if user == "" {
+	if options.Root {
+		user = "root"
+	} else if user == "" {
 		user = "eregion"
 	}
 	hostKey, hostKeyPath, err := generateHostKey()
@@ -214,7 +220,16 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		cleanup()
 		return nil, err
 	}
+	if options.Root {
+		if _, err := runDocker(ctx, "exec", container, "sh", "-c", "sed -i 's/^PermitRootLogin no/PermitRootLogin yes/' /etc/ssh/sshd_config.d/eregion.conf"); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
 	home := "/home/" + user
+	if options.Root {
+		home = "/root"
+	}
 	if _, err := runDocker(ctx, "exec", container, "sh", "-c", "mkdir -p "+home+"/.ssh && chown -R "+user+":"+user+" "+home); err != nil {
 		cleanup()
 		return nil, err

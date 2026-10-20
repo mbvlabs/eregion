@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -203,6 +204,65 @@ func TestContextCredentialAddIsScopedAndBound(t *testing.T) {
 	encoded, _ := json.Marshal(decodeOne(t, stdout).Data)
 	if strings.Contains(string(encoded), strings.TrimSpace(string(raw))) {
 		t.Fatal("credential result leaked the token")
+	}
+}
+
+func TestContextCredentialAddStoresActionGrants(t *testing.T) {
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	operator := strings.Repeat("o", 43)
+	hash := sha256.Sum256([]byte(operator))
+	if err := host.WriteAuthFile(authPath, []api.Principal{{Actor: contract.Actor{Kind: "operator", Subject: "operator"}, TokenSHA256: hex.EncodeToString(hash[:]), Scopes: host.KnownScopes()}}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	tokenOut := filepath.Join(dir, "ci.token")
+	base := []string{"context", "credential", "add", "--auth-file", authPath, "--subject", "ci-deploy",
+		"--scope", "operations:submit",
+		"--action-grant", "platform.deploy:env/api/production",
+		"--action-grant", "platform.release.create:env/api/*",
+		"--token-out", tokenOut, "--dry-run", "--json"}
+	code, stdout, stderr := invoke(t, base...)
+	if code != 0 {
+		t.Fatalf("dry-run: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	envelope := decodeOne(t, stdout)
+	data, _ := json.Marshal(envelope.Data)
+	if !bytes.Contains(data, []byte("platform.deploy")) || !bytes.Contains(data, []byte("env/api/*")) {
+		t.Fatalf("plan omitted action grants: %s", data)
+	}
+	var plan struct {
+		Confirmation struct {
+			Token string `json:"token"`
+		} `json:"confirmation"`
+	}
+	if err := json.Unmarshal(data, &plan); err != nil || plan.Confirmation.Token == "" {
+		t.Fatalf("plan: %s %v", data, err)
+	}
+	confirm := append([]string(nil), base...)
+	confirm = confirm[:len(confirm)-2] // drop --dry-run/--json
+	confirm = append(confirm, "--confirm", plan.Confirmation.Token, "--json")
+	code, stdout, stderr = invoke(t, confirm...)
+	if code != 0 {
+		t.Fatalf("apply: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	principals, err := host.ReadAuthFile(authPath)
+	if err != nil || len(principals) != 2 {
+		t.Fatalf("auth file: %+v %v", principals, err)
+	}
+	grants := principals[1].ActionGrants
+	if len(grants) != 2 || grants[0].Kind != "platform.deploy" || grants[1].Target != "env/api/*" {
+		t.Fatalf("stored grants: %+v", grants)
+	}
+	if _, err := api.NewAuth(principals); err != nil {
+		t.Fatalf("server rejected the created credential: %v", err)
+	}
+	raw, _ := os.ReadFile(tokenOut)
+	if bytes.Contains([]byte(stdout+stderr), bytes.TrimSpace(raw)) {
+		t.Fatal("credential output leaked the token")
+	}
+	if code, _, _ := invoke(t, "context", "credential", "add", "--auth-file", authPath, "--subject", "bad",
+		"--scope", "operations:submit", "--action-grant", "platform.deploy:env/*/production", "--token-out", tokenOut, "--dry-run", "--json"); code == 0 {
+		t.Fatal("an ambiguous action grant was accepted")
 	}
 }
 

@@ -341,19 +341,30 @@ func (r *Runner) commitWindow() time.Duration {
 }
 
 func commitScript(dir string, manifest commitManifest) string {
-	confirmed := filepath.Join(dir, "confirmed")
-	rolledBack := filepath.Join(dir, "rolled-back")
+	confirmed := shellQuote(filepath.Join(dir, "confirmed"))
+	rolledBack := shellQuote(filepath.Join(dir, "rolled-back"))
+	rollingBack := shellQuote(filepath.Join(dir, "rollback.lock"))
+	failed := shellQuote(filepath.Join(dir, "rollback-failed"))
 	var out strings.Builder
-	out.WriteString("#!/bin/sh\nset -eu\n")
-	out.WriteString("while [ ! -f " + shellQuote(confirmed) + " ]; do\n")
+	out.WriteString("#!/bin/sh\nset -u\n")
+	out.WriteString("if [ -f " + confirmed + " ] || [ -f " + rolledBack + " ]; then exit 0; fi\n")
+	out.WriteString("while :; do\n")
+	out.WriteString("  if [ -f " + confirmed + " ] || [ -f " + rolledBack + " ]; then exit 0; fi\n")
 	out.WriteString("  now=$(date +%s)\n")
 	out.WriteString(fmt.Sprintf("  if [ \"$now\" -ge %d ]; then\n", manifest.Deadline.Unix()))
+	// Re-check the markers after observing the deadline: a confirmation or an
+	// explicit rollback may have raced the last poll iteration.
+	out.WriteString("    if [ -f " + confirmed + " ] || [ -f " + rolledBack + " ]; then exit 0; fi\n")
+	// Only one restore may run. An old watchdog from operation A must never
+	// overwrite the configuration confirmed by a newer operation B.
+	out.WriteString("    if mkdir " + rollingBack + " 2>/dev/null; then :; else exit 0; fi\n")
+	out.WriteString("    if [ -f " + confirmed + " ] || [ -f " + rolledBack + " ]; then rmdir " + rollingBack + " 2>/dev/null || true; exit 0; fi\n")
 	for _, file := range manifest.Files {
 		target := shellQuote(file.Path)
 		if file.Exists {
 			backup := shellQuote(filepath.Join(dir, file.Backup))
 			out.WriteString("    mkdir -p " + shellQuote(filepath.Dir(file.Path)) + "\n")
-			out.WriteString("    if cp -a " + backup + " " + target + "; then :; else printf 'restore failed at %s\\n' \"$now\" > " + shellQuote(filepath.Join(dir, "rollback-failed")) + "; exit 1; fi\n")
+			out.WriteString("    if ! cp -a " + backup + " " + target + "; then printf 'restore failed at %s\\n' \"$now\" > " + failed + "; rmdir " + rollingBack + " 2>/dev/null || true; exit 1; fi\n")
 			out.WriteString(fmt.Sprintf("    chmod %04o %s 2>/dev/null || true\n", file.Mode&0o777, target))
 			if file.UID >= 0 && file.GID >= 0 {
 				out.WriteString(fmt.Sprintf("    chown %d:%d %s 2>/dev/null || true\n", file.UID, file.GID, target))
@@ -370,12 +381,66 @@ func commitScript(dir string, manifest commitManifest) string {
 			out.WriteString("    systemctl disable --now " + shellQuote(unit.Name) + " 2>/dev/null || true\n")
 		}
 	}
-	out.WriteString("    printf 'rolled back at %s\\n' \"$now\" > " + shellQuote(rolledBack) + "\n")
+	out.WriteString("    printf 'rolled back at %s\\n' \"$now\" > " + rolledBack + "\n")
+	out.WriteString("    rmdir " + rollingBack + " 2>/dev/null || true\n")
 	out.WriteString("    exit 0\n")
 	out.WriteString("  fi\n")
 	out.WriteString("  sleep 1\n")
-	out.WriteString("done\nexit 0\n")
+	out.WriteString("done\n")
 	return out.String()
+}
+
+// reconcileCommits runs before a new apply. A detached watchdog dies with a
+// reboot, so an expired, unconfirmed snapshot must be restored here rather than
+// left to overwrite a newer configuration later. A future window from another
+// operation blocks mutation: two rollback windows must never overlap.
+func (r *Runner) reconcileCommits(projectedOperation string) error {
+	entries, err := os.ReadDir(commitRoot(r.Config))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	now := r.now()
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		operationID := entry.Name()
+		raw, _, exists, err := fileState(commitManifestPath(r.Config, operationID))
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		var manifest commitManifest
+		if err := json.Unmarshal(raw, &manifest); err != nil {
+			return contract.NewFault(contract.PreconditionFailed, "a rollback snapshot is invalid", "Inspect the bootstrap commit directory before applying again.")
+		}
+		_, _, hasConfirmed, err := fileState(commitConfirmedPath(r.Config, operationID))
+		if err != nil {
+			return err
+		}
+		_, _, hasRolledBack, err := fileState(commitRolledBackPath(r.Config, operationID))
+		if err != nil {
+			return err
+		}
+		if hasConfirmed || hasRolledBack {
+			continue
+		}
+		if !now.Before(manifest.Deadline) {
+			if err := r.rollbackCommit(operationID); err != nil {
+				return contract.NewFault(contract.PreconditionFailed, "an expired access change could not be rolled back", "Inspect the commit snapshot and restore it manually before applying again.")
+			}
+			continue
+		}
+		if operationID != projectedOperation {
+			return contract.NewFault(contract.ConfirmationRequired, "another access-changing apply still has an open rollback window", "Confirm or wait for operation "+operationID+" before starting a new convergence; a stale watchdog must not overwrite newer configuration.")
+		}
+	}
+	return nil
 }
 
 // Confirm closes the rollback window for operationID. It must be called from a
@@ -426,7 +491,13 @@ func (r *Runner) Confirm(ctx context.Context, operationID string) (ConfirmReport
 	}
 	now := r.now()
 	if now.After(manifest.Deadline) {
-		return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed", "The watchdog should have restored the previous access state. Inspect the host and run bootstrap plan again; do not assume the new state is live.")
+		// The detached watchdog may not have survived a reboot or a PID-namespace
+		// tear-down. Reconcile the snapshot now rather than confirming a state
+		// that is no longer live.
+		if err := r.rollbackCommit(operationID); err != nil {
+			return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed and the snapshot could not be restored", "Inspect the host and the commit snapshot manually; do not assume the new state is live.")
+		}
+		return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed", "The previous access state was restored. Inspect the host and run bootstrap plan again; do not assume the new state is live.")
 	}
 	if err := os.WriteFile(commitConfirmedPath(r.Config, operationID), []byte(now.UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
 		return ConfirmReport{}, err
@@ -454,6 +525,19 @@ type ConfirmReport struct {
 // logic through its generated shell script; tests call this directly to prove
 // the revert path without waiting for a wall-clock deadline.
 func (r *Runner) rollbackCommit(operationID string) error {
+	dir := commitPath(r.Config, operationID)
+	confirmedPath := commitConfirmedPath(r.Config, operationID)
+	rolledBackPath := commitRolledBackPath(r.Config, operationID)
+	for _, marker := range []string{confirmedPath, rolledBackPath} {
+		if _, _, exists, err := fileState(marker); err != nil {
+			return err
+		} else if exists {
+			// A confirmed operation must never be reverted by a late caller; a
+			// second rollback is already done. This is the disarm path for an
+			// old watchdog after a newer configuration was confirmed.
+			return nil
+		}
+	}
 	raw, _, exists, err := fileState(commitManifestPath(r.Config, operationID))
 	if err != nil {
 		return err
@@ -465,31 +549,56 @@ func (r *Runner) rollbackCommit(operationID string) error {
 	if err := json.Unmarshal(raw, &manifest); err != nil {
 		return err
 	}
-	dir := commitPath(r.Config, operationID)
+	// Serialize with a detached watchdog using the same atomic directory claim.
+	lock := filepath.Join(dir, "rollback.lock")
+	if err := os.Mkdir(lock, 0o700); err != nil {
+		if os.IsExist(err) {
+			return nil // Another rollback owns this snapshot.
+		}
+		return err
+	}
+	removeLock := func() { _ = os.Remove(lock) }
+	// Re-check after taking the claim: a confirmation may have arrived while
+	// this process was reading the manifest.
+	for _, marker := range []string{confirmedPath, rolledBackPath} {
+		if _, _, exists, err := fileState(marker); err != nil {
+			removeLock()
+			return err
+		} else if exists {
+			removeLock()
+			return nil
+		}
+	}
 	for _, file := range manifest.Files {
 		if file.Exists {
 			source := filepath.Join(dir, file.Backup)
 			if err := os.MkdirAll(filepath.Dir(file.Path), 0o750); err != nil {
+				removeLock()
 				return err
 			}
 			raw, _, _, err := fileState(source)
 			if err != nil {
+				removeLock()
 				return err
 			}
 			if err := writeFile(file.Path, raw, os.FileMode(file.Mode)&0o777, "root", "root"); err != nil {
+				removeLock()
 				return err
 			}
 			if os.Geteuid() == 0 && file.UID >= 0 && file.GID >= 0 {
 				if err := os.Chown(file.Path, file.UID, file.GID); err != nil {
+					removeLock()
 					return err
 				}
 			}
 		} else if err := os.Remove(file.Path); err != nil && !os.IsNotExist(err) {
+			removeLock()
 			return err
 		}
 	}
 	if r.Exec != nil {
 		if err := r.Exec.Run(context.Background(), "host-commit-rollback", "systemctl daemon-reload 2>/dev/null || true", nil, nil); err != nil {
+			removeLock()
 			return err
 		}
 		for _, unit := range manifest.Services {
@@ -500,7 +609,22 @@ func (r *Runner) rollbackCommit(operationID string) error {
 			_ = r.Exec.Run(context.Background(), "host-commit-rollback-"+unit.Name, script, nil, nil)
 		}
 	}
-	return os.WriteFile(commitRolledBackPath(r.Config, operationID), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
+	if err := os.WriteFile(rolledBackPath, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		removeLock()
+		return err
+	}
+	removeLock()
+	// Clear the pending window so a subsequent plan starts cleanly. This is
+	// also the boot reconciliation path when the detached watchdog did not
+	// survive a reboot.
+	_ = engineWithStateLock(r.Config, func(state *State) error {
+		if state.OperationID == operationID && state.CommitID == operationID {
+			state.CommitID = ""
+			state.CommitDeadline = time.Time{}
+		}
+		return nil
+	})
+	return nil
 }
 
 func markConfirmed(cfg Config, operationID string, now time.Time) error {

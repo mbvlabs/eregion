@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -82,12 +83,34 @@ type ApplyEntry struct {
 	Detail   string `json:"detail,omitempty"`
 }
 
-// Status is the bootstrap state plus current drift observations.
+// Status is the node-local bootstrap state plus the persisted step journal. It
+// deliberately does not evaluate drift: status works without the database URL,
+// operator-token output, binary, or other apply-only inputs. Run `bootstrap
+// plan` when those inputs are available to observe drift.
 type Status struct {
-	Bootstrapped bool   `json:"bootstrapped"`
-	Ready        bool   `json:"ready"`
-	State        *State `json:"state,omitempty"`
-	Plan         Plan   `json:"plan"`
+	Bootstrapped bool `json:"bootstrapped"`
+	Complete     bool `json:"complete"`
+	Active       bool `json:"active"`
+	Pending      bool `json:"pending_commit,omitempty"`
+	// RollbackRequired reports an expired commit window that no live watchdog
+	// has rolled back (for example after a reboot). Run apply or confirm to
+	// reconcile it before planning a new generation.
+	RollbackRequired bool         `json:"rollback_required,omitempty"`
+	CommitDeadline   *time.Time   `json:"commit_deadline,omitempty"`
+	State            *State       `json:"state,omitempty"`
+	Journal          string       `json:"journal"`
+	Steps            []StatusStep `json:"steps"`
+}
+
+// StatusStep is one persisted effect in the current bootstrap generation.
+type StatusStep struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	Attempt   uint32 `json:"attempt"`
+	Applied   uint32 `json:"applied_attempt,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
+	EndedAt   string `json:"completed_at,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 // NewRunner validates the intent and fills production defaults.
@@ -102,6 +125,16 @@ func NewRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
 // only the host layout, not the database URL or credential outputs that the
 // original apply used; those values are in the journal.
 func NewConfirmRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
+	if err := cfg.Layout.Validate(); err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, err.Error(), "Use the default bootstrap layout or the layout used by the original apply.")
+	}
+	return newRunner(cfg, registry), nil
+}
+
+// NewStatusRunner reads the node-local bootstrap state. It needs only a valid
+// layout: status must work on a fresh shell without the database URL, operator
+// token output, or binaries that apply required.
+func NewStatusRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
 	if err := cfg.Layout.Validate(); err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, err.Error(), "Use the default bootstrap layout or the layout used by the original apply.")
 	}
@@ -302,6 +335,9 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, risks), r.now()); err != nil {
 		return ApplyReport{}, err
 	}
+	if err := r.reconcileCommits(projected.OperationID); err != nil {
+		return ApplyReport{}, err
+	}
 	credentials, err := LoadCredentials(r.Config, true)
 	if err != nil {
 		return ApplyReport{}, err
@@ -440,20 +476,45 @@ func (r *Runner) applyFault(step Step, execution engine.Execution, status engine
 	return fault
 }
 
-// Status reads the bootstrap state and observes drift. It never mutates.
-func (r *Runner) Status(ctx context.Context) (Status, error) {
+// Status reads the node-local state and journal only. It never evaluates a
+// plan: status must work without apply-only inputs and must not mutate.
+func (r *Runner) Status(_ context.Context) (Status, error) {
 	state, exists, err := loadState(r.Config)
 	if err != nil {
 		return Status{}, err
 	}
-	plan, err := r.Plan(ctx)
+	status := Status{Bootstrapped: exists, Journal: JournalPath(r.Config), Steps: []StatusStep{}}
+	var operationID string
+	if exists {
+		status.State = &state
+		status.Active = state.Active
+		status.Complete = !state.Active && state.CommitID == "" && !state.CompletedAt.IsZero()
+		operationID = state.OperationID
+		if state.CommitID != "" {
+			status.Pending = true
+			deadline := state.CommitDeadline
+			status.CommitDeadline = &deadline
+			status.RollbackRequired = !r.now().Before(deadline)
+		}
+	}
+	journal, err := engine.LoadJournal(JournalPath(r.Config))
 	if err != nil {
 		return Status{}, err
 	}
-	status := Status{Bootstrapped: exists, Ready: exists && plan.Ready, Plan: plan}
-	if exists {
-		status.State = &state
+	for _, task := range journal.Tasks {
+		if operationID != "" && task.OperationID != operationID {
+			continue
+		}
+		detail := task.Error
+		if r.Secrets != nil {
+			detail = r.Secrets.Redact(detail)
+		}
+		status.Steps = append(status.Steps, StatusStep{
+			ID: task.Step, Status: task.Status, Attempt: task.Attempt, Applied: task.AppliedAttempt,
+			StartedAt: task.StartedAt, EndedAt: task.CompletedAt, Error: detail,
+		})
 	}
+	sort.Slice(status.Steps, func(i, j int) bool { return status.Steps[i].ID < status.Steps[j].ID })
 	return status, nil
 }
 

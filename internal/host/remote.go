@@ -196,7 +196,7 @@ func (r *Remote) Upload(ctx context.Context, destDir string, files []RemoteFile)
 	if err := gz.Close(); err != nil {
 		return err
 	}
-	command := "set -eu\nmkdir -p " + shellQuote(destDir) + "\ntar -xzf - -C " + shellQuote(destDir)
+	command := "set -eu\numask 077\nmkdir -p " + shellQuote(destDir) + "\ntar -xzf - -C " + shellQuote(destDir)
 	var stderr strings.Builder
 	if err := r.Run(ctx, command, bytes.NewReader(archive.Bytes()), io.Discard, &stderr); err != nil {
 		detail := strings.TrimSpace(stderr.String())

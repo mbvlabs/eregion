@@ -170,7 +170,7 @@ func (c Config) Validate() error {
 	}
 	role, err := ConfigForRole(c.Role)
 	if err != nil {
-		return contract.NewFault(contract.ValidationFailed, err.Error(), "Use --role main, application, or builder.")
+		return contract.NewFault(contract.ValidationFailed, err.Error(), "Use --role main, application, builder, or telemetry.")
 	}
 	if err := c.Layout.Validate(); err != nil {
 		return contract.NewFault(contract.ValidationFailed, err.Error(), "Use absolute, non-root host paths.")

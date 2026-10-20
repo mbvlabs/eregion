@@ -33,8 +33,8 @@ type wizardField struct {
 
 func bootstrapWizardFields(cfg host.Config) []wizardField {
 	return []wizardField{
-		{Key: "role", Label: "Role (main, application, builder)", Value: string(cfg.Role), Required: true},
-		{Key: "node", Label: "Node name", Value: cfg.Node, Required: true},
+		{Key: "role", Label: "Role (main, application, builder, telemetry)", Value: string(cfg.Role), Required: true},
+		{Key: "node", Label: "Node name (local and main name the local identity)", Value: cfg.Node, Required: true},
 		{Key: "database-url-file", Label: "External database URL file (main role)", Value: ""},
 		{Key: "operator-token-out", Label: "Operator token output on the host (main role)", Value: cfg.OperatorTokenOut, Required: true},
 		{Key: "automation-subject", Label: "Optional automation subject", Value: cfg.AutomationSubject},

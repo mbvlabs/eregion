@@ -156,6 +156,10 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return err
 		}
+		// Write the name of the actual node record, so an environment created
+		// with the "main" alias still references a row when this deployment
+		// keeps the older "local" identity.
+		input.Node = node.Name
 		if err := s.checkPlacement(node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
 			return err
 		}
@@ -398,9 +402,16 @@ func contains(values []string, want string) bool {
 // registration command. It records only capabilities actually found on the
 // host; it never claims remote identity or installs anything.
 func (s *Service) ensureLocalNode(ctx context.Context) error {
-	identity, ok := s.transportIdentity()
-	if !ok || identity != "local" {
+	identity := strings.TrimSpace(s.localNode)
+	if identity == "" {
 		return nil
+	}
+	// loadNode resolves the "local"/"main" alias, so an older deployment is not
+	// duplicated when the configured identity changed.
+	if _, err := loadNode(ctx, s.pool, identity); err == nil {
+		return nil
+	} else if fault := contract.Classify(err); fault.Code != contract.NotFound {
+		return err
 	}
 	caps := []string{}
 	if _, err := exec.LookPath("docker"); err == nil {
@@ -417,8 +428,8 @@ func (s *Service) ensureLocalNode(ctx context.Context) error {
 		roles = append(roles, platform.RoleBuilder)
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities,address,status,last_seen_at)
-        VALUES('local',$1,$2,'','ready',clock_timestamp())
-        ON CONFLICT (name) DO NOTHING`, roles, caps)
+        VALUES($1,$2,$3,'','ready',clock_timestamp())
+        ON CONFLICT (name) DO NOTHING`, identity, roles, caps)
 	if err != nil {
 		return unavailable(err)
 	}

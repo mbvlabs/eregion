@@ -12,18 +12,20 @@ import (
 )
 
 // Role is the node responsibility selected at bootstrap time. It is an
-// explicit placement decision, not a hint. Telemetry is intentionally absent:
-// it is a separate role in M5 and must never share the control plane.
+// explicit placement decision, not a hint. Telemetry has its own dedicated
+// role: bootstrap prepares Docker/Compose prerequisites there and never
+// installs a telemetry stack or co-locates it with the control plane.
 type Role string
 
 const (
 	RoleMain        Role = "main"
 	RoleApplication Role = "application"
 	RoleBuilder     Role = "builder"
+	RoleTelemetry   Role = "telemetry"
 )
 
 // Roles lists every role this increment can configure.
-func Roles() []Role { return []Role{RoleMain, RoleApplication, RoleBuilder} }
+func Roles() []Role { return []Role{RoleMain, RoleApplication, RoleBuilder, RoleTelemetry} }
 
 func (r Role) Valid() bool {
 	for _, candidate := range Roles() {
@@ -52,8 +54,9 @@ type RoleConfig struct {
 	// NodeAgent installs the node binary, node configuration, and state
 	// directory reached over the pinned node transport.
 	NodeAgent bool `json:"node_agent"`
-	// Telemetry is always false. Telemetry never runs on the main node and is
-	// not installed by this milestone.
+	// Telemetry prepares a dedicated telemetry host. It installs the runtime
+	// and Compose prerequisites only: no collector, storage, or telemetry
+	// stack is installed by bootstrap.
 	Telemetry bool `json:"telemetry"`
 }
 
@@ -68,12 +71,15 @@ func ConfigForRole(role Role) (RoleConfig, error) {
 		return RoleConfig{Role: role, Runtime: true, NodeAgent: true}, nil
 	case RoleBuilder:
 		return RoleConfig{Role: role, Runtime: true, Builder: true, NodeAgent: true}, nil
-	case "telemetry":
-		return RoleConfig{}, fmt.Errorf("the telemetry role is not implemented; it is a separate M5 node and is never co-located with the control plane")
+	case RoleTelemetry:
+		// Telemetry is a dedicated node. Bootstrap prepares Docker and Compose
+		// and the node execution account; it never installs a telemetry stack
+		// and never co-locates it with the control plane.
+		return RoleConfig{Role: role, Runtime: true, NodeAgent: true, Telemetry: true}, nil
 	case "edge":
 		return RoleConfig{}, fmt.Errorf("the edge role is not implemented; its scope is an open placement decision")
 	default:
-		return RoleConfig{}, fmt.Errorf("unknown host role %q; use main, application, or builder", role)
+		return RoleConfig{}, fmt.Errorf("unknown host role %q; use main, application, builder, or telemetry", role)
 	}
 }
 
