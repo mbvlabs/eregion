@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -47,6 +48,13 @@ type RuntimeStatus struct {
 	Endpoints      map[string]string `json:"endpoints,omitempty"`
 	Retention      Retention         `json:"retention"`
 	Traces         bool              `json:"traces"`
+	// State and Observed describe what was actually checked. "unknown" means
+	// placement exists but no health observation was made; absent means no
+	// telemetry node is registered. Neither value is a fabricated success.
+	State     string     `json:"state"`
+	Observed  bool       `json:"observed"`
+	CheckedAt *time.Time `json:"checked_at,omitempty"`
+	Message   string     `json:"message,omitempty"`
 }
 
 // StatusProvider lets the orchestrator report telemetry availability without
@@ -77,6 +85,9 @@ type installInput struct {
 	EnableTraces        bool      `json:"enable_traces"`
 	CredentialsFile     string    `json:"credentials_file"`
 	GrafanaPasswordFile string    `json:"grafana_password_file"`
+	// ExternalExport is additive to the telemetry node. It contains endpoint and
+	// file references only; credential contents are never accepted here.
+	ExternalExport *ExternalExport `json:"external_export,omitempty"`
 }
 
 func (i installInput) Target() platform.Target { return i.target }
@@ -85,7 +96,8 @@ func (i installInput) Preview() any {
 		"node": i.target.Node, "private_address": i.PrivateAddress, "root_dir": i.RootDir,
 		"retention": i.Retention, "enable_traces": i.EnableTraces,
 		"credentials_file": i.CredentialsFile, "grafana_password_file": i.GrafanaPasswordFile,
-		"note": "File paths are references; credential contents are never part of action input.",
+		"external_export": i.ExternalExport,
+		"note":            "File paths are references; credential contents are never part of action input.",
 	}
 }
 
@@ -163,6 +175,13 @@ func normalizeInstall(target platform.Target, raw json.RawMessage) (platform.Act
 		return nil, err
 	}
 	input.Versions = versions
+	if input.ExternalExport != nil {
+		external, err := input.ExternalExport.Validate()
+		if err != nil {
+			return nil, err
+		}
+		input.ExternalExport = &external
+	}
 	return input, nil
 }
 
@@ -276,13 +295,6 @@ func (e *actionExecutor) install(ctx context.Context, exec platform.Execution) (
 		return platform.Result{}, err
 	}
 	identity := TargetIdentity{Node: placement.Name, PrivateAddress: placement.PrivateAddress, HostID: placement.HostID}
-	dispatched, err := e.runtime.Dispatch.Open(ctx, identity)
-	if err != nil {
-		return platform.Result{}, err
-	}
-	if !dispatched.Identity().Equal(identity) {
-		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "node dispatch identity does not match authoritative placement", "Refuse the install; the executor is not bound to the intended node and host key.")
-	}
 	report(exec, "preflight", "Reading credential references.")
 	credentials, err := readCredentialFile(input.CredentialsFile)
 	if err != nil {
@@ -300,10 +312,18 @@ func (e *actionExecutor) install(ctx context.Context, exec platform.Execution) (
 		Retention: input.Retention, Versions: input.Versions,
 		Credentials: credentials, RootDir: input.RootDir,
 		GrafanaAdminPassword: password, EnableTraces: input.EnableTraces,
+		ExternalExport: input.ExternalExport,
 	}
 	prepared, err := Prepare(cfg)
 	if err != nil {
 		return platform.Result{}, err
+	}
+	dispatched, err := openDispatch(ctx, e.runtime.Dispatch, identity, exec, prepared.RootDir)
+	if err != nil {
+		return platform.Result{}, err
+	}
+	if !dispatched.Identity().Equal(identity) {
+		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "node dispatch identity does not match authoritative placement", "Refuse the install; the executor is not bound to the intended node and host key.")
 	}
 	report(exec, "render", "Rendering the pinned telemetry stack.")
 	installer := NewInstallerWithExecutor(prepared, dispatched)
@@ -350,13 +370,6 @@ func (e *actionExecutor) agent(ctx context.Context, exec platform.Execution) (pl
 	if err := identity.Validate(); err != nil {
 		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "agent target has no pinned host identity", "Record the host-key fingerprint during enrollment before dispatching an agent.")
 	}
-	dispatched, err := e.runtime.Dispatch.Open(ctx, identity)
-	if err != nil {
-		return platform.Result{}, err
-	}
-	if !dispatched.Identity().Equal(identity) {
-		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "node dispatch identity does not match authoritative placement", "Refuse the install; the executor is not bound to the intended node and host key.")
-	}
 	raw, err := readSecretFile(input.TokenFile, 1024)
 	if err != nil {
 		return platform.Result{}, err
@@ -374,6 +387,13 @@ func (e *actionExecutor) agent(ctx context.Context, exec platform.Execution) (pl
 	prepared, err := PrepareAgent(cfg)
 	if err != nil {
 		return platform.Result{}, err
+	}
+	dispatched, err := openDispatch(ctx, e.runtime.Dispatch, identity, exec, prepared.RootDir)
+	if err != nil {
+		return platform.Result{}, err
+	}
+	if !dispatched.Identity().Equal(identity) {
+		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "node dispatch identity does not match authoritative placement", "Refuse the install; the executor is not bound to the intended node and host key.")
 	}
 	report(exec, "apply", "Installing the node exporter agent.")
 	installer := NewAgentInstallerWithExecutor(prepared, dispatched)
@@ -538,7 +558,7 @@ func (inventoryProvider) Collection() string { return InventoryCollection }
 
 func (p inventoryProvider) Read(ctx context.Context, query platform.InventoryQuery) (any, error) {
 	if p.status == nil {
-		return []RuntimeStatus{{Configured: false, Retention: DefaultRetention()}}, nil
+		return []RuntimeStatus{{Configured: false, State: StatusAbsent, Retention: DefaultRetention(), Message: "No telemetry node is configured. Operation history remains available."}}, nil
 	}
 	status, err := p.status.TelemetryStatus(ctx)
 	if err != nil {

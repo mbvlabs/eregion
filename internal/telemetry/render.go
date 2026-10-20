@@ -76,6 +76,15 @@ func RenderPlan(prepared Prepared) (Plan, error) {
 
 func renderCompose(cfg Config) string {
 	ip := cfg.Node.PrivateAddress
+	externalVolumes := ""
+	if cfg.ExternalExport != nil {
+		if cfg.ExternalExport.TokenFile != "" {
+			externalVolumes += fmt.Sprintf("      - %q\n", cfg.ExternalExport.TokenFile+":/etc/otelcol/external-token:ro")
+		}
+		if cfg.ExternalExport.TLSCAFile != "" {
+			externalVolumes += fmt.Sprintf("      - %q\n", cfg.ExternalExport.TLSCAFile+":/etc/otelcol/external-ca.crt:ro")
+		}
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, `name: eregion-telemetry
 
@@ -89,7 +98,7 @@ services:
       - ./collector/ingest-tokens:/etc/otelcol/ingest-tokens:ro
       - ../tls:/etc/otelcol/tls:ro
       - otel-state:/var/lib/otelcol
-    ports:
+%s    ports:
       - "%s:4317:4317"
       - "%s:4318:4318"
     depends_on:
@@ -182,7 +191,7 @@ services:
         condition: service_started
     security_opt:
       - no-new-privileges:true
-`, cfg.Versions.Collector, ip, ip, cfg.Versions.VictoriaMetrics, cfg.Retention.MetricsDays, cfg.Versions.VictoriaLogs, cfg.Retention.LogsDays, cfg.Versions.VictoriaMetrics, ip, cfg.Versions.VictoriaMetrics, ip, cfg.Versions.Grafana, ip)
+`, cfg.Versions.Collector, externalVolumes, ip, ip, cfg.Versions.VictoriaMetrics, cfg.Retention.MetricsDays, cfg.Versions.VictoriaLogs, cfg.Retention.LogsDays, cfg.Versions.VictoriaMetrics, ip, cfg.Versions.VictoriaMetrics, ip, cfg.Versions.Grafana, ip)
 	if cfg.EnableTraces {
 		fmt.Fprintf(&b, `
   tempo:
@@ -218,12 +227,47 @@ func renderTokens(credentials []IngestCredential) string {
 }
 
 func renderCollector(cfg Config) string {
+	extensionList := "bearertokenauth/ingest, file_storage, health_check"
+	externalExtension := ""
+	externalExporter := ""
+	metricExporters := "[prometheusremotewrite]"
+	logExporters := "[otlphttp/logs]"
+	traceExporters := "[otlp/tempo]"
+	external := cfg.ExternalExport
+	if external != nil {
+		exporterName := "otlphttp/external"
+		if external.Protocol == "otlp_grpc" {
+			exporterName = "otlp/external"
+		}
+		tlsBlock := ""
+		if external.TLSCAFile != "" {
+			tlsBlock = "\n    tls:\n      ca_file: /etc/otelcol/external-ca.crt"
+		}
+		authBlock := ""
+		if external.TokenFile != "" {
+			externalExtension = "  bearertokenauth/export:\n    scheme: Bearer\n    filename: /etc/otelcol/external-token\n"
+			extensionList += ", bearertokenauth/export"
+			authBlock = "\n    auth:\n      authenticator: bearertokenauth/export"
+		}
+		externalExporter = fmt.Sprintf(`  %s:
+    endpoint: %s%s%s
+    retry_on_failure:
+      enabled: true
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 10000
+`, exporterName, external.Endpoint, tlsBlock, authBlock)
+		metricExporters = "[prometheusremotewrite, " + exporterName + "]"
+		logExporters = "[otlphttp/logs, " + exporterName + "]"
+		traceExporters = "[otlp/tempo, " + exporterName + "]"
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, `extensions:
   bearertokenauth/ingest:
     scheme: Bearer
     filename: /etc/otelcol/ingest-tokens
-  file_storage:
+%s  file_storage:
     directory: /var/lib/otelcol
   health_check:
     endpoint: 127.0.0.1:13133
@@ -277,7 +321,7 @@ exporters:
       enabled: true
       storage: file_storage
       queue_size: 10000
-`)
+%s`, externalExtension, externalExporter)
 	if cfg.EnableTraces {
 		b.WriteString(`  otlp/tempo:
     endpoint: tempo:4317
@@ -291,9 +335,9 @@ exporters:
       queue_size: 10000
 `)
 	}
-	b.WriteString(`
+	fmt.Fprintf(&b, `
 service:
-  extensions: [bearertokenauth/ingest, file_storage, health_check]
+  extensions: [%s]
   telemetry:
     metrics:
       address: 127.0.0.1:8888
@@ -301,18 +345,18 @@ service:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [prometheusremotewrite]
+      exporters: %s
     logs:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlphttp/logs]
-`)
+      exporters: %s
+`, extensionList, metricExporters, logExporters)
 	if cfg.EnableTraces {
-		b.WriteString(`    traces:
+		fmt.Fprintf(&b, `    traces:
       receivers: [otlp]
       processors: [memory_limiter, batch]
-      exporters: [otlp/tempo]
-`)
+      exporters: %s
+`, traceExporters)
 	}
 	return b.String()
 }
