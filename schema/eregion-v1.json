@@ -85,12 +85,14 @@
         "attempt": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
         "state": { "$ref": "#/$defs/state" },
         "stage": { "type": "string", "minLength": 1 },
+        "execution_id": { "type": "string", "pattern": "^op_[0-9a-f]{32}:[0-9]+:[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$" },
         "message": { "type": "string" },
         "progress": { "$ref": "#/$defs/progress" }
       },
       "allOf": [
         { "if": { "properties": { "kind": { "const": "state" } } }, "then": { "required": ["state"] }, "else": { "not": { "required": ["state"] } } },
         { "if": { "properties": { "kind": { "const": "step" } } }, "then": { "required": ["stage"] } },
+        { "if": { "required": ["execution_id"] }, "then": { "properties": { "kind": { "const": "step" } } } },
         { "if": { "properties": { "kind": { "const": "progress" } } }, "then": { "required": ["progress"] }, "else": { "not": { "required": ["progress"] } } }
       ]
     },

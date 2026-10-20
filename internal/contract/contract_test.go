@@ -87,6 +87,22 @@ func TestEventValidation(t *testing.T) {
 	if err := e.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	step := sampleEvent()
+	step.Kind, step.State, step.Stage = "step", "", "diagnostic-step-01-v1"
+	step.ExecutionID = string(step.OperationID) + ":1:diagnostic-step-01-v1"
+	if err := step.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	bad := step
+	bad.ExecutionID = "not-an-execution"
+	if bad.Validate() == nil {
+		t.Fatal("accepted invalid execution identity")
+	}
+	bad = step
+	bad.Kind, bad.ExecutionID = "log", step.ExecutionID
+	if bad.Validate() == nil {
+		t.Fatal("only step events may carry an execution identity")
+	}
 }
 
 func TestSequencesAreJSONStringIntegers(t *testing.T) {

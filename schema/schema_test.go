@@ -80,6 +80,32 @@ func TestStreamRecords(t *testing.T) {
 	}
 }
 
+func TestExecutionIdentityShape(t *testing.T) {
+	schema := compile(t, "")
+	base := `{"schema":"eregion/v1","type":"event","event":{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sequence":"1","at":"2026-10-20T12:00:00Z","kind":"step","attempt":1,"stage":"diagnostic-step-01-v1"`
+	for raw, valid := range map[string]bool{
+		base + `,"execution_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:diagnostic-step-01-v1"}}`: true,
+		base + `}}`:                      true,
+		base + `,"execution_id":"bad"}}`: false,
+	} {
+		var value any
+		if err := json.Unmarshal([]byte(raw), &value); err != nil {
+			t.Fatal(err)
+		}
+		if (schema.Validate(value) == nil) != valid {
+			t.Fatalf("execution identity schema mismatch: %s", raw)
+		}
+	}
+	progress := `{"schema":"eregion/v1","type":"event","event":{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sequence":"1","at":"2026-10-20T12:00:00Z","kind":"log","attempt":1,"execution_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1:diagnostic-step-01-v1"}}`
+	var value any
+	if err := json.Unmarshal([]byte(progress), &value); err != nil {
+		t.Fatal(err)
+	}
+	if schema.Validate(value) == nil {
+		t.Fatal("non-step event carried an execution identity")
+	}
+}
+
 func TestSchemaRejectsMalformedContracts(t *testing.T) {
 	schema := compile(t, "")
 	for _, raw := range []string{

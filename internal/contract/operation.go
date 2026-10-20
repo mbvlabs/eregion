@@ -13,6 +13,7 @@ type OperationID string
 
 var operationIDPattern = regexp.MustCompile(`^op_[0-9a-f]{32}$`)
 var keyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+var executionIDPattern = regexp.MustCompile(`^op_[0-9a-f]{32}:[0-9]+:[a-z0-9]+(-[a-z0-9]+)*-v[0-9]+$`)
 
 func NewOperationID() (OperationID, error) {
 	var value [16]byte
@@ -134,6 +135,7 @@ type Event struct {
 	Attempt     uint32      `json:"attempt"`
 	State       State       `json:"state,omitempty"`
 	Stage       string      `json:"stage,omitempty"`
+	ExecutionID string      `json:"execution_id,omitempty"`
 	Message     string      `json:"message,omitempty"`
 	Progress    *Progress   `json:"progress,omitempty"`
 }
@@ -159,6 +161,9 @@ func (e Event) Validate() error {
 	}
 	if e.Kind == "step" && strings.TrimSpace(e.Stage) == "" {
 		return NewFault(ValidationFailed, "step event requires a stage", "Name the observed execution stage.")
+	}
+	if e.ExecutionID != "" && (e.Kind != "step" || !executionIDPattern.MatchString(e.ExecutionID)) {
+		return NewFault(ValidationFailed, "invalid execution identity", "Only step events may carry a durable node execution identity.")
 	}
 	if e.Kind == "progress" {
 		if e.Progress == nil || e.Progress.Total == 0 || e.Progress.Current > e.Progress.Total || strings.TrimSpace(e.Progress.Unit) == "" {
