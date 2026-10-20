@@ -136,9 +136,9 @@ func (m Model) renderStagesPane(width, height int) string {
 		lines = append(lines, m.stageView(index, stage))
 	}
 	completed, active, failed := m.view.StageCounts()
-	counts := fmt.Sprintf("%d completed · %d active", completed, active)
+	counts := fmt.Sprintf("%d completed%s%d active", completed, m.glyphs.separator(), active)
 	if failed > 0 {
-		counts += fmt.Sprintf(" · %d failed", failed)
+		counts += fmt.Sprintf("%s%d failed", m.glyphs.separator(), failed)
 	}
 	lines = append(lines, "", m.dim().Render(counts))
 	if progress := m.progressView(width); progress != "" {
@@ -180,7 +180,7 @@ func (m Model) renderInsightsPane(width, height int) string {
 			if detail == "" {
 				detail = "no detail"
 			}
-			line := fmt.Sprintf("%s %s · %s · %s", state, probes, detail, observation.At.UTC().Format("15:04:05"))
+			line := fmt.Sprintf("%s %s%s%s%s%s", state, probes, m.glyphs.separator(), detail, m.glyphs.separator(), observation.At.UTC().Format("15:04:05"))
 			lines = append(lines, style.Render(truncate(line, width)))
 		}
 	}
@@ -196,19 +196,19 @@ func (m Model) renderEventsPane(width, height int) string {
 	}
 	label := "EVENTS"
 	if m.paused {
-		label += " · scroll paused"
+		label += m.glyphs.separator() + "scroll paused"
 		if m.newEvents > 0 {
-			label += fmt.Sprintf(" · %d new", m.newEvents)
+			label += fmt.Sprintf("%s%d new", m.glyphs.separator(), m.newEvents)
 		}
 	}
 	if total := len(m.view.EventLines); total > 0 {
-		label += fmt.Sprintf(" · %d shown · %d observed", total, m.view.EventCount)
+		label += fmt.Sprintf("%s%d shown%s%d observed", m.glyphs.separator(), total, m.glyphs.separator(), m.view.EventCount)
 	}
 	if len(m.view.BuildLog) > 0 {
-		label += fmt.Sprintf(" · build log %d", len(m.view.BuildLog))
+		label += fmt.Sprintf("%sbuild log %d", m.glyphs.separator(), len(m.view.BuildLog))
 	}
 	if m.view.Gap {
-		label += " · sequence gap"
+		label += m.glyphs.separator() + "sequence gap"
 	}
 	m.events.SetWidth(max(1, width))
 	m.events.SetHeight(max(1, height-1))
@@ -230,7 +230,7 @@ func (m Model) renderFooter(width int) string {
 	case m.done:
 		mode = "complete"
 	case m.view.Terminal():
-		mode = "terminal · closing"
+		mode = "terminal" + m.glyphs.separator() + "closing"
 	}
 	status := strings.Join([]string{
 		freshness,
@@ -244,7 +244,7 @@ func (m Model) renderFooter(width int) string {
 	helpModel.SetWidth(max(1, width))
 	hints := helpModel.View(m.keys)
 	if hints == "" {
-		hints = m.dim().Render("? help · q detach")
+		hints = m.dim().Render("? help" + m.glyphs.separator() + "q detach")
 	}
 	return fitLines(joinNonEmpty(status, hints), width, 2)
 }
@@ -268,7 +268,7 @@ func (m Model) renderCompact(width, height int) string {
 		lines = append(lines, m.accent().Render("active: "+stage.Name))
 	} else if len(m.view.Stages) > 0 {
 		completed, _, _ := m.view.StageCounts()
-		lines = append(lines, m.dim().Render(fmt.Sprintf("%d stages observed · %d completed", len(m.view.Stages), completed)))
+		lines = append(lines, m.dim().Render(fmt.Sprintf("%d stages observed%s%d completed", len(m.view.Stages), m.glyphs.separator(), completed)))
 	}
 	lines = append(lines, m.dim().Render(viewer.DefaultClean(m.view.ServingLine())))
 	if len(m.view.Health) > 0 {
@@ -279,7 +279,7 @@ func (m Model) renderCompact(width, height int) string {
 		}
 		probes := ""
 		if last.Checks > 0 {
-			probes = fmt.Sprintf(" · %d probe(s)", last.Checks)
+			probes = fmt.Sprintf("%s%d probe(s)", m.glyphs.separator(), last.Checks)
 		}
 		lines = append(lines, m.dim().Render(state+probes))
 	}
@@ -298,9 +298,9 @@ func (m Model) renderCompact(width, height int) string {
 		m.glyphs.observation(m.view.ObservationState)+" "+m.view.Freshness(m.now),
 	))
 	if m.showHelp {
-		lines = append(lines, m.dim().Render("? toggles help · tab pane · space pause · q detach"))
+		lines = append(lines, m.dim().Render("? toggles help"+m.glyphs.separator()+"tab pane"+m.glyphs.separator()+"space pause"+m.glyphs.separator()+"q detach"))
 	} else {
-		lines = append(lines, m.dim().Render("? help · q detach"))
+		lines = append(lines, m.dim().Render("? help"+m.glyphs.separator()+"q detach"))
 	}
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }

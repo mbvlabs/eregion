@@ -15,6 +15,7 @@ const JournalSchema = 1
 // and Recover must reconcile the binary before another upgrade starts.
 const (
 	StatusInstalling  = "installing"
+	StatusVerifying   = "verifying"
 	StatusInstalled   = "installed"
 	StatusRollingBack = "rolling_back"
 	StatusRolledBack  = "rolled_back"
@@ -39,6 +40,7 @@ type Journal struct {
 	SourcePath   string `json:"source_path,omitempty"`
 	SourceSHA256 string `json:"source_sha256,omitempty"`
 	StagedPath   string `json:"staged_path,omitempty"`
+	HealthCheck  string `json:"health_check,omitempty"`
 	UpdatedAt    string `json:"updated_at"`
 	Error        string `json:"error,omitempty"`
 }

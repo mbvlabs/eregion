@@ -80,7 +80,10 @@ jobs:
         run: |
           set -euo pipefail
           go mod download
+          test -z "$(gofmt -l cmd internal schema examples)"
+          go vet ./...
           go test ./...
+          go -C examples/hello test ./...
       - name: Sign release manifest
         env:
           EREGION_RELEASE_SIGNING_KEY: ${{ secrets.EREGION_RELEASE_SIGNING_KEY }}

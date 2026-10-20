@@ -1,13 +1,17 @@
 package tui
 
 import (
+	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
-	tea "charm.land/bubbletea/v2"
+	"charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/viewer"
 )
@@ -249,13 +253,118 @@ func keyPress(value string) tea.KeyPressMsg {
 	panic("unsupported test key: " + value)
 }
 
-func TestGoldenRenders(t *testing.T) {
+func TestTerminalCompatibilityMatrix(t *testing.T) {
 	cases := []struct {
 		name   string
-		width  int
-		height int
+		term   string
 		opts   func(Options) Options
-		clean  viewer.Cleaner
+		asSafe bool
+	}{
+		{name: "dumb", term: "dumb", opts: func(o Options) Options { o.ASCII = true; return o }},
+		{name: "dumb-nocolor", term: "dumb", opts: func(o Options) Options { o.ASCII = true; o.NoColor = true; return o }, asSafe: true},
+		{name: "xterm-256color", term: "xterm-256color"},
+		{name: "screen-256color", term: "screen-256color", opts: func(o Options) Options { o.NoColor = true; return o }, asSafe: true},
+		{name: "no-color", term: "xterm-256color", opts: func(o Options) Options { o.NoColor = true; return o }, asSafe: true},
+		{name: "ascii", term: "xterm-256color", opts: func(o Options) Options { o.ASCII = true; o.NoColor = true; return o }, asSafe: true},
+		{name: "reduced-motion", term: "xterm-256color", opts: func(o Options) Options { o.ReducedMotion = true; return o }},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("TERM", test.term)
+			options := testOptions(80, 24)
+			if test.opts != nil {
+				options = test.opts(options)
+			}
+			model := newModel(*fixtureModel(t, nil), options)
+			rendered := model.render()
+			if !utf8.ValidString(rendered) || !strings.Contains(rendered, string(testID)) {
+				t.Fatalf("%s render is invalid or lost identity: %q", test.name, rendered)
+			}
+			if test.asSafe && strings.ContainsRune(rendered, '\x1b') {
+				t.Fatalf("%s render contains escapes", test.name)
+			}
+			if test.term == "dumb" && strings.ContainsAny(rendered, "✓◐●◇■│") {
+				t.Fatalf("dumb terminal received Unicode glyphs:\n%s", rendered)
+			}
+			if options.ReducedMotion && strings.Contains(rendered, "⠋") {
+				t.Fatalf("reduced motion rendered a spinner:\n%s", rendered)
+			}
+		})
+	}
+}
+
+func TestWideAndEmojiLabelsFitTerminal(t *testing.T) {
+	model := fixtureModel(t, nil)
+	wideEvents := []contract.Event{
+		{OperationID: testID, Sequence: 7, At: testNow, Kind: "step", Attempt: 1, Stage: "部署-数据库 ✅", Message: "起動中 🚀"},
+		{OperationID: testID, Sequence: 8, At: testNow, Kind: "log", Attempt: 1, Stage: "部署-数据库 ✅", Message: "文字幅のテスト 🧪 with a long tail that must truncate"},
+	}
+	if err := model.Page(wideEvents, testNow); err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range [][2]int{{20, 6}, {300, 80}} {
+		options := testOptions(size[0], size[1])
+		options.NoColor = true
+		rendered := newModel(*model, options).render()
+		if !utf8.ValidString(rendered) {
+			t.Fatalf("%dx%d render is not valid UTF-8", size[0], size[1])
+		}
+		lines := strings.Split(rendered, "\n")
+		if len(lines) != size[1] {
+			t.Fatalf("%dx%d rendered %d lines", size[0], size[1], len(lines))
+		}
+		for index, line := range lines {
+			if width := lipgloss.Width(line); width > size[0] {
+				t.Fatalf("%dx%d line %d width %d exceeds terminal: %q", size[0], size[1], index, width, line)
+			}
+		}
+		if size[0] == 20 && !strings.Contains(rendered, "eregion") {
+			t.Fatalf("tiny wide-label render lost the context title:\n%s", rendered)
+		}
+		if size[0] == 300 && !strings.Contains(rendered, "部署-数据库") && !strings.Contains(rendered, "文字幅") {
+			t.Fatalf("wide render lost CJK/emoji content:\n%s", rendered)
+		}
+	}
+}
+
+func TestProgramRunsUnderTerminalModes(t *testing.T) {
+	for _, term := range []string{"dumb", "xterm-256color", "screen-256color"} {
+		t.Run(term, func(t *testing.T) {
+			t.Setenv("TERM", term)
+			options := testOptions(80, 24)
+			options.ASCII = term == "dumb"
+			options.NoColor = true
+			options.In = strings.NewReader("")
+			var output bytes.Buffer
+			options.Out = &output
+			initial := fixtureModel(t, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			summary, err := Run(ctx, initial, options, func(_ context.Context, _ func(viewer.Observation) error) (viewer.Summary, error) {
+				return viewer.Summary{OperationID: testID, State: contract.Succeeded}, nil
+			})
+			if err != nil {
+				t.Fatalf("program: %v", err)
+			}
+			if summary.OperationID != testID {
+				t.Fatalf("summary = %+v", summary)
+			}
+			if !utf8.Valid(output.Bytes()) {
+				t.Fatal("program wrote invalid UTF-8")
+			}
+		})
+	}
+}
+
+func TestGoldenRenders(t *testing.T) {
+	cases := []struct {
+		name     string
+		term     string
+		width    int
+		height   int
+		opts     func(Options) Options
+		clean    viewer.Cleaner
+		decorate func(*viewer.Model)
 	}{
 		{name: "wide-color", width: 120, height: 30},
 		{name: "standard-color", width: 80, height: 24},
@@ -263,12 +372,25 @@ func TestGoldenRenders(t *testing.T) {
 		{name: "tiny-nocolor", width: 28, height: 8, opts: func(o Options) Options { o.NoColor = true; return o }},
 		{name: "standard-ascii", width: 80, height: 24, opts: func(o Options) Options { o.ASCII = true; o.NoColor = true; return o }},
 		{name: "standard-nocolor", width: 80, height: 24, opts: func(o Options) Options { o.NoColor = true; return o }},
+		{name: "term-dumb-20x6", term: "dumb", width: 20, height: 6, opts: func(o Options) Options { o.ASCII = true; o.NoColor = true; return o }},
+		{name: "term-screen-256color", term: "screen-256color", width: 80, height: 24},
+		{name: "term-reduced-motion", term: "xterm-256color", width: 80, height: 24, opts: func(o Options) Options { o.ReducedMotion = true; return o }},
+		{name: "wide-300x80", term: "xterm-256color", width: 300, height: 80},
+		{name: "cjk-emoji-nocolor", term: "xterm-256color", width: 80, height: 24, opts: func(o Options) Options { o.NoColor = true; return o }, decorate: func(model *viewer.Model) {
+			_ = model.Page([]contract.Event{
+				{OperationID: testID, Sequence: 7, At: testNow, Kind: "step", Attempt: 1, Stage: "部署-数据库 ✅", Message: "起動中 🚀"},
+				{OperationID: testID, Sequence: 8, At: testNow, Kind: "log", Attempt: 1, Stage: "部署-数据库 ✅", Message: "文字幅のテスト 🧪"},
+			}, testNow)
+		}},
 		{name: "hostile-nocolor", width: 80, height: 20, opts: func(o Options) Options { o.NoColor = true; return o }, clean: func(text string) string {
 			return viewer.DefaultClean(strings.ReplaceAll(text, "hunter2", "[REDACTED]"))
 		}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			if test.term != "" {
+				t.Setenv("TERM", test.term)
+			}
 			model := fixtureModel(t, test.clean)
 			if test.name == "hostile-nocolor" {
 				if err := model.Page([]contract.Event{{
@@ -278,12 +400,15 @@ func TestGoldenRenders(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if test.decorate != nil {
+				test.decorate(model)
+			}
 			options := testOptions(test.width, test.height)
 			if test.opts != nil {
 				options = test.opts(options)
 			}
 			rendered := newModel(*model, options).render()
-			if test.name == "standard-nocolor" || test.name == "tiny-nocolor" || test.name == "standard-ascii" || test.name == "hostile-nocolor" {
+			if strings.Contains(test.name, "nocolor") || test.name == "standard-ascii" || test.name == "term-dumb-20x6" {
 				if strings.ContainsRune(rendered, '\x1b') {
 					t.Fatalf("no-color golden contains escapes:\n%q", rendered)
 				}

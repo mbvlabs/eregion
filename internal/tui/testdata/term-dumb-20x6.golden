@@ -1,0 +1,6 @@
+eregion > RUNNING
+op_aaaaaaaaaaaaaaaaa
+control-plane | elap
+active: build
+serving release: not
+last: building image

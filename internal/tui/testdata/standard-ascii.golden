@@ -5,9 +5,9 @@ op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 serving release: not applicable to diagnostic.test
 EXECUTION STAGES
 > [x] preflight          completed
-  [>] build              running · attempt 1
+  [>] build              running | attempt 1
 
-1 completed · 1 active
+1 completed | 1 active
 2/5 steps ################------------------------
 active: build
 
@@ -15,10 +15,10 @@ TARGETS
 [x] preflight              completed
 [>] build                  running
 --------------------------------------------------------------------------------
-EVENTS · 6 shown · 6 observed · build log 1
+EVENTS | 6 shown | 6 observed | build log 1
 12:00:02     3 step preflight node step started                                 
 12:00:03     4 step build node step started                                     
 12:00:04     5 progress 2/5 steps effect acknowledged durably                   
 12:00:05     6 log build building image                                         
 * live · last observation 0ms ago | following | 6 events
-space pause scroll · tab pane · ? help · q detach
+space pause scroll | tab pane | ? help | q detach
