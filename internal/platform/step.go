@@ -237,11 +237,11 @@ func buildContainerStep(exec engine.Execution, raw json.RawMessage) (engine.Step
 		}
 	}
 	for key, value := range payload.Labels {
-		if !strings.Contains(key, "/") {
-			return nil, fmt.Errorf("container label %q must have a DNS-style prefix", key)
+		if err := validateLabelKey(key); err != nil {
+			return nil, err
 		}
-		if len(value) > 128 {
-			return nil, fmt.Errorf("container label %q is too long", key)
+		if len(value) > 128 || strings.ContainsAny(value, "\x00\r\n") {
+			return nil, fmt.Errorf("container label %q has an invalid value", key)
 		}
 	}
 	hash, err := containerConfigHash(payload)
@@ -707,6 +707,24 @@ func buildIsolation(work string) ([]string, error) {
 }
 
 // -------------------------------------------------------------- command run
+
+// validateLabelKey accepts both Docker label forms: a reverse-DNS key such as
+// "io.eregion.app" and a namespaced key such as "com.example/component".
+func validateLabelKey(key string) error {
+	if key == "" || len(key) > 255 || strings.ContainsAny(key, "\x00\r\n ") {
+		return fmt.Errorf("container label %q is invalid", key)
+	}
+	if prefix, suffix, ok := strings.Cut(key, "/"); ok {
+		if !labelKeyPattern.MatchString(prefix) || !labelKeyPattern.MatchString(suffix) {
+			return fmt.Errorf("container label %q has an invalid prefix or name", key)
+		}
+		return nil
+	}
+	if !labelKeyPattern.MatchString(key) {
+		return fmt.Errorf("container label %q is not a DNS-style key", key)
+	}
+	return nil
+}
 
 func validateArgv(argv []string) error {
 	if len(argv) == 0 || len(argv) > 64 {
