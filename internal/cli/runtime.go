@@ -306,7 +306,6 @@ func (a *app) sshTransport() (node.Transport, error) {
 	if address == "" || user == "" || identity == "" || knownHosts == "" {
 		return nil, contract.NewFault(contract.InputRequired, "the SSH node transport is not configured", "Set EREGION_NODE_SSH_ADDRESS, EREGION_NODE_SSH_USER, EREGION_NODE_SSH_IDENTITY, and EREGION_NODE_SSH_KNOWN_HOSTS.")
 	}
-	a.secrets.Add(identity)
 	keys, err := transport.LoadHostKeys(knownHosts)
 	if err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "the pinned node host keys could not be read", "Check EREGION_NODE_SSH_KNOWN_HOSTS; it must contain the pinned host key of the node.")
