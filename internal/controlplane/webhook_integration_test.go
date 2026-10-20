@@ -39,6 +39,7 @@ func TestIntegrationWebhookDeliveryIsDeduplicated(t *testing.T) {
 		Input: func(api.WebhookEvent) (json.RawMessage, error) {
 			return json.RawMessage(`{"name":"shop"}`), nil
 		},
+		Deliveries: NewWebhookDeliveryStore(pool),
 	}, run.Service)
 	if err != nil {
 		t.Fatal(err)
