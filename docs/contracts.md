@@ -1,11 +1,11 @@
 # Agent and operation contracts
 
-**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts, M0.2 diagnostic execution, the M0.3 local node boundary, and the M0.3 pinned SSH transport.
+**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts, M0.2 diagnostic execution, the M0.3 local node boundary, and the M0.3 pinned SSH transport (optionally inside userspace WireGuard).
 
 CLI discovery, operation persistence, HTTP transport, scoped authorization,
 transactional River insertion, local node dispatch, and the pinned SSH node
-transport are implemented. Token issuance, destructive-operation confirmations,
-userspace WireGuard, and interactive viewing are not. See
+transport, plain or inside a userspace WireGuard tunnel, are implemented. Token
+issuance, destructive-operation confirmations, and interactive viewing are not. See
 [control-plane setup](control-plane.md) for the current API and limitations.
 
 ## Compatibility
@@ -177,8 +177,9 @@ must make their steps convergent rather than assuming the old effect is reused.
 The local transport uses node-local `flock` plus a journal. It coordinates processes
 on one host; it is not a distributed lock. The pinned SSH transport reuses the same
 journal, effect records, and node-local locks on the node; the control plane's
-decision procedure does not change. Userspace WireGuard is a future increment and
-will not change the worker's decision procedure either.
+decision procedure does not change. Userspace WireGuard only replaces the
+connection under SSH, so it does not change the decision procedure either: a lost
+tunnel is a lost stream, and the retry asks the node for its status first.
 
 ## Terminal failure codes
 

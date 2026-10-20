@@ -33,16 +33,16 @@ changes run.
   Events are not pruned yet; missing history returns an explicit cursor precondition
   error.
 
-These guarantees cover the local node boundary and the pinned SSH transport.
-Userspace WireGuard, remote node enrollment, and distributed leases remain future
-work.
+These guarantees cover the local node boundary, the pinned SSH transport, and pinned
+SSH inside a userspace WireGuard tunnel. Remote node enrollment and distributed
+leases remain future work.
 
 ## Local node execution and recovery
 
 The worker calls a `node.Transport`, not a shell or SSH directly. Two adapters
 implement the same `Call(ctx, Request, onEvent)` interface: the in-process
-`local` dispatcher and the pinned `ssh` transport. Userspace WireGuard will
-implement the same interface.
+`local` dispatcher and the pinned `ssh` transport. Userspace WireGuard is not a
+third adapter: it is the dialer the `ssh` transport opens its connection through.
 
 Execution identity is `op_<id>:<attempt>:<step>`; the stable effect key is
 `op_<id>:<step>`. The attempt changes on retry, the effect key does not. Before every
@@ -163,6 +163,72 @@ The full decisions,
 including the privilege policy, the state directory layout, and the retention
 policy, are in [the M0.3 SSH plan](m0.3-ssh-plan.md).
 
+## SSH inside a userspace WireGuard tunnel
+
+The SSH transport can reach its node through a userspace WireGuard tunnel. The
+tunnel runs inside the control-plane process (wireguard-go on gVisor netstack):
+no TUN device, no root, and no routing change on the control plane. SSH, the
+host-key pin, the node protocol, and the node binary are unchanged. The tunnel
+only replaces the TCP connection under SSH.
+
+```sh
+export EREGION_NODE_TRANSPORT=ssh
+export EREGION_NODE_SSH_ADDRESS='10.77.0.2:22'                  # the node's tunnel address
+export EREGION_NODE_SSH_USER='eregion-node'
+export EREGION_NODE_SSH_IDENTITY='/etc/eregion/control-plane-key'
+export EREGION_NODE_SSH_KNOWN_HOSTS='/etc/eregion/known_hosts'   # pinned for 10.77.0.2
+export EREGION_NODE_WG_PRIVATE_KEY_FILE='/etc/eregion/wg.key'    # mode 0600, wg genkey output
+export EREGION_NODE_WG_ADDRESS='10.77.0.1'                       # the control plane's tunnel address
+export EREGION_NODE_WG_PEER_PUBLIC_KEY='<node public key>'
+export EREGION_NODE_WG_ENDPOINT='node-1.example:51820'
+# Optional: the node subnet (default: the node address alone) and the keepalive in seconds.
+export EREGION_NODE_WG_ALLOWED_IPS='10.77.0.0/24'
+export EREGION_NODE_WG_KEEPALIVE=25
+```
+
+On the node, use kernel WireGuard with the control plane as its only peer:
+
+```sh
+wg genkey | tee /etc/wireguard/node.key | wg pubkey      # give the public key to the control plane
+ip link add wg0 type wireguard
+wg set wg0 listen-port 51820 private-key /etc/wireguard/node.key \
+  peer '<control-plane public key>' allowed-ips 10.77.0.1/32
+ip address add 10.77.0.2/24 dev wg0
+ip link set wg0 up
+```
+
+The node needs no endpoint for the control plane: WireGuard learns it from the
+first authenticated packet. The node must answer ICMP echo on its tunnel
+address, because the control plane's liveness probe uses it.
+
+- **Key handling.** The private key comes only from a file. The file must be a
+  regular file with no group or other permission bits. There is no variable that
+  takes the key itself. The CLI registers the key for redaction before it builds
+  anything, and every printed form of the key in the process is `[REDACTED]`.
+  The key is never in a request, a River argument, an event, a log, or a row.
+- **One process per key.** The node knows one endpoint per peer, so two
+  processes with the same key steal the peer from each other. A worker takes a
+  host-local lock for its key in `$XDG_RUNTIME_DIR` (or the temporary directory)
+  and refuses to start when another process holds it. Give every worker process
+  its own key and tunnel address. Each is a separate peer on the node.
+  `serve --workers=false` builds no node transport and takes no key.
+- **Allowed IPs.** Only the node subnet is routed: a default route or a prefix
+  broader than `/16` (IPv4) or `/48` (IPv6) is refused, and the SSH address must
+  be inside it.
+- **Lifecycle.** The tunnel comes up on the first dial and is shared by every
+  call. Its first handshake is bounded by 10 seconds. A tunnel that cannot come
+  up fails the attempt before any SSH byte is sent, so no work is dispatched.
+  The error names the endpoint and the peer key, and it is retryable: wrong keys
+  look exactly like a node that is down. While the tunnel is up, the control plane
+  probes it. When it has received nothing for 15 seconds, it is lost: open
+  connections fail as lost streams, and the next dial rebuilds the tunnel. The
+  worker closes the tunnel when it stops.
+- **Failure meaning.** A tunnel lost after dispatch is a lost stream, never proof
+  that the node task stopped. The node task is detached, as for plain SSH, and
+  the retry asks the node for its status before it runs anything.
+
+The decisions are in [the M0.3 WireGuard plan](m0.3-wireguard-plan.md).
+
 ## Start a local development control plane
 
 Requires Linux, Go, just, and a separately available PostgreSQL database. Supply
@@ -248,8 +314,8 @@ shutdown waits up to fifteen seconds. Viewer interruption never calls cancellati
 Non-loopback API listeners require both `--tls-cert` and `--tls-key`. Clients require
 HTTPS except for literal loopback HTTP and verify certificates through normal
 system trust. No insecure TLS bypass or credential-bearing redirects are allowed.
-Userspace WireGuard is not implemented yet; the SSH transport reaches its node over
-plain TCP today and over a userspace tunnel once the WireGuard dialer lands.
+The SSH transport reaches its node over plain TCP, or over a userspace WireGuard
+tunnel when `EREGION_NODE_WG_PRIVATE_KEY_FILE` is set.
 
 ## API contract
 
@@ -311,10 +377,20 @@ generated host key and one authorized key. `just ssh-fixture` builds its image a
 `just transport` runs the transport tests. The same scenarios run against the
 disposable SSH endpoint in the integration suite, including a lost response injected
 at the transport boundary, a killed worker, a duplicate submission, a cancellation at
-a step boundary, and a node task that outliving its caller. The SSH tests skip
+a step boundary, and a node task that outlives its caller. The SSH tests skip
 cleanly when Docker or the fixture image is unavailable; they never fail the rest of
 the suite.
 
-The `local` transport is in-process. There is no userspace WireGuard, node
-enrollment, remote mesh reconciliation, or multi-host conflict scope yet; see
+The WireGuard dialer has two test nodes. The first is an in-process wireguard-go node
+that serves the in-process SSH node inside the tunnel, so the tunnel behaviour runs
+without Docker. The second is the same `sshd` fixture container behind kernel
+WireGuard, with only its UDP port published. A UDP relay in front of it black-holes
+the tunnel to make a real loss. `just wireguard` runs the WireGuard transport tests.
+The integration suite runs the same exactly-once scenarios over SSH inside the tunnel,
+and checks that the WireGuard key is in no table and no worker log. The container
+tests skip cleanly when Docker, `NET_ADMIN`, or the host's `wireguard` module is
+missing.
+
+The `local` transport is in-process. There is no node enrollment, WireGuard key
+distribution, remote mesh reconciliation, or multi-host conflict scope yet; see
 [next transport increments](ssh-wireguard-next.md).

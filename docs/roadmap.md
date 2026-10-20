@@ -11,10 +11,10 @@ without a terminal or a browser. A human can use the same contracts through an
 exceptional Charm-based terminal interface. Neither client owns execution lifetime.
 
 This is a dependency-ordered plan, not a delivery-date estimate. Checkboxes denote
-verified deliverables, not the presence of placeholder commands. M0.1 and M0.2 are
-implemented, M0.3's local execution boundary is implemented, and M0.3's pinned SSH
-transport increment is implemented; userspace WireGuard and later milestones remain
-planned. Browser sketches use synthetic data.
+verified deliverables, not the presence of placeholder commands. M0.1, M0.2, and
+M0.3 are implemented: M0.3's local execution boundary, its pinned SSH transport, and
+its userspace WireGuard transport all pass the exactly-once scenarios. Later
+milestones remain planned. Browser sketches use synthetic data.
 
 ## Constraints that apply to every milestone
 
@@ -92,8 +92,10 @@ No remote host execution, deployment, interactive viewer, or complete HA claim y
   pinned SSH endpoint passes the remote exactly-once scenarios: a lost response, a
   killed worker, a duplicate submission, a cancellation at a step boundary, and a
   node task that outlives its caller.
-- [ ] Add userspace WireGuard as a separate transport increment with separate
-  tests. This remains the remote half of the milestone.
+- [x] Add userspace WireGuard as a separate transport increment with separate
+  tests. Pinned SSH inside a userspace WireGuard tunnel passes the same remote
+  exactly-once scenarios against a kernel WireGuard node. See
+  [the M0.3 WireGuard plan](m0.3-wireguard-plan.md).
 - [x] Define durable local node execution identity and attach/status behavior. A
   retried job asks the node before dispatching and never starts a second live effect.
   Remote supervision and reattachment are decided for SSH in
@@ -107,9 +109,16 @@ No remote host execution, deployment, interactive viewer, or complete HA claim y
 lost acknowledgements cannot duplicate the test side effect.
 **Gate (pinned SSH):** the SSH endpoint passes the same exactly-once scenarios as
 the local suite, including a lost response, a killed worker, a duplicate submission,
-cancellation at a step boundary, and a node task that outlives its caller. The gate
-stays closed for userspace WireGuard until a WireGuard endpoint passes the same
-scenarios.
+cancellation at a step boundary, and a node task that outlives its caller.
+**Gate (userspace WireGuard):** passed. The SSH endpoint reached through a userspace
+WireGuard tunnel passes the same scenarios, with a tunnel lost after dispatch as the
+lost response. A tunnel that cannot come up dispatches no work.
+
+**Delivered:** M0.3 is complete. Local node dispatch, durable node execution identity
+and status, acknowledgement reconciliation, the pinned SSH transport with detached
+node tasks, and the userspace WireGuard dialer it can run through. See
+[setup and limitations](control-plane.md). There is no node enrollment, WireGuard key
+distribution, multi-node placement, or distributed lease yet.
 
 ### M0.4 — First real Charm view
 
@@ -272,7 +281,8 @@ These are unresolved, not silently approved by the sketches:
 - **Before M0.3:** remote execution supervision/reattachment and ownership fencing;
   distributed conflict scopes. Local `flock` only protects local host mutations.
   The local decisions are recorded in the [M0.3 plan](m0.3-plan.md); the SSH
-  decisions are recorded in the [M0.3 SSH plan](m0.3-ssh-plan.md). Distributed
+  decisions are recorded in the [M0.3 SSH plan](m0.3-ssh-plan.md), and the WireGuard
+  decisions in the [M0.3 WireGuard plan](m0.3-wireguard-plan.md). Distributed
   conflict scopes across nodes remain open for
   [the SSH/WireGuard increments](ssh-wireguard-next.md).
 - **Before M1:** Debian/Ubuntu releases and architectures; external database hosting
@@ -289,9 +299,9 @@ These are unresolved, not silently approved by the sketches:
 
 ## First implementation batch
 
-M0.1 and M0.2 are complete, M0.3's local execution/recovery boundary is implemented,
-and its pinned SSH transport increment is implemented and tested against a
-disposable SSH endpoint. Next are userspace WireGuard, then M0.4's Charm viewer. Use
+M0.1, M0.2, and M0.3 are complete. M0.3's pinned SSH transport is tested against a
+disposable SSH endpoint, both directly and through a userspace WireGuard tunnel to a
+kernel WireGuard node. Next is M0.4's Charm viewer. Use
 synthetic operation fixtures from the sketches to test output and reducer contracts.
 Add the real Charm operation viewer in M0.4, not a separate demo CLI that grows its
 own business logic.

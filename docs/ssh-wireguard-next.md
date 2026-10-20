@@ -1,13 +1,14 @@
 # Next transport increments: pinned SSH, then userspace WireGuard
 
-**Status:** Increment A (pinned SSH) implemented · 2026-10-20
-**Increment B (userspace WireGuard):** Planned, not implemented.
-This document lists what remains after M0.3's
-local node-dispatch boundary. It is not evidence that userspace WireGuard works.
+**Status:** Increment A (pinned SSH) and Increment B (userspace WireGuard) implemented · 2026-10-20
+
+This document lists the transport increments after M0.3's local node-dispatch
+boundary, and what each one delivered.
 
 The decisions that the SSH increment had to make are recorded in
-[the M0.3 SSH plan](m0.3-ssh-plan.md). This document keeps the increments and
-their tests visible.
+[the M0.3 SSH plan](m0.3-ssh-plan.md), and the WireGuard decisions in
+[the M0.3 WireGuard plan](m0.3-wireguard-plan.md). This document keeps the
+increments and their tests visible.
 
 ## What is already fixed
 
@@ -90,36 +91,62 @@ key; `just ssh-fixture` builds its image and the tests skip cleanly when Docker
 is unavailable. See [the M0.3 SSH plan](m0.3-ssh-plan.md) for the fixture
 details and the exact decisions.
 
-## Increment B: userspace WireGuard
+## Increment B: userspace WireGuard — done
 
-Deliverables:
+Implemented. The SSH transport runs inside a userspace WireGuard tunnel when it is
+given the WireGuard dialer. The worker, the operation contract, the River arguments,
+the PostgreSQL step model, the SSH transport, host-key pinning, the node protocol,
+and the node binary did not change: the dialer is the only addition.
 
-- A userspace WireGuard dialer (no TUN/root on the operator side) that the SSH
-  transport uses as its `net.Conn` source.
-- Lazy handshake, keepalive, node-subnet-only allowed IPs, and an explicit failure
-  when the tunnel cannot come up.
-- Tunnel identity and key handling documented; private keys never enter logs,
-  events, River arguments, or the operation database.
-- The same node identity/status/reconciliation semantics as the SSH increment. A
-  dropped tunnel is a transport loss, not proof that the node task stopped.
-- Tests:
-  - tunnel up/down and reconnect;
-  - handshake failure does not dispatch work;
-  - lost tunnel after dispatch recovers through status;
-  - no duplicate effect after reconnect;
-  - key material is absent from redacted output and persisted rows.
-- A documented choice of supervision model: the node continues a detached task and
-  is queried by status, or the transport reports the task as unknown. Do not assume
-  the SSH session owns execution lifetime.
+What shipped:
 
-The dialer seam is in place: the SSH transport asks a `Dialer` for a `net.Conn`
-and never dials a socket itself. The SSH transport, the host-key pinning, the
-node protocol, and the node binary do not change when the dialer does.
+- `internal/transport`: `WireGuardDialer`, a `Dialer` on an in-process wireguard-go
+  device with gVisor netstack (no TUN, no root). It adapts the tunnel core from
+  vaire: the UAPI configuration, the 1380-byte MTU, and the 25-second keepalive.
+  It also adds vaire's one-process-per-key rule as a host-local key lock.
+- Lazy handshake on the first dial, bounded by 10 seconds. A tunnel that cannot
+  come up is a `TunnelDownError` before any SSH byte, so nothing is dispatched. The
+  error is retryable, because wrong keys look exactly like a node that is down.
+- One tunnel per process, shared by every call; persistent keepalive; a liveness
+  probe (ICMP echo when the tunnel is quiet) that declares the tunnel lost after 15
+  seconds of silence. A loss closes open connections, which the SSH transport
+  reports as `ErrStreamLost`. The next dial rebuilds the tunnel. The worker closes
+  it when it stops.
+- Allowed IPs limited to the node subnet (no default route, nothing broader than
+  `/16` or `/48`), and an address outside them is refused without touching the
+  tunnel.
+- Key handling: the private key comes only from a strict-mode file, every printed
+  form of it is redacted, and the CLI registers it for redaction before it builds
+  anything. It never enters a request, a River argument, an event, a log, or a row.
+- CLI: `EREGION_NODE_TRANSPORT=ssh` plus `EREGION_NODE_WG_*`, listed in the `serve`
+  and `worker` metadata.
+- Supervision: unchanged. The node runs a detached task and is queried by
+  `status`; the tunnel never owns execution lifetime, and a lost tunnel never means
+  the task stopped.
+
+Delivered tests (all green):
+
+| Scenario | Where |
+| --- | --- |
+| tunnel up, status, and reuse across calls | `internal/transport` (in-process node and the kernel WireGuard container) |
+| handshake failure dispatches no work | `internal/transport` (in-process node and the kernel WireGuard container) |
+| tunnel down, then reconnect | `internal/transport` (UDP relay black hole, both nodes) |
+| lost tunnel after dispatch recovers through status, no duplicate effect | `internal/transport` and `internal/controlplane` |
+| host-key pinning still holds inside the tunnel | `internal/transport` |
+| shutdown, the key lock, allowed IPs, configuration validation | `internal/transport` and `internal/cli` |
+| key material absent from printed forms, logs, errors, persisted rows | `internal/transport`, `internal/cli`, `internal/controlplane` |
+| duplicate submission, cancellation at a step boundary, killed worker whose node task outlives it | `internal/controlplane` against the kernel WireGuard node |
+
+The kernel WireGuard node is the SSH fixture container with `NET_ADMIN`, a `wg0`
+interface, and only its UDP port published. Its tests skip cleanly without Docker,
+`NET_ADMIN`, or the host's `wireguard` module. See
+[the M0.3 WireGuard plan](m0.3-wireguard-plan.md) for the decisions.
 
 ## Remote supervision and reattachment — decided for SSH
 
 The local implementation uses process lifetime plus `flock` as its liveness fence.
-These questions are decided for SSH in
+These questions are decided for SSH, and carry over unchanged to SSH inside
+userspace WireGuard, in
 [the M0.3 SSH plan](m0.3-ssh-plan.md); the short answers are:
 
 1. **Node execution lifetime:** a detached node task plus a durable journal
@@ -146,5 +173,7 @@ These questions are decided for SSH in
 The remote M0.3 gate is open for the pinned SSH endpoint: it passes the same
 exactly-once scenarios as the local suite, including a lost response, a killed
 worker, a duplicate submission, cancellation at a step boundary, and a node task
-that outlives its caller. The gate stays closed for userspace WireGuard until a
-WireGuard endpoint passes the same scenarios. Advertise only the tested path.
+that outlives its caller. The gate is also open for userspace WireGuard: the SSH
+endpoint reached through a userspace WireGuard tunnel to a kernel WireGuard node
+passes the same scenarios, with a tunnel lost after dispatch as the lost response.
+Advertise only the tested paths.
