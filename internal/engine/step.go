@@ -4,10 +4,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"regexp"
 
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
+
+// ErrInputsMismatch means an existing effect was recorded under other inputs.
+// Retrying the same step cannot make it converge.
+var ErrInputsMismatch = errors.New("step inputs mismatch")
+
+// ErrPermanent marks a step Check/Apply failure that a retry cannot fix. Steps
+// wrap it to report a non-retryable precondition failure.
+var ErrPermanent = errors.New("permanent step failure")
 
 // Step is one versioned, idempotent unit of node convergence.
 type Step interface {

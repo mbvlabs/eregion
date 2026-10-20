@@ -84,17 +84,17 @@ func (s *DiagnosticStep) Check(_ context.Context, rt engine.Runtime) (engine.Che
 	}
 	var value marker
 	if err := json.Unmarshal(raw, &value); err != nil {
-		return engine.CheckResult{}, fmt.Errorf("diagnostic marker is corrupt: %w", err)
+		return engine.CheckResult{}, fmt.Errorf("%w: diagnostic marker is corrupt: %w", engine.ErrPermanent, err)
 	}
 	inputs, err := s.Inputs()
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
 	if value.InputsHash != engine.InputsHash(s.ID(), inputs) {
-		return engine.CheckResult{}, fmt.Errorf("diagnostic marker %s belongs to different inputs", s.ID())
+		return engine.CheckResult{}, fmt.Errorf("%w: %w: diagnostic marker %s belongs to different inputs", engine.ErrPermanent, engine.ErrInputsMismatch, s.ID())
 	}
 	if value.OperationID != string(s.exec.OperationID) || value.Step != s.ID() {
-		return engine.CheckResult{}, fmt.Errorf("diagnostic marker %s has the wrong identity", s.ID())
+		return engine.CheckResult{}, fmt.Errorf("%w: diagnostic marker %s has the wrong identity", engine.ErrPermanent, s.ID())
 	}
 	return engine.CheckResult{Complete: true, Detail: "diagnostic marker already present"}, nil
 }
@@ -143,10 +143,10 @@ func (s *DiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, report en
 		}
 		var prior marker
 		if err := json.Unmarshal(existing, &prior); err != nil {
-			return engine.ApplyResult{}, fmt.Errorf("diagnostic marker is corrupt: %w", err)
+			return engine.ApplyResult{}, fmt.Errorf("%w: diagnostic marker is corrupt: %w", engine.ErrPermanent, err)
 		}
 		if prior.InputsHash != value.InputsHash || prior.OperationID != value.OperationID || prior.Step != value.Step {
-			return engine.ApplyResult{}, fmt.Errorf("diagnostic marker %s was already applied with different inputs", s.ID())
+			return engine.ApplyResult{}, fmt.Errorf("%w: %w: diagnostic marker %s was already applied with different inputs", engine.ErrPermanent, engine.ErrInputsMismatch, s.ID())
 		}
 		if report != nil {
 			report(engine.Event{Kind: "log", Step: s.ID(), Message: "diagnostic marker already existed; no second effect"})

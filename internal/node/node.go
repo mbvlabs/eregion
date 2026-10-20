@@ -49,6 +49,7 @@ type Response struct {
 	InputsHash     string          `json:"inputs_hash,omitempty"`
 	Executed       bool            `json:"executed"`
 	Retryable      bool            `json:"retryable"`
+	InputsMismatch bool            `json:"inputs_mismatch,omitempty"`
 	Result         json.RawMessage `json:"result,omitempty"`
 	Detail         string          `json:"detail,omitempty"`
 }

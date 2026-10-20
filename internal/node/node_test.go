@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -195,6 +196,45 @@ func TestInvalidPayloadFailsClosed(t *testing.T) {
 	response, err := local.Call(context.Background(), Request{Method: MethodRun, RequestID: "bad", Execution: exec, Payload: raw}, nil)
 	if err != nil || response.Status != engine.StatusFailed || response.Retryable {
 		t.Fatalf("invalid payload: %+v %v", response, err)
+	}
+}
+
+func TestRunClassifiesInputsMismatchAsPermanent(t *testing.T) {
+	local, err := NewLocal(t.TempDir(), "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := execution(t, DiagnosticStepID(1), 1)
+	raw, _ := json.Marshal(DiagnosticPayload{Index: 1, Total: 2})
+	if response, err := local.Call(context.Background(), Request{Method: MethodRun, RequestID: "first", Execution: exec, Payload: raw}, nil); err != nil || response.Status != engine.StatusCompleted {
+		t.Fatalf("first run: %+v %v", response, err)
+	}
+	secondRaw, _ := json.Marshal(DiagnosticPayload{Index: 1, Total: 1})
+	response, err := local.Call(context.Background(), Request{Method: MethodRun, RequestID: "second", Execution: exec, Payload: secondRaw}, nil)
+	if err != nil || response.Status != engine.StatusFailed || response.Retryable || !response.InputsMismatch {
+		t.Fatalf("inputs mismatch classification: %+v %v", response, err)
+	}
+	if got := countEffects(t, local.dispatcher.engine.StateDir, exec); got != 1 {
+		t.Fatalf("inputs mismatch re-applied the effect: %d", got)
+	}
+}
+
+func TestRunClassifiesCorruptMarkerAsPermanent(t *testing.T) {
+	local, err := NewLocal(t.TempDir(), "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := execution(t, DiagnosticStepID(1), 1)
+	path := MarkerPath(local.dispatcher.engine.StateDir, exec)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	response, err := local.Call(context.Background(), runRequest(t, exec, 0), nil)
+	if err != nil || response.Status != engine.StatusFailed || response.Retryable || response.InputsMismatch {
+		t.Fatalf("corrupt marker classification: %+v %v", response, err)
 	}
 }
 

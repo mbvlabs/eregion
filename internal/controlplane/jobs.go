@@ -225,7 +225,7 @@ func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attem
 	}
 	if hasRecord {
 		if record.InputsHash != inputsHash {
-			return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Never reuse an operation with different inputs; inspect the node journal.")
+			return w.failInputsMismatch(ctx, id, attempt, "step inputs changed for an existing effect")
 		}
 		if record.State == "completed" {
 			return nil
@@ -243,7 +243,7 @@ func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attem
 		return fmt.Errorf("node status %s: %w", stepID, err)
 	}
 	if status.InputsHash != "" && status.InputsHash != inputsHash {
-		return contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not re-apply an effect recorded under other inputs.")
+		return w.failInputsMismatch(ctx, id, attempt, "node effect has different inputs")
 	}
 	if status.Status == engine.StatusCompleted {
 		if !hasRecord {
@@ -284,7 +284,7 @@ func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attem
 		}
 	}
 	if response.InputsHash != "" && response.InputsHash != inputsHash {
-		return contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
+		return w.failInputsMismatch(ctx, id, attempt, "node effect has different inputs")
 	}
 	switch response.Status {
 	case engine.StatusCompleted:
@@ -301,6 +301,9 @@ func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attem
 		if response.Retryable {
 			return fmt.Errorf("node step %s failed: %s", stepID, response.Detail)
 		}
+		if response.InputsMismatch {
+			return w.failInputsMismatch(ctx, id, attempt, "node step failed with different inputs")
+		}
 		if err := w.service.failOperation(ctx, id, attempt, "Node step failed without a retryable cause: "+response.Detail); err != nil {
 			return err
 		}
@@ -308,6 +311,16 @@ func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attem
 	default:
 		return fmt.Errorf("node returned unexpected status %q for %s", response.Status, stepID)
 	}
+}
+
+// failInputsMismatch ends the operation once. A recorded effect under other
+// inputs can never converge, so returning a retryable error would only loop.
+func (w *testWorker) failInputsMismatch(ctx context.Context, id contract.OperationID, attempt uint32, message string) error {
+	fault := contract.NewFault(contract.PreconditionFailed, message, "Do not re-apply an effect recorded under other inputs; inspect the node journal.")
+	if err := w.service.failOperation(ctx, id, attempt, fault.Message); err != nil {
+		return err
+	}
+	return errOperationTerminal
 }
 
 func diagnosticPayload(index int, input operations.TestInput) json.RawMessage {

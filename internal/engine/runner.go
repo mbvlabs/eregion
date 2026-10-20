@@ -224,7 +224,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		return TaskStatus{}, err
 	} else if ok {
 		if record.InputsHash != inputsHash {
-			return TaskStatus{}, fmt.Errorf("effect %s completed with different inputs", exec.EffectKey())
+			return TaskStatus{}, fmt.Errorf("%w: effect %s completed with different inputs", ErrInputsMismatch, exec.EffectKey())
 		}
 		if err := e.completeFromRecord(exec, record); err != nil {
 			return TaskStatus{}, err
@@ -246,7 +246,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	}
 	if task, ok := journal.Tasks[exec.EffectKey()]; ok {
 		if task.InputsHash != "" && task.InputsHash != inputsHash {
-			return TaskStatus{}, fmt.Errorf("effect %s has different inputs", exec.EffectKey())
+			return TaskStatus{}, fmt.Errorf("%w: effect %s has different inputs", ErrInputsMismatch, exec.EffectKey())
 		}
 		if task.Status == TaskCompleted {
 			return TaskStatus{
@@ -344,7 +344,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 			return TaskStatus{}, err
 		}
 		if !ok || existing.InputsHash != inputsHash {
-			return TaskStatus{}, fmt.Errorf("effect %s was published with different inputs", exec.EffectKey())
+			return TaskStatus{}, fmt.Errorf("%w: effect %s was published with different inputs", ErrInputsMismatch, exec.EffectKey())
 		}
 		record = existing
 		executed = false

@@ -78,17 +78,24 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 				}, nil
 			}
 			return Response{
-				Status:      engine.StatusFailed,
-				ExecutionID: request.Execution.ExecutionID(),
-				InputsHash:  status.InputsHash,
-				Retryable:   !errors.Is(err, engine.ErrJournalCorrupt),
-				Detail:      registry.Redact(err.Error()),
+				Status:         engine.StatusFailed,
+				ExecutionID:    request.Execution.ExecutionID(),
+				InputsHash:     status.InputsHash,
+				Retryable:      !permanent(err),
+				InputsMismatch: errors.Is(err, engine.ErrInputsMismatch),
+				Detail:         registry.Redact(err.Error()),
 			}, nil
 		}
 		return responseFromStatus(status), nil
 	default:
 		return Response{}, fmt.Errorf("unknown node method %q", request.Method)
 	}
+}
+
+func permanent(err error) bool {
+	return errors.Is(err, engine.ErrJournalCorrupt) ||
+		errors.Is(err, engine.ErrInputsMismatch) ||
+		errors.Is(err, engine.ErrPermanent)
 }
 
 func responseFromStatus(status engine.TaskStatus) Response {
