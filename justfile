@@ -47,7 +47,8 @@ postgres:
 postgres-stop:
     docker rm -f eregion-postgres
 
-# Build the disposable SSH node fixture image used by the transport tests.
+# Build the disposable SSH node fixture image used by the transport tests. The
+# same image runs the node behind kernel WireGuard for the WireGuard tests.
 ssh-fixture:
     go build -trimpath -o testdata/ssh/eregion-node ./cmd/eregion-node
     docker build -t eregion-ssh-fixture:latest testdata/ssh
@@ -56,6 +57,12 @@ ssh-fixture:
 # Run the transport tests, including the disposable SSH node fixture.
 transport:
     go test -count=1 ./internal/transport -timeout 600s
+
+# Run the WireGuard transport tests: the in-process tunnel and the disposable
+# node behind kernel WireGuard. The container tests skip without Docker,
+# NET_ADMIN, or the host's wireguard module.
+wireguard:
+    go test -count=1 ./internal/transport -run 'WireGuard' -v -timeout 600s
 
 # Check formatting, static analysis, and tests.
 check: fmt-check lint test

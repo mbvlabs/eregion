@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/engine"
+	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -46,7 +48,37 @@ type Options struct {
 	// TaskCommand replaces the command that starts a detached node task. The
 	// node uses it verbatim, so a fixture can make a task that never starts.
 	TaskCommand []string
+	// WireGuard puts the node behind kernel WireGuard. Only the WireGuard UDP
+	// port is published, so SSH is reachable only through the tunnel. The
+	// container needs NET_ADMIN and the host's wireguard module; without them
+	// Start reports ErrUnavailable.
+	WireGuard bool
 }
+
+// WireGuardNode describes the fixture's WireGuard side.
+type WireGuardNode struct {
+	// Endpoint is the published UDP host:port of the node's wg0.
+	Endpoint string
+	// PublicKey is the node's WireGuard public key in wg base64 form.
+	PublicKey string
+	// PrivateKeyFile is the control plane's private key, mode 0600. The node
+	// knows its public half as its only peer.
+	PrivateKeyFile string
+	// ControlAddress is the control plane's tunnel address.
+	ControlAddress string
+	// NodeAddress is the node's tunnel address.
+	NodeAddress string
+	// Subnet is the tunnel subnet.
+	Subnet string
+}
+
+// The fixture's tunnel addressing.
+const (
+	wireGuardControlAddress = "10.77.0.1"
+	wireGuardNodeAddress    = "10.77.0.2"
+	wireGuardSubnet         = "10.77.0.0/24"
+	wireGuardPort           = "51820"
+)
 
 // Fixture is a running throwaway SSH node.
 type Fixture struct {
@@ -60,6 +92,9 @@ type Fixture struct {
 	HostKey ssh.PublicKey
 	// KnownHostsFile is a known_hosts file with the pinned host key.
 	KnownHostsFile string
+	// WireGuard is set when the node is behind WireGuard. Address is then the
+	// node's tunnel address.
+	WireGuard *WireGuardNode
 
 	image string
 }
@@ -102,11 +137,23 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 	_ = identity
 
 	container := "eregion-ssh-fixture-" + strconv.Itoa(os.Getpid()) + "-" + randomSuffix()
-	if _, err := runDocker(ctx, "run", "-d", "--init", "--name", container, "-p", "127.0.0.1::2222", image, "sleep", "infinity"); err != nil {
+	run := []string{"run", "-d", "--init", "--name", container, "-p", "127.0.0.1::2222"}
+	if options.WireGuard {
+		run = []string{"run", "-d", "--init", "--name", container, "--cap-add", "NET_ADMIN", "-p", "127.0.0.1::" + wireGuardPort + "/udp"}
+	}
+	if _, err := runDocker(ctx, append(run, image, "sleep", "infinity")...); err != nil {
 		return nil, err
 	}
 	fixture := &Fixture{Name: container, image: image, HostKey: hostKey, IdentityFile: identityPath}
 	cleanup := func() { _, _ = runDocker(context.Background(), "rm", "-f", container) }
+	if options.WireGuard {
+		node, err := setupWireGuard(ctx, container, filepath.Dir(identityPath))
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		fixture.WireGuard = node
+	}
 
 	if err := copyIntoContainer(ctx, container, hostKeyPath, "/etc/ssh/ssh_host_ed25519_key"); err != nil {
 		cleanup()
@@ -164,10 +211,13 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		cleanup()
 		return nil, err
 	}
-	address, err := publishedAddress(ctx, container)
-	if err != nil {
-		cleanup()
-		return nil, err
+	address := net.JoinHostPort(wireGuardNodeAddress, "2222")
+	if !options.WireGuard {
+		address, err = publishedAddress(ctx, container, "2222/tcp")
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
 	}
 	fixture.Address = address
 	knownHosts := filepath.Join(filepath.Dir(identityPath), "known_hosts")
@@ -177,11 +227,104 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		return nil, err
 	}
 	fixture.KnownHostsFile = knownHosts
+	if options.WireGuard {
+		// The SSH port is not published: wait for it inside the node.
+		if _, err := runDocker(ctx, "exec", container, "sh", "-c", "for i in $(seq 1 300); do ss -ltn | grep -q ':2222 ' && exit 0; sleep 0.1; done; exit 1"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("the node's SSH server did not start: %w", err)
+		}
+		return fixture, nil
+	}
 	if err := waitForPort(ctx, address, 30*time.Second); err != nil {
 		cleanup()
 		return nil, err
 	}
 	return fixture, nil
+}
+
+// setupWireGuard brings up kernel WireGuard in the node container. It
+// reports ErrUnavailable when the container cannot create a WireGuard
+// interface, so a host without the capability skips instead of failing.
+func setupWireGuard(ctx context.Context, container, directory string) (*WireGuardNode, error) {
+	if out, err := runDocker(ctx, "exec", container, "ip", "link", "add", "wg0", "type", "wireguard"); err != nil {
+		return nil, fmt.Errorf("%w: the node container cannot create a kernel WireGuard interface (it needs NET_ADMIN and the host's wireguard module): %s", ErrUnavailable, strings.TrimSpace(out))
+	}
+	nodePrivate, nodePublic, err := generateWireGuardKey()
+	if err != nil {
+		return nil, err
+	}
+	controlPrivate, controlPublic, err := generateWireGuardKey()
+	if err != nil {
+		return nil, err
+	}
+	nodeKeyPath := filepath.Join(directory, "wg-node.key")
+	if err := os.WriteFile(nodeKeyPath, []byte(nodePrivate+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	controlKeyPath := filepath.Join(directory, "wg-control.key")
+	if err := os.WriteFile(controlKeyPath, []byte(controlPrivate+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	if _, err := runDocker(ctx, "exec", container, "mkdir", "-p", "-m", "0700", "/etc/wireguard"); err != nil {
+		return nil, err
+	}
+	if err := copyIntoContainer(ctx, container, nodeKeyPath, "/etc/wireguard/node.key"); err != nil {
+		return nil, err
+	}
+	script := "chmod 600 /etc/wireguard/node.key" +
+		" && wg set wg0 listen-port " + wireGuardPort + " private-key /etc/wireguard/node.key peer " + controlPublic + " allowed-ips " + wireGuardControlAddress + "/32" +
+		" && ip address add " + wireGuardNodeAddress + "/24 dev wg0" +
+		" && ip link set wg0 up"
+	if _, err := runDocker(ctx, "exec", container, "sh", "-c", script); err != nil {
+		return nil, err
+	}
+	endpoint, err := publishedAddress(ctx, container, wireGuardPort+"/udp")
+	if err != nil {
+		return nil, err
+	}
+	return &WireGuardNode{
+		Endpoint:       endpoint,
+		PublicKey:      nodePublic,
+		PrivateKeyFile: controlKeyPath,
+		ControlAddress: wireGuardControlAddress,
+		NodeAddress:    wireGuardNodeAddress,
+		Subnet:         wireGuardSubnet,
+	}, nil
+}
+
+// SetWireGuardPeer replaces the control-plane key the node accepts, so a
+// test can make a node that does not know the control plane.
+func (f *Fixture) SetWireGuardPeer(ctx context.Context, publicKey string) error {
+	if f.WireGuard == nil {
+		return errors.New("the fixture has no WireGuard node")
+	}
+	out, err := runDocker(ctx, "exec", f.Name, "wg", "show", "wg0", "peers")
+	if err != nil {
+		return err
+	}
+	script := ""
+	for _, peer := range strings.Fields(out) {
+		script += "wg set wg0 peer " + peer + " remove && "
+	}
+	script += "wg set wg0 peer " + publicKey + " allowed-ips " + wireGuardControlAddress + "/32"
+	_, err = runDocker(ctx, "exec", f.Name, "sh", "-c", script)
+	return err
+}
+
+// generateWireGuardKey returns a private key, clamped as wg genkey does, and
+// its public key, both in wg base64 form.
+func generateWireGuardKey() (string, string, error) {
+	var private [curve25519.ScalarSize]byte
+	if _, err := rand.Read(private[:]); err != nil {
+		return "", "", err
+	}
+	private[0] &= 248
+	private[31] = (private[31] & 127) | 64
+	public, err := curve25519.X25519(private[:], curve25519.Basepoint)
+	if err != nil {
+		return "", "", err
+	}
+	return base64.StdEncoding.EncodeToString(private[:]), base64.StdEncoding.EncodeToString(public), nil
 }
 
 // Close removes the node container.
@@ -290,8 +433,16 @@ func ensureImage(ctx context.Context, root, image string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(binary)
-	tag := image + ":" + hex.EncodeToString(sum[:])[:16]
+	dockerfile, err := os.ReadFile(filepath.Join(root, "testdata", "ssh", "Dockerfile"))
+	if err != nil {
+		return "", err
+	}
+	// The tag covers the Dockerfile too, so a changed image recipe is never
+	// served from an image built by the old one.
+	hash := sha256.New()
+	hash.Write(binary)
+	hash.Write(dockerfile)
+	tag := image + ":" + hex.EncodeToString(hash.Sum(nil))[:16]
 	if _, err := runDocker(ctx, "image", "inspect", tag); err == nil {
 		return tag, nil
 	}
@@ -300,10 +451,6 @@ func ensureImage(ctx context.Context, root, image string) (string, error) {
 		return "", err
 	}
 	defer func() { _ = os.RemoveAll(context) }()
-	dockerfile, err := os.ReadFile(filepath.Join(root, "testdata", "ssh", "Dockerfile"))
-	if err != nil {
-		return "", err
-	}
 	if err := os.WriteFile(filepath.Join(context, "Dockerfile"), dockerfile, 0o600); err != nil {
 		return "", err
 	}
@@ -407,9 +554,9 @@ func copyIntoContainer(ctx context.Context, container, source, destination strin
 	return err
 }
 
-// publishedAddress returns the published host:port of the node's SSH server.
-func publishedAddress(ctx context.Context, container string) (string, error) {
-	out, err := runDocker(ctx, "port", container, "2222/tcp")
+// publishedAddress returns the published host:port of one container port.
+func publishedAddress(ctx context.Context, container, port string) (string, error) {
+	out, err := runDocker(ctx, "port", container, port)
 	if err != nil {
 		return "", err
 	}
