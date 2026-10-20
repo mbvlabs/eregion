@@ -59,12 +59,14 @@ func sshTransport(t *testing.T, fixture *sshfixture.Fixture, address string) nod
 }
 
 // sshTransportFromEnvironment builds the SSH transport for a helper process.
+// When EREGION_CRASH_WG_KEY_FILE is set, the transport runs inside the
+// fixture's WireGuard tunnel.
 func sshTransportFromEnvironment() (node.Transport, error) {
 	keys, err := transport.LoadHostKeys(os.Getenv("EREGION_CRASH_SSH_KNOWN_HOSTS"))
 	if err != nil {
 		return nil, err
 	}
-	return transport.NewSSHTransport(transport.SSHConfig{
+	config := transport.SSHConfig{
 		Address:      os.Getenv("EREGION_CRASH_SSH_ADDRESS"),
 		User:         "eregion",
 		IdentityFile: os.Getenv("EREGION_CRASH_SSH_IDENTITY"),
@@ -72,7 +74,15 @@ func sshTransportFromEnvironment() (node.Transport, error) {
 		ExpectedNode: "fixture-node",
 		Timeout:      30 * time.Second,
 		PollInterval: 100 * time.Millisecond,
-	})
+	}
+	if keyFile := os.Getenv("EREGION_CRASH_WG_KEY_FILE"); keyFile != "" {
+		dialer, err := wireGuardDialerFor(keyFile, os.Getenv("EREGION_CRASH_WG_PEER"), os.Getenv("EREGION_CRASH_WG_ENDPOINT"))
+		if err != nil {
+			return nil, err
+		}
+		config.Dialer = dialer
+	}
+	return transport.NewSSHTransport(config)
 }
 
 // TestIntegrationSSHDuplicateSubmissionsShareOneEffect proves that duplicate
