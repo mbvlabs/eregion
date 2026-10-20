@@ -264,7 +264,24 @@ func ensureImage(ctx context.Context, root, image string) (string, error) {
 	if output, err := build.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("%w: the fixture image could not be built: %v: %s", ErrUnavailable, err, output)
 	}
+	pruneOldImages(ctx, image, tag)
 	return tag, nil
+}
+
+// pruneOldImages removes the fixture images of an earlier node binary. It
+// ignores failures: an image that is still in use must stay.
+func pruneOldImages(ctx context.Context, repository, keep string) {
+	output, err := runDocker(ctx, "images", "--format", "{{.Repository}}:{{.Tag}}", repository)
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" || name == keep || !strings.HasPrefix(name, repository+":") {
+			continue
+		}
+		_, _ = runDocker(ctx, "rmi", name)
+	}
 }
 
 // buildNodeBinary builds the node binary for the fixture image.
