@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/engine"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -41,6 +43,9 @@ type Options struct {
 	NodeName string
 	// User is the node account. It defaults to "eregion".
 	User string
+	// TaskCommand replaces the command that starts a detached node task. The
+	// node uses it verbatim, so a fixture can make a task that never starts.
+	TaskCommand []string
 }
 
 // Fixture is a running throwaway SSH node.
@@ -129,9 +134,17 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		cleanup()
 		return nil, err
 	}
-	config := fmt.Sprintf("{\"node\":%q,\"state_dir\":\"/var/lib/eregion/node\"}", nodeName)
+	config := map[string]any{"node": nodeName, "state_dir": "/var/lib/eregion/node"}
+	if len(options.TaskCommand) > 0 {
+		config["task_command"] = options.TaskCommand
+	}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
 	configPath := filepath.Join(filepath.Dir(identityPath), "node.json")
-	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+	if err := os.WriteFile(configPath, raw, 0o600); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -217,6 +230,43 @@ func (f *Fixture) Read(ctx context.Context, path string) (string, error) {
 		return "", err
 	}
 	return out, nil
+}
+
+// TaskOwnerPID returns the PID of the node task that owns the effect of one
+// operation, or 0 when no task is running for it.
+func (f *Fixture) TaskOwnerPID(ctx context.Context, operationID string) (int, error) {
+	raw, err := f.Read(ctx, "/var/lib/eregion/node/journal.json")
+	if err != nil {
+		return 0, err
+	}
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	var journal engine.Journal
+	if err := json.Unmarshal([]byte(raw), &journal); err != nil {
+		return 0, fmt.Errorf("read the node journal: %w", err)
+	}
+	for _, task := range journal.Tasks {
+		if task.OperationID == operationID && task.Status == engine.TaskRunning {
+			return task.Owner.PID, nil
+		}
+	}
+	return 0, nil
+}
+
+// KillTask kills the node task that owns the effect of one operation. The
+// kernel releases the effect lock it held, so the node observes a task that
+// died mid-step.
+func (f *Fixture) KillTask(ctx context.Context, operationID string) error {
+	pid, err := f.TaskOwnerPID(ctx, operationID)
+	if err != nil {
+		return err
+	}
+	if pid == 0 {
+		return fmt.Errorf("no node task is running for %s", operationID)
+	}
+	_, err = runDocker(ctx, "exec", f.Name, "sh", "-c", "kill -9 "+strconv.Itoa(pid))
+	return err
 }
 
 // List returns the file names in a directory of the node's state directory.

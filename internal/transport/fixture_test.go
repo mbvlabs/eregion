@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,9 +18,15 @@ import (
 // the fixture image is not available.
 func startFixture(t *testing.T) *sshfixture.Fixture {
 	t.Helper()
+	return startFixtureWith(t, sshfixture.Options{})
+}
+
+// startFixtureWith starts the disposable SSH node with explicit options.
+func startFixtureWith(t *testing.T, options sshfixture.Options) *sshfixture.Fixture {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	fixture, err := sshfixture.Start(ctx, sshfixture.Options{})
+	fixture, err := sshfixture.Start(ctx, options)
 	if err != nil {
 		if errors.Is(err, sshfixture.ErrUnavailable) {
 			t.Skipf("the SSH fixture is unavailable: %v", err)
@@ -253,6 +260,107 @@ func TestSSHFixtureReportsAProtocolRefusal(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("a refused request wrote %d effects", count)
+	}
+}
+
+// TestSSHFixtureReportsADeadNodeTaskPromptly proves that a node task that
+// died mid-step is reported right away, with the node task log, instead of
+// being polled until the caller's deadline. The next attempt reconciles the
+// effect and applies it exactly once.
+func TestSSHFixtureReportsADeadNodeTaskPromptly(t *testing.T) {
+	fixture := startFixture(t)
+	client := fixtureTransport(t, fixture)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	type result struct {
+		response node.Response
+		err      error
+	}
+	results := make(chan result, 1)
+	go func() {
+		response, err := client.Call(context.Background(), runRequest(t, exec, 1000), nil)
+		results <- result{response: response, err: err}
+	}()
+	// Kill the node task while it holds the effect lock and waits for its
+	// step delay.
+	ctx := context.Background()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		pid, err := fixture.TaskOwnerPID(ctx, string(exec.OperationID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pid != 0 {
+			if err := fixture.KillTask(ctx, string(exec.OperationID)); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the node task did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var got result
+	select {
+	case got = <-results:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the dead node task was not reported")
+	}
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if got.response.Status != engine.StatusFailed || !got.response.Retryable {
+		t.Fatalf("a dead node task is not a retryable failure: %+v", got.response)
+	}
+	if !strings.Contains(got.response.Detail, "diagnostic marker is absent") {
+		t.Fatalf("the node task log is missing from the detail: %+v", got.response)
+	}
+	// The next attempt reconciles the effect: it is applied exactly once.
+	recovered, err := client.Call(context.Background(), runRequest(t, exec, 1000), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status != engine.StatusCompleted {
+		t.Fatalf("the recovery did not complete the step: %+v", recovered)
+	}
+	count, err := fixture.EffectCount(ctx, string(exec.OperationID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("the recovery applied %d effects", count)
+	}
+}
+
+// TestSSHFixtureReportsANodeTaskThatNeverStarted proves that a node task that
+// never reaches the node journal is reported as a failed start, with the node
+// task log, instead of being polled until the caller's deadline.
+func TestSSHFixtureReportsANodeTaskThatNeverStarted(t *testing.T) {
+	fixture := startFixtureWith(t, sshfixture.Options{TaskCommand: []string{
+		"/bin/sh", "-c", "cat <&3 >/dev/null; echo 'the node task could not start' >&2; exit 1",
+	}})
+	client := fixtureTransport(t, fixture)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	started := time.Now()
+	response, err := client.Call(context.Background(), runRequest(t, exec, 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Fatalf("a node task that never started was not reported promptly: %s", elapsed)
+	}
+	if response.Status != engine.StatusFailed || !response.Retryable {
+		t.Fatalf("a node task that never started is not a retryable failure: %+v", response)
+	}
+	if !strings.Contains(response.Detail, "the node task could not start") {
+		t.Fatalf("the node task log is missing from the detail: %+v", response)
+	}
+	count, err := fixture.EffectCount(context.Background(), string(exec.OperationID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("a node task that never started applied %d effects", count)
 	}
 }
 

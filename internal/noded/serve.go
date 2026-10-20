@@ -112,6 +112,12 @@ func handle(config Config, steps *node.StepRegistry, request node.Request) node.
 	}
 }
 
+// TaskLogTailBytes bounds the node task log tail the node returns with a
+// status response. The tail explains a task that died, never started, or
+// failed; it is bounded so a chatty task cannot exhaust the control plane,
+// and it stays far below the protocol's frame limit.
+const TaskLogTailBytes = 8 << 10
+
 func statusResponse(config Config, request node.Request) node.Response {
 	nodeEngine, err := engine.New(config.StateDir, config.Node, &secrets.Registry{})
 	if err != nil {
@@ -121,7 +127,78 @@ func statusResponse(config Config, request node.Request) node.Response {
 	if err != nil {
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.PreconditionFailed), Detail: err.Error()}
 	}
-	return node.ResponseFromStatus(status)
+	response := node.ResponseFromStatus(status)
+	if !explainsTaskOutcome(status.Status) {
+		return response
+	}
+	tail, err := taskLogTail(config, request, len(response.Detail))
+	if err != nil || tail == "" {
+		return response
+	}
+	response.Detail = joinDetail(response.Detail, tail)
+	return response
+}
+
+// explainsTaskOutcome reports whether a status is one where the node task log
+// explains what happened: a task that died, a task that never started, or a
+// task that failed. A running or completed task needs no log.
+func explainsTaskOutcome(status engine.Status) bool {
+	switch status {
+	case engine.StatusStale, engine.StatusAbsent, engine.StatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// taskLogTail returns the bounded tail of the node task log for one
+// execution. A missing log is not an error: the task may never have started.
+//
+// The node redacts the tail with the secrets of the request it answers. A
+// status request carries none, so the transport redacts the tail again with
+// the secrets of the run request before it becomes an error detail.
+func taskLogTail(config Config, request node.Request, detail int) (string, error) {
+	limit := TaskLogTailBytes
+	// The tail travels in the same frame as the rest of the response, so the
+	// frame never exceeds the protocol's limit.
+	if room := node.MaxFrameBytes - detail - 1024; room < limit {
+		limit = room
+	}
+	if limit <= 0 {
+		return "", nil
+	}
+	file, err := os.Open(taskLogPath(config, request)) //nolint:gosec // G304: the node's own log path.
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	// Only the tail of the log is read: a chatty task must not be able to
+	// exhaust the node's memory.
+	if info.Size() > int64(limit) {
+		if _, err := file.Seek(info.Size()-int64(limit), io.SeekStart); err != nil {
+			return "", err
+		}
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, int64(limit)))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+// joinDetail appends the node task log to a status detail.
+func joinDetail(detail, tail string) string {
+	if detail == "" {
+		return "node task log:\n" + tail
+	}
+	return detail + "\nnode task log:\n" + tail
 }
 
 // runResponse starts a detached node task and answers "running". It refuses
@@ -189,13 +266,12 @@ func SpawnTask(config Config, request node.Request) error {
 	if err != nil {
 		return err
 	}
-	logPath, err := taskLogPath(config, request)
-	if err != nil {
+	if err := taskLogDir(config); err != nil {
 		_ = readEnd.Close()
 		_ = writeEnd.Close()
 		return err
 	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: the node's own log directory.
+	logFile, err := os.OpenFile(taskLogPath(config, request), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: the node's own log directory.
 	if err != nil {
 		_ = readEnd.Close()
 		_ = writeEnd.Close()
@@ -228,11 +304,12 @@ func SpawnTask(config Config, request node.Request) error {
 }
 
 // taskLogPath is the bounded log of one node task.
-func taskLogPath(config Config, request node.Request) (string, error) {
-	dir := filepath.Join(config.StateDir, "logs")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
+func taskLogPath(config Config, request node.Request) string {
 	name := strings.ReplaceAll(request.Execution.ExecutionID(), ":", "_")
-	return filepath.Join(dir, name+".log"), nil
+	return filepath.Join(config.StateDir, "logs", name+".log")
+}
+
+// taskLogDir creates the node's private log directory.
+func taskLogDir(config Config) error {
+	return os.MkdirAll(filepath.Join(config.StateDir, "logs"), 0o700)
 }

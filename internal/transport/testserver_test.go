@@ -8,13 +8,17 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/noded"
 	"golang.org/x/crypto/ssh"
@@ -42,6 +46,8 @@ type testServer struct {
 	// stderr is written to the channel's standard error before the request is
 	// handled.
 	stderr string
+	// transportConfig adjusts the client configuration of the test.
+	transportConfig func(*SSHConfig)
 
 	mu      sync.Mutex
 	closed  bool
@@ -230,7 +236,7 @@ func (s *testServer) transport(t *testing.T, keys *HostKeys) *SSHTransport {
 		keys = NewHostKeys()
 		keys.Pin(s.address(), s.hostKey)
 	}
-	client, err := NewSSHTransport(SSHConfig{
+	config := SSHConfig{
 		Address:      s.address(),
 		User:         "eregion",
 		IdentityFile: s.identity,
@@ -238,7 +244,11 @@ func (s *testServer) transport(t *testing.T, keys *HostKeys) *SSHTransport {
 		Command:      "eregion-node serve",
 		ExpectedNode: s.config.Node,
 		Timeout:      10 * time.Second,
-	})
+	}
+	if s.transportConfig != nil {
+		s.transportConfig(&config)
+	}
+	client, err := NewSSHTransport(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +265,67 @@ func TestNodeTaskHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if os.Getenv("EREGION_NODE_TASK_NEVER_STARTS") == "1" {
+		// A task command that cannot start: it reads the request and then
+		// fails before the node journal ever hears about the task.
+		readTaskRequest()
+		fmt.Fprintln(os.Stderr, "the node task could not start")
+		os.Exit(1)
+	}
+	if path := os.Getenv("EREGION_NODE_TASK_DIE_FILE"); path != "" {
+		dieMidStep(path, config.StateDir)
+	}
 	if err := noded.RunTask(config); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// readTaskRequest reads the request a detached task receives on its inherited
+// pipe. The helper needs it so the parent's write never fails on a closed
+// pipe.
+func readTaskRequest() {
+	file := os.NewFile(noded.TaskRequestFD, "node-request")
+	if file == nil {
+		return
+	}
+	defer func() { _ = file.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(file, node.MaxFrameBytes))
+}
+
+// dieMidStep kills the task once the node journal records it, so the node
+// observes a task that died mid-step. The marker file keeps every later task
+// alive.
+func dieMidStep(path, stateDir string) {
+	if _, err := os.Stat(path); err == nil {
+		return
+	}
+	if err := os.WriteFile(path, []byte("died\n"), 0o600); err != nil {
+		return
+	}
+	go func() {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if journalHasRunningTask(stateDir) {
+				fmt.Fprintln(os.Stderr, "the node task died mid-step")
+				_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+}
+
+// journalHasRunningTask reports whether the node journal records a task that
+// is running.
+func journalHasRunningTask(stateDir string) bool {
+	journal, err := engine.LoadJournal(engine.JournalPath(stateDir))
+	if err != nil {
+		return false
+	}
+	for _, task := range journal.Tasks {
+		if task.Status == engine.TaskRunning {
+			return true
+		}
+	}
+	return false
 }

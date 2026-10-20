@@ -297,6 +297,94 @@ func TestSSHTransportBoundsTheStderrTail(t *testing.T) {
 	}
 }
 
+// TestSSHTransportReportsADeadNodeTaskPromptly proves that a node task that
+// died mid-step is reported right away, with the node task log, instead of
+// being polled until the caller's deadline. The next attempt reconciles the
+// effect and applies it exactly once.
+func TestSSHTransportReportsADeadNodeTaskPromptly(t *testing.T) {
+	server := newTestServer(t)
+	t.Setenv("EREGION_NODE_TASK_DIE_FILE", filepath.Join(t.TempDir(), "died"))
+	client := server.transport(t, nil)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	started := time.Now()
+	response, err := client.Call(context.Background(), runRequest(t, exec, 1000), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Fatalf("a dead node task was not reported promptly: %s", elapsed)
+	}
+	if response.Status != engine.StatusFailed || !response.Retryable {
+		t.Fatalf("a dead node task is not a retryable failure: %+v", response)
+	}
+	if !strings.Contains(response.Detail, "the node task died mid-step") {
+		t.Fatalf("the node task log is missing from the detail: %+v", response)
+	}
+	if node.IsStreamLost(err) {
+		t.Fatal("a dead node task was reported as a lost stream")
+	}
+	// The next attempt reconciles the effect: it is applied exactly once.
+	recovered, err := client.Call(context.Background(), runRequest(t, exec, 1000), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status != engine.StatusCompleted {
+		t.Fatalf("the recovery did not complete the step: %+v", recovered)
+	}
+	if count := countEffects(t, server.config.StateDir, exec); count != 1 {
+		t.Fatalf("the recovery applied %d effects", count)
+	}
+}
+
+// TestSSHTransportReportsANodeTaskThatNeverStarted proves that a node task
+// that never reaches the node journal is reported as a failed start, with the
+// node task log, instead of being polled until the caller's deadline.
+func TestSSHTransportReportsANodeTaskThatNeverStarted(t *testing.T) {
+	server := newTestServer(t)
+	t.Setenv("EREGION_NODE_TASK_NEVER_STARTS", "1")
+	server.transportConfig = func(config *SSHConfig) {
+		config.AbsentGrace = 300 * time.Millisecond
+	}
+	client := server.transport(t, nil)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	started := time.Now()
+	response, err := client.Call(context.Background(), runRequest(t, exec, 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Fatalf("a node task that never started was not reported promptly: %s", elapsed)
+	}
+	if response.Status != engine.StatusFailed || !response.Retryable {
+		t.Fatalf("a node task that never started is not a retryable failure: %+v", response)
+	}
+	if !strings.Contains(response.Detail, "the node task could not start") {
+		t.Fatalf("the node task log is missing from the detail: %+v", response)
+	}
+	if count := countEffects(t, server.config.StateDir, exec); count != 0 {
+		t.Fatalf("a node task that never started applied %d effects", count)
+	}
+}
+
+// countEffects counts the effect markers the node wrote for one execution.
+func countEffects(t *testing.T, stateDir string, exec engine.Execution) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(stateDir, "effects", string(exec.OperationID)))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		t.Fatal(err)
+	}
+	count := 0
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".applied") {
+			count++
+		}
+	}
+	return count
+}
+
 func TestHostKeysLoadKnownHosts(t *testing.T) {
 	server := newTestServer(t)
 	path := filepath.Join(t.TempDir(), "known_hosts")

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -31,6 +32,11 @@ const DefaultPollInterval = 200 * time.Millisecond
 // DefaultMaxWait bounds how long one call waits for a detached node task.
 // The node task itself keeps running; only the control plane's wait ends.
 const DefaultMaxWait = 10 * time.Minute
+
+// DefaultAbsentGrace is how long the transport waits for a node task to appear
+// in the node journal after the node reported that it started. A task that
+// never appears is a failed start, not a running task.
+const DefaultAbsentGrace = 2 * time.Second
 
 // userPattern accepts a POSIX user name. The user is not interpreted by a
 // shell, but a strict name keeps configuration typos visible.
@@ -66,7 +72,13 @@ type SSHConfig struct {
 	PollInterval time.Duration
 	// MaxWait bounds how long one call waits for a detached node task. The
 	// node task keeps running when the wait ends; the outcome is unknown.
+	// A shorter caller deadline wins: a worker waits at most until its job
+	// deadline.
 	MaxWait time.Duration
+	// AbsentGrace is how long the transport waits for a node task to appear
+	// in the node journal after the node reported that it started. A task
+	// that never appears is a failed start, not a running task.
+	AbsentGrace time.Duration
 }
 
 // SSHTransport dispatches node requests over pinned SSH.
@@ -133,6 +145,9 @@ func NewSSHTransport(config SSHConfig) (*SSHTransport, error) {
 	}
 	if config.MaxWait <= 0 {
 		config.MaxWait = DefaultMaxWait
+	}
+	if config.AbsentGrace <= 0 {
+		config.AbsentGrace = DefaultAbsentGrace
 	}
 	dialer := config.Dialer
 	if dialer == nil {
@@ -338,12 +353,19 @@ func (t *SSHTransport) runSession(client *ssh.Client, request node.Request, onEv
 
 // awaitTerminal asks for the status of a detached node task until it is
 // terminal. A lost stream stays an explicit unknown outcome.
+//
+// A task that died (a stale status) and a task that never started (an absent
+// status past the grace window) are reported as retryable failures instead of
+// being polled until the caller's deadline. The next attempt reconciles the
+// effect through status before it runs anything.
 func (t *SSHTransport) awaitTerminal(ctx context.Context, client *ssh.Client, request node.Request, registry *secrets.Registry) (node.Response, error) {
 	interval := wait(t.config.PollInterval)
 	deadline := time.Now().Add(t.config.MaxWait)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}
+	// The grace window starts when the node reported that it started the task.
+	started := time.Now()
 	for {
 		if !time.Now().Before(deadline) {
 			return node.Response{}, fmt.Errorf("%w: the node task is still running after %s; the node may still finish it", node.ErrStreamLost, t.config.MaxWait)
@@ -365,7 +387,38 @@ func (t *SSHTransport) awaitTerminal(ctx context.Context, client *ssh.Client, re
 		switch response.Status {
 		case engine.StatusCompleted, engine.StatusFailed:
 			return response, nil
+		case engine.StatusStale:
+			// The node task died: it released its effect lock. The effect may
+			// or may not have been applied, so the outcome stays unknown and
+			// the next attempt reconciles it through status.
+			return retryableFailure(response, "the node task is stale"), nil
+		case engine.StatusAbsent:
+			if time.Since(started) < t.config.AbsentGrace {
+				// The node started a task, but the task has not reached the
+				// node journal yet. Give it the grace window.
+				continue
+			}
+			// The node reported a started task, but no task ever appeared in
+			// its journal: the task never started.
+			return retryableFailure(response, "the node task did not start"), nil
 		}
+	}
+}
+
+// retryableFailure reports a node task that cannot make progress on this
+// attempt. The failure carries the node's own detail, including the bounded
+// task log tail, so the reason is visible without opening the node.
+func retryableFailure(response node.Response, reason string) node.Response {
+	detail := reason
+	if response.Detail != "" {
+		detail += ": " + response.Detail
+	}
+	return node.Response{
+		Status:      engine.StatusFailed,
+		ExecutionID: response.ExecutionID,
+		Retryable:   true,
+		ErrorCode:   string(contract.Unavailable),
+		Detail:      detail,
 	}
 }
 

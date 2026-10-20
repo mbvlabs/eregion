@@ -37,7 +37,10 @@ type Config struct {
 	Path string `json:"-"`
 	// TaskCommand starts a detached node task. It defaults to this binary's
 	// own "task" subcommand. A test fixture replaces it.
-	TaskCommand []string `json:"-"`
+	//
+	// The command is the node operator's own local program: it is never
+	// derived from a request, and it is validated before it is executed.
+	TaskCommand []string `json:"task_command,omitempty"`
 }
 
 // LoadConfig reads the node configuration. An explicit path wins over the
@@ -78,6 +81,28 @@ func (c Config) Validate() error {
 	}
 	if strings.ContainsAny(c.StateDir, "\n\r") {
 		return errors.New("the node state directory must not contain control characters")
+	}
+	return validateTaskCommand(c.TaskCommand)
+}
+
+// validateTaskCommand keeps a node task command a local program: an absolute
+// path, no empty argument, and no control characters. A command is never
+// resolved through the search path, so the node starts exactly the program the
+// operator named.
+func validateTaskCommand(command []string) error {
+	if len(command) == 0 {
+		return nil
+	}
+	if command[0] == "" || !filepath.IsAbs(command[0]) {
+		return errors.New("the node task command must be an absolute path")
+	}
+	for _, argument := range command {
+		if argument == "" {
+			return errors.New("the node task command must not have an empty argument")
+		}
+		if strings.ContainsAny(argument, "\n\r\x00") {
+			return errors.New("the node task command must not contain control characters")
+		}
 	}
 	return nil
 }
