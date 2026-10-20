@@ -42,16 +42,20 @@ type Event struct {
 // Response is the final node result. A transport error is separate: a domain
 // failure returns a Response with Status failed.
 type Response struct {
-	Status         engine.Status   `json:"status"`
-	ExecutionID    string          `json:"execution_id,omitempty"`
-	Attempt        uint32          `json:"attempt,omitempty"`
-	AppliedAttempt uint32          `json:"applied_attempt,omitempty"`
-	InputsHash     string          `json:"inputs_hash,omitempty"`
-	Executed       bool            `json:"executed"`
-	Retryable      bool            `json:"retryable"`
-	InputsMismatch bool            `json:"inputs_mismatch,omitempty"`
-	Result         json.RawMessage `json:"result,omitempty"`
-	Detail         string          `json:"detail,omitempty"`
+	Status         engine.Status `json:"status"`
+	ExecutionID    string        `json:"execution_id,omitempty"`
+	Attempt        uint32        `json:"attempt,omitempty"`
+	AppliedAttempt uint32        `json:"applied_attempt,omitempty"`
+	InputsHash     string        `json:"inputs_hash,omitempty"`
+	Executed       bool          `json:"executed"`
+	Retryable      bool          `json:"retryable"`
+	InputsMismatch bool          `json:"inputs_mismatch,omitempty"`
+	// ErrorCode classifies a failed step in a machine-readable way, so a caller
+	// never has to parse the message text to tell a precondition failure from
+	// an unexpected one.
+	ErrorCode string          `json:"error_code,omitempty"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Detail    string          `json:"detail,omitempty"`
 }
 
 // Transport moves one request to a node and streams its events. Implementations

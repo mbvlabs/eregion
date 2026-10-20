@@ -2,10 +2,10 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
@@ -20,14 +20,25 @@ type Hooks struct {
 type Dispatcher struct {
 	engine *engine.Engine
 	hooks  Hooks
+	steps  *StepRegistry
 }
 
 func NewDispatcher(stateDir, nodeName string, registry *secrets.Registry) (*Dispatcher, error) {
+	return NewDispatcherWithSteps(stateDir, nodeName, registry, DefaultRegistry())
+}
+
+// NewDispatcherWithSteps builds a dispatcher with an explicit step registry.
+// The node binary and the control plane use the same registry so both sides
+// derive the same canonical inputs for an effect.
+func NewDispatcherWithSteps(stateDir, nodeName string, registry *secrets.Registry, steps *StepRegistry) (*Dispatcher, error) {
 	nodeEngine, err := engine.New(stateDir, nodeName, registry)
 	if err != nil {
 		return nil, err
 	}
-	return &Dispatcher{engine: nodeEngine}, nil
+	if steps == nil {
+		steps = DefaultRegistry()
+	}
+	return &Dispatcher{engine: nodeEngine, steps: steps}, nil
 }
 
 // SetHooks installs test seams. It is not part of the wire protocol.
@@ -62,9 +73,9 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 				return Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), Retryable: true, Detail: registry.Redact(err.Error())}, nil
 			}
 		}
-		step, err := diagnosticStep(request)
+		step, err := d.steps.Build(request.Execution, request.Payload)
 		if err != nil {
-			return Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), Detail: registry.Redact(err.Error())}, nil
+			return Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), ErrorCode: string(contract.PreconditionFailed), Detail: registry.Redact(err.Error())}, nil
 		}
 		status, err := requestEngine.Run(ctx, step, request.Execution, report)
 		if err != nil {
@@ -83,6 +94,7 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 				InputsHash:     status.InputsHash,
 				Retryable:      !permanent(err),
 				InputsMismatch: errors.Is(err, engine.ErrInputsMismatch),
+				ErrorCode:      string(errorCode(err)),
 				Detail:         registry.Redact(err.Error()),
 			}, nil
 		}
@@ -98,6 +110,17 @@ func permanent(err error) bool {
 		errors.Is(err, engine.ErrPermanent)
 }
 
+// errorCode classifies a failed step so a caller does not have to read the
+// message text. It uses the same taxonomy as the operation contract.
+func errorCode(err error) contract.Code {
+	switch {
+	case errors.Is(err, engine.ErrInputsMismatch), errors.Is(err, engine.ErrJournalCorrupt), errors.Is(err, engine.ErrPermanent):
+		return contract.PreconditionFailed
+	default:
+		return contract.Internal
+	}
+}
+
 func responseFromStatus(status engine.TaskStatus) Response {
 	return Response{
 		Status:         status.Status,
@@ -109,15 +132,4 @@ func responseFromStatus(status engine.TaskStatus) Response {
 		Result:         status.Result,
 		Detail:         status.Detail,
 	}
-}
-
-func diagnosticStep(request Request) (engine.Step, error) {
-	var payload DiagnosticPayload
-	if len(request.Payload) == 0 {
-		return nil, errors.New("diagnostic step payload is required")
-	}
-	if err := json.Unmarshal(request.Payload, &payload); err != nil {
-		return nil, fmt.Errorf("invalid diagnostic step payload: %w", err)
-	}
-	return NewDiagnosticStep(request.Execution, payload)
 }
