@@ -13,15 +13,18 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/transport"
 	"github.com/spf13/cobra"
 )
 
@@ -42,6 +45,18 @@ func serverMeta(summary, example, reason string) CommandMeta {
 	return meta
 }
 
+// nodeTransportEnvironment lists the environment variables that select and
+// configure the node transport. The local transport is the default.
+var nodeTransportEnvironment = []string{
+	"EREGION_NODE_TRANSPORT",
+	"EREGION_NODE_SSH_ADDRESS",
+	"EREGION_NODE_SSH_USER",
+	"EREGION_NODE_SSH_IDENTITY",
+	"EREGION_NODE_SSH_KNOWN_HOSTS",
+	"EREGION_NODE_SSH_COMMAND",
+	"EREGION_NODE_SSH_NODE",
+}
+
 func (a *app) runtimeSpecs() []spec {
 	submitMeta := operationMeta("Submit a harmless durable diagnostic operation", "eregion operations test --idempotency-key ci:diagnostic-1 --json")
 	submitMeta.Mutating, submitMeta.DryRun = true, true
@@ -52,6 +67,9 @@ func (a *app) runtimeSpecs() []spec {
 	migrateMeta.DryRun = true
 	serveMeta := serverMeta("Run the authenticated control-plane API", "eregion serve --listen 127.0.0.1:8080", "A running API/worker service has no static mutation preview; use system migrate --dry-run to inspect schema changes.")
 	serveMeta.Environment = append(serveMeta.Environment, "EREGION_AUTH_FILE")
+	serveMeta.Environment = append(serveMeta.Environment, nodeTransportEnvironment...)
+	workerMeta := serverMeta("Run River workers without an API listener", "eregion worker --concurrency 2", "Background execution cannot be previewed; this command starts workers for accepted operations.")
+	workerMeta.Environment = append(workerMeta.Environment, nodeTransportEnvironment...)
 	return []spec{
 		{use: "serve", meta: serveMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("listen", "127.0.0.1:8080", "API listen address; non-loopback requires TLS")
@@ -60,7 +78,7 @@ func (a *app) runtimeSpecs() []spec {
 			cmd.Flags().Bool("workers", true, "Run River workers alongside the API")
 			cmd.Flags().Int("concurrency", 2, "Diagnostic workers in this process (1–16)")
 		}, run: a.serve},
-		{use: "worker", meta: serverMeta("Run River workers without an API listener", "eregion worker --concurrency 2", "Background execution cannot be previewed; this command starts workers for accepted operations."), flags: func(cmd *cobra.Command) {
+		{use: "worker", meta: workerMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Int("concurrency", 2, "Diagnostic workers in this process (1–16)")
 		}, run: a.worker},
 		{use: "system", meta: readMeta("Inspect local control-plane maintenance commands", []string{"Discover explicit database maintenance commands."}, []string{"eregion help system --json"}), run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil }, children: []spec{
@@ -249,12 +267,62 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		pool.Close()
 		return nil, nil, err
 	}
-	run, err := controlplane.New(pool, a.logger(cmd), controlplane.WorkerConfig{Concurrency: concurrency})
+	nodeTransport, err := a.nodeTransport()
+	if err != nil {
+		pool.Close()
+		return nil, nil, err
+	}
+	run, err := controlplane.New(pool, a.logger(cmd), controlplane.WorkerConfig{Concurrency: concurrency, Transport: nodeTransport})
 	if err != nil {
 		pool.Close()
 		return nil, nil, err
 	}
 	return pool, run, nil
+}
+
+// nodeTransport builds the transport a worker dispatches node work through.
+// The local transport is the default; EREGION_NODE_TRANSPORT=ssh selects the
+// pinned SSH transport. The choice never changes the worker, the operation
+// contract, or the database model.
+func (a *app) nodeTransport() (node.Transport, error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("EREGION_NODE_TRANSPORT"))) {
+	case "", "local":
+		return nil, nil
+	case "ssh":
+		return a.sshTransport()
+	default:
+		return nil, contract.NewFault(contract.ValidationFailed, "unknown node transport", "Set EREGION_NODE_TRANSPORT to local or ssh.")
+	}
+}
+
+// sshTransport builds the pinned SSH transport from the environment. Every
+// value comes from the environment, never from a command argument, so a
+// credential never reaches a process list.
+func (a *app) sshTransport() (node.Transport, error) {
+	address := os.Getenv("EREGION_NODE_SSH_ADDRESS")
+	user := os.Getenv("EREGION_NODE_SSH_USER")
+	identity := os.Getenv("EREGION_NODE_SSH_IDENTITY")
+	knownHosts := os.Getenv("EREGION_NODE_SSH_KNOWN_HOSTS")
+	if address == "" || user == "" || identity == "" || knownHosts == "" {
+		return nil, contract.NewFault(contract.InputRequired, "the SSH node transport is not configured", "Set EREGION_NODE_SSH_ADDRESS, EREGION_NODE_SSH_USER, EREGION_NODE_SSH_IDENTITY, and EREGION_NODE_SSH_KNOWN_HOSTS.")
+	}
+	a.secrets.Add(identity)
+	keys, err := transport.LoadHostKeys(knownHosts)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "the pinned node host keys could not be read", "Check EREGION_NODE_SSH_KNOWN_HOSTS; it must contain the pinned host key of the node.")
+	}
+	client, err := transport.NewSSHTransport(transport.SSHConfig{
+		Address:      address,
+		User:         user,
+		IdentityFile: identity,
+		HostKeys:     keys,
+		Command:      os.Getenv("EREGION_NODE_SSH_COMMAND"),
+		ExpectedNode: os.Getenv("EREGION_NODE_SSH_NODE"),
+	})
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "the SSH node transport is not usable", err.Error())
+	}
+	return client, nil
 }
 
 func stopWorkers(run *controlplane.Runtime) error {
