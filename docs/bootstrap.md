@@ -28,11 +28,17 @@ The detection normalizes `x86_64`/`aarch64` fixture values to Go's `amd64`/
 | `main` | yes | yes | yes, loopback `127.0.0.1:5000` by default | no | API + worker |
 | `application` | yes | no | no | yes | no |
 | `builder` | yes | yes | no | yes | no |
+| `telemetry` | yes (+ Compose) | no | no | yes | no |
 
 The main node therefore installs the application runtime, the Buildpacks build
-stack, and the container registry. **No telemetry stack is installed by any
-bootstrap role.** `telemetry` and `edge` are rejected explicitly; telemetry is
-an M5 role that must never share the control plane.
+stack, and the container registry. The `builder` and `main` roles install `git`,
+which builds use to fetch source. Node roles install `wireguard-tools` because
+enrollment probes `wg` and reconciliation renders a WireGuard configuration.
+
+The `telemetry` role prepares a dedicated Debian/Ubuntu host with Docker,
+Compose, and the node execution account. **Bootstrap does not install a
+telemetry stack, collector, database, or storage, and telemetry is never
+co-located with the control plane.** `edge` is still rejected explicitly.
 
 The registry image is pinned by digest. `pack` is downloaded from the pinned
 release artifact and its SHA-256 is verified. Package installation uses the
@@ -62,6 +68,11 @@ Useful facts:
 
 - `plan`, `diff`, and `status` are read-only. They never write the journal,
   start a service, or install a package.
+- `status` reads the node-local state and engine journal only. It needs no
+  database URL, operator-token output, or binary, so it works from a fresh
+  shell after an interrupted first contact. It reports the generation, active
+  and completed state, pending commit deadline, and every persisted step. It
+  does **not** evaluate drift; run `plan` when the apply inputs are available.
 - `apply` requires both `--apply` and the plan-bound `--confirm` token. The token
   expires after 15 minutes and is bound to the canonical intent, generation, and
   the access-change list.
@@ -85,6 +96,24 @@ State layout (paths are configurable in `host.Layout`, production defaults):
 /etc/eregion/                                auth, environment, TLS, node config
 ```
 
+The control-plane environment is **merged**, not rewritten byte-for-byte. Bootstrap
+owns `EREGION_DATABASE_URL`, the auth/state paths, `EREGION_NODE_NAME`, and the
+node transport settings (`EREGION_NODE_SSH_IDENTITY`,
+`EREGION_NODE_SSH_KNOWN_HOSTS`, `EREGION_NODE_WG_KEY_DIR`,
+`EREGION_NODE_WG_ADDRESS`, `EREGION_NODE_WG_SUBNET`). It replaces those keys and
+preserves every operator-added line and comment. Plan/check output names the
+preserved keys instead of hiding the merge. It records the identity and pin-file
+paths for enrolled nodes; it never invents or writes the private key.
+
+`node.json` is merged the same way: bootstrap owns `node` and `state_dir` and
+preserves operator keys such as `wireguard_apply` and `task_command`.
+
+The in-process local node identity defaults to `local` for compatibility and
+accepts `main` as the documented main-node name. `EREGION_NODE_NAME` selects it;
+bootstrap writes the requested `--node` value (for example `main`) into
+`control-plane.env`. A deployment that already has a `local` node row keeps
+working through the alias instead of being silently duplicated.
+
 ## Remote first contact over pinned SSH
 
 ```sh
@@ -103,24 +132,35 @@ eregion bootstrap remote \
 - The command uploads the exact running `eregion` binary (and the node binary
   for node roles) plus private inputs as a tar stream over the SSH channel. It
   then runs `eregion bootstrap plan` and `eregion bootstrap apply` on the host.
-- Remote plan and apply use the **same** uploaded bundle path, so the plan token
-  binds to the same binary path and content. The bundle is removed after the
-  action; artifacts that failed to converge remain in the host journal.
+- Remote plan and apply use one **stable** uploaded bundle directory derived from
+  the host, node, role, and binary content, under
+  `/var/lib/eregion/bootstrap/remote/`. The remote configuration hash includes the
+  uploaded binary path, so a timestamped directory would make every re-run a new
+  generation. Re-running the same intent now resumes the same generation and
+  operation and acknowledges completed steps.
+- The bundle is kept after a dry-run, an interrupted apply, or a pending
+  commit-confirm, because the next invocation must use the same binary path and
+  content. A fully successful apply (or confirm) removes it explicitly. A failed
+  cleanup is reported on stderr but does not turn a completed apply into a
+  failure.
 - Step progress is streamed from the remote stderr while the final envelope stays
   on stdout. An interrupted connection is a lost progress stream, not a lost
   journal: re-running picks up the same generation on the host.
 - `eregion bootstrap remote --dry-run` returns only the remote plan. Nothing is
-  applied.
+  applied, and the bundle remains for the subsequent apply.
 
 ### Credential handoff
 
 The initial operator token is generated **on the host**. It is written once to
 the protected remote path (`--operator-token-out`, or
 `/var/lib/eregion/bootstrap/operator.handoff` by default) with mode 0600. The
-remote command reads it once over the SSH channel, validates its token shape, and
-stores it in the local context file with mode 0600. The token is never printed in
-plain or JSON output. Use `--token-file-out /private/path` only when another
-protected file is explicitly required.
+remote command reads it once over the SSH channel, validates its token shape,
+stores it in the local context file with mode 0600, and **removes the host file**.
+The token is never printed in plain or JSON output. A read failure keeps the file
+so the operator can recover it from a fresh connection; a successful read always
+consumes it, even if the content is malformed. Node-only roles generate no
+operator token and do not attempt a handoff. Use `--token-file-out /private/path`
+only when another protected file is explicitly required.
 
 `--context-name` names the saved context (default: the node name).
 `--context-url` sets its API origin. If it is omitted and the API listens on
@@ -158,18 +198,28 @@ eregion context credential add \
   --auth-file /etc/eregion/auth.json \
   --subject ci-deploy \
   --scope operations:submit \
+  --action-grant platform.deploy:env/api/production \
+  --action-grant platform.release.create:env/api/* \
   --token-out /root/eregion-ci.token \
   --dry-run --json
 # Then repeat with --confirm '<token from the plan>'.
 ```
 
 The command adds a `ci` actor to the existing server auth file. Dry-run returns
-the auth-file revision and a plan-bound confirmation token. Apply verifies that
-the revision is unchanged, writes the token once to the owner-only output, and
-stores only the SHA-256 principal in the auth file. Neither the plan nor the
-result contains the token. The available scopes are `operations:submit`,
-`operations:read`, `operations:cancel`, and `system:read`; a credential cannot
-widen its own scope.
+the auth-file revision, requested grants, and a plan-bound confirmation token.
+Apply verifies that the revision is unchanged, writes the token once to the
+owner-only output, and stores only the SHA-256 principal in the auth file.
+Neither the plan nor the result contains the token. `--action-grant` is
+repeatable and uses the same `kind:target` semantics as the server
+(`internal/api/authorization.go`): an exact action kind and canonical target,
+with only `env/<app>/*` permitted as a wildcard. Scopes alone never grant
+platform actions. Invalid, ambiguous, or duplicate grants fail before apply.
+
+The available scopes are `operations:submit`, `operations:read`,
+`operations:cancel`, and `system:read`; a credential cannot widen its own scope.
+The bootstrap `--automation-scope` path creates the older diagnostic-only CI
+credential; use `context credential add --action-grant` when CI must submit
+platform actions.
 
 ## Commit-confirm for access-changing apply
 
@@ -205,14 +255,21 @@ node-local state, and marks the generation complete. If the deadline passes
 first, the detached watchdog restores the snapshot, reapplies the original
 modes/owners, runs `systemctl daemon-reload`, restarts units that existed, and
 disables units that did not. It writes a `rolled-back` marker. A confirmation
-after the deadline is rejected; the operator must inspect the host and plan
-again.
+after the deadline is rejected **and reconciles the snapshot first**; the
+operator must inspect the host and plan again.
 
-The revert path is tested directly (`rollbackCommit`), including the pending
-state and confirmation markers. The watchdog process itself is detached so a
-dropped SSH connection or a CLI exit does not cancel the deadline. A normal
-fresh bootstrap with a loopback API and no key replacement has no access changes
-and completes without a rollback window.
+The generated watchdog honors `confirmed` and `rolled-back` before and after the
+deadline and takes an atomic `rollback.lock` claim. An old watchdog therefore
+cannot overwrite a newer confirmed configuration. An explicit rollback writes
+`rolled-back`, which disarms any watchdog still alive. `apply` reconciles
+unconfirmed snapshots under the apply lock: an expired snapshot is restored
+before new mutation, and an unconfirmed future window from another operation
+blocks a second convergence. This covers a reboot that killed the detached
+watchdog. The generated shell script is exercised directly in tests with fake
+`systemctl` and temporary paths, in addition to the Go `rollbackCommit` tests.
+
+A normal fresh bootstrap with a loopback API and no key replacement has no access
+changes and completes without a rollback window.
 
 ## Guided terminal setup
 
@@ -249,6 +306,12 @@ it runs:
 - a resumed `apply` (`resumed: true`, same operation);
 - a completed re-plan and re-apply with no step reporting `executed: true`.
 
+The opt-in SSH integration suite also runs `bootstrap remote` twice against the
+disposable fixture and asserts the same config hash, generation, and operation
+ID, then performs a real root apply with package/daemon stand-ins and a completed
+idempotent re-apply. That proves the stable bundle, credential-free node path,
+journal, and remote CLI bridge, not a fresh VM or a live daemon.
+
 Current result on this workstation (amd64): all four images pass. Containers are
 uniquely named, run with `--network none` and `--rm`, and never touch the host's
 systemd, Docker daemon, or existing containers.
@@ -260,7 +323,8 @@ role selection, journal, resume, idempotency, account/directory/file steps, and
 the real distro userland, but it does **not** prove service supervision, a live
 container runtime, real package installation, registry pulls, Buildpacks
 execution, PostgreSQL migrations, or kernel/network behaviour. Those need a
-fresh-host VM matrix; the remote SSH path additionally needs a real SSH endpoint.
+fresh-host VM matrix. The remote SSH path is covered against the disposable
+fixture, but it still needs a real fresh VM for the same evidence.
 
 ## Database outage and competing migrations
 

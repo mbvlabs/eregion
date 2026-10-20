@@ -45,14 +45,78 @@ func (s *credentialsStep) Inputs() ([]byte, error) {
 	}{hashes, engine.HashSecret(s.cfg.DatabaseURL), s.authPath(), s.envPath(), s.cfg.OperatorTokenOut, s.cfg.AutomationTokenOut, s.cfg.AutomationScopes, s.cfg.AutomationSubject, s.cfg.Node, s.cfg.Layout.NodeStateDir})
 }
 
-func (s *credentialsStep) env() []byte {
-	lines := []string{
+func (s *credentialsStep) managedEnv() []string {
+	return []string{
 		envLine("EREGION_DATABASE_URL", s.cfg.DatabaseURL),
 		envLine("EREGION_AUTH_FILE", s.authPath()),
 		envLine("EREGION_NODE_STATE_DIR", s.cfg.Layout.NodeStateDir),
 		envLine("EREGION_NODE_TRANSPORT", "local"),
+		envLine("EREGION_NODE_NAME", s.cfg.Node),
+		// The operator installs this identity and pins node host keys here.
+		// Bootstrap records the paths so an enrolled fleet needs no ad-hoc
+		// service edits; it never writes or invents a private key.
+		envLine("EREGION_NODE_SSH_IDENTITY", filepath.Join(s.cfg.Layout.ConfigDir, "control-plane-key")),
+		envLine("EREGION_NODE_SSH_KNOWN_HOSTS", filepath.Join(s.cfg.Layout.ConfigDir, "known_hosts")),
+		envLine("EREGION_NODE_WG_KEY_DIR", filepath.Join(s.cfg.Layout.DataDir, "control-plane", "wireguard")),
+		envLine("EREGION_NODE_WG_ADDRESS", "10.77.0.1"),
+		envLine("EREGION_NODE_WG_SUBNET", "10.77.0.0/24"),
 	}
-	return []byte(strings.Join(lines, "\n") + "\n")
+}
+
+// mergeEnv keeps operator-added lines and replaces only the keys bootstrap
+// manages. It returns the keys it preserved so plan and check output can report
+// the merge instead of presenting it as an exact rewrite.
+func mergeEnv(existing []byte, managed []string) ([]byte, []string) {
+	managedSet := map[string]bool{}
+	for _, line := range managed {
+		key, _, _ := strings.Cut(line, "=")
+		managedSet[strings.TrimSpace(key)] = true
+	}
+	var kept []string
+	preservedSet := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimRight(string(existing), "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			kept = append(kept, line)
+			continue
+		}
+		key, _, ok := strings.Cut(trimmed, "=")
+		if !ok {
+			kept = append(kept, line)
+			continue
+		}
+		key = strings.TrimSpace(key)
+		if managedSet[key] {
+			continue
+		}
+		kept = append(kept, line)
+		preservedSet[key] = true
+	}
+	lines := append(kept, managed...)
+	preserved := make([]string, 0, len(preservedSet))
+	for key := range preservedSet {
+		preserved = append(preserved, key)
+	}
+	sort.Strings(preserved)
+	return []byte(strings.Join(lines, "\n") + "\n"), preserved
+}
+
+func (s *credentialsStep) env() []byte {
+	existing, _, _, _ := fileState(s.envPath())
+	merged, _ := mergeEnv(existing, s.managedEnv())
+	return merged
+}
+
+func (s *credentialsStep) envPreserved() []string {
+	existing, _, _, err := fileState(s.envPath())
+	if err != nil {
+		return nil
+	}
+	_, preserved := mergeEnv(existing, s.managedEnv())
+	return preserved
 }
 
 func envLine(key, value string) string {
@@ -81,8 +145,13 @@ func (s *credentialsStep) Check(_ context.Context, _ engine.Runtime) (engine.Che
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
+	preserved := s.envPreserved()
 	if !ok || mode != 0o600 {
-		return incomplete("the control-plane environment file is missing, differs, or is not mode 0600")
+		detail := "the control-plane environment file is missing, differs, or is not mode 0600"
+		if len(preserved) > 0 {
+			detail += "; operator keys preserved: " + strings.Join(preserved, ", ")
+		}
+		return incomplete(detail)
 	}
 	if changed, err := tokenExportState(s.cfg.OperatorTokenOut, s.credentials.Operator); err != nil {
 		return engine.CheckResult{}, err
@@ -95,6 +164,9 @@ func (s *credentialsStep) Check(_ context.Context, _ engine.Runtime) (engine.Che
 		} else if changed {
 			return incomplete("the automation credential export is missing, differs, or is not mode 0600")
 		}
+	}
+	if len(preserved) > 0 {
+		return complete("API auth, control-plane environment, and requested credential exports are owner-only; preserved operator keys: " + strings.Join(preserved, ", "))
 	}
 	return complete("API auth, control-plane environment, and requested credential exports are owner-only")
 }
@@ -145,7 +217,10 @@ func (s *credentialsStep) Apply(_ context.Context, _ engine.Runtime, _ engine.Re
 func (s *credentialsStep) Diff(context.Context, engine.Runtime) ([]string, error) {
 	out := []string{
 		"+ write " + s.authPath() + " (0600; hashed principals only)",
-		"+ write " + s.envPath() + " (0600; database URL and client paths)",
+		"+ merge " + s.envPath() + " (0600; managed keys replaced, operator lines preserved)",
+	}
+	for _, key := range s.envPreserved() {
+		out = append(out, "= preserve operator environment key "+key)
 	}
 	if s.cfg.OperatorTokenOut != "" {
 		out = append(out, "+ export the operator credential to "+s.cfg.OperatorTokenOut+" (0600)")

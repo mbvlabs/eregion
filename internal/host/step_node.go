@@ -32,14 +32,34 @@ func (s *nodeConfigStep) sshDir() string   { return filepath.Join(s.nodeHome(), 
 func (s *nodeConfigStep) keysPath() string { return filepath.Join(s.sshDir(), "authorized_keys") }
 
 func (s *nodeConfigStep) config() ([]byte, error) {
-	raw, err := json.MarshalIndent(struct {
-		Node     string `json:"node"`
-		StateDir string `json:"state_dir"`
-	}{Node: s.cfg.Node, StateDir: s.cfg.Layout.NodeStateDir}, "", "  ")
+	// Preserve operator-owned keys in an existing node.json. Bootstrap owns the
+	// node name and state directory; it must not erase a privileged
+	// wireguard_apply helper, a task_command, or any future node setting merely
+	// because this binary does not know it.
+	values := map[string]json.RawMessage{}
+	raw, _, exists, err := fileState(s.configPath())
 	if err != nil {
 		return nil, err
 	}
-	return append(raw, '\n'), nil
+	if exists {
+		if err := json.Unmarshal(raw, &values); err != nil {
+			return nil, fmt.Errorf("the existing node configuration %s is not valid JSON: %w", s.configPath(), err)
+		}
+	}
+	node, err := json.Marshal(s.cfg.Node)
+	if err != nil {
+		return nil, err
+	}
+	stateDir, err := json.Marshal(s.cfg.Layout.NodeStateDir)
+	if err != nil {
+		return nil, err
+	}
+	values["node"], values["state_dir"] = node, stateDir
+	merged, err := json.MarshalIndent(values, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(merged, '\n'), nil
 }
 
 func (s *nodeConfigStep) authorizedKeys() ([]byte, bool, error) {

@@ -89,6 +89,14 @@ Minimal `/etc/eregion/node.json`:
 {"node": "app-1", "state_dir": "/var/lib/eregion/node"}
 ```
 
+Bootstrap owns `node` and `state_dir` when it writes this file and preserves
+operator keys already present, including an optional privileged WireGuard helper:
+
+```json
+{"node": "app-1", "state_dir": "/var/lib/eregion/node",
+ "wireguard_apply": ["/usr/local/sbin/eregion-wg-apply"]}
+```
+
 The node account owns only its state directory. The control plane reaches the
 node over SSH with a pinned host key; see
 [control-plane.md](control-plane.md#remote-node-execution-over-pinned-ssh).
@@ -152,12 +160,20 @@ eregion bootstrap apply --role main --node main \
 eregion bootstrap status --role main --node main --json
 ```
 
+`status` reads the node-local state and journal only. It requires neither the
+database URL nor `--operator-token-out`; use `plan` when you want a drift check.
+The installed `/etc/eregion/control-plane.env` includes the node transport paths
+for enrolled nodes (`EREGION_NODE_SSH_IDENTITY`, `EREGION_NODE_SSH_KNOWN_HOSTS`,
+`EREGION_NODE_WG_KEY_DIR`, `EREGION_NODE_WG_ADDRESS`, `EREGION_NODE_WG_SUBNET`)
+and `EREGION_NODE_NAME`. Re-applying preserves operator-added lines; install the
+SSH private key and pinned `known_hosts` at the reported paths.
+
 Flags implemented today:
 
 | Flag | Meaning |
 | --- | --- |
-| `--role main\|application\|builder` | Placement role. Telemetry is a separate workflow. |
-| `--node NAME` | Node name; `local` is the default for the main execution identity. |
+| `--role main\|application\|builder\|telemetry` | Placement role. `telemetry` prepares Docker/Compose only; it does not install a telemetry stack. |
+| `--node NAME` | Node name. `local` is the default; `local` and `main` both name the in-process control-plane identity. |
 | `--database-url-file PATH` | Owner-only external PostgreSQL URL file; otherwise `EREGION_DATABASE_URL`. |
 | `--operator-token-out PATH` | Required absolute output for the first operator token (mode `0600`). |
 | `--operator-token-file PATH` | Optional existing owner-only operator token input. |
@@ -174,9 +190,13 @@ Role notes:
 
 - `main` requires the external database URL and `--operator-token-out`; it
   installs the control-plane service units, applies migrations, and starts
-  workers/API only after readiness.
+  workers/API only after readiness. It also installs `git` for builds.
 - `application` and `builder` require `--node-binary` (and a builder-capable
-  host for Buildpacks builds). They install the node service and node account.
+  host for Buildpacks builds). They install the node service, node account,
+  `wireguard-tools`, and `git` on a builder.
+- `telemetry` requires `--node-binary` and installs Docker, Compose, and the node
+  account on a dedicated host. It does not install a collector, storage, or any
+  telemetry stack, and it is never co-located with the control plane.
 - Access-changing plans (non-loopback API, node authorized keys, TLS material)
   require an explicit confirmation; read the reported risks before applying.
 - The bootstrap command group may continue to gain flags. `eregion commands
@@ -209,6 +229,22 @@ different origin are refused. Keep the token out of CI logs and terminal
 recordings. If the binary you are running does not list `context`, export
 `EREGION_API_URL` and read the token from a protected file into
 `EREGION_API_TOKEN` for the single command instead.
+
+For CI, issue a scoped credential instead of copying the operator token:
+
+```sh
+eregion context credential add \
+  --auth-file /etc/eregion/auth.json \
+  --subject ci-deploy \
+  --scope operations:submit \
+  --action-grant platform.deploy:env/api/production \
+  --token-out /root/eregion-ci.token \
+  --dry-run --json
+# Repeat with --confirm <token from the plan>.
+```
+
+`--action-grant` is repeatable and uses the server's exact `kind:target` rules;
+scopes alone do not authorize platform actions.
 
 For a development loopback instead of production:
 

@@ -51,6 +51,7 @@ func serverMeta(summary, example, reason string) CommandMeta {
 // configure the node transport. The local transport is the default.
 var nodeTransportEnvironment = []string{
 	"EREGION_NODE_TRANSPORT",
+	"EREGION_NODE_NAME",
 	"EREGION_NODE_SSH_ADDRESS",
 	"EREGION_NODE_SSH_USER",
 	"EREGION_NODE_SSH_IDENTITY",
@@ -323,7 +324,8 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 	logger := a.logger(cmd)
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: resolver,
-		Nodes: a.fleetResolverConfig(logger),
+		LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
+		Nodes:         a.fleetResolverConfig(logger),
 	})
 	if err != nil {
 		closeTransport()

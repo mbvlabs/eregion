@@ -25,6 +25,21 @@ func (s *packagesStep) packages() []string {
 	if s.role.Runtime {
 		packages = append(packages, "docker.io")
 	}
+	if s.role.Builder {
+		// Builds in this increment fetch source with git and execute it on the
+		// build host. Git is part of the build prerequisite, not optional.
+		packages = append(packages, "git")
+	}
+	if s.role.NodeAgent {
+		// Enrollment probes `wg`, and private connectivity renders WireGuard
+		// configuration with the operator-installed helper.
+		packages = append(packages, "wireguard-tools")
+	}
+	if s.role.Telemetry {
+		// The telemetry role needs a Compose-capable host. Bootstrap does not
+		// install a telemetry stack, collector, or storage.
+		packages = append(packages, "docker-compose")
+	}
 	return packages
 }
 

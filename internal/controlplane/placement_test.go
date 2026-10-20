@@ -81,6 +81,24 @@ type namedTransport struct {
 
 func (n namedTransport) NodeIdentity() string { return n.name }
 
+func TestLocalNodeIdentityAliases(t *testing.T) {
+	if !localNodeNamesMatch("local", "main") || !localNodeNamesMatch("main", "local") {
+		t.Fatal("local and main must name the same local transport")
+	}
+	if localNodeNamesMatch("app-1", "main") || localNodeNamesMatch("local", "app-1") {
+		t.Fatal("a remote identity matched the local alias")
+	}
+	if alt, ok := alternateLocalNodeName("local"); !ok || alt != "main" {
+		t.Fatalf("local alias: %q %t", alt, ok)
+	}
+	if alt, ok := alternateLocalNodeName("main"); !ok || alt != "local" {
+		t.Fatalf("main alias: %q %t", alt, ok)
+	}
+	if _, ok := alternateLocalNodeName("app-1"); ok {
+		t.Fatal("a remote node name has a local alias")
+	}
+}
+
 func TestFallbackIdentityIsRequiredForRegisteredNodes(t *testing.T) {
 	registered := testNode("main", platform.EnrollmentRegistered, []string{platform.RoleApplication}, platform.CapabilityDocker)
 
@@ -89,9 +107,14 @@ func TestFallbackIdentityIsRequiredForRegisteredNodes(t *testing.T) {
 	if err := insertOnly.checkPlacement(registered, platform.RoleApplication, platform.CapabilityDocker); err != nil {
 		t.Fatal(err)
 	}
-	// A worker whose transport authenticates as another node refuses.
+	// A local transport may serve either accepted main-node name: "local" is
+	// the original development identity and "main" is the documented name.
 	other := &Service{transport: namedTransport{name: "local"}}
-	wantViolation(t, other.checkPlacement(registered, platform.RoleApplication, platform.CapabilityDocker), ReasonIdentityMismatch)
+	if err := other.checkPlacement(registered, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+		t.Fatalf("the local/main alias was refused: %v", err)
+	}
+	remote := &Service{transport: namedTransport{name: "app-1"}}
+	wantViolation(t, remote.checkPlacement(registered, platform.RoleApplication, platform.CapabilityDocker), ReasonIdentityMismatch)
 	// A transport that does not pin an identity is refused rather than guessed.
 	unpinned := &Service{transport: namedTransport{name: ""}}
 	wantViolation(t, unpinned.checkPlacement(registered, platform.RoleApplication, platform.CapabilityDocker), ReasonTransportUnpinned)

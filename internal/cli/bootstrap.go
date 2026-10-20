@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,13 +76,17 @@ func (a *app) bootstrapActionSpec(action string, mutating bool, parent CommandMe
 		if err != nil {
 			return result{}, err
 		}
+		if action == "status" {
+			runner, err := host.NewStatusRunner(cfg, a.secrets)
+			if err != nil {
+				return result{}, err
+			}
+			report, err := runner.Status(cmd.Context())
+			return hostResult(report), err
+		}
 		runner, err := host.NewRunner(cfg, a.secrets)
 		if err != nil {
 			return result{}, err
-		}
-		if action == "status" {
-			report, err := runner.Status(cmd.Context())
-			return hostResult(report), err
 		}
 		plan, err := runner.Plan(cmd.Context())
 		return hostResult(plan), err
@@ -189,8 +195,8 @@ func bootstrapFlags(cmd *cobra.Command) {
 // inherit a --dry-run/--confirm default.
 func bootstrapInputFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
-	f.String("role", "main", "Placement: main, application, or builder (no telemetry)")
-	f.String("node", "local", "Node name; main defaults to the core local execution identity")
+	f.String("role", "main", "Placement: main, application, builder, or telemetry")
+	f.String("node", "local", "Node name; local and main are accepted names for the in-process local identity")
 	f.String("database-url-file", "", "Owner-only external PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
 	f.String("operator-token-file", "", "Optional existing owner-only operator token input")
 	f.String("operator-token-out", "", "Required absolute operator token output for main; mode 0600")
@@ -259,7 +265,7 @@ func (a *app) bootstrapRemote(cmd *cobra.Command, _ []string) (result, error) {
 	if !dry && !apply {
 		return result{}, contract.NewFault(contract.ConfirmationRequired, "remote bootstrap requires --dry-run or --apply", "Run with --dry-run to review the remote plan, then with --apply to converge and receive the operator credential.")
 	}
-	session, err := newRemoteSession(cmd.Context(), remote, cfg)
+	session, err := newRemoteSession(cmd.Context(), remote, cfg, address)
 	if err != nil {
 		return result{}, err
 	}
@@ -276,9 +282,12 @@ func (a *app) bootstrapRemote(cmd *cobra.Command, _ []string) (result, error) {
 		var fault *contract.Fault
 		if errors.As(remoteErr, &fault) && fault.Code == contract.ConfirmationRequired {
 			// The credential already exists on the host and the new access path
-			// may be live; hand it off before asking for confirmation.
-			if saveErr := a.saveRemoteCredential(cmd, remote, cfg, address); saveErr != nil {
-				return result{}, saveErr
+			// may be live; hand it off before asking for confirmation. Keep the
+			// bundle: confirm needs the same binary path and generation.
+			if role, roleErr := cfg.RoleConfig(); roleErr == nil && role.ControlPlane {
+				if saveErr := a.saveRemoteCredential(cmd, remote, cfg); saveErr != nil {
+					return result{}, saveErr
+				}
 			}
 			if fault.Hint != "" {
 				fault.Hint += " "
@@ -287,8 +296,13 @@ func (a *app) bootstrapRemote(cmd *cobra.Command, _ []string) (result, error) {
 		}
 		return result{}, remoteErr
 	}
-	if err := a.saveRemoteCredential(cmd, remote, cfg, address); err != nil {
-		return hostResult(report), err
+	if role, roleErr := cfg.RoleConfig(); roleErr == nil && role.ControlPlane {
+		if err := a.saveRemoteCredential(cmd, remote, cfg); err != nil {
+			return hostResult(report), err
+		}
+	}
+	if err := session.Remove(cmd.Context()); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap remote: uploaded bundle cleanup failed: %v\n", err)
 	}
 	return hostResult(report), nil
 }
@@ -319,21 +333,61 @@ func (a *app) remoteClient(cmd *cobra.Command) (*host.Remote, string, error) {
 	return remote, hostPart, nil
 }
 
-func remoteBundleDir() string {
-	return filepath.Join(host.DefaultLayout().StateDir, "remote", fmt.Sprintf("%d", time.Now().UnixNano()))
+// remoteBundleDir derives a stable per-host/per-intent directory. A random or
+// timestamped directory would change the uploaded --binary path on every
+// invocation, and the remote ConfigHash includes that path: the plan token and
+// the journal generation would never match, so a re-run could not resume.
+func remoteBundleDir(cfg host.Config, address string) (string, error) {
+	hash := sha256.New()
+	hash.Write([]byte("eregion/remote-bundle/v1\x00" + address + "\x00" + cfg.Node + "\x00" + string(cfg.Role) + "\x00"))
+	paths := []string{cfg.BinaryPath, cfg.NodeBinaryPath}
+	if cfg.BinaryPath == "" {
+		if effective, err := cfg.EffectiveBinaryPath(); err == nil {
+			paths = append(paths, effective)
+		}
+	}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		digest, err := fileDigest(path)
+		if err != nil {
+			return "", err
+		}
+		hash.Write([]byte(digest))
+		hash.Write([]byte{0})
+	}
+	name := "bundle-" + hex.EncodeToString(hash.Sum(nil))[:24]
+	return filepath.Join(host.DefaultLayout().StateDir, "remote", name), nil
+}
+
+func fileDigest(path string) (string, error) {
+	file, err := os.Open(path) //nolint:gosec // G304: operator-provided bootstrap input.
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 // remoteSession keeps one uploaded bundle for a plan/apply pair. The remote
-// configuration hash includes the uploaded binary path, so plan and apply must
-// use the same directory or the plan token would not bind.
+// configuration hash includes the uploaded binary path, so plan, apply, and a
+// later resume must use the same directory.
 type remoteSession struct {
 	remote *host.Remote
 	dir    string
 	args   []string
 }
 
-func newRemoteSession(ctx context.Context, remote *host.Remote, cfg host.Config) (*remoteSession, error) {
-	dir := remoteBundleDir()
+func newRemoteSession(ctx context.Context, remote *host.Remote, cfg host.Config, address string) (*remoteSession, error) {
+	dir, err := remoteBundleDir(cfg, address)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "cannot derive the remote bootstrap bundle", err.Error())
+	}
 	files, args, err := remoteBundle(cfg, dir)
 	if err != nil {
 		return nil, err
@@ -344,8 +398,15 @@ func newRemoteSession(ctx context.Context, remote *host.Remote, cfg host.Config)
 	return &remoteSession{remote: remote, dir: dir, args: args}, nil
 }
 
-func (s *remoteSession) Close() {
-	_ = s.remote.Remove(context.Background(), s.dir)
+// Close is intentionally a no-op. A failed or interrupted apply must keep the
+// stable bundle so the next invocation resumes the same generation, and a
+// pending commit-confirm still needs it. Success removes it explicitly with
+// Remove.
+func (s *remoteSession) Close() {}
+
+// Remove is the explicit cleanup after a fully successful remote action.
+func (s *remoteSession) Remove(ctx context.Context) error {
+	return s.remote.Remove(ctx, s.dir)
 }
 
 func (s *remoteSession) run(ctx context.Context, action string, extra []string, stderr io.Writer) ([]byte, error) {
@@ -518,18 +579,41 @@ func decodeRemoteEnvelope[T any](raw []byte, action string) (T, error) {
 	return value, nil
 }
 
-func (a *app) saveRemoteCredential(cmd *cobra.Command, remote *host.Remote, cfg host.Config, address string) error {
+// remoteCredentialReader is the narrow SSH surface credential handoff needs.
+// It is an interface so the consume-once behavior is testable without Docker.
+type remoteCredentialReader interface {
+	Output(context.Context, string) ([]byte, error)
+	Remove(context.Context, string) error
+}
+
+// consumeRemoteToken reads the one-time host credential and removes it in the
+// same step. The value is never included in an error or log message. A read
+// failure keeps the file for the operator; a successful read always consumes
+// it, even when the content is malformed, so a second copy does not linger.
+func consumeRemoteToken(ctx context.Context, remote remoteCredentialReader, path string) (string, error) {
+	raw, err := remote.Output(ctx, "cat "+shellPath(path))
+	if err != nil {
+		return "", contract.NewFault(contract.Unavailable, "the operator credential could not be read over SSH", "The token was generated on the host at "+path+"; read it from a fresh connection. Do not print it in an untrusted terminal.")
+	}
+	token := strings.TrimSpace(string(raw))
+	removeErr := remote.Remove(ctx, path)
+	if !host.ValidToken(token) {
+		return "", contract.NewFault(contract.Unavailable, "the handed-off operator credential is invalid", "Inspect the remote credential file; do not reuse an invalid token.")
+	}
+	if removeErr != nil {
+		return "", contract.NewFault(contract.Unavailable, "the handed-off operator credential could not be removed from the host", "Remove "+path+" over a fresh connection before continuing; the token is not printed.")
+	}
+	return token, nil
+}
+
+func (a *app) saveRemoteCredential(cmd *cobra.Command, remote remoteCredentialReader, cfg host.Config) error {
 	operatorOut := cfg.OperatorTokenOut
 	if operatorOut == "" {
 		operatorOut = filepath.Join(host.DefaultLayout().StateDir, "operator.handoff")
 	}
-	raw, err := remote.Output(cmd.Context(), "cat "+shellPath(operatorOut))
+	token, err := consumeRemoteToken(cmd.Context(), remote, operatorOut)
 	if err != nil {
-		return contract.NewFault(contract.Unavailable, "the operator credential could not be read over SSH", "The token was generated on the host at "+operatorOut+"; read it from a fresh connection. Do not print it in an untrusted terminal.")
-	}
-	token := strings.TrimSpace(string(raw))
-	if !host.ValidToken(token) {
-		return contract.NewFault(contract.Unavailable, "the handed-off operator credential is invalid", "Inspect the remote credential file; do not reuse an invalid token.")
+		return err
 	}
 	a.secrets.Add(token)
 	endpoint := remoteContextURL(cmd, cfg)
@@ -572,7 +656,7 @@ func remoteContextURL(cmd *cobra.Command, cfg host.Config) string {
 }
 
 func (a *app) bootstrapRemoteConfirm(cmd *cobra.Command, id string) (result, error) {
-	remote, _, err := a.remoteClient(cmd)
+	remote, address, err := a.remoteClient(cmd)
 	if err != nil {
 		return result{}, err
 	}
@@ -580,7 +664,7 @@ func (a *app) bootstrapRemoteConfirm(cmd *cobra.Command, id string) (result, err
 	if err != nil {
 		return result{}, err
 	}
-	session, err := newRemoteSession(cmd.Context(), remote, cfg)
+	session, err := newRemoteSession(cmd.Context(), remote, cfg, address)
 	if err != nil {
 		return result{}, err
 	}
@@ -590,5 +674,11 @@ func (a *app) bootstrapRemoteConfirm(cmd *cobra.Command, id string) (result, err
 		return result{}, err
 	}
 	report, err := decodeRemoteEnvelope[host.ConfirmReport](raw, "confirm")
-	return hostResult(report), err
+	if err != nil {
+		return result{}, err
+	}
+	if err := session.Remove(cmd.Context()); err != nil {
+		fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap confirm: uploaded bundle cleanup failed: %v\n", err)
+	}
+	return hostResult(report), nil
 }

@@ -680,7 +680,7 @@ func (s *Service) checkNodeIdentity(n platform.Node) error {
 		}
 		return nil
 	}
-	if identity != n.Name {
+	if !localNodeNamesMatch(identity, n.Name) {
 		return contract.NewFault(contract.PreconditionFailed, "node identity does not match the authenticated transport", fmt.Sprintf("The transport identifies %q, not %q. Hostnames are not authorization.", identity, n.Name))
 	}
 	return nil

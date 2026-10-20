@@ -168,7 +168,7 @@ func (a *app) contextSpecs() []spec {
 // token, and apply requires that exact token. The credential is written once to
 // an owner-only file; neither the plan nor the result prints it.
 func (a *app) contextCredentialSpec(meta func(string, string, bool) CommandMeta) spec {
-	credentialMeta := meta("Add a scoped automation credential to the server auth file", "eregion context credential add --auth-file /etc/eregion/auth.json --subject ci-deploy --scope operations:submit --token-out /root/ci.token --dry-run --json", true)
+	credentialMeta := meta("Add a scoped automation credential to the server auth file", "eregion context credential add --auth-file /etc/eregion/auth.json --subject ci-deploy --scope operations:submit --action-grant platform.deploy:env/api/production --token-out /root/ci.token --dry-run --json", true)
 	credentialMeta.Mutating, credentialMeta.DryRun, credentialMeta.Confirmation = true, true, "plan-bound"
 	credentialMeta.DryRunReason = ""
 	return spec{use: "credential", meta: meta("Manage scoped automation credentials", "eregion context credential add --dry-run --json", false),
@@ -178,6 +178,7 @@ func (a *app) contextCredentialSpec(meta func(string, string, bool) CommandMeta)
 				cmd.Flags().String("auth-file", "/etc/eregion/auth.json", "Server auth file containing token hashes")
 				cmd.Flags().String("subject", "", "Stable CI actor subject")
 				cmd.Flags().StringSlice("scope", nil, "Explicit scopes (operations:submit, operations:read, operations:cancel, system:read)")
+				cmd.Flags().StringArray("action-grant", nil, "Repeatable kind:target grant, for example platform.deploy:env/api/production")
 				cmd.Flags().String("token-out", "", "Absolute owner-only token output; never printed")
 				cmd.Flags().Bool("dry-run", false, "Show the base revision and confirmation token without writing")
 				cmd.Flags().String("confirm", "", "Exact plan-bound confirmation token")
@@ -185,10 +186,19 @@ func (a *app) contextCredentialSpec(meta func(string, string, bool) CommandMeta)
 				authFile, _ := cmd.Flags().GetString("auth-file")
 				subject, _ := cmd.Flags().GetString("subject")
 				scopes, _ := cmd.Flags().GetStringSlice("scope")
+				grantFlags, _ := cmd.Flags().GetStringArray("action-grant")
+				grants := make([]api.ActionGrant, 0, len(grantFlags))
+				for _, raw := range grantFlags {
+					grant, err := host.ParseActionGrant(raw)
+					if err != nil {
+						return result{}, err
+					}
+					grants = append(grants, grant)
+				}
 				tokenOut, _ := cmd.Flags().GetString("token-out")
 				request := host.CredentialAddRequest{
 					AuthFile: authFile, Actor: contract.Actor{Kind: "ci", Subject: subject},
-					Scopes: scopes, TokenOut: tokenOut,
+					Scopes: scopes, Grants: grants, TokenOut: tokenOut,
 				}
 				if err := request.Validate(); err != nil {
 					return result{}, err
@@ -206,7 +216,7 @@ func (a *app) contextCredentialSpec(meta func(string, string, bool) CommandMeta)
 				if dryRun {
 					return hostResult(map[string]any{
 						"auth_file": authFile, "actor_kind": "ci", "actor_subject": subject,
-						"scopes": scopes, "base_revision": revision,
+						"scopes": scopes, "action_grants": grants, "base_revision": revision,
 						"confirmation": plan, "dry_run": true,
 					}), nil
 				}

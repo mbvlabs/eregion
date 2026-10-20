@@ -134,10 +134,14 @@ func TestSupportAndRoleMatrix(t *testing.T) {
 	if !main.ControlPlane || !main.Runtime || !main.Builder || !main.Registry || main.Telemetry {
 		t.Fatal(main)
 	}
-	for _, role := range []Role{"telemetry", "edge", "typo"} {
+	for _, role := range []Role{"edge", "typo"} {
 		if _, err := ConfigForRole(role); err == nil {
 			t.Fatal(role)
 		}
+	}
+	telemetry, err := ConfigForRole(RoleTelemetry)
+	if err != nil || !telemetry.Runtime || !telemetry.Telemetry || !telemetry.NodeAgent || telemetry.ControlPlane {
+		t.Fatalf("telemetry role: %+v %v", telemetry, err)
 	}
 	if cfg := DefaultConfig(RoleMain, ""); cfg.Node != "local" {
 		t.Fatal("main must match the core's local execution node")

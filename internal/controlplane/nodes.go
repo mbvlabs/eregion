@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -47,12 +48,42 @@ func scanNode(row pgx.Row) (platform.Node, error) {
 func loadNode(ctx context.Context, q rowQuerier, name string) (platform.Node, error) {
 	n, err := scanNode(q.QueryRow(ctx, nodeSelect+` WHERE name=$1`, name))
 	if errors.Is(err, pgx.ErrNoRows) {
+		if alternate, ok := alternateLocalNodeName(name); ok {
+			n, err = scanNode(q.QueryRow(ctx, nodeSelect+` WHERE name=$1`, alternate))
+		}
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
 		return n, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
 	}
 	if err != nil {
 		return n, unavailable(err)
 	}
 	return n, nil
+}
+
+// localNodeNames are the two accepted names for the in-process local node.
+// "local" is the original development identity; "main" is the documented main
+// node name. Either may name the same local transport.
+var localNodeNames = map[string]bool{"local": true, "main": true}
+
+func isLocalNodeName(name string) bool { return localNodeNames[strings.TrimSpace(name)] }
+
+func alternateLocalNodeName(name string) (string, bool) {
+	switch strings.TrimSpace(name) {
+	case "local":
+		return "main", true
+	case "main":
+		return "local", true
+	default:
+		return "", false
+	}
+}
+
+// localNodeNamesMatch reports whether an authenticated local identity may serve
+// a node name. A remote identity never matches through this alias.
+func localNodeNamesMatch(identity, name string) bool {
+	identity, name = strings.TrimSpace(identity), strings.TrimSpace(name)
+	return identity == name || (isLocalNodeName(identity) && isLocalNodeName(name))
 }
 
 // nodeConn is the private connection record of a node: everything the control
@@ -80,6 +111,22 @@ type nodeConn struct {
 }
 
 func loadNodeConn(ctx context.Context, q rowQuerier, name string) (nodeConn, error) {
+	rec, err := scanNodeConn(ctx, q, name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if alternate, ok := alternateLocalNodeName(name); ok {
+			rec, err = scanNodeConn(ctx, q, alternate)
+		}
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return rec, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
+	}
+	if err != nil {
+		return rec, unavailable(err)
+	}
+	return rec, nil
+}
+
+func scanNodeConn(ctx context.Context, q rowQuerier, name string) (nodeConn, error) {
 	var rec nodeConn
 	var wgState string
 	err := q.QueryRow(ctx, `SELECT name,roles,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key,
@@ -89,11 +136,8 @@ func loadNodeConn(ctx context.Context, q rowQuerier, name string) (nodeConn, err
 		Scan(&rec.Name, &rec.Roles, &rec.Enrollment, &rec.Transport, &rec.SSHAddress, &rec.SSHUser, &rec.HostKey,
 			&rec.ExpectedIdentityFP, &rec.IdentityKey, &rec.IdentityFP, &rec.BuildConcurrency, &rec.BuildUser,
 			&rec.WGEnabled, &rec.WGAddress, &rec.WGEndpoint, &rec.WGSSHPort, &rec.WGPublicKey, &rec.ControlWGPublicKey, &wgState)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return rec, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
-	}
 	if err != nil {
-		return rec, unavailable(err)
+		return rec, err
 	}
 	rec.WGState = platform.WireGuardState(wgState)
 	return rec, nil
@@ -210,7 +254,7 @@ func (s *Service) checkFallbackIdentity(n platform.Node) error {
 		}
 		return nil // Insert-only API process: the worker rechecks before dispatch.
 	}
-	if identity != n.Name {
+	if !localNodeNamesMatch(identity, n.Name) {
 		return placementViolation(ReasonIdentityMismatch, n.Name, fmt.Sprintf("this worker's authenticated transport identifies %q, not %q", identity, n.Name),
 			"Enroll the node so the control plane reaches it over its own pinned SSH transport. Hostnames are not authorization.", map[string]any{"transport_identity": identity})
 	}
