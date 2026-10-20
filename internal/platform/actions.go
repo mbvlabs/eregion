@@ -3,7 +3,6 @@ package platform
 import (
 	"encoding/json"
 	"net"
-	"net/url"
 	"path/filepath"
 	"strings"
 )
@@ -346,9 +345,8 @@ func normalizeSource(input *ReleaseCreateInput) error {
 		if input.Source.Image != "" || input.Source.Path != "" {
 			return invalid("source", "A git source uses source.url and optional source.ref.")
 		}
-		parsed, err := url.Parse(input.Source.URL)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return invalid("source URL", "Use an https:// repository URL without credentials, query, or fragment.")
+		if err := ValidateGitSourceURL(input.Source.URL); err != nil {
+			return invalid("source URL", err.Error())
 		}
 		if input.Source.Ref != "" && !validGitRef(input.Source.Ref) {
 			return invalid("source ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")

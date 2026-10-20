@@ -13,8 +13,8 @@ the finding. This is a review, not a penetration test or an external audit.
 
 | ID | Severity | Area | Status |
 | --- | --- | --- | --- |
-| S1 | Medium | Git build sources are not restricted to public hosts and may follow redirects | **Accepted for v0.1**; not fixed in this tree (owner: platform/security). See scoped acceptance below. |
-| S2 | Low | Private-access proxy forwards client credential headers other than `Authorization` | **Accepted for v0.1**; not fixed in this tree (owner: API/private-access). |
+| S1 | Medium | Git build sources are not restricted to public hosts and may follow redirects | **Fixed in this tree.** HTTPS host allowlist, private-address re-resolution at build time, and redirects disabled. |
+| S2 | Low | Private-access proxy forwards client credential headers other than `Authorization` | **Fixed in this tree.** The rewrite strips cookies, proxy credentials, and forwarding headers; covered by a unit test. |
 | S3 | Low | SSH identity file check and read are a TOCTOU pair and do not reject symlinks | **Accepted for v0.1**; not fixed in this tree (owner: transport). |
 | S4 | Low | Webhook replay is bounded only by operation idempotency retention | **Fixed in this tree.** Durable `eregion_webhook_deliveries`, migration 008, unit and PostgreSQL integration tests. |
 | S5 | Informational | Bearer-token resolution uses a normal map lookup | Accepted; no practical attack demonstrated. |
@@ -211,27 +211,32 @@ There is no private/loopback/link-local/CGNAT/metadata address check, and
 clone `https://10.0.0.5/internal.git` or a public URL that redirects to an
 internal endpoint, turning the builder into an authenticated-internal-network
 probe. Directory builds are already restricted; git builds are not.  
-**Fix (concrete):**
-1. Resolve `parsed.Hostname()` at submission and again in `buildPackStep`, and
-   reject any answer that is loopback, private, link-local, CGNAT, unspecified,
-   multicast, or the cloud metadata address (`169.254.169.254`). Reuse the
-   `publicIP` policy already in `internal/upgrade/download.go`.
-2. Allowlist repository hosts with an operator setting such as
-   `EREGION_BUILD_GIT_ALLOWED_HOSTS`; default to the public GitHub host only.
-3. Run clone with redirects disabled and no ambient credentials:
-   `git -c http.followRedirects=false -c protocol.file.allow=never clone ...`,
-   `GIT_TERMINAL_PROMPT=0`, and the existing clean build environment.
-4. Add tests for literal private IPs, a hostname resolving to a private IP,
-   and a redirect response.
+**Fixed in this tree (owner: platform/security):**
+1. `ValidateGitSourceURL` runs at submission (`normalizeSource`) and again when
+   the node builds the pack step. It accepts only credential-free HTTPS on an
+   allowlisted hostname, refuses IP literals, loopback/`.local`/`.internal`
+   names, and non-443 ports.
+2. `EREGION_GIT_ALLOWED_HOSTS` is an explicit comma-separated hostname list.
+   The default is a small public-forge set (GitHub, GitLab, Codeberg,
+   Bitbucket, SourceHut). Setting the variable replaces the defaults; a
+   self-hosted forge must be deliberate.
+3. `CheckGitSourceResolution` re-resolves the host immediately before clone.
+   Default public forges must resolve only to public addresses; loopback,
+   link-local, unspecified, multicast, and CGNAT answers are always refused.
+   An operator-added host may resolve to a private address, but link-local and
+   loopback answers remain refused.
+4. `buildIsolation` runs git with `http.followRedirects=false`,
+   `protocol.allow=never`, `protocol.https=always`, `GIT_ALLOW_PROTOCOL=https`,
+   `GIT_CONFIG_NOSYSTEM=1`, and `GIT_TERMINAL_PROMPT=0`, so an allowed forge
+   cannot bounce the clone to another protocol or internal service.
+5. `internal/platform/source_test.go` covers allowed and refused URL shapes,
+   explicit allowlist replacement, and the redirect-hardening environment.
 
-**v0.1 decision — accepted, not fixed (owner: platform/security).** The finding
-needs a builder node with outbound network access and a caller holding a
-release-create grant. The v0.1 line is documented as a single-control-plane
-experimental release and does not advertise multi-tenant builder isolation. The
-scoped acceptance is: do not expose the builder role to untrusted CI credentials
-or place it on a network with reachable internal services; the concrete fix
-above remains the release-blocking requirement before a shared or multi-tenant
-builder claim. This worktree did not edit `internal/platform`.
+Residual risk: DNS could change between the resolution check and the clone
+inside git (a narrow rebinding window), and an operator can deliberately
+allowlist a private forge. Both are bounded by the explicit host allowlist and
+by not exposing builder roles to untrusted CI credentials. A network-level
+egress policy remains recommended for builder nodes.
 
 ### S2 — Low — Private-access proxy forwards client credential headers
 
@@ -241,17 +246,12 @@ builder claim. This worktree did not edit `internal/platform`.
 The private route already requires a bearer token plus a matching device grant,
 so this is not an access bypass, but a browser cookie or proxy credential for
 the control-plane origin is unnecessarily disclosed to the upstream service.  
-**Fix:** in `Rewrite`, delete `Cookie`, `Proxy-Authorization`, `X-Forwarded-For`,
-`X-Forwarded-Host`, `X-Forwarded-Proto`, and `Forwarded`; then set only the
-forwarding headers the deployment deliberately wants. Reject `CONNECT` at the
-mux. Add a test that the upstream never sees those headers.
-
-**v0.1 decision — accepted, not fixed (owner: API/private-access).** The private
-route still requires a bearer token and a device grant, so this is unnecessary
-disclosure rather than an access bypass. Until the rewrite deletes those
-headers, do not put control-plane cookies or proxy credentials in front of the
-same origin. The fix is small and remains queued for the next private-access
-change.
+**Fixed in this tree (owner: API/private-access).** `rewritePrivateRequest`
+deletes `Authorization`, `Cookie`, `Proxy-Authorization`, `X-Forwarded-For`,
+`X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Real-IP`, and `Forwarded`; unrelated
+headers are preserved. `TestPrivateRewriteStripsCredentialsAndForwardingHeaders`
+asserts that none of them reach the upstream. The private route still requires a
+bearer token and a matching device grant.
 
 ### S3 — Low — SSH identity file check/read is a TOCTOU pair
 
@@ -328,6 +328,6 @@ avoid the `string(raw)` conversion.
 - No multi-host HA/failover guarantee is made. See
   [release-criteria.md](release-criteria.md); publish only failover behavior
   that was actually drilled.
-- Findings S1–S3 are accepted for the experimental v0.1 line with the owners and
-  scoped mitigations above; they are not fixed. S4 is fixed and covered by unit
-  and PostgreSQL integration tests. S5–S6 are informational and accepted.
+- S1, S2, and S4 are fixed in this tree and covered by unit/integration tests.
+  S3 remains accepted for the experimental v0.1 line with the owner and scoped
+  mitigation above. S5–S6 are informational and accepted.

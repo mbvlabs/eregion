@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -574,9 +573,8 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 		return nil, errors.New("pack source path must be absolute")
 	}
 	if payload.GitURL != "" {
-		parsed, err := url.Parse(payload.GitURL)
-		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-			return nil, errors.New("git build source must be an https URL without credentials")
+		if err := ValidateGitSourceURL(payload.GitURL); err != nil {
+			return nil, err
 		}
 		switch {
 		case payload.GitRef == "":
@@ -629,6 +627,9 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	}
 	source := s.payload.Path
 	if s.payload.GitURL != "" {
+		if err := CheckGitSourceResolution(ctx, s.payload.GitURL); err != nil {
+			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		}
 		source = filepath.Join(work, "src")
 		args := []string{"git", "clone"}
 		if shaPattern.MatchString(s.payload.GitRef) {
@@ -703,6 +704,16 @@ func buildIsolation(work string) ([]string, error) {
 		"PACK_HOME=" + dirs["pack"],
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
+		// Never let an allowed forge redirect a clone to an internal service.
+		// Git reads these as configuration without a writable gitconfig.
+		"GIT_CONFIG_COUNT=3",
+		"GIT_CONFIG_KEY_0=http.followRedirects",
+		"GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=protocol.allow",
+		"GIT_CONFIG_VALUE_1=never",
+		"GIT_CONFIG_KEY_2=protocol.https",
+		"GIT_CONFIG_VALUE_2=always",
+		"GIT_ALLOW_PROTOCOL=https",
 	}, nil
 }
 

@@ -242,8 +242,12 @@ Build source (requires `pack` on a builder-capable node):
 }
 ```
 
-`source.type` is `image`, `directory`, or `git`. Git URLs are `https://` without
-embedded credentials; `ref` is optional. Directory paths are absolute and must
+`source.type` is `image`, `directory`, or `git`. Git URLs are `https://` on an
+explicitly allowed hostname with no embedded credentials, query, fragment, or
+non-default port; `ref` is optional. The default allowlist is GitHub, GitLab,
+Codeberg, Bitbucket, and SourceHut; `EREGION_GIT_ALLOWED_HOSTS` replaces it for a
+self-hosted forge. The host is re-resolved at build time and default public
+forges must resolve to public addresses. Directory paths are absolute and must
 exist beneath a configured build source root on the build node. A build that
 cannot run fails honestly with `precondition_failed`; it never records a fake
 release. The release row is created durably as `pending`, then becomes `ready`

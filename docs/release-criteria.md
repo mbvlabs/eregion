@@ -16,7 +16,7 @@ failed gate blocks the release; it is never waived by prose.
 | G4 Signed release artifacts | `upgrade verify` with the published key; manifest/artifact hashes | Workflow now uploads to S3 and fails without a destination; requires the release workflow, signing secret, and object-store credentials. Not executed here |
 | G5 Upgrade and rollback drills | `just upgrade-drill`, `just recovery-drill`, plus [upgrades.md](upgrades.md#recovery-drills) | Automated drills are runnable; full disposable-host drills still need an operator |
 | G6 Terminal compatibility | `just release-terminal` under the TERM matrix | Runs when `just dev-up` is ready; otherwise prints a clear skip |
-| G7 Security review | [security-review.md](security-review.md), findings triaged | S4 fixed; S1–S3 accepted for v0.1 with owner and mitigation; S5–S6 accepted |
+| G7 Security review | [security-review.md](security-review.md), findings triaged | S1, S2, and S4 fixed; S3 accepted for v0.1 with owner and mitigation; S5–S6 accepted |
 | G8 Fresh-VM install | documented matrix on clean Debian/Ubuntu VMs | **Unproven here** |
 | G9 Real Cloudflare | real zone/token, DNS and private-access path | **Unproven here** |
 | G10 Multi-host HA/failover | drilled loss/outage scenarios | **Unproven here**; connection-level database-outage and node-loss-during-deploy integration drills exist, not multi-host failover |
@@ -196,13 +196,13 @@ Review [security-review.md](security-review.md). Before tagging:
 - host-key pinning, webhook HMAC, vault route authorization, and command
   construction are re-checked against the tagged commit.
 
-At the time of this document S4 (webhook replay retention) is **fixed** with a
-durable delivery table and unit/PostgreSQL tests. S1 (Medium, git build SSRF) is
-accepted for v0.1 with the owner and scoped mitigation in the security review;
-S2 and S3 (Low) are accepted for v0.1 with owners. S5–S6 are informational and
-accepted. The release record must repeat those decisions; S1 must not be
-described as fixed or as safe for untrusted builder credentials. Fixing S1 is
-release-blocking before any shared/multi-tenant builder claim.
+At the time of this document S1 (git build SSRF) and S4 (webhook replay
+retention) are **fixed** and covered by unit/integration tests: S1 has an
+explicit HTTPS host allowlist, build-time private-address re-resolution, and
+redirect/protocol hardening; S4 has a durable delivery table. S2 (private-proxy header
+leakage) is also fixed with a regression test. S3 (Low) remains accepted for
+v0.1 with an owner and scoped mitigation. S5–S6 are
+informational and accepted. The release record must repeat those decisions.
 
 ## G8 — Fresh-VM install matrix (explicitly unproven)
 
@@ -316,7 +316,7 @@ G3: pass|fail|not run  evidence:
 G4: pass|fail|not run  evidence:
 G5: pass|fail|not run  evidence:
 G6: pass|fail|not run  evidence:
-G7: pass|scoped acceptance  findings: S1–S3 accepted, S4 fixed, S5–S6 accepted
+G7: pass|scoped acceptance  findings: S1 fixed, S2 fixed, S4 fixed, S3 accepted, S5–S6 accepted
 G8: not run (unproven)
 G9: not run (unproven)
 G10: not run (unproven; integration drill evidence attached)

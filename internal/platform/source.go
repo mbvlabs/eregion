@@ -1,12 +1,114 @@
 package platform
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 )
+
+// DefaultGitAllowedHosts is the fail-closed allowlist for HTTPS git build
+// sources. Deployments with a self-hosted forge set EREGION_GIT_ALLOWED_HOSTS
+// explicitly; an environment value replaces (never widens) this list.
+var DefaultGitAllowedHosts = []string{
+	"github.com", "gitlab.com", "codeberg.org", "bitbucket.org", "git.sr.ht",
+}
+
+// GitAllowedHosts returns the configured hostname allowlist.
+func GitAllowedHosts() []string {
+	raw := strings.TrimSpace(os.Getenv("EREGION_GIT_ALLOWED_HOSTS"))
+	if raw == "" {
+		return append([]string(nil), DefaultGitAllowedHosts...)
+	}
+	var hosts []string
+	for _, value := range strings.Split(raw, ",") {
+		value = strings.ToLower(strings.TrimSpace(value))
+		value = strings.TrimSuffix(value, ".")
+		if value == "" || strings.ContainsAny(value, "/:@ \t\r\n") {
+			continue
+		}
+		hosts = append(hosts, value)
+	}
+	if len(hosts) == 0 {
+		return append([]string(nil), DefaultGitAllowedHosts...)
+	}
+	return hosts
+}
+
+// ValidateGitSourceURL accepts only credential-free HTTPS repository URLs on an
+// explicitly allowed hostname. IP literals, loopback/local names, non-443 ports,
+// credentials, queries, and fragments are refused before git runs. Git is also
+// invoked with redirects disabled, so an allowed host cannot bounce the clone to
+// an internal service.
+func ValidateGitSourceURL(raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("use an https:// repository URL without credentials, query, or fragment")
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return fmt.Errorf("git build sources must use the default HTTPS port")
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host == "" || net.ParseIP(host) != nil {
+		return fmt.Errorf("git build sources require a hostname, not an IP address")
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return fmt.Errorf("git build sources cannot target a loopback or internal name")
+	}
+	for _, allowed := range GitAllowedHosts() {
+		if host == allowed || strings.HasSuffix(host, "."+allowed) {
+			return nil
+		}
+	}
+	return fmt.Errorf("git host %q is not in EREGION_GIT_ALLOWED_HOSTS", host)
+}
+
+// CheckGitSourceResolution re-checks the host at build time. A default public
+// forge must resolve only to public addresses, which blocks DNS rebinding to an
+// internal service. An operator-added host may resolve to a private address
+// (self-hosted forges), but loopback, link-local, unspecified, and multicast
+// answers are always refused.
+func CheckGitSourceResolution(ctx context.Context, raw string) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return fmt.Errorf("invalid git source URL")
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupIPAddr(resolveCtx, host)
+	if err != nil || len(addresses) == 0 {
+		return fmt.Errorf("could not resolve the git build host")
+	}
+	explicit := true
+	for _, known := range DefaultGitAllowedHosts {
+		if host == known || strings.HasSuffix(host, "."+known) {
+			explicit = false
+			break
+		}
+	}
+	for _, address := range addresses {
+		ip := address.IP
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			ip.IsUnspecified() || ip.IsMulticast() {
+			return fmt.Errorf("git build host resolves to a non-routable internal address")
+		}
+		if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return fmt.Errorf("git build host resolves to a carrier-grade NAT address")
+		}
+		if !explicit && ip.IsPrivate() {
+			return fmt.Errorf("git build host resolves to a private address")
+		}
+	}
+	return nil
+}
 
 // DefaultBuildSourceRoots is the only default directory from which a directory
 // source build may read. A deployment may configure additional roots explicitly;

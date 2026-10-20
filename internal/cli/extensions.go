@@ -133,6 +133,23 @@ func parseCloudflareZones(value, tokenFile string) ([]integrations.DNSZone, erro
 	return zones, nil
 }
 
+// rewritePrivateRequest forwards only the path and the headers the private
+// upstream needs. The upstream never sees the control-plane credential, a
+// browser cookie for this origin, proxy credentials, or client-supplied
+// forwarding headers.
+func rewritePrivateRequest(target *url.URL, r *httputil.ProxyRequest) {
+	r.SetURL(target)
+	r.Out.URL.Path = "/" + strings.TrimPrefix(r.In.URL.Path, api.PrivatePrefix)
+	r.Out.URL.RawPath = ""
+	for _, header := range []string{
+		"Authorization", "Cookie", "Proxy-Authorization",
+		"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
+		"X-Real-IP", "Forwarded",
+	} {
+		r.Out.Header.Del(header)
+	}
+}
+
 // serveFlag returns a flag value, falling back to its environment variable.
 func serveFlag(cmd *cobra.Command, name, environment string) string {
 	if value, _ := cmd.Flags().GetString(name); value != "" {
@@ -173,10 +190,7 @@ func (a *app) buildMux(cmd *cobra.Command, logger *slog.Logger, auth *api.Auth, 
 		}
 		proxy := &httputil.ReverseProxy{
 			Rewrite: func(r *httputil.ProxyRequest) {
-				r.SetURL(target)
-				r.Out.URL.Path = "/" + strings.TrimPrefix(r.In.URL.Path, api.PrivatePrefix)
-				r.Out.URL.RawPath = ""
-				r.Out.Header.Del("Authorization") // The upstream never sees the control-plane credential.
+				rewritePrivateRequest(target, r)
 			},
 			ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 		}
