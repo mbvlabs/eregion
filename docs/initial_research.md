@@ -10,6 +10,24 @@ Sections 1–3 describe the source projects as researched, not requirements for
 eregion. Sections 4–7 define the revised target architecture and roadmap. Where they
 differ, the target design takes precedence over a literal port of either source.
 
+> **Decision update (2026-10-20): node model and telemetry.** Supersedes the
+> conflicting parts of §4.6, Phase 1, and Phase 5 below; see the
+> [roadmap](roadmap.md) for the current plan.
+>
+> - **Main node.** By default the main node runs the control plane plus application
+>   runtime, Buildpacks builds, and the container registry. This replaces "no
+>   unconditional build stack on control-plane hosts". Responsibilities stay
+>   separable in code so work can move to dedicated nodes later.
+> - **Additional nodes** take explicit roles: application, builder, edge, telemetry.
+> - **Telemetry node.** Telemetry is self-hosted on a dedicated `telemetry` node role
+>   that is never co-located with the main node. It installs an opinionated stack:
+>   OpenTelemetry Collector ingest, metrics/log/trace storage with bounded retention,
+>   and unmodified upstream Grafana (AGPLv3) with eregion-authored dashboards.
+>   Applications get an OTLP endpoint, and the CLI reads logs and graphs from the
+>   telemetry node. Exporting to an external stack remains optional. Still no
+>   ClickHouse, and operation history stays in PostgreSQL and works without a
+>   telemetry node.
+
 ### Agreed direction at a glance
 
 Execution planning now lives in [the implementation roadmap](roadmap.md), with
@@ -576,6 +594,9 @@ potential is explored.
 
 ### 4.6 Telemetry without a bundled analytics database
 
+> Superseded in part by the 2026-10-20 decision update at the top of this document:
+> telemetry is now stored on a dedicated, eregion-managed telemetry node.
+
 Do **not** port deploycrate-ce's bundled ClickHouse storage or its ClickHouse-
 dependent rollup and analytics pipeline into v1. Instead expose telemetry primitives
 that make integration with Grafana-compatible and other existing stacks easy:
@@ -699,6 +720,8 @@ and migrations; install the supervised API/worker service, private transport, an
 necessary ingress. Add scoped automation credentials, login/secrets handoff,
 plan/apply, and access-safety checks. Install only dependencies required by the
 selected roles; no ClickHouse or unconditional build stack on control-plane hosts.
+*(Superseded 2026-10-20: the main node runs application runtime, Buildpacks builds,
+and the container registry by default; see the decision update at the top.)*
 
 **Done when:** a fresh host on each supported distribution becomes a healthy
 control plane; re-apply is idempotent; an authenticated automation client can submit
@@ -749,6 +772,9 @@ backup → verify → restore drill succeeds. Resource deletion/restore cannot s
 operate on the control plane's required database.
 
 ### Phase 5 — External telemetry, DNS, and private access
+
+> Superseded in part (2026-10-20): telemetry is delivered by a dedicated telemetry
+> node role with an opinionated Grafana-based stack; external export is optional.
 
 Complete log access, metrics exposure, trace export, collector/backend configuration,
 and external observability examples without ClickHouse-dependent rollups. Foundational

@@ -19,8 +19,11 @@ later milestones remain planned. Browser sketches use synthetic data.
 
 - External PostgreSQL and River; no SQLite, custom job queue, or separate broker.
 - Debian and Ubuntu; select supported releases before shipping host mutations.
-- Separate control-plane, application, and build responsibilities; role combination
-  policy remains explicit, not accidental.
+- Node model: the main node runs the control plane plus application runtime,
+  Buildpacks builds, and the container registry by default. Additional nodes take
+  explicit roles (application, builder, edge, telemetry). Telemetry never runs on the
+  main node. Responsibilities stay separable in code and placement is explicit, so
+  work can move off the main node without redesign.
 - Agent-first metadata, structured errors/output, no-TTY inputs, and dry-run or
   preview semantics ship with each command. Do not defer them to a polish phase.
 - API and CLI reuse application services. UI packages never enqueue work or run SSH
@@ -29,9 +32,9 @@ later milestones remain planned. Browser sketches use synthetic data.
   control sequences. Do not persist plaintext secrets in events or River arguments.
 - Remote effects are at-least-once; use idempotency, scoped coordination, and
   reconciliation. River queue concurrency is not a distributed environment lock.
-- No bundled ClickHouse. Operation history works without an observability backend.
-  Telemetry storage direction (see M5): store application telemetry in PostgreSQL,
-  sized for solo operators and small businesses, rather than requiring an external stack.
+- No bundled ClickHouse. Operation history lives in PostgreSQL and works without any
+  telemetry node. Application telemetry runs on a dedicated telemetry node role (see
+  M5), never on the control plane.
 - Deliver a human-visible improvement alongside each agent-capable vertical slice.
 
 ## M0 — Prove one durable operation (research Phase 0)
@@ -128,10 +131,10 @@ real interactive terminal. No renderer is required for execution or diagnosis.
 - [ ] Add a second control plane against the same database in integration tests.
 
 **Gate:** supported fresh-host VM matrix passes bootstrap, interrupted resume, and
-idempotent re-apply; no builder stack is installed just because a host is a control
-plane. Database outage and competing migration behavior are documented and tested.
+idempotent re-apply; the main node installs the application runtime, Buildpacks
+build stack, and container registry, and no telemetry stack. Database outage and competing migration behavior are documented and tested.
 
-## M2 — Enroll application and build servers (research Phase 2)
+## M2 — Enroll additional application and builder nodes (research Phase 2)
 
 **Depends on:** M1 and an explicit role/placement policy.
 
@@ -143,7 +146,7 @@ plane. Database outage and competing migration behavior are documented and teste
 - [ ] Add a fleet terminal view with role labels, health, freshness, and focused
   node details. Empty and unreachable states are first-class.
 
-**Gate:** both role types enroll on the supported distro matrix and cannot receive
+**Gate:** application and builder nodes enroll on the supported distro matrix and cannot receive
 work outside their declared placement/capability constraints.
 
 ## M3 — Build and deploy from CLI or CI (research Phase 3)
@@ -152,8 +155,8 @@ work outside their declared placement/capability constraints.
 
 - [ ] Port apps/environments, revisioned secrets, sources/targets, releases,
   deployment records, desired/applied state, and change history into PostgreSQL.
-- [ ] Port River build/release-command/deploy workers, Buildpacks execution on build
-  servers, registry/artifact handling, and runtime placement.
+- [ ] Port River build/release-command/deploy workers, Buildpacks execution on the
+  main node or builder nodes, registry/artifact handling, and runtime placement.
 - [ ] Implement preflight → candidates → health → traffic switch → verification →
   cleanup, plus rollback and incomplete-operation reconciliation.
 - [ ] Add scoped CI deployment triggers, request deduplication, operation polling,
@@ -178,21 +181,30 @@ create duplicate deployments. A failed candidate leaves the serving release inta
 **Gate:** app-to-database access and backup/verify/restore drills pass; failed restore
 has a tested recovery path. Additional engines require explicit scope decisions.
 
-## M5 — Telemetry and network integrations (research Phase 5)
+## M5 — Telemetry node and network integrations (research Phase 5)
 
-- [ ] Expose an OpenTelemetry (OTLP) endpoint for applications and store their logs,
-  metrics, and traces in PostgreSQL with bounded retention. The target is solo
-  operators and small businesses, so no separate observability backend is required.
-- [ ] Optional export to an external observability stack, with documented examples
-  and no bundled ClickHouse requirement.
-- [ ] CLI log access and optional terminal graphs with source, unit, time window,
-  timestamp, and honest stale/no-data/backend-unconfigured states.
+**Depends on:** M2 node enrollment and role/placement policy.
+
+- [ ] Add a `telemetry` node role, enrolled and managed like other nodes (Check/Apply
+  steps, health, upgrades). It is never co-located with the control plane.
+- [ ] Install an opinionated, self-hosted stack on that node: OpenTelemetry Collector
+  ingest, metrics/log/trace storage with bounded retention, and unmodified Grafana
+  with eregion-authored dashboards and alerting defaults.
+- [ ] Expose OTLP for applications; run a collector on application/build nodes that
+  ships container logs and host/service metrics to the telemetry node over the
+  private network with per-node credentials.
+- [ ] CLI log access and optional terminal graphs that query the telemetry node
+  through a data-source interface, with source, unit, time window, timestamp, and
+  honest stale/no-data/no-telemetry-node states.
+- [ ] Optional export to an external observability stack instead of, or in addition
+  to, the telemetry node.
 - [ ] Cloudflare DNS reconciliation through River, custom routes, and private
   access device/grant operations with auditable authorization.
 
-**Gate:** application telemetry is stored in PostgreSQL and examinable from the CLI,
-logs are searchable/tailable, DNS reconciles,
-and private access is enforced. Agent operation diagnosis still works without it.
+**Gate:** a telemetry node enrolls, receives application OTLP data and node logs/
+metrics, serves Grafana dashboards, and the CLI can search/tail logs from it; DNS
+reconciles and private access is enforced. Agent operation diagnosis still works
+with no telemetry node.
 
 ## M6 — Webhooks and expanded terminal workflows (research Phase 6)
 
@@ -216,6 +228,30 @@ noninteractive equivalents. No web UI is required.
 **Gate:** publish only the tested failover guarantees. Multiple worker processes
 alone are not proof of an HA platform.
 
+## Future direction (not scheduled)
+
+Idea under consideration (2026-10-20), not part of v1 and not a commitment:
+
+- **Cluster wrapper CLI.** Once eregion and eru are stable, a separate wrapper
+  provisions infrastructure (servers, private network, firewalls, DNS) with
+  OpenTofu/Terraform or provider APIs, then drives eregion and the PostgreSQL tool
+  through their machine contracts (JSON/NDJSON, operation IDs, dry-run, idempotency)
+  rather than importing their internals.
+- **Ownership split.** The provisioning layer owns machines and networks; eregion and
+  the PostgreSQL tool own what runs on them. No resource has two sources of truth.
+- **Separate binaries.** Keep eregion and the PostgreSQL tool independent (different
+  install targets, release cadence, and blast radius). Reduce duplicated code by
+  extracting a shared Go module (contracts, output, Check/Apply engine, transport)
+  once eregion's adapted copies stabilise, not by merging binaries.
+- **Naming.** The wrapper may take the `eru` name, and the PostgreSQL tool would be
+  renamed (candidates: Vairë, Mandos). Renaming touches binary names, `/etc/eru`,
+  `/var/lib/eru`, lock paths, and schema IDs, so do it early or with a compatibility
+  period.
+
+Keep the door open now at no extra cost: expose machine-readable contract versions
+for compatibility checks, and keep node enrollment taking existing hosts as input.
+eregion never provisions machines itself.
+
 ## Decisions to make just in time
 
 These are unresolved, not silently approved by the sketches:
@@ -230,11 +266,15 @@ These are unresolved, not silently approved by the sketches:
   [the SSH/WireGuard increments](ssh-wireguard-next.md).
 - **Before M1:** Debian/Ubuntu releases and architectures; external database hosting
   boundary; public/private API exposure; public SSH posture; migration ownership.
-- **Before M2:** role combinations/resource-hosting role; build isolation; minimum
+- **Before M2:** which roles may combine beyond the main node's defaults (edge role
+  scope, resource-hosting role); how builds and the registry move off the main node;
+  build isolation from runtime workloads on the main node; minimum
   HA deployment and artifact/secret availability.
-- **Before M5:** PostgreSQL telemetry schema, partitioning/retention, and write volume
-  limits (isolation from operation tables); collector packaging; external export
-  interface; and default telemetry collection cost.
+- **Before M5:** telemetry storage engines (license and footprint: e.g. VictoriaMetrics
+  + VictoriaLogs (Apache 2.0) vs Loki/Tempo/Mimir (AGPLv3)); Grafana AGPLv3 posture
+  (ship unmodified upstream) and dashboard licensing; retention and sizing defaults;
+  telemetry-node HA/backup expectations; collector packaging and auth; external
+  export interface.
 
 ## First implementation batch
 
