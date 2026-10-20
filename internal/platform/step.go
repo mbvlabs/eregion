@@ -714,14 +714,12 @@ func validateLabelKey(key string) error {
 	if key == "" || len(key) > 255 || strings.ContainsAny(key, "\x00\r\n ") {
 		return fmt.Errorf("container label %q is invalid", key)
 	}
-	if prefix, suffix, ok := strings.Cut(key, "/"); ok {
-		if !labelKeyPattern.MatchString(prefix) || !labelKeyPattern.MatchString(suffix) {
-			return fmt.Errorf("container label %q has an invalid prefix or name", key)
-		}
-		return nil
+	prefix, suffix, qualified := strings.Cut(key, "/")
+	if !qualified {
+		prefix, suffix, qualified = strings.Cut(key, ".")
 	}
-	if !labelKeyPattern.MatchString(key) {
-		return fmt.Errorf("container label %q is not a DNS-style key", key)
+	if !qualified || !labelKeyPattern.MatchString(prefix) || !labelKeyPattern.MatchString(suffix) {
+		return fmt.Errorf("container label %q must have a DNS-style prefix and name", key)
 	}
 	return nil
 }

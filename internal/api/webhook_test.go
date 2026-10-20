@@ -91,6 +91,9 @@ func newTestWebhook(t *testing.T, service operations.Service, config WebhookConf
 	if config.Allowed == nil {
 		config.Allowed = []AllowedPush{{Repository: "Acme/API", Branch: "main", App: "api", Environment: "production"}}
 	}
+	if config.Deliveries == nil {
+		config.Deliveries = NewMemoryWebhookDeliveries()
+	}
 	handler, err := NewWebhookHandler(config, service)
 	if err != nil {
 		t.Fatal(err)
@@ -247,12 +250,63 @@ func TestWebhookCustomDeployMappingAndConflict(t *testing.T) {
 	if response.Code != http.StatusAccepted || service.submissions[0].Kind != platform.KindDeploy {
 		t.Fatalf("custom mapping failed: %d %+v", response.Code, service.submissions)
 	}
-	// Same delivery with a different canonical input is a conflict in the
-	// durable service, not a second operation.
-	service.err = contract.NewFault(contract.Conflict, "idempotency key already binds different inputs", "")
-	response = serveWebhook(handler, signedWebhookRequest(t, body, "push", "delivery-deploy"))
+	// Same delivery with different canonical input is refused by the durable
+	// delivery record before a second operation can be submitted.
+	response = serveWebhook(handler, signedWebhookRequest(t, append(body, '\n'), "push", "delivery-deploy"))
 	if response.Code != http.StatusConflict {
 		t.Fatalf("conflict status = %d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestWebhookReplaySurvivesOperationRetention(t *testing.T) {
+	service := newWebhookService()
+	deliveries := NewMemoryWebhookDeliveries()
+	handler := newTestWebhook(t, service, WebhookConfig{Deliveries: deliveries})
+	body := webhookPayload()
+	first := serveWebhook(handler, signedWebhookRequest(t, body, "push", "delivery-retained"))
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first status = %d body=%s", first.Code, first.Body.String())
+	}
+	var accepted webhookResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &accepted); err != nil || accepted.OperationID == "" {
+		t.Fatalf("first response = %s %v", first.Body.String(), err)
+	}
+	// Simulate operation and idempotency-row purge: the durable delivery row is
+	// the only replay guard left.
+	service.mu.Lock()
+	service.byKey = map[string]contract.Operation{}
+	service.submissions = nil
+	service.mu.Unlock()
+	second := serveWebhook(handler, signedWebhookRequest(t, body, "push", "delivery-retained"))
+	if second.Code != http.StatusAccepted {
+		t.Fatalf("replay status = %d body=%s", second.Code, second.Body.String())
+	}
+	var replay webhookResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &replay); err != nil {
+		t.Fatal(err)
+	}
+	if replay.OperationID != accepted.OperationID {
+		t.Fatalf("replay created a new operation: %s then %s", accepted.OperationID, replay.OperationID)
+	}
+	if len(service.submissions) != 0 {
+		t.Fatalf("replay reached the operation service %d times", len(service.submissions))
+	}
+	records := deliveries.Records()
+	if len(records) != 1 || !records[0].Submitted || records[0].BodySHA256 != WebhookBodyHash(body) {
+		t.Fatalf("delivery record = %+v", records)
+	}
+	if strings.Contains(records[0].DeliveryIDHash, "delivery-retained") {
+		t.Fatal("raw delivery ID was stored")
+	}
+	// The same delivery ID with different bytes is a conflict, not new work.
+	other := webhookPayload()
+	other = append(other, '\n')
+	conflict := serveWebhook(handler, signedWebhookRequest(t, other, "push", "delivery-retained"))
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("different body status = %d body=%s", conflict.Code, conflict.Body.String())
+	}
+	if len(service.submissions) != 0 {
+		t.Fatal("conflicting replay reached the operation service")
 	}
 }
 
@@ -273,5 +327,8 @@ func TestWebhookConfigFailsClosed(t *testing.T) {
 	}
 	if _, err := NewWebhookHandler(WebhookConfig{Secret: []byte(webhookSecret), Allowed: []AllowedPush{{Repository: "a/b", Branch: "main", App: "api", Environment: "prod"}}}, nil); err == nil {
 		t.Fatal("webhook handler accepted a nil operation service")
+	}
+	if _, err := NewWebhookHandler(WebhookConfig{Secret: []byte(webhookSecret), Allowed: []AllowedPush{{Repository: "a/b", Branch: "main", App: "api", Environment: "prod"}}}, service); err == nil {
+		t.Fatal("webhook handler accepted a nil delivery store")
 	}
 }

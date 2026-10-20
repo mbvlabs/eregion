@@ -36,9 +36,10 @@ const maxProbeOutput = 64 << 10
 // The operator binary must report the manifest version through `version
 // --json`. When a database URL is available, the probe also runs the read-only
 // `system migrate --dry-run` and requires the new binary's required schema to
-// match the manifest and the database to be current. The node binary has no
-// JSON version surface yet, so its probe requires a successful `version`
-// execution and checks a semantic version only when one is printed.
+// match the manifest and the database to be current. The node binary reports
+// the same build metadata through `version --json`; a plain `version` fallback
+// is accepted for older node builds, but either form must report the exact
+// manifest version. A development node binary never satisfies a release.
 func NewHealthProbe(config ProbeConfig) HealthProbe {
 	timeout := config.Timeout
 	if timeout <= 0 {
@@ -67,26 +68,7 @@ func NewHealthProbe(config ProbeConfig) HealthProbe {
 
 func probeVersion(ctx context.Context, binaryPath string, target Target, want string) (string, error) {
 	if target == TargetNode {
-		output, err := runProbe(ctx, binaryPath, nil, "version")
-		if err != nil {
-			return "", contract.NewFault(contract.Unavailable, "the installed node binary failed its version probe", "The previous binary was restored; inspect the node artifact and retry the release.")
-		}
-		line := firstLine(output)
-		if !strings.HasPrefix(line, "eregion-node") {
-			return "", contract.NewFault(contract.PreconditionFailed, "the installed node binary did not identify itself", "The previous binary was restored; publish a node artifact that answers `version`.")
-		}
-		fields := strings.Fields(line)
-		if len(fields) > 1 && fields[1] != "dev" {
-			got, parseErr := ParseVersion(fields[1])
-			if parseErr != nil {
-				return "", contract.NewFault(contract.PreconditionFailed, "the installed node binary reported an invalid version", "The previous binary was restored; publish a semantic release version.")
-			}
-			expected, _ := ParseVersion(want)
-			if got.Compare(expected) != 0 {
-				return "", contract.NewFault(contract.PreconditionFailed, "the installed node binary reports a different version than the manifest", "The previous binary was restored; publish the artifact that matches the signed manifest.")
-			}
-		}
-		return "node version probe: " + line, nil
+		return probeNodeVersion(ctx, binaryPath, want)
 	}
 	output, err := runProbe(ctx, binaryPath, nil, "version", "--json")
 	if err != nil {
@@ -105,6 +87,45 @@ func probeVersion(ctx context.Context, binaryPath string, target Target, want st
 		return "", contract.NewFault(contract.PreconditionFailed, "the installed operator binary reports a different version than the manifest", "The previous binary was restored; publish the artifact that matches the signed manifest.")
 	}
 	return "version probe: " + envelope.Data.Version, nil
+}
+
+func probeNodeVersion(ctx context.Context, binaryPath, want string) (string, error) {
+	expected, err := ParseVersion(want)
+	if err != nil {
+		return "", contract.NewFault(contract.PreconditionFailed, "the signed manifest has no usable node version", "Republish the release manifest with a semantic version.")
+	}
+	// New node builds answer version --json. Older builds are still checked
+	// through their plain `version` line; neither form may skip the version
+	// comparison because the artifact is signed and version-bound.
+	if output, err := runProbe(ctx, binaryPath, nil, "version", "--json"); err == nil {
+		var info struct {
+			Version string `json:"version"`
+		}
+		if json.Unmarshal([]byte(firstLine(output)), &info) == nil && info.Version != "" {
+			return checkNodeVersion(info.Version, expected, "node JSON version probe")
+		}
+	}
+	output, err := runProbe(ctx, binaryPath, nil, "version")
+	if err != nil {
+		return "", contract.NewFault(contract.Unavailable, "the installed node binary failed its version probe", "The previous binary was restored; inspect the node artifact and retry the release.")
+	}
+	line := firstLine(output)
+	fields := strings.Fields(line)
+	if len(fields) == 0 || fields[0] != "eregion-node" || len(fields) < 2 {
+		return "", contract.NewFault(contract.PreconditionFailed, "the installed node binary did not identify itself", "The previous binary was restored; publish a node artifact that answers `version`.")
+	}
+	return checkNodeVersion(fields[1], expected, "node version probe")
+}
+
+func checkNodeVersion(reported string, expected Version, label string) (string, error) {
+	got, err := ParseVersion(reported)
+	if err != nil {
+		return "", contract.NewFault(contract.PreconditionFailed, "the installed node binary reported an invalid version", "The previous binary was restored; publish a semantic release version.")
+	}
+	if got.Compare(expected) != 0 {
+		return "", contract.NewFault(contract.PreconditionFailed, "the installed node binary reports a different version than the manifest", "The previous binary was restored; publish the artifact that matches the signed manifest.")
+	}
+	return label + ": eregion-node " + got.String(), nil
 }
 
 func probeReadiness(ctx context.Context, binaryPath, databaseURL string, manifestSchema int) (string, error) {

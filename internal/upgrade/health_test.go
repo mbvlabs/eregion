@@ -159,6 +159,20 @@ func TestHealthProbeNodeRequiresIdentity(t *testing.T) {
 	if _, err := probe(context.Background(), bad); err == nil {
 		t.Fatal("an unrelated binary passed the node probe")
 	}
+	// The released node binary answers version --json. A development build or a
+	// different release must never satisfy a signed node artifact.
+	jsonVersion := func(version string) string {
+		return "#!/bin/sh\nif [ \"$1\" = \"version\" ] && [ \"$2\" = \"--json\" ]; then echo '{\"version\":\"" + version + "\"}'; exit 0; fi\nexit 1\n"
+	}
+	good := writeProbeScript(t, jsonVersion("1.1.0"))
+	if detail, err := probe(context.Background(), good); err != nil || !strings.Contains(detail, "node JSON version probe: eregion-node 1.1.0") {
+		t.Fatalf("json detail = %q, err = %v", detail, err)
+	}
+	for _, wrong := range []string{"dev", "1.0.0", "9.9.9"} {
+		if _, err := probe(context.Background(), writeProbeScript(t, jsonVersion(wrong))); err == nil {
+			t.Fatalf("node version %q was accepted for a 1.1.0 manifest", wrong)
+		}
+	}
 }
 
 func writeProbeScript(t *testing.T, body string) string {

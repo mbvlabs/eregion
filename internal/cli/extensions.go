@@ -46,6 +46,7 @@ var serveExtensionEnvironment = []string{
 type extensionRuntime struct {
 	Vault      *vault.Service
 	Extensions *controlplane.Extensions
+	Deliveries *controlplane.PostgresWebhookDeliveries
 }
 
 // startExtensions builds the vault service and registers the extension actions.
@@ -83,6 +84,7 @@ func (a *app) startExtensions(pool *pgxpool.Pool, executes bool, nodes controlpl
 		return parts, nil, err
 	}
 	parts.Extensions = extensions
+	parts.Deliveries = controlplane.NewWebhookDeliveryStore(pool)
 	return parts, vault.NewEnvironmentResolver(parts.Vault), nil
 }
 
@@ -149,7 +151,7 @@ func (a *app) buildMux(cmd *cobra.Command, logger *slog.Logger, auth *api.Auth, 
 	} else {
 		logger.Info("secret API disabled", "reason", "EREGION_VAULT_KEY_FILE is not set")
 	}
-	webhook, err := a.webhookHandler(cmd, service)
+	webhook, err := a.webhookHandler(cmd, service, parts.Deliveries)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +189,7 @@ func (a *app) buildMux(cmd *cobra.Command, logger *slog.Logger, auth *api.Auth, 
 // webhookHandler builds the GitHub handler when a secret file and an allow-list
 // are both configured, and returns nil when neither is. Half a configuration is
 // an error: a webhook must never be mounted without its allow-list.
-func (a *app) webhookHandler(cmd *cobra.Command, service operations.Service) (http.Handler, error) {
+func (a *app) webhookHandler(cmd *cobra.Command, service operations.Service, deliveries api.WebhookDeliveryStore) (http.Handler, error) {
 	secretFile := serveFlag(cmd, "webhook-secret-file", "EREGION_WEBHOOK_SECRET_FILE")
 	allow, _ := cmd.Flags().GetStringArray("webhook-allow")
 	if len(allow) == 0 {
@@ -212,7 +214,7 @@ func (a *app) webhookHandler(cmd *cobra.Command, service operations.Service) (ht
 		}
 		entries = append(entries, entry)
 	}
-	return api.NewWebhookHandler(api.WebhookConfig{Secret: secret, Allowed: entries}, service)
+	return api.NewWebhookHandler(api.WebhookConfig{Secret: secret, Allowed: entries, Deliveries: deliveries}, service)
 }
 
 // parseAllowedPush parses owner/repo@branch=app/environment.

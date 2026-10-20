@@ -13,12 +13,12 @@ the finding. This is a review, not a penetration test or an external audit.
 
 | ID | Severity | Area | Status |
 | --- | --- | --- | --- |
-| S1 | Medium | Git build sources are not restricted to public hosts and may follow redirects | Open; file not owned by this worktree task |
-| S2 | Low | Private-access proxy forwards client credential headers other than `Authorization` | Open; file not owned |
-| S3 | Low | SSH identity file check and read are a TOCTOU pair and do not reject symlinks | Open; file not owned |
-| S4 | Low | Webhook replay is bounded only by operation idempotency retention | Open; file not owned |
-| S5 | Informational | Bearer-token resolution uses a normal map lookup | Open; no practical attack demonstrated |
-| S6 | Informational | Secret request body is copied into a Go string before decoding | Open; memory-lifetime only |
+| S1 | Medium | Git build sources are not restricted to public hosts and may follow redirects | **Accepted for v0.1**; not fixed in this tree (owner: platform/security). See scoped acceptance below. |
+| S2 | Low | Private-access proxy forwards client credential headers other than `Authorization` | **Accepted for v0.1**; not fixed in this tree (owner: API/private-access). |
+| S3 | Low | SSH identity file check and read are a TOCTOU pair and do not reject symlinks | **Accepted for v0.1**; not fixed in this tree (owner: transport). |
+| S4 | Low | Webhook replay is bounded only by operation idempotency retention | **Fixed in this tree.** Durable `eregion_webhook_deliveries`, migration 008, unit and PostgreSQL integration tests. |
+| S5 | Informational | Bearer-token resolution uses a normal map lookup | Accepted; no practical attack demonstrated. |
+| S6 | Informational | Secret request body is copied into a Go string before decoding | Accepted; memory-lifetime hygiene only. |
 
 No plaintext-secret leak, authentication bypass, host-key bypass, or command
 injection was found in the reviewed paths. The terminal-safety and ASCII
@@ -121,8 +121,17 @@ route.
 - The repository/branch allowlist is checked before any submission; a deleted
   branch or non-branch ref is ignored (`internal/api/webhook.go:188-206`).
 - The idempotency key is `ghdelivery-<X-GitHub-Delivery>`
-  (`internal/api/webhook.go:236-244`), so a retried or replayed delivery
-  resolves to the same durable operation instead of starting a second one.
+  (`internal/api/webhook.go`), so a retried or replayed delivery resolves to the
+  same durable operation instead of starting a second one.
+- A delivery is also recorded in `eregion_webhook_deliveries` before submission
+  and completed with the accepted operation ID. The row stores SHA-256 of the
+  delivery ID, SHA-256 of the exact body, actor/kind/target, and the operation
+  ID; it never stores the secret, raw signature, raw delivery ID, or body
+  (`internal/api/webhook_delivery.go`,
+  `internal/controlplane/webhook_deliveries.go`, migration 008). A replay after
+  operation/idempotency retention returns the recorded operation ID and creates
+  nothing. The same delivery ID with different signed bytes is refused as
+  `conflict`.
 - The handler never reads `Authorization` and never enqueues directly; it
   submits through `operations.Service.Submit` (same durable operation + River
   job path as the API).
@@ -215,6 +224,15 @@ probe. Directory builds are already restricted; git builds are not.
 4. Add tests for literal private IPs, a hostname resolving to a private IP,
    and a redirect response.
 
+**v0.1 decision — accepted, not fixed (owner: platform/security).** The finding
+needs a builder node with outbound network access and a caller holding a
+release-create grant. The v0.1 line is documented as a single-control-plane
+experimental release and does not advertise multi-tenant builder isolation. The
+scoped acceptance is: do not expose the builder role to untrusted CI credentials
+or place it on a network with reachable internal services; the concrete fix
+above remains the release-blocking requirement before a shared or multi-tenant
+builder claim. This worktree did not edit `internal/platform`.
+
 ### S2 — Low — Private-access proxy forwards client credential headers
 
 **Where:** `internal/cli/extensions.go:120-128`.  
@@ -227,6 +245,13 @@ the control-plane origin is unnecessarily disclosed to the upstream service.
 `X-Forwarded-Host`, `X-Forwarded-Proto`, and `Forwarded`; then set only the
 forwarding headers the deployment deliberately wants. Reject `CONNECT` at the
 mux. Add a test that the upstream never sees those headers.
+
+**v0.1 decision — accepted, not fixed (owner: API/private-access).** The private
+route still requires a bearer token and a device grant, so this is unnecessary
+disclosure rather than an access bypass. Until the rewrite deletes those
+headers, do not put control-plane cookies or proxy credentials in front of the
+same origin. The fix is small and remains queued for the next private-access
+change.
 
 ### S3 — Low — SSH identity file check/read is a TOCTOU pair
 
@@ -241,20 +266,38 @@ not an unauthenticated attack.
 with `Lstat` before opening (or use `O_NOFOLLOW` on Unix). Add a test with a
 symlink swapped after stat.
 
+**v0.1 decision — accepted, not fixed (owner: transport).** The SSH identity is
+operator-controlled and the attack requires write access to its parent
+directory, so this is defence in depth. Keep identity directories root-owned
+and not group/world-writable. The opened-handle fix remains queued for the next
+transport change.
+
 ### S4 — Low — Webhook replay is bounded by operation idempotency retention
 
-**Where:** `internal/api/webhook.go:236-244`; idempotency behavior is owned by
-the operations store.  
+**Where:** `internal/api/webhook.go`; idempotency behavior is owned by the
+operations store.
 **Why:** GitHub signatures cover no timestamp, so a captured valid request can
-be replayed. Today a replay with the same `X-GitHub-Delivery` returns the
-original operation, which is the correct side effect. If operation/idempotency
-rows are ever purged while the secret is still valid, an old delivery could
-create a new operation. The signature itself cannot expire the request.  
-**Fix:** keep a bounded `eregion_webhook_deliveries(delivery_id, body_sha256,
-first_seen_at)` table independent of operation retention, insert it in the same
-transaction as submission, and return `conflict` on a body-hash mismatch for a
-known delivery. Add a test that a replay after operation retention still
-returns the original/no new operation.
+be replayed. A replay with the same `X-GitHub-Delivery` returns the original
+operation, which is the correct side effect. If operation/idempotency rows are
+ever purged while the secret is still valid, an old delivery could create a new
+operation. The signature itself cannot expire the request.
+**Fix implemented:** migration `008_webhook_deliveries.sql` adds
+`eregion_webhook_deliveries`. The handler reserves a delivery before submission
+and completes it with the accepted operation ID. Only SHA-256 of the delivery ID
+and exact body, the actor/kind/target, and the operation ID are stored — never
+the secret, raw signature, raw delivery ID, or body. Operation retention and
+delivery retention are independent. A known delivery with different body bytes
+is refused with `conflict`; a replay returns the recorded operation ID even when
+the operation row no longer exists. The reservation is written before
+`Submit`, then completed with the accepted operation ID; it is deliberately
+independent of the operation transaction so a process crash leaves a pending
+reservation that the next replay completes with the same idempotency key. The
+store is PostgreSQL-backed in production and shared by every control plane; an
+in-memory implementation exists for unit tests only.
+
+**Tests:** `TestWebhookReplaySurvivesOperationRetention` (API unit) and
+`TestIntegrationWebhookDeliverySurvivesOperationRetention` (real PostgreSQL;
+deletes the operation/idempotency row before replaying).
 
 ### S5 — Informational — Bearer-token lookup is not constant time
 
@@ -285,5 +328,6 @@ avoid the `string(raw)` conversion.
 - No multi-host HA/failover guarantee is made. See
   [release-criteria.md](release-criteria.md); publish only failover behavior
   that was actually drilled.
-- Findings S1–S4 are in files owned by other worktree tasks. They are recorded
-  with concrete fixes and were not edited here.
+- Findings S1–S3 are accepted for the experimental v0.1 line with the owners and
+  scoped mitigations above; they are not fixed. S4 is fixed and covered by unit
+  and PostgreSQL integration tests. S5–S6 are informational and accepted.

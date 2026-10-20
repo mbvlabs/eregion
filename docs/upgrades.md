@@ -34,8 +34,10 @@ not logged by the upgrade path.
 
 ### Manifest format
 
-`eregion/release/v1` is forward-only. Unknown fields are ignored by
-`encoding/json`; a future incompatible format must use a new schema name.
+`eregion/release/v1` is strict and forward-only. The loader rejects unknown JSON
+fields and trailing JSON; a future incompatible format must use a new schema
+name and a binary that understands it. Fields are never guessed or silently
+ignored.
 
 ```json
 {
@@ -160,8 +162,12 @@ Common flags: `--target operator|node`, `--binary`, `--state-dir`,
 `--manifest`, `--artifact-dir`, `--public-key-file`, `--schema-version`,
 `--current-version`, `--dry-run`, `--confirm`, `--backup`, `--format`,
 `--inventory` (`upgrade plan`), `--health-check`, and `--health-timeout`.
-The health probe runs the newly installed binary with `version --json`; when
-`EREGION_DATABASE_URL` is set it also runs the read-only
+The health probe runs the newly installed operator binary with `version --json`
+and the installed node binary with `version --json` (falling back to the plain
+`version` line only for older node builds). Either form must report the exact
+semantic version named by the signed manifest; a development or mismatched node
+build is refused and the previous binary is restored. When
+`EREGION_DATABASE_URL` is set the operator probe also runs the read-only
 `system migrate --dry-run` and requires `current == required == manifest
 schema_version`. Pass `--health-check=false` only when another system performs
 the verification.
@@ -244,15 +250,38 @@ dry run and apply the new plan.
    SHA256, builds the manifest, signs it with
    `secrets.EREGION_RELEASE_SIGNING_KEY`, self-verifies the signature, and writes
    the public key for distribution;
-5. publishes the archives, checksum listing, manifest, and public key.
+5. uploads every archive, `manifest.json`, `SHA256SUMS`, and `release.pub` to
+   the configured S3-compatible object store;
+6. publishes the same files as GitHub release assets for human convenience.
 
-The workflow fails if the signing secret is absent. It also fails unless the
-repository variable `EREGION_RELEASE_BASE_URL` names a direct HTTPS object-store
-base URL: GitHub release-asset URLs redirect, and the upgrade downloader refuses
-redirects, so a manifest containing those URLs would not be installable. `SHA256SUMS` is **not** a
-signature and must never be described as one: it is an unauthenticated
-convenience listing. Authenticity comes only from the Ed25519 manifest
-signature verified against the published public key.
+`workflow_dispatch` accepts an existing `v*` tag and runs the same build/sign/
+publish path. The workflow fails if the signing secret is absent. It also fails
+unless both the public HTTPS base URL (`EREGION_RELEASE_BASE_URL`) and a
+matching S3 destination (`EREGION_RELEASE_S3_URI`, for example
+`s3://company-releases/eregion`) are configured. The manifest is signed with
+URLs under the base URL, so the upload must happen before any manifest is
+published. A failure to upload fails the workflow; it never leaves a signed
+manifest pointing at objects that do not exist.
+
+Object-store configuration:
+
+| Kind | Name | Purpose |
+| --- | --- | --- |
+| variable | `EREGION_RELEASE_BASE_URL` | Direct HTTPS prefix that serves the uploaded objects, no redirects |
+| variable | `EREGION_RELEASE_S3_URI` | Destination prefix, `s3://bucket/prefix` |
+| variable | `EREGION_RELEASE_AWS_REGION` | AWS/S3 region |
+| variable | `EREGION_RELEASE_S3_ENDPOINT` | Optional endpoint for an S3-compatible provider |
+| variable | `EREGION_RELEASE_AWS_ROLE_ARN` | Optional OIDC role; preferred over static keys |
+| secret | `EREGION_RELEASE_AWS_ACCESS_KEY_ID`, `EREGION_RELEASE_AWS_SECRET_ACCESS_KEY` | Static credentials when OIDC is unavailable |
+| secret | `EREGION_RELEASE_SIGNING_KEY` | Base64 Ed25519 seed; never printed |
+
+The upload uses `aws s3 cp`/`aws s3 ls` and only requires S3-compatible
+credentials. GitHub release-asset URLs redirect, and the upgrade downloader
+refuses redirects, so `EREGION_RELEASE_BASE_URL` must be the direct object host,
+not a GitHub release page. `SHA256SUMS` is **not** a signature and must never be
+described as one: it is an unauthenticated convenience listing. Authenticity
+comes only from the Ed25519 manifest signature verified against the published
+public key.
 
 Operators should pin the public key out of band (for example in configuration
 management) and set `EREGION_UPGRADE_PUBLIC_KEY_FILE`. Rotating the key requires
@@ -280,6 +309,21 @@ A release is publishable only when all of these hold:
 
 Run these on disposable hosts and test roots. Do not replace a real user binary
 as part of the drill.
+
+Two drills are automated and wired into `just release-check`:
+
+- `just upgrade-drill` runs `scripts/upgrade_drill.py`. It builds disposable
+  `1.0.0`/`1.1.0` binaries and a signed manifest in a temporary directory, then
+  verifies the signature (including a tampered manifest), checks compatibility,
+  applies, inspects the journal/backup, rolls back, and confirms that a failed
+  version probe restores the previous binary. It needs only Go and Linux
+  `amd64`; it skips clearly otherwise.
+- `just recovery-drill` runs `scripts/recovery_drill.py` against a disposable
+  PostgreSQL container: backup, verify, restore, a failed restore, and safety
+  recovery. It prints a skip when Docker, the daemon, or the `postgres:17` image
+  is unavailable.
+
+The remaining drills below still require an operator and disposable hosts.
 
 1. **Tampered signature:** change one manifest byte after signing. Check,
    dry-run, and apply must fail before any download; the binary must be

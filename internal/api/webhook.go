@@ -61,6 +61,10 @@ type WebhookConfig struct {
 	Input func(WebhookEvent) (json.RawMessage, error)
 	// MaxBody defaults to 1 MiB and may not exceed 5 MiB.
 	MaxBody int64
+	// Deliveries is the durable replay guard. It is required: operation
+	// idempotency rows can be purged, and a signed GitHub delivery has no
+	// timestamp that would otherwise expire a replay.
+	Deliveries WebhookDeliveryStore
 }
 
 type WebhookHandler struct {
@@ -82,6 +86,9 @@ func NewWebhookHandler(config WebhookConfig, submitter operations.Service) (*Web
 	}
 	if len(config.Allowed) == 0 {
 		return nil, contract.NewFault(contract.ValidationFailed, "webhook allowlist is empty", "Allowlist at least one exact repository and branch; the handler fails closed.")
+	}
+	if config.Deliveries == nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "webhook handler needs a durable delivery store", "Share one PostgreSQL delivery store across every control-plane process; operation idempotency alone is not a replay guard.")
 	}
 	if config.Kind == "" {
 		config.Kind = DefaultWebhookKind
@@ -238,12 +245,48 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
+	deliveryHash := WebhookDeliveryHash(deliveryID)
+	bodyHash := WebhookBodyHash(body)
+	record, created, err := h.config.Deliveries.Reserve(r.Context(), WebhookDelivery{
+		DeliveryIDHash: deliveryHash, BodySHA256: bodyHash, Actor: actor,
+		Kind: h.config.Kind, Target: target,
+	})
+	if err != nil {
+		if contract.Classify(err).Code == contract.Conflict {
+			h.writeError(w, err)
+			return
+		}
+		writeWebhook(w, http.StatusServiceUnavailable, webhookResponse{
+			Message: "webhook delivery could not be recorded durably", Code: string(contract.Unavailable),
+		})
+		return
+	}
+	if !created && record.Submitted {
+		// The delivery was already accepted. Return the original operation
+		// even if operation retention has since purged the operation row: this
+		// path never submits a new operation for a replayed delivery.
+		writeWebhook(w, http.StatusAccepted, webhookResponse{
+			Accepted: true, OperationID: string(record.OperationID), Kind: record.Kind, Target: record.Target,
+			Message: "duplicate delivery; the original operation was already accepted",
+		})
+		return
+	}
 	op, err := h.submitter.Submit(r.Context(), operations.Submission{
 		Kind: h.config.Kind, Target: target, Actor: actor,
 		IdempotencyKey: idempotencyKey, Input: input,
 	})
 	if err != nil {
 		h.writeError(w, err)
+		return
+	}
+	if err := h.config.Deliveries.Complete(r.Context(), deliveryHash, op.ID); err != nil {
+		// The operation is already durable; only the replay record failed. Ask
+		// GitHub to retry so the same delivery is completed, never resubmitted
+		// as new work.
+		writeWebhook(w, http.StatusServiceUnavailable, webhookResponse{
+			Message: "operation was accepted but the delivery replay record is not durable", Code: string(contract.Unavailable),
+			OperationID: string(op.ID),
+		})
 		return
 	}
 	writeWebhook(w, http.StatusAccepted, webhookResponse{
