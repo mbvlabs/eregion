@@ -376,6 +376,47 @@ func TestIntegrationActionsConfiguredAndSecretFree(t *testing.T) {
 	}
 }
 
+func TestDNSInventoryReadsConfiguredZonesWithoutMutationRuntime(t *testing.T) {
+	fixture := newCloudflareFixture(testZoneID)
+	fixture.records["existing"] = DNSRecord{ID: "existing", Name: "app.example.com", Type: "A", Content: "10.0.0.4", TTL: 300, Comment: "eregion:managed"}
+	server := httptest.NewServer(fixture)
+	defer server.Close()
+	tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
+	if err := os.WriteFile(tokenPath, []byte(testCloudflareToken+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	registry := platform.NewRegistry()
+	if err := Configure(registry, RuntimeConfig{
+		DNSZones:          []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: tokenPath}},
+		CloudflareBaseURL: server.URL + "/client/v4", CloudflareClient: server.Client(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	provider, ok := registry.InventoryProvider(InventoryCollectionDNS)
+	if !ok {
+		t.Fatal("dns inventory is not registered")
+	}
+	inventory, err := provider.Read(context.Background(), platform.InventoryQuery{Collection: InventoryCollectionDNS, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, ok := inventory.(platform.Inventory)
+	if !ok {
+		t.Fatalf("unexpected inventory type %T", inventory)
+	}
+	routes, ok := page.Items.([]DNSRoute)
+	if !ok || len(routes) != 1 || routes[0].Name != "app.example.com" || routes[0].ManagedBy != "eregion" {
+		t.Fatalf("unexpected DNS inventory: %#v", page.Items)
+	}
+	encoded, _ := json.Marshal(inventory)
+	if strings.Contains(string(encoded), testCloudflareToken) {
+		t.Fatal("DNS inventory leaked the API token")
+	}
+	if err := Configure(platform.NewRegistry(), RuntimeConfig{DNSZones: []DNSZone{{ZoneID: "bad", ZoneName: "example.com", TokenFile: tokenPath}}}); err == nil {
+		t.Fatal("invalid DNS inventory zone was accepted")
+	}
+}
+
 func TestIntegrationActionWithoutRuntimeFailsClosed(t *testing.T) {
 	registry := platform.NewRegistry()
 	if err := Configure(registry, RuntimeConfig{}); err != nil {

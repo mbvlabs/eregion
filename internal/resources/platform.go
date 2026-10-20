@@ -87,9 +87,11 @@ func Register(registry *platform.Registry, services *Services) error {
 		{Kind: KindResourceHealth, Summary: "Observe a PostgreSQL application resource", Normalize: normalizeResourceHealth, Executor: executor},
 		{Kind: KindResourceDestroy, Summary: "Destroy an application resource with exact confirmation", Normalize: normalizeResourceDestroy, Executor: executor},
 		{Kind: KindResourceRecover, Summary: "Recover an interrupted database restore", Normalize: normalizeResourceRecover, Executor: executor},
+		{Kind: KindResourceCredentials, Summary: "Export resource credentials to one protected file", Normalize: normalizeResourceCredentials, Executor: executor},
 		{Kind: KindBackupCreate, Summary: "Create a PostgreSQL logical backup archive", Normalize: normalizeBackupCreate, Executor: executor},
 		{Kind: KindBackupVerify, Summary: "Verify a backup archive checksum and table of contents", Normalize: normalizeBackupVerify, Executor: executor},
 		{Kind: KindBackupRestore, Summary: "Restore a verified backup with a safety backup and rollback", Normalize: normalizeBackupRestore, Executor: executor},
+		{Kind: KindBackupSchedule, Summary: "Record a backup schedule and retention policy", Normalize: normalizeBackupSchedule, Executor: executor},
 	}
 	for _, definition := range definitions {
 		if err := registry.Register(definition); err != nil {
@@ -169,6 +171,13 @@ func platformMessage(result Result) string {
 			return fmt.Sprintf("resource %s restore recovery completed", result.Resource)
 		}
 		return fmt.Sprintf("resource %s has no interrupted restore", result.Resource)
+	case ActionCredentials:
+		if result.Export != nil {
+			return fmt.Sprintf("resource %s credentials written to %s", result.Resource, result.Export.Destination)
+		}
+		return fmt.Sprintf("resource %s credentials exported", result.Resource)
+	case ActionSchedule:
+		return fmt.Sprintf("resource %s backup schedule policy recorded", result.Resource)
 	default:
 		return "resource action completed"
 	}
@@ -200,6 +209,19 @@ func requestFromPlatform(kind string, raw json.RawMessage) (Request, Spec, error
 			return Request{}, Spec{}, err
 		}
 		return Request{Action: ActionRecover, Spec: input.Spec}, input.Spec, nil
+	case KindResourceCredentials:
+		var input ResourceCredentialsInput
+		if err := decodePlatformInput(raw, &input); err != nil {
+			return Request{}, Spec{}, err
+		}
+		return Request{Action: ActionCredentials, Spec: input.Spec, Export: &ExportRequest{Destination: input.Destination}}, input.Spec, nil
+	case KindBackupSchedule:
+		var input BackupScheduleInput
+		if err := decodePlatformInput(raw, &input); err != nil {
+			return Request{}, Spec{}, err
+		}
+		policy := input.Policy
+		return Request{Action: ActionSchedule, Spec: input.Spec, Policy: &policy}, input.Spec, nil
 	case KindBackupCreate:
 		var input BackupCreateInput
 		if err := decodePlatformInput(raw, &input); err != nil {
@@ -233,7 +255,9 @@ type ResourceCreateInput struct {
 func (in ResourceCreateInput) Target() platform.Target {
 	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
 }
-func (in ResourceCreateInput) Preview() any { return in }
+func (in ResourceCreateInput) Preview() any {
+	return staticPreview(ActionCreate, in.Spec, false)
+}
 
 type ResourceHealthInput struct {
 	Spec Spec `json:"spec"`
@@ -242,7 +266,9 @@ type ResourceHealthInput struct {
 func (in ResourceHealthInput) Target() platform.Target {
 	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
 }
-func (in ResourceHealthInput) Preview() any { return in }
+func (in ResourceHealthInput) Preview() any {
+	return staticPreview(ActionHealth, in.Spec, false)
+}
 
 type ResourceDestroyInput struct {
 	Spec         Spec   `json:"spec"`
@@ -253,7 +279,9 @@ type ResourceDestroyInput struct {
 func (in ResourceDestroyInput) Target() platform.Target {
 	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
 }
-func (in ResourceDestroyInput) Preview() any { return in }
+func (in ResourceDestroyInput) Preview() any {
+	return staticPreview(ActionDestroy, in.Spec, in.RemoveVolume)
+}
 
 type ResourceRecoverInput struct {
 	Spec Spec `json:"spec"`
@@ -262,7 +290,21 @@ type ResourceRecoverInput struct {
 func (in ResourceRecoverInput) Target() platform.Target {
 	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
 }
-func (in ResourceRecoverInput) Preview() any { return in }
+func (in ResourceRecoverInput) Preview() any {
+	return staticPreview(ActionRecover, in.Spec, false)
+}
+
+type ResourceCredentialsInput struct {
+	Spec        Spec   `json:"spec"`
+	Destination string `json:"destination"`
+}
+
+func (in ResourceCredentialsInput) Target() platform.Target {
+	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
+}
+func (in ResourceCredentialsInput) Preview() any {
+	return staticPreview(ActionCredentials, in.Spec, false)
+}
 
 type BackupCreateInput struct {
 	Spec   Spec    `json:"spec"`
@@ -273,7 +315,9 @@ type BackupCreateInput struct {
 func (in BackupCreateInput) Target() platform.Target {
 	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
 }
-func (in BackupCreateInput) Preview() any { return in }
+func (in BackupCreateInput) Preview() any {
+	return staticPreview(ActionBackup, in.Spec, false)
+}
 
 type BackupVerifyInput struct {
 	Spec    Spec   `json:"spec"`
@@ -283,7 +327,9 @@ type BackupVerifyInput struct {
 func (in BackupVerifyInput) Target() platform.Target {
 	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
 }
-func (in BackupVerifyInput) Preview() any { return in }
+func (in BackupVerifyInput) Preview() any {
+	return staticPreview(ActionVerify, in.Spec, false)
+}
 
 type BackupRestoreInput struct {
 	Spec         Spec    `json:"spec"`
@@ -295,7 +341,21 @@ type BackupRestoreInput struct {
 func (in BackupRestoreInput) Target() platform.Target {
 	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
 }
-func (in BackupRestoreInput) Preview() any { return in }
+func (in BackupRestoreInput) Preview() any {
+	return staticPreview(ActionRestore, in.Spec, false)
+}
+
+type BackupScheduleInput struct {
+	Spec   Spec   `json:"spec"`
+	Policy Policy `json:"policy"`
+}
+
+func (in BackupScheduleInput) Target() platform.Target {
+	return platform.Target{Kind: platform.TargetNode, Node: in.Spec.Host}
+}
+func (in BackupScheduleInput) Preview() any {
+	return staticPreview(ActionSchedule, in.Spec, false)
+}
 
 func decodePlatformInput(raw json.RawMessage, value any) error {
 	if len(bytes.TrimSpace(raw)) == 0 {
@@ -372,6 +432,20 @@ func normalizeResourceRecover(target platform.Target, raw json.RawMessage) (plat
 	return &input, nil
 }
 
+func normalizeResourceCredentials(target platform.Target, raw json.RawMessage) (platform.ActionInput, error) {
+	var input ResourceCredentialsInput
+	if err := decodePlatformInput(raw, &input); err != nil {
+		return nil, err
+	}
+	if err := validatePlatformSpec(target, input.Spec); err != nil {
+		return nil, err
+	}
+	if err := validateExportDestination(input.Destination); err != nil {
+		return nil, err
+	}
+	return &input, nil
+}
+
 func normalizeBackupCreate(target platform.Target, raw json.RawMessage) (platform.ActionInput, error) {
 	var input BackupCreateInput
 	if err := decodePlatformInput(raw, &input); err != nil {
@@ -427,6 +501,20 @@ func normalizeBackupRestore(target platform.Target, raw json.RawMessage) (platfo
 	return &input, nil
 }
 
+func normalizeBackupSchedule(target platform.Target, raw json.RawMessage) (platform.ActionInput, error) {
+	var input BackupScheduleInput
+	if err := decodePlatformInput(raw, &input); err != nil {
+		return nil, err
+	}
+	if err := validatePlatformSpec(target, input.Spec); err != nil {
+		return nil, err
+	}
+	if err := input.Policy.Validate(); err != nil {
+		return nil, err
+	}
+	return &input, nil
+}
+
 // ResourceInventoryItem is a secret-free observation for the resources
 // collection.
 type ResourceInventoryItem struct {
@@ -461,18 +549,23 @@ func (p *resourceInventory) Read(ctx context.Context, query platform.InventoryQu
 		}
 		for _, spec := range specs {
 			health, err := service.health(ctx, spec)
+			var item ResourceInventoryItem
 			if err != nil {
 				classification := contract.Classify(err)
-				items = append(items, ResourceInventoryItem{
+				item = ResourceInventoryItem{
 					Spec: spec, State: StateUnknown,
 					Health: &Health{Status: HealthUnknown, Detail: classification.Message, CheckedAt: service.now()},
-				})
+				}
 			} else {
-				items = append(items, ResourceInventoryItem{
+				item = ResourceInventoryItem{
 					Spec: spec, State: health.State, Endpoint: health.Endpoint,
 					Credential: health.Credential, Health: health.Health,
-				})
+				}
 			}
+			if query.State != "" && string(item.State) != query.State {
+				continue
+			}
+			items = append(items, item)
 			if len(items) >= limit {
 				break
 			}
