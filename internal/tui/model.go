@@ -142,6 +142,10 @@ func newModel(initial viewer.Model, opts Options) Model {
 		prog.Full = '#'
 		prog.Empty = '-'
 	}
+	if opts.NoColor {
+		prog.FullColor = nil
+		prog.EmptyColor = nil
+	}
 	events := viewport.New(viewport.WithWidth(opts.Width), viewport.WithHeight(8))
 	events.SoftWrap = true
 	events.FillHeight = true

@@ -1,6 +1,8 @@
 # Terminal interface direction
 
-**Status:** Design proposal, not an implemented interface · 2026-10-16  
+**Status:** Direction implemented incrementally · operation viewer shipped in M0.4;
+fleet, release/deployment, resource, and backup workspaces shipped in the
+M2/M3/M4/M6 terminal slice (see [workspace usage and CLI mapping](workspace.md)) · 2026-10-20  
 **Review:** Open [interactive sketches](design/tui-sketches.html) in a browser. All
 servers, operations, log lines, timings, and charts are synthetic fixtures.
 
@@ -63,6 +65,12 @@ dependency policy. Official references:
 ## Primary screens
 
 ### Operation viewer — the first implementation
+
+Implemented in `internal/viewer` (presentation-neutral reducer) and
+`internal/tui` (Bubble Tea presentation). The reducer also extracts per-target
+deployment state, build log lines, explicit health observations, and the serving
+release evidence that the platform worker actually emits; missing event fields
+are listed in [workspace.md](workspace.md#data-the-worker-does-not-currently-emit).
 
 The main question is **“What is happening, and what can I safely do next?”**
 

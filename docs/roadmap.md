@@ -168,7 +168,7 @@ build stack, and container registry, and no telemetry stack. Database outage and
 - [ ] Isolate build credentials, caches, concurrency, and source execution from
   runtime workloads; never accept a hostname as sufficient authorization.
 - [ ] Implement nodes list/status/check and operation-backed enrollment/retry.
-- [ ] Add a fleet terminal view with role labels, health, freshness, and focused
+- [x] Add a fleet terminal view with role labels, health, freshness, and focused
   node details. Empty and unreachable states are first-class.
 
 **Gate:** application and builder nodes enroll on the supported distro matrix and cannot receive
@@ -186,7 +186,7 @@ work outside their declared placement/capability constraints.
   cleanup, plus rollback and incomplete-operation reconciliation.
 - [ ] Add scoped CI deployment triggers, request deduplication, operation polling,
   follow/reconnect, safe retry/cancel, and dry-run plans.
-- [ ] Expand the terminal operation view with per-target state, build logs, explicit
+- [x] Expand the terminal operation view with per-target state, build logs, explicit
   health observations, and a visible statement of which release is serving.
 
 **Gate:** a Go sample app builds and deploys from CLI and CI/API, survives viewer and
@@ -201,7 +201,7 @@ create duplicate deployments. A failed candidate leaves the serving release inta
   retention, safety backups, and confirmed restore.
 - [ ] Keep the external control-plane database outside ordinary application-resource
   destruction. Document and exercise its separate recovery procedure.
-- [ ] Add resource/backup terminal views and destructive plan/confirmation screens.
+- [x] Add resource/backup terminal views and destructive plan/confirmation screens.
 
 **Gate:** app-to-database access and backup/verify/restore drills pass; failed restore
 has a tested recovery path. Additional engines require explicit scope decisions.
@@ -235,7 +235,7 @@ with no telemetry node.
 
 - [ ] Signed GitHub webhook ingestion and deduplicated durable submission using the
   same path as CLI/CI. Do not build another queue or deployment implementation.
-- [ ] Expand keyboard-driven application/fleet views, guided forms, filters,
+- [x] Expand keyboard-driven application/fleet views, guided forms, filters,
   command discovery, and graphs where data is available.
 
 **Gate:** GitHub delivery retries are safe; all interactive actions have documented

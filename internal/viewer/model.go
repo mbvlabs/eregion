@@ -114,6 +114,14 @@ type Model struct {
 	Stages   []Stage
 	Progress *contract.Progress
 
+	// Platform observations derived only from emitted events. Targets mirrors
+	// the observed stages with their role; BuildLog, Health, and Serving hold
+	// the explicit build, probe, and serving evidence.
+	Targets  []DeploymentTarget
+	BuildLog []BuildLine
+	Health   []HealthObservation
+	Serving  ServingRelease
+
 	ObservationState ObservationState
 	LastSuccessAt    time.Time
 	LastError        string
@@ -137,6 +145,9 @@ type Model struct {
 	startedAt     time.Time
 	haveState     bool
 	stateSequence uint64
+	currentStage  string
+	currentRole   TargetRole
+	currentLabel  string
 }
 
 func New(id contract.OperationID, opts Options) *Model {
@@ -282,19 +293,24 @@ func (m *Model) applyEvent(event contract.Event) {
 	switch event.Kind {
 	case "state":
 		m.applyState(event.State, event.Attempt, event.ErrorCode, event.At, event.Sequence, false)
+		m.observeReleaseID(event)
 	case "step":
 		m.observeStep(event)
+		m.observePlatformStep(event)
 	case "warning":
 		if event.Stage != "" {
 			m.markStage(event.Stage, StageFailed, event.Attempt, event.At)
 		}
+		m.observeLog(event)
 	case "progress":
 		if event.Progress != nil {
 			progress := *event.Progress
 			m.Progress = &progress
 		}
 	case "log":
-		// Diagnostics are retained in EventLines; they do not invent stages.
+		// Diagnostics are retained in EventLines; build and health evidence is
+		// extracted without inventing stages.
+		m.observeLog(event)
 	}
 }
 
@@ -313,6 +329,7 @@ func (m *Model) applyAttempt(attempt uint32, at time.Time) {
 			m.Stages[i].LastSeen = at
 		}
 	}
+	m.syncTargets()
 }
 
 func (m *Model) applyState(state contract.State, attempt uint32, code contract.Code, at time.Time, sequence uint64, snapshot bool) {
@@ -372,11 +389,13 @@ func (m *Model) observeStep(event contract.Event) {
 			stage.Attempt = event.Attempt
 			stage.LastSeen = event.At
 			m.completeOtherRunning(name, event.At)
+			m.syncTargets()
 			return
 		}
 	}
 	m.Stages = append(m.Stages, Stage{Name: name, Status: StageRunning, Attempt: event.Attempt, FirstSeen: event.At, LastSeen: event.At})
 	m.completeOtherRunning(name, event.At)
+	m.syncTargets()
 }
 
 // The diagnostic engine is sequential: a newly observed step means the
@@ -399,6 +418,7 @@ func (m *Model) markStage(name string, status StageStatus, attempt uint32, at ti
 				m.Stages[i].Attempt = attempt
 			}
 			m.Stages[i].LastSeen = at
+			m.syncTargets()
 			return
 		}
 	}
@@ -419,6 +439,7 @@ func (m *Model) finishStages(state contract.State, at time.Time) {
 		}
 		m.Stages[i].LastSeen = at
 	}
+	m.syncTargets()
 }
 
 // PollSucceeded marks a successful observation and recovers a stale view.
@@ -601,6 +622,9 @@ func (m *Model) Clone() *Model {
 	clone := *m
 	clone.EventLines = append([]contract.Event(nil), m.EventLines...)
 	clone.Stages = append([]Stage(nil), m.Stages...)
+	clone.Targets = append([]DeploymentTarget(nil), m.Targets...)
+	clone.BuildLog = append([]BuildLine(nil), m.BuildLog...)
+	clone.Health = append([]HealthObservation(nil), m.Health...)
 	if m.Progress != nil {
 		progress := *m.Progress
 		clone.Progress = &progress

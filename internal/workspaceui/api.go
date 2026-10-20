@@ -7,6 +7,8 @@ package workspaceui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/resources"
 )
 
 // API is the subset of the authenticated API client the workspace uses. The
@@ -47,6 +50,23 @@ type Action struct {
 // Noninteractive is the generic platform submit equivalent shown for every
 // action. The wrapper uses the same kind, target, input, and idempotency key as
 // the interactive path; it never adds a second submission mechanism.
+// PlanToken binds a typed confirmation to the exact kind, target, and input
+// that the dry run previewed. It mirrors the CLI's plan-bound rollback token so
+// a changed input cannot reuse an earlier approval.
+func (a Action) PlanToken() string {
+	input := a.Input
+	if len(input) == 0 {
+		input = json.RawMessage(`{}`)
+	}
+	digest := sha256.New()
+	_, _ = digest.Write([]byte(a.Kind))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write([]byte(a.Target))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(input)
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
 func (a Action) Noninteractive() string {
 	input := string(a.Input)
 	if input == "" {
@@ -155,6 +175,14 @@ func decodeInventory(tab Tab, raw json.RawMessage, clean func(string) string) ([
 		return decodeApps(items, clean)
 	case Envs:
 		return decodeEnvironments(items, clean)
+	case Releases:
+		return decodeReleases(items, clean)
+	case Deployments:
+		return decodeDeployments(items, clean)
+	case Resources:
+		return decodeResources(items, clean)
+	case Backups:
+		return decodeBackups(items, clean)
 	default:
 		return decodeGeneric(items, clean)
 	}
@@ -209,8 +237,12 @@ func decodeNodes(raw json.RawMessage, clean func(string) string) ([]Item, error)
 			{Label: "updated", Value: node.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")},
 		}
 		search := joinSearch(title, status, strings.Join(node.Roles, " "), strings.Join(node.Capabilities, " "), node.Address)
+		lastSeen := ""
+		if node.LastSeenAt != nil {
+			lastSeen = node.LastSeenAt.UTC().Format(time.RFC3339)
+		}
 		items = append(items, Item{Key: title, Title: title, Subtitle: clean(strings.Join(node.Roles, ",")), Status: status, Details: details, SearchText: search, Data: map[string]string{
-			"name": title, "status": status, "roles": clean(strings.Join(node.Roles, ",")), "capabilities": clean(strings.Join(node.Capabilities, ",")), "address": clean(node.Address),
+			"name": title, "status": status, "roles": clean(strings.Join(node.Roles, ",")), "capabilities": clean(strings.Join(node.Capabilities, ",")), "address": clean(node.Address), "last_seen_at": lastSeen,
 		}})
 	}
 	return items, nil
@@ -281,6 +313,230 @@ func decodeEnvironments(raw json.RawMessage, clean func(string) string) ([]Item,
 		}})
 	}
 	return items, nil
+}
+
+func decodeReleases(raw json.RawMessage, clean func(string) string) ([]Item, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var releases []platform.Release
+	if err := json.Unmarshal(raw, &releases); err != nil {
+		return nil, invalidAPI("release inventory is not a release list")
+	}
+	items := make([]Item, 0, len(releases))
+	for _, release := range releases {
+		app, environment := clean(release.App), clean(release.Environment)
+		id := clean(string(release.ID))
+		title := app + "/" + environment + " " + id
+		status := clean(string(release.Status))
+		details := []Detail{
+			{Label: "release", Value: id},
+			{Label: "app", Value: app},
+			{Label: "environment", Value: environment},
+			{Label: "status", Value: status},
+			{Label: "image", Value: clean(release.Image)},
+			{Label: "image id", Value: clean(release.ImageID)},
+			{Label: "source", Value: clean(release.Source.Type)},
+			{Label: "created", Value: release.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
+		}
+		if release.Source.Path != "" {
+			details = append(details, Detail{Label: "source path", Value: clean(release.Source.Path)})
+		}
+		if release.Source.URL != "" {
+			details = append(details, Detail{Label: "source URL", Value: clean(release.Source.URL)})
+		}
+		if release.Source.Ref != "" {
+			details = append(details, Detail{Label: "source ref", Value: clean(release.Source.Ref)})
+		}
+		if release.Build != nil {
+			details = append(details, Detail{Label: "builder", Value: clean(release.Build.Builder)})
+		}
+		if release.Command != nil {
+			details = append(details, Detail{Label: "release command", Value: clean(strings.Join(release.Command.Argv, " "))})
+		}
+		if release.CompletedAt != nil {
+			details = append(details, Detail{Label: "completed", Value: release.CompletedAt.Format("2006-01-02 15:04:05Z07:00")})
+		}
+		if release.ErrorCode != "" {
+			details = append(details, Detail{Label: "error code", Value: string(release.ErrorCode)})
+		}
+		if release.Error != "" {
+			details = append(details, Detail{Label: "error", Value: clean(release.Error)})
+		}
+		search := joinSearch(title, status, release.Image, release.ImageID, release.Source.Type, release.Source.URL)
+		items = append(items, Item{
+			Key: id, Title: title, Subtitle: clean(release.Image), Status: status, Details: details, SearchText: search,
+			Data: map[string]string{
+				"release": id, "app": app, "environment": environment, "status": status,
+				"image": clean(release.Image), "image_id": clean(release.ImageID), "host": "",
+			},
+			Payload: marshalPayload(release),
+		})
+	}
+	return items, nil
+}
+
+func decodeDeployments(raw json.RawMessage, clean func(string) string) ([]Item, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var deployments []platform.Deployment
+	if err := json.Unmarshal(raw, &deployments); err != nil {
+		return nil, invalidAPI("deployment inventory is not a deployment list")
+	}
+	items := make([]Item, 0, len(deployments))
+	for _, deployment := range deployments {
+		app, environment := clean(deployment.App), clean(deployment.Environment)
+		action := clean(string(deployment.Action))
+		title := app + "/" + environment + " " + action
+		status := clean(string(deployment.State))
+		operation := clean(string(deployment.OperationID))
+		details := []Detail{
+			{Label: "app", Value: app},
+			{Label: "environment", Value: environment},
+			{Label: "action", Value: action},
+			{Label: "state", Value: status},
+			{Label: "release", Value: clean(string(deployment.ReleaseID))},
+			{Label: "previous release", Value: clean(string(deployment.PreviousReleaseID))},
+			{Label: "operation", Value: operation},
+			{Label: "created", Value: deployment.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
+			{Label: "updated", Value: deployment.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")},
+		}
+		if deployment.CompletedAt != nil {
+			details = append(details, Detail{Label: "completed", Value: deployment.CompletedAt.Format("2006-01-02 15:04:05Z07:00")})
+		}
+		if deployment.ErrorCode != "" {
+			details = append(details, Detail{Label: "error code", Value: string(deployment.ErrorCode)})
+		}
+		if deployment.Message != "" {
+			details = append(details, Detail{Label: "message", Value: clean(deployment.Message)})
+		}
+		search := joinSearch(title, status, operation, string(deployment.ReleaseID), string(deployment.PreviousReleaseID), deployment.Message)
+		items = append(items, Item{
+			Key: clean(string(deployment.ID)), Title: title, Subtitle: operation, Status: status, Details: details, SearchText: search,
+			Data: map[string]string{
+				"app": app, "environment": environment, "state": status, "action": action,
+				"release": clean(string(deployment.ReleaseID)), "operation": operation,
+			},
+			Payload: marshalPayload(deployment),
+		})
+	}
+	return items, nil
+}
+
+func decodeResources(raw json.RawMessage, clean func(string) string) ([]Item, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var observations []resources.ResourceInventoryItem
+	if err := json.Unmarshal(raw, &observations); err != nil {
+		return nil, invalidAPI("resource inventory is not a resource list")
+	}
+	items := make([]Item, 0, len(observations))
+	for _, observation := range observations {
+		spec := observation.Spec
+		name, host := clean(spec.Name), clean(spec.Host)
+		status := clean(string(observation.State))
+		if observation.Health != nil && observation.Health.Status != "" {
+			status = clean(string(observation.Health.Status))
+		}
+		details := []Detail{
+			{Label: "name", Value: name},
+			{Label: "engine", Value: clean(string(spec.Engine))},
+			{Label: "version", Value: clean(spec.Version)},
+			{Label: "host", Value: host},
+			{Label: "database", Value: clean(spec.Database)},
+			{Label: "username", Value: clean(spec.Username)},
+			{Label: "protection", Value: clean(string(spec.Protection))},
+			{Label: "state", Value: clean(string(observation.State))},
+		}
+		if observation.Endpoint != nil {
+			details = append(details,
+				Detail{Label: "endpoint", Value: clean(fmt.Sprintf("%s:%d", observation.Endpoint.Address, observation.Endpoint.Port))},
+				Detail{Label: "sslmode", Value: clean(observation.Endpoint.SSLMode)},
+			)
+		}
+		if observation.Credential != nil {
+			details = append(details, Detail{Label: "credential file", Value: clean(observation.Credential.PasswordFile)})
+		}
+		if observation.Health != nil {
+			details = append(details,
+				Detail{Label: "health", Value: clean(string(observation.Health.Status))},
+				Detail{Label: "health detail", Value: clean(observation.Health.Detail)},
+				Detail{Label: "health checked", Value: observation.Health.CheckedAt.Format("2006-01-02 15:04:05Z07:00")},
+			)
+		}
+		details = append(details, Detail{Label: "telemetry", Value: "source-dependent; no metric is invented"})
+		search := joinSearch(name, host, string(spec.Engine), spec.Database, string(observation.State), status)
+		items = append(items, Item{
+			Key: name + "@" + host, Title: name, Subtitle: host, Status: status, Details: details, SearchText: search,
+			Data: map[string]string{
+				"name": name, "host": host, "engine": clean(string(spec.Engine)), "status": status,
+				"database": clean(spec.Database), "version": clean(spec.Version),
+			},
+			Payload: marshalPayload(spec),
+		})
+	}
+	return items, nil
+}
+
+func decodeBackups(raw json.RawMessage, clean func(string) string) ([]Item, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var artifacts []resources.BackupArtifact
+	if err := json.Unmarshal(raw, &artifacts); err != nil {
+		return nil, invalidAPI("backup inventory is not a backup list")
+	}
+	items := make([]Item, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		archive := clean(artifact.Archive)
+		title := clean(artifact.Resource) + " " + pathBase(archive)
+		status := "unverified"
+		if artifact.Verified {
+			status = "verified"
+		}
+		details := []Detail{
+			{Label: "archive", Value: archive},
+			{Label: "manifest", Value: clean(artifact.Manifest)},
+			{Label: "resource", Value: clean(artifact.Resource)},
+			{Label: "host", Value: clean(artifact.Host)},
+			{Label: "database", Value: clean(artifact.Database)},
+			{Label: "effect", Value: clean(artifact.EffectID)},
+			{Label: "size", Value: fmt.Sprintf("%d bytes", artifact.SizeBytes)},
+			{Label: "sha256", Value: clean(artifact.SHA256)},
+			{Label: "reason", Value: clean(artifact.Reason)},
+			{Label: "created", Value: artifact.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
+		}
+		if artifact.VerifiedAt != nil {
+			details = append(details, Detail{Label: "verified", Value: artifact.VerifiedAt.Format("2006-01-02 15:04:05Z07:00")})
+		}
+		search := joinSearch(title, artifact.Resource, artifact.Host, artifact.Database, artifact.Archive, artifact.SHA256, status)
+		items = append(items, Item{
+			Key: artifact.Archive, Title: title, Subtitle: clean(artifact.Host), Status: status, Details: details, SearchText: search,
+			Data: map[string]string{
+				"archive": archive, "resource": clean(artifact.Resource), "host": clean(artifact.Host),
+				"database": clean(artifact.Database), "sha256": clean(artifact.SHA256), "status": status,
+			},
+			Payload: marshalPayload(artifact),
+		})
+	}
+	return items, nil
+}
+
+func marshalPayload(value any) json.RawMessage {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func pathBase(value string) string {
+	if index := strings.LastIndexAny(value, `/\`); index >= 0 && index+1 < len(value) {
+		return value[index+1:]
+	}
+	return value
 }
 
 func envDetails(values map[string]string, clean func(string) string) []Detail {

@@ -27,6 +27,8 @@ const (
 	Fleet Tab = iota
 	Apps
 	Envs
+	Releases
+	Deployments
 	Resources
 	Backups
 	tabCount
@@ -40,6 +42,10 @@ func (t Tab) String() string {
 		return "Apps"
 	case Envs:
 		return "Envs"
+	case Releases:
+		return "Releases"
+	case Deployments:
+		return "Deployments"
 	case Resources:
 		return "Resources"
 	case Backups:
@@ -58,6 +64,10 @@ func (t Tab) Collection() string {
 		return "apps"
 	case Envs:
 		return "environments"
+	case Releases:
+		return "releases"
+	case Deployments:
+		return "deployments"
 	case Resources:
 		return "resources"
 	case Backups:
@@ -76,12 +86,16 @@ func ParseTab(value string) (Tab, error) {
 		return Apps, nil
 	case "envs", "env", "environments":
 		return Envs, nil
+	case "releases", "release":
+		return Releases, nil
+	case "deployments", "deployment", "deploys":
+		return Deployments, nil
 	case "resources", "resource":
 		return Resources, nil
 	case "backups", "backup":
 		return Backups, nil
 	default:
-		return Fleet, contract.NewFault(contract.Usage, "unknown workspace tab", "Use fleet, apps, envs, resources, or backups.")
+		return Fleet, contract.NewFault(contract.Usage, "unknown workspace tab", "Use fleet, apps, envs, releases, deployments, resources, or backups.")
 	}
 }
 
@@ -91,7 +105,8 @@ type Detail struct {
 	Value string
 }
 
-// Item is one sanitized inventory row.
+// Item is one sanitized inventory row. Payload carries the raw server object
+// used to build an action input; it is never rendered directly.
 type Item struct {
 	Key        string
 	Title      string
@@ -100,6 +115,7 @@ type Item struct {
 	Details    []Detail
 	SearchText string
 	Data       map[string]string
+	Payload    json.RawMessage
 }
 
 type loadState int
@@ -124,6 +140,7 @@ type tabState struct {
 // terminal deliberately.
 type Options struct {
 	API           API
+	Metrics       MetricsSource
 	Host          string
 	Secrets       *secrets.Registry
 	ASCII         bool
@@ -201,6 +218,12 @@ type operationMsg struct {
 
 type tickMsg time.Time
 
+type metricsMsg struct {
+	key    string
+	series MetricsSeries
+	err    error
+}
+
 type opView struct {
 	reducer  *viewer.Model
 	id       contract.OperationID
@@ -226,9 +249,17 @@ type Model struct {
 	filterText string
 	filtering  bool
 
+	paletteOpen   bool
+	paletteIndex  int
+	paletteFilter textField
+	notice        string
+
 	detail       bool
 	detailScroll int
 	showHelp     bool
+
+	metrics        *metricsView
+	metricsLoading bool
 
 	form *formState
 	op   *opView
@@ -256,15 +287,16 @@ func New(opts Options) Model {
 		helpModel.FullSeparator = "    "
 	}
 	model := Model{
-		opts:    opts,
-		now:     opts.Now(),
-		width:   opts.Width,
-		height:  opts.Height,
-		tab:     opts.InitialTab,
-		filter:  filter,
-		spinner: spin,
-		help:    helpModel,
-		keys:    defaultKeys(),
+		opts:          opts,
+		now:           opts.Now(),
+		width:         opts.Width,
+		height:        opts.Height,
+		tab:           opts.InitialTab,
+		filter:        filter,
+		paletteFilter: newTextField(128),
+		spinner:       spin,
+		help:          helpModel,
+		keys:          defaultKeys(),
 	}
 	model.tabs[opts.InitialTab].state = loadLoading
 	model.summary.Tab = opts.InitialTab.String()
@@ -308,6 +340,9 @@ func (m Model) spinnerActive() bool {
 	if m.form != nil && (m.form.phase == formChecking || m.form.phase == formSubmitting) {
 		return true
 	}
+	if m.metricsLoading {
+		return true
+	}
 	return m.op != nil && m.op.loading
 }
 
@@ -321,6 +356,9 @@ func (m *Model) setTab(tab Tab) tea.Cmd {
 	m.summary.Tab = tab.String()
 	m.detail = false
 	m.detailScroll = 0
+	m.metrics = nil
+	m.metricsLoading = false
+	m.notice = ""
 	if m.tabs[tab].state == loadIdle {
 		m.tabs[tab].state = loadLoading
 		return tea.Batch(m.loadTabCommand(), m.spinCommand())
@@ -404,6 +442,17 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case operationMsg:
 		m.applyOperation(message)
 		return m, nil
+	case metricsMsg:
+		m.metricsLoading = false
+		if item, ok := m.selectedItem(); !ok || item.Key != message.key {
+			return m, nil
+		}
+		if message.err != nil {
+			m.metrics = &metricsView{key: message.key, errText: ErrorText(message.err, m.clean)}
+		} else {
+			m.metrics = &metricsView{key: message.key, series: message.series}
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -442,6 +491,7 @@ func (m *Model) applyPreview(message previewMsg) {
 	// the exact action that was previewed, never a redacted display projection.
 	approved := message.action
 	m.form.approved = &approved
+	m.form.planToken = approved.PlanToken()
 	m.form.target = approved.Target
 	if approved.ConfirmPhrase != "" {
 		m.form.confirm.Focus()
@@ -516,6 +566,13 @@ func (m Model) handleKey(message tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.filtering {
 		return m.handleFilterKey(message)
 	}
+	if m.paletteOpen {
+		return m.handlePaletteKey(message)
+	}
+	if pressed == ":" || pressed == "ctrl+p" {
+		m.openPalette()
+		return m, nil
+	}
 	if pressed == "q" {
 		return m.detach()
 	}
@@ -552,9 +609,15 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 		command := m.setTab(Envs)
 		return m, command
 	case "4":
-		command := m.setTab(Resources)
+		command := m.setTab(Releases)
 		return m, command
 	case "5":
+		command := m.setTab(Deployments)
+		return m, command
+	case "6":
+		command := m.setTab(Resources)
+		return m, command
+	case "7":
 		command := m.setTab(Backups)
 		return m, command
 	case "tab":
@@ -584,9 +647,10 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 			m.selected[m.tab] = min(len(items)-1, index+max(1, m.listCapacity()/2))
 		}
 	case "enter", " ":
-		if _, ok := m.selectedItem(); ok {
+		if item, ok := m.selectedItem(); ok {
 			m.detail = true
 			m.detailScroll = 0
+			return m, m.requestMetrics(item)
 		}
 	case "/":
 		m.filtering = true
@@ -603,13 +667,25 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 		command := m.refresh()
 		return m, command
 	case "a":
-		m.form = m.newAppForm()
+		m.openForm("app")
 	case "e":
-		m.form = m.newEnvironmentForm()
+		m.openForm("env")
 	case "i":
-		m.form = m.newReleaseForm()
+		m.openForm("release")
 	case "d":
-		m.form = m.newDeployForm()
+		m.openForm("deploy")
+	case "o":
+		m.openForm("rollback")
+	case "n":
+		m.openForm("node-check")
+	case "x":
+		m.openForm("resource-destroy")
+	case "b":
+		m.openForm("backup-create")
+	case "v":
+		m.openForm("backup-verify")
+	case "R":
+		m.openForm("backup-restore")
 	case "?":
 		m.showHelp = true
 	}
@@ -644,6 +720,8 @@ func (m Model) handleDetailKey(pressed string) (tea.Model, tea.Cmd) {
 	case "esc", "enter":
 		m.detail = false
 		m.detailScroll = 0
+		m.metrics = nil
+		m.metricsLoading = false
 	case "up", "k":
 		m.detailScroll = max(0, m.detailScroll-1)
 	case "down", "j":
@@ -656,13 +734,25 @@ func (m Model) handleDetailKey(pressed string) (tea.Model, tea.Cmd) {
 		command := m.refresh()
 		return m, command
 	case "a":
-		m.form = m.newAppForm()
+		m.openForm("app")
 	case "e":
-		m.form = m.newEnvironmentForm()
+		m.openForm("env")
 	case "i":
-		m.form = m.newReleaseForm()
+		m.openForm("release")
 	case "d":
-		m.form = m.newDeployForm()
+		m.openForm("deploy")
+	case "o":
+		m.openForm("rollback")
+	case "n":
+		m.openForm("node-check")
+	case "x":
+		m.openForm("resource-destroy")
+	case "b":
+		m.openForm("backup-create")
+	case "v":
+		m.openForm("backup-verify")
+	case "R":
+		m.openForm("backup-restore")
 	case "?":
 		m.showHelp = true
 	}
@@ -814,6 +904,7 @@ type keyMap struct {
 	Nav       key.Binding
 	Tabs      key.Binding
 	Filter    key.Binding
+	Discovery key.Binding
 	Details   key.Binding
 	Refresh   key.Binding
 	Actions   key.Binding
@@ -827,11 +918,12 @@ type keyMap struct {
 func defaultKeys() keyMap {
 	return keyMap{
 		Nav:       key.NewBinding(key.WithKeys("j", "k", "g", "G"), key.WithHelp("j/k g/G", "move")),
-		Tabs:      key.NewBinding(key.WithKeys("tab", "1-5"), key.WithHelp("tab/1-5", "workspace")),
+		Tabs:      key.NewBinding(key.WithKeys("tab", "1-7"), key.WithHelp("tab/1-7", "workspace")),
 		Filter:    key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
+		Discovery: key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "commands")),
 		Details:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "details")),
 		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Actions:   key.NewBinding(key.WithKeys("a", "e", "i", "d"), key.WithHelp("a e i d", "app env image deploy")),
+		Actions:   key.NewBinding(key.WithKeys("a", "e", "i", "d", "o", "n", "x", "b", "v", "R"), key.WithHelp("a e i d o n x b v R", "guided actions")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Detach:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "detach")),
 		Form:      key.NewBinding(key.WithKeys("enter", "tab", "esc"), key.WithHelp("enter/tab", "field")),
@@ -841,7 +933,7 @@ func defaultKeys() keyMap {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Nav, k.Tabs, k.Filter, k.Details, k.Refresh, k.Actions, k.Help, k.Detach}
+	return []key.Binding{k.Nav, k.Tabs, k.Filter, k.Discovery, k.Details, k.Refresh, k.Actions, k.Help, k.Detach}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
