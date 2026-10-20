@@ -54,8 +54,8 @@ func newApp() *app {
 			[]string{"eregion commands --json", "eregion --help"}, "eregion commands --json"),
 		run: func(cmd *cobra.Command, _ []string) (result, error) {
 			return result{
-				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "M0.2 — durable diagnostic operations", "commands": a.meta.catalog(a.root)},
-				plain: "eregion — agent-first application platform\n\nM0.2: PostgreSQL/River diagnostic operations and automation API.\nNo host bootstrap or application deployment commands yet.\n\nNext: eregion commands --json",
+				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "M0.3 — node execution and recovery boundary", "commands": a.meta.catalog(a.root)},
+				plain: "eregion — agent-first application platform\n\nM0.3: PostgreSQL/River operations, local node dispatch, and recovery.\nNo remote transports, host bootstrap, or application deployment commands yet.\n\nNext: eregion commands --json",
 			}, nil
 		},
 	}

@@ -73,7 +73,7 @@ func (a *app) runtimeSpecs() []spec {
 		}, run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil }, children: []spec{
 			{use: "test", meta: submitMeta, flags: func(cmd *cobra.Command) {
 				cmd.Flags().String("idempotency-key", "", "Stable submission key; required unless --dry-run")
-				cmd.Flags().Int("steps", 3, "Diagnostic steps (1–20); no host changes")
+				cmd.Flags().Int("steps", 3, "Diagnostic steps (1–20); writes only node-local markers")
 				cmd.Flags().Int("step-delay-ms", 100, "Delay per step (0–1000 ms)")
 				cmd.Flags().Int("fail-until-attempt", 0, "Intentionally fail attempts up to this number (0–3)")
 				cmd.Flags().Bool("dry-run", false, "Validate with the API without inserting an operation or job")

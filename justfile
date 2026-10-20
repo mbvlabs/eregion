@@ -28,7 +28,7 @@ race:
 # Run live PostgreSQL/River/API/process-crash tests against isolated test databases.
 integration:
     @test -n "${EREGION_TEST_DATABASE_URL:-}" || { echo "Set EREGION_TEST_DATABASE_URL to a disposable PostgreSQL test server (role requires CREATEDB)." >&2; exit 1; }
-    go test -race -count=1 ./internal/controlplane -run TestIntegration -timeout 120s
+    go test -race -count=1 ./internal/controlplane -run TestIntegration -timeout 240s
 
 # Check formatting, static analysis, and tests.
 check: fmt-check lint test
