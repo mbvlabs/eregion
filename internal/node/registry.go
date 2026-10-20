@@ -39,7 +39,9 @@ var diagnosticStepPattern = regexp.MustCompile(`^diagnostic-step-[0-9]{2}-v1$`)
 // step families. The platform steps are the only path a release or deployment
 // uses to reach Docker or Buildpacks, so the control plane and node binary derive
 // identical inputs and effect identities.
-func NewStepRegistry() *StepRegistry {
+func NewStepRegistry() *StepRegistry { return NewStepRegistryWithHost(HostSettings{}) }
+
+func newBaseRegistry() *StepRegistry {
 	registry := &StepRegistry{}
 	registry.Register(diagnosticStepPattern.MatchString, buildDiagnosticStep)
 	for _, family := range platform.StepFamilies() {

@@ -24,6 +24,9 @@ type Service struct {
 	enqueuePlatform func(context.Context, pgx.Tx, contract.Operation) (int64, error)
 	// transport is the node-dispatch boundary. Local today; SSH/WireGuard later.
 	transport node.Transport
+	// resolver reaches the node a piece of work is placed on: the enrolled
+	// node's own pinned SSH transport, or transport for the node it serves.
+	resolver *NodeResolver
 	// afterNode is a test-only seam between a node effect and its database
 	// acknowledgement. Production leaves it nil.
 	afterNode func(contract.OperationID, string) error

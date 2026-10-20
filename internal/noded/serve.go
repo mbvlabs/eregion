@@ -28,7 +28,7 @@ import (
 // from a running step. The journal is compacted after each task and by the
 // explicit "compact" command.
 func Serve(config Config, stdin io.Reader, stdout io.Writer) error {
-	steps := node.DefaultRegistry()
+	steps := node.NewStepRegistryWithHost(config.HostSettings())
 	reader := bufio.NewReader(stdin)
 	writer := bufio.NewWriter(stdout)
 	for {

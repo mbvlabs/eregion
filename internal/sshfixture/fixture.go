@@ -53,6 +53,39 @@ type Options struct {
 	// container needs NET_ADMIN and the host's wireguard module; without them
 	// Start reports ErrUnavailable.
 	WireGuard bool
+	// ClientKeyFile reuses an existing SSH identity (mode 0600, OpenSSH
+	// private-key PEM) instead of generating one, so several nodes can trust
+	// the one key a control plane holds. Create one with NewClientKey.
+	ClientKeyFile string
+	// Files are executable files installed in the node, by absolute path. A
+	// test uses them to stand in for host tools (docker, pack) without
+	// installing them.
+	Files map[string]string
+	// WireGuardApply is the node's privileged WireGuard apply helper command.
+	WireGuardApply []string
+	// NetAdmin gives the node NET_ADMIN and publishes both its SSH port and its
+	// WireGuard UDP port, without configuring any interface. A control plane
+	// reaches it directly first and then configures WireGuard through the
+	// reconcile flow. Without the host's wireguard module Start reports
+	// ErrUnavailable.
+	NetAdmin bool
+}
+
+// NewClientKey writes a fresh SSH client identity into dir and returns its path.
+func NewClientKey(dir string) (string, error) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", err
+	}
+	block, err := ssh.MarshalPrivateKey(key, "eregion-fixture-client")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "id_ed25519")
+	if err := os.WriteFile(path, pem.EncodeToMemory(block), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // WireGuardNode describes the fixture's WireGuard side.
@@ -95,6 +128,8 @@ type Fixture struct {
 	// WireGuard is set when the node is behind WireGuard. Address is then the
 	// node's tunnel address.
 	WireGuard *WireGuardNode
+	// UDPEndpoint is the published WireGuard host:port of a NetAdmin node.
+	UDPEndpoint string
 
 	image string
 }
@@ -130,16 +165,32 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 	if err != nil {
 		return nil, err
 	}
-	identity, identityPath, authorized, err := generateClientKey()
-	if err != nil {
-		return nil, err
+	var identityPath string
+	var authorized []byte
+	if options.ClientKeyFile != "" {
+		raw, err := os.ReadFile(options.ClientKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		signer, err := ssh.ParsePrivateKey(raw)
+		if err != nil {
+			return nil, err
+		}
+		identityPath, authorized = options.ClientKeyFile, ssh.MarshalAuthorizedKey(signer.PublicKey())
+	} else {
+		_, identityPath, authorized, err = generateClientKey()
+		if err != nil {
+			return nil, err
+		}
 	}
-	_ = identity
 
 	container := "eregion-ssh-fixture-" + strconv.Itoa(os.Getpid()) + "-" + randomSuffix()
 	run := []string{"run", "-d", "--init", "--name", container, "-p", "127.0.0.1::2222"}
 	if options.WireGuard {
 		run = []string{"run", "-d", "--init", "--name", container, "--cap-add", "NET_ADMIN", "-p", "127.0.0.1::" + wireGuardPort + "/udp"}
+	}
+	if options.NetAdmin {
+		run = []string{"run", "-d", "--init", "--name", container, "--cap-add", "NET_ADMIN", "-p", "127.0.0.1::2222", "-p", "127.0.0.1::" + wireGuardPort + "/udp"}
 	}
 	if _, err := runDocker(ctx, append(run, image, "sleep", "infinity")...); err != nil {
 		return nil, err
@@ -182,6 +233,21 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		return nil, err
 	}
 	config := map[string]any{"node": nodeName, "state_dir": "/var/lib/eregion/node"}
+	if len(options.WireGuardApply) > 0 {
+		config["wireguard_apply"] = options.WireGuardApply
+	}
+	scratch, err := os.MkdirTemp("", "eregion-ssh-files")
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+	defer func() { _ = os.RemoveAll(scratch) }()
+	for path, content := range options.Files {
+		if err := installFile(ctx, container, scratch, path, content); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
 	if len(options.TaskCommand) > 0 {
 		config["task_command"] = options.TaskCommand
 	}
@@ -220,6 +286,17 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		}
 	}
 	fixture.Address = address
+	if options.NetAdmin {
+		if out, err := runDocker(ctx, "exec", container, "ip", "link", "add", "wgprobe", "type", "wireguard"); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("%w: the node container cannot create a kernel WireGuard interface (it needs NET_ADMIN and the host's wireguard module): %s", ErrUnavailable, strings.TrimSpace(out))
+		}
+		_, _ = runDocker(ctx, "exec", container, "ip", "link", "del", "wgprobe")
+		if fixture.UDPEndpoint, err = publishedAddress(ctx, container, wireGuardPort+"/udp"); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
 	knownHosts := filepath.Join(filepath.Dir(identityPath), "known_hosts")
 	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(hostKey)))
 	if err := os.WriteFile(knownHosts, []byte(knownHostsLine(address)+" "+line+"\n"), 0o600); err != nil {
@@ -240,6 +317,43 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		return nil, err
 	}
 	return fixture, nil
+}
+
+// installFile copies an executable file into the node.
+func installFile(ctx context.Context, container, scratch, path, content string) error {
+	source := filepath.Join(scratch, hex.EncodeToString([]byte(path)))
+	if err := os.WriteFile(source, []byte(content), 0o700); err != nil {
+		return err
+	}
+	if _, err := runDocker(ctx, "exec", container, "mkdir", "-p", filepath.Dir(path)); err != nil {
+		return err
+	}
+	if err := copyIntoContainer(ctx, container, source, path); err != nil {
+		return err
+	}
+	_, err := runDocker(ctx, "exec", container, "chmod", "0755", path)
+	return err
+}
+
+// InstallFile installs an executable file in a running node.
+func (f *Fixture) InstallFile(ctx context.Context, path, content string) error {
+	scratch, err := os.MkdirTemp("", "eregion-ssh-files")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(scratch) }()
+	return installFile(ctx, f.Name, scratch, path, content)
+}
+
+// Exec runs a shell command in the node as root and returns its output.
+func (f *Fixture) Exec(ctx context.Context, command string) (string, error) {
+	return runDocker(ctx, "exec", f.Name, "sh", "-c", command)
+}
+
+// ExecDetached starts a long-running root shell command in the node.
+func (f *Fixture) ExecDetached(ctx context.Context, command string) error {
+	_, err := runDocker(ctx, "exec", "-d", f.Name, "sh", "-c", command)
+	return err
 }
 
 // setupWireGuard brings up kernel WireGuard in the node container. It

@@ -77,6 +77,10 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runRecordAction(ctx, op.ID, attempt, normalized)
 	case platform.KindNodeCheck:
 		return w.runNodeCheck(ctx, op.ID, attempt, normalized)
+	case platform.KindNodeEnroll:
+		return w.runNodeEnroll(ctx, op.ID, attempt, normalized)
+	case platform.KindNodeReconcile:
+		return w.runNodeReconcile(ctx, op.ID, attempt, normalized)
 	case platform.KindReleaseCreate:
 		return w.runRelease(ctx, op.ID, attempt, normalized)
 	case platform.KindDeploy, platform.KindRollback:
@@ -126,6 +130,11 @@ func (w *platformWorker) settle(ctx context.Context, id contract.OperationID, at
 		return w.service.cancelPlatform(ctx, id, attempt, "Cancellation acknowledged at a step boundary; completed effects were not rolled back.")
 	}
 	fault := contract.Classify(err)
+	if reason, ok := IsPlacementViolation(err); ok {
+		// A refusal is also an event, so an agent reading the operation sees the
+		// machine-readable reason without parsing the message.
+		w.service.appendWorkerEvent(ctx, id, attempt, "placement_violation", fault.Message+" [reason="+reason+"]")
+	}
 	switch fault.Code {
 	case contract.Unavailable:
 		return err
@@ -187,28 +196,38 @@ func (w *platformWorker) runRecordAction(ctx context.Context, id contract.Operat
 
 func (w *platformWorker) runNodeCheck(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
 	input := normalized.Input.(*platform.NodeCheckInput)
-	n, err := w.service.node(ctx, input.Node)
+	rec, err := loadNodeConn(ctx, w.service.pool, input.Node)
 	if err != nil {
-		return err
+		return w.settle(ctx, id, attempt, err)
 	}
-	if err := w.service.checkNodeIdentity(n); err != nil {
-		return err
+	if rec.Enrollment == platform.EnrollmentEnrolled && rec.Transport == "ssh" {
+		return w.runEnrolledCheck(ctx, id, attempt, rec)
 	}
-	if _, err := w.runStep(ctx, id, attempt, "platform-node-01-v1", platform.ArgvPayload{
+	// A registered node is observed through the worker's own transport, and
+	// only when that transport authenticates as exactly this node.
+	tr, err := w.service.resolver.TransportFor(ctx, input.Node)
+	if err != nil {
+		w.service.recordNodeCheck(ctx, input.Node, checkStateFor(err), contract.Classify(err).Message, false)
+		return w.settle(ctx, id, attempt, err)
+	}
+	if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-node-01-v1", platform.ArgvPayload{
 		Step: "platform-node-01-v1", Argv: []string{"docker", "version"}, TimeoutSeconds: 30,
 	}, nil); err != nil {
+		w.service.recordNodeCheck(ctx, input.Node, checkStateFor(err), contract.Classify(err).Message, false)
 		return w.settle(ctx, id, attempt, err)
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if _, err := w.runStep(ctx, id, attempt, "platform-node-02-v1", platform.ArgvPayload{
+	if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-node-02-v1", platform.ArgvPayload{
 		Step: "platform-node-02-v1", Argv: []string{"pack", "version"}, AllowFailure: true, TimeoutSeconds: 30,
 	}, nil); err != nil {
+		w.service.recordNodeCheck(ctx, input.Node, checkStateFor(err), contract.Classify(err).Message, false)
 		return w.settle(ctx, id, attempt, err)
 	}
 	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		_, err := tx.Exec(ctx, `UPDATE eregion_platform_nodes SET status='ready',last_seen_at=clock_timestamp(),updated_at=clock_timestamp() WHERE name=$1`, input.Node)
+		_, err := tx.Exec(ctx, `UPDATE eregion_platform_nodes SET status='ready',last_seen_at=clock_timestamp(),last_check_at=clock_timestamp(),
+            last_check_state='ok',last_check_detail='docker reachable (declared facts, not enrolled)',updated_at=clock_timestamp() WHERE name=$1`, input.Node)
 		return err
 	}); err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -233,6 +252,10 @@ func (w *platformWorker) runRelease(ctx context.Context, id contract.OperationID
 	if err := w.service.checkPlacement(n, role, capability); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
+	tr, err := w.service.resolver.TransportFor(ctx, n.Name)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
 	release, err := w.service.releaseForOperation(ctx, id)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -240,13 +263,13 @@ func (w *platformWorker) runRelease(ctx context.Context, id contract.OperationID
 	var result json.RawMessage
 	if input.Source.Type == "image" {
 		if input.Pull {
-			if _, err := w.runStep(ctx, id, attempt, "platform-pull-01-v1", platform.ArgvPayload{
+			if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-pull-01-v1", platform.ArgvPayload{
 				Step: "platform-pull-01-v1", Argv: []string{"docker", "pull", release.Image}, TimeoutSeconds: 600,
 			}, nil); err != nil {
 				return w.settle(ctx, id, attempt, err)
 			}
 		}
-		result, err = w.runStep(ctx, id, attempt, "platform-image-01-v1", platform.ArgvPayload{
+		result, err = w.runStepOn(ctx, tr, id, attempt, "platform-image-01-v1", platform.ArgvPayload{
 			Step:           "platform-image-01-v1",
 			Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.Image},
 			TimeoutSeconds: 30,
@@ -266,14 +289,14 @@ func (w *platformWorker) runRelease(ctx context.Context, id contract.OperationID
 		if build == nil {
 			build = &platform.Build{Builder: platform.DefaultBuilder}
 		}
-		if _, err := w.runStep(ctx, id, attempt, "platform-pack-01-v1", platform.PackPayload{
+		if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-pack-01-v1", platform.PackPayload{
 			Step: "platform-pack-01-v1", Image: release.Image, Path: path,
 			GitURL: input.Source.URL, GitRef: input.Source.Ref,
 			Builder: build.Builder, Env: build.Env, TimeoutSeconds: 900,
 		}, nil); err != nil {
 			return w.settle(ctx, id, attempt, err)
 		}
-		result, err = w.runStep(ctx, id, attempt, "platform-image-01-v1", platform.ArgvPayload{
+		result, err = w.runStepOn(ctx, tr, id, attempt, "platform-image-01-v1", platform.ArgvPayload{
 			Step:           "platform-image-01-v1",
 			Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.Image},
 			TimeoutSeconds: 30,
@@ -322,6 +345,10 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
+	tr, err := w.service.resolver.TransportFor(ctx, env.Node)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
 	secrets, err := w.service.resolveEnvironmentSecrets(ctx, env)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -338,7 +365,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			defer cancel()
 			execution := engine.Execution{OperationID: id, Attempt: attempt, Step: "platform-cleanup-01-v1", RequestID: newRequestID()}
 			raw, _ := json.Marshal(platform.ArgvPayload{Step: execution.Step, Argv: []string{"docker", "rm", "-f", candidateName}, AllowFailure: true, TimeoutSeconds: 30})
-			_, _ = w.service.transport.Call(cleanupCtx, node.Request{Method: node.MethodRun, Execution: execution, RequestID: execution.RequestID, Payload: raw}, nil)
+			_, _ = tr.Call(cleanupCtx, node.Request{Method: node.MethodRun, Execution: execution, RequestID: execution.RequestID, Payload: raw}, nil)
 		}
 	}()
 
@@ -357,7 +384,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		commandArgs = append(commandArgs, release.ImageID)
 		commandArgs = append(commandArgs, release.Command.Argv...)
 		secretKeys := sortedPlatformKeys(env.SecretRefs)
-		if _, err := w.runStep(ctx, id, attempt, "platform-command-01-v1", platform.ArgvPayload{
+		if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-command-01-v1", platform.ArgvPayload{
 			Step: "platform-command-01-v1", Argv: commandArgs,
 			Env: env.Env, SecretEnvKeys: secretKeys, TimeoutSeconds: release.Command.TimeoutSeconds,
 		}, secrets); err != nil {
@@ -378,11 +405,11 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		},
 	}
 	candidateStarted = true // docker may have created a container even on error.
-	if _, err := w.runStep(ctx, id, attempt, "platform-container-01-v1", candidatePayload, secrets); err != nil {
+	if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-container-01-v1", candidatePayload, secrets); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 
-	if _, err := w.runStep(ctx, id, attempt, "platform-health-01-v1", platform.HealthPayload{
+	if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-health-01-v1", platform.HealthPayload{
 		Step: "platform-health-01-v1", Type: env.Health.Type, Target: platformHealthTarget(env, env.CandidatePort),
 		TimeoutSeconds: env.Health.TimeoutSeconds, IntervalMS: 500,
 	}, nil); err != nil {
@@ -404,11 +431,11 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if previous.Image != "" {
 		servingPayload.FallbackImage = previous.ImageID
 	}
-	if _, err := w.runStep(ctx, id, attempt, "platform-container-02-v1", servingPayload, secrets); err != nil {
+	if _, err := w.runStepOn(ctx, tr, id, attempt, "platform-container-02-v1", servingPayload, secrets); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 
-	_, verifyErr := w.runStep(ctx, id, attempt, "platform-health-02-v1", platform.HealthPayload{
+	_, verifyErr := w.runStepOn(ctx, tr, id, attempt, "platform-health-02-v1", platform.HealthPayload{
 		Step: "platform-health-02-v1", Type: env.Health.Type, Target: platformHealthTarget(env, env.HostPort),
 		TimeoutSeconds: env.Health.TimeoutSeconds, IntervalMS: 500,
 	}, nil)
@@ -426,8 +453,8 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 					"io.eregion.release": string(previous.ID), "io.eregion.role": "serving",
 				},
 			}
-			if _, restoreErr := w.runStep(ctx, id, attempt, "platform-container-03-v1", restore, secrets); restoreErr == nil {
-				_, _ = w.runStep(ctx, id, attempt, "platform-health-03-v1", platform.HealthPayload{
+			if _, restoreErr := w.runStepOn(ctx, tr, id, attempt, "platform-container-03-v1", restore, secrets); restoreErr == nil {
+				_, _ = w.runStepOn(ctx, tr, id, attempt, "platform-health-03-v1", platform.HealthPayload{
 					Step: "platform-health-03-v1", Type: env.Health.Type, Target: platformHealthTarget(env, env.HostPort),
 					TimeoutSeconds: env.Health.TimeoutSeconds, IntervalMS: 500,
 				}, nil)
@@ -763,8 +790,8 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 // runStep mirrors the diagnostic worker's durable effect protocol for a generic
 // platform payload. Database acknowledgement is attempt-fenced; node status is
 // always consulted before a retry dispatches another effect.
-func (w *platformWorker) runStep(ctx context.Context, id contract.OperationID, attempt uint32, stepID string, payload any, secrets map[string]string) (json.RawMessage, error) {
-	if w.service.transport == nil {
+func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, stepID string, payload any, secrets map[string]string) (json.RawMessage, error) {
+	if tr == nil {
 		return nil, contract.NewFault(contract.Unavailable, "node transport is not configured", "Run this work in a worker configured with a node transport.")
 	}
 	raw, err := json.Marshal(payload)
@@ -793,7 +820,7 @@ func (w *platformWorker) runStep(ctx context.Context, id contract.OperationID, a
 			return record.Result, nil
 		}
 	}
-	status, err := w.service.transport.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
+	status, err := tr.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
 	if err != nil {
 		if errors.Is(err, engine.ErrJournalCorrupt) {
 			return nil, contract.NewFault(contract.PreconditionFailed, "node journal is corrupt", "Inspect the node journal before retrying.")
@@ -828,7 +855,7 @@ func (w *platformWorker) runStep(ctx context.Context, id contract.OperationID, a
 		return record.Result, nil
 	}
 	var events []node.Event
-	response, err := w.service.transport.Call(ctx, node.Request{
+	response, err := tr.Call(ctx, node.Request{
 		Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec, Payload: raw, Secrets: secrets,
 	}, func(event node.Event) { events = append(events, event) })
 	if appendErr := w.service.appendNodeEvents(ctx, id, attempt, events); appendErr != nil && err == nil {
@@ -912,6 +939,19 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
 		}
 		return s.failReconciledPlatform(ctx, op, "release execution ended before the image was verified or built", contract.Unavailable)
+	case platform.KindNodeCheck, platform.KindNodeReconcile:
+		return s.failReconciledPlatform(ctx, op, "the node action ended before it recorded a result; it is idempotent, so submit it again", contract.Unavailable)
+	case platform.KindNodeEnroll:
+		// Enrollment is durable only once the worker recorded it. A job that ended
+		// first leaves the node pending (or failed) for platform nodes retry; the
+		// operation never claims verification it did not see.
+		var state string
+		var enrollOp *string
+		_ = s.pool.QueryRow(ctx, `SELECT enrollment_state,enroll_operation_id FROM eregion_platform_nodes WHERE name=(SELECT split_part($1,'/',2))`, op.Target).Scan(&state, &enrollOp)
+		if state == string(platform.EnrollmentEnrolled) && enrollOp != nil && *enrollOp == string(op.ID) {
+			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+		}
+		return s.failReconciledPlatform(ctx, op, "enrollment ended before the node was verified; retry with platform nodes retry", contract.Unavailable)
 	case platform.KindAppCreate, platform.KindEnvironmentCreate, platform.KindNodeRegister:
 		exists, err := s.recordActionExists(ctx, op)
 		if err != nil {
@@ -1046,4 +1086,25 @@ func insertPlatformChange(ctx context.Context, tx pgx.Tx, op *contract.Operation
 		changeID, appID, envID, sequence, kind, op.ID, op.Actor.Kind, op.Actor.Subject, summary,
 		nullableJSON(desiredJSON), nullableJSON(appliedJSON))
 	return err
+}
+
+// appendWorkerEvent records a best-effort observation under the attempt fence.
+func (s *Service) appendWorkerEvent(ctx context.Context, id contract.OperationID, attempt uint32, stage, message string) {
+	if len(message) > 4096 {
+		message = message[:4096]
+	}
+	_, _, _ = s.mutateOwned(context.WithoutCancel(ctx), id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+		if op.State.Terminal() {
+			return nil
+		}
+		return appendEvent(ctx, tx, op, contract.Event{Kind: "log", Stage: stage, Message: message})
+	})
+}
+
+// buildLimit is the node's concurrent-build allowance.
+func buildLimit(n platform.Node) int {
+	if n.BuildConcurrency < 1 {
+		return 1
+	}
+	return n.BuildConcurrency
 }

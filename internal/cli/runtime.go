@@ -63,6 +63,8 @@ var nodeTransportEnvironment = []string{
 	"EREGION_NODE_WG_ENDPOINT",
 	"EREGION_NODE_WG_ALLOWED_IPS",
 	"EREGION_NODE_WG_KEEPALIVE",
+	"EREGION_NODE_WG_KEY_DIR",
+	"EREGION_NODE_WG_SUBNET",
 }
 
 func (a *app) runtimeSpecs() []spec {
@@ -327,13 +329,18 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
-	run, err := controlplane.New(pool, a.logger(cmd), controlplane.WorkerConfig{Concurrency: concurrency, Transport: nodeTransport, SecretResolver: resolver})
+	logger := a.logger(cmd)
+	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
+		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: resolver,
+		Nodes: a.fleetResolverConfig(logger),
+	})
 	if err != nil {
 		closeTransport()
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
-	return pool, run, parts, closeTransport, nil
+	// The per-node tunnels are released with the transport, after the workers.
+	return pool, run, parts, func() { run.Close(); closeTransport() }, nil
 }
 
 // nodeTransport builds the transport a worker dispatches node work through.
@@ -348,6 +355,23 @@ func (a *app) nodeTransport(logger *slog.Logger) (node.Transport, func(), error)
 		return a.sshTransport(logger)
 	default:
 		return nil, nil, contract.NewFault(contract.ValidationFailed, "unknown node transport", "Set EREGION_NODE_TRANSPORT to local or ssh.")
+	}
+}
+
+// fleetResolverConfig configures how enrolled nodes are reached. Enrolled
+// nodes carry their own pinned host key and address in PostgreSQL; the
+// environment supplies only the control plane's own credentials: the SSH
+// identity authorized on every node (EREGION_NODE_SSH_IDENTITY), the directory
+// of per-node WireGuard keys, and the private network addressing.
+func (a *app) fleetResolverConfig(logger *slog.Logger) controlplane.ResolverConfig {
+	return controlplane.ResolverConfig{
+		SSHIdentityFile:         os.Getenv("EREGION_NODE_SSH_IDENTITY"),
+		WireGuardKeyDir:         os.Getenv("EREGION_NODE_WG_KEY_DIR"),
+		WireGuardControlAddress: os.Getenv("EREGION_NODE_WG_ADDRESS"),
+		WireGuardSubnet:         os.Getenv("EREGION_NODE_WG_SUBNET"),
+		Logf: func(format string, args ...any) {
+			logger.Warn("WireGuard: " + fmt.Sprintf(format, args...))
+		},
 	}
 }
 

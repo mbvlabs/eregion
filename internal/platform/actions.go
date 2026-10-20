@@ -109,6 +109,8 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindAppCreate, Summary: "Create an application", Normalize: normalizeAppCreate})
 	r.registerBuiltin(Definition{Kind: KindNodeRegister, Summary: "Register node placement facts", Normalize: normalizeNodeRegister})
 	r.registerBuiltin(Definition{Kind: KindNodeCheck, Summary: "Check node runtime availability", Normalize: normalizeNodeCheck})
+	r.registerBuiltin(Definition{Kind: KindNodeEnroll, Summary: "Enroll a node: pin its host key, verify its identity, probe it, and configure its roles", Normalize: normalizeNodeEnroll})
+	r.registerBuiltin(Definition{Kind: KindNodeReconcile, Summary: "Reconcile a node's WireGuard peers and role configuration", Normalize: normalizeNodeReconcile})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentCreate, Summary: "Create an application environment", Normalize: normalizeEnvironmentCreate})
 	r.registerBuiltin(Definition{Kind: KindReleaseCreate, Summary: "Record or build a release", Normalize: normalizeReleaseCreate})
 	r.registerBuiltin(Definition{Kind: KindDeploy, Summary: "Deploy a release with health-first switching", Normalize: normalizeDeploy})

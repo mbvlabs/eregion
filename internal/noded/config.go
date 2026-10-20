@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/mbvlabs/eregion/internal/node"
 )
 
 const (
@@ -41,6 +43,16 @@ type Config struct {
 	// The command is the node operator's own local program: it is never
 	// derived from a request, and it is validated before it is executed.
 	TaskCommand []string `json:"task_command,omitempty"`
+	// WireGuardApply is an operator-installed privileged helper that loads the
+	// rendered WireGuard configuration; the configuration path is appended as
+	// its last argument. Empty means a peer configuration is rendered but never
+	// applied by the node account, and the reconcile reports that honestly.
+	WireGuardApply []string `json:"wireguard_apply,omitempty"`
+}
+
+// HostSettings returns the host-level settings the node steps use.
+func (c Config) HostSettings() node.HostSettings {
+	return node.HostSettings{WireGuardApply: c.WireGuardApply}
 }
 
 // LoadConfig reads the node configuration. An explicit path wins over the
@@ -82,7 +94,13 @@ func (c Config) Validate() error {
 	if strings.ContainsAny(c.StateDir, "\n\r") {
 		return errors.New("the node state directory must not contain control characters")
 	}
-	return validateTaskCommand(c.TaskCommand)
+	if err := validateTaskCommand(c.TaskCommand); err != nil {
+		return err
+	}
+	if err := validateTaskCommand(c.WireGuardApply); err != nil {
+		return errors.New("the WireGuard apply helper must be an absolute path without control characters")
+	}
+	return nil
 }
 
 // validateTaskCommand keeps a node task command a local program: an absolute
