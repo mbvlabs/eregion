@@ -24,6 +24,13 @@ import (
 // standard input, never in a command line.
 func Serve(config Config, stdin io.Reader, stdout io.Writer) error {
 	steps := node.DefaultRegistry()
+	// The journal is an index. It is compacted when the node starts so it does
+	// not grow without bound.
+	if removed, err := engine.Compact(context.Background(), config.StateDir, engine.DefaultRetention()); err != nil {
+		fmt.Fprintf(os.Stderr, "eregion-node: journal compaction failed: %v\n", err)
+	} else if removed > 0 {
+		fmt.Fprintf(os.Stderr, "eregion-node: compacted %d journal tasks\n", removed)
+	}
 	reader := bufio.NewReader(stdin)
 	writer := bufio.NewWriter(stdout)
 	for {

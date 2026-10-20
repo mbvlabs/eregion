@@ -49,6 +49,11 @@ func RunTask(config Config) error {
 		fmt.Fprintf(os.Stdout, "%s %s %s\n", event.Kind, event.Step, registry.Redact(event.Message))
 	}
 	status, err := nodeEngine.Run(context.Background(), step, request.Execution, report)
+	// The journal is compacted after every task so it stays bounded on a node
+	// that never restarts.
+	if _, compactErr := engine.Compact(context.Background(), config.StateDir, engine.DefaultRetention()); compactErr != nil {
+		fmt.Fprintf(os.Stderr, "eregion-node: journal compaction failed: %v\n", compactErr)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "node task failed: %s\n", registry.Redact(err.Error()))
 		return err
