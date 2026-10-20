@@ -147,3 +147,30 @@ func TestOperationAndErrorDefinitions(t *testing.T) {
 		}
 	}
 }
+
+func TestOperationErrorCodeShape(t *testing.T) {
+	opSchema := compile(t, "#/$defs/operation")
+	id, err := contract.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := contract.Operation{ID: id, Kind: "test", Target: "local", Actor: contract.Actor{Kind: "system", Subject: "test"}, State: contract.Failed, Attempt: 1, LastSequence: 2, ErrorCode: contract.PreconditionFailed, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	raw, _ := json.Marshal(base)
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatal(err)
+	}
+	if err := opSchema.Validate(value); err != nil {
+		t.Fatal(err)
+	}
+	succeeded := base
+	succeeded.State, succeeded.ErrorCode = contract.Succeeded, contract.PreconditionFailed
+	raw, _ = json.Marshal(succeeded)
+	value = nil
+	if err := json.Unmarshal(raw, &value); err != nil {
+		t.Fatal(err)
+	}
+	if err := opSchema.Validate(value); err == nil {
+		t.Fatal("a succeeded operation carried an error code")
+	}
+}

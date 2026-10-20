@@ -105,6 +105,73 @@ func TestEventValidation(t *testing.T) {
 	}
 }
 
+func TestOperationErrorCodeIsMachineReadable(t *testing.T) {
+	operation := Operation{
+		ID: "op_" + OperationID(strings.Repeat("a", 32)), Kind: "diagnostic.test", Target: "control-plane",
+		Actor: Actor{Kind: "ci", Subject: "release"}, State: Failed, Attempt: 1, LastSequence: 2,
+		ErrorCode: PreconditionFailed,
+		CreatedAt: time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC), UpdatedAt: time.Date(2026, 10, 20, 12, 0, 1, 0, time.UTC),
+	}
+	if err := operation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"error_code":"precondition_failed"`) {
+		t.Fatalf("the error code is not on the wire: %s", raw)
+	}
+	// Only a failed operation carries an error code.
+	succeeded := operation
+	succeeded.State, succeeded.ErrorCode = Succeeded, PreconditionFailed
+	if succeeded.Validate() == nil {
+		t.Fatal("a succeeded operation carried an error code")
+	}
+	unknown := operation
+	unknown.ErrorCode = "made_up"
+	if unknown.Validate() == nil {
+		t.Fatal("an unknown error code was accepted")
+	}
+	// A failed operation without an error code stays valid: the code is
+	// additive, not required.
+	withoutCode := operation
+	withoutCode.ErrorCode = ""
+	if err := withoutCode.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEventErrorCodeOnlyOnAFailedState(t *testing.T) {
+	failed := sampleEvent()
+	failed.Kind, failed.State, failed.ErrorCode = "state", Failed, PreconditionFailed
+	if err := failed.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"error_code":"precondition_failed"`) {
+		t.Fatalf("the error code is not on the wire: %s", raw)
+	}
+	running := sampleEvent()
+	running.Kind, running.State, running.ErrorCode = "state", Running, PreconditionFailed
+	if running.Validate() == nil {
+		t.Fatal("a running state event carried an error code")
+	}
+	log := sampleEvent()
+	log.Kind, log.State, log.ErrorCode = "log", "", PreconditionFailed
+	if log.Validate() == nil {
+		t.Fatal("a log event carried an error code")
+	}
+	unknown := sampleEvent()
+	unknown.Kind, unknown.State, unknown.ErrorCode = "state", Failed, "made_up"
+	if unknown.Validate() == nil {
+		t.Fatal("an unknown error code was accepted")
+	}
+}
+
 func TestSequencesAreJSONStringIntegers(t *testing.T) {
 	event := sampleEvent()
 	event.Sequence = 18446744073709551615

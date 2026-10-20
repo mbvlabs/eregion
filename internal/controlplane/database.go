@@ -26,6 +26,9 @@ var migration001 string
 //go:embed migrations/002_node_execution.sql
 var migration002 string
 
+//go:embed migrations/003_operation_error_code.sql
+var migration003 string
+
 type migration struct {
 	version int
 	name    string
@@ -38,6 +41,7 @@ type migration struct {
 var migrations = []migration{
 	{version: 1, name: "001_operations.sql", sql: migration001},
 	{version: 2, name: "002_node_execution.sql", sql: migration002},
+	{version: 3, name: "003_operation_error_code.sql", sql: migration003},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.

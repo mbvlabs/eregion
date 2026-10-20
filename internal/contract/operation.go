@@ -97,8 +97,11 @@ type Operation struct {
 	State        State       `json:"state"`
 	Attempt      uint32      `json:"attempt"`
 	LastSequence uint64      `json:"last_sequence,string"`
-	CreatedAt    time.Time   `json:"created_at"`
-	UpdatedAt    time.Time   `json:"updated_at"`
+	// ErrorCode classifies why a failed operation ended. It is empty for every
+	// other state, so a caller never has to parse the message text.
+	ErrorCode Code      `json:"error_code,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (o Operation) Validate() error {
@@ -110,6 +113,14 @@ func (o Operation) Validate() error {
 	}
 	if strings.TrimSpace(o.Kind) == "" || strings.TrimSpace(o.Target) == "" || !o.State.Valid() || o.CreatedAt.IsZero() || o.UpdatedAt.IsZero() || o.LastSequence == 0 || ((o.State == Running || o.State == Succeeded) && o.Attempt == 0) {
 		return NewFault(ValidationFailed, "invalid operation snapshot", "Require authoritative identity, state, timestamps, attempt, and accepted-event sequence.")
+	}
+	if o.ErrorCode != "" {
+		if o.State != Failed {
+			return NewFault(ValidationFailed, "invalid operation snapshot", "Only a failed operation carries an error code.")
+		}
+		if !KnownCode(o.ErrorCode) {
+			return NewFault(ValidationFailed, "invalid operation snapshot", "Use a known error code.")
+		}
 	}
 	return nil
 }
@@ -136,8 +147,11 @@ type Event struct {
 	State       State       `json:"state,omitempty"`
 	Stage       string      `json:"stage,omitempty"`
 	ExecutionID string      `json:"execution_id,omitempty"`
-	Message     string      `json:"message,omitempty"`
-	Progress    *Progress   `json:"progress,omitempty"`
+	// ErrorCode classifies a failed terminal state. It is only valid on a
+	// state event that reports the failed state.
+	ErrorCode Code      `json:"error_code,omitempty"`
+	Message   string    `json:"message,omitempty"`
+	Progress  *Progress `json:"progress,omitempty"`
 }
 
 func (e Event) Validate() error {
@@ -164,6 +178,14 @@ func (e Event) Validate() error {
 	}
 	if e.ExecutionID != "" && (e.Kind != "step" || !executionIDPattern.MatchString(e.ExecutionID)) {
 		return NewFault(ValidationFailed, "invalid execution identity", "Only step events may carry a durable node execution identity.")
+	}
+	if e.ErrorCode != "" {
+		if e.Kind != "state" || e.State != Failed {
+			return NewFault(ValidationFailed, "invalid error code", "Only a failed state event carries an error code.")
+		}
+		if !KnownCode(e.ErrorCode) {
+			return NewFault(ValidationFailed, "invalid error code", "Use a known error code.")
+		}
 	}
 	if e.Kind == "progress" {
 		if e.Progress == nil || e.Progress.Total == 0 || e.Progress.Current > e.Progress.Total || strings.TrimSpace(e.Progress.Unit) == "" {
