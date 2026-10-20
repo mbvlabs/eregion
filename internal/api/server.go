@@ -103,15 +103,18 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 			return nil, 0, contract.NewFault(contract.ValidationFailed, "JSON content type required", "Use Content-Type: application/json.")
 		}
-		raw, err := io.ReadAll(io.LimitReader(r.Body, 16385))
-		if err != nil || len(raw) > 16384 {
-			return nil, 0, contract.NewFault(contract.ValidationFailed, "request body is unreadable or too large", "Limit JSON requests to 16 KiB.")
+		raw, err := io.ReadAll(io.LimitReader(r.Body, maxPlatformRequestBytes+1))
+		if err != nil || len(raw) > maxPlatformRequestBytes {
+			return nil, 0, contract.NewFault(contract.ValidationFailed, "request body is unreadable or too large", "Limit JSON requests to 64 KiB of action input plus envelope overhead.")
 		}
 		var request testRequest
 		decoder := json.NewDecoder(strings.NewReader(string(raw)))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF {
 			return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid operation request", "Provide kind, target, input, and optional dry_run; identity comes from authentication.")
+		}
+		if strings.HasPrefix(request.Kind, "platform.") {
+			return s.submitPlatformAction(r, raw)
 		}
 		if request.Kind != operations.TestKind || request.Target != operations.TestTarget {
 			return nil, 0, contract.NewFault(contract.ValidationFailed, "unsupported operation kind or target", "Use diagnostic.test on control-plane.")
@@ -130,6 +133,9 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 		op, err := s.service.Submit(r.Context(), operations.Submission{Kind: request.Kind, Target: request.Target, Actor: actor, IdempotencyKey: r.Header.Get("Idempotency-Key"), Input: canonical})
 		return op, http.StatusAccepted, err
 	}
+	if r.Method == http.MethodGet && r.URL.Path == "/v1/platform" {
+		return s.platformInventory(r)
+	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 	if len(parts) >= 3 && parts[0] == "v1" && parts[1] == "operations" {
 		id := contract.OperationID(parts[2])
@@ -138,9 +144,22 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 		}
 		if r.Method == http.MethodGet && len(parts) == 3 {
 			op, err := s.service.Get(r.Context(), actor, id)
-			return op, http.StatusOK, err
+			if err != nil {
+				return op, http.StatusOK, err
+			}
+			if err := s.authorizeExistingOperation(r, op); err != nil {
+				return nil, 0, err
+			}
+			return op, http.StatusOK, nil
 		}
 		if r.Method == http.MethodGet && len(parts) == 4 && parts[3] == "events" {
+			existing, err := s.service.Get(r.Context(), actor, id)
+			if err != nil {
+				return nil, 0, err
+			}
+			if err := s.authorizeExistingOperation(r, existing); err != nil {
+				return nil, 0, err
+			}
 			after := uint64(0)
 			limit := 100
 			query, queryErr := url.ParseQuery(r.URL.RawQuery)
@@ -170,6 +189,13 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 			return page, http.StatusOK, err
 		}
 		if r.Method == http.MethodPost && len(parts) == 4 && parts[3] == "cancel" {
+			existing, err := s.service.Get(r.Context(), actor, id)
+			if err != nil {
+				return nil, 0, err
+			}
+			if err := s.authorizeExistingOperation(r, existing); err != nil {
+				return nil, 0, err
+			}
 			op, err := s.service.RequestCancel(r.Context(), actor, id)
 			return op, http.StatusAccepted, err
 		}

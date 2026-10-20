@@ -13,16 +13,38 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 type Service struct {
 	pool    *pgxpool.Pool
 	enqueue func(context.Context, pgx.Tx, contract.OperationID) (int64, error)
+	// enqueuePlatform inserts the one River job for a platform action in the
+	// same transaction as its domain rows.
+	enqueuePlatform func(context.Context, pgx.Tx, contract.Operation) (int64, error)
 	// transport is the node-dispatch boundary. Local today; SSH/WireGuard later.
 	transport node.Transport
 	// afterNode is a test-only seam between a node effect and its database
 	// acknowledgement. Production leaves it nil.
 	afterNode func(contract.OperationID, string) error
+	// secrets resolves environment secret references into transient values. It is
+	// intentionally nil until the M3 vault agent installs a resolver.
+	secrets SecretResolver
+	// sourceRoots is the symlink-resolved directory-build allowlist.
+	sourceRoots []string
+}
+
+// SecretResolver resolves opaque environment secret references without
+// persisting values. Implementations must return only the requested keys.
+type SecretResolver interface {
+	Resolve(context.Context, map[string]string) (map[string]string, error)
+}
+
+func (s *Service) buildSourceRoots() []string {
+	if len(s.sourceRoots) > 0 {
+		return s.sourceRoots
+	}
+	return platform.BuildSourceRoots()
 }
 
 var _ operations.Service = (*Service)(nil)
@@ -42,6 +64,9 @@ func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contra
 	}
 	if err := contract.ValidateIdempotencyKey(sub.IdempotencyKey); err != nil {
 		return zero, err
+	}
+	if platform.IsKind(sub.Kind) {
+		return s.submitPlatform(ctx, sub)
 	}
 	if sub.Kind != operations.TestKind || sub.Target != operations.TestTarget || sub.Confirmation != "" {
 		return zero, contract.NewFault(contract.ValidationFailed, "unsupported operation or target", "Only diagnostic.test on control-plane is implemented; it needs no confirmation.")

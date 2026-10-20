@@ -69,6 +69,7 @@ type Transport interface {
 // Local runs requests in-process through the node dispatcher.
 type Local struct {
 	dispatcher *Dispatcher
+	name       string
 }
 
 func NewLocal(stateDir, nodeName string, registry *secrets.Registry) (*Local, error) {
@@ -76,7 +77,7 @@ func NewLocal(stateDir, nodeName string, registry *secrets.Registry) (*Local, er
 	if err != nil {
 		return nil, err
 	}
-	return &Local{dispatcher: dispatcher}, nil
+	return &Local{dispatcher: dispatcher, name: nodeName}, nil
 }
 
 // DefaultStateDir returns the shared node state directory. Every worker process
@@ -96,6 +97,11 @@ func DefaultStateDir() string {
 }
 
 func (*Local) Name() string { return "local" }
+
+// NodeIdentity is the configured local node name. Platform placement compares
+// this authenticated runtime identity with the node record; a hostname is never
+// used for placement.
+func (l *Local) NodeIdentity() string { return l.name }
 
 func (l *Local) SetHooks(hooks Hooks) { l.dispatcher.SetHooks(hooks) }
 

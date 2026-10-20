@@ -86,6 +86,10 @@ type Engine struct {
 	Node        string
 	Secrets     *secrets.Registry
 	LockTimeout time.Duration
+	// SecretValues are request-scoped and transient. The dispatcher sets this
+	// copy per request; it is never journaled. Steps may pass values only into
+	// child-process environments.
+	SecretValues map[string]string
 }
 
 // New validates and creates the engine's private state directory.
@@ -291,7 +295,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	defer hostLock()
 
 	// Check again under the host lock: another effect may have changed shared state.
-	check, err := step.Check(ctx, Runtime{DryRun: false, Secrets: e.registry(), Root: e.StateDir})
+	check, err := step.Check(ctx, Runtime{DryRun: false, Secrets: e.registry(), SecretValues: e.SecretValues, Root: e.StateDir})
 	if err != nil {
 		return e.fail(exec, running, fmt.Errorf("check %s: %w", step.ID(), err))
 	}
@@ -299,7 +303,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	result := ApplyResult{}
 	if !check.Complete {
 		report.emit(Event{Kind: "log", Step: step.ID(), Message: check.Detail})
-		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), Root: e.StateDir}, report)
+		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), SecretValues: e.SecretValues, Root: e.StateDir}, report)
 		if err != nil {
 			return e.fail(exec, running, err)
 		}

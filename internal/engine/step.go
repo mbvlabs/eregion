@@ -80,6 +80,10 @@ type ApplyResult struct {
 type Runtime struct {
 	DryRun  bool
 	Secrets *secrets.Registry
+	// SecretValues are transient request-scoped values for the current effect.
+	// They are never included in step inputs, the node journal, or events; steps
+	// that use them must pass them only to the child process environment.
+	SecretValues map[string]string
 	// Root is the node's private state directory. Steps that write node-local
 	// diagnostic state must stay beneath it.
 	Root string

@@ -41,6 +41,7 @@ func RunTask(config Config) error {
 	if err != nil {
 		return err
 	}
+	nodeEngine.SecretValues = request.Secrets
 	step, err := node.DefaultRegistry().Build(request.Execution, request.Payload)
 	if err != nil {
 		return err

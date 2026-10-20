@@ -1,3 +1,4 @@
 /bin/
 /coverage.out
 /.local/
+__pycache__/

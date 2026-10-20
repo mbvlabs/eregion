@@ -136,6 +136,7 @@ func TestSSHTransportReportsALostStreamWithoutStoppingTheNode(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	server.waitTaskExit(t, exec)
 	// The retry path asks for status before it runs anything, and the status
 	// reports the completed effect.
 	status, err := client.Call(context.Background(), statusRequest(exec), nil)
@@ -212,6 +213,7 @@ func TestSSHTransportCancellationDoesNotKillTheNodeTask(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	server.waitTaskExit(t, exec)
 }
 
 // TestSSHTransportRefusesARevokedHostKey proves that a key the known_hosts
@@ -277,6 +279,7 @@ func TestSSHTransportWaitFollowsTheContextDeadline(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 30*time.Second {
 		t.Fatalf("the wait did not follow the deadline: %s", elapsed)
 	}
+	server.waitTaskExit(t, exec)
 }
 
 // TestSSHTransportRequiresAPinnedHostKey proves that a node without a pinned

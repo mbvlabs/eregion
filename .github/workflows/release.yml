@@ -1,0 +1,147 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, node: true }
+          - { goos: linux, goarch: arm64, node: true }
+          - { goos: darwin, goarch: amd64, node: false }
+          - { goos: darwin, goarch: arm64, node: false }
+          - { goos: windows, goarch: amd64, node: false }
+          - { goos: windows, goarch: arm64, node: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build archives
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          WITH_NODE: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          case "$version" in
+            ''|*[!0-9A-Za-z.+-]*) echo "invalid release tag: ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+          esac
+          mkdir -p dist
+          stage="$(mktemp -d)"
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          ldflags="-s -w -X github.com/mbvlabs/eregion/internal/buildinfo.Version=${version} -X github.com/mbvlabs/eregion/internal/buildinfo.Commit=${GITHUB_SHA} -X github.com/mbvlabs/eregion/internal/buildinfo.BuiltAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          go build -trimpath -ldflags "$ldflags" -o "${stage}/eregion${ext}" ./cmd/eregion
+          name="eregion_${version}_${GOOS}_${GOARCH}.tar.gz"
+          tar -C "$stage" -czf "dist/${name}" "eregion${ext}"
+          if [ "$WITH_NODE" = "true" ]; then
+            go build -trimpath -ldflags "$ldflags" -o "${stage}/eregion-node${ext}" ./cmd/eregion-node
+            node_name="eregion-node_${version}_linux_${GOARCH}.tar.gz"
+            tar -C "$stage" -czf "dist/${node_name}" "eregion-node${ext}"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.node }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify source before publishing
+        run: |
+          set -euo pipefail
+          go mod download
+          go test ./...
+      - name: Sign release manifest
+        env:
+          EREGION_RELEASE_SIGNING_KEY: ${{ secrets.EREGION_RELEASE_SIGNING_KEY }}
+          UPGRADE_FROM: ${{ vars.EREGION_UPGRADE_FROM }}
+          RELEASE_CHANNEL: ${{ vars.EREGION_RELEASE_CHANNEL }}
+          RELEASE_BASE_URL: ${{ vars.EREGION_RELEASE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -z "${EREGION_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "EREGION_RELEASE_SIGNING_KEY is not configured; refusing to publish an unsigned release" >&2
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          channel="${RELEASE_CHANNEL:-stable}"
+          base_url="${RELEASE_BASE_URL:-}"
+          if [ -z "$base_url" ]; then
+            # GitHub release-asset URLs redirect to another host. The upgrade
+            # downloader refuses redirects, so publishing a manifest with those
+            # URLs would produce a release that cannot be installed. Require an
+            # explicit direct HTTPS object-store base URL instead.
+            echo "EREGION_RELEASE_BASE_URL is not configured; refusing to sign a manifest whose artifact URLs redirect" >&2
+            exit 1
+          fi
+          case "$base_url" in
+            https://*) ;;
+            *) echo "EREGION_RELEASE_BASE_URL must be an absolute HTTPS URL" >&2; exit 1 ;;
+          esac
+          schema_version="$(find internal/controlplane/migrations -maxdepth 1 -name '*.sql' -printf '%f\n' | sed 's/^0*//; s/_.*//' | sort -n | tail -1)"
+          if [ -z "$schema_version" ]; then echo "could not determine schema version" >&2; exit 1; fi
+          go run ./internal/upgrade/releasegen \
+            -dir dist \
+            -version "$version" \
+            -channel "$channel" \
+            -base-url "$base_url" \
+            -schema-version "$schema_version" \
+            -upgrade-from "${UPGRADE_FROM:-}" \
+            -checksums dist/SHA256SUMS \
+            -public-key-out dist/release.pub
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPGRADE_FROM: ${{ vars.EREGION_UPGRADE_FROM }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "Signed eregion ${version}."
+            echo
+            echo "Verify dist/manifest.json against the published Ed25519 public key in dist/release.pub before installing."
+            echo "SHA256SUMS is an integrity listing, not a signature."
+            echo
+            if [ -n "${UPGRADE_FROM:-}" ]; then
+              echo "Supported direct upgrade sources: ${UPGRADE_FROM}."
+            fi
+            echo "This release does not claim high availability or a tested failover SLA."
+          } > dist/RELEASE_NOTES.md
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/manifest.json \
+            dist/SHA256SUMS \
+            dist/release.pub \
+            --title "eregion ${version}" \
+            --notes-file dist/RELEASE_NOTES.md \
+            --verify-tag

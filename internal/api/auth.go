@@ -20,9 +20,10 @@ var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32,256}$`)
 var knownScopes = []string{"operations:submit", "operations:read", "operations:cancel", "system:read"}
 
 type Principal struct {
-	Actor       contract.Actor `json:"actor"`
-	TokenSHA256 string         `json:"token_sha256"`
-	Scopes      []string       `json:"scopes"`
+	Actor        contract.Actor `json:"actor"`
+	TokenSHA256  string         `json:"token_sha256"`
+	Scopes       []string       `json:"scopes"`
+	ActionGrants []ActionGrant  `json:"action_grants,omitempty"`
 }
 
 type Auth struct{ principals map[[32]byte]Principal }
@@ -76,22 +77,37 @@ func NewAuth(principals []Principal) (*Auth, error) {
 			}
 		}
 		principal.Scopes = slices.Clone(principal.Scopes)
+		if err := validateGrants(principal.ActionGrants); err != nil {
+			return nil, err
+		}
+		principal.ActionGrants = slices.Clone(principal.ActionGrants)
 		auth.principals[key] = principal
 	}
 	return auth, nil
 }
 
 func (a *Auth) authenticate(header, scope string) (contract.Actor, error) {
-	const prefix = "Bearer "
-	if !strings.HasPrefix(header, prefix) || !tokenPattern.MatchString(strings.TrimPrefix(header, prefix)) {
-		return contract.Actor{}, contract.NewFault(contract.Unauthenticated, "API authentication required", "Supply a valid Bearer token.")
-	}
-	principal, ok := a.principals[sha256.Sum256([]byte(strings.TrimPrefix(header, prefix)))]
-	if !ok {
-		return contract.Actor{}, contract.NewFault(contract.Unauthenticated, "API authentication failed", "Check the token and configured server credentials.")
+	principal, err := a.resolvePrincipal(header)
+	if err != nil {
+		return contract.Actor{}, err
 	}
 	if !slices.Contains(principal.Scopes, scope) {
 		return contract.Actor{}, contract.NewFault(contract.Forbidden, "API credential lacks the required scope", "Use a credential explicitly authorized for this action.")
 	}
 	return principal.Actor, nil
+}
+
+func (a *Auth) resolvePrincipal(header string) (Principal, error) {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) || !tokenPattern.MatchString(strings.TrimPrefix(header, prefix)) {
+		return Principal{}, contract.NewFault(contract.Unauthenticated, "API authentication required", "Supply a valid Bearer token.")
+	}
+	if a == nil {
+		return Principal{}, contract.NewFault(contract.Unauthenticated, "API authentication is not configured", "Configure scoped API credentials.")
+	}
+	principal, ok := a.principals[sha256.Sum256([]byte(strings.TrimPrefix(header, prefix)))]
+	if !ok {
+		return Principal{}, contract.NewFault(contract.Unauthenticated, "API authentication failed", "Check the token and configured server credentials.")
+	}
+	return principal, nil
 }

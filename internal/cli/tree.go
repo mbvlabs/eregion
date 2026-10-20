@@ -17,6 +17,10 @@ type result struct {
 	data    any
 	plain   string
 	next    []string
+	// streamed means the command wrote its own terminal records (NDJSON,
+	// append-only plain, or the interactive view) and the runner must not
+	// append a second envelope.
+	streamed bool
 }
 
 type spec struct {
@@ -54,15 +58,15 @@ func newApp() *app {
 			[]string{"eregion commands --json", "eregion --help"}, "eregion commands --json"),
 		run: func(cmd *cobra.Command, _ []string) (result, error) {
 			return result{
-				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "M0.3 — node execution and recovery boundary", "commands": a.meta.catalog(a.root)},
-				plain: "eregion — agent-first application platform\n\nM0.3: PostgreSQL/River operations, local node dispatch, and recovery.\nNo remote transports, host bootstrap, or application deployment commands yet.\n\nNext: eregion commands --json",
+				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "experimental application platform", "commands": a.meta.catalog(a.root)},
+				plain: "eregion — experimental application platform\n\nAuthenticated platform clients, durable operations, and opt-in terminal workspaces.\nInspect command contracts and dry-run plans before changing host or application state.\n\nNext: eregion commands --json",
 			}, nil
 		},
 	}
 	a.root = a.command(rootSpec)
 	a.root.SilenceErrors, a.root.SilenceUsage = true, true
 	a.root.CompletionOptions.DisableDefaultCmd = true
-	a.root.PersistentFlags().String("output", "plain", "Output mode: plain or json")
+	a.root.PersistentFlags().String("output", "plain", "Output mode: plain or json; follow commands also accept ndjson")
 	a.root.PersistentFlags().Bool("json", false, "Shorthand for --output json")
 	a.root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		var required *pflag.ValueRequiredError
@@ -72,8 +76,10 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, s := range append(a.specs(), a.runtimeSpecs()...) {
-		a.attach(a.root, s)
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.platformSpecs(), a.secretSpecs(), a.upgradeSpecs(), a.workspaceSpecs()} {
+		for _, s := range specs {
+			a.attach(a.root, s)
+		}
 	}
 	a.root.SetHelpFunc(func(cmd *cobra.Command, _ []string) {
 		a.started = true

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,6 +23,7 @@ import (
 )
 
 const diagnosticQueue = "diagnostic"
+const platformQueue = "platform"
 
 // jobTimeout is the deadline one River job gets. It is the effective bound
 // for a wait on a detached node task: the transport's own wait bound stays
@@ -34,6 +36,15 @@ type testArgs struct {
 }
 
 func (testArgs) Kind() string { return "diagnostic_test" }
+
+// platformArgs deliberately contains only durable identity. Input stays in
+// PostgreSQL and may be read by the worker; no secret material enters River.
+type platformArgs struct {
+	OperationID contract.OperationID `json:"operation_id"`
+	ActionKind  string               `json:"action_kind"`
+}
+
+func (platformArgs) Kind() string { return "platform_action" }
 
 type reconcileArgs struct{}
 
@@ -54,13 +65,19 @@ type WorkerConfig struct {
 	// NodeStateDir is the local dispatcher's shared state directory. Tests inject
 	// a temporary directory; services use EREGION_NODE_STATE_DIR or the default.
 	NodeStateDir string
+	// SecretResolver resolves environment secret references at deployment time.
+	// Nil means referenced secrets fail honestly instead of being injected.
+	SecretResolver SecretResolver
+	// SourceRoots is the directory-build allowlist. Empty uses
+	// EREGION_BUILD_SOURCE_ROOTS (or /srv/eregion/sources).
+	SourceRoots []string
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool}
+	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots}
 	service.transport = config.Transport
 	if service.transport == nil && (config.Concurrency > 0 || config.NodeStateDir != "") {
 		stateDir := config.NodeStateDir
@@ -75,6 +92,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	}
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &testWorker{service: service})
+	river.AddWorker(workers, &platformWorker{service: service})
 	river.AddWorker(workers, &reconcileWorker{service: service})
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
@@ -84,6 +102,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	if config.Concurrency > 0 {
 		riverConfig.Queues = map[string]river.QueueConfig{
 			diagnosticQueue: {MaxWorkers: config.Concurrency},
+			platformQueue:   {MaxWorkers: config.Concurrency},
 			"maintenance":   {MaxWorkers: 1},
 		}
 		riverConfig.PeriodicJobs = []*river.PeriodicJob{
@@ -98,6 +117,13 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	}
 	service.enqueue = func(ctx context.Context, tx pgx.Tx, id contract.OperationID) (int64, error) {
 		inserted, err := client.InsertTx(ctx, tx, testArgs{OperationID: id}, &river.InsertOpts{Queue: diagnosticQueue, MaxAttempts: operations.TestMaxAttempts})
+		if err != nil {
+			return 0, err
+		}
+		return inserted.Job.ID, nil
+	}
+	service.enqueuePlatform = func(ctx context.Context, tx pgx.Tx, op contract.Operation) (int64, error) {
+		inserted, err := client.InsertTx(ctx, tx, platformArgs{OperationID: op.ID, ActionKind: op.Kind}, &river.InsertOpts{Queue: platformQueue, MaxAttempts: platformMaxAttempts})
 		if err != nil {
 			return 0, err
 		}
@@ -439,6 +465,9 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 	}
 	if op.State.Terminal() {
 		return nil
+	}
+	if strings.HasPrefix(op.Kind, "platform.") {
+		return s.reconcilePlatformOperation(ctx, op)
 	}
 	var input operations.TestInput
 	var rawInput []byte

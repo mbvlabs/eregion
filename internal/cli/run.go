@@ -1,5 +1,5 @@
 // Package cli adapts declarative command contracts to Cobra. It never owns durable
-// operation execution and does not depend on a renderer, database, or queue.
+// operation execution; presenters only observe work the control plane owns.
 package cli
 
 import (
@@ -12,8 +12,8 @@ import (
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
-// Run writes exactly one envelope in JSON mode, including parse/help failures.
-// All current human output is append-only plain text; no TTY probing is needed.
+// Run writes exactly one envelope in JSON mode, including parse/help failures,
+// except for follow commands whose presenter writes its own terminal protocol.
 func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer) int {
 	return run(ctx, args, in, out, stderr, &secrets.Registry{})
 }
@@ -22,7 +22,26 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 	registerEnvironmentSecrets(registry)
 	a := newApp()
 	a.secrets = registry
+	selection := followSelectionFromArgs(args, a.valueFlags())
 	mode, err := output.OptionsFromArgs(args, a.valueFlags()...)
+	followMode := string(output.Plain)
+	if selection.NDJSON {
+		if selection.JSON {
+			err = contract.NewFault(contract.InvalidOutputMode, "conflicting output modes", "Use --output ndjson or --json, not both.")
+		} else {
+			var fault *contract.Fault
+			if errors.As(err, &fault) && fault.Code == contract.InvalidOutputMode {
+				// NDJSON is a streaming mode available only to follow commands.
+				err, mode = nil, output.Plain
+			}
+		}
+	}
+	if selection.NDJSON && !selection.JSON {
+		followMode = "ndjson"
+	} else if mode == output.JSON {
+		followMode = string(output.JSON)
+	}
+	ctx = context.WithValue(ctx, followIOKey{}, &followIO{in: in, out: out, err: stderr, mode: followMode})
 	writer := output.Writer{Out: out, Err: stderr, Mode: mode, Secrets: registry}
 	command := "eregion"
 	if err == nil {
@@ -51,6 +70,19 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 		envelope = contract.Failure(command, err)
 	} else {
 		envelope = contract.Success(a.result.command, a.result.data, a.result.next)
+	}
+	if a.result.streamed {
+		// The follow presenter already wrote its protocol (NDJSON result,
+		// stable plain summary, or restored TUI plus summary).
+		return contract.ExitCode(err)
+	}
+	if selection.Active && followMode == "ndjson" {
+		if finishErr := output.NewStream(out, registry).Finish(envelope); finishErr != nil {
+			// Do not append another record after a possibly partial write.
+			_, _ = io.WriteString(stderr, "error [internal_error]: could not write command output\n")
+			return 70
+		}
+		return contract.ExitCode(err)
 	}
 	if writeErr := writer.Write(envelope, a.result.plain); writeErr != nil {
 		// Do not append a second JSON envelope after a possibly partial write.

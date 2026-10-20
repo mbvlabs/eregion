@@ -122,18 +122,24 @@ distribution, multi-node placement, or distributed lease yet.
 
 ### M0.4 — First real Charm view
 
-- [ ] Build Bubble Tea v2 + Bubbles v2 + Lip Gloss v2 presentation primitives from
+- [x] Build Bubble Tea v2 + Bubbles v2 + Lip Gloss v2 presentation primitives from
   the approved sketches: header, stage list, event viewport, status/footer.
-- [ ] Feed live operation events through a reducer also used by fixture tests.
-- [ ] Implement loading, queued, running, stale/reconnecting, failed, and completed
+- [x] Feed live operation events through a reducer also used by fixture tests.
+- [x] Implement loading, queued, running, stale/reconnecting, failed, and completed
   states before adding dashboards. Show elapsed time and indeterminate work honestly.
-- [ ] Support resize, narrow layouts, help, keyboard navigation, plain output,
+- [x] Support resize, narrow layouts, help, keyboard navigation, plain output,
   no-color, reduced motion, and safe terminal text.
-- [ ] Test that leaving the viewer does not cancel the operation and that rendered
+- [x] Test that leaving the viewer does not cancel the operation and that rendered
   state catches up correctly after replay, duplicate delivery, or connection loss.
 
 **Gate:** the same test operation is usable through JSON/NDJSON, plain text, and a
 real interactive terminal. No renderer is required for execution or diagnosis.
+
+**Delivered (2026-10-20):** real Charm v2 operation viewer, shared reducer and
+poll/replay loop, JSON/NDJSON/plain presenters, accessibility options, fixture and
+render tests. `just terminal-smoke` passed against a live PostgreSQL/API/worker:
+resize down to 18×5, help/navigation, detach with exit 130 without cancellation,
+then reconnect/replay to completion. This does not establish later host/fleet/HA gates.
 
 ## M1 — Bootstrap a control plane (research Phase 1)
 

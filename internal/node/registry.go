@@ -8,6 +8,7 @@ import (
 	"regexp"
 
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 // StepFactory builds the step for one execution identity and request payload.
@@ -33,10 +34,16 @@ type stepFamily struct {
 // diagnosticStepPattern matches the versioned diagnostic step family.
 var diagnosticStepPattern = regexp.MustCompile(`^diagnostic-step-[0-9]{2}-v1$`)
 
-// NewStepRegistry returns a registry with the built-in diagnostic step family.
+// NewStepRegistry returns a registry with the built-in diagnostic and platform
+// step families. The platform steps are the only path a release or deployment
+// uses to reach Docker or Buildpacks, so the control plane and node binary derive
+// identical inputs and effect identities.
 func NewStepRegistry() *StepRegistry {
 	registry := &StepRegistry{}
 	registry.Register(diagnosticStepPattern.MatchString, buildDiagnosticStep)
+	for _, family := range platform.StepFamilies() {
+		registry.Register(family.Match, family.Build)
+	}
 	return registry
 }
 

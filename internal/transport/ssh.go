@@ -164,6 +164,10 @@ func NewSSHTransport(config SSHConfig) (*SSHTransport, error) {
 // Name identifies the transport in logs and diagnostics.
 func (t *SSHTransport) Name() string { return "ssh" }
 
+// NodeIdentity is the pinned node name verified in the SSH handshake. Platform
+// placement must match this value; an unpinned SSH transport is rejected.
+func (t *SSHTransport) NodeIdentity() string { return t.config.ExpectedNode }
+
 // Call dispatches one request to the node.
 //
 // A run request that the node accepts starts a detached node task. The

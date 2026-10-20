@@ -1,6 +1,38 @@
 default:
     @just --list
 
+# Start a disposable loopback PostgreSQL + API + worker; never touches host services.
+dev-up:
+    python3 scripts/dev.py up
+
+# Stop the development API and discard only this checkout's disposable database.
+dev-down:
+    python3 scripts/dev.py down
+
+# Check local development readiness without printing credentials.
+dev-status:
+    python3 scripts/dev.py status
+
+# Rebuild/restart API+workers and apply new migrations, retaining the dev database.
+dev-restart:
+    python3 scripts/dev.py restart
+
+# Check development launcher permissions, identity guards, and atomic writes.
+dev-test:
+    python3 -m unittest discover -s scripts -p 'test_*.py'
+
+# Install checksum-pinned pack into .local/dev/tools, never system-wide.
+dev-buildpacks:
+    python3 scripts/buildpacks.py
+
+# Build real sample images, deploy, reject a bad candidate, and roll back (requires dev-up).
+smoke:
+    python3 scripts/smoke.py
+
+# Exercise the real interactive viewer in a resizable pseudo-terminal (requires dev-up).
+terminal-smoke:
+    python3 scripts/terminal_smoke.py
+
 # Build the operator CLI.
 build:
     go build -trimpath -o bin/eregion ./cmd/eregion
@@ -11,23 +43,26 @@ build-node:
 
 # Format Go sources.
 fmt:
-    gofmt -w cmd internal schema
+    gofmt -w cmd internal schema examples
 
 # Fail if Go sources need formatting.
 fmt-check:
-    @test -z "$(gofmt -l cmd internal schema)" || { gofmt -l cmd internal schema; exit 1; }
+    @test -z "$(gofmt -l cmd internal schema examples)" || { gofmt -l cmd internal schema examples; exit 1; }
 
 # Run static analysis.
 lint:
     go vet ./...
+    go -C examples/hello vet ./...
 
 # Run unit, contract, schema, and executable tests.
 test:
     go test ./...
+    go -C examples/hello test ./...
 
 # Run tests with the race detector.
 race:
     go test -race ./...
+    go -C examples/hello test -race ./...
 
 # Run live PostgreSQL/River/API/process-crash tests against isolated test databases.
 integration:
@@ -65,4 +100,4 @@ wireguard:
     go test -count=1 ./internal/transport -run 'WireGuard' -v -timeout 600s
 
 # Check formatting, static analysis, and tests.
-check: fmt-check lint test
+check: fmt-check lint test dev-test

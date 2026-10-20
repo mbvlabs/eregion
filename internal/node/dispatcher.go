@@ -55,6 +55,7 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 	}
 	requestEngine := *d.engine
 	requestEngine.Secrets = registry
+	requestEngine.SecretValues = request.Secrets
 	report := func(event engine.Event) {
 		if onEvent != nil {
 			onEvent(Event{Kind: event.Kind, Step: event.Step, ExecutionID: request.Execution.ExecutionID(), Message: registry.Redact(event.Message)})

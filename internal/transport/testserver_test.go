@@ -117,6 +117,26 @@ func newTestServer(t *testing.T) *testServer {
 
 func (s *testServer) address() string { return s.listener.Addr().String() }
 
+// An effect marker (and even completed status) precedes the detached helper's
+// final journal compaction. Wait for the owning process to exit before TempDir
+// cleanup; cancelling the caller must still leave the task itself untouched.
+func (s *testServer) waitTaskExit(t *testing.T, exec engine.Execution) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		journal, err := engine.LoadJournal(engine.JournalPath(s.config.StateDir))
+		if err == nil {
+			if task, ok := journal.Tasks[exec.EffectKey()]; ok && task.Owner.PID > 0 {
+				if errors.Is(syscall.Kill(task.Owner.PID, 0), syscall.ESRCH) {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("detached node task did not exit before fixture cleanup")
+}
+
 func (s *testServer) Close() {
 	s.mu.Lock()
 	if s.closed {

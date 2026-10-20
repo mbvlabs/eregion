@@ -68,6 +68,8 @@ var nodeTransportEnvironment = []string{
 func (a *app) runtimeSpecs() []spec {
 	submitMeta := operationMeta("Submit a harmless durable diagnostic operation", "eregion operations test --idempotency-key ci:diagnostic-1 --json")
 	submitMeta.Mutating, submitMeta.DryRun = true, true
+	followMeta := operationMeta("Follow an operation's durable state and events", "eregion operations follow op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output ndjson")
+	followMeta.Output = "events"
 	cancelMeta := operationMeta("Request cancellation at a diagnostic safe boundary", "eregion operations cancel op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json")
 	cancelMeta.Mutating = true
 	cancelMeta.DryRunReason = "Cancellation is an idempotent request, not a deployment plan; inspect state with operations get."
@@ -103,7 +105,10 @@ func (a *app) runtimeSpecs() []spec {
 				cmd.Flags().Int("step-delay-ms", 100, "Delay per step (0–1000 ms)")
 				cmd.Flags().Int("fail-until-attempt", 0, "Intentionally fail attempts up to this number (0–3)")
 				cmd.Flags().Bool("dry-run", false, "Validate with the API without inserting an operation or job")
+				cmd.Flags().Bool("follow", false, "Follow the submitted operation after it is accepted")
+				followFlags(cmd)
 			}, run: a.submitTest},
+			{use: "follow <operation_id>", meta: followMeta, args: oneID, flags: followFlags, run: a.follow},
 			{use: "get <operation_id>", meta: operationMeta("Read the authoritative operation snapshot", "eregion operations get op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json"), args: oneID, run: func(cmd *cobra.Command, args []string) (result, error) {
 				client, err := a.client(cmd)
 				if err != nil {
@@ -171,7 +176,16 @@ func (a *app) submitTest(cmd *cobra.Command, _ []string) (result, error) {
 	delay, _ := cmd.Flags().GetInt("step-delay-ms")
 	fail, _ := cmd.Flags().GetInt("fail-until-attempt")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	follow, _ := cmd.Flags().GetBool("follow")
 	key, _ := cmd.Flags().GetString("idempotency-key")
+	if dryRun && follow {
+		return result{}, contract.NewFault(contract.Usage, "--follow cannot be combined with --dry-run", "Submit without --dry-run to follow a durable operation.")
+	}
+	if follow {
+		if err := validateFollow(cmd); err != nil {
+			return result{}, err
+		}
+	}
 	if !dryRun && key == "" {
 		return result{}, contract.NewFault(contract.InputRequired, "--idempotency-key is required", "Choose a stable key and reuse it if submission times out.")
 	}
@@ -190,7 +204,17 @@ func (a *app) submitTest(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	response, err := client.Test(cmd.Context(), input, key, dryRun)
-	return apiResult(response), err
+	if err != nil {
+		return result{}, err
+	}
+	if follow {
+		var operation contract.Operation
+		if json.Unmarshal(response, &operation) != nil || operation.Validate() != nil {
+			return result{}, contract.NewFault(contract.Unavailable, "API returned unreadable operation data", "Check binary compatibility; do not assume an unrecognized result means work was not accepted.")
+		}
+		return a.followOperation(cmd, client, operation.ID)
+	}
+	return apiResult(response), nil
 }
 
 func (a *app) database(ctx context.Context) (*pgxpool.Pool, error) {

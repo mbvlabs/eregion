@@ -1,0 +1,24 @@
+eregion · 127.0.0.1:8080 · diagnostic.test
+control-plane
+op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+⠋ RUNNING · attempt 1 · elapsed 10.0s
+EXECUTION STAGES
+> ✓ preflight          completed
+  ◐ build              running · attempt 1
+
+1 completed · 1 active
+────────────────────────────────────────────────────────────────────────────────
+EVENTS · 6 shown · 6 observed
+12:00:00     1 state accepted durably                                           
+12:00:01     2 state worker started                                             
+12:00:02     3 step preflight node step started                                 
+12:00:03     4 step build node step started                                     
+12:00:04     5 progress 2/5 steps effect acknowledged durably                   
+12:00:05     6 log build building image                                         
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+● live · last observation 0ms ago · following · 6 events
+space pause scroll · tab pane · ? help · q detach

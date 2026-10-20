@@ -118,11 +118,18 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 	if err := json.Unmarshal(raw, &data); err != nil {
 		t.Fatal(err)
 	}
-	if len(data.Commands) != 13 {
-		t.Fatalf("unexpected command catalog: %s", raw)
+	implemented := newApp()
+	if len(data.Commands) != len(walk(implemented.root)) {
+		t.Fatalf("catalog does not match implemented tree: %d commands", len(data.Commands))
 	}
+	seen := map[string]bool{}
 	for _, command := range data.Commands {
-		if command.Prompts || command.Output != "result" || command.Destructive {
+		if seen[command.Path] {
+			t.Fatalf("duplicate catalog command: %s", command.Path)
+		}
+		seen[command.Path] = true
+		events := command.Path == "eregion operations follow" && command.Output == "events"
+		if command.Prompts || (command.Output != "result" && !events) {
 			t.Fatalf("advertised unimplemented behavior: %+v", command)
 		}
 		if command.Mutating && !command.DryRun && command.DryRunReason == "" {
@@ -134,6 +141,11 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 		}
 		if !flags["json"] || !flags["output"] || !flags["help"] {
 			t.Fatalf("missing inherited/help flags: %+v", command)
+		}
+	}
+	for _, path := range []string{"eregion operations follow", "eregion platform submit", "eregion platform fleet", "eregion ui", "eregion secret list", "eregion upgrade check"} {
+		if !seen[path] {
+			t.Fatalf("missing implemented product command: %s", path)
 		}
 	}
 }
