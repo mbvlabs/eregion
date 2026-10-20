@@ -4,10 +4,12 @@ An **agent-first** self-hosted application platform for user-owned Debian and Ub
 servers. Human terminal experiences come second, with a rich Charm-based interface
 planned on top of the same machine-readable contracts. A web UI can come later.
 
-**Current state: M0.2 — durable diagnostic operations.** The authenticated API,
-external PostgreSQL state, explicit migrations, and River workers are implemented.
-The diagnostic operation changes only database records/events. Host bootstrap,
-deployments, remote node execution, and the Charm viewer are not implemented yet.
+**Current state: M0.3 — node execution and recovery boundary (local transport).**
+The authenticated API, external PostgreSQL state, versioned migrations, River
+workers, a Check/Apply step engine, a durable node journal, and a local node-dispatch
+transport are implemented. The diagnostic operation writes only marker files under
+the node state directory. Pinned SSH and userspace WireGuard transports, host
+bootstrap, deployments, and the Charm viewer are not implemented yet.
 
 ## Build and explore
 
@@ -44,6 +46,8 @@ Server support will be a separate Debian/Ubuntu VM matrix once host operations e
 ## Design and contracts
 
 - [Implementation roadmap](docs/roadmap.md)
+- [M0.3 execution plan](docs/m0.3-plan.md)
+- [Next transport increments](docs/ssh-wireguard-next.md)
 - [Agent/wire contracts and exit codes](docs/contracts.md)
 - [Control-plane setup and API](docs/control-plane.md)
 - [Research and architecture](docs/initial_research.md)
@@ -51,5 +55,5 @@ Server support will be a separate Debian/Ubuntu VM matrix once host operations e
 - [Versioned JSON Schema](schema/eregion-v1.json)
 
 The intended control plane uses external PostgreSQL and River, role-focused
-servers, an early automation API, and external telemetry integrations. M0.2 proves
-durable execution with database-only diagnostics; it is not a production PaaS yet.
+servers, an early automation API, and external telemetry integrations. M0.3 proves
+durable local node execution and recovery; it is not a production PaaS yet.

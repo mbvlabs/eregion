@@ -1,8 +1,10 @@
-# M0.2 control-plane setup
+# M0.3 control-plane setup
 
-The first vertical slice is **diagnostic.test**, not deployment. It records
-database-only steps, progress, retries, cancellation, and terminal state. No shell
-commands, host configuration, image builds, or application changes run.
+The first vertical slice is **diagnostic.test**, not deployment. It runs through the
+node-dispatch boundary and records progress, retries, cancellation, and terminal
+state. Each step creates one marker file under the node's private state directory. No
+shell commands, service/package/network configuration, image builds, or application
+changes run.
 
 ## Database and execution decisions
 
@@ -11,25 +13,92 @@ commands, host configuration, image builds, or application changes run.
 - Use native `pgx` transactions and River's `riverpgxv5` driver, pinned to River
   0.40.0 as in the deploycrate-ce research. This preserves its transactional
   enqueueing approach without introducing Bun or fx.
-- Explicit migrations only: API/worker startup checks schema versions/checksums
-  and fails closed if migrations are missing, incompatible, or edited.
+- Explicit, ordered migrations only: API/worker startup checks every version's
+  checksum and fails closed if a migration is missing, newer, or edited. Version 2
+  adds `eregion_operation_steps`; the version 1 checksum is unchanged.
 - Migration processes serialize with a dedicated PostgreSQL session advisory lock.
   River versions commit individually because PostgreSQL enum changes require it;
   domain DDL is transactional. Interrupted migration is resumable, not globally
   atomic across every version. Services remain unready until migration completes.
 - Submission commits operation, River job, and accepted event together. Scoped
   idempotency keys bind normalized input hashes. Conflicting inputs return conflict.
-- Each database-only step and progress event commits in a short row-locked
-  transaction. No transaction stays open during a simulated work delay.
+- Each step row and progress event commits in a short row-locked transaction. No
+  transaction stays open while a node command runs.
 - Diagnostic jobs allow three attempts, retry after attempt-number seconds, time
   out after one minute, and become rescue-eligible after two minutes. Actual rescue
   also depends on River maintenance/election cadence; this is not a failover SLA.
 - A River maintenance job reconciles discarded/missing execution records to visible
-  domain failure. Operation history is independent of River job retention. Events
-  are not pruned yet; missing history returns an explicit cursor precondition error.
+  domain failure, or leaves them running with a warning while the node effect still
+  holds a live local lock. Operation history is independent of River job retention.
+  Events are not pruned yet; missing history returns an explicit cursor precondition
+  error.
 
-These guarantees cover database-only diagnostics, not safe replay of remote side
-effects. Durable node execution and fencing remain M0.3 work.
+These guarantees cover the local node boundary. Pinned SSH and userspace WireGuard
+transports, remote node supervision, and distributed leases remain future work.
+
+## Local node execution and recovery
+
+The worker calls a `node.Transport`, not a shell or SSH directly. The only implemented
+adapter is in-process `local`; pinned SSH and userspace WireGuard will implement the
+same `Call(ctx, Request, onEvent)` interface.
+
+Execution identity is `op_<id>:<attempt>:<step>`; the stable effect key is
+`op_<id>:<step>`. The attempt changes on retry, the effect key does not. Before every
+dispatch the worker checks both the PostgreSQL step row and the node's durable status.
+A completed effect is acknowledged, never re-run.
+
+`EREGION_NODE_STATE_DIR` is one shared directory per host (default for a non-root CLI:
+`$XDG_STATE_HOME/eregion/node` or `~/.local/state/eregion/node`). Every worker process
+on that host must use the same directory. A production service should set an explicit
+root-owned path such as `/var/lib/eregion/node`. Layout:
+
+```text
+<state>/journal.json              durable per-effect execution journal
+<state>/journal.json.lock         short journal read-modify-write lock
+<state>/host.lock                 global local host-mutation flock
+<state>/locks/<sha256>.lock       per-effect flock; ownership/liveness fence
+<state>/effects/<op>/<step>.json  durable effect record
+<state>/effects/<op>/<step>.applied  create-once diagnostic marker
+```
+
+The journal records `running|completed|failed`, `inputs_hash`, attempt, execution ID,
+request ID, owner diagnostics, and the attempt that actually applied the effect. A
+corrupt journal is an explicit `precondition_failed`; it is never reset silently. All
+writes use temp+chmod+fsync+rename+directory-sync. The diagnostic marker uses
+create-once (temp + hard link), so a duplicate application cannot overwrite which
+attempt produced the effect.
+
+`flock` coordinates processes on **one host only**. The effect lock is the liveness
+fence: the kernel releases it when an owner dies. Status tries the lock without waiting;
+success means a `running` journal entry is stale. PostgreSQL row locks plus attempt
+equality fence domain writes, and the `(operation_id, step)` primary key makes
+acknowledgements idempotent. Neither is a distributed lock; multiple control-plane
+instances are not claiming HA.
+
+Reconciliation is a total decision over the database step row and node status:
+
+| DB step | Node | Action |
+| --- | --- | --- |
+| completed | any, same hash | Skip; already acknowledged |
+| completed | any, different hash | `precondition_failed`; never re-apply |
+| incomplete | completed, same hash | Acknowledge once and emit a recovery event |
+| incomplete | running (live lock) | Attach/retry; never start a parallel Apply |
+| incomplete | stale/absent/failed | Run under the effect lock; Check decides |
+
+A worker crash or a lost transport response leaves the journal/effect record behind.
+The retried River job first asks status, acknowledges the completed effect, and only
+then continues. A River job discarded while the node effect is still live-running is
+not failed by reconciliation; it stays `running` with a warning until the effect
+settles. This covers local effects only.
+
+Cancellation is separate from detaching a viewer or client. `operations get`,
+`operations events`, a closed connection, or an interrupted request never cancel.
+Only `RequestCancel` sets `cancelling`. Every diagnostic step is atomic and declares
+an `after_apply` boundary: the worker starts no new step after observing cancellation,
+but lets an in-flight step finish and acknowledges it. Completed effects are not rolled
+back. If all steps finished, the honest terminal state is `succeeded`; otherwise
+`cancelled`. River job timeout or process shutdown is not a cancellation request; it
+may leave a `running` journal entry that the next attempt reconciles through Check.
 
 ## Start a local development control plane
 
@@ -41,6 +110,7 @@ use `sslmode=disable` only with literal loopback hosts, not `localhost`.
 ```sh
 # Example shape only: obtain real credentials without putting them in shell history.
 export EREGION_DATABASE_URL='postgres://USER:PASSWORD@database.example/eregion?sslmode=verify-full'
+export EREGION_NODE_STATE_DIR="$PWD/.local/node-state"  # one shared directory per host
 just build
 bin/eregion system migrate --dry-run --json
 bin/eregion system migrate --json
@@ -102,9 +172,10 @@ bin/eregion worker --concurrency 2
 ```
 
 Each process uses `EREGION_DATABASE_URL`. Only API processes need
-`EREGION_AUTH_FILE`; only operator clients need `EREGION_API_TOKEN`. Multiple
-workers/control-plane processes share PostgreSQL and River, with distinct generated
-River client IDs. This is not yet a complete HA deployment design.
+`EREGION_AUTH_FILE`; only operator clients need `EREGION_API_TOKEN`. Every worker on
+one host must use the same `EREGION_NODE_STATE_DIR`; separate hosts need separate
+directories. Multiple workers/control-plane processes share PostgreSQL and River, with
+distinct generated River client IDs. This is not yet a complete HA deployment design.
 
 API/worker commands run in the foreground. Lifecycle logs go to stderr; `--json`
 emits the final result on stdout when the service stops. SIGINT/SIGTERM initiate
@@ -161,10 +232,17 @@ random `eregion_test_*` databases and drop only those databases. They never fall
 back to `EREGION_DATABASE_URL`. Default unit tests skip database tests when the test
 URL is absent; `just integration` fails rather than silently skipping.
 
-Coverage includes concurrent migrations, enqueue/commit rollback injection,
+Coverage includes concurrent versioned migrations, enqueue/commit rollback injection,
 concurrent submission deduplication, two worker clients, cursor replay, retry
-exhaustion, cancellation, discarded-job reconciliation, and real CLI/API/worker
-processes with graceful shutdown. Crash recovery kills a separate worker process
-and advances only its test database's stale timestamps to exercise River rescue
-without waiting for the production rescue threshold. This does not simulate remote
-host execution or prove full fleet HA.
+exhaustion, cancellation before start and at a step boundary, viewer detach,
+discarded-job reconciliation, and real CLI/API/worker processes with graceful
+shutdown. Recovery tests inject a failure between the node effect and its database
+acknowledgement, drop a transport response after dispatch, and kill a separate worker
+process. Each asserts exactly one marker file, one completed step row, and one
+progress event per step. Reconciliation is also tested not to fail an operation while
+its node effect still holds a live local lock. This does not simulate remote host
+execution or prove full fleet HA.
+
+The `local` transport is in-process. There is no SSH, WireGuard, node enrollment,
+remote supervision, or multi-host conflict scope yet; see
+[next transport increments](ssh-wireguard-next.md).

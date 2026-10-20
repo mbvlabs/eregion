@@ -1,10 +1,11 @@
 # Agent and operation contracts
 
-**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts and M0.2 diagnostic execution.
+**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts, M0.2 diagnostic execution, and the M0.3 local node boundary.
 
-CLI discovery, operation persistence, HTTP transport, scoped authorization, and
-transactional River insertion are implemented. Token issuance, destructive-operation
-confirmations, remote execution, and interactive viewing are not. See
+CLI discovery, operation persistence, HTTP transport, scoped authorization,
+transactional River insertion, and local node dispatch are implemented. Token
+issuance, destructive-operation confirmations, pinned SSH/WireGuard transports, and
+interactive viewing are not. See
 [control-plane setup](control-plane.md) for the current API and limitations.
 
 ## Compatibility
@@ -108,6 +109,9 @@ text. Cobra argument/flag errors become typed usage/input errors.
 - The same scoped key/input returns the original operation; the same scoped key
   with different input fails with `conflict`. Database constraints and transactional
   insertion enforce this across control-plane processes in M0.2.
+- A different idempotency key is deliberately a different operation, even with the
+  same input. Its node effect key also differs. Deduplication is scoped by
+  authenticated actor, kind, target, and key, not by input alone.
 - A timed-out submission is ambiguous: reuse its idempotency key to discover the
   original outcome. Never blindly submit again with a fresh key.
 
@@ -136,16 +140,50 @@ the corrective-link persistence model and terminal retry command remain future w
 
 A cancellation request is not an acknowledgement. Work can complete while a
 request is in flight or after reaching a noninterruptible boundary. Leaving a
-viewer never invokes request-cancel.
+viewer never invokes request-cancel. The worker observes cancellation at explicit
+step boundaries: it starts no new step, but lets an atomic in-flight step finish and
+acknowledges its effect. Completed effects are not rolled back. If every step had
+already completed, `succeeded` is the honest terminal state; otherwise `cancelled`.
 
 “Connecting”, “loading”, “stale”, and “reconnecting” are client observation states,
 not operation states. A stale viewer must say **last known**, not assert execution
 has stopped or is still healthy.
 
+## Node execution identity and reconciliation
+
+M0.3 introduces two internal identifiers, both derived from the public operation ID:
+
+- **execution identity:** `op_<id>:<attempt>:<step>`, persisted in the node journal
+  and in the step row while running;
+- **effect key:** `op_<id>:<step>`, stable across attempts.
+
+The public operation snapshot and event sequence do not change. A `step` event may
+carry the optional additive `execution_id` field. No other event kind may carry it,
+and no client needs it to submit, read, follow, or cancel an operation.
+
+Before dispatching a step, the worker checks the PostgreSQL step row and then the
+node's durable status. A completed effect is acknowledged, not re-run. A live-running
+node effect is attached/retried, never started a second time. A completed effect with
+a different canonical inputs hash is `precondition_failed`. River arguments still
+contain only the operation ID; no secret material enters events, step rows, or River
+arguments.
+
+Exactly-once applies to the **effect key**. Duplicate submissions with one scoped
+idempotency key share one operation and one effect key. River retries and lost
+acknowledgements reuse the same effect key. A different idempotency key is a different
+operation and therefore a different effect; future corrected retries of terminal work
+must make their steps convergent rather than assuming the old effect is reused.
+
+The local transport uses node-local `flock` plus a journal. It coordinates processes
+on one host; it is not a distributed lock. SSH and userspace WireGuard transports are
+future increments and will not change the worker's decision procedure.
+
 ## Events, cursors, and NDJSON
 
 Events have operation ID, monotonically increasing per-operation sequence,
 timestamp, kind, and attempt, with optional stage/message/state/measurement fields.
+A `step` event may also carry the optional additive `execution_id`; M0.2 readers that
+ignore unknown fields remain compatible.
 Timestamps are RFC 3339; producers use UTC. Sequences—not timestamps—define order.
 Sequence starts at 1. Cursor `after` may be 0. Accepted M0.2 snapshots contain at
 least their accepted-event sequence; zero represents pre-acceptance in shared types.

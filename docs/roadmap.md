@@ -12,7 +12,8 @@ exceptional Charm-based terminal interface. Neither client owns execution lifeti
 
 This is a dependency-ordered plan, not a delivery-date estimate. Checkboxes denote
 verified deliverables, not the presence of placeholder commands. M0.1 and M0.2 are
-implemented; later milestones remain planned. Browser sketches use synthetic data.
+implemented, and M0.3's local execution boundary is implemented; remote transports and
+later milestones remain planned. Browser sketches use synthetic data.
 
 ## Constraints that apply to every milestone
 
@@ -29,6 +30,8 @@ implemented; later milestones remain planned. Browser sketches use synthetic dat
 - Remote effects are at-least-once; use idempotency, scoped coordination, and
   reconciliation. River queue concurrency is not a distributed environment lock.
 - No bundled ClickHouse. Operation history works without an observability backend.
+  Telemetry storage direction (see M5): store application telemetry in PostgreSQL,
+  sized for solo operators and small businesses, rather than requiring an external stack.
 - Deliver a human-visible improvement alongside each agent-capable vertical slice.
 
 ## M0 — Prove one durable operation (research Phase 0)
@@ -78,18 +81,22 @@ No remote host execution, deployment, interactive viewer, or complete HA claim y
 
 ### M0.3 — Node execution and recovery boundary
 
-- [ ] Adapt Check/Apply, journal/input hashes, atomic writes, and shell redaction.
-- [ ] Run the test operation locally through node dispatch first; add pinned SSH
-  and userspace WireGuard as separate transport increments with separate tests.
-- [ ] Define durable node execution identity and attach/status behavior for remote
-  tasks. If SSH or an orchestration worker dies, determine whether the node task
-  continues before retrying; never blindly launch a second build/deployment.
-- [ ] Persist and reconcile completed side effects when the corresponding database
-  acknowledgement was interrupted. Test failure between effect and acknowledgement.
-- [ ] Define cancellation boundaries independently from detaching a viewer.
+- [x] Adapt Check/Apply, journal/input hashes, atomic writes, and shell redaction.
+- [x] Run the test operation locally through node dispatch. The transport interface
+  is deliberately independent of the local implementation.
+- [ ] Add pinned SSH and userspace WireGuard as separate transport increments with
+  separate tests. This remains the remote half of the milestone.
+- [x] Define durable local node execution identity and attach/status behavior. A
+  retried job asks the node before dispatching and never starts a second live effect.
+  Remote supervision/reattachment remains part of the transport increment.
+- [x] Persist and reconcile completed side effects when the corresponding database
+  acknowledgement was interrupted, including tests that fail between effect and
+  acknowledgement.
+- [x] Define cancellation boundaries independently from detaching a viewer.
 
-**Gate:** local and remote test paths report honest results; duplicate requests and
-lost acknowledgements cannot duplicate the test side effect.
+**Gate (local):** the local test path reports honest results; duplicate requests and
+lost acknowledgements cannot duplicate the test side effect. The remote gate remains
+open until the SSH/WireGuard increments land.
 
 ### M0.4 — First real Charm view
 
@@ -173,14 +180,18 @@ has a tested recovery path. Additional engines require explicit scope decisions.
 
 ## M5 — Telemetry and network integrations (research Phase 5)
 
-- [ ] External metrics/log/trace integration, with documented collector/backend
-  examples and no bundled ClickHouse requirement.
+- [ ] Expose an OpenTelemetry (OTLP) endpoint for applications and store their logs,
+  metrics, and traces in PostgreSQL with bounded retention. The target is solo
+  operators and small businesses, so no separate observability backend is required.
+- [ ] Optional export to an external observability stack, with documented examples
+  and no bundled ClickHouse requirement.
 - [ ] CLI log access and optional terminal graphs with source, unit, time window,
   timestamp, and honest stale/no-data/backend-unconfigured states.
 - [ ] Cloudflare DNS reconciliation through River, custom routes, and private
   access device/grant operations with auditable authorization.
 
-**Gate:** a documented external observability stack receives data, DNS reconciles,
+**Gate:** application telemetry is stored in PostgreSQL and examinable from the CLI,
+logs are searchable/tailable, DNS reconciles,
 and private access is enforced. Agent operation diagnosis still works without it.
 
 ## M6 — Webhooks and expanded terminal workflows (research Phase 6)
@@ -214,19 +225,24 @@ These are unresolved, not silently approved by the sketches:
   Suggested starting API: HTTP JSON plus cursor-based SSE or NDJSON events.
 - **Before M0.3:** remote execution supervision/reattachment and ownership fencing;
   distributed conflict scopes. Local `flock` only protects local host mutations.
+  The local decisions are recorded in the [M0.3 plan](m0.3-plan.md); remote
+  supervision and distributed conflict scopes remain open for
+  [the SSH/WireGuard increments](ssh-wireguard-next.md).
 - **Before M1:** Debian/Ubuntu releases and architectures; external database hosting
   boundary; public/private API exposure; public SSH posture; migration ownership.
 - **Before M2:** role combinations/resource-hosting role; build isolation; minimum
   HA deployment and artifact/secret availability.
-- **Before M5:** collector packaging, local log access/buffering/retention, external
-  data-source interface, and default telemetry collection cost.
+- **Before M5:** PostgreSQL telemetry schema, partitioning/retention, and write volume
+  limits (isolation from operation tables); collector packaging; external export
+  interface; and default telemetry collection cost.
 
 ## First implementation batch
 
-M0.1 and M0.2 are complete; begin **M0.3** next, keeping commits reviewable. Use synthetic operation
-fixtures from the sketches to test output and reducer contracts while PostgreSQL
-integration is built. Add the real Charm operation viewer in M0.4, not a separate
-demo CLI that grows its own business logic.
+M0.1 and M0.2 are complete, and M0.3's local execution/recovery boundary is
+implemented. Next are the pinned SSH and userspace WireGuard transports, then M0.4's
+Charm viewer. Use synthetic operation fixtures from the sketches to test output and
+reducer contracts. Add the real Charm operation viewer in M0.4, not a separate demo CLI
+that grows its own business logic.
 
 Do not port the entire command catalog, deploy real services, or advertise working
 deployments in this first batch. Its output is one trustworthy vertical slice.
