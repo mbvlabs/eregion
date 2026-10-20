@@ -52,7 +52,7 @@ def main():
 
     # Long enough that the terminal matrix detaches before the operation ends.
     operation = cli("operations", "test", "--idempotency-key", "terminal:" + uuid.uuid4().hex,
-                    "--steps", "30", "--step-delay-ms", "1000")
+                    "--steps", "20", "--step-delay-ms", "1000")
     operation_id = operation["id"]
     for name, overrides, extra in TERMINAL_MODES:
         env = dict(base_env)
