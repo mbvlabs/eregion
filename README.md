@@ -11,7 +11,10 @@ step engine, node dispatch, pinned SSH and userspace WireGuard transports, the
 Charm operation viewer, host bootstrap, node enrollment, Buildpacks releases,
 deployments and rollback, PostgreSQL resources and backups, telemetry/log reads,
 Cloudflare DNS and private-access grants, GitHub webhooks, signed upgrades, and
-guided terminal workspaces are in this tree.
+guided terminal workspaces are in this tree. Two cross-node build bullets remain
+open: dedicated build credentials and registry artifact movement. A distinct
+`build_node` is placement-checked but refused before `pack` until that path
+exists, rather than pretending a local image moved to another host.
 
 This is an **experimental v0.1 line**, not a production or HA claim. The
 fresh-VM matrix, a real Cloudflare zone, a real telemetry-node install, and
@@ -58,6 +61,7 @@ just smoke           # real image build, deploy, failed candidate, rollback
 just buildpacks-smoke  # directory-source Buildpacks release, deploy, served body
 just terminal-smoke  # real PTY viewer matrix, detach, replay
 just recovery-drill  # disposable PostgreSQL backup/verify/restore drill
+just controlplane-recovery-drill  # dump/restore the control-plane database
 just upgrade-drill   # signed release, apply, rollback, health restore
 ```
 

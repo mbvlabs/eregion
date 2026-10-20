@@ -1,6 +1,6 @@
 # eregion implementation roadmap
 
-**Status:** Proposed execution plan · 2026-10-16  
+**Status:** Implemented v0.1 vertical slices · 2026-10-20  
 **Product direction:** [Initial research](initial_research.md), Sections 4–5  
 **Terminal direction:** [TUI design](tui-design.md) · [interactive sketches](design/tui-sketches.html)
 
@@ -11,10 +11,35 @@ without a terminal or a browser. A human can use the same contracts through an
 exceptional Charm-based terminal interface. Neither client owns execution lifetime.
 
 This is a dependency-ordered plan, not a delivery-date estimate. Checkboxes denote
-verified deliverables, not the presence of placeholder commands. M0.1, M0.2, and
-M0.3 are implemented: M0.3's local execution boundary, its pinned SSH transport, and
-its userspace WireGuard transport all pass the exactly-once scenarios. Later
-milestones remain planned. Browser sketches use synthetic data.
+verified deliverables with local code and tests, not the presence of placeholder
+commands and not a production-infrastructure claim. M0.1–M0.4 and the local
+implementation of M1–M7 are in this tree. Two cross-node build bullets remain
+open, and the fresh-VM, real-Cloudflare, real-telemetry-host, and multi-host
+failover gates cannot be proven from this checkout; those are called out where
+they occur. Browser sketches use synthetic data.
+
+## Evidence in this tree
+
+Run these from a clean checkout. Container/dev prerequisites skip explicitly and
+never silently pass.
+
+```sh
+just check                     # formatting, vet, unit/contract/schema/scripts
+just integration-norace        # PostgreSQL/River/API/process integration
+just transport                 # pinned SSH + WireGuard exactly-once scenarios
+just dev-up
+just smoke                     # real image deploy, dedup, failed candidate, rollback
+just buildpacks-smoke          # directory-source Buildpacks release + deploy
+just terminal-smoke            # real PTY viewer matrix, detach, replay
+just recovery-drill            # resource backup/verify/restore + failed restore
+just controlplane-recovery-drill
+just upgrade-drill             # signed release, apply, rollback, health restore
+just release-check             # the full local v0.1 gate
+```
+
+The v0.1 line does not claim fresh-VM support, real Cloudflare behavior, a live
+telemetry-node install, or automatic HA/failover. See
+[release criteria](release-criteria.md) for the gate-by-gate record.
 
 ## Constraints that apply to every milestone
 
@@ -56,9 +81,11 @@ milestones remain planned. Browser sketches use synthetic data.
 **Gate:** command metadata and output contract tests pass, including redirected
 output, invalid arguments, no-TTY operation, and redaction.
 
-**Delivered:** local `commands`, `help`, and `version`; `eregion/v1` contracts and
-JSON Schema; a future operations service interface and NDJSON serializer, not a
-running service. See [contracts](contracts.md) for invariants and deferred behavior.
+**Delivered:** the `commands`, `help`, `version`, operation, platform, resource,
+network, secret, upgrade, bootstrap, and workspace command families; the
+`eregion/v1` envelope and JSON Schema; metadata validation; deterministic exit
+codes; NDJSON event streaming; and shared client/service boundaries. See
+[contracts](contracts.md).
 
 ### M0.2 — PostgreSQL, River, and the API
 
@@ -78,10 +105,12 @@ running service. See [contracts](contracts.md) for invariants and deferred behav
 **Gate:** a CLI or API client submits once, disconnects, and reconnects to the same
 operation. Two worker instances can run; a worker crash does not lose accepted work.
 
-**Delivered:** native pgx/River transactions, explicit migrations, scoped hashed-token
-API auth, diagnostic submission/read/events/cancel commands, separate API/worker
-entry points, and PostgreSQL/process integration tests. See [setup and limitations](control-plane.md).
-No remote host execution, deployment, interactive viewer, or complete HA claim yet.
+**Delivered:** native pgx/River transactions, explicit migrations, scoped
+hashed-token API auth, durable operation/event/step history, diagnostic and
+platform submission/read/events/cancel/follow commands, separate API/worker
+entry points, readiness/timeouts/graceful shutdown, and PostgreSQL/process
+integration tests. See [control-plane setup](control-plane.md). No complete HA
+claim is made.
 
 ### M0.3 — Node execution and recovery boundary
 
@@ -145,113 +174,208 @@ then reconnect/replay to completion. This does not establish later host/fleet/HA
 
 **Depends on:** M0 and the database/platform/API decisions below.
 
-- [ ] Resumable first contact, credential handoff, and node-local bootstrap journal.
+- [x] Resumable first contact, credential handoff, and node-local bootstrap journal.
   Pre-database bootstrap progress cannot depend on the unavailable platform store.
-- [ ] Debian/Ubuntu compatibility checks and role-aware package/service steps.
-- [ ] Validate external database TLS/permissions, apply migrations safely, install
+- [x] Debian/Ubuntu compatibility checks and role-aware package/service steps.
+- [x] Validate external database TLS/permissions, apply migrations safely, install
   the API/worker service, and expose readiness with useful failure reasons.
-- [ ] Context login/export, scoped automation credentials, ingress/access policy,
-  and commit-confirm for changes that may break operator access.
-- [ ] Guided terminal setup with noninteractive flag parity and a plan/diff view.
-- [ ] Add a second control plane against the same database in integration tests.
+- [x] Context login/export, scoped automation credentials, ingress/access policy,
+  and commit-confirm for changes that may break operator access. The exposure
+  policy is a loopback/TLS listener requirement, access-risk acknowledgement, and
+  commit-confirm watchdog; no reverse proxy or firewall is bundled.
+- [x] Guided terminal setup with noninteractive flag parity and a plan/diff view.
+- [x] Add a second control plane against the same database in integration tests.
 
-**Gate:** supported fresh-host VM matrix passes bootstrap, interrupted resume, and
-idempotent re-apply; the main node installs the application runtime, Buildpacks
-build stack, and container registry, and no telemetry stack. Database outage and competing migration behavior are documented and tested.
+**Gate (local):** passed. Bootstrap plan/apply/resume, remote first contact over
+pinned SSH (disposable fixture), credential-once handoff, commit-confirm rollback,
+idempotent re-apply, competing migrations, and two control planes on one database.
+**Gate (fresh VM):** unproven. The container matrix stubs systemd/Docker/apt; no
+clean Debian/Ubuntu VM install was run here.
+
+**Delivered:** `eregion bootstrap` (local and pinned-SSH remote), resumable
+node-local journal, Debian 12/13 and Ubuntu 22.04/24.04 checks, role-specific
+packages/services (main/application/builder/telemetry), database preflight and
+advisory-locked forward-only migrations, API/worker units, authenticated
+readiness, contexts and private credential files, plan-bound scoped automation
+credentials with action grants, guided Bubble Tea setup with flag parity, and a
+detached commit-confirm watchdog. See [bootstrap](bootstrap.md).
 
 ## M2 — Enroll additional application and builder nodes (research Phase 2)
 
 **Depends on:** M1 and an explicit role/placement policy.
 
-- [ ] Port enrollment, identity verification, capabilities, peer reconciliation,
+- [x] Port enrollment, identity verification, capabilities, peer reconciliation,
   private connectivity, and role-specific host configuration.
 - [ ] Isolate build credentials, caches, concurrency, and source execution from
   runtime workloads; never accept a hostname as sufficient authorization.
-- [ ] Implement nodes list/status/check and operation-backed enrollment/retry.
+  Caches, source allowlisting, scrubbed build environments, per-node build slots,
+  and identity checks are implemented. Dedicated build credentials and
+  cross-node artifact movement are not; a distinct `build_node` is refused
+  before `pack` rather than pretending the image moved.
+- [x] Implement nodes list/status/check and operation-backed enrollment/retry.
 - [x] Add a fleet terminal view with role labels, health, freshness, and focused
   node details. Empty and unreachable states are first-class.
 
-**Gate:** application and builder nodes enroll on the supported distro matrix and cannot receive
-work outside their declared placement/capability constraints.
+**Gate (local):** passed for placement and identity. Nodes enroll over pinned SSH,
+prove a node-generated identity, expose probed capabilities, reconcile WireGuard
+peers, and cannot receive work outside their declared role/capability constraints.
+**Gate (distro matrix):** unproven. Enrollment is exercised against the Debian 12
+fixture, not every supported Debian/Ubuntu release and architecture.
+
+**Delivered:** enrollment over pinned SSH, identity attestation and first-use
+pinning, capability probing, role validation (including telemetry and registry),
+WireGuard key/address/peer reconciliation, role-specific host configuration,
+quarantine on identity swap, `platform nodes list/status/check/enroll/retry/reconcile/register`,
+and the keyboard-driven fleet workspace. See [nodes](nodes.md).
 
 ## M3 — Build and deploy from CLI or CI (research Phase 3)
 
 **Depends on:** M2; durable remote task recovery must already work.
 
-- [ ] Port apps/environments, revisioned secrets, sources/targets, releases,
+- [x] Port apps/environments, revisioned secrets, sources/targets, releases,
   deployment records, desired/applied state, and change history into PostgreSQL.
 - [ ] Port River build/release-command/deploy workers, Buildpacks execution on the
   main node or builder nodes, registry/artifact handling, and runtime placement.
-- [ ] Implement preflight → candidates → health → traffic switch → verification →
+  River workers, directory/git/image sources, release commands, placement, and
+  Buildpacks on a co-located or builder node are implemented. The installed
+  registry is not yet on the release/deploy path, so a distinct builder node is
+  refused instead of pretending a local image is available on the app node.
+- [x] Implement preflight → candidates → health → traffic switch → verification →
   cleanup, plus rollback and incomplete-operation reconciliation.
-- [ ] Add scoped CI deployment triggers, request deduplication, operation polling,
+- [x] Add scoped CI deployment triggers, request deduplication, operation polling,
   follow/reconnect, safe retry/cancel, and dry-run plans.
 - [x] Expand the terminal operation view with per-target state, build logs, explicit
   health observations, and a visible statement of which release is serving.
 
-**Gate:** a Go sample app builds and deploys from CLI and CI/API, survives viewer and
-worker loss, swaps traffic safely, and rolls back. Duplicate CI requests do not
-create duplicate deployments. A failed candidate leaves the serving release intact.
+**Gate (local CLI/API):** passed. `just smoke` builds and deploys real images,
+deduplicates submissions, preserves the serving release after a failed candidate,
+follows events through the CLI, and rolls back. `just buildpacks-smoke` builds the
+sample directory source with Buildpacks, deploys it, and verifies the served body.
+Worker loss, lost acknowledgements, competing operations, and node loss during a
+deploy are covered by PostgreSQL integration tests.
+**Gate (CI end-to-end):** partially proven. A signed GitHub delivery is tested
+through the mounted mux into the real operation service with duplicate-delivery
+deduplication; a push submits a durable release build, not an automatic deploy.
+
+**Delivered:** PostgreSQL apps/environments/releases/deployments/change history,
+revisioned encrypted secrets, River build/deploy/rollback workers, Buildpacks and
+image sources, preflight, release commands, candidate health, traffic switch,
+post-switch verification, durable cleanup, rollback, reconciliation, scoped CI
+action grants, webhook dedup, polling/follow, retry/cancel, dry-run plans, and a
+per-target Charm operation view. See [platform contract](platform-contract.md).
 
 ## M4 — Resources and recovery (research Phase 4)
 
-- [ ] PostgreSQL application resources first: credentials, endpoints, volumes,
+- [x] PostgreSQL application resources first: credentials, endpoints, volumes,
   placement, connectivity, health, and guarded lifecycle operations.
-- [ ] River-backed backup destinations, schedules, execution, verification,
-  retention, safety backups, and confirmed restore.
-- [ ] Keep the external control-plane database outside ordinary application-resource
+- [x] River-backed backup destinations, schedules, execution, verification,
+  retention, safety backups, and confirmed restore. One explicit filesystem
+  backup destination is supported; there is no object-store driver yet.
+- [x] Keep the external control-plane database outside ordinary application-resource
   destruction. Document and exercise its separate recovery procedure.
 - [x] Add resource/backup terminal views and destructive plan/confirmation screens.
 
-**Gate:** app-to-database access and backup/verify/restore drills pass; failed restore
-has a tested recovery path. Additional engines require explicit scope decisions.
+**Gate (local):** passed. Resource creation/health/connectivity, backup/verify,
+confirmed restore, failed-restore rollback, safety backup verification, declared
+schedules, retention, verify-after, and the separate control-plane dump/restore/
+readiness drill all pass against disposable PostgreSQL.
+**Gate (deployed app):** connectivity is tested from a real pgx client on the
+host, not from a deployed application container. Only PostgreSQL is in scope.
+
+**Delivered:** labelled PostgreSQL containers and volumes with verified host
+identity, generated and exported credentials, endpoint/health probes, guarded
+destroy, River-backed backups with manifests/SHA-256, schedules, retention,
+safety backups, confirmed restore with rollback, a durable restore journal and
+recover action, exclusion of the control-plane database, an exercised separate
+control-plane recovery procedure, and resource/backup terminal workspaces. See
+[resources](resources.md).
 
 ## M5 — Telemetry node and network integrations (research Phase 5)
 
 **Depends on:** M2 node enrollment and role/placement policy.
 
-- [ ] Add a `telemetry` node role, enrolled and managed like other nodes (Check/Apply
+- [x] Add a `telemetry` node role, enrolled and managed like other nodes (Check/Apply
   steps, health, upgrades). It is never co-located with the control plane.
-- [ ] Install an opinionated, self-hosted stack on that node: OpenTelemetry Collector
+  The role is enrollable, host-prepped with Docker/Compose, refused with
+  `control-plane`, and its stack actions use the shared River/node path. Stack
+  re-install is the upgrade mechanism; there is no separate telemetry-upgrade
+  command.
+- [x] Install an opinionated, self-hosted stack on that node: OpenTelemetry Collector
   ingest, metrics/log/trace storage with bounded retention, and unmodified Grafana
   with eregion-authored dashboards and alerting defaults.
-- [ ] Expose OTLP for applications; run a collector on application/build nodes that
+- [x] Expose OTLP for applications; run a collector on application/build nodes that
   ships container logs and host/service metrics to the telemetry node over the
   private network with per-node credentials.
-- [ ] CLI log access and optional terminal graphs that query the telemetry node
+- [x] CLI log access and optional terminal graphs that query the telemetry node
   through a data-source interface, with source, unit, time window, timestamp, and
   honest stale/no-data/no-telemetry-node states.
-- [ ] Optional export to an external observability stack instead of, or in addition
-  to, the telemetry node.
-- [ ] Cloudflare DNS reconciliation through River, custom routes, and private
-  access device/grant operations with auditable authorization.
+- [x] Optional export to an external observability stack instead of, or in addition
+  to, the telemetry node. External-only is implemented for the per-node OTLP
+  agent; the stack installer remains additive.
+- [x] Cloudflare DNS reconciliation through River, custom routes, and private
+  access device/grant operations with auditable authorization. DNS records are
+  explicit desired records; private access covers device inventory and
+  expiring grants, not device enrollment or a bundled tunnel client.
 
-**Gate:** a telemetry node enrolls, receives application OTLP data and node logs/
-metrics, serves Grafana dashboards, and the CLI can search/tail logs from it; DNS
-reconciles and private access is enforced. Agent operation diagnosis still works
-with no telemetry node.
+**Gate (local interface):** passed. The CLI returns source/window/unit/timestamp
+and distinct ok/no-data/stale/absent states; agent, install, and credential
+actions validate placement and never persist plaintext tokens.
+**Gate (real infrastructure):** unproven. No telemetry VM, Docker Compose stack,
+Grafana dashboard/alert evaluation, live OTLP delivery, Cloudflare zone, or real
+private tunnel was exercised in this checkout.
+
+**Delivered:** telemetry/application/builder role placement, production action
+wiring through the per-node resolver, VictoriaMetrics/VictoriaLogs/vmauth/Grafana
+rendering with retention and alert provisioning, OTLP receivers, per-node ingest
+credentials, a hostmetrics/filelog agent, additive and external-only export,
+`logs search/tail`, `metrics query`, workspace graphs, Cloudflare DNS
+plan/reconcile with ownership markers and audit, and private-access grants with
+audit. See [telemetry](telemetry.md) and [network](network.md).
 
 ## M6 — Webhooks and expanded terminal workflows (research Phase 6)
 
-- [ ] Signed GitHub webhook ingestion and deduplicated durable submission using the
+- [x] Signed GitHub webhook ingestion and deduplicated durable submission using the
   same path as CLI/CI. Do not build another queue or deployment implementation.
 - [x] Expand keyboard-driven application/fleet views, guided forms, filters,
   command discovery, and graphs where data is available.
 
-**Gate:** GitHub delivery retries are safe; all interactive actions have documented
-noninteractive equivalents. No web UI is required.
+**Gate (local):** passed. HMAC-verified deliveries, repository/branch allowlists,
+a durable `eregion_webhook_deliveries` reservation that survives operation
+retention, duplicate replay returning the original operation, and conflict on a
+reused delivery ID with different bytes. The handler submits through the real
+`operations.Service`; it does not open a second queue. Interactive forms show
+their exact noninteractive CLI equivalent.
+
+**Delivered:** `POST /v1/webhooks/github` with signed, deduplicated pushes mapped
+to durable release creation; fleet/app/environment/release/deployment/resource/
+backup workspace tabs; filters, details, help, command discovery, and metrics
+graphs through the telemetry data source. See [workspace](workspace.md).
 
 ## M7 — Upgrades and release readiness (research Phase 7)
 
-- [ ] Signed releases, operator/node upgrade and rollback, coordinated control-plane
-  upgrades, compatibility checks, and schema migration policy.
-- [ ] Validate the agreed HA scope: process/node loss, shared database outage,
+- [x] Signed releases, operator/node upgrade and rollback, coordinated control-plane
+  upgrades, compatibility checks, and schema migration policy. Coordinated
+  control-plane upgrade is an inventory-validated operator plan plus sequential
+  commands; it is not autonomous multi-host orchestration.
+- [x] Validate the agreed HA scope: process/node loss, shared database outage,
   competing operations, and interrupted remote acknowledgements.
-- [ ] Complete recovery drills, agent skill/guide generation, security review,
+- [x] Complete recovery drills, agent skill/guide generation, security review,
   installation docs, terminal compatibility tests, and versioned release criteria.
 
-**Gate:** publish only the tested failover guarantees. Multiple worker processes
-alone are not proof of an HA platform.
+**Gate (local/documented HA scope):** passed. Two control planes on one database,
+worker/process loss, interrupted acknowledgements, duplicate submissions,
+cross-process target locks, a connection-level shared-database outage, node loss
+during a deploy, and competing operations are covered by integration tests.
+**Gate (multi-host failover):** unproven. A PostgreSQL primary failover, load-
+balanced control planes, and a live multi-host drill were not run. Publish only
+the tested guarantees; multiple worker processes are not an HA platform.
+
+**Delivered:** Ed25519-signed manifests with strict parsing, artifact size/SHA-256
+verification, compatibility and schema-direction checks, atomic single-host
+apply/rollback with journal and backup, health-checked automatic restore, a
+signed S3 publish workflow, `eregion upgrade check/plan/apply/rollback/verify/guide`,
+`eregion guide`, install/security/release-criteria docs, the terminal TERM matrix,
+and local upgrade/control-plane/resource drills. See [upgrades](upgrades.md).
 
 ## Future direction (not scheduled)
 
@@ -279,38 +403,52 @@ eregion never provisions machines itself.
 
 ## Decisions to make just in time
 
-These are unresolved, not silently approved by the sketches:
+Most of these were decided while implementing; the remaining open items are not
+silently approved by the sketches:
 
-- **Before M0.2:** PostgreSQL versions/TLS/driver; initial auth/scopes; API transport,
-  event replay/retention, operation states, and submission idempotency contract.
-  Suggested starting API: HTTP JSON plus cursor-based SSE or NDJSON events.
-- **Before M0.3:** remote execution supervision/reattachment and ownership fencing;
-  distributed conflict scopes. Local `flock` only protects local host mutations.
-  The local decisions are recorded in the [M0.3 plan](m0.3-plan.md); the SSH
-  decisions are recorded in the [M0.3 SSH plan](m0.3-ssh-plan.md), and the WireGuard
-  decisions in the [M0.3 WireGuard plan](m0.3-wireguard-plan.md). Distributed
-  conflict scopes across nodes remain open for
-  [the SSH/WireGuard increments](ssh-wireguard-next.md).
-- **Before M1:** Debian/Ubuntu releases and architectures; external database hosting
-  boundary; public/private API exposure; public SSH posture; migration ownership.
-- **Before M2:** which roles may combine beyond the main node's defaults (edge role
-  scope, resource-hosting role); how builds and the registry move off the main node;
-  build isolation from runtime workloads on the main node; minimum
-  HA deployment and artifact/secret availability.
-- **Before M5:** telemetry storage engines (license and footprint: e.g. VictoriaMetrics
-  + VictoriaLogs (Apache 2.0) vs Loki/Tempo/Mimir (AGPLv3)); Grafana AGPLv3 posture
-  (ship unmodified upstream) and dashboard licensing; retention and sizing defaults;
-  telemetry-node HA/backup expectations; collector packaging and auth; external
-  export interface.
+- **M0.2 (resolved):** PostgreSQL 17 + native pgx/River; scoped hashed bearer
+  tokens; HTTP JSON plus cursor-based NDJSON events; the operation/idempotency/
+  state contract in [contracts](contracts.md) and [control-plane](control-plane.md).
+- **M0.3 (resolved locally/SSH/WireGuard):** supervision, reattachment, and
+  ownership fencing are recorded in the [M0.3 plan](m0.3-plan.md), [SSH plan](m0.3-ssh-plan.md),
+  and [WireGuard plan](m0.3-wireguard-plan.md). Cross-node distributed conflict
+  scopes remain open ([next increments](ssh-wireguard-next.md)).
+- **M1 (resolved):** Debian 12/13 and Ubuntu 22.04/24.04, amd64/arm64; external
+  PostgreSQL is the only store; non-loopback API requires TLS; migrations use an
+  advisory lock and forward-only checksums; bootstrap owns migration execution.
+  The fresh-VM matrix itself is still unproven.
+- **M2 (partly open):** role combinations are constrained in code (telemetry and
+  control-plane cannot be enrolled; builder+application is refused; a distinct
+  `build_node` is gated). Still open: how builds and registry artifacts move off
+  the main node, dedicated build credentials, and a multi-tenant builder boundary.
+- **M5 (mostly resolved):** VictoriaMetrics/VictoriaLogs (Apache 2.0), vmauth
+  read gateways, optional Tempo, unmodified upstream Grafana, bounded retention,
+  and file-referenced collector credentials. Still open: sizing/HA/backup
+  expectations for the telemetry node and external-only stack install (the
+  external-only agent path exists).
+- **Ingress:** the current policy is loopback/TLS plus commit-confirm and private
+  access grants. A bundled reverse proxy/firewall is a scope decision, not a
+  hidden default.
 
-## First implementation batch
+## Current status and next evidence
 
-M0.1, M0.2, and M0.3 are complete. M0.3's pinned SSH transport is tested against a
-disposable SSH endpoint, both directly and through a userspace WireGuard tunnel to a
-kernel WireGuard node. Next is M0.4's Charm viewer. Use
-synthetic operation fixtures from the sketches to test output and reducer contracts.
-Add the real Charm operation viewer in M0.4, not a separate demo CLI that grows its
-own business logic.
+The v0.1 local product is testable end to end: bootstrap a host, enroll nodes,
+build and deploy an application, observe/reattach/detach, roll back, back up and
+restore, read telemetry, reconcile DNS, revoke access, receive signed webhooks,
+and upgrade/roll back the binary. The remaining work is evidence and hardening,
+not placeholder commands:
 
-Do not port the entire command catalog, deploy real services, or advertise working
-deployments in this first batch. Its output is one trustworthy vertical slice.
+1. Run the fresh-host VM matrix (Debian 12/13 and Ubuntu 22.04/24.04, amd64/arm64)
+   for main, application, builder, and telemetry roles. Record G8 evidence.
+2. Exercise a real Cloudflare zone/token, private-access tunnel, and telemetry VM
+   with live OTLP + Grafana. Record G9 and the M5 real-infrastructure gate.
+3. Implement cross-node artifact movement (registry push/pull and build
+   credentials) so a distinct builder node can receive builds. Close M2.2/M3.2.
+4. Drill PostgreSQL primary failover, load-balanced control planes, and a
+   node-loss/upgrade sequence across hosts. Publish only what passes (G10/M7).
+5. Add a bundled ingress policy (reverse proxy/firewall) if operators should not
+   supply their own; today the API exposure policy is loopback/TLS plus
+   commit-confirm.
+
+Do not advertise production HA, fresh-VM support, or a multi-tenant builder
+boundary before those runs exist. Browser sketches remain synthetic.

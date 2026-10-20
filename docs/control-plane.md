@@ -1,4 +1,4 @@
-# M0.3 control-plane setup
+# Control-plane setup and transport
 
 The first vertical slice is **diagnostic.test**, not deployment. It runs through the
 node-dispatch boundary and records progress, retries, cancellation, and terminal
@@ -34,8 +34,10 @@ changes run.
   error.
 
 These guarantees cover the local node boundary, the pinned SSH transport, and pinned
-SSH inside a userspace WireGuard tunnel. Remote node enrollment and distributed
-leases remain future work.
+SSH inside a userspace WireGuard tunnel. Remote node enrollment, pinned identity,
+and WireGuard peer reconciliation are implemented ([nodes](nodes.md)); a
+cross-node distributed conflict scope and automatic multi-host failover remain
+open ([next increments](ssh-wireguard-next.md)).
 
 ## Local node execution and recovery
 
@@ -342,8 +344,11 @@ ASCII letters/digits/underscore/hyphen characters. The credential file supports
 1–128 entries, explicit scopes, and owner-only regular files (0600/0400). Identity
 comes from the file, never the request body. Other actors receive not-found for
 operation IDs they do not own; no cross-actor administrator role exists yet.
-Token rotation/revocation is a credential-file change plus service restart. Token
-issuance, expiry, login, and dynamic credential administration remain future work.
+Token rotation/revocation is a credential-file change plus service restart.
+`eregion context credential add` issues a plan-bound scoped automation credential
+without printing its token, and contexts support login/list/show/use/export.
+Automatic expiry and a remote rotation API are not implemented; rotation is an
+explicit credential-file change.
 
 Requests are limited to 16 KiB, headers to 8 KiB, and handler contexts to ten
 seconds. Clients time out after fifteen seconds and cap responses at 1 MiB. Errors
@@ -417,6 +422,8 @@ and checks that the WireGuard key is in no table and no worker log. The containe
 tests skip cleanly when Docker, `NET_ADMIN`, or the host's `wireguard` module is
 missing.
 
-The `local` transport is in-process. There is no node enrollment, WireGuard key
-distribution, remote mesh reconciliation, or multi-host conflict scope yet; see
+The `local` transport is in-process. Enrolled application/builder/telemetry nodes
+use their own pinned SSH transport, with node-generated identity attestation and
+WireGuard peer reconciliation. A distributed conflict scope across nodes and
+automatic failover are still open; see [nodes](nodes.md) and
 [next transport increments](ssh-wireguard-next.md).
