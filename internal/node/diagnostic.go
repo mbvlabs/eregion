@@ -96,7 +96,7 @@ func (s *DiagnosticStep) Check(_ context.Context, rt engine.Runtime) (engine.Che
 	if value.OperationID != string(s.exec.OperationID) || value.Step != s.ID() {
 		return engine.CheckResult{}, fmt.Errorf("%w: diagnostic marker %s has the wrong identity", engine.ErrPermanent, s.ID())
 	}
-	return engine.CheckResult{Complete: true, Detail: "diagnostic marker already present"}, nil
+	return engine.CheckResult{Complete: true, Detail: "diagnostic marker already present", AppliedAttempt: value.AppliedAttempt}, nil
 }
 
 func (s *DiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {

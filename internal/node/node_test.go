@@ -238,6 +238,53 @@ func TestRunClassifiesCorruptMarkerAsPermanent(t *testing.T) {
 	}
 }
 
+func TestRecoveredEffectRecordsTheApplyingAttempt(t *testing.T) {
+	local, err := NewLocal(t.TempDir(), "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := execution(t, DiagnosticStepID(1), 1)
+	// A previous attempt applied the effect but died before the effect record
+	// was published. The marker still names the attempt that applied it.
+	path := MarkerPath(local.dispatcher.engine.StateDir, exec)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	inputs, err := NewDiagnosticStep(exec, DiagnosticPayload{Index: 1, Total: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := inputs.Inputs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(marker{
+		OperationID:    string(exec.OperationID),
+		Step:           exec.Step,
+		InputsHash:     engine.InputsHash(exec.Step, canonical),
+		AppliedAttempt: 1,
+		ExecutionID:    exec.ExecutionID(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retry := exec
+	retry.Attempt = 2
+	response, err := local.Call(context.Background(), runRequest(t, retry, 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusCompleted || response.Executed {
+		t.Fatalf("recovered effect: %+v", response)
+	}
+	if response.AppliedAttempt != 1 {
+		t.Fatalf("applied attempt %d, want the attempt that applied the effect (1)", response.AppliedAttempt)
+	}
+}
+
 func countEffects(t *testing.T, root string, exec engine.Execution) int {
 	t.Helper()
 	entries, err := os.ReadDir(root + "/effects/" + string(exec.OperationID))

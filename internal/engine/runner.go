@@ -102,7 +102,7 @@ func New(stateDir, node string, registry *secrets.Registry) (*Engine, error) {
 	return &Engine{StateDir: stateDir, Node: node, Secrets: registry, LockTimeout: 20 * time.Second}, nil
 }
 
-func (e *Engine) JournalPath() string { return filepath.Join(e.StateDir, "journal.json") }
+func (e *Engine) JournalPath() string { return JournalPath(e.StateDir) }
 
 func (e *Engine) hostLockPath() string { return filepath.Join(e.StateDir, "host.lock") }
 
@@ -313,11 +313,18 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		// record without it.
 		encodedResult = nil
 	}
-	appliedAttempt := uint32(0)
-	if executed {
+	appliedAttempt := AttemptUnknown
+	switch {
+	case executed:
 		appliedAttempt = exec.Attempt
-	} else if task, ok := journal.Tasks[exec.EffectKey()]; ok {
-		appliedAttempt = task.AppliedAttempt
+	case check.AppliedAttempt != AttemptUnknown:
+		// The step recovered a durable record of the attempt that applied the
+		// effect. Recording it keeps "which attempt applied this" honest.
+		appliedAttempt = check.AppliedAttempt
+	default:
+		if task, ok := journal.Tasks[exec.EffectKey()]; ok {
+			appliedAttempt = task.AppliedAttempt
+		}
 	}
 	record := EffectRecord{
 		OperationID:    string(exec.OperationID),

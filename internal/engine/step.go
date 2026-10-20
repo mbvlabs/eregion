@@ -18,6 +18,12 @@ var ErrInputsMismatch = errors.New("step inputs mismatch")
 // wrap it to report a non-retryable precondition failure.
 var ErrPermanent = errors.New("permanent step failure")
 
+// AttemptUnknown is the documented sentinel for "the attempt that applied this
+// effect is not known". A step that keeps a durable record of the applying
+// attempt reports it through CheckResult.AppliedAttempt; a step that cannot
+// leaves the sentinel in place instead of guessing.
+const AttemptUnknown uint32 = 0
+
 // Step is one versioned, idempotent unit of node convergence.
 type Step interface {
 	ID() string
@@ -56,6 +62,10 @@ func (b Boundary) Valid() bool {
 type CheckResult struct {
 	Complete bool
 	Detail   string
+	// AppliedAttempt is the attempt that actually applied the effect, when the
+	// step can report it from a durable record. AttemptUnknown means the step
+	// did not record it; the engine then keeps the attempt it knows.
+	AppliedAttempt uint32
 }
 
 // ApplyResult is what Apply changed.
