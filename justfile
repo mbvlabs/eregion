@@ -34,6 +34,10 @@ smoke:
 bootstrap-matrix:
     python3 scripts/bootstrap_matrix.py
 
+# Build the sample app from a directory with Buildpacks, deploy, and serve it (requires dev-up and dev-buildpacks).
+buildpacks-smoke:
+    python3 scripts/buildpacks_smoke.py
+
 # Exercise the real interactive viewer in a resizable pseudo-terminal (requires dev-up).
 terminal-smoke:
     python3 scripts/terminal_smoke.py

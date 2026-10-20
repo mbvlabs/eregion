@@ -55,6 +55,7 @@ End-to-end drills against the running development stack:
 
 ```sh
 just smoke           # real image build, deploy, failed candidate, rollback
+just buildpacks-smoke  # directory-source Buildpacks release, deploy, served body
 just terminal-smoke  # real PTY viewer matrix, detach, replay
 just recovery-drill  # disposable PostgreSQL backup/verify/restore drill
 just upgrade-drill   # signed release, apply, rollback, health restore
