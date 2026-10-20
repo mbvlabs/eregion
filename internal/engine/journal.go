@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -65,6 +66,9 @@ type EffectRecord struct {
 	CompletedAt    string          `json:"completed_at"`
 	Result         json.RawMessage `json:"result,omitempty"`
 }
+
+// JournalPath is the journal file inside a node state directory.
+func JournalPath(stateDir string) string { return filepath.Join(stateDir, "journal.json") }
 
 // NewJournal returns an empty journal for node.
 func NewJournal(node string) *Journal {
