@@ -1,7 +1,9 @@
 package noded
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
+	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
 // testConfig writes a node configuration for a test and returns it.
@@ -145,6 +148,85 @@ func TestNodeTaskRunner(t *testing.T) {
 	}
 	if err := RunTask(config); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// journalWithOldTask writes a node journal that holds one task outside the
+// retention window, so a compaction would drop it.
+func journalWithOldTask(t *testing.T, stateDir string) string {
+	t.Helper()
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journal := engine.NewJournal("test-node")
+	recent := time.Now().UTC().Format(time.RFC3339Nano)
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339Nano)
+	for index := range engine.DefaultRetention().Keep {
+		key := fmt.Sprintf("op_recent:%d:diagnostic-step-01-v1", index)
+		journal.Tasks[key] = engine.Task{
+			OperationID: "op_recent",
+			Step:        "diagnostic-step-01-v1",
+			Status:      engine.TaskCompleted,
+			StartedAt:   recent,
+			CompletedAt: recent,
+		}
+	}
+	journal.Tasks["op_old:1:diagnostic-step-01-v1"] = engine.Task{
+		OperationID: "op_old",
+		Step:        "diagnostic-step-01-v1",
+		Status:      engine.TaskCompleted,
+		StartedAt:   old,
+		CompletedAt: old,
+	}
+	if err := journal.Save(engine.JournalPath(stateDir), &secrets.Registry{}); err != nil {
+		t.Fatal(err)
+	}
+	return "op_old:1:diagnostic-step-01-v1"
+}
+
+// TestServeDoesNotCompactTheJournal proves that a serving process leaves the
+// journal alone. Every status poll starts a new serving process, and a
+// compaction on every poll would take the journal lock away from a running
+// step.
+func TestServeDoesNotCompactTheJournal(t *testing.T) {
+	directory := t.TempDir()
+	stateDir := filepath.Join(directory, "state")
+	config := Config{Node: "test-node", StateDir: stateDir, Path: filepath.Join(directory, "node.json")}
+	old := journalWithOldTask(t, stateDir)
+	stdin := strings.NewReader(`{"type":"hello","version":1}` + "\n")
+	var stdout bytes.Buffer
+	if err := Serve(config, stdin, &stdout); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := engine.LoadJournal(engine.JournalPath(stateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := journal.Tasks[old]; !ok {
+		t.Fatal("the serving process compacted the journal")
+	}
+}
+
+// TestCompactStillBoundsTheJournal proves that the explicit compaction still
+// drops the tasks outside the retention window.
+func TestCompactStillBoundsTheJournal(t *testing.T) {
+	directory := t.TempDir()
+	stateDir := filepath.Join(directory, "state")
+	config := Config{Node: "test-node", StateDir: stateDir, Path: filepath.Join(directory, "node.json")}
+	old := journalWithOldTask(t, stateDir)
+	removed, err := Compact(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 {
+		t.Fatalf("the compaction removed %d tasks", removed)
+	}
+	journal, err := engine.LoadJournal(engine.JournalPath(stateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := journal.Tasks[old]; ok {
+		t.Fatal("the compaction kept a task outside the retention window")
 	}
 }
 

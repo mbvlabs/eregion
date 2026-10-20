@@ -22,15 +22,13 @@ import (
 // Serve answers node requests until the stream closes. It is the entry point
 // the control plane reaches over SSH: the request arrives on the channel's
 // standard input, never in a command line.
+//
+// The journal is not compacted here. Every status poll starts a new serving
+// process, and a compaction on every poll would take the journal lock away
+// from a running step. The journal is compacted after each task and by the
+// explicit "compact" command.
 func Serve(config Config, stdin io.Reader, stdout io.Writer) error {
 	steps := node.DefaultRegistry()
-	// The journal is an index. It is compacted when the node starts so it does
-	// not grow without bound.
-	if removed, err := engine.Compact(context.Background(), config.StateDir, engine.DefaultRetention()); err != nil {
-		fmt.Fprintf(os.Stderr, "eregion-node: journal compaction failed: %v\n", err)
-	} else if removed > 0 {
-		fmt.Fprintf(os.Stderr, "eregion-node: compacted %d journal tasks\n", removed)
-	}
 	reader := bufio.NewReader(stdin)
 	writer := bufio.NewWriter(stdout)
 	for {

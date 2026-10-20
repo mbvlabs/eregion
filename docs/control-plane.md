@@ -73,10 +73,13 @@ create-once (temp + hard link), so a duplicate application cannot overwrite whic
 attempt produced the effect.
 
 The journal is an index and is compacted: terminal tasks older than the retention
-window are dropped unless they are among the most recent ones, and the node
-compacts at startup. The effect records are the durable exactly-once evidence and
-are **not** compacted automatically; pruning them is an explicit operator action,
-because dropping one would let a stale retry re-apply an effect.
+window are dropped unless they are among the most recent ones. The compaction runs
+after every node task and through the explicit `eregion-node compact` command. A
+serving process never compacts: every status poll starts a new serving process, and
+a compaction on every poll would take the journal lock away from a running step. The
+effect records are the durable exactly-once evidence and are **not** compacted
+automatically; pruning them is an explicit operator action, because dropping one
+would let a stale retry re-apply an effect.
 
 `flock` coordinates processes on **one host only**. The effect lock is the liveness
 fence: the kernel releases it when an owner dies. Status tries the lock without waiting;

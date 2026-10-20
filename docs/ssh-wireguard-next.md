@@ -54,7 +54,9 @@ What shipped:
 - A documented authentication and privilege policy: key-only authentication to a
   dedicated unprivileged account, a pinned host key, no root/sudo, no agent
   forwarding, no PTY, and no shell interpolation of any request value.
-- Node-side journal compaction with a retention policy.
+- Node-side journal compaction with a retention policy, after every task and
+  through the explicit `eregion-node compact` command. A serving process never
+  compacts, because every status poll starts a new one.
 - A machine-readable error code on the terminal state of a failed operation.
 
 Delivered tests (all green):
@@ -118,9 +120,9 @@ These questions are decided for SSH in
    at the step boundary; a detached task is left to finish and reconciled through
    `status`.
 4. **State directory:** `/var/lib/eregion/node`, owned by a dedicated
-   unprivileged account, mode 0700, files 0600. The journal is compacted; the
-   effect records are the durable exactly-once evidence and are not compacted
-   automatically.
+   unprivileged account, mode 0700, files 0600. The journal is compacted after
+   every task and through an explicit command; the effect records are the
+   durable exactly-once evidence and are not compacted automatically.
 5. **Observability:** the request ID and the execution identity cross the
    boundary; a lost stream is surfaced as an explicit unknown outcome that never
    claims the work stopped.
