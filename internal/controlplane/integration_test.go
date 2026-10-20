@@ -26,7 +26,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
+	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
 var testActor = contract.Actor{Kind: "ci", Subject: "integration-ci"}
@@ -75,9 +78,16 @@ func testPool(t *testing.T, migrate bool) (*pgxpool.Pool, string) {
 	return pool, u.String()
 }
 
-func testRuntime(t *testing.T, pool *pgxpool.Pool, workers int) *Runtime {
+func testRuntime(t *testing.T, pool *pgxpool.Pool, workers int, stateDirs ...string) *Runtime {
 	t.Helper()
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: workers, TestOnly: true})
+	stateDir := os.Getenv("EREGION_NODE_STATE_DIR")
+	if len(stateDirs) > 0 && stateDirs[0] != "" {
+		stateDir = stateDirs[0]
+	}
+	if stateDir == "" {
+		stateDir = t.TempDir()
+	}
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: workers, TestOnly: true, NodeStateDir: stateDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +131,7 @@ func TestIntegrationMigrations(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := context.Background()
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 0 || plan.RiverCurrent != 0 {
+	if err != nil || plan.Current != 0 || plan.Required != 2 || plan.RiverCurrent != 0 {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	if Ready(ctx, pool) == nil {
@@ -147,6 +157,12 @@ func TestIntegrationMigrations(t *testing.T) {
 	}
 	if err := Ready(ctx, pool); contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("did not detect edited migration: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DELETE FROM eregion_schema_migrations WHERE version=1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Ready(ctx, pool); contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("did not detect a migration history gap: %v", err)
 	}
 }
 
@@ -261,8 +277,9 @@ func TestIntegrationAPIWorkersAndReplay(t *testing.T) {
 	}
 	// The submitting connection/client can disappear; a new client finds the same op.
 	client, _ = api.NewClient(server.URL, token)
-	startWorkers(t, testRuntime(t, pool, 2))
-	startWorkers(t, testRuntime(t, pool, 2))
+	nodeDir := t.TempDir()
+	startWorkers(t, testRuntime(t, pool, 2, nodeDir))
+	startWorkers(t, testRuntime(t, pool, 2, nodeDir))
 	await(t, 15*time.Second, func() bool {
 		op, err := apiRun.Service.Get(ctx, testActor, submitted.ID)
 		return err == nil && op.State == contract.Succeeded
@@ -362,7 +379,7 @@ func TestIntegrationCrashWorkerHelper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run := testRuntime(t, pool, 1)
+	run := testRuntime(t, pool, 1, os.Getenv("EREGION_NODE_STATE_DIR"))
 	if err := run.Jobs.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -371,14 +388,15 @@ func TestIntegrationCrashWorkerHelper(t *testing.T) {
 
 func TestIntegrationWorkerProcessCrash(t *testing.T) {
 	pool, dsn := testPool(t, true)
-	run := testRuntime(t, pool, 0)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 0, nodeDir)
 	ctx := context.Background()
 	op, err := run.Service.Submit(ctx, submission("crash-recovery", `{"steps":8,"step_delay_ms":250}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	child := exec.Command(os.Args[0], "-test.run=^TestIntegrationCrashWorkerHelper$")
-	child.Env = append(os.Environ(), "EREGION_CRASH_WORKER_HELPER=1", "EREGION_CRASH_DATABASE_URL="+dsn)
+	child.Env = append(os.Environ(), "EREGION_CRASH_WORKER_HELPER=1", "EREGION_CRASH_DATABASE_URL="+dsn, "EREGION_NODE_STATE_DIR="+nodeDir)
 	child.Stdout, child.Stderr = io.Discard, io.Discard
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
@@ -408,7 +426,7 @@ func TestIntegrationWorkerProcessCrash(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE river_leader SET expires_at=clock_timestamp()-interval '1 second'`); err != nil {
 		t.Fatal(err)
 	}
-	startWorkers(t, testRuntime(t, pool, 2))
+	startWorkers(t, testRuntime(t, pool, 2, nodeDir))
 	await(t, 45*time.Second, func() bool {
 		current, err := run.Service.Get(ctx, testActor, op.ID)
 		return err == nil && current.State == contract.Succeeded
@@ -429,6 +447,12 @@ func TestIntegrationWorkerProcessCrash(t *testing.T) {
 	}
 	if count != 8 {
 		t.Fatalf("crash duplicated/lost committed steps: %d", count)
+	}
+	if got := effectCount(t, nodeDir, op.ID, 8); got != 8 {
+		t.Fatalf("crash duplicated/lost effects: %d", got)
+	}
+	if got := completedStepRows(t, pool, op.ID); got != 8 {
+		t.Fatalf("crash duplicated/lost step rows: %d", got)
 	}
 }
 
@@ -455,7 +479,8 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	address := reserved.Addr().String()
 	_ = reserved.Close()
 	endpoint := "http://" + address
-	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile, "EREGION_API_URL="+endpoint, "EREGION_API_TOKEN="+credential)
+	nodeDir := t.TempDir()
+	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile, "EREGION_API_URL="+endpoint, "EREGION_API_TOKEN="+credential, "EREGION_NODE_STATE_DIR="+nodeDir)
 	start := func(args ...string) (*exec.Cmd, <-chan error) {
 		command := exec.Command(binary, args...)
 		command.Env = environment
@@ -494,11 +519,14 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 		t.Fatalf("CLI did not durably queue: %s %v", raw, err)
 	}
 	worker, workerDone := start("worker", "--concurrency", "2", "--json")
-	service := testRuntime(t, pool, 0).Service
+	service := testRuntime(t, pool, 0, nodeDir).Service
 	await(t, 10*time.Second, func() bool {
 		op, err := service.Get(context.Background(), testActor, accepted.Data.ID)
 		return err == nil && op.State == contract.Succeeded
 	})
+	if got := effectCount(t, nodeDir, accepted.Data.ID, 5); got != 5 {
+		t.Fatalf("executable lifecycle effects: %d", got)
+	}
 	command = exec.Command(binary, "operations", "events", string(accepted.Data.ID), "--limit", "2", "--json")
 	command.Env = environment
 	raw, err = command.Output()
@@ -520,5 +548,408 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 		case <-time.After(20 * time.Second):
 			t.Fatal("service ignored graceful shutdown")
 		}
+	}
+}
+
+func effectCount(t *testing.T, stateDir string, id contract.OperationID, steps int) int {
+	t.Helper()
+	count := 0
+	for index := 1; index <= steps; index++ {
+		path := filepath.Join(stateDir, "effects", string(id), node.DiagnosticStepID(index)+".applied")
+		if _, err := os.Stat(path); err == nil {
+			count++
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	return count
+}
+
+func completedStepRows(t *testing.T, pool *pgxpool.Pool, id contract.OperationID) int {
+	t.Helper()
+	var count int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM eregion_operation_steps WHERE operation_id=$1 AND state='completed'`, id).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func progressEventCount(t *testing.T, service *Service, id contract.OperationID) int {
+	t.Helper()
+	page, err := service.Events(context.Background(), testActor, contract.Cursor{OperationID: id}, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, event := range page.Events {
+		if event.Kind == "progress" {
+			count++
+		}
+	}
+	return count
+}
+
+func TestIntegrationInterruptedAcknowledgementRecoversExactlyOnce(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 2, nodeDir)
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("ack-loss", `{"steps":3,"step_delay_ms":0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	run.Service.afterNode = func(id contract.OperationID, step string) error {
+		if id != op.ID || step != node.DiagnosticStepID(2) {
+			return nil
+		}
+		failed := false
+		once.Do(func() { failed = true })
+		if failed {
+			return errors.New("injected failure between node effect and database acknowledgement")
+		}
+		return nil
+	}
+	startWorkers(t, run)
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, op.ID)
+		return err == nil && current.State == contract.Succeeded
+	})
+	if got := effectCount(t, nodeDir, op.ID, 3); got != 3 {
+		t.Fatalf("effect count: %d", got)
+	}
+	if got := completedStepRows(t, pool, op.ID); got != 3 {
+		t.Fatalf("completed step rows: %d", got)
+	}
+	if got := progressEventCount(t, run.Service, op.ID); got != 3 {
+		t.Fatalf("progress events: %d", got)
+	}
+	marker, err := os.ReadFile(filepath.Join(nodeDir, "effects", string(op.ID), node.DiagnosticStepID(2)+".applied"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var applied struct {
+		AppliedAttempt uint32 `json:"applied_attempt"`
+	}
+	if err := json.Unmarshal(marker, &applied); err != nil || applied.AppliedAttempt != 1 {
+		t.Fatalf("retry re-applied the effect: %s %v", marker, err)
+	}
+	current, _ := run.Service.Get(ctx, testActor, op.ID)
+	if current.Attempt != 2 {
+		t.Fatalf("expected one retry, got attempt %d", current.Attempt)
+	}
+}
+
+func TestIntegrationLostFinalAcknowledgement(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 2, nodeDir)
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("final-ack-loss", `{"steps":2,"step_delay_ms":0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	run.Service.afterNode = func(id contract.OperationID, step string) error {
+		if id != op.ID || step != node.DiagnosticStepID(2) {
+			return nil
+		}
+		failed := false
+		once.Do(func() { failed = true })
+		if failed {
+			return errors.New("injected failure before the final acknowledgement")
+		}
+		return nil
+	}
+	startWorkers(t, run)
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, op.ID)
+		return err == nil && current.State == contract.Succeeded
+	})
+	if got := effectCount(t, nodeDir, op.ID, 2); got != 2 {
+		t.Fatalf("effect count: %d", got)
+	}
+	if got := progressEventCount(t, run.Service, op.ID); got != 2 {
+		t.Fatalf("progress events: %d", got)
+	}
+}
+
+type dropOnceTransport struct {
+	inner node.Transport
+	step  string
+	once  sync.Once
+}
+
+func (d *dropOnceTransport) Name() string { return "drop-once" }
+
+func (d *dropOnceTransport) Call(ctx context.Context, request node.Request, onEvent func(node.Event)) (node.Response, error) {
+	response, err := d.inner.Call(ctx, request, onEvent)
+	if err != nil || request.Method != node.MethodRun || request.Execution.Step != d.step {
+		return response, err
+	}
+	dropped := false
+	d.once.Do(func() { dropped = true })
+	if dropped {
+		return node.Response{}, errors.New("simulated transport stream loss after dispatch")
+	}
+	return response, nil
+}
+
+func TestIntegrationLostTransportResponseRecovers(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 2, nodeDir)
+	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.Service.transport = &dropOnceTransport{inner: local, step: node.DiagnosticStepID(1)}
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("lost-response", `{"steps":2,"step_delay_ms":0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWorkers(t, run)
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, op.ID)
+		return err == nil && current.State == contract.Succeeded
+	})
+	if got := effectCount(t, nodeDir, op.ID, 2); got != 2 {
+		t.Fatalf("effect count after lost response: %d", got)
+	}
+	if got := progressEventCount(t, run.Service, op.ID); got != 2 {
+		t.Fatalf("progress events: %d", got)
+	}
+}
+
+func TestIntegrationDuplicateSubmissionsShareOneEffect(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 2, nodeDir)
+	ctx := context.Background()
+	var wait sync.WaitGroup
+	ids := make(chan contract.OperationID, 10)
+	for range 10 {
+		wait.Go(func() {
+			op, err := run.Service.Submit(ctx, submission("duplicate-effect", `{"steps":3,"step_delay_ms":0}`))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			ids <- op.ID
+		})
+	}
+	wait.Wait()
+	close(ids)
+	var id contract.OperationID
+	for next := range ids {
+		if id != "" && id != next {
+			t.Fatalf("duplicate submissions created different operations: %s %s", id, next)
+		}
+		id = next
+	}
+	startWorkers(t, run)
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, id)
+		return err == nil && current.State == contract.Succeeded
+	})
+	if got := effectCount(t, nodeDir, id, 3); got != 3 {
+		t.Fatalf("duplicate effect: %d", got)
+	}
+	if got := completedStepRows(t, pool, id); got != 3 {
+		t.Fatalf("duplicate acknowledgements: %d", got)
+	}
+	if got := progressEventCount(t, run.Service, id); got != 3 {
+		t.Fatalf("duplicate progress: %d", got)
+	}
+	retry, err := run.Service.Submit(ctx, submission("duplicate-effect", `{"steps":3,"step_delay_ms":0}`))
+	if err != nil || retry.ID != id {
+		t.Fatalf("repeat submission did not return the original operation: %+v %v", retry, err)
+	}
+	if got := effectCount(t, nodeDir, id, 3); got != 3 {
+		t.Fatalf("repeat submission duplicated the effect: %d", got)
+	}
+}
+
+func TestIntegrationCancellationBeforeStartWritesNoEffect(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 2, nodeDir)
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("cancel-before", `{"steps":4,"step_delay_ms":0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run.Service.RequestCancel(ctx, testActor, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	startWorkers(t, run)
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, op.ID)
+		return err == nil && current.State == contract.Canceled
+	})
+	if got := effectCount(t, nodeDir, op.ID, 4); got != 0 {
+		t.Fatalf("cancellation before start wrote effects: %d", got)
+	}
+	if got := completedStepRows(t, pool, op.ID); got != 0 {
+		t.Fatalf("cancellation before start acknowledged steps: %d", got)
+	}
+}
+
+func TestIntegrationCancellationHonoursStepBoundary(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 2, nodeDir)
+	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	local.SetHooks(node.Hooks{BeforeRun: func(ctx context.Context, exec engine.Execution) error {
+		if exec.Step != node.DiagnosticStepID(2) {
+			return nil
+		}
+		started <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}})
+	run.Service.transport = local
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("cancel-boundary", `{"steps":3,"step_delay_ms":0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWorkers(t, run)
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("worker never reached the second step")
+	}
+	if _, err := run.Service.RequestCancel(ctx, testActor, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, op.ID)
+		return err == nil && current.State == contract.Canceled
+	})
+	if got := effectCount(t, nodeDir, op.ID, 3); got != 2 {
+		t.Fatalf("cancellation did not stop at the step boundary: %d effects", got)
+	}
+	if got := completedStepRows(t, pool, op.ID); got != 2 {
+		t.Fatalf("completed step rows after cancellation: %d", got)
+	}
+}
+
+func TestIntegrationDetachingViewerDoesNotCancel(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 2, nodeDir)
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("detach", `{"steps":3,"step_delay_ms":50}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWorkers(t, run)
+	viewer, cancelViewer := context.WithCancel(ctx)
+	cancelViewer()
+	if _, err := run.Service.Get(viewer, testActor, op.ID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("viewer cancellation identity: %v", err)
+	}
+	await(t, 20*time.Second, func() bool {
+		current, err := run.Service.Get(ctx, testActor, op.ID)
+		return err == nil && current.State == contract.Succeeded
+	})
+	if got := effectCount(t, nodeDir, op.ID, 3); got != 3 {
+		t.Fatalf("detaching a viewer duplicated or lost effects: %d", got)
+	}
+}
+
+func TestIntegrationReconcileDoesNotFailLiveNodeEffect(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 0, nodeDir)
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("reconcile-live", `{"steps":1,"step_delay_ms":0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := engine.Execution{OperationID: op.ID, Attempt: 0, Step: node.DiagnosticStepID(1), RequestID: "reconcile"}
+	step, err := node.NewDiagnosticStep(exec, node.DiagnosticPayload{Index: 1, Total: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs, _ := step.Inputs()
+	inputsHash := engine.InputsHash(step.ID(), inputs)
+	if _, err := run.Service.beginStep(ctx, op.ID, 0, step.ID(), inputsHash, exec.ExecutionID()); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte(exec.EffectKey()))
+	release, err := engine.Acquire(ctx, filepath.Join(nodeDir, "locks", hex.EncodeToString(sum[:])+".lock"), engine.LockExclusive, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := engine.NewJournal("local")
+	journal.Tasks[exec.EffectKey()] = engine.Task{
+		OperationID: string(op.ID), Step: step.ID(), Attempt: 0, ExecutionID: exec.ExecutionID(),
+		InputsHash: inputsHash, Status: engine.TaskRunning,
+	}
+	if err := journal.Save(filepath.Join(nodeDir, "journal.json"), &secrets.Registry{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE river_job SET state='discarded',finalized_at=clock_timestamp() WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1)`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Service.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := run.Service.Get(ctx, testActor, op.ID)
+	if current.State != contract.Running {
+		t.Fatalf("reconcile failed a live node effect: %+v", current)
+	}
+	release()
+	if err := run.Service.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = run.Service.Get(ctx, testActor, op.ID)
+	if current.State != contract.Failed {
+		t.Fatalf("stale effect was not reconciled to visible failure: %+v", current)
+	}
+	if got := effectCount(t, nodeDir, op.ID, 1); got != 0 {
+		t.Fatalf("reconciliation created an effect: %d", got)
+	}
+}
+
+func TestIntegrationUpgradeFromVersion1(t *testing.T) {
+	pool, _ := testPool(t, false)
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, migration001); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TABLE eregion_schema_migrations (version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := migrationByVersion(1)
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_schema_migrations(version,checksum) VALUES (1,$1)`, migrationHash(first)); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := PlanMigrations(ctx, pool)
+	if err != nil || plan.Current != 1 || plan.Required != 2 {
+		t.Fatalf("version 1 plan: %+v %v", plan, err)
+	}
+	if _, err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	var exists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('eregion_operation_steps') IS NOT NULL`).Scan(&exists); err != nil || !exists {
+		t.Fatalf("version 2 table missing: %v %v", exists, err)
+	}
+	if err := Ready(ctx, pool); err != nil {
+		t.Fatal(err)
 	}
 }

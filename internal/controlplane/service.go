@@ -11,12 +11,18 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 )
 
 type Service struct {
 	pool    *pgxpool.Pool
 	enqueue func(context.Context, pgx.Tx, contract.OperationID) (int64, error)
+	// transport is the node-dispatch boundary. Local today; SSH/WireGuard later.
+	transport node.Transport
+	// afterNode is a test-only seam between a node effect and its database
+	// acknowledgement. Production leaves it nil.
+	afterNode func(contract.OperationID, string) error
 }
 
 var _ operations.Service = (*Service)(nil)
@@ -110,6 +116,9 @@ func (s *Service) Get(ctx context.Context, actor contract.Actor, id contract.Ope
 		return op, contract.NewFault(contract.NotFound, "operation not found", "Check the ID and authenticated identity.")
 	}
 	if err != nil {
+		if ctx.Err() != nil {
+			return op, ctx.Err()
+		}
 		return op, unavailable()
 	}
 	return op, nil
@@ -130,6 +139,9 @@ func (s *Service) Events(ctx context.Context, actor contract.Actor, cursor contr
 	// No pruning in M0.2. A missing retained event is an explicit gap, not silent loss.
 	rows, err := s.pool.Query(ctx, `SELECT sequence,event FROM eregion_operation_events WHERE operation_id=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT $4`, cursor.OperationID, int64(cursor.After), int64(op.LastSequence), limit)
 	if err != nil {
+		if ctx.Err() != nil {
+			return page, ctx.Err()
+		}
 		return page, unavailable()
 	}
 	defer rows.Close()
@@ -188,6 +200,34 @@ func (s *Service) mutate(ctx context.Context, id contract.OperationID, change fu
 		return op, unavailable()
 	}
 	return op, nil
+}
+
+// mutateOwned is mutate with an attempt fence. A stale or terminal operation is
+// returned unchanged and change does not run. River's completion query is not
+// attempt-fenced, so every worker domain write must pass through here.
+func (s *Service) mutateOwned(ctx context.Context, id contract.OperationID, attempt uint32, change func(pgx.Tx, *contract.Operation) error) (contract.Operation, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return contract.Operation{}, false, unavailable()
+	}
+	defer rollback(tx)
+	op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 FOR UPDATE", id))
+	if err != nil {
+		return op, false, unavailable()
+	}
+	if op.State.Terminal() || op.Attempt != attempt {
+		if err := tx.Commit(ctx); err != nil {
+			return op, false, unavailable()
+		}
+		return op, false, nil
+	}
+	if err := change(tx, &op); err != nil {
+		return op, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return op, false, unavailable()
+	}
+	return op, true, nil
 }
 
 func transition(ctx context.Context, tx pgx.Tx, op *contract.Operation, state contract.State, message string) error {

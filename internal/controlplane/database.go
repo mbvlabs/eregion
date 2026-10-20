@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
-	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -22,9 +21,25 @@ import (
 )
 
 //go:embed migrations/001_operations.sql
-var migrationSQL string
+var migration001 string
 
-const schemaVersion = 1
+//go:embed migrations/002_node_execution.sql
+var migration002 string
+
+type migration struct {
+	version int
+	name    string
+	sql     string
+}
+
+// migrations are applied in order. Never edit an applied migration; add a new
+// version instead. Each version has its own checksum so adding 002 does not make
+// an existing 001 database look edited.
+var migrations = []migration{
+	{version: 1, name: "001_operations.sql", sql: migration001},
+	{version: 2, name: "002_node_execution.sql", sql: migration002},
+}
+
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.
 
 type MigrationPlan struct {
@@ -82,26 +97,61 @@ func migrator(pool *pgxpool.Pool) (*rivermigrate.Migrator[pgx.Tx], error) {
 	return rivermigrate.New(riverpgxv5.New(pool), &rivermigrate.Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 }
 
-func migrationHash() string {
-	hash := sha256.Sum256([]byte(migrationSQL))
+func migrationHash(m migration) string {
+	hash := sha256.Sum256([]byte(m.sql))
 	return hex.EncodeToString(hash[:])
+}
+
+func requiredVersion() int {
+	return migrations[len(migrations)-1].version
+}
+
+func migrationByVersion(version int) (migration, bool) {
+	for _, m := range migrations {
+		if m.version == version {
+			return m, true
+		}
+	}
+	return migration{}, false
 }
 
 // PlanMigrations performs no DDL. Newer/inconsistent schemas fail closed.
 func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
-	plan := MigrationPlan{Required: schemaVersion}
+	plan := MigrationPlan{Required: requiredVersion()}
 	var exists bool
 	if err := pool.QueryRow(ctx, "SELECT to_regclass('eregion_schema_migrations') IS NOT NULL").Scan(&exists); err != nil {
 		return plan, unavailable()
 	}
 	if exists {
-		var checksum string
-		err := pool.QueryRow(ctx, "SELECT version, checksum FROM eregion_schema_migrations ORDER BY version DESC LIMIT 1").Scan(&plan.Current, &checksum)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		rows, err := pool.Query(ctx, "SELECT version, checksum FROM eregion_schema_migrations ORDER BY version")
+		if err != nil {
 			return plan, unavailable()
 		}
-		if plan.Current > schemaVersion || (plan.Current == schemaVersion && checksum != migrationHash()) {
-			return plan, contract.NewFault(contract.PreconditionFailed, "database schema is newer or migration content differs", "Use a compatible binary; never rewrite applied migrations.")
+		defer rows.Close()
+		expected := 1
+		for rows.Next() {
+			var version int
+			var checksum string
+			if err := rows.Scan(&version, &checksum); err != nil {
+				return plan, unavailable()
+			}
+			applied, known := migrationByVersion(version)
+			if !known || version > requiredVersion() {
+				return plan, contract.NewFault(contract.PreconditionFailed, "database schema is newer than this binary", "Upgrade the binary before using this database; never rewrite applied migrations.")
+			}
+			if version != expected {
+				return plan, contract.NewFault(contract.PreconditionFailed, "database migration history has a gap", "Restore the missing migration history from a backup; do not guess at applied versions.")
+			}
+			if checksum != migrationHash(applied) {
+				return plan, contract.NewFault(contract.PreconditionFailed, "applied migration content differs", "Use a compatible binary; never rewrite applied migrations.")
+			}
+			if version > plan.Current {
+				plan.Current = version
+			}
+			expected++
+		}
+		if err := rows.Err(); err != nil {
+			return plan, unavailable()
 		}
 	}
 	m, err := migrator(pool)
@@ -172,24 +222,29 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
 	if _, err := m.Migrate(ctx, rivermigrate.DirectionUp, nil); err != nil {
 		return plan, unavailable(err)
 	}
-	tx, err := conn.Begin(ctx)
-	if err != nil {
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS eregion_schema_migrations (version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
 		return plan, unavailable(err)
 	}
-	defer rollback(tx)
-	if plan.Current < schemaVersion {
-		if _, err := tx.Exec(ctx, migrationSQL); err != nil {
+	for _, m := range migrations {
+		if m.version <= plan.Current {
+			continue
+		}
+		tx, err := conn.Begin(ctx)
+		if err != nil {
 			return plan, unavailable(err)
 		}
-		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS eregion_schema_migrations (version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
+		if _, err := tx.Exec(ctx, m.sql); err != nil {
+			rollback(tx)
 			return plan, unavailable(err)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_schema_migrations(version,checksum) VALUES ($1,$2)`, schemaVersion, migrationHash()); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO eregion_schema_migrations(version,checksum) VALUES ($1,$2)`, m.version, migrationHash(m)); err != nil {
+			rollback(tx)
 			return plan, unavailable(err)
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return plan, unavailable()
+		if err := tx.Commit(ctx); err != nil {
+			return plan, unavailable(err)
+		}
+		plan.Current = m.version
 	}
 	plan.Current, plan.RiverCurrent = plan.Required, plan.RiverRequired
 	return plan, nil

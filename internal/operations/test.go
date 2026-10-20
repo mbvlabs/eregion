@@ -12,8 +12,10 @@ const TestKind = "diagnostic.test"
 const TestTarget = "control-plane"
 const TestMaxAttempts = 3
 
-// TestInput controls bounded, database-only diagnostic work. No user text or secret
-// material is accepted. Failure injection exercises retries without external effects.
+// TestInput controls bounded diagnostic work. The worker runs it through the node
+// dispatch boundary, which writes only node-local marker effects. No user text or
+// secret material is accepted. Failure injection exercises retries without
+// producing node side effects on the failing attempt.
 type TestInput struct {
 	Steps            int `json:"steps"`
 	StepDelayMS      int `json:"step_delay_ms"`

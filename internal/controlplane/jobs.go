@@ -2,15 +2,21 @@ package controlplane
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
+	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 )
@@ -37,6 +43,12 @@ type WorkerConfig struct {
 	Concurrency int
 	// TestOnly removes River startup jitter. Never enable it in service commands.
 	TestOnly bool
+	// Transport defaults to a local node dispatcher. SSH and userspace WireGuard
+	// adapters will implement the same interface.
+	Transport node.Transport
+	// NodeStateDir is the local dispatcher's shared state directory. Tests inject
+	// a temporary directory; services use EREGION_NODE_STATE_DIR or the default.
+	NodeStateDir string
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
@@ -44,6 +56,18 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
 	service := &Service{pool: pool}
+	service.transport = config.Transport
+	if service.transport == nil && (config.Concurrency > 0 || config.NodeStateDir != "") {
+		stateDir := config.NodeStateDir
+		if stateDir == "" {
+			stateDir = node.DefaultStateDir()
+		}
+		local, err := node.NewLocal(stateDir, "local", &secrets.Registry{})
+		if err != nil {
+			return nil, contract.NewFault(contract.ValidationFailed, "could not initialise the local node transport", "Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.")
+		}
+		service.transport = local
+	}
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &reconcileWorker{service: service})
@@ -86,88 +110,221 @@ func (*testWorker) NextRetry(job *river.Job[testArgs]) time.Time {
 	return time.Now().Add(time.Duration(job.Attempt) * time.Second)
 }
 
+var errOperationTerminal = errors.New("operation is terminal")
+
 func (w *testWorker) Work(ctx context.Context, job *river.Job[testArgs]) error {
-	var input operations.TestInput
-	op, err := w.service.mutate(ctx, job.Args.OperationID, func(tx pgx.Tx, op *contract.Operation) error {
-		if op.State.Terminal() {
-			return nil
-		}
-		if op.State == contract.Cancelling {
-			return transition(ctx, tx, op, contract.Canceled, "Diagnostic cancellation acknowledged at a safe boundary.")
-		}
-		if op.Attempt > uint32(job.Attempt) {
-			return nil // A rescued newer attempt owns database-only progress.
-		}
-		op.Attempt = uint32(job.Attempt)
-		var raw []byte
-		if err := tx.QueryRow(ctx, "UPDATE eregion_operations SET attempt=$2 WHERE id=$1 RETURNING input", op.ID, op.Attempt).Scan(&raw); err != nil {
-			return err
-		}
-		if err := json.Unmarshal(raw, &input); err != nil {
-			return err
-		}
-		if op.State == contract.Queued {
-			if err := transition(ctx, tx, op, contract.Running, "Diagnostic worker started."); err != nil {
-				return err
-			}
-		}
-		return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: "diagnostic", Message: "Database-only diagnostic attempt started."})
-	})
-	if err != nil || op.State.Terminal() || op.Attempt > uint32(job.Attempt) {
+	attempt := uint32(job.Attempt)
+	op, raw, claimed, err := w.service.claimAttempt(ctx, job.Args.OperationID, attempt, "diagnostic")
+	if err != nil {
 		return err
 	}
+	if !claimed {
+		return w.service.waitForNewerAttempt(ctx, op.ID, attempt)
+	}
+	var input operations.TestInput
+	if err := json.Unmarshal(raw, &input); err != nil {
+		return err
+	}
+	if op.State == contract.Cancelling {
+		return w.reconcileCancellation(ctx, op.ID, attempt, input)
+	}
 	if job.Attempt <= input.FailUntilAttempt {
-		_, err := w.service.mutate(ctx, op.ID, func(tx pgx.Tx, current *contract.Operation) error {
-			if current.State.Terminal() || current.Attempt != uint32(job.Attempt) {
-				return nil
-			}
-			if current.State == contract.Cancelling {
-				return transition(ctx, tx, current, contract.Canceled, "Diagnostic cancellation acknowledged.")
-			}
-			if job.Attempt >= job.MaxAttempts {
-				return transition(ctx, tx, current, contract.Failed, "Diagnostic retry limit reached.")
-			}
-			return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Message: "Diagnostic requested a retry; work remains durably queued."})
-		})
+		return w.injectedFailure(ctx, op.ID, attempt, job)
+	}
+	for index := 1; index <= input.Steps; index++ {
+		state, currentAttempt, err := w.service.operationState(ctx, op.ID)
 		if err != nil {
 			return err
 		}
-		if job.Attempt >= job.MaxAttempts {
-			return river.JobCancel(errors.New("diagnostic retry limit reached"))
+		if currentAttempt != attempt {
+			return w.service.waitForNewerAttempt(ctx, op.ID, attempt)
 		}
-		return errors.New("diagnostic retry requested")
-	}
-	for {
-		timer := time.NewTimer(time.Duration(input.StepDelayMS) * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if state.Terminal() {
+			return nil
 		}
-		op, err = w.service.mutate(ctx, op.ID, func(tx pgx.Tx, current *contract.Operation) error {
-			if current.State.Terminal() || current.Attempt > uint32(job.Attempt) {
+		if state == contract.Cancelling {
+			return w.reconcileCancellation(ctx, op.ID, attempt, input)
+		}
+		if err := w.runStep(ctx, op.ID, attempt, index, input); err != nil {
+			if errors.Is(err, errOperationTerminal) {
 				return nil
 			}
-			if current.State == contract.Cancelling {
-				return transition(ctx, tx, current, contract.Canceled, "Diagnostic cancellation acknowledged at a safe boundary.")
-			}
-			var completed int
-			if err := tx.QueryRow(ctx, "UPDATE eregion_operations SET completed_steps=LEAST(completed_steps+1,$2) WHERE id=$1 RETURNING completed_steps", current.ID, input.Steps).Scan(&completed); err != nil {
-				return err
-			}
-			if err := appendEvent(ctx, tx, current, contract.Event{Kind: "progress", Progress: &contract.Progress{Current: uint64(completed), Total: uint64(input.Steps), Unit: "steps"}, Message: "Diagnostic step committed."}); err != nil {
-				return err
-			}
-			if completed == input.Steps {
-				return transition(ctx, tx, current, contract.Succeeded, "Diagnostic operation succeeded; no host changes were made.")
-			}
-			return nil
-		})
-		if err != nil || op.State.Terminal() || op.Attempt > uint32(job.Attempt) {
 			return err
 		}
 	}
+	if _, err := w.service.finishSucceeded(ctx, op.ID, attempt); err != nil {
+		return err
+	}
+	return nil
+}
+
+func diagnosticStepID(index int) string { return node.DiagnosticStepID(index) }
+
+func (w *testWorker) injectedFailure(ctx context.Context, id contract.OperationID, attempt uint32, job *river.Job[testArgs]) error {
+	op, _, err := w.service.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+		if current.State.Terminal() {
+			return nil
+		}
+		if current.State == contract.Cancelling {
+			return transition(ctx, tx, current, contract.Canceled, "Diagnostic cancellation acknowledged.")
+		}
+		if job.Attempt >= job.MaxAttempts {
+			if err := markIncompleteSteps(ctx, tx, id, "retry limit reached before the step completed"); err != nil {
+				return err
+			}
+			return transition(ctx, tx, current, contract.Failed, "Diagnostic retry limit reached.")
+		}
+		return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Message: "Diagnostic requested a retry; work remains durably queued."})
+	})
+	if err != nil {
+		return err
+	}
+	if op.State.Terminal() {
+		return nil
+	}
+	if job.Attempt >= job.MaxAttempts {
+		return river.JobCancel(errors.New("diagnostic retry limit reached"))
+	}
+	return errors.New("diagnostic retry requested")
+}
+
+// runStep asks the database, then the node, whether an effect already exists.
+// Only a node status of absent/stale/failed leads to a dispatch.
+func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attempt uint32, index int, input operations.TestInput) error {
+	if w.service.transport == nil {
+		return contract.NewFault(contract.Unavailable, "node transport is not configured", "Run this work in a worker configured with a node transport.")
+	}
+	stepID := diagnosticStepID(index)
+	exec := engine.Execution{OperationID: id, Attempt: attempt, Step: stepID, RequestID: newRequestID()}
+	step, err := node.NewDiagnosticStep(exec, node.DiagnosticPayload{Index: index, Total: input.Steps, StepDelayMS: input.StepDelayMS})
+	if err != nil {
+		return err
+	}
+	inputs, err := step.Inputs()
+	if err != nil {
+		return err
+	}
+	inputsHash := engine.InputsHash(step.ID(), inputs)
+
+	record, hasRecord, err := w.service.stepRecord(ctx, id, stepID)
+	if err != nil {
+		return err
+	}
+	if hasRecord {
+		if record.InputsHash != inputsHash {
+			return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Never reuse an operation with different inputs; inspect the node journal.")
+		}
+		if record.State == "completed" {
+			return nil
+		}
+	}
+
+	status, err := w.service.transport.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
+	if err != nil {
+		if errors.Is(err, engine.ErrJournalCorrupt) {
+			if failErr := w.service.failOperation(ctx, id, attempt, "Node journal is corrupt; inspect it before retrying."); failErr != nil {
+				return failErr
+			}
+			return errOperationTerminal
+		}
+		return fmt.Errorf("node status %s: %w", stepID, err)
+	}
+	if status.InputsHash != "" && status.InputsHash != inputsHash {
+		return contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not re-apply an effect recorded under other inputs.")
+	}
+	if status.Status == engine.StatusCompleted {
+		if !hasRecord {
+			if _, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, status.ExecutionID); err != nil {
+				return err
+			}
+		}
+		if err := w.service.recordRecoveredStep(ctx, id, attempt, stepID, inputsHash, status); err != nil {
+			return err
+		}
+		_, err := w.service.ackStep(ctx, id, attempt, stepID, inputsHash, status.ExecutionID, status.Result, input.Steps)
+		return err
+	}
+
+	already, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, exec.ExecutionID())
+	if err != nil {
+		return err
+	}
+	if already {
+		return nil
+	}
+
+	var nodeEvents []node.Event
+	onEvent := func(event node.Event) { nodeEvents = append(nodeEvents, event) }
+	response, err := w.service.transport.Call(ctx, node.Request{
+		Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec,
+		Payload: diagnosticPayload(index, input),
+	}, onEvent)
+	if appendErr := w.service.appendNodeEvents(ctx, id, attempt, nodeEvents); appendErr != nil && err == nil {
+		err = appendErr
+	}
+	if err != nil {
+		return fmt.Errorf("node run %s: %w", stepID, err)
+	}
+	if w.service.afterNode != nil {
+		if err := w.service.afterNode(id, stepID); err != nil {
+			return err
+		}
+	}
+	if response.InputsHash != "" && response.InputsHash != inputsHash {
+		return contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
+	}
+	switch response.Status {
+	case engine.StatusCompleted:
+		_, err := w.service.ackStep(ctx, id, attempt, stepID, inputsHash, response.ExecutionID, response.Result, input.Steps)
+		return err
+	case engine.StatusRunning:
+		// A live local owner holds the effect beyond our lock timeout. Do not
+		// start a second Apply; let River retry and reconcile.
+		return contract.NewFault(contract.Unavailable, "node task is still running", "The operation remains running; reconnecting or retrying will attach to the existing effect, not start another.")
+	case engine.StatusFailed:
+		if failErr := w.service.failStep(ctx, id, attempt, stepID, response.Detail); failErr != nil {
+			return failErr
+		}
+		if response.Retryable {
+			return fmt.Errorf("node step %s failed: %s", stepID, response.Detail)
+		}
+		if err := w.service.failOperation(ctx, id, attempt, "Node step failed without a retryable cause: "+response.Detail); err != nil {
+			return err
+		}
+		return errOperationTerminal
+	default:
+		return fmt.Errorf("node returned unexpected status %q for %s", response.Status, stepID)
+	}
+}
+
+func diagnosticPayload(index int, input operations.TestInput) json.RawMessage {
+	raw, _ := json.Marshal(node.DiagnosticPayload{Index: index, Total: input.Steps, StepDelayMS: input.StepDelayMS})
+	return raw
+}
+
+func newRequestID() string {
+	value := make([]byte, 16)
+	if _, err := rand.Read(value); err != nil {
+		return "request"
+	}
+	return hex.EncodeToString(value)
+}
+
+// reconcileCancellation acknowledges completed effects that were not yet
+// acknowledged, then decides between success (all effects complete) and
+// cancellation. It never starts a new node step.
+func (w *testWorker) reconcileCancellation(ctx context.Context, id contract.OperationID, attempt uint32, input operations.TestInput) error {
+	live, err := w.service.reconcileCompletedSteps(ctx, id, attempt, input)
+	if err != nil {
+		return err
+	}
+	if live {
+		return contract.NewFault(contract.Unavailable, "node task is still running", "Cancellation waits for the in-flight step boundary; retry to reconcile the completed effect.")
+	}
+	if _, err := w.service.finishCancelled(ctx, id, attempt, input.Steps); err != nil {
+		return err
+	}
+	return nil
 }
 
 type reconcileWorker struct {
@@ -202,21 +359,124 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		return err
 	}
 	for _, id := range ids {
-		if _, err := s.mutate(ctx, id, func(tx pgx.Tx, op *contract.Operation) error {
-			if op.State.Terminal() {
-				return nil
-			}
-			var ended bool
-			if err := tx.QueryRow(ctx, `SELECT NOT EXISTS (SELECT 1 FROM river_job WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1) AND state NOT IN ('discarded','cancelled','completed'))`, id).Scan(&ended); err != nil {
-				return err
-			}
-			if !ended {
-				return nil
-			}
-			return transition(ctx, tx, op, contract.Failed, "Execution ended without an acknowledged domain result; inspect operation history before retrying.")
-		}); err != nil {
+		if err := s.reconcileOperation(ctx, id); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationID) error {
+	if s.transport == nil {
+		return contract.NewFault(contract.Unavailable, "node transport is not configured", "Reconciliation requires a worker node transport.")
+	}
+	op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
+	if err != nil {
+		return unavailable()
+	}
+	if op.State.Terminal() {
+		return nil
+	}
+	var input operations.TestInput
+	var rawInput []byte
+	if err := s.pool.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", id).Scan(&rawInput); err != nil {
+		return unavailable()
+	}
+	if err := json.Unmarshal(rawInput, &input); err != nil {
+		return err
+	}
+	live := false
+	records, err := s.stepRecords(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if record.State == "completed" {
+			continue
+		}
+		exec := engine.Execution{OperationID: id, Attempt: op.Attempt, Step: record.Step, RequestID: newRequestID()}
+		status, statusErr := s.transport.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
+		if statusErr != nil {
+			if errors.Is(statusErr, engine.ErrJournalCorrupt) {
+				return s.failOperation(ctx, id, op.Attempt, "Node journal is corrupt; inspect it before retrying.")
+			}
+			return unavailable(statusErr)
+		}
+		if status.InputsHash != "" && status.InputsHash != record.InputsHash {
+			_, err := s.mutate(ctx, id, func(tx pgx.Tx, current *contract.Operation) error {
+				if current.State.Terminal() {
+					return nil
+				}
+				return transition(ctx, tx, current, contract.Failed, "Node effect inputs changed during reconciliation; inspect the node journal.")
+			})
+			return err
+		}
+		if status.Status == engine.StatusCompleted {
+			if _, err := s.ackStep(ctx, id, op.Attempt, record.Step, record.InputsHash, status.ExecutionID, status.Result, input.Steps); err != nil {
+				return err
+			}
+			continue
+		}
+		if status.Status == engine.StatusRunning {
+			live = true
+		}
+	}
+	var completed int
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operation_steps WHERE operation_id=$1 AND state='completed'`, id).Scan(&completed); err != nil {
+		return unavailable()
+	}
+	if completed == input.Steps {
+		_, err := s.finishSucceeded(ctx, id, op.Attempt)
+		return err
+	}
+	if live {
+		_, err := s.mutate(ctx, id, func(tx pgx.Tx, current *contract.Operation) error {
+			if current.State.Terminal() {
+				return nil
+			}
+			if current.State == contract.Queued {
+				if err := transition(ctx, tx, current, contract.Running, "Reconciled a live node task after its job ended."); err != nil {
+					return err
+				}
+			}
+			return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Message: "Execution ended without a domain result, but the node task is still running; cancellation and failure wait for the in-flight step boundary."})
+		})
+		return err
+	}
+	if op.State == contract.Cancelling {
+		_, err := s.finishCancelled(ctx, id, op.Attempt, input.Steps)
+		return err
+	}
+	_, err = s.mutate(ctx, id, func(tx pgx.Tx, current *contract.Operation) error {
+		if current.State.Terminal() {
+			return nil
+		}
+		if err := markIncompleteSteps(ctx, tx, id, "execution ended before the step was acknowledged"); err != nil {
+			return err
+		}
+		return transition(ctx, tx, current, contract.Failed, "Execution ended without an acknowledged domain result; inspect operation history before retrying.")
+	})
+	return err
+}
+
+// waitForNewerAttempt does not write domain state while a newer River attempt
+// owns the operation. River's completion query is not attempt-fenced, so
+// returning early could complete the shared job row underneath newer work.
+func (s *Service) waitForNewerAttempt(ctx context.Context, id contract.OperationID, attempt uint32) error {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state, current, err := s.operationState(ctx, id)
+		if err != nil {
+			return err
+		}
+		if state.Terminal() || current <= attempt {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
