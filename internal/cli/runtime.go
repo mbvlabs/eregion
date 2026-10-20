@@ -10,9 +10,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,6 +57,12 @@ var nodeTransportEnvironment = []string{
 	"EREGION_NODE_SSH_KNOWN_HOSTS",
 	"EREGION_NODE_SSH_COMMAND",
 	"EREGION_NODE_SSH_NODE",
+	"EREGION_NODE_WG_PRIVATE_KEY_FILE",
+	"EREGION_NODE_WG_ADDRESS",
+	"EREGION_NODE_WG_PEER_PUBLIC_KEY",
+	"EREGION_NODE_WG_ENDPOINT",
+	"EREGION_NODE_WG_ALLOWED_IPS",
+	"EREGION_NODE_WG_KEEPALIVE",
 }
 
 func (a *app) runtimeSpecs() []spec {
@@ -256,72 +264,170 @@ func (a *app) logger(cmd *cobra.Command) *slog.Logger {
 	return slog.New(slog.NewTextHandler(safeLogWriter{out: cmd.ErrOrStderr(), registry: a.secrets}, &slog.HandlerOptions{Level: slog.LevelInfo}))
 }
 
-func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, *controlplane.Runtime, error) {
+// startRuntime opens the database and builds the runtime. The returned
+// closer releases the node transport (a WireGuard tunnel and its key lock);
+// call it after the workers stopped.
+func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, *controlplane.Runtime, func(), error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
 	defer cancel()
 	pool, err := a.database(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := controlplane.Ready(ctx, pool); err != nil {
 		pool.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	nodeTransport, err := a.nodeTransport()
-	if err != nil {
-		pool.Close()
-		return nil, nil, err
+	// A process without workers never dispatches node work, so it builds no
+	// node transport and holds no WireGuard key.
+	var nodeTransport node.Transport
+	closeTransport := func() {}
+	if concurrency > 0 {
+		nodeTransport, closeTransport, err = a.nodeTransport(a.logger(cmd))
+		if err != nil {
+			pool.Close()
+			return nil, nil, nil, err
+		}
 	}
 	run, err := controlplane.New(pool, a.logger(cmd), controlplane.WorkerConfig{Concurrency: concurrency, Transport: nodeTransport})
 	if err != nil {
+		closeTransport()
 		pool.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return pool, run, nil
+	return pool, run, closeTransport, nil
 }
 
 // nodeTransport builds the transport a worker dispatches node work through.
 // The local transport is the default; EREGION_NODE_TRANSPORT=ssh selects the
 // pinned SSH transport. The choice never changes the worker, the operation
 // contract, or the database model.
-func (a *app) nodeTransport() (node.Transport, error) {
+func (a *app) nodeTransport(logger *slog.Logger) (node.Transport, func(), error) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("EREGION_NODE_TRANSPORT"))) {
 	case "", "local":
-		return nil, nil
+		return nil, func() {}, nil
 	case "ssh":
-		return a.sshTransport()
+		return a.sshTransport(logger)
 	default:
-		return nil, contract.NewFault(contract.ValidationFailed, "unknown node transport", "Set EREGION_NODE_TRANSPORT to local or ssh.")
+		return nil, nil, contract.NewFault(contract.ValidationFailed, "unknown node transport", "Set EREGION_NODE_TRANSPORT to local or ssh.")
 	}
 }
 
 // sshTransport builds the pinned SSH transport from the environment. Every
 // value comes from the environment, never from a command argument, so a
-// credential never reaches a process list.
-func (a *app) sshTransport() (node.Transport, error) {
+// credential never reaches a process list. When
+// EREGION_NODE_WG_PRIVATE_KEY_FILE is set, the SSH connection runs inside a
+// userspace WireGuard tunnel and EREGION_NODE_SSH_ADDRESS is the node's
+// tunnel address.
+func (a *app) sshTransport(logger *slog.Logger) (node.Transport, func(), error) {
 	address := os.Getenv("EREGION_NODE_SSH_ADDRESS")
 	user := os.Getenv("EREGION_NODE_SSH_USER")
 	identity := os.Getenv("EREGION_NODE_SSH_IDENTITY")
 	knownHosts := os.Getenv("EREGION_NODE_SSH_KNOWN_HOSTS")
 	if address == "" || user == "" || identity == "" || knownHosts == "" {
-		return nil, contract.NewFault(contract.InputRequired, "the SSH node transport is not configured", "Set EREGION_NODE_SSH_ADDRESS, EREGION_NODE_SSH_USER, EREGION_NODE_SSH_IDENTITY, and EREGION_NODE_SSH_KNOWN_HOSTS.")
+		return nil, nil, contract.NewFault(contract.InputRequired, "the SSH node transport is not configured", "Set EREGION_NODE_SSH_ADDRESS, EREGION_NODE_SSH_USER, EREGION_NODE_SSH_IDENTITY, and EREGION_NODE_SSH_KNOWN_HOSTS.")
 	}
 	keys, err := transport.LoadHostKeys(knownHosts)
 	if err != nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "the pinned node host keys could not be read", "Check EREGION_NODE_SSH_KNOWN_HOSTS; it must contain the pinned host key of the node.")
+		return nil, nil, contract.NewFault(contract.ValidationFailed, "the pinned node host keys could not be read", "Check EREGION_NODE_SSH_KNOWN_HOSTS; it must contain the pinned host key of the node.")
 	}
-	client, err := transport.NewSSHTransport(transport.SSHConfig{
+	config := transport.SSHConfig{
 		Address:      address,
 		User:         user,
 		IdentityFile: identity,
 		HostKeys:     keys,
 		Command:      os.Getenv("EREGION_NODE_SSH_COMMAND"),
 		ExpectedNode: os.Getenv("EREGION_NODE_SSH_NODE"),
+	}
+	closer := func() {}
+	if os.Getenv("EREGION_NODE_WG_PRIVATE_KEY_FILE") != "" {
+		dialer, err := a.wireGuardDialer(address, logger)
+		if err != nil {
+			return nil, nil, err
+		}
+		config.Dialer = dialer
+		closer = func() { _ = dialer.Close() }
+	}
+	client, err := transport.NewSSHTransport(config)
+	if err != nil {
+		closer()
+		return nil, nil, contract.NewFault(contract.ValidationFailed, "the SSH node transport is not usable", err.Error())
+	}
+	return client, closer, nil
+}
+
+// wireGuardDialer builds the userspace WireGuard dialer from the environment.
+// The private key comes only from a strict-mode file and is registered for
+// redaction before anything else can print it.
+func (a *app) wireGuardDialer(sshAddress string, logger *slog.Logger) (*transport.WireGuardDialer, error) {
+	key, err := transport.ReadWireGuardKey(os.Getenv("EREGION_NODE_WG_PRIVATE_KEY_FILE"))
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "the WireGuard private key could not be read", err.Error())
+	}
+	key.Register(a.secrets)
+	usage := "Set EREGION_NODE_WG_ADDRESS, EREGION_NODE_WG_PEER_PUBLIC_KEY, and EREGION_NODE_WG_ENDPOINT; EREGION_NODE_SSH_ADDRESS must be the node's tunnel address."
+	localText := os.Getenv("EREGION_NODE_WG_ADDRESS")
+	peerText := os.Getenv("EREGION_NODE_WG_PEER_PUBLIC_KEY")
+	endpoint := os.Getenv("EREGION_NODE_WG_ENDPOINT")
+	if localText == "" || peerText == "" || endpoint == "" {
+		return nil, contract.NewFault(contract.InputRequired, "the WireGuard tunnel is not configured", usage)
+	}
+	local, err := netip.ParseAddr(localText)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "EREGION_NODE_WG_ADDRESS is not an IP address", usage)
+	}
+	host, _, err := net.SplitHostPort(sshAddress)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "EREGION_NODE_SSH_ADDRESS must be host:port", usage)
+	}
+	nodeAddress, err := netip.ParseAddr(host)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "EREGION_NODE_SSH_ADDRESS must be the node's tunnel IP address when WireGuard is enabled", usage)
+	}
+	peer, err := transport.ParseWireGuardPublicKey(peerText)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "EREGION_NODE_WG_PEER_PUBLIC_KEY is not a WireGuard public key", usage)
+	}
+	var allowed []netip.Prefix
+	for _, field := range strings.Split(os.Getenv("EREGION_NODE_WG_ALLOWED_IPS"), ",") {
+		if field = strings.TrimSpace(field); field == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(field)
+		if err != nil {
+			return nil, contract.NewFault(contract.ValidationFailed, "EREGION_NODE_WG_ALLOWED_IPS must be comma-separated prefixes", "Use the node subnet, for example 10.77.0.0/24, or leave it unset to route only the node address.")
+		}
+		allowed = append(allowed, prefix)
+	}
+	var keepalive time.Duration
+	if text := os.Getenv("EREGION_NODE_WG_KEEPALIVE"); text != "" {
+		seconds, err := strconv.Atoi(text)
+		if err != nil || seconds < 1 || seconds > 3600 {
+			return nil, contract.NewFault(contract.ValidationFailed, "EREGION_NODE_WG_KEEPALIVE must be 1–3600 seconds", "Leave it unset for the 25-second default.")
+		}
+		keepalive = time.Duration(seconds) * time.Second
+	}
+	lockDir := os.Getenv("XDG_RUNTIME_DIR")
+	if lockDir == "" {
+		lockDir = os.TempDir()
+	}
+	dialer, err := transport.NewWireGuardDialer(transport.WireGuardConfig{
+		PrivateKey:    key,
+		Address:       local,
+		NodeAddress:   nodeAddress,
+		PeerPublicKey: peer,
+		Endpoint:      endpoint,
+		AllowedIPs:    allowed,
+		Keepalive:     keepalive,
+		LockDir:       lockDir,
+		Logf: func(format string, args ...any) {
+			logger.Warn("WireGuard: " + fmt.Sprintf(format, args...))
+		},
 	})
 	if err != nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "the SSH node transport is not usable", err.Error())
+		return nil, contract.NewFault(contract.ValidationFailed, "the WireGuard tunnel is not usable", err.Error())
 	}
-	return client, nil
+	return dialer, nil
 }
 
 func stopWorkers(run *controlplane.Runtime) error {
@@ -335,11 +441,12 @@ func (a *app) worker(cmd *cobra.Command, _ []string) (result, error) {
 	if concurrency < 1 {
 		return result{}, contract.NewFault(contract.ValidationFailed, "worker concurrency must be positive", "Use --concurrency 1–16.")
 	}
-	pool, run, err := a.startRuntime(cmd, concurrency)
+	pool, run, closeTransport, err := a.startRuntime(cmd, concurrency)
 	if err != nil {
 		return result{}, err
 	}
 	defer pool.Close()
+	defer closeTransport()
 	if err := run.Jobs.Start(cmd.Context()); err != nil {
 		return result{}, err
 	}
@@ -380,11 +487,13 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	if !withWorkers {
 		concurrency = 0
 	}
-	pool, run, err := a.startRuntime(cmd, concurrency)
+	pool, run, closeTransport, err := a.startRuntime(cmd, concurrency)
 	if err != nil {
 		return result{}, err
 	}
 	defer pool.Close()
+	// Deferred before the worker stop below, so it runs after it.
+	defer closeTransport()
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return result{}, contract.NewFault(contract.Unavailable, "could not bind API listener", "Check --listen and whether the port is available.")
