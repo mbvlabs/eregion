@@ -249,6 +249,32 @@ func (s *Service) Plan(ctx context.Context, req Request) (Plan, error) {
 	case ActionRecover:
 		plan.Steps = []PlanStep{{ID: "recover", Description: "Recover an interrupted restore from the durable journal, restoring the previous database when needed."}}
 		plan.Warnings = append(plan.Warnings, "recovery changes database names to return to the pre-restore state")
+	case ActionCredentials:
+		if req.Export == nil {
+			return Plan{}, invalidResource("credential export destination is required", "Name one new absolute destination file.")
+		}
+		if err := validateExportDestination(req.Export.Destination); err != nil {
+			return Plan{}, err
+		}
+		plan.Steps = []PlanStep{
+			{ID: "credential", Description: "Read the protected credential for the owned resource."},
+			{ID: "export", Description: "Write one new 0600 credential bundle to the explicit destination file; plaintext is never printed or returned."},
+			{ID: "report", Description: "Report only the destination path and non-secret endpoint metadata."},
+		}
+		plan.Warnings = append(plan.Warnings, "the destination path is on the application host; the file contains a credential")
+	case ActionSchedule:
+		if req.Policy == nil {
+			return Plan{}, invalidResource("backup policy is required", "Provide a schedule and at least one retention bound.")
+		}
+		if _, err := s.requireBackupDir(); err != nil {
+			return Plan{}, err
+		}
+		plan.Steps = []PlanStep{
+			{ID: "validate", Description: "Validate the interval or cron expression, timezone, and retention bound."},
+			{ID: "record", Description: "Write the secret-free backup policy declaration to the protected state directory."},
+			{ID: "report", Description: "Return the River periodic declaration; registration is owned by the orchestrator."},
+		}
+		plan.Warnings = append(plan.Warnings, "this records policy only; it does not execute a backup or start a scheduler")
 	}
 	if req.Action == ActionBackup && req.Backup != nil && req.Backup.Policy != nil {
 		plan.Warnings = append(plan.Warnings, "backup policy is a declaration for the orchestrator; this action executes one backup only")
@@ -328,6 +354,10 @@ func (s *Service) Execute(ctx context.Context, req Request) (result Result, err 
 		result, err = s.restore(ctx, spec, req.Restore, effect)
 	case ActionRecover:
 		result, err = s.recover(ctx, spec)
+	case ActionCredentials:
+		result, err = s.exportCredentials(ctx, spec, req.Export, effect)
+	case ActionSchedule:
+		result, err = s.setSchedule(spec, req.Policy)
 	default:
 		return Result{}, invalidResource("unsupported resource action", "Use a supported action.")
 	}

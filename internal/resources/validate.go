@@ -116,7 +116,7 @@ func containerName(spec Spec) string { return "eregion-pg-" + spec.Name }
 
 func validateRequest(req Request) error {
 	if !req.Action.Valid() {
-		return invalidResource("unsupported resource action", "Use create, health, destroy, backup, verify, restore, or recover.")
+		return invalidResource("unsupported resource action", "Use create, health, destroy, backup, verify, restore, recover, credentials, or schedule.")
 	}
 	switch req.Action {
 	case ActionVerify:
@@ -130,6 +130,17 @@ func validateRequest(req Request) error {
 	case ActionRestore:
 		if req.Restore == nil || strings.TrimSpace(req.Restore.Archive) == "" || strings.TrimSpace(req.Restore.Confirmation) == "" {
 			return invalidResource("restore requires an archive and confirmation", "Provide a backup archive and the exact resource name as confirmation.")
+		}
+	case ActionCredentials:
+		if req.Export == nil {
+			return invalidResource("credential export destination is required", "Name one new absolute destination file; credentials are never printed.")
+		}
+	case ActionSchedule:
+		if req.Policy == nil {
+			return invalidResource("backup policy is required", "Provide a schedule and at least one retention bound.")
+		}
+		if err := req.Policy.Validate(); err != nil {
+			return err
 		}
 	case ActionBackup:
 		if req.Backup != nil && req.Backup.Policy != nil {

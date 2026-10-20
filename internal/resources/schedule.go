@@ -1,7 +1,9 @@
 package resources
 
 import (
+	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -9,6 +11,8 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 )
+
+const scheduleStateSchema = "eregion/backup-schedule/v1"
 
 // Schedule declares when an orchestrator should execute a backup. It never
 // starts a scheduler in this package. Exactly one of EverySeconds or Cron is
@@ -247,12 +251,12 @@ func (c cronExpression) matches(at time.Time) bool {
 // ScheduledBackup is the exact durable action the orchestrator should insert as
 // a River periodic job. It contains no credential value.
 type ScheduledBackup struct {
-	Key      string
-	Kind     string
-	Target   string
-	Input    []byte
-	Schedule Schedule
-	Policy   Policy
+	Key      string   `json:"key"`
+	Kind     string   `json:"kind"`
+	Target   string   `json:"target"`
+	Input    []byte   `json:"input,omitempty"`
+	Schedule Schedule `json:"schedule"`
+	Policy   Policy   `json:"policy"`
 }
 
 // PeriodicBackup validates a policy and returns the action declaration for a
@@ -288,6 +292,57 @@ func (s *Service) PeriodicBackup(spec Spec, policy Policy) (ScheduledBackup, err
 		Schedule: policy.Schedule,
 		Policy:   policy,
 	}, nil
+}
+
+// scheduleState is the protected, secret-free record of one applied backup
+// policy. It is configuration for the orchestrator's River periodic job; this
+// package still does not start a scheduler.
+type scheduleState struct {
+	Schema    string          `json:"schema"`
+	Spec      Spec            `json:"spec"`
+	Policy    Policy          `json:"policy"`
+	Key       string          `json:"key"`
+	Kind      string          `json:"kind"`
+	Target    string          `json:"target"`
+	Input     json.RawMessage `json:"input"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+func (s *Service) schedulePath(name string) string {
+	return filepath.Join(s.resourceDir(name), "schedule.json")
+}
+
+func (s *Service) setSchedule(spec Spec, policy *Policy) (Result, error) {
+	result := baseResult(ActionSchedule, spec, StateUnknown)
+	if policy == nil {
+		return result, invalidResource("backup policy is required", "Provide a schedule and at least one retention bound.")
+	}
+	scheduled, err := s.PeriodicBackup(spec, *policy)
+	if err != nil {
+		return result, err
+	}
+	state := scheduleState{
+		Schema: scheduleStateSchema, Spec: spec, Policy: *policy,
+		Key: scheduled.Key, Kind: scheduled.Kind, Target: scheduled.Target,
+		Input: json.RawMessage(scheduled.Input), UpdatedAt: s.now(),
+	}
+	encoded, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return result, err
+	}
+	if err := ensurePrivateDir(s.resourceDir(spec.Name)); err != nil {
+		return result, unavailable("could not create the protected state directory", "Check permissions on the service state directory.")
+	}
+	if err := writeAtomic(s.schedulePath(spec.Name), append(encoded, '\n'), 0o600); err != nil {
+		return result, unavailable("could not record the backup schedule policy", "Check permissions and free space on the service state directory.")
+	}
+	result.Changed = true
+	result.Scheduled = &ScheduledBackup{
+		Key: scheduled.Key, Kind: scheduled.Kind, Target: scheduled.Target,
+		Schedule: scheduled.Schedule, Policy: scheduled.Policy,
+	}
+	result.State = StateReady
+	return result, nil
 }
 
 func formatCronError(err error) string {

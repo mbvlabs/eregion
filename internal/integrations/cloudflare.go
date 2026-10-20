@@ -99,12 +99,9 @@ func NewCloudflare(cfg CloudflareConfig) (*Cloudflare, error) {
 	if err != nil || parsed.User != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname()))) {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid Cloudflare API URL", "Use HTTPS, or plain HTTP only for a loopback test endpoint.")
 	}
-	if cfg.Authorizer == nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "Cloudflare mutations require an authorizer", "Configure explicit authorization; DNS changes fail closed.")
-	}
-	if cfg.Audit == nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "Cloudflare mutations require an audit sink", "Configure durable auditing; DNS changes fail closed.")
-	}
+	// Read-only inventory may construct a client without an authorizer or audit
+	// sink. ReconcileOperation rechecks both and fails closed before any
+	// mutation, so a read-only client cannot become a mutation path.
 	client := cfg.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
@@ -151,6 +148,9 @@ func (c *Cloudflare) Reconcile(ctx context.Context, actor contract.Actor, desire
 // entry for the plan.
 func (c *Cloudflare) ReconcileOperation(ctx context.Context, actor contract.Actor, opID contract.OperationID, desired []DNSRecord) (DNSReport, error) {
 	report := DNSReport{Zone: c.zoneName, OperationID: string(opID), FetchedAt: c.now().UTC()}
+	if c.authz == nil || c.audit == nil {
+		return report, contract.NewFault(contract.Unavailable, "DNS reconciliation is not configured", "Wire explicit authorization and a durable audit sink; DNS changes fail closed.")
+	}
 	if err := actor.Validate(); err != nil {
 		return report, err
 	}

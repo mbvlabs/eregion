@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,8 +22,32 @@ const (
 	// KindAccessRevoke revokes an audited private-device grant.
 	KindAccessRevoke = "platform.access.revoke"
 
-	InventoryCollection = "access"
+	InventoryCollection    = "access"
+	InventoryCollectionDNS = "dns"
 )
+
+// DNSZone configures one read-only Cloudflare zone inventory. TokenFile is an
+// absolute root-owned 0600 credential-file reference; the token is never part of
+// action input, route output, or logs.
+type DNSZone struct {
+	ZoneID    string
+	ZoneName  string
+	TokenFile string
+}
+
+// DNSRoute is one observed record in the read-only DNS inventory.
+type DNSRoute struct {
+	ZoneID    string `json:"zone_id"`
+	Zone      string `json:"zone"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Content   string `json:"content"`
+	TTL       int    `json:"ttl"`
+	Proxied   bool   `json:"proxied"`
+	Comment   string `json:"comment,omitempty"`
+	ManagedBy string `json:"managed_by,omitempty"`
+}
 
 // RuntimeConfig wires durable integration actions. Nil dependencies fail closed
 // at execution time; package initialization never requires external services.
@@ -32,6 +57,9 @@ type RuntimeConfig struct {
 	Access            *AccessController
 	CloudflareBaseURL string
 	CloudflareClient  *http.Client
+	// DNSZones configures the read-only dns inventory collection. Mutations
+	// still carry their own zone and token-file reference in action input.
+	DNSZones []DNSZone
 }
 
 type dnsInput struct {
@@ -99,6 +127,24 @@ func Configure(reg *platform.Registry, cfg RuntimeConfig) error {
 	if err := reg.Register(platform.Definition{
 		Kind: KindAccessRevoke, Summary: "Revoke a private-device access grant",
 		Normalize: normalizeRevoke, Executor: executor,
+	}); err != nil {
+		return err
+	}
+	seenZones := map[string]bool{}
+	for _, zone := range cfg.DNSZones {
+		if err := ValidateSecretRef(zone.TokenFile); err != nil {
+			return err
+		}
+		if !zoneIDPattern.MatchString(zone.ZoneID) || !dnsNamePattern.MatchString(zone.ZoneName) || !strings.Contains(zone.ZoneName, ".") {
+			return contract.NewFault(contract.ValidationFailed, "invalid DNS inventory zone", "Configure a lowercase 32-character zone ID and a lowercase zone name.")
+		}
+		if seenZones[zone.ZoneID] {
+			return contract.NewFault(contract.ValidationFailed, "duplicate DNS inventory zone", "Configure each Cloudflare zone once.")
+		}
+		seenZones[zone.ZoneID] = true
+	}
+	if err := reg.RegisterInventory(dnsInventory{
+		zones: cfg.DNSZones, baseURL: cfg.CloudflareBaseURL, client: cfg.CloudflareClient,
 	}); err != nil {
 		return err
 	}
@@ -328,4 +374,68 @@ func boundedLimit(limit int) int {
 		return 50
 	}
 	return limit
+}
+
+// dnsInventory reads records from explicitly configured zones. It performs no
+// mutation and records no audit entry; authorization for mutations remains in
+// the reconcile action path.
+type dnsInventory struct {
+	zones   []DNSZone
+	baseURL string
+	client  *http.Client
+}
+
+func (dnsInventory) Collection() string { return InventoryCollectionDNS }
+
+func (p dnsInventory) Read(ctx context.Context, query platform.InventoryQuery) (any, error) {
+	limit := boundedLimit(query.Limit)
+	routes := make([]DNSRoute, 0)
+	for _, zone := range p.zones {
+		raw, err := ReadSecretFile(zone.TokenFile, 4096)
+		if err != nil {
+			return nil, err
+		}
+		client, err := NewCloudflare(CloudflareConfig{
+			APIToken: strings.TrimRight(string(raw), "\r\n"),
+			ZoneID:   zone.ZoneID, ZoneName: zone.ZoneName,
+			BaseURL: p.baseURL, HTTPClient: p.client,
+		})
+		if err != nil {
+			return nil, err
+		}
+		records, err := client.ListRecords(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			route := DNSRoute{
+				ZoneID: zone.ZoneID, Zone: zone.ZoneName, ID: record.ID, Name: record.Name,
+				Type: record.Type, Content: record.Content, TTL: record.TTL,
+				Proxied: record.Proxied, Comment: record.Comment,
+			}
+			if managed(record) {
+				route.ManagedBy = "eregion"
+			}
+			routes = append(routes, route)
+			if len(routes) >= limit {
+				break
+			}
+		}
+		if len(routes) >= limit {
+			break
+		}
+	}
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Zone == routes[j].Zone {
+			if routes[i].Name == routes[j].Name {
+				return routes[i].Type < routes[j].Type
+			}
+			return routes[i].Name < routes[j].Name
+		}
+		return routes[i].Zone < routes[j].Zone
+	})
+	if len(routes) > limit {
+		routes = routes[:limit]
+	}
+	return platform.Inventory{Collection: InventoryCollectionDNS, Items: routes, Limit: limit}, nil
 }

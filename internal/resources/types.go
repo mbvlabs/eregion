@@ -35,11 +35,17 @@ const (
 	// ActionRecover rolls back an interrupted restore recorded in the durable
 	// restore journal. It does not start a new restore or need a backup archive.
 	ActionRecover Action = "recover"
+	// ActionCredentials writes an application credential bundle to one explicit
+	// protected destination file. It never returns plaintext in its result.
+	ActionCredentials Action = "credentials"
+	// ActionSchedule records a backup policy declaration. It does not start a
+	// scheduler; the orchestrator owns River periodic registration.
+	ActionSchedule Action = "schedule"
 )
 
 func (a Action) Valid() bool {
 	switch a {
-	case ActionCreate, ActionHealth, ActionDestroy, ActionBackup, ActionVerify, ActionRestore, ActionRecover:
+	case ActionCreate, ActionHealth, ActionDestroy, ActionBackup, ActionVerify, ActionRestore, ActionRecover, ActionCredentials, ActionSchedule:
 		return true
 	}
 	return false
@@ -47,7 +53,7 @@ func (a Action) Valid() bool {
 
 func (a Action) Mutating() bool {
 	switch a {
-	case ActionCreate, ActionDestroy, ActionBackup, ActionRestore, ActionRecover:
+	case ActionCreate, ActionDestroy, ActionBackup, ActionRestore, ActionRecover, ActionCredentials, ActionSchedule:
 		return true
 	}
 	return false
@@ -127,6 +133,15 @@ type CredentialReference struct {
 	Mode         string `json:"mode"`
 }
 
+// CredentialExport describes one explicitly requested protected-file export. It
+// names the destination and never contains the credential value.
+type CredentialExport struct {
+	Destination string `json:"destination"`
+	Mode        string `json:"mode"`
+	Username    string `json:"username"`
+	Database    string `json:"database"`
+}
+
 // Health is one explicit observation. It is not a promise of continuous
 // availability.
 type Health struct {
@@ -187,6 +202,8 @@ type Result struct {
 	RestoredFrom *BackupArtifact      `json:"restored_from,omitempty"`
 	SafetyBackup *BackupArtifact      `json:"safety_backup,omitempty"`
 	Recovery     *Recovery            `json:"recovery,omitempty"`
+	Export       *CredentialExport    `json:"export,omitempty"`
+	Scheduled    *ScheduledBackup     `json:"scheduled,omitempty"`
 	Warnings     []string             `json:"warnings,omitempty"`
 	ObservedAt   time.Time            `json:"observed_at"`
 }
@@ -206,6 +223,8 @@ type Request struct {
 	Verify      *VerifyRequest  `json:"verify,omitempty"`
 	Destroy     *DestroyRequest `json:"destroy,omitempty"`
 	Restore     *RestoreRequest `json:"restore,omitempty"`
+	Export      *ExportRequest  `json:"export,omitempty"`
+	Policy      *Policy         `json:"policy,omitempty"`
 }
 
 // BackupRequest controls one archive. Destination comes from Service
@@ -240,6 +259,12 @@ type RestoreRequest struct {
 	Policy       *Policy `json:"policy,omitempty"`
 }
 
+// ExportRequest names one new protected destination file. The credential
+// contents are written there; they are never part of the request or result.
+type ExportRequest struct {
+	Destination string `json:"destination"`
+}
+
 // PlanStep is one ordered execution step. A plan performs no mutation.
 type PlanStep struct {
 	ID          string `json:"id"`
@@ -263,4 +288,90 @@ type Plan struct {
 	BackupDestination    string     `json:"backup_destination,omitempty"`
 	SafetyBackup         bool       `json:"safety_backup"`
 	Warnings             []string   `json:"warnings,omitempty"`
+}
+
+// Preview is the static dry-run view attached to an action input. The
+// control-plane API returns it without inserting an operation or River job.
+// Current container state is read by resources status instead; a preview is not
+// an authorization token and Execute revalidates everything.
+type Preview struct {
+	Schema               string     `json:"schema"`
+	Action               Action     `json:"action"`
+	Resource             string     `json:"resource"`
+	Host                 string     `json:"host"`
+	Engine               Engine     `json:"engine"`
+	Steps                []PlanStep `json:"steps"`
+	Destructive          bool       `json:"destructive"`
+	ConfirmationRequired bool       `json:"confirmation_required"`
+	ConfirmationPhrase   string     `json:"confirmation_phrase,omitempty"`
+	SafetyBackup         bool       `json:"safety_backup"`
+	Warnings             []string   `json:"warnings,omitempty"`
+}
+
+// staticPreview describes what an action would do without contacting Docker.
+func staticPreview(action Action, spec Spec, removeVolume bool) Preview {
+	preview := Preview{
+		Schema: Schema, Action: action, Resource: spec.Name, Host: spec.Host, Engine: spec.Engine,
+	}
+	switch action {
+	case ActionCreate:
+		preview.Steps = []PlanStep{
+			{ID: "validate", Description: "Validate the resource identity, version, explicit application host, endpoint, and credential references."},
+			{ID: "volume", Description: "Create or verify the labelled named volume."},
+			{ID: "container", Description: "Create or start the PostgreSQL container with the protected password file mounted read-only."},
+			{ID: "health", Description: "Wait for pg_isready on the application host and publish the observed endpoint."},
+		}
+	case ActionHealth:
+		preview.Steps = []PlanStep{{ID: "health", Description: "Inspect the owned container and run pg_isready. No mutation."}}
+	case ActionDestroy:
+		preview.Destructive, preview.ConfirmationRequired, preview.ConfirmationPhrase = true, true, spec.Name
+		preview.Steps = []PlanStep{
+			{ID: "confirm", Description: "Require the exact resource name and refuse the control-plane database.", Destructive: true},
+			{ID: "container", Description: "Remove only the container whose ownership labels match this resource.", Destructive: true},
+		}
+		if removeVolume {
+			preview.Steps = append(preview.Steps, PlanStep{ID: "volume", Description: "Remove the labelled named volume and protected credential files (database data is deleted).", Destructive: true})
+		} else {
+			preview.Steps = append(preview.Steps, PlanStep{ID: "volume", Description: "Keep the named volume and credentials; data remains recoverable."})
+		}
+	case ActionBackup:
+		preview.Steps = []PlanStep{
+			{ID: "ready", Description: "Verify the owned container is accepting connections."},
+			{ID: "dump", Description: "Run pg_dump --format=custom into a temporary file in the configured backup directory."},
+			{ID: "checksum", Description: "Compute SHA-256, publish the archive atomically, and write its manifest."},
+		}
+	case ActionVerify:
+		preview.Steps = []PlanStep{
+			{ID: "checksum", Description: "Recompute and compare the archive SHA-256 with its manifest."},
+			{ID: "list", Description: "Run pg_restore --list against the archive and require a nonzero table of contents."},
+		}
+	case ActionRestore:
+		preview.Destructive, preview.ConfirmationRequired, preview.ConfirmationPhrase = true, true, spec.Name
+		preview.SafetyBackup = true
+		preview.Steps = []PlanStep{
+			{ID: "confirm", Description: "Require the exact resource name and refuse the control-plane database.", Destructive: true},
+			{ID: "verify", Description: "Verify the selected archive, its manifest, resource identity, checksum, and pg_restore listing."},
+			{ID: "safety", Description: "Take and verify a safety backup before any target change."},
+			{ID: "temporary", Description: "Restore into a temporary database next to the target."},
+			{ID: "cutover", Description: "Terminate target connections, rename the old database aside, and rename the restored database into place.", Destructive: true},
+			{ID: "health", Description: "Probe the restored database; on failure roll the previous database back.", Destructive: true},
+		}
+	case ActionRecover:
+		preview.Steps = []PlanStep{{ID: "recover", Description: "Recover an interrupted restore from the durable journal, restoring the previous database when needed."}}
+	case ActionCredentials:
+		preview.Steps = []PlanStep{
+			{ID: "credential", Description: "Read the protected credential for the owned resource."},
+			{ID: "export", Description: "Write one new 0600 credential bundle to the explicit destination file; plaintext is never printed or returned."},
+			{ID: "report", Description: "Report only the destination path and non-secret endpoint metadata."},
+		}
+		preview.Warnings = append(preview.Warnings, "the destination path is on the application host; the file contains a credential")
+	case ActionSchedule:
+		preview.Steps = []PlanStep{
+			{ID: "validate", Description: "Validate the interval or cron expression, timezone, and retention bound."},
+			{ID: "record", Description: "Write the secret-free backup policy declaration to the protected state directory."},
+			{ID: "report", Description: "Return the River periodic declaration; registration is owned by the orchestrator."},
+		}
+		preview.Warnings = append(preview.Warnings, "this records policy only; it does not execute a backup or start a scheduler")
+	}
+	return preview
 }
