@@ -41,11 +41,12 @@ the earlier approval.
 | Action | Key | Interactive behavior | Noninteractive equivalent | Destructive |
 | --- | --- | --- | --- | --- |
 | Create application | `a` | Guided form → dry run → submit | `eregion platform apps create <app> --idempotency-key <key> --json` | no |
-| Create environment | `e` | Guided form → dry run → submit | `eregion platform environments create <app> <environment> --node <node> --container-port <port> --host-port <port> --health-path <path> --idempotency-key <key> --json` | no |
+| Create environment | `e` | Guided form → dry run → submit | `eregion platform environments create <app> <environment> --node <node> [--build-node <node>] --container-port <port> --host-port <port> --health-path <path> --idempotency-key <key> --json` | no |
 | Create image release | `i` | Guided form → dry run → submit | `eregion platform releases create <app> <environment> --image <image> --idempotency-key <key> --json` | no |
 | Preview a deployment | — | Palette documents the command | `eregion platform deployments plan <app> <environment> --release-id <release> --json` | no |
 | Deploy release | `d` | Guided form → dry run → typed environment → submit | `eregion platform deployments deploy <app> <environment> --release-id <release> --idempotency-key <key> --json` | replaces serving release |
 | Roll back environment | `o` | Guided form → dry run → typed environment → submit | `eregion platform deployments rollback <app> <environment> --dry-run --json`, then submit the same target with the returned `--confirm <token>` and an idempotency key | yes |
+| Retry failed deployment | — | Palette documents the command | `eregion platform deployments retry --deployment <deployment-or-operation-id> --idempotency-key <key> --json` | no |
 | Check node runtime | `n` | Guided form → dry run → submit | `eregion platform nodes check <node> --idempotency-key <key> --json` | no |
 | Destroy application resource | `x` | Guided form → dry run → typed resource name → submit | `eregion platform submit --kind platform.resource.destroy --target node/<host> --input-file action.json --idempotency-key <key> --json` | yes |
 | Create resource backup | `b` | Guided form → dry run → submit | `eregion platform submit --kind platform.backup.create --target node/<host> --input-file action.json --idempotency-key <key> --json` | no |
@@ -67,38 +68,37 @@ implemented command.
 The M3 viewer derives its presentation only from event data the platform worker
 emits:
 
-- **Per-target state:** step IDs map to build, candidate container, candidate
-  health, traffic switch, serving health, rollback, restore health, cleanup, and
-  node targets. Unknown stages remain generic steps.
-- **Build log:** sanitized log lines observed while a build-capable step is
-  active. Hostile ANSI/OSC and control characters are escaped and registered
-  secrets are redacted before rendering.
-- **Health observations:** explicit `health passed after N check(s): detail`
-  log lines and failed health-step warnings, each with timestamp and probe count
-  when reported.
-- **Serving release:** the serving container log line (`container <name> runs
-  <image>`) is shown with the immutable image. When the event stream does not
-  identify a release ID, the viewer says “release ID not reported by events”
-  rather than guessing one.
+- **Per-target state:** step IDs map to preflight, build, candidate container,
+  candidate health, traffic switch, serving health, rollback, restore health,
+  cleanup, and node targets. Unknown stages remain generic steps.
+- **Build log:** sanitized log lines attributed by the structured `step`/`stage`
+  fields the worker stamps on node log events. Hostile ANSI/OSC and control
+  characters are escaped and registered secrets are redacted before rendering.
+- **Health observations:** structured `health` objects with target, probe count,
+  timeout/deadline, attempt, pass/fail, and detail. A zero probe count is shown
+  as “not reported”. The old message parser remains only as a fallback for
+  pre-structured event streams.
+- **Serving release:** traffic-switch acknowledgements, deploy success, deploy
+  failure, and restore events carry `release_id` and `serving_release_id`. The
+  normal success path therefore states the actual serving release ID, and the
+  container log supplies the immutable image and container name.
+- **Cleanup:** `platform-cleanup-01-v1` is a durable step. The viewer shows it as
+  a target and as a cleanup line with its measured duration; “not observed” is
+  distinct from “pending”.
+- **Durations:** completed node steps carry `duration_ms`, shown beside the event
+  and used to mark the stage complete.
 
-### Data the worker does not currently emit
+### Remaining limits
 
-These gaps are rendered honestly; they are not synthesized:
+These are rendered honestly; they are not synthesized:
 
-1. Log events have no `stage`/step field. Build and health attribution uses the
-   most recently observed step, so a late log after a step boundary can only be
-   shown as a generic log.
-2. Deployment success/failure events carry no release ID. The viewer can show
-   the serving image digest from the container log, but not the release ID
-   unless a restore warning names it.
-3. `platform-cleanup-01-v1` runs directly in the worker's deferred cleanup and
-   appends no step or log event, so cleanup is not visible in the viewer.
-4. Health produces one success log or a failure warning, not a structured
-   observation event with target, probe count, attempt, and deadline.
-5. There is no explicit traffic-switch acknowledgement event; the viewer sees
-   the step start, the container log, and later verification.
-6. Steps have start/completion timestamps only through event timestamps; there
-   is no per-step duration field.
+1. An older event stream without structured fields falls back to the last
+   observed step and message parsing. A late log may then be a generic log.
+2. An interrupted deployment that never wrote a switch, restore, or failure event
+   shows only what the durable events prove; inventory remains authoritative for
+   the after-the-fact reconciliation result.
+3. Cross-node image transfer and registry credentials are not implemented, so a
+   distinct `build_node` build is refused rather than shown as progress.
 
 ## Graphs and telemetry
 

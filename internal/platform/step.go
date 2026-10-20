@@ -35,7 +35,7 @@ type Family struct {
 }
 
 var (
-	argvStepPattern      = regexp.MustCompile(`^platform-(argv|node|pull|image|command|cleanup)-[0-9]{2}-v1$`)
+	argvStepPattern      = regexp.MustCompile(`^platform-(argv|node|pull|image|command|cleanup|preflight)-[0-9]{2}-v1$`)
 	containerStepPattern = regexp.MustCompile(`^platform-container-[0-9]{2}-v1$`)
 	healthStepPattern    = regexp.MustCompile(`^platform-health-[0-9]{2}-v1$`)
 	packStepPattern      = regexp.MustCompile(`^platform-pack-[0-9]{2}-v1$`)
@@ -237,7 +237,16 @@ func buildContainerStep(exec engine.Execution, raw json.RawMessage) (engine.Step
 		}
 	}
 	for key, value := range payload.Labels {
-		if !strings.Contains(key, "/") {
+		if len(key) == 0 || len(key) > 253 || strings.ContainsAny(key, " \t\r\n\x00") {
+			return nil, fmt.Errorf("container label %q is empty, too long, or contains whitespace", key)
+		}
+		// Docker accepts a bare key; when a slash is present the part before it
+		// must still be a DNS-style prefix. io.eregion.app is a valid bare key.
+		name := key
+		if slash := strings.IndexByte(key, '/'); slash >= 0 {
+			name = key[:slash]
+		}
+		if !labelKeyPattern.MatchString(name) {
 			return nil, fmt.Errorf("container label %q must have a DNS-style prefix", key)
 		}
 		if len(value) > 128 {

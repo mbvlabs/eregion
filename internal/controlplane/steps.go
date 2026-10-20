@@ -366,9 +366,8 @@ func (s *Service) appendNodeEvents(ctx context.Context, id contract.OperationID,
 			if event.Kind == "step" {
 				kind = "step"
 			}
-			contractEvent := contract.Event{Kind: kind, Message: message}
+			contractEvent := contract.Event{Kind: kind, Stage: event.Step, Step: event.Step, Message: message}
 			if kind == "step" {
-				contractEvent.Stage = event.Step
 				contractEvent.ExecutionID = event.ExecutionID
 			}
 			if err := appendEvent(ctx, tx, op, contractEvent); err != nil {

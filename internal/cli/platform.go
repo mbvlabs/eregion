@@ -465,6 +465,7 @@ func (a *app) platformEnvironmentsSpec() spec {
 				flags: func(cmd *cobra.Command) {
 					addSubmissionFlags(cmd)
 					cmd.Flags().String("node", "", "Node that must have the application role and docker capability")
+					cmd.Flags().String("build-node", "", "Optional builder node (builder + buildpacks) for releases; defaults to --node")
 					cmd.Flags().Int("container-port", platform.DefaultContainerPort, "Container port")
 					cmd.Flags().Int("host-port", 0, "Stable host port; 0 allocates one from 20000–29999")
 					cmd.Flags().String("bind", platform.DefaultBind, "Literal bind address")
@@ -478,6 +479,7 @@ func (a *app) platformEnvironmentsSpec() spec {
 					if node == "" {
 						return result{}, contract.NewFault(contract.InputRequired, "--node is required", "Choose a registered node with the application role and docker capability.")
 					}
+					buildNode, _ := cmd.Flags().GetString("build-node")
 					containerPort, _ := cmd.Flags().GetInt("container-port")
 					hostPort, _ := cmd.Flags().GetInt("host-port")
 					bind, _ := cmd.Flags().GetString("bind")
@@ -494,7 +496,7 @@ func (a *app) platformEnvironmentsSpec() spec {
 						return result{}, err
 					}
 					return a.submitPlatform(cmd, platform.KindEnvironmentCreate, target.String(), platform.EnvironmentCreateInput{
-						App: args[0], Name: args[1], Node: node, ContainerPort: containerPort,
+						App: args[0], Name: args[1], Node: node, BuildNode: buildNode, ContainerPort: containerPort,
 						HostPort: hostPort, Bind: bind,
 						Health: platform.HealthInput{Type: healthType, Path: healthPath, TimeoutSeconds: healthTimeout},
 						Env:    env,
@@ -637,6 +639,16 @@ func (a *app) platformDeploymentsSpec() spec {
 				},
 			},
 			{
+				use:  "retry",
+				meta: platformMutationMeta("Re-submit a terminally failed deployment through the same operation service, preserving its target and release", "eregion platform deployments retry --deployment dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --idempotency-key ci:retry-deploy-1 --json"),
+				args: platformReadArgs,
+				flags: func(cmd *cobra.Command) {
+					addSubmissionFlags(cmd)
+					cmd.Flags().String("deployment", "", "Failed deployment ID (dep_...) or its operation ID (op_...)")
+				},
+				run: a.retryDeployment,
+			},
+			{
 				use:  "rollback <app> <environment>",
 				meta: platformDestructiveMeta("Deploy a previous release, by default the environment's last applied release", "eregion platform deployments rollback api production --dry-run --json"),
 				args: platformTwoNames("app", "environment"),
@@ -759,6 +771,49 @@ func (a *app) platformEnvironmentStatus(cmd *cobra.Command, app, environment str
 		return result{}, err
 	}
 	return platformItemResult("environments", app+"/"+environment, item, raw), nil
+}
+
+// retryDeployment re-submits a failed deployment through the ordinary action
+// service. It preserves the frozen target, action, and release; it does not
+// create a queue entry or reset the failed operation itself.
+func (a *app) retryDeployment(cmd *cobra.Command, _ []string) (result, error) {
+	deploymentID, _ := cmd.Flags().GetString("deployment")
+	if strings.TrimSpace(deploymentID) == "" {
+		return result{}, contract.NewFault(contract.InputRequired, "--deployment is required", "Use the deployment ID or the failed deployment's operation ID.")
+	}
+	raw, err := a.platformReadInventoryWith(cmd, "deployments", url.Values{"limit": {"200"}})
+	if err != nil {
+		return result{}, err
+	}
+	var page struct {
+		Items []platform.Deployment `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return result{}, contract.NewFault(contract.Unavailable, "API returned an invalid deployment inventory", "Check binary compatibility before assuming the deployment is absent.")
+	}
+	var found *platform.Deployment
+	for index := range page.Items {
+		item := &page.Items[index]
+		if string(item.ID) == deploymentID || string(item.OperationID) == deploymentID {
+			found = item
+			break
+		}
+	}
+	if found == nil {
+		return result{}, contract.NewFault(contract.NotFound, "deployment not found", "List deployments with platform deployments list --json.")
+	}
+	if found.State != platform.DeploymentFailed {
+		return result{}, contract.NewFault(contract.PreconditionFailed, "only a terminally failed deployment can be retried",
+			fmt.Sprintf("Deployment %s is %s. Wait for it to finish, or submit a new deployment for a different release.", found.ID, found.State))
+	}
+	target, err := platform.NewEnvironmentTarget(found.App, found.Environment)
+	if err != nil {
+		return result{}, err
+	}
+	if found.Action == platform.ActionRollback {
+		return a.submitPlatform(cmd, platform.KindRollback, target.String(), platform.RollbackInput{ToReleaseID: found.ReleaseID})
+	}
+	return a.submitPlatform(cmd, platform.KindDeploy, target.String(), platform.DeployInput{ReleaseID: found.ReleaseID})
 }
 
 func (a *app) platformReadInventory(cmd *cobra.Command, collection string) (json.RawMessage, error) {

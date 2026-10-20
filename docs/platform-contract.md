@@ -76,6 +76,29 @@ Stage events name the deployment stage (`preflight`, `build`, `candidate`,
 `health`, `switch`, `verify`, `cleanup`, `rollback`). Progress is only emitted
 when measured. A client detaching never cancels the operation.
 
+Platform observations are structured as well as human-readable. Log and warning
+events may carry `step` (the durable node step), `release_id`, and
+`serving_release_id`. A traffic-switch acknowledgement, a deploy success, and a
+deploy failure name the release they are about; failure additionally names the
+release that still serves when it is known. Completed node steps carry a
+measured `duration_ms`. Health probes carry:
+
+```json
+"health": {
+  "target": "http://127.0.0.1:20000/healthz",
+  "type": "http",
+  "passed": true,
+  "checks": 3,
+  "timeout_seconds": 30,
+  "detail": "http status 200"
+}
+```
+
+`checks` is zero when the node completed the probe from its read-only Check and
+therefore did not report a probe count. Clients must render that as "not
+reported", not invent a count. All fields are additive: an event written before
+them remains valid and viewers keep a message-parsing fallback.
+
 ## 2. Targets
 
 | Kind | Canonical target | Example |
@@ -177,6 +200,7 @@ key and endpoint. Rerunning it changes nothing when the node already matches.
 {
   "name": "production",
   "node": "main",
+  "build_node": "builder-1",
   "container_port": 8080,
   "host_port": 0,
   "health": { "type": "http", "path": "/healthz", "timeout_seconds": 30 },
@@ -184,6 +208,15 @@ key and endpoint. Rerunning it changes nothing when the node already matches.
 }
 ```
 
+- `build_node` is optional. It must be a node with the `builder` role and
+  `buildpacks` capability; `node` keeps the `application` + `docker`
+  requirement. An omitted `build_node` means builds run on `node`, which is the
+  working co-located development path (the main node). A distinct build node is
+  accepted and placement-checked, but a local Docker image is not visible on the
+  application node without a shared registry. `platform.release.create` for a
+  directory or git source therefore fails with an explicit
+  `precondition_failed` ("shared registry") instead of pretending the image
+  moved. Image sources do not need a build node.
 - `host_port: 0` allocates a stable host port from 20000–29999 under a
   transaction-scoped PostgreSQL lock. A candidate port is allocated from
   30000–39999 and stored, so a retry never depends on an ephemeral Docker port.
@@ -211,10 +244,19 @@ Build source (requires `pack` on a builder-capable node):
 
 `source.type` is `image`, `directory`, or `git`. Git URLs are `https://` without
 embedded credentials; `ref` is optional. Directory paths are absolute and must
-exist on the target node. A build that cannot run fails honestly with
-`precondition_failed`; it never records a fake release. The release row is
-created durably as `pending`, then becomes `ready` only after the image exists on
-the node.
+exist beneath a configured build source root on the build node. A build that
+cannot run fails honestly with `precondition_failed`; it never records a fake
+release. The release row is created durably as `pending`, then becomes `ready`
+only after the image exists on the node.
+
+Build sources run on `environment.build_node` (or its `node` by default) after a
+second placement check. The worker takes one of that node's
+`build_concurrency` slots through a PostgreSQL session advisory lock, so the
+limit holds across control-plane processes and a dead worker releases its slot.
+Waiting emits `build_queued`; taking the slot emits `build_running`. The build
+uses the existing isolated per-operation HOME, Docker config, cache, temp, and
+`pack` tree. A build node distinct from the application node is refused before
+any command runs until registry transfer exists (see `build_node` above).
 
 ### `platform.deploy`
 
@@ -230,6 +272,23 @@ the node.
 
 `to_release_id` is optional; the default is the environment's last applied
 release. Rollback is a normal deploy of that release and keeps change history.
+
+### Retrying a terminally failed deployment
+
+A failed deployment is immutable history. To retry it, submit the same action
+again through `POST /v1/operations` with a new idempotency key (or reuse the key
+of a timed-out retry). The CLI helper is:
+
+```sh
+eregion platform deployments retry \
+  --deployment dep_...|op_... \
+  --idempotency-key ci:retry-1 [--dry-run] --json
+```
+
+It reads the deployment from inventory, requires `state=failed`, and re-submits
+`platform.deploy` (or `platform.rollback` for a failed rollback) with the frozen
+target and release. It does not rewrite the failed operation, create a second
+queue, or bypass the action service. `--dry-run` returns the ordinary preview.
 
 ### `platform.node.check`
 
@@ -249,11 +308,15 @@ pinned identity again.
   `serving_release_id`. A failed candidate never changes either. A failed
   post-switch verification restores the previous serving release and records a
   failed deployment plus a `rollback` change.
-- **Order.** `preflight → candidate → health → switch → verify → cleanup`.
-  Candidate health is checked before the serving container is touched. The
-  direct Docker runtime has a short switch window while the serving container is
-  replaced; it does not claim zero-downtime. An edge proxy can be added later
-  without changing these states.
+- **Order.** `preflight → [release command] → candidate → health → switch →
+  verify → cleanup`. Preflight is a durable node step that proves the immutable
+  release image is present before anything is replaced. Candidate health is
+  checked before the serving container is touched. The direct Docker runtime has
+  a short switch window while the serving container is replaced; it does not
+  claim zero-downtime. An edge proxy can be added later without changing these
+  states. Cleanup is the durable `platform-cleanup-01-v1` step: it removes the
+  candidate container, appears in operation history with a duration, and is
+  attempted again by reconciliation after a crash or cancellation.
 - **Per-target lock.** A deployment holds a PostgreSQL session advisory lock for
   its environment across every control-plane process. River concurrency is not
   used as a distributed lock. A second deployment waits briefly, then fails with
@@ -266,11 +329,19 @@ pinned identity again.
 - **Cancellation.** Cancellation is observed before candidate creation and
   before traffic switch. After switch the deployment verifies and completes;
   completed effects are not rolled back implicitly. A cancelled candidate is
-  cleaned up and the serving release stays intact.
+  cleaned up and the serving release stays intact. Cancellation reconciled after
+  the process died inspects the switch step: a completed switch is recorded as
+  the serving release with healthy health if verification completed, or unknown
+  health if it did not, instead of leaving the old release in inventory.
 - **Reconciliation.** A platform operation whose River job disappeared is not
   left `running`. Trivial accepted rows may be completed; builds fail their
-  release; deployments fail visibly and inspect the serving container labels so
-  inventory reflects the container that is actually serving when possible.
+  release; deployments inspect completed step records before choosing a serving
+  release. A completed `platform-container-03-v1` restore means the previous
+  release is serving again, so that release (and its measured restore health) is
+  recorded; the failed new release is never recorded as serving. A completed
+  switch without a restore records the new release with healthy or unknown
+  health according to whether verification committed. Reconciliation also
+  removes a leftover candidate through the durable cleanup step.
 - **No fake success.** Docker, `pack`, SSH, or node failures produce failed
   operations with a machine-readable code. Buildpacks absence is a failure, not
   a synthetic artifact. Image-source deployment works without `pack`.
@@ -379,8 +450,11 @@ submission path.
 - Zero-downtime edge proxy/Caddy traffic switching. Direct Docker publishes a
   stable host port and retains the previous image for rollback.
 - Revisioned secret storage and injection. Use non-secret `env` for now.
-- Docker registry credentials, remote source upload, build caches, and release
-  commands. A remote directory/git build requires the source on that node.
+- Docker registry credentials, cross-node image transfer, remote source upload,
+  shared build caches, and release commands. A directory/git build runs on the
+  environment's build node (the runtime node by default); a distinct build node
+  is refused with an explicit shared-registry error. The source must exist on
+  that node.
 - Host bootstrap, package installation, and telemetry placement. Node
   enrollment provisions nothing on the host beyond role directories; see
   [nodes](nodes.md) for what the operator installs first.

@@ -102,8 +102,14 @@ func (m Model) renderWide(width, height int) string {
 	}
 	rightWidth := max(10, width-leftWidth-3)
 	insightHeight := 0
-	if len(m.view.Targets) > 0 || len(m.view.Health) > 0 {
-		insightHeight = min(max(3, len(m.view.Targets)+len(m.view.Health)+3), max(3, height/2))
+	if len(m.view.Targets) > 0 || len(m.view.Health) > 0 || m.view.Cleanup.Observed {
+		needed := insightLines(m.view)
+		if len(m.view.Health) == 0 && !m.view.Cleanup.Observed {
+			// Keep the historical padded pane when there is no health or
+			// cleanup evidence to fit.
+			needed = len(m.view.Targets) + 3
+		}
+		insightHeight = min(needed, max(3, height/2))
 	}
 	left := joinNonEmpty(
 		m.renderStagesPane(leftWidth, max(4, height-insightHeight)),
@@ -116,8 +122,8 @@ func (m Model) renderWide(width, height int) string {
 func (m Model) renderStandard(width, height int) string {
 	eventsHeight := min(max(3, height/3), max(3, height-4))
 	insightHeight := 0
-	if len(m.view.Targets) > 0 || len(m.view.Health) > 0 {
-		insightHeight = min(max(2, len(m.view.Targets)/2+len(m.view.Health)+2), max(2, (height-eventsHeight)/2))
+	if len(m.view.Targets) > 0 || len(m.view.Health) > 0 || m.view.Cleanup.Observed {
+		insightHeight = min(insightLines(m.view), max(2, height-eventsHeight-4))
 	}
 	stagesHeight := max(2, height-eventsHeight-insightHeight-1)
 	stages := m.renderStagesPane(width, stagesHeight)
@@ -150,12 +156,41 @@ func (m Model) renderStagesPane(width, height int) string {
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }
 
+// insightLines is the exact line count renderInsightsPane needs, so a pane does
+// not pad an empty row or hide the health and cleanup evidence.
+func insightLines(view viewer.Model) int {
+	lines := len(view.Targets) + 1
+	if len(view.Health) > 0 {
+		lines += 2 + len(view.Health)
+	}
+	if view.Cleanup.Observed {
+		lines++
+	}
+	return lines
+}
+
 func (m Model) renderInsightsPane(width, height int) string {
 	if height <= 0 {
 		return ""
 	}
 	lines := []string{m.dim().Render("TARGETS")}
-	for _, target := range m.view.Targets {
+	healthBlock := 0
+	if len(m.view.Health) > 0 {
+		healthBlock = 2 + len(m.view.Health)
+	}
+	cleanupBlock := 0
+	if m.view.Cleanup.Observed {
+		cleanupBlock = 1
+	}
+	targetBudget := len(m.view.Targets)
+	if fit := height - 1 - healthBlock - cleanupBlock; fit < targetBudget {
+		targetBudget = max(0, fit-1)
+	}
+	for index, target := range m.view.Targets {
+		if index >= targetBudget {
+			lines = append(lines, m.dim().Render(fmt.Sprintf("… %d more target(s)", len(m.view.Targets)-targetBudget)))
+			break
+		}
 		symbol := m.glyphs.stage(target.Status)
 		label := target.Role.String()
 		if target.Label != "" && target.Label != string(target.Role) {
@@ -176,13 +211,28 @@ func (m Model) renderInsightsPane(width, height int) string {
 			if observation.Checks > 0 {
 				probes = fmt.Sprintf("%d probe(s)", observation.Checks)
 			}
+			deadline := ""
+			if observation.TimeoutSeconds > 0 {
+				deadline = fmt.Sprintf("%s%ds deadline", m.glyphs.separator(), observation.TimeoutSeconds)
+			}
+			target := ""
+			if observation.Target != "" {
+				target = observation.Target + m.glyphs.separator()
+			}
 			detail := observation.Detail
 			if detail == "" {
 				detail = "no detail"
 			}
-			line := fmt.Sprintf("%s %s%s%s%s%s", state, probes, m.glyphs.separator(), detail, m.glyphs.separator(), observation.At.UTC().Format("15:04:05"))
+			line := fmt.Sprintf("%s %s%s%s%s%s%s", state, probes, deadline, m.glyphs.separator(), target, detail, m.glyphs.separator()+observation.At.UTC().Format("15:04:05"))
 			lines = append(lines, style.Render(truncate(line, width)))
 		}
+	}
+	if m.view.Cleanup.Observed {
+		style := m.okStyle()
+		if m.view.Cleanup.Status == viewer.StageFailed {
+			style = m.risk()
+		}
+		lines = append(lines, style.Render(truncate(viewer.DefaultClean(m.view.CleanupLine()), width)))
 	}
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }
@@ -282,6 +332,9 @@ func (m Model) renderCompact(width, height int) string {
 			probes = fmt.Sprintf("%s%d probe(s)", m.glyphs.separator(), last.Checks)
 		}
 		lines = append(lines, m.dim().Render(state+probes))
+	}
+	if m.view.Cleanup.Observed {
+		lines = append(lines, m.dim().Render(viewer.DefaultClean(m.view.CleanupLine())))
 	}
 	if len(m.view.EventLines) > 0 {
 		last := m.view.EventLines[len(m.view.EventLines)-1]

@@ -121,6 +121,7 @@ type Model struct {
 	BuildLog []BuildLine
 	Health   []HealthObservation
 	Serving  ServingRelease
+	Cleanup  CleanupObservation
 
 	ObservationState ObservationState
 	LastSuccessAt    time.Time
@@ -293,7 +294,7 @@ func (m *Model) applyEvent(event contract.Event) {
 	switch event.Kind {
 	case "state":
 		m.applyState(event.State, event.Attempt, event.ErrorCode, event.At, event.Sequence, false)
-		m.observeReleaseID(event)
+		m.observeServing(event, TargetStep)
 	case "step":
 		m.observeStep(event)
 		m.observePlatformStep(event)

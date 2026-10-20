@@ -41,8 +41,8 @@ type DeploymentTarget struct {
 }
 
 // BuildLine is one log observation attributed to a build-capable stage. The
-// platform worker does not stamp the step ID on log events; the reducer
-// attributes a line only when the most recently observed step is a build step.
+// platform worker stamps the durable step on log events; older events without a
+// step are attributed to the most recently observed step.
 type BuildLine struct {
 	Sequence uint64
 	At       time.Time
@@ -50,31 +50,47 @@ type BuildLine struct {
 	Message  string
 }
 
-// HealthObservation is an explicit probe result observed in a log or warning
-// event. Checks is zero when the event did not report a probe count.
+// HealthObservation is one explicit probe result. Structured fields come from
+// the worker's health event; the message parser remains only as a fallback for
+// events written before structured observations existed.
 type HealthObservation struct {
-	Sequence uint64
-	At       time.Time
-	Stage    string
-	Attempt  uint32
-	Passed   bool
-	Checks   int
-	Detail   string
+	Sequence       uint64
+	At             time.Time
+	Stage          string
+	Attempt        uint32
+	Target         string
+	TimeoutSeconds int
+	Passed         bool
+	Checks         int
+	Detail         string
 }
 
-// ServingRelease is the release evidence present in event data. The worker
-// emits the serving container's immutable image in a log line but not the
-// release ID, so ReleaseID is often empty and the presentation must say so.
+// ServingRelease is the release evidence present in event data. Structured
+// events name the serving release; older streams only carry the container log
+// line and a restore warning.
 type ServingRelease struct {
 	Observed  bool
 	ReleaseID string
 	Image     string
 	Container string
+	Health    string
 	At        time.Time
 	Sequence  uint64
 	Source    string
 }
 
+// CleanupObservation states whether the candidate cleanup step was observed.
+// Cleanup is a durable step, so its absence is a fact the viewer can report.
+type CleanupObservation struct {
+	Observed bool
+	Status   StageStatus
+	At       time.Time
+	Sequence uint64
+	Duration time.Duration
+}
+
+// healthPassedPattern is a compatibility fallback for streams that predate
+// structured health events. New events always carry contract.Health.
 var (
 	healthPassedPattern  = regexp.MustCompile(`^health passed after ([0-9]+) check\(s\): (.*)$`)
 	containerRunsPattern = regexp.MustCompile(`^container ([^ ]+) runs ([^ ]+)$`)
@@ -94,6 +110,8 @@ func classifyStage(stage string) (TargetRole, string) {
 		return TargetBuild, "resolve image"
 	case strings.HasPrefix(lower, "platform-command-"):
 		return TargetBuild, "release command"
+	case strings.HasPrefix(lower, "platform-preflight-"):
+		return TargetBuild, "preflight"
 	case strings.HasPrefix(lower, "platform-container-01-"):
 		return TargetCandidate, "candidate container"
 	case strings.HasPrefix(lower, "platform-health-01-"):
@@ -124,6 +142,12 @@ func (m *Model) observePlatformStep(event contract.Event) {
 	m.currentStage = event.Stage
 	m.currentRole = role
 	m.currentLabel = label
+	if role == TargetCleanup {
+		m.Cleanup.Observed = true
+		m.Cleanup.Status = StageRunning
+		m.Cleanup.At = event.At
+		m.Cleanup.Sequence = event.Sequence
+	}
 	m.syncTargets()
 }
 
@@ -146,6 +170,9 @@ func (m *Model) syncTargets() {
 func (m *Model) observeLog(event contract.Event) {
 	stage := strings.TrimSpace(event.Stage)
 	if stage == "" {
+		stage = strings.TrimSpace(event.Step)
+	}
+	if stage == "" {
 		stage = m.currentStage
 	}
 	role, _ := classifyStage(stage)
@@ -157,45 +184,83 @@ func (m *Model) observeLog(event contract.Event) {
 			m.BuildLog = m.BuildLog[len(m.BuildLog)-limit:]
 		}
 	}
-	m.observeHealthLog(event, stage, role)
+	if event.Health != nil {
+		m.observeStructuredHealth(event, stage)
+	} else {
+		m.observeHealthLog(event, stage, role)
+	}
+	m.observeServing(event, role)
 	m.observeContainerLog(event, role)
-	m.observeReleaseID(event)
+	m.observeCleanup(event, role)
+	m.observeStepDuration(event)
+	m.observeReleaseFallback(event)
 }
 
-// observeHealthLog turns the health step's explicit log/warning observation
-// into a health record. The log event itself carries no stage, so it is
-// attributed to the stage that was active when it arrived.
-func (m *Model) observeHealthLog(event contract.Event, stage string, role TargetRole) {
-	message := strings.TrimSpace(event.Message)
-	if role == TargetCandidateHealth || role == TargetServingHealth || role == TargetRestoreHealth {
-		if match := healthPassedPattern.FindStringSubmatch(message); match != nil {
-			checks := 0
-			_, _ = fmt.Sscan(match[1], &checks)
-			m.Health = append(m.Health, HealthObservation{
-				Sequence: event.Sequence, At: event.At, Stage: stage, Attempt: event.Attempt,
-				Passed: true, Checks: checks, Detail: match[2],
-			})
+// observeStructuredHealth prefers the worker's explicit probe fields. If the
+// node already emitted a failed health warning for the same stage and attempt,
+// this replaces that message-derived record instead of duplicating it.
+func (m *Model) observeStructuredHealth(event contract.Event, stage string) {
+	health := event.Health
+	attempt := event.Attempt
+	if attempt == 0 {
+		attempt = m.Attempt
+	}
+	observation := HealthObservation{
+		Sequence: event.Sequence, At: event.At, Stage: stage, Attempt: attempt,
+		Target: health.Target, TimeoutSeconds: health.TimeoutSeconds,
+		Passed: health.Passed, Checks: health.Checks, Detail: health.Detail,
+	}
+	for i := len(m.Health) - 1; i >= 0; i-- {
+		previous := m.Health[i]
+		if previous.Stage == stage && previous.Attempt == attempt {
+			m.Health[i] = observation
 			return
 		}
-		if event.Kind == "warning" {
-			detail := strings.TrimPrefix(message, "Node step failed: ")
-			m.Health = append(m.Health, HealthObservation{
-				Sequence: event.Sequence, At: event.At, Stage: stage, Attempt: event.Attempt,
-				Passed: false, Detail: detail,
-			})
+	}
+	m.Health = append(m.Health, observation)
+}
+
+// observeHealthLog parses the old human-readable message. It is kept only so a
+// stream written before structured events still shows health evidence.
+func (m *Model) observeHealthLog(event contract.Event, stage string, role TargetRole) {
+	message := strings.TrimSpace(event.Message)
+	if match := healthPassedPattern.FindStringSubmatch(message); match != nil {
+		checks := 0
+		_, _ = fmt.Sscan(match[1], &checks)
+		m.Health = append(m.Health, HealthObservation{
+			Sequence: event.Sequence, At: event.At, Stage: stage, Attempt: event.Attempt,
+			Passed: true, Checks: checks, Detail: match[2],
+		})
+		return
+	}
+	if event.Kind == "warning" && (role == TargetCandidateHealth || role == TargetServingHealth || role == TargetRestoreHealth) {
+		detail := strings.TrimPrefix(message, "Node step failed: ")
+		m.Health = append(m.Health, HealthObservation{
+			Sequence: event.Sequence, At: event.At, Stage: stage, Attempt: event.Attempt,
+			Passed: false, Detail: detail,
+		})
+	}
+}
+
+func (m *Model) observeServing(event contract.Event, role TargetRole) {
+	release := event.ServingReleaseID
+	if release == "" && (role == TargetTrafficSwitch || role == TargetRollback) {
+		release = event.ReleaseID
+	}
+	if release == "" {
+		return
+	}
+	health := m.Serving.Health
+	if event.Health != nil {
+		if event.Health.Passed {
+			health = "healthy"
+		} else {
+			health = "unhealthy"
 		}
 	}
-	// A health success can be replayed without its step event when the viewer
-	// joined late. Accept the unambiguous message, but never invent a stage.
-	if match := healthPassedPattern.FindStringSubmatch(message); match != nil {
-		if role != TargetCandidateHealth && role != TargetServingHealth && role != TargetRestoreHealth {
-			checks := 0
-			_, _ = fmt.Sscan(match[1], &checks)
-			m.Health = append(m.Health, HealthObservation{
-				Sequence: event.Sequence, At: event.At, Stage: stage, Attempt: event.Attempt,
-				Passed: true, Checks: checks, Detail: match[2],
-			})
-		}
+	m.Serving = ServingRelease{
+		Observed: true, ReleaseID: release, Image: m.Serving.Image, Container: m.Serving.Container,
+		Health: health, At: event.At, Sequence: event.Sequence, Source: string(role),
 	}
 }
 
@@ -208,17 +273,53 @@ func (m *Model) observeContainerLog(event contract.Event, role TargetRole) {
 		return
 	}
 	releaseID := m.Serving.ReleaseID
+	if releaseID == "" {
+		releaseID = event.ReleaseID
+	}
 	m.Serving = ServingRelease{
 		Observed: true, ReleaseID: releaseID, Image: match[2], Container: match[1],
-		At: event.At, Sequence: event.Sequence, Source: string(role),
+		Health: m.Serving.Health,
+		At:     event.At, Sequence: event.Sequence, Source: string(role),
 	}
 }
 
-// observeReleaseID picks up the only release identity the worker currently
-// puts in a message: the previous release named when a failed verification
-// restores the old container.
-func (m *Model) observeReleaseID(event contract.Event) {
-	if !strings.Contains(event.Message, "release") || m.Serving.ReleaseID != "" {
+func (m *Model) observeCleanup(event contract.Event, role TargetRole) {
+	if role != TargetCleanup {
+		return
+	}
+	m.Cleanup.Observed = true
+	m.Cleanup.At = event.At
+	m.Cleanup.Sequence = event.Sequence
+	if event.DurationMS != nil {
+		m.Cleanup.Status = StageCompleted
+		m.Cleanup.Duration = time.Duration(*event.DurationMS) * time.Millisecond
+	}
+	if event.Kind == "warning" {
+		m.Cleanup.Status = StageFailed
+	}
+}
+
+// observeStepDuration marks a stage complete from the worker's measured step
+// completion event, so a finished stage does not stay "running" until the next
+// step starts.
+func (m *Model) observeStepDuration(event contract.Event) {
+	if event.Step == "" || event.DurationMS == nil {
+		return
+	}
+	for i := range m.Stages {
+		if m.Stages[i].Name == event.Step {
+			m.Stages[i].Status = StageCompleted
+			m.Stages[i].LastSeen = event.At
+			m.syncTargets()
+			return
+		}
+	}
+}
+
+// observeReleaseFallback keeps old streams readable: a restore warning named the
+// previous release before structured release fields existed.
+func (m *Model) observeReleaseFallback(event contract.Event) {
+	if m.Serving.ReleaseID != "" || event.ReleaseID != "" || event.ServingReleaseID != "" {
 		return
 	}
 	if id := releaseIDPattern.FindString(event.Message); id != "" {
@@ -240,6 +341,9 @@ func (m *Model) ServingLine() string {
 			release = "release ID not reported by events"
 		}
 		line := "serving release: " + release + " · image " + image
+		if m.Serving.Health != "" {
+			line += " · health " + m.Serving.Health
+		}
 		if m.Serving.Source == string(TargetRollback) {
 			line += " (previous release restored)"
 		}
@@ -255,6 +359,19 @@ func (m *Model) ServingLine() string {
 		return "serving release: not applicable to " + m.Kind
 	}
 	return "serving release: unknown · no serving-container event was emitted"
+}
+
+// CleanupLine states whether the candidate cleanup step happened. The worker
+// emits it as a durable step, so "not observed" is not the same as "pending".
+func (m *Model) CleanupLine() string {
+	if !m.Cleanup.Observed {
+		return "candidate cleanup: not observed"
+	}
+	line := "candidate cleanup: " + string(m.Cleanup.Status)
+	if m.Cleanup.Duration > 0 {
+		line += " in " + FormatDuration(m.Cleanup.Duration)
+	}
+	return line
 }
 
 // ShortImage trims an image digest for a narrow header while keeping its

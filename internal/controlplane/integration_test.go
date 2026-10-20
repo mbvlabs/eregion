@@ -131,7 +131,7 @@ func TestIntegrationMigrations(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := context.Background()
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 0 || plan.Required != 7 || plan.RiverCurrent != 0 {
+	if err != nil || plan.Current != 0 || plan.Required != 8 || plan.RiverCurrent != 0 {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	if Ready(ctx, pool) == nil {
@@ -1048,7 +1048,7 @@ func TestIntegrationUpgradeFromVersion1(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 1 || plan.Required != 7 {
+	if err != nil || plan.Current != 1 || plan.Required != 8 {
 		t.Fatalf("version 1 plan: %+v %v", plan, err)
 	}
 	if _, err := Migrate(ctx, pool); err != nil {

@@ -172,8 +172,21 @@ func TestIntegrationPlatformLocalDockerDeployRollbackRecovery(t *testing.T) {
 		t.Fatal("idempotent submission duplicated deployment")
 	}
 	bad := createRelease("badrelease", "debian:bookworm-slim")
-	platformAwait(t, s, platformSubmit(t, s, platform.KindDeploy, "env/live/production", "baddeploy", map[string]any{"release_id": bad.ID}), contract.Failed)
+	badOp := platformSubmit(t, s, platform.KindDeploy, "env/live/production", "baddeploy", map[string]any{"release_id": bad.ID})
+	platformAwait(t, s, badOp, contract.Failed)
 	assertServing(r1.ID)
+	assertCandidateRemoved := func(op contract.Operation) {
+		t.Helper()
+		name := platform.CandidateContainerName(env.ID, op.ID)
+		if out, err := exec.Command("docker", "inspect", "--type=container", name).CombinedOutput(); err == nil {
+			t.Fatalf("candidate %s survived the terminal deployment: %s", name, out)
+		}
+		if !s.completedStep(ctx, op.ID, deploymentCleanupStep) {
+			t.Fatalf("deployment %s has no completed cleanup step", op.ID)
+		}
+	}
+	assertCandidateRemoved(badOp)
+	assertCandidateRemoved(deploy)
 	if env.DesiredRelease != bad.ID {
 		t.Fatal("failed desired state was lost")
 	}

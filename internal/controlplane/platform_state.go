@@ -167,12 +167,23 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return unavailable()
 		}
+		var buildNode any
+		if input.BuildNode != "" {
+			builder, err := nodeByNameTx(ctx, tx, input.BuildNode)
+			if err != nil {
+				return err
+			}
+			if err := s.checkPlacement(builder, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
+				return err
+			}
+			buildNode = input.BuildNode
+		}
 		env, _ := json.Marshal(input.Env)
 		refs, _ := json.Marshal(input.SecretRefs)
 		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environments
-            (id,app_id,name,node_name,host_port,candidate_port,container_port,bind_address,health_type,health_path,health_timeout_seconds,env,secret_refs)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-			envID, app.ID, input.Name, input.Node, hostPort, candidatePort, input.ContainerPort, input.Bind,
+            (id,app_id,name,node_name,build_node,host_port,candidate_port,container_port,bind_address,health_type,health_path,health_timeout_seconds,env,secret_refs)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			envID, app.ID, input.Name, input.Node, buildNode, hostPort, candidatePort, input.ContainerPort, input.Bind,
 			input.Health.Type, input.Health.Path, input.Health.TimeoutSeconds, env, refs); err != nil {
 			return platformWriteError(err, "environment name or port already exists")
 		}
@@ -182,7 +193,10 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		if input.Source.Type != "image" {
-			node, err := nodeByNameTx(ctx, tx, env.Node)
+			if err := crossNodeBuildUnsupported(env, input.Source.Type); err != nil {
+				return err
+			}
+			node, err := nodeByNameTx(ctx, tx, env.BuildNodeName())
 			if err != nil {
 				return err
 			}
@@ -561,7 +575,7 @@ func (s *Service) inventoryApps(ctx context.Context, query platform.InventoryQue
 	return items, rows.Err()
 }
 
-const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,e.host_port,e.candidate_port,e.container_port,
+const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.build_node,''),e.host_port,e.candidate_port,e.container_port,
     e.bind_address,e.health_type,e.health_path,e.health_timeout_seconds,e.env,e.secret_refs,e.secret_revision,
     coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,''),coalesce(e.serving_release_id,''),
     e.health_state,e.health_detail,e.health_checked_at,e.created_at,e.updated_at
@@ -571,7 +585,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var env platform.Environment
 	var rawEnv, rawRefs []byte
 	var desired, applied, serving string
-	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
+	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
 		&desired, &applied, &serving, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.CreatedAt, &env.UpdatedAt)
 	if err != nil {
@@ -930,12 +944,26 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	case *platform.EnvironmentCreateInput:
 		preview.Steps = []string{"record environment", "allocate stable and candidate ports"}
 		preview.Summary = "Create environment " + input.Name + " on node " + input.Node + "."
+		if input.BuildNode != "" {
+			preview.Summary += " Builds run on builder node " + input.BuildNode + "."
+			if input.BuildNode != input.Node {
+				preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
+			}
+		}
 	case *platform.ReleaseCreateInput:
 		preview.Summary = "Record release from " + input.Source.Type + " source."
 		if input.Source.Type == "image" {
 			preview.Steps = []string{"verify image on node", "mark release ready"}
 		} else {
+			env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
+			if err != nil {
+				return preview, err
+			}
+			if err := crossNodeBuildUnsupported(env, input.Source.Type); err != nil {
+				return preview, err
+			}
 			preview.Steps = []string{"prepare source", "pack build", "verify image", "mark release ready"}
+			preview.Summary = "Build on " + env.BuildNodeName() + ", then mark the release ready."
 			preview.Warnings = append(preview.Warnings, "Buildpacks execution requires pack on the environment's builder-capable node.")
 		}
 	case *platform.NodeCheckInput:
@@ -964,7 +992,7 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 }
 
 func deploymentSteps() []string {
-	return []string{"preflight", "release command", "candidate", "health", "switch", "verify", "cleanup"}
+	return []string{"preflight (verify the release image on the node)", "release command", "candidate", "health", "switch", "verify", "cleanup"}
 }
 
 func addReleaseWarnings(preview *platform.Preview, release platform.Release, env platform.Environment) {
