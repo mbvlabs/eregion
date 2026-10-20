@@ -29,7 +29,12 @@ type HTTPConfig struct {
 	// never stored in the query or result.
 	MetricsTokenFile string
 	LogsTokenFile    string
-	HTTPClient       *http.Client
+	// MetricsToken and LogsToken are optional in-process credentials from the
+	// environment. They are used only when no token file is configured and are
+	// never written to output.
+	MetricsToken string
+	LogsToken    string
+	HTTPClient   *http.Client
 	// StaleAfter is measured against the query window end (or now when the
 	// window still includes the present).
 	StaleAfter time.Duration
@@ -42,6 +47,8 @@ type HTTPDataSource struct {
 	logsURL          string
 	metricsTokenFile string
 	logsTokenFile    string
+	metricsToken     string
+	logsToken        string
 	http             *http.Client
 	staleAfter       time.Duration
 	maxBody          int64
@@ -86,6 +93,7 @@ func NewHTTPDataSource(cfg HTTPConfig) (*HTTPDataSource, error) {
 	return &HTTPDataSource{
 		metricsURL: metricsURL, logsURL: logsURL,
 		metricsTokenFile: cfg.MetricsTokenFile, logsTokenFile: cfg.LogsTokenFile,
+		metricsToken: cfg.MetricsToken, logsToken: cfg.LogsToken,
 		http: client, staleAfter: staleAfter, maxBody: maxBody, now: now,
 	}, nil
 }
@@ -140,7 +148,7 @@ func (d *HTTPDataSource) Logs(ctx context.Context, query LogQuery) (LogResult, e
 	params.Set("end", query.Window.End.UTC().Format(time.RFC3339Nano))
 	params.Set("limit", strconv.Itoa(limit))
 	endpoint := d.logsURL + "/select/logsql/query?" + params.Encode()
-	response, err := d.get(ctx, endpoint, d.logsTokenFile)
+	response, err := d.get(ctx, endpoint, d.logsTokenFile, d.logsToken)
 	if err != nil {
 		result.Message = "The telemetry log backend is unavailable."
 		return result, err
@@ -258,7 +266,7 @@ func (d *HTTPDataSource) Metrics(ctx context.Context, query MetricQuery) (Metric
 	params.Set("end", strconv.FormatInt(query.Window.End.Unix(), 10))
 	params.Set("step", strconv.FormatInt(int64(step/time.Second), 10))
 	endpoint := d.metricsURL + "/api/v1/query_range?" + params.Encode()
-	response, err := d.get(ctx, endpoint, d.metricsTokenFile)
+	response, err := d.get(ctx, endpoint, d.metricsTokenFile, d.metricsToken)
 	if err != nil {
 		result.Message = "The telemetry metric backend is unavailable."
 		return result, err
@@ -375,21 +383,24 @@ func (d *HTTPDataSource) freshness(window Window, observed time.Time) State {
 	return StateOK
 }
 
-func (d *HTTPDataSource) get(ctx context.Context, endpoint, tokenFile string) (*http.Response, error) {
+func (d *HTTPDataSource) get(ctx context.Context, endpoint, tokenFile, directToken string) (*http.Response, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, contract.NewFault(contract.Internal, "could not construct telemetry query", "Check the configured read endpoint.")
 	}
 	request.Header.Set("Accept", "application/json")
+	token := strings.TrimSpace(directToken)
 	if tokenFile != "" {
 		raw, err := readSecretFile(tokenFile, 512)
 		if err != nil {
 			return nil, err
 		}
-		token := strings.TrimRight(string(raw), "\r\n")
+		token = strings.TrimRight(string(raw), "\r\n")
 		if token == "" {
 			return nil, contract.NewFault(contract.PreconditionFailed, "telemetry read-token file is empty", "Write the gateway bearer token to the referenced 0600 file.")
 		}
+	}
+	if token != "" {
 		request.Header.Set("Authorization", "Bearer "+token)
 	}
 	response, err := d.http.Do(request)

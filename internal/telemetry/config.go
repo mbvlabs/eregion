@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -181,6 +182,65 @@ type Config struct {
 	GrafanaAdminPassword string
 	// EnableTraces adds Tempo and its OTLP export pipeline.
 	EnableTraces bool
+	// ExternalExport copies accepted telemetry to an upstream OTLP endpoint in
+	// addition to the telemetry node. Credentials are file references; their
+	// contents never enter the render, an event, or a command line.
+	ExternalExport *ExternalExport
+}
+
+// ExternalExport is one upstream OTLP collector endpoint. TokenFile and
+// TLSCAFile are paths on the telemetry node that the collector mounts read-only.
+type ExternalExport struct {
+	Endpoint  string `json:"endpoint"`
+	Protocol  string `json:"protocol,omitempty"` // otlp_http (default) or otlp_grpc
+	TokenFile string `json:"token_file,omitempty"`
+	TLSCAFile string `json:"tls_ca_file,omitempty"`
+}
+
+// Validate defaults and checks one external export. HTTP endpoints must be
+// HTTPS unless they resolve to a private address, matching the read gateway's
+// policy.
+func (e ExternalExport) Validate() (ExternalExport, error) {
+	value := strings.TrimSpace(e.Endpoint)
+	if value == "" {
+		return e, contract.NewFault(contract.ValidationFailed, "external export endpoint is required", "Use an https:// OTLP endpoint, or an http:// endpoint on a private network.")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return e, contract.NewFault(contract.ValidationFailed, "invalid external export endpoint", "Use an OTLP endpoint URL without embedded credentials or a fragment.")
+	}
+	switch parsed.Scheme {
+	case "https":
+	case "http":
+		if !isPrivateOrLoopbackHost(parsed.Hostname()) {
+			return e, contract.NewFault(contract.ValidationFailed, "external export over plain HTTP must stay on a private network", "Use HTTPS for a public observability stack.")
+		}
+	default:
+		return e, contract.NewFault(contract.ValidationFailed, "invalid external export endpoint scheme", "Use https://, or http:// to a private address.")
+	}
+	protocol := strings.TrimSpace(e.Protocol)
+	if protocol == "" {
+		protocol = "otlp_http"
+	}
+	if protocol != "otlp_http" && protocol != "otlp_grpc" {
+		return e, contract.NewFault(contract.ValidationFailed, "invalid external export protocol", "Use otlp_http or otlp_grpc.")
+	}
+	if protocol == "otlp_grpc" && parsed.Path != "" && parsed.Path != "/" {
+		return e, contract.NewFault(contract.ValidationFailed, "OTLP/gRPC export endpoint cannot have a path", "Use host:port for otlp_grpc.")
+	}
+	if e.TokenFile != "" {
+		if err := validateSecretReference(e.TokenFile); err != nil {
+			return e, err
+		}
+	}
+	if e.TLSCAFile != "" {
+		if err := validateFileReference(e.TLSCAFile); err != nil {
+			return e, err
+		}
+	}
+	value = strings.TrimSuffix(parsed.String(), "/")
+	e.Endpoint, e.Protocol = value, protocol
+	return e, nil
 }
 
 // Prepared is a validated, defaulted config with a canonical root directory.
@@ -237,6 +297,13 @@ func Prepare(cfg Config) (Prepared, error) {
 	cfg.Retention = retention
 	cfg.Versions = versions
 	cfg.RootDir = filepath.Clean(absolute)
+	if cfg.ExternalExport != nil {
+		external, err := cfg.ExternalExport.Validate()
+		if err != nil {
+			return Prepared{}, err
+		}
+		cfg.ExternalExport = &external
+	}
 	return Prepared{Config: cfg}, nil
 }
 

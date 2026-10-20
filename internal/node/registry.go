@@ -9,6 +9,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/telemetry/remote"
 )
 
 // StepFactory builds the step for one execution identity and request payload.
@@ -42,6 +43,9 @@ func NewStepRegistry() *StepRegistry {
 	registry := &StepRegistry{}
 	registry.Register(diagnosticStepPattern.MatchString, buildDiagnosticStep)
 	for _, family := range platform.StepFamilies() {
+		registry.Register(family.Match, family.Build)
+	}
+	for _, family := range remote.StepFamilies() {
 		registry.Register(family.Match, family.Build)
 	}
 	return registry

@@ -103,6 +103,11 @@ func followSelectionFromArgs(args []string, valueFlags []string) followSelection
 			selection.Active = testFollow
 		}
 	}
+	// logs tail is a streaming read like operations follow: it opts into NDJSON
+	// without changing the rules for any other command.
+	if len(words) >= 2 && words[0] == "logs" && words[1] == "tail" {
+		selection.Active = true
+	}
 	if selection.Active && outputSet && selected == "ndjson" {
 		selection.NDJSON = true
 	}

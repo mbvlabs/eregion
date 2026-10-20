@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 // Runner is the only process boundary in this package. Commands are argv
@@ -91,6 +92,22 @@ type NodeExecutor interface {
 // identity before returning; a command-only or local fallback is not acceptable.
 type Dispatch interface {
 	Open(context.Context, TargetIdentity) (NodeExecutor, error)
+}
+
+// OperationDispatch is the durable production form of Dispatch. It carries the
+// accepted operation identity and the prepared install root so every node step
+// is journaled under a stable effect key and cannot write outside that root.
+// Implementations that only expose Open remain usable by tests and local
+// previews.
+type OperationDispatch interface {
+	OpenOperation(context.Context, TargetIdentity, contract.OperationID, uint32, string) (NodeExecutor, error)
+}
+
+func openDispatch(ctx context.Context, dispatch Dispatch, identity TargetIdentity, exec platform.Execution, root string) (NodeExecutor, error) {
+	if operationDispatch, ok := dispatch.(OperationDispatch); ok {
+		return operationDispatch.OpenOperation(ctx, identity, exec.OperationID, exec.Attempt, root)
+	}
+	return dispatch.Open(ctx, identity)
 }
 
 // LocalFilesystem is the explicit local target used by CLI/bootstrap installs.
@@ -216,6 +233,12 @@ func joinArgs(args []string) string {
 func safeInstallError(action string, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
+	}
+	// A node step's machine-readable refusal (for example changed inputs for an
+	// existing effect) must not be flattened into a generic retryable failure.
+	var fault *contract.Fault
+	if errors.As(err, &fault) && fault.Code != contract.Unavailable {
+		return fault
 	}
 	return contract.NewFault(contract.Unavailable, action+" failed", "Inspect node-local permissions and the container runtime; no partial state is assumed to be healthy.")
 }
