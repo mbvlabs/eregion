@@ -214,6 +214,49 @@ func TestSSHTransportCancellationDoesNotKillTheNodeTask(t *testing.T) {
 	}
 }
 
+// TestSSHTransportRefusesARevokedHostKey proves that a key the known_hosts
+// file revokes is refused with its own permanent error, even when another
+// line pins the same key.
+func TestSSHTransportRefusesARevokedHostKey(t *testing.T) {
+	server := newTestServer(t)
+	host := HostID(server.address())
+	line := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(server.hostKey)))
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	content := "@revoked " + host + " " + line + "\n" + host + " " + line + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys, err := LoadHostKeys(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewSSHTransport(SSHConfig{
+		Address:      server.address(),
+		User:         "eregion",
+		IdentityFile: server.identity,
+		HostKeys:     keys,
+		Timeout:      10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	_, err = client.Call(context.Background(), runRequest(t, exec, 0), nil)
+	if err == nil {
+		t.Fatal("a revoked host key was accepted")
+	}
+	var revoked *HostKeyRevokedError
+	if !errors.As(err, &revoked) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !IsPermanentTransport(err) {
+		t.Fatal("a revoked host key is not permanent")
+	}
+	if _, statErr := os.Stat(markerPath(server.config.StateDir, exec)); !os.IsNotExist(statErr) {
+		t.Fatal("the node ran a request before the host key was verified")
+	}
+}
+
 func TestSSHTransportRequiresAPinnedHostKey(t *testing.T) {
 	server := newTestServer(t)
 	_, err := NewSSHTransport(SSHConfig{

@@ -31,6 +31,21 @@ func (e *HostKeyMismatchError) Error() string {
 // Unwrap exposes the underlying pin failure.
 func (e *HostKeyMismatchError) Unwrap() error { return ErrPermanentTransport }
 
+// HostKeyRevokedError reports a node whose host key the known_hosts file
+// revokes. A revoked key is refused even when another line pins it, and the
+// refusal is permanent: a revoked key is never accepted.
+type HostKeyRevokedError struct {
+	Address string
+	Got     string
+}
+
+func (e *HostKeyRevokedError) Error() string {
+	return fmt.Sprintf("the host key of %s (%s) is revoked by the known_hosts file", e.Address, e.Got)
+}
+
+// Unwrap exposes the permanent classification.
+func (e *HostKeyRevokedError) Unwrap() error { return ErrPermanentTransport }
+
 // VersionMismatchError reports a node that does not speak the node protocol
 // version this control plane implements. It is permanent.
 type VersionMismatchError struct {

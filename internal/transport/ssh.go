@@ -205,6 +205,9 @@ func (t *SSHTransport) connect(ctx context.Context) (*ssh.Client, error) {
 	if err != nil {
 		_ = raw.Close()
 		if errors.As(err, &pinFailure) {
+			if pinFailure.Revoked {
+				return nil, &HostKeyRevokedError{Address: t.config.Address, Got: pinFailure.Got}
+			}
 			return nil, &HostKeyMismatchError{
 				Address: t.config.Address,
 				Got:     pinFailure.Got,
