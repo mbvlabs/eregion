@@ -165,11 +165,16 @@ func TestSSHFixtureCancellationDoesNotKillTheNodeTask(t *testing.T) {
 
 func TestSSHFixtureRecoversThroughStatusAfterALostResponse(t *testing.T) {
 	fixture := startFixture(t)
-	proxy := newCutProxy(t, fixture.Address, 150*time.Millisecond)
+	proxy, err := sshfixture.NewCutProxy(fixture.Address, 50*time.Millisecond, 150*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = proxy.Close() })
 	// The proxy forwards to the node, so it presents the node's host key. The
 	// pin follows the address the client dials.
 	keys := NewHostKeys()
 	keys.Pin(proxy.Address(), fixture.HostKey)
+
 	client, err := NewSSHTransport(SSHConfig{
 		Address:      proxy.Address(),
 		User:         "eregion",

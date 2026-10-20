@@ -131,7 +131,7 @@ func TestIntegrationMigrations(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := context.Background()
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 0 || plan.Required != 2 || plan.RiverCurrent != 0 {
+	if err != nil || plan.Current != 0 || plan.Required != 3 || plan.RiverCurrent != 0 {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	if Ready(ctx, pool) == nil {
@@ -380,6 +380,13 @@ func TestIntegrationCrashWorkerHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := testRuntime(t, pool, 1, os.Getenv("EREGION_NODE_STATE_DIR"))
+	if address := os.Getenv("EREGION_CRASH_SSH_ADDRESS"); address != "" {
+		transport, err := sshTransportFromEnvironment()
+		if err != nil {
+			t.Fatal(err)
+		}
+		run.Service.transport = transport
+	}
 	if err := run.Jobs.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -1041,7 +1048,7 @@ func TestIntegrationUpgradeFromVersion1(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 1 || plan.Required != 2 {
+	if err != nil || plan.Current != 1 || plan.Required != 3 {
 		t.Fatalf("version 1 plan: %+v %v", plan, err)
 	}
 	if _, err := Migrate(ctx, pool); err != nil {
