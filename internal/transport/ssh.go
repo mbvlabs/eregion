@@ -323,7 +323,11 @@ func (t *SSHTransport) runSession(client *ssh.Client, request node.Request, onEv
 			if next.Response == nil {
 				return node.Response{}, errors.New("the node sent an empty response")
 			}
-			return *next.Response, nil
+			// The node redacts its own detail; the transport redacts again
+			// before the detail reaches a log, an event, or an error.
+			response := *next.Response
+			response.Detail = registry.Redact(response.Detail)
+			return response, nil
 		case node.FrameError:
 			return node.Response{}, &HandshakeError{Address: t.config.Address, Reason: next.Error}
 		default:

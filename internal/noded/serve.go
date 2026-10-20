@@ -88,6 +88,17 @@ func writeError(writer *bufio.Writer, reason string) error {
 // Handle answers one request. A run request never executes the step in the
 // serving process: the step runs detached so it outlives the channel.
 func Handle(config Config, steps *node.StepRegistry, request node.Request) node.Response {
+	// Register the request secrets before any detail, log, or event is written.
+	registry := &secrets.Registry{}
+	for _, value := range request.Secrets {
+		registry.Add(value)
+	}
+	response := handle(config, steps, request)
+	response.Detail = registry.Redact(response.Detail)
+	return response
+}
+
+func handle(config Config, steps *node.StepRegistry, request node.Request) node.Response {
 	if err := request.Execution.Validate(); err != nil {
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: err.Error()}
 	}
