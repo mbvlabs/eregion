@@ -372,6 +372,32 @@ process. Each asserts exactly one marker file, one completed step row, and one
 progress event per step. Reconciliation is also tested not to fail an operation while
 its node effect still holds a live local lock.
 
+### Control-plane database recovery drill
+
+The external control-plane database has a separate recovery procedure in
+[resources and recovery](resources.md#separate-external-control-plane-database-recovery).
+Part of it is exercised automatically:
+
+```sh
+# Prerequisites: pg_dump, pg_restore, psql on PATH; a built bin/eregion (the
+# target builds it); and EREGION_TEST_DATABASE_URL or EREGION_DATABASE_URL
+# pointing at an already-migrated eregion control-plane database, or a running
+# just dev-up environment.
+just controlplane-recovery-drill
+
+# In-process equivalent through Ready/PlanMigrations:
+EREGION_TEST_DATABASE_URL=... \
+  go test -count=1 ./internal/controlplane -run TestIntegrationControlPlaneRecoveryDrill -v
+```
+
+The drill dumps the source with `pg_dump`, restores it into two generated
+`eregion_cp_recovery_drill_<hex>` databases on the same server, verifies key
+tables and `eregion system migrate --dry-run --json` readiness (application and
+River versions), and compares both restores. It creates and drops only those
+generated databases and never writes to or drops the source. It does not test a
+production failover, writer quiescence, DNS/DSN cutover, or recovery-time
+objectives; those remain operator procedures.
+
 The pinned SSH transport has its own fixture: a throwaway `sshd` container with a
 generated host key and one authorized key. `just ssh-fixture` builds its image and
 `just transport` runs the transport tests. The same scenarios run against the

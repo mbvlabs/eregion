@@ -48,6 +48,16 @@ terminal-smoke:
 recovery-drill:
     @if ! command -v docker >/dev/null 2>&1; then echo "skip: Docker is not installed"; elif ! docker info >/dev/null 2>&1; then echo "skip: Docker daemon is not reachable"; elif ! docker image inspect postgres:17 >/dev/null 2>&1; then echo "skip: postgres:17 is not available locally; pull it explicitly to run this drill"; else python3 scripts/recovery_drill.py; fi
 
+# Exercise the separate external control-plane database recovery procedure:
+# dump a migrated source, restore into two generated temporary databases on the
+# same server, verify migration/River readiness and key tables, then compare the
+# restores. Prerequisites: PostgreSQL client tools, a built bin/eregion, and
+# EREGION_TEST_DATABASE_URL or EREGION_DATABASE_URL pointing at an already-migrated
+# control-plane database (or a running just dev-up environment). It never drops or
+# writes the source database and refuses names outside its generated prefix.
+controlplane-recovery-drill: build
+    python3 scripts/controlplane_recovery_drill.py
+
 # Run the signed upgrade drill: build disposable 1.0.0/1.1.0 binaries and a
 # signed manifest, then exercise verify/check/apply/rollback/status and the
 # automatic restore after a failed health probe.

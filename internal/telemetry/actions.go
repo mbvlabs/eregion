@@ -123,13 +123,18 @@ func (i credentialInput) Preview() any {
 
 type agentInput struct {
 	target           platform.Target
-	PrivateAddress   string   `json:"private_address,omitempty"`
-	TelemetryAddress string   `json:"telemetry_address"`
-	TokenFile        string   `json:"token_file"`
-	TLSCAFile        string   `json:"tls_ca_file"`
-	RootDir          string   `json:"root_dir,omitempty"`
-	LogPaths         []string `json:"log_paths,omitempty"`
-	Versions         Versions `json:"versions,omitempty"`
+	PrivateAddress   string `json:"private_address,omitempty"`
+	TelemetryAddress string `json:"telemetry_address,omitempty"`
+	TokenFile        string `json:"token_file,omitempty"`
+	TLSCAFile        string `json:"tls_ca_file,omitempty"`
+	// ExternalExports ships telemetry directly upstream. If ExternalOnly is
+	// false they are additive to the local telemetry node; if true they replace
+	// it and no local address, token, or CA may be supplied.
+	ExternalExports []ExternalExport `json:"external_exports,omitempty"`
+	ExternalOnly    bool             `json:"external_only,omitempty"`
+	RootDir         string           `json:"root_dir,omitempty"`
+	LogPaths        []string         `json:"log_paths,omitempty"`
+	Versions        Versions         `json:"versions,omitempty"`
 }
 
 func (i agentInput) Target() platform.Target { return i.target }
@@ -137,8 +142,9 @@ func (i agentInput) Preview() any {
 	return map[string]any{
 		"node": i.target.Node, "private_address": i.PrivateAddress,
 		"telemetry_address": i.TelemetryAddress, "token_file": i.TokenFile,
-		"tls_ca_file": i.TLSCAFile, "root_dir": i.RootDir, "log_paths": i.LogPaths,
-		"note": "token_file is a path reference; its contents are never part of action input.",
+		"tls_ca_file": i.TLSCAFile, "external_exports": i.ExternalExports,
+		"external_only": i.ExternalOnly, "root_dir": i.RootDir, "log_paths": i.LogPaths,
+		"note": "token_file, tls_ca_file, and external token/CA paths are references; their contents are never part of action input.",
 	}
 }
 
@@ -241,23 +247,37 @@ func normalizeAgent(target platform.Target, raw json.RawMessage) (platform.Actio
 	if input.PrivateAddress != "" && !privateAddressText(input.PrivateAddress) {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid node private address", "Use the private address recorded for the node.")
 	}
-	if err := validateSecretReference(input.TokenFile); err != nil {
-		return nil, err
-	}
-	if err := validateFileReference(input.TLSCAFile); err != nil {
-		return nil, err
-	}
 	if input.RootDir != "" && !filepath.IsAbs(input.RootDir) {
 		return nil, contract.NewFault(contract.ValidationFailed, "agent root directory must be absolute", "Use a root-owned absolute directory.")
 	}
-	host, port, err := net.SplitHostPort(strings.TrimSpace(input.TelemetryAddress))
-	if err != nil || port != "4317" {
-		return nil, contract.NewFault(contract.ValidationFailed, "invalid telemetry OTLP endpoint", "Use the telemetry node's private address with port 4317.")
+	if input.ExternalOnly {
+		if input.TelemetryAddress != "" || input.TokenFile != "" || input.TLSCAFile != "" {
+			return nil, contract.NewFault(contract.ValidationFailed, "external-only agent cannot also target a local telemetry node", "Omit telemetry_address, token_file, and tls_ca_file when external_only is true.")
+		}
+		if len(input.ExternalExports) == 0 {
+			return nil, contract.NewFault(contract.ValidationFailed, "external-only agent requires at least one external export", "Add at least one external_exports entry, or use the additive agent with a telemetry node.")
+		}
+	} else {
+		if err := validateSecretReference(input.TokenFile); err != nil {
+			return nil, err
+		}
+		if err := validateFileReference(input.TLSCAFile); err != nil {
+			return nil, err
+		}
+		host, port, err := net.SplitHostPort(strings.TrimSpace(input.TelemetryAddress))
+		if err != nil || port != "4317" {
+			return nil, contract.NewFault(contract.ValidationFailed, "invalid telemetry OTLP endpoint", "Use the telemetry node's private address with port 4317.")
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || !privateAddress(ip) {
+			return nil, contract.NewFault(contract.ValidationFailed, "telemetry endpoint must be a private address", "The exporter accepts only a private telemetry node address.")
+		}
 	}
-	ip := net.ParseIP(host)
-	if ip == nil || !privateAddress(ip) {
-		return nil, contract.NewFault(contract.ValidationFailed, "telemetry endpoint must be a private address", "The exporter accepts only a private telemetry node address.")
+	externalExports, err := ValidateExternalExports(input.ExternalExports)
+	if err != nil {
+		return nil, err
 	}
+	input.ExternalExports = externalExports
 	if len(input.LogPaths) > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "too many log paths", "Use at most 16 explicit container or application log paths.")
 	}
@@ -549,18 +569,23 @@ func (e *actionExecutor) agent(ctx context.Context, exec platform.Execution) (pl
 	if err := identity.Validate(); err != nil {
 		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "agent target has no pinned host identity", "Record the host-key fingerprint during enrollment before dispatching an agent.")
 	}
-	raw, err := readSecretFile(input.TokenFile, 1024)
-	if err != nil {
-		return platform.Result{}, err
-	}
-	token := strings.TrimRight(string(raw), "\r\n")
-	caPEM, err := readConfigFile(input.TLSCAFile, 64*1024)
-	if err != nil {
-		return platform.Result{}, err
+	var token string
+	var caPEM []byte
+	if !input.ExternalOnly {
+		raw, err := readSecretFile(input.TokenFile, 1024)
+		if err != nil {
+			return platform.Result{}, err
+		}
+		token = strings.TrimRight(string(raw), "\r\n")
+		caPEM, err = readConfigFile(input.TLSCAFile, 64*1024)
+		if err != nil {
+			return platform.Result{}, err
+		}
 	}
 	cfg := AgentConfig{
 		Node:             Node{Name: placement.Name, Role: roleForAgent(placement.Roles), PrivateAddress: placement.PrivateAddress, IsMain: placement.IsMain, IsControlPlane: placement.IsControlPlane},
 		TelemetryAddress: input.TelemetryAddress, Token: token, TLSCAPEM: caPEM,
+		ExternalExports: input.ExternalExports, ExternalOnly: input.ExternalOnly,
 		RootDir: input.RootDir, LogPaths: input.LogPaths, Versions: input.Versions,
 	}
 	prepared, err := PrepareAgent(cfg)
@@ -580,13 +605,25 @@ func (e *actionExecutor) agent(ctx context.Context, exec platform.Execution) (pl
 	if err != nil {
 		return platform.Result{}, err
 	}
-	return platform.Result{
-		Message: "Telemetry exporter agent installed.",
-		Data: map[string]any{
-			"node": placement.Name, "telemetry_endpoint": prepared.TelemetryAddress,
-			"files_written": len(result.Files), "commands_run": len(result.Commands),
-		},
-	}, nil
+	data := map[string]any{
+		"node": placement.Name, "external_only": prepared.ExternalOnly,
+		"external_exports": len(prepared.ExternalExports),
+		"files_written":    len(result.Files), "commands_run": len(result.Commands),
+	}
+	message := "Telemetry exporter agent installed."
+	if prepared.ExternalOnly {
+		message = "Telemetry exporter agent installed in external-only mode; no local telemetry node is configured."
+	} else {
+		data["telemetry_endpoint"] = prepared.TelemetryAddress
+	}
+	if len(prepared.ExternalExports) > 0 {
+		endpoints := make([]string, 0, len(prepared.ExternalExports))
+		for _, external := range prepared.ExternalExports {
+			endpoints = append(endpoints, external.Endpoint)
+		}
+		data["external_endpoints"] = endpoints
+	}
+	return platform.Result{Message: message, Data: data}, nil
 }
 
 func validateTelemetryPlacement(name string, placement Placement, requestedAddress string) error {

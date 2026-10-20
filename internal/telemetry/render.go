@@ -566,8 +566,12 @@ func RenderAgentPlan(prepared PreparedAgent) (Plan, error) {
 	files := []PlanFile{
 		{Path: filepath.Join(stackDir, "compose.yaml"), Data: []byte(renderAgentCompose(cfg)), Mode: 0640},
 		{Path: filepath.Join(stackDir, "collector", "config.yaml"), Data: []byte(renderAgentCollector(cfg)), Mode: 0640},
-		{Path: filepath.Join(stackDir, "tls", "ca.crt"), Data: cfg.TLSCAPEM, Mode: 0644},
-		{Path: filepath.Join(stackDir, "collector", "ingest-token"), Data: []byte(cfg.Token + "\n"), Mode: 0600, Secret: true},
+	}
+	if !cfg.ExternalOnly {
+		files = append(files,
+			PlanFile{Path: filepath.Join(stackDir, "tls", "ca.crt"), Data: cfg.TLSCAPEM, Mode: 0644},
+			PlanFile{Path: filepath.Join(stackDir, "collector", "ingest-token"), Data: []byte(cfg.Token + "\n"), Mode: 0600, Secret: true},
+		)
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	composePath := filepath.Join(stackDir, "compose.yaml")
@@ -581,7 +585,38 @@ func RenderAgentPlan(prepared PreparedAgent) (Plan, error) {
 	}, nil
 }
 
+// externalTokenMount is where one export's token file is mounted read-only in
+// the agent container. The index makes multiple exports unambiguous.
+func externalTokenMount(index int) string {
+	return fmt.Sprintf("/etc/otelcol/external-%d-token", index)
+}
+
+func externalCAMount(index int) string {
+	return fmt.Sprintf("/etc/otelcol/external-%d-ca.crt", index)
+}
+
 func renderAgentCompose(cfg AgentConfig) string {
+	var volumes strings.Builder
+	volumes.WriteString(`      - ./collector/config.yaml:/etc/otelcol/config.yaml:ro
+`)
+	if !cfg.ExternalOnly {
+		volumes.WriteString(`      - ./collector/ingest-token:/etc/otelcol/ingest-token:ro
+      - ./tls:/etc/otelcol/tls:ro
+`)
+	}
+	for index, external := range cfg.ExternalExports {
+		if external.TokenFile != "" {
+			fmt.Fprintf(&volumes, "      - %q\n", external.TokenFile+":"+externalTokenMount(index)+":ro")
+		}
+		if external.TLSCAFile != "" {
+			fmt.Fprintf(&volumes, "      - %q\n", external.TLSCAFile+":"+externalCAMount(index)+":ro")
+		}
+	}
+	volumes.WriteString(`      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/log:/var/log:ro
+      - /:/hostfs:ro
+      - agent-state:/var/lib/otelcol
+`)
 	return fmt.Sprintf(`name: eregion-otel-agent
 
 services:
@@ -590,14 +625,7 @@ services:
     command: ["--config=/etc/otelcol/config.yaml"]
     restart: unless-stopped
     volumes:
-      - ./collector/config.yaml:/etc/otelcol/config.yaml:ro
-      - ./collector/ingest-token:/etc/otelcol/ingest-token:ro
-      - ./tls:/etc/otelcol/tls:ro
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /var/log:/var/log:ro
-      - /:/hostfs:ro
-      - agent-state:/var/lib/otelcol
-    ports:
+%s    ports:
       - "%s:4317:4317"
       - "%s:4318:4318"
     read_only: true
@@ -608,7 +636,7 @@ services:
 
 volumes:
   agent-state:
-`, cfg.Versions.Collector, cfg.Node.PrivateAddress, cfg.Node.PrivateAddress)
+`, cfg.Versions.Collector, volumes.String(), cfg.Node.PrivateAddress, cfg.Node.PrivateAddress)
 }
 
 func renderAgentCollector(cfg AgentConfig) string {
@@ -616,11 +644,63 @@ func renderAgentCollector(cfg AgentConfig) string {
 	for _, path := range cfg.LogPaths {
 		fmt.Fprintf(&includes, "        - %q\n", path)
 	}
-	return fmt.Sprintf(`extensions:
-  bearertokenauth/telemetry:
+	extensions := []string{"file_storage", "health_check"}
+	var extensionBlocks, exportersBlock strings.Builder
+	exporterNames := make([]string, 0, 1+len(cfg.ExternalExports))
+	if !cfg.ExternalOnly {
+		extensions = append([]string{"bearertokenauth/telemetry"}, extensions...)
+		extensionBlocks.WriteString(`  bearertokenauth/telemetry:
     scheme: Bearer
     filename: /etc/otelcol/ingest-token
-  file_storage:
+`)
+		exporterNames = append(exporterNames, "otlp/telemetry")
+		fmt.Fprintf(&exportersBlock, `  otlp/telemetry:
+    endpoint: %s
+    tls:
+      ca_file: /etc/otelcol/tls/ca.crt
+    auth:
+      authenticator: bearertokenauth/telemetry
+    retry_on_failure:
+      enabled: true
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 10000
+`, cfg.TelemetryAddress)
+	}
+	for index, external := range cfg.ExternalExports {
+		name := fmt.Sprintf("otlphttp/external-%d", index)
+		if external.Protocol == "otlp_grpc" {
+			name = fmt.Sprintf("otlp/external-%d", index)
+		}
+		authBlock := ""
+		if external.TokenFile != "" {
+			authenticator := fmt.Sprintf("bearertokenauth/export-%d", index)
+			extensions = append(extensions, authenticator)
+			fmt.Fprintf(&extensionBlocks, `  %s:
+    scheme: Bearer
+    filename: %s
+`, authenticator, externalTokenMount(index))
+			authBlock = "\n    auth:\n      authenticator: " + authenticator
+		}
+		tlsBlock := ""
+		if external.TLSCAFile != "" {
+			tlsBlock = "\n    tls:\n      ca_file: " + externalCAMount(index)
+		}
+		fmt.Fprintf(&exportersBlock, `  %s:
+    endpoint: %s%s%s
+    retry_on_failure:
+      enabled: true
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 10000
+`, name, external.Endpoint, tlsBlock, authBlock)
+		exporterNames = append(exporterNames, name)
+	}
+	pipelineExporters := "[" + strings.Join(exporterNames, ", ") + "]"
+	return fmt.Sprintf(`extensions:
+%s  file_storage:
     directory: /var/lib/otelcol
   health_check:
     endpoint: 127.0.0.1:13133
@@ -665,21 +745,9 @@ processors:
     override: false
 
 exporters:
-  otlp/telemetry:
-    endpoint: %s
-    tls:
-      ca_file: /etc/otelcol/tls/ca.crt
-    auth:
-      authenticator: bearertokenauth/telemetry
-    retry_on_failure:
-      enabled: true
-    sending_queue:
-      enabled: true
-      storage: file_storage
-      queue_size: 10000
-
+%s
 service:
-  extensions: [bearertokenauth/telemetry, file_storage, health_check]
+  extensions: [%s]
   telemetry:
     metrics:
       address: 127.0.0.1:8888
@@ -687,16 +755,16 @@ service:
     metrics:
       receivers: [otlp, hostmetrics]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlp/telemetry]
+      exporters: %s
     logs:
       receivers: [otlp, filelog]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlp/telemetry]
+      exporters: %s
     traces:
       receivers: [otlp]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlp/telemetry]
-`, includes.String(), cfg.TelemetryAddress)
+      exporters: %s
+`, extensionBlocks.String(), includes.String(), exportersBlock.String(), strings.Join(extensions, ", "), pipelineExporters, pipelineExporters, pipelineExporters)
 }
 
 // DataSourceEndpoints are the private read endpoints the control plane or CLI
