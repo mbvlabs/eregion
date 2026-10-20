@@ -46,14 +46,22 @@ What shipped:
   requests over the channel's standard input and output, dispatches by step name
   through a step registry, and runs each step as a **detached** task that
   outlives its caller. The request reaches the task through an inherited pipe,
-  so a transient secret never touches the node's disk.
+  so a transient secret never touches the node's disk, and the serving process
+  writes that request before it returns, so a serving process that exits with
+  the channel never drops it.
 - A protocol-version handshake that fails closed before any request is accepted.
 - A bounded (8 KiB), redacted stderr tail and an explicit "stream lost"
   outcome that never implies the node stopped. The retry path calls `status`
   before `run`.
+- A dead or never-started node task is reported at once: a stale status and an
+  absent status past a short grace window are retryable failures, and the node
+  answers them with a bounded, redacted tail of the node task log, so the
+  reason reaches the operation detail.
 - A documented authentication and privilege policy: key-only authentication to a
   dedicated unprivileged account, a pinned host key, no root/sudo, no agent
-  forwarding, no PTY, and no shell interpolation of any request value.
+  forwarding, no PTY, and no shell interpolation of any request value. The
+  `known_hosts` markers are honoured: a revoked key is refused, a
+  cert-authority line is skipped, and a hashed entry matches its host.
 - Node-side journal compaction with a retention policy, after every task and
   through the explicit `eregion-node compact` command. A serving process never
   compacts, because every status poll starts a new one.
@@ -70,6 +78,11 @@ Delivered tests (all green):
 | duplicate requests produce one effect | `internal/transport` and `internal/controlplane` |
 | cancellation while connected never kills a step mid-effect | `internal/transport` and `internal/controlplane` |
 | failure injection for a lost response at the transport boundary | `internal/transport` (cut proxy in front of the container) |
+| a node task that dies mid-step is reported at once, with the node task log | `internal/transport` (in-process node and the disposable container) |
+| a node task that never starts is reported at once, with the node task log | `internal/transport` (in-process node and the disposable container) |
+| a revoked, cert-authority, or hashed `known_hosts` entry | `internal/transport` |
+| a serving process that exits never drops the task request | `internal/noded` |
+| a serving process never compacts the journal | `internal/noded` |
 | killed worker, duplicate submission, cancellation at a step boundary | `internal/controlplane` against the disposable SSH endpoint |
 
 The disposable SSH endpoint is a throwaway `sshd` container with a generated host
@@ -125,7 +138,8 @@ These questions are decided for SSH in
    durable exactly-once evidence and are not compacted automatically.
 5. **Observability:** the request ID and the execution identity cross the
    boundary; a lost stream is surfaced as an explicit unknown outcome that never
-   claims the work stopped.
+   claims the work stopped. A task that died or never started is surfaced as a
+   retryable failure with the node task log, not as a wait until the deadline.
 
 ## Gate for the remote half
 

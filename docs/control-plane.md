@@ -144,6 +144,10 @@ install -m 0600 -o root -g root node.json /etc/eregion/node.json
 {"node": "app-1", "state_dir": "/var/lib/eregion/node"}
 ```
 
+An optional `task_command` replaces the command that starts a detached node
+task. It is the node operator's own local program, it must be an absolute path,
+and it is never derived from a request.
+
 The node account is unprivileged and owns only its state directory. The control
 plane pins the node's host key; a missing pin, a changed key, or a protocol
 version mismatch fails closed and ends the operation with
@@ -152,7 +156,10 @@ unknown outcome: the node task keeps running, and the retry asks the node for it
 status before it runs anything.
 
 The node runs each step as a detached task, so the task outlives the connection
-that started it and the control plane polls the node's status. The full decisions,
+that started it and the control plane polls the node's status. A task that died
+or never started is reported at once, as a retryable failure that carries a
+bounded tail of the node task log, instead of a wait until the job deadline.
+The full decisions,
 including the privilege policy, the state directory layout, and the retention
 policy, are in [the M0.3 SSH plan](m0.3-ssh-plan.md).
 
