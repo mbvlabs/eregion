@@ -78,8 +78,11 @@ func (a *app) runtimeSpecs() []spec {
 	serveMeta := serverMeta("Run the authenticated control-plane API", "eregion serve --listen 127.0.0.1:8080", "A running API/worker service has no static mutation preview; use system migrate --dry-run to inspect schema changes.")
 	serveMeta.Environment = append(serveMeta.Environment, "EREGION_AUTH_FILE")
 	serveMeta.Environment = append(serveMeta.Environment, nodeTransportEnvironment...)
+	serveMeta.Environment = append(serveMeta.Environment, extensionEnvironment...)
+	serveMeta.Environment = append(serveMeta.Environment, serveExtensionEnvironment...)
 	workerMeta := serverMeta("Run River workers without an API listener", "eregion worker --concurrency 2", "Background execution cannot be previewed; this command starts workers for accepted operations.")
 	workerMeta.Environment = append(workerMeta.Environment, nodeTransportEnvironment...)
+	workerMeta.Environment = append(workerMeta.Environment, extensionEnvironment...)
 	return []spec{
 		{use: "serve", meta: serveMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("listen", "127.0.0.1:8080", "API listen address; non-loopback requires TLS")
@@ -87,6 +90,9 @@ func (a *app) runtimeSpecs() []spec {
 			cmd.Flags().String("tls-key", "", "TLS private-key file")
 			cmd.Flags().Bool("workers", true, "Run River workers alongside the API")
 			cmd.Flags().Int("concurrency", 2, "Diagnostic workers in this process (1–16)")
+			cmd.Flags().String("webhook-secret-file", "", "GitHub webhook secret file (0600); defaults to EREGION_WEBHOOK_SECRET_FILE")
+			cmd.Flags().StringArray("webhook-allow", nil, "Allowed push owner/repo@branch=app/environment (repeatable); defaults to EREGION_WEBHOOK_ALLOW")
+			cmd.Flags().String("private-upstream", "", "Private upstream URL enforced by access grants under /private/; defaults to EREGION_PRIVATE_UPSTREAM")
 		}, run: a.serve},
 		{use: "worker", meta: workerMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Int("concurrency", 2, "Diagnostic workers in this process (1–16)")
@@ -291,16 +297,16 @@ func (a *app) logger(cmd *cobra.Command) *slog.Logger {
 // startRuntime opens the database and builds the runtime. The returned
 // closer releases the node transport (a WireGuard tunnel and its key lock);
 // call it after the workers stopped.
-func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, *controlplane.Runtime, func(), error) {
+func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, *controlplane.Runtime, extensionRuntime, func(), error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
 	defer cancel()
 	pool, err := a.database(ctx)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, extensionRuntime{}, nil, err
 	}
 	if err := controlplane.Ready(ctx, pool); err != nil {
 		pool.Close()
-		return nil, nil, nil, err
+		return nil, nil, extensionRuntime{}, nil, err
 	}
 	// A process without workers never dispatches node work, so it builds no
 	// node transport and holds no WireGuard key.
@@ -310,16 +316,24 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		nodeTransport, closeTransport, err = a.nodeTransport(a.logger(cmd))
 		if err != nil {
 			pool.Close()
-			return nil, nil, nil, err
+			return nil, nil, extensionRuntime{}, nil, err
 		}
 	}
-	run, err := controlplane.New(pool, a.logger(cmd), controlplane.WorkerConfig{Concurrency: concurrency, Transport: nodeTransport})
+	// Extensions register before New so the registry is complete before any
+	// action can be normalized, submitted, or executed.
+	parts, resolver, err := a.startExtensions(pool, concurrency > 0)
 	if err != nil {
 		closeTransport()
 		pool.Close()
-		return nil, nil, nil, err
+		return nil, nil, extensionRuntime{}, nil, err
 	}
-	return pool, run, closeTransport, nil
+	run, err := controlplane.New(pool, a.logger(cmd), controlplane.WorkerConfig{Concurrency: concurrency, Transport: nodeTransport, SecretResolver: resolver})
+	if err != nil {
+		closeTransport()
+		pool.Close()
+		return nil, nil, extensionRuntime{}, nil, err
+	}
+	return pool, run, parts, closeTransport, nil
 }
 
 // nodeTransport builds the transport a worker dispatches node work through.
@@ -465,7 +479,7 @@ func (a *app) worker(cmd *cobra.Command, _ []string) (result, error) {
 	if concurrency < 1 {
 		return result{}, contract.NewFault(contract.ValidationFailed, "worker concurrency must be positive", "Use --concurrency 1–16.")
 	}
-	pool, run, closeTransport, err := a.startRuntime(cmd, concurrency)
+	pool, run, _, closeTransport, err := a.startRuntime(cmd, concurrency)
 	if err != nil {
 		return result{}, err
 	}
@@ -511,7 +525,7 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	if !withWorkers {
 		concurrency = 0
 	}
-	pool, run, closeTransport, err := a.startRuntime(cmd, concurrency)
+	pool, run, parts, closeTransport, err := a.startRuntime(cmd, concurrency)
 	if err != nil {
 		return result{}, err
 	}
@@ -534,7 +548,12 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 		}()
 	}
 	logger := a.logger(cmd)
-	server := &http.Server{Handler: api.NewHandler(auth, run.Service, func(ctx context.Context) error { return controlplane.Ready(ctx, pool) }), TLSConfig: tlsConfig, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 8192}
+	base := api.NewHandler(auth, run.Service, func(ctx context.Context) error { return controlplane.Ready(ctx, pool) })
+	handler, err := a.buildMux(cmd, logger, auth, base, run.Service, parts)
+	if err != nil {
+		return result{}, err
+	}
+	server := &http.Server{Handler: handler, TLSConfig: tlsConfig, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 8192}
 	logger.Info("API listener bound", "address", listener.Addr().String(), "workers", withWorkers)
 	done := make(chan error, 1)
 	go func() {

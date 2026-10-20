@@ -27,8 +27,8 @@ type Service struct {
 	// afterNode is a test-only seam between a node effect and its database
 	// acknowledgement. Production leaves it nil.
 	afterNode func(contract.OperationID, string) error
-	// secrets resolves environment secret references into transient values. It is
-	// intentionally nil until the M3 vault agent installs a resolver.
+	// secrets resolves environment secret references into transient values. Nil
+	// means referenced secrets fail honestly instead of being injected.
 	secrets SecretResolver
 	// sourceRoots is the symlink-resolved directory-build allowlist.
 	sourceRoots []string
@@ -38,6 +38,13 @@ type Service struct {
 // persisting values. Implementations must return only the requested keys.
 type SecretResolver interface {
 	Resolve(context.Context, map[string]string) (map[string]string, error)
+}
+
+// EnvironmentSecretResolver is the authoritative form: the deployment's app and
+// environment bind the namespace, so a reference to another environment is
+// refused. A resolver that implements it is always preferred over Resolve.
+type EnvironmentSecretResolver interface {
+	ResolveEnvironment(ctx context.Context, app, environment string, refs map[string]string) (map[string]string, error)
 }
 
 func (s *Service) buildSourceRoots() []string {

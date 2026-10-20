@@ -94,7 +94,9 @@ func (s *Service) claimPlatform(ctx context.Context, id contract.OperationID, at
 				return err
 			}
 		}
-		if err := tx.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, id).Scan(&raw); err != nil {
+		// The claim persists the attempt: every later fenced write compares
+		// against it, so a claim that left it at 0 could never finish.
+		if err := tx.QueryRow(ctx, `UPDATE eregion_operations SET attempt=$2 WHERE id=$1 RETURNING input`, id, op.Attempt).Scan(&raw); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
@@ -489,9 +491,15 @@ func (s *Service) resolveEnvironmentSecrets(ctx context.Context, env platform.En
 		return nil, nil
 	}
 	if s.secrets == nil {
-		return nil, contract.NewFault(contract.PreconditionFailed, "secret injection is not configured", "Install the M3 vault resolver and configure the secret references before deploying.")
+		return nil, contract.NewFault(contract.PreconditionFailed, "secret injection is not configured", "Set EREGION_VAULT_KEY_FILE on every control-plane worker and pin the secret references before deploying.")
 	}
-	values, err := s.secrets.Resolve(ctx, env.SecretRefs)
+	var values map[string]string
+	var err error
+	if scoped, ok := s.secrets.(EnvironmentSecretResolver); ok {
+		values, err = scoped.ResolveEnvironment(ctx, env.App, env.Name, env.SecretRefs)
+	} else {
+		values, err = s.secrets.Resolve(ctx, env.SecretRefs)
+	}
 	if err != nil {
 		return nil, contract.NewFault(contract.Unavailable, "environment secrets could not be resolved", "Check the vault agent and reference revisions, then retry the deployment.")
 	}

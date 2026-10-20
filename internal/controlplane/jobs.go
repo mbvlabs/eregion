@@ -94,6 +94,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &platformWorker{service: service})
 	river.AddWorker(workers, &reconcileWorker{service: service})
+	river.AddWorker(workers, &backupScheduleWorker{service: service, logger: logger})
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
@@ -108,6 +109,11 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		riverConfig.PeriodicJobs = []*river.PeriodicJob{
 			river.NewPeriodicJob(river.PeriodicInterval(5*time.Second), func() (river.JobArgs, *river.InsertOpts) {
 				return reconcileArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 3}
+			}, &river.PeriodicJobOpts{RunOnStart: true}),
+			// Backup policies are evaluated by every worker; the deterministic
+			// idempotency key makes concurrent evaluation submit each slot once.
+			river.NewPeriodicJob(river.PeriodicInterval(backupScheduleInterval), func() (river.JobArgs, *river.InsertOpts) {
+				return backupScheduleArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 3, UniqueOpts: river.UniqueOpts{ByPeriod: backupScheduleInterval / 2}}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
 		}
 	}

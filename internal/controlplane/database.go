@@ -32,6 +32,16 @@ var migration003 string
 //go:embed migrations/004_platform.sql
 var migration004 string
 
+// 005 is a byte-for-byte copy of vault/schema.sql so the migration stays
+// explicit and immutable even if the package schema is edited later. A test
+// keeps the two identical until 005 is applied anywhere.
+//
+//go:embed migrations/005_vault.sql
+var migration005 string
+
+//go:embed migrations/006_integrations.sql
+var migration006 string
+
 type migration struct {
 	version int
 	name    string
@@ -46,6 +56,8 @@ var migrations = []migration{
 	{version: 2, name: "002_node_execution.sql", sql: migration002},
 	{version: 3, name: "003_operation_error_code.sql", sql: migration003},
 	{version: 4, name: "004_platform.sql", sql: migration004},
+	{version: 5, name: "005_vault.sql", sql: migration005},
+	{version: 6, name: "006_integrations.sql", sql: migration006},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.
