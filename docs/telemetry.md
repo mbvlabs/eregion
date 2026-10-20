@@ -134,6 +134,16 @@ admin secret and written to `0600` files on the telemetry node.
 
 ## External export
 
+There are two export modes:
+
+- **additive** (the default) keeps the local telemetry node and optionally
+  copies telemetry to one or more upstream OTLP endpoints;
+- **external-only** (`platform.telemetry.agent` with `external_only: true`) ships
+  directly to upstream endpoints and does not install or require a telemetry
+  node.
+
+### Local stack export (additive)
+
 `platform.telemetry.install` accepts an optional upstream OTLP endpoint in
 addition to the telemetry node:
 
@@ -158,8 +168,80 @@ addition to the telemetry node:
   token. No credential value is rendered into the collector config, compose
   file, events, or command arguments.
 - Metrics, logs, and (when enabled) traces are copied to the upstream endpoint.
-  External-only operation without a telemetry node is **not** implemented; the
-  action still installs the local stack.
+  The local stack is still installed; this form is additive only.
+
+### Node agent: additive or external-only
+
+`platform.telemetry.agent` installs the collector on an application or builder
+node. In additive mode it requires the local telemetry endpoint and its per-node
+credential and may also list `external_exports`:
+
+```json
+{
+  "telemetry_address": "10.77.0.10:4317",
+  "token_file": "/etc/eregion/otel/ingest-token",
+  "tls_ca_file": "/etc/eregion/otel/ca.crt",
+  "external_exports": [
+    {
+      "endpoint": "https://otlp.example.com:4318",
+      "protocol": "otlp_http",
+      "token_file": "/etc/eregion/otel/external-token",
+      "tls_ca_file": "/etc/eregion/otel/external-ca.crt"
+    }
+  ]
+}
+```
+
+External-only mode replaces the local telemetry node. The same node still
+exposes OTLP receivers for applications, scrapes host metrics, and reads
+container/application logs; only the destinations change:
+
+```json
+{
+  "external_only": true,
+  "external_exports": [
+    {
+      "endpoint": "https://otlp.example.com:4318",
+      "token_file": "/etc/eregion/otel/external-token",
+      "tls_ca_file": "/etc/eregion/otel/external-ca.crt"
+    },
+    {
+      "endpoint": "https://otlp-eu.example.com:4317",
+      "protocol": "otlp_grpc"
+    }
+  ],
+  "root_dir": "/var/lib/eregion/otel-agent",
+  "log_paths": ["/var/log/containers/*.log"]
+}
+```
+
+Validation is fail-closed:
+
+- `external_only` requires at least one `external_exports` entry and refuses a
+  `telemetry_address`, `token_file`, or `tls_ca_file` in the same input. Those
+  local fields are not silently ignored.
+- Additive mode keeps the previous requirement for a private
+  `telemetry_address`, a `0600` token-file reference, and a CA-file reference.
+- Every external endpoint follows `ExternalExport` validation: HTTPS, or plain
+  HTTP only for a private/loopback address; `otlp_http` (default) or `otlp_grpc`;
+  no embedded URL credentials; `token_file` and `tls_ca_file` are absolute file
+  references validated for safety. At most eight distinct
+  endpoint/protocol pairs are accepted.
+- The external token and CA files are mounted read-only at indexed paths
+  (`/etc/otelcol/external-<n>-token` and `external-<n>-ca.crt`). Their contents
+  are never read into action input, events, River arguments, commands, or
+  results.
+
+Rendering matches the mode. Additive mode writes the local ingest-token file and
+TLS CA and includes the `otlp/telemetry` exporter. External-only mode writes
+neither the local token file nor the CA, omits their compose mounts, and emits
+only the external exporters in the metrics, logs, and traces pipelines. The
+action result in external-only mode contains the node, `external_only: true`,
+the non-secret external endpoints, and file/command counts; it never contains a
+token value or a fabricated local endpoint.
+
+Existing agent inputs without `external_exports` or `external_only` behave
+exactly as before.
 
 ## CLI reads
 
@@ -212,7 +294,12 @@ Verified by unit and integration tests in this increment:
   convergent retry and changed-input refusal;
 - credential issuance writes one 0600 array, rotates/replaces one node entry,
   reports only a digest, and rejects a token in action input;
-- external export rendering, file-reference mounts, and credential-free output;
+- external export rendering, file-reference mounts, and credential-free output,
+  for both the additive local stack and the additive/external-only node agent;
+- external-only agent validation: refusal of a local address/token/CA, refusal of
+  an empty export list, duplicate/over-limit exports, and unsafe HTTP endpoints;
+- external-only agent rendering and action dispatch: no local ingest token or CA
+  mount, external-only collector pipelines, and a result with no token value;
 - Grafana alerting provisioning is rendered with a datasource UID that matches
   the provisioned datasource, and the provisioning directory is mounted;
 - CLI search/tail/query envelopes, NDJSON tail, plain output, explicit
@@ -229,7 +316,11 @@ Not verified in this increment, and not claimed:
 - `docker compose` actually converging on a fresh host, package installation, or
   node enrollment/bootstrap;
 - true service health, HA, backup/restore, or retention enforcement under load;
-- external-only export without a local telemetry node; export is additive only;
+- a real external observability endpoint accepting the rendered OTLP traffic,
+  including its authentication/TLS behaviour; external-only mode is verified by
+  validation, render, and dispatched-action tests, not against a live vendor;
+- external endpoint failover, per-export queue isolation under backpressure, or
+  delivery guarantees beyond the collector's configured retry/queue settings;
 - SSH/WireGuard transport identity beyond the pinned key configuration; the
   node table records an address, not a host key.
 

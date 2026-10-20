@@ -347,15 +347,51 @@ func (p Prepared) LogsReadTokenPath() string {
 }
 
 // AgentConfig is the exporter collector installed on an application or builder
-// node. It never contains a credential: the token is mounted from a 0600 file.
+// node. It never contains a credential: local ingest and external export tokens
+// are mounted from file references.
+//
+// ExternalOnly switches the agent from "ship to the telemetry node" to "ship
+// directly to one or more external OTLP endpoints". In that mode the local
+// telemetry address, ingest token, and local TLS CA are deliberately absent;
+// PrepareAgent refuses them rather than ignoring them.
 type AgentConfig struct {
 	Node             Node
 	TelemetryAddress string
 	Token            string
 	TLSCAPEM         []byte
+	ExternalExports  []ExternalExport
+	ExternalOnly     bool
 	RootDir          string
 	LogPaths         []string
 	Versions         Versions
+}
+
+// MaxExternalExports bounds the upstream fan-out. Each export needs its own
+// exporter, queue, and optional credential mount; a small explicit cap keeps a
+// bad input from multiplying collector state without bound.
+const MaxExternalExports = 8
+
+// ValidateExternalExports defaults and checks a fan-out list. Endpoints must be
+// distinct so a retry cannot silently ship duplicate series to one backend.
+func ValidateExternalExports(values []ExternalExport) ([]ExternalExport, error) {
+	if len(values) > MaxExternalExports {
+		return nil, contract.NewFault(contract.ValidationFailed, "too many external exports", "Configure at most eight upstream OTLP endpoints.")
+	}
+	result := make([]ExternalExport, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		external, err := value.Validate()
+		if err != nil {
+			return nil, err
+		}
+		key := external.Protocol + "\x00" + external.Endpoint
+		if seen[key] {
+			return nil, contract.NewFault(contract.ValidationFailed, "duplicate external export", "List each upstream endpoint and protocol at most once.")
+		}
+		seen[key] = true
+		result = append(result, external)
+	}
+	return result, nil
 }
 
 type PreparedAgent struct {
@@ -372,19 +408,33 @@ func PrepareAgent(cfg AgentConfig) (PreparedAgent, error) {
 	if cfg.Node.IsMain || cfg.Node.IsControlPlane {
 		return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "agent cannot be installed on the main or control-plane node", "Export telemetry from application and builder nodes only.")
 	}
-	host, port, err := net.SplitHostPort(strings.TrimSpace(cfg.TelemetryAddress))
-	if err != nil || port != "4317" {
-		return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "invalid telemetry OTLP endpoint", "Use the telemetry node's private address with port 4317.")
+	ip, port := net.IP(nil), ""
+	if cfg.ExternalOnly {
+		if cfg.TelemetryAddress != "" || cfg.Token != "" || len(cfg.TLSCAPEM) != 0 {
+			return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "external-only agent cannot also target a local telemetry node", "Omit telemetry_address, token_file, and tls_ca_file; set external_only only when exporting directly upstream.")
+		}
+		if len(cfg.ExternalExports) == 0 {
+			return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "external-only agent requires at least one external export", "Configure at least one external_exports entry, or install the additive agent with a telemetry node.")
+		}
+	} else {
+		host, parsedPort, err := net.SplitHostPort(strings.TrimSpace(cfg.TelemetryAddress))
+		if err != nil || parsedPort != "4317" {
+			return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "invalid telemetry OTLP endpoint", "Use the telemetry node's private address with port 4317.")
+		}
+		ip, port = net.ParseIP(host), parsedPort
+		if ip == nil || !privateAddress(ip) {
+			return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "telemetry endpoint must be a private address", "The exporter accepts only a private telemetry node address.")
+		}
+		credential := IngestCredential{Node: cfg.Node.Name, Token: cfg.Token}
+		if err := credential.Validate(); err != nil {
+			return PreparedAgent{}, err
+		}
+		if err := validateCAFile(cfg.TLSCAPEM); err != nil {
+			return PreparedAgent{}, err
+		}
 	}
-	ip := net.ParseIP(host)
-	if ip == nil || !privateAddress(ip) {
-		return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "telemetry endpoint must be a private address", "The exporter accepts only a private telemetry node address.")
-	}
-	credential := IngestCredential{Node: cfg.Node.Name, Token: cfg.Token}
-	if err := credential.Validate(); err != nil {
-		return PreparedAgent{}, err
-	}
-	if err := validateCAFile(cfg.TLSCAPEM); err != nil {
+	externalExports, err := ValidateExternalExports(cfg.ExternalExports)
+	if err != nil {
 		return PreparedAgent{}, err
 	}
 	if len(cfg.LogPaths) == 0 {
@@ -410,7 +460,12 @@ func PrepareAgent(cfg AgentConfig) (PreparedAgent, error) {
 	if err != nil || !filepath.IsAbs(absolute) {
 		return PreparedAgent{}, contract.NewFault(contract.ValidationFailed, "invalid agent root directory", "Use an absolute directory owned by root.")
 	}
-	cfg.TelemetryAddress = net.JoinHostPort(ip.String(), port)
+	if cfg.ExternalOnly {
+		cfg.TelemetryAddress = ""
+	} else {
+		cfg.TelemetryAddress = net.JoinHostPort(ip.String(), port)
+	}
+	cfg.ExternalExports = externalExports
 	cfg.Versions = versions
 	cfg.RootDir = filepath.Clean(absolute)
 	return PreparedAgent{AgentConfig: cfg}, nil
