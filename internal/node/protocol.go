@@ -52,6 +52,15 @@ var ErrStreamLost = errors.New("node stream lost")
 // stream: the node answered, but not with something this side understands.
 var ErrProtocol = errors.New("invalid node protocol")
 
+// ErrPermanentTransport marks a transport failure that a retry cannot fix: a
+// host-key mismatch, a protocol version mismatch, or a refused handshake. The
+// control plane reports it as a precondition failure instead of retrying it
+// forever.
+var ErrPermanentTransport = errors.New("permanent node transport failure")
+
+// IsPermanentTransport reports whether a transport error is permanent.
+func IsPermanentTransport(err error) bool { return errors.Is(err, ErrPermanentTransport) }
+
 // IsStreamLost reports whether err is an explicit lost-stream outcome.
 func IsStreamLost(err error) bool { return errors.Is(err, ErrStreamLost) }
 

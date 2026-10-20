@@ -27,11 +27,11 @@ type Service struct {
 
 var _ operations.Service = (*Service)(nil)
 
-const columns = `id, kind, target, actor_kind, actor_subject, state, attempt, last_sequence, created_at, updated_at`
+const columns = `id, kind, target, actor_kind, actor_subject, state, attempt, last_sequence, error_code, created_at, updated_at`
 
 func scanOperation(row pgx.Row) (contract.Operation, error) {
 	var op contract.Operation
-	err := row.Scan(&op.ID, &op.Kind, &op.Target, &op.Actor.Kind, &op.Actor.Subject, &op.State, &op.Attempt, &op.LastSequence, &op.CreatedAt, &op.UpdatedAt)
+	err := row.Scan(&op.ID, &op.Kind, &op.Target, &op.Actor.Kind, &op.Actor.Subject, &op.State, &op.Attempt, &op.LastSequence, &op.ErrorCode, &op.CreatedAt, &op.UpdatedAt)
 	return op, err
 }
 
@@ -178,7 +178,7 @@ func (s *Service) RequestCancel(ctx context.Context, actor contract.Actor, id co
 		if op.State.Terminal() || op.State == contract.Cancelling {
 			return nil
 		}
-		return transition(ctx, tx, op, contract.Cancelling, "Cancellation requested; waiting for a worker safe boundary.")
+		return transition(ctx, tx, op, contract.Cancelling, "", "Cancellation requested; waiting for a worker safe boundary.")
 	})
 }
 
@@ -230,15 +230,19 @@ func (s *Service) mutateOwned(ctx context.Context, id contract.OperationID, atte
 	return op, true, nil
 }
 
-func transition(ctx context.Context, tx pgx.Tx, op *contract.Operation, state contract.State, message string) error {
+// transition moves the operation to a new state. A failed transition carries
+// the machine-readable error code that the operation snapshot and the state
+// event expose, so a caller never has to read the message text.
+func transition(ctx context.Context, tx pgx.Tx, op *contract.Operation, state contract.State, code contract.Code, message string) error {
 	if err := contract.ValidateTransition(op.State, state); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, "UPDATE eregion_operations SET state=$2 WHERE id=$1", op.ID, state); err != nil {
+	if _, err := tx.Exec(ctx, "UPDATE eregion_operations SET state=$2,error_code=$3 WHERE id=$1", op.ID, state, string(code)); err != nil {
 		return unavailable()
 	}
 	op.State = state
-	return appendEvent(ctx, tx, op, contract.Event{Kind: "state", State: state, Message: message})
+	op.ErrorCode = code
+	return appendEvent(ctx, tx, op, contract.Event{Kind: "state", State: state, ErrorCode: code, Message: message})
 }
 
 func appendEvent(ctx context.Context, tx pgx.Tx, op *contract.Operation, event contract.Event) error {

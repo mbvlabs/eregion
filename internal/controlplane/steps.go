@@ -24,15 +24,16 @@ type StepRecord struct {
 	StartedAt   time.Time            `json:"started_at"`
 	CompletedAt *time.Time           `json:"completed_at,omitempty"`
 	Error       string               `json:"error,omitempty"`
+	ErrorCode   contract.Code        `json:"error_code,omitempty"`
 	Result      json.RawMessage      `json:"result,omitempty"`
 }
 
-const stepColumns = `operation_id,step,inputs_hash,state,attempt,execution_id,started_at,completed_at,error,result`
+const stepColumns = `operation_id,step,inputs_hash,state,attempt,execution_id,started_at,completed_at,error,error_code,result`
 
 func scanStep(row pgx.Row) (StepRecord, error) {
 	var step StepRecord
 	var result []byte
-	err := row.Scan(&step.OperationID, &step.Step, &step.InputsHash, &step.State, &step.Attempt, &step.ExecutionID, &step.StartedAt, &step.CompletedAt, &step.Error, &result)
+	err := row.Scan(&step.OperationID, &step.Step, &step.InputsHash, &step.State, &step.Attempt, &step.ExecutionID, &step.StartedAt, &step.CompletedAt, &step.Error, &step.ErrorCode, &result)
 	if err != nil {
 		return step, err
 	}
@@ -79,7 +80,7 @@ func (s *Service) claimAttempt(ctx context.Context, id contract.OperationID, att
 	var input json.RawMessage
 	op, claimed, err := s.mutateOwnedOrClaim(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		if op.State == contract.Queued {
-			if err := transition(ctx, tx, op, contract.Running, "Diagnostic worker started through node dispatch."); err != nil {
+			if err := transition(ctx, tx, op, contract.Running, "", "Diagnostic worker started through node dispatch."); err != nil {
 				return err
 			}
 		}
@@ -214,11 +215,12 @@ func nullableJSON(raw json.RawMessage) any {
 	return raw
 }
 
-// failStep records a failed node step without touching a completed one.
-func (s *Service) failStep(ctx context.Context, id contract.OperationID, attempt uint32, step, message string) error {
+// failStep records a failed node step without touching a completed one. The
+// error code is machine-readable: a caller does not have to read the message.
+func (s *Service) failStep(ctx context.Context, id contract.OperationID, attempt uint32, step string, code contract.Code, message string) error {
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		result, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='failed',completed_at=clock_timestamp(),error=$3 WHERE operation_id=$1 AND step=$2 AND state<>'completed'`,
-			id, step, message)
+		result, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='failed',completed_at=clock_timestamp(),error=$3,error_code=$4 WHERE operation_id=$1 AND step=$2 AND state<>'completed'`,
+			id, step, message, string(code))
 		if err != nil {
 			return err
 		}
@@ -244,11 +246,11 @@ func (s *Service) finishSucceeded(ctx context.Context, id contract.OperationID, 
 			return nil
 		}
 		if op.State == contract.Queued {
-			if err := transition(ctx, tx, op, contract.Running, "Reconciled node work from a recovered execution."); err != nil {
+			if err := transition(ctx, tx, op, contract.Running, "", "Reconciled node work from a recovered execution."); err != nil {
 				return err
 			}
 		}
-		return transition(ctx, tx, op, contract.Succeeded, "Diagnostic operation succeeded; node-local marker effects were acknowledged.")
+		return transition(ctx, tx, op, contract.Succeeded, "", "Diagnostic operation succeeded; node-local marker effects were acknowledged.")
 	})
 	if err != nil {
 		return op, err
@@ -271,15 +273,15 @@ func (s *Service) finishCancelled(ctx context.Context, id contract.OperationID, 
 			return err
 		}
 		if completed == total {
-			return transition(ctx, tx, op, contract.Succeeded, "Cancellation arrived after the final safe boundary; all node effects were already complete.")
+			return transition(ctx, tx, op, contract.Succeeded, "", "Cancellation arrived after the final safe boundary; all node effects were already complete.")
 		}
 		if op.State != contract.Cancelling {
 			return nil
 		}
-		if err := markIncompleteSteps(ctx, tx, id, "cancelled before the step completed"); err != nil {
+		if err := markIncompleteSteps(ctx, tx, id, contract.Unavailable, "cancelled before the step completed"); err != nil {
 			return err
 		}
-		return transition(ctx, tx, op, contract.Canceled, "Cancellation acknowledged at a node step boundary; completed effects were not rolled back.")
+		return transition(ctx, tx, op, contract.Canceled, "", "Cancellation acknowledged at a node step boundary; completed effects were not rolled back.")
 	})
 	if err != nil {
 		return op, err
@@ -290,22 +292,23 @@ func (s *Service) finishCancelled(ctx context.Context, id contract.OperationID, 
 	return op, nil
 }
 
-func markIncompleteSteps(ctx context.Context, tx pgx.Tx, id contract.OperationID, message string) error {
-	_, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='failed',completed_at=clock_timestamp(),error=$2 WHERE operation_id=$1 AND state<>'completed'`, id, message)
+func markIncompleteSteps(ctx context.Context, tx pgx.Tx, id contract.OperationID, code contract.Code, message string) error {
+	_, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='failed',completed_at=clock_timestamp(),error=$2,error_code=$3 WHERE operation_id=$1 AND state<>'completed'`, id, message, string(code))
 	return err
 }
 
 // failOperation makes a non-retryable node failure visible and closes any
-// unfinished step rows, without rewriting a terminal operation.
-func (s *Service) failOperation(ctx context.Context, id contract.OperationID, attempt uint32, message string) error {
+// unfinished step rows, without rewriting a terminal operation. The error code
+// is machine-readable.
+func (s *Service) failOperation(ctx context.Context, id contract.OperationID, attempt uint32, code contract.Code, message string) error {
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, current *contract.Operation) error {
 		if current.State.Terminal() {
 			return nil
 		}
-		if err := markIncompleteSteps(ctx, tx, id, message); err != nil {
+		if err := markIncompleteSteps(ctx, tx, id, code, message); err != nil {
 			return err
 		}
-		return transition(ctx, tx, current, contract.Failed, message)
+		return transition(ctx, tx, current, contract.Failed, code, message)
 	})
 	if err != nil {
 		return err

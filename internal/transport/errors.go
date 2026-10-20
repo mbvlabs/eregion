@@ -1,10 +1,11 @@
 package transport
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/mbvlabs/eregion/internal/node"
 )
 
 // StderrTailBytes bounds the remote command's standard error. Only the last
@@ -61,11 +62,12 @@ func (e *HandshakeError) Unwrap() error { return ErrPermanentTransport }
 // ErrPermanentTransport marks a transport failure that a retry cannot fix: a
 // host-key mismatch, a protocol version mismatch, or a refused handshake. The
 // control plane reports it as a precondition failure instead of retrying it
-// forever.
-var ErrPermanentTransport = errors.New("permanent node transport failure")
+// forever. It is the node package's sentinel, so the control plane does not
+// have to know which transport produced it.
+var ErrPermanentTransport = node.ErrPermanentTransport
 
 // IsPermanentTransport reports whether a transport error is permanent.
-func IsPermanentTransport(err error) bool { return errors.Is(err, ErrPermanentTransport) }
+func IsPermanentTransport(err error) bool { return node.IsPermanentTransport(err) }
 
 // tailBuffer keeps the last bytes written to it.
 type tailBuffer struct {
