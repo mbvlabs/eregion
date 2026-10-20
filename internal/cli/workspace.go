@@ -25,20 +25,22 @@ func (a *app) workspaceSpecs() []spec {
 	meta.Mutating = true
 	meta.DryRunReason = "The workspace previews every action with the platform dry-run API before explicit submission; the command itself only starts the interface."
 	meta.WhenToUse = []string{
-		"Explore fleet, app, environment, resource, and backup inventory with freshness and focused details.",
-		"Preview and submit an app, environment, image release, or deploy form; every action shows its noninteractive platform submit equivalent.",
+		"Explore fleet, app, environment, release, deployment, resource, and backup inventory with freshness and focused details.",
+		"Preview and submit an app, environment, image release, deploy, rollback, node check, resource destruction, or backup action; every action shows its noninteractive platform submit equivalent.",
+		"Use ':' for command discovery, '/' to filter, and the documented destructive confirmation before submission.",
 		"Requires --interactive and a real terminal on stdin and stdout. Machine output never starts the interface.",
 	}
 	meta.Examples = []string{
 		"eregion ui --interactive",
 		"eregion ui --interactive --tab apps --ascii --no-color --reduced-motion",
+		"eregion ui --interactive --tab deployments",
 	}
 	return []spec{{
 		use:  "ui",
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().Bool("interactive", false, "Open the workspace in this terminal; required")
-			cmd.Flags().String("tab", "fleet", "Initial workspace: fleet, apps, envs, resources, or backups")
+			cmd.Flags().String("tab", "fleet", "Initial workspace: fleet, apps, envs, releases, deployments, resources, or backups")
 			cmd.Flags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 			cmd.Flags().Bool("ascii", false, "Use ASCII glyphs instead of Unicode")
 			cmd.Flags().Bool("no-color", false, "Disable colour (NO_COLOR is also honoured)")

@@ -42,6 +42,52 @@ func testOptions(width, height int) Options {
 	return Options{Host: "127.0.0.1:8080", Now: func() time.Time { return testNow }, Width: width, Height: height}
 }
 
+func platformFixtureModel(t *testing.T) *viewer.Model {
+	t.Helper()
+	start := testNow.Add(-12 * time.Second)
+	model := viewer.New(testID, viewer.Options{})
+	model.Snapshot(contract.Operation{
+		ID: testID, Kind: "platform.deploy", Target: "env/payments/production",
+		Actor: contract.Actor{Kind: "ci", Subject: "release"}, State: contract.Running,
+		Attempt: 1, LastSequence: 9, CreatedAt: start, UpdatedAt: testNow,
+	}, testNow)
+	events := []contract.Event{
+		{OperationID: testID, Sequence: 1, At: start, Kind: "step", Attempt: 1, Stage: "platform-pack-01-v1", Message: "Node step started."},
+		{OperationID: testID, Sequence: 2, At: start.Add(time.Second), Kind: "log", Attempt: 1, Message: "stdout: restoring Go dependency cache"},
+		{OperationID: testID, Sequence: 3, At: start.Add(2 * time.Second), Kind: "step", Attempt: 1, Stage: "platform-container-01-v1", Message: "Node step started."},
+		{OperationID: testID, Sequence: 4, At: start.Add(3 * time.Second), Kind: "log", Attempt: 1, Message: "container eregion-candidate runs sha256:" + strings.Repeat("a", 64)},
+		{OperationID: testID, Sequence: 5, At: start.Add(4 * time.Second), Kind: "step", Attempt: 1, Stage: "platform-health-01-v1", Message: "Node step started."},
+		{OperationID: testID, Sequence: 6, At: start.Add(5 * time.Second), Kind: "log", Attempt: 1, Message: "health passed after 3 check(s): http status 200"},
+		{OperationID: testID, Sequence: 7, At: start.Add(6 * time.Second), Kind: "step", Attempt: 1, Stage: "platform-container-02-v1", Message: "Node step started."},
+		{OperationID: testID, Sequence: 8, At: start.Add(7 * time.Second), Kind: "log", Attempt: 1, Message: "container eregion-serving runs sha256:" + strings.Repeat("c", 64)},
+		{OperationID: testID, Sequence: 9, At: start.Add(8 * time.Second), Kind: "step", Attempt: 1, Stage: "platform-health-02-v1", Message: "Node step started."},
+	}
+	if err := model.Page(events, testNow); err != nil {
+		t.Fatal(err)
+	}
+	return model
+}
+
+func TestPlatformTargetsHealthAndServingRender(t *testing.T) {
+	model := newModel(*platformFixtureModel(t), testOptions(120, 34))
+	rendered := model.render()
+	for _, want := range []string{"serving release:", "image sha256:", "TARGETS", "candidate health", "HEALTH OBSERVATIONS", "health passed", "3 probe(s)", "build log"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("missing %q:\n%s", want, rendered)
+		}
+	}
+	model.width, model.height = 80, 26
+	standard := model.render()
+	if !strings.Contains(standard, "serving release:") || !strings.Contains(standard, "TARGETS") || !strings.Contains(standard, "health passed") {
+		t.Fatalf("standard layout lost deployment context:\n%s", standard)
+	}
+	model.width, model.height = 40, 18
+	narrow := model.render()
+	if !strings.Contains(narrow, "serving release:") {
+		t.Fatalf("narrow layout lost deployment context:\n%s", narrow)
+	}
+}
+
 func TestLayoutsAreResponsive(t *testing.T) {
 	model := newModel(*fixtureModel(t, nil), testOptions(120, 30))
 	wide := model.render()

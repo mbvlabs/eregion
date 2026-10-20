@@ -90,28 +90,41 @@ func (m Model) renderHeader(width int) string {
 		meta = append(meta, "["+string(m.view.ErrorCode)+"]")
 	}
 	line3 := strings.Join(append([]string{badgeStyle.Render(badge)}, meta...), m.glyphs.separator())
-	return fitLines(strings.Join([]string{line1, line2, id, line3}, "\n"), width, 4)
+	serving := m.dim().Render(viewer.DefaultClean(m.view.ServingLine()))
+	return fitLines(strings.Join([]string{line1, line2, id, line3, serving}, "\n"), width, 5)
 }
 
 func (m Model) renderWide(width, height int) string {
-	leftWidth := min(34, max(22, width/3))
+	leftWidth := min(38, max(24, width/3))
 	separator := m.dim().Render(" │ ")
 	if m.opts.ASCII {
 		separator = " | "
 	}
 	rightWidth := max(10, width-leftWidth-3)
-	left := m.renderStagesPane(leftWidth, height)
+	insightHeight := 0
+	if len(m.view.Targets) > 0 || len(m.view.Health) > 0 {
+		insightHeight = min(max(3, len(m.view.Targets)+len(m.view.Health)+3), max(3, height/2))
+	}
+	left := joinNonEmpty(
+		m.renderStagesPane(leftWidth, max(4, height-insightHeight)),
+		m.renderInsightsPane(leftWidth, insightHeight),
+	)
 	right := m.renderEventsPane(rightWidth, height)
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, separator, right)
 }
 
 func (m Model) renderStandard(width, height int) string {
-	stagesHeight := min(max(4, len(m.view.Stages)+3), max(4, height/3))
-	eventsHeight := max(2, height-stagesHeight-1)
+	eventsHeight := min(max(3, height/3), max(3, height-4))
+	insightHeight := 0
+	if len(m.view.Targets) > 0 || len(m.view.Health) > 0 {
+		insightHeight = min(max(2, len(m.view.Targets)/2+len(m.view.Health)+2), max(2, (height-eventsHeight)/2))
+	}
+	stagesHeight := max(2, height-eventsHeight-insightHeight-1)
 	stages := m.renderStagesPane(width, stagesHeight)
+	insights := m.renderInsightsPane(width, insightHeight)
 	rule := m.rule(width)
 	events := m.renderEventsPane(width, eventsHeight)
-	return joinNonEmpty(stages, rule, events)
+	return joinNonEmpty(stages, insights, rule, events)
 }
 
 func (m Model) renderStagesPane(width, height int) string {
@@ -137,6 +150,43 @@ func (m Model) renderStagesPane(width, height int) string {
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }
 
+func (m Model) renderInsightsPane(width, height int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := []string{m.dim().Render("TARGETS")}
+	for _, target := range m.view.Targets {
+		symbol := m.glyphs.stage(target.Status)
+		label := target.Role.String()
+		if target.Label != "" && target.Label != string(target.Role) {
+			label = target.Label
+		}
+		line := fmt.Sprintf("%s %-22s %s", symbol, truncate(label, 22), target.Status)
+		lines = append(lines, m.stateStyle(stageState(target.Status)).Render(line))
+	}
+	if len(m.view.Health) > 0 {
+		lines = append(lines, "", m.dim().Render("HEALTH OBSERVATIONS"))
+		for _, observation := range m.view.Health {
+			state := "passed"
+			style := m.okStyle()
+			if !observation.Passed {
+				state, style = "failed", m.risk()
+			}
+			probes := "checks not reported"
+			if observation.Checks > 0 {
+				probes = fmt.Sprintf("%d probe(s)", observation.Checks)
+			}
+			detail := observation.Detail
+			if detail == "" {
+				detail = "no detail"
+			}
+			line := fmt.Sprintf("%s %s · %s · %s", state, probes, detail, observation.At.UTC().Format("15:04:05"))
+			lines = append(lines, style.Render(truncate(line, width)))
+		}
+	}
+	return fitLines(strings.Join(lines, "\n"), width, height)
+}
+
 func (m Model) renderEventsPane(width, height int) string {
 	if m.showHelp {
 		helpModel := m.help
@@ -154,11 +204,17 @@ func (m Model) renderEventsPane(width, height int) string {
 	if total := len(m.view.EventLines); total > 0 {
 		label += fmt.Sprintf(" · %d shown · %d observed", total, m.view.EventCount)
 	}
+	if len(m.view.BuildLog) > 0 {
+		label += fmt.Sprintf(" · build log %d", len(m.view.BuildLog))
+	}
 	if m.view.Gap {
 		label += " · sequence gap"
 	}
 	m.events.SetWidth(max(1, width))
 	m.events.SetHeight(max(1, height-1))
+	if !m.paused {
+		m.events.GotoBottom()
+	}
 	content := m.events.View()
 	return fitLines(m.dim().Render(label)+"\n"+content, width, height)
 }
@@ -213,6 +269,19 @@ func (m Model) renderCompact(width, height int) string {
 	} else if len(m.view.Stages) > 0 {
 		completed, _, _ := m.view.StageCounts()
 		lines = append(lines, m.dim().Render(fmt.Sprintf("%d stages observed · %d completed", len(m.view.Stages), completed)))
+	}
+	lines = append(lines, m.dim().Render(viewer.DefaultClean(m.view.ServingLine())))
+	if len(m.view.Health) > 0 {
+		last := m.view.Health[len(m.view.Health)-1]
+		state := "health passed"
+		if !last.Passed {
+			state = "health failed"
+		}
+		probes := ""
+		if last.Checks > 0 {
+			probes = fmt.Sprintf(" · %d probe(s)", last.Checks)
+		}
+		lines = append(lines, m.dim().Render(state+probes))
 	}
 	if len(m.view.EventLines) > 0 {
 		last := m.view.EventLines[len(m.view.EventLines)-1]
@@ -279,4 +348,25 @@ func fitLines(text string, width, height int) string {
 		lines = append(lines, "")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func truncate(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lipgloss.Width(text) <= width {
+		return text
+	}
+	if width <= 3 {
+		return strings.Repeat(".", width)
+	}
+	target := width - 3
+	var out strings.Builder
+	for _, r := range text {
+		if lipgloss.Width(out.String()+string(r)) > target {
+			break
+		}
+		out.WriteRune(r)
+	}
+	return out.String() + "..."
 }

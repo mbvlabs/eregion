@@ -166,6 +166,294 @@ func mustDecode(t *testing.T, tab Tab, raw string) []Item {
 
 func render(m Model) string { return m.render() }
 
+const resourcesJSON = `{"collection":"resources","items":[{"spec":{"name":"db","engine":"postgresql","version":"17","host":"app-01","address":"127.0.0.1","port":5432,"database":"api","username":"api"},"state":"ready","endpoint":{"node":"app-01","address":"127.0.0.1","port":5432,"database":"api","username":"api","sslmode":"disable"},"credential":{"username":"api","database":"api","password_file":"/run/secrets/db","mode":"0600"},"health":{"status":"healthy","detail":"select 1","checked_at":"2026-10-20T09:59:55Z"}}]}`
+
+const backupsJSON = `{"collection":"backups","items":[{"archive":"/var/backups/app/db-20261020.dump","manifest":"/var/backups/app/db-20261020.json","resource":"db","host":"app-01","database":"api","effect_id":"op:backup:1","size_bytes":4096,"sha256":"abc123","created_at":"2026-10-20T09:00:00Z","reason":"manual","verified":true,"verified_at":"2026-10-20T09:01:00Z"}]}`
+
+const releasesJSON = `{"collection":"releases","items":[{"id":"` + testReleaseID + `","app":"api","environment":"production","image":"ghcr.io/acme/api:2026-10-20","image_id":"sha256:abc","source":{"type":"image","image":"ghcr.io/acme/api:2026-10-20"},"status":"ready","created_at":"2026-10-20T09:00:00Z"}]}`
+
+const deploymentsJSON = `{"collection":"deployments","items":[{"id":"dep_00000000000000000000000000000001","operation_id":"` + testOperationID + `","app":"api","environment":"production","action":"deploy","release_id":"` + testReleaseID + `","previous_release_id":"rel_00000000000000000000000000000002","state":"succeeded","message":"Serving release ` + testReleaseID + ` passed health verification.","created_at":"2026-10-20T09:00:00Z","updated_at":"2026-10-20T09:05:00Z"}]}`
+
+func TestParseTabCoversEveryWorkspace(t *testing.T) {
+	values := map[string]Tab{
+		"fleet": Fleet, "apps": Apps, "envs": Envs, "releases": Releases,
+		"deployments": Deployments, "resources": Resources, "backups": Backups,
+	}
+	for value, want := range values {
+		got, err := ParseTab(value)
+		if err != nil || got != want || got.Collection() == "" {
+			t.Fatalf("ParseTab(%q) = %v, %v", value, got, err)
+		}
+	}
+	if _, err := ParseTab("telemetry"); err == nil {
+		t.Fatal("accepted an unknown tab")
+	}
+}
+
+func TestFleetRoleHealthFreshnessAndFocusedDetails(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
+		return json.RawMessage(nodesJSON), nil
+	}
+	m = load(t, m, nodesJSON)
+	m.width, m.height = 120, 24
+	view := render(m)
+	for _, want := range []string{"SERVER", "ROLE", "HEALTH", "OBSERVED", "application, builder", "10s ago", "focus: main"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in fleet view:\n%s", want, view)
+		}
+	}
+	if !strings.Contains(view, "unreachable") {
+		t.Fatalf("unreachable node lost its health:\n%s", view)
+	}
+}
+
+func TestReleasesAndDeploymentsTabs(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
+		switch collection {
+		case "releases":
+			return json.RawMessage(releasesJSON), nil
+		case "deployments":
+			return json.RawMessage(deploymentsJSON), nil
+		default:
+			return json.RawMessage(`{"collection":"` + collection + `","items":[]}`), nil
+		}
+	}
+	next, command := stepCmd(t, m, press('4'))
+	m = applyCommand(t, next, command)
+	view := render(m)
+	for _, want := range []string{"Releases", testReleaseID, "ghcr.io/acme/api", "ready"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in releases:\n%s", want, view)
+		}
+	}
+	next, command = stepCmd(t, m, press('5'))
+	m = applyCommand(t, next, command)
+	view = render(m)
+	for _, want := range []string{"Deployments", testOperationID, "succeeded", "deploy"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in deployments:\n%s", want, view)
+		}
+	}
+}
+
+func TestResourceAndBackupViews(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
+		switch collection {
+		case "resources":
+			return json.RawMessage(resourcesJSON), nil
+		case "backups":
+			return json.RawMessage(backupsJSON), nil
+		default:
+			return json.RawMessage(`{"collection":"` + collection + `","items":[]}`), nil
+		}
+	}
+	next, command := stepCmd(t, m, press('6'))
+	m = applyCommand(t, next, command)
+	view := render(m)
+	for _, want := range []string{"db", "app-01", "healthy"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in resources:\n%s", want, view)
+		}
+	}
+	next, command = stepCmd(t, m, press('7'))
+	m = applyCommand(t, next, command)
+	view = render(m)
+	for _, want := range []string{"db-20261020.dump", "app-01", "verified"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in backups:\n%s", want, view)
+		}
+	}
+	m = step(t, m, special(tea.KeyEnter))
+	view = render(m)
+	for _, want := range []string{"/var/backups/app/db-20261020.dump", "abc123", "verified"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in backup details:\n%s", want, view)
+		}
+	}
+}
+
+func TestResourceDestroyConfirmationIsBoundToPreview(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
+		return json.RawMessage(resourcesJSON), nil
+	}
+	next, command := stepCmd(t, m, press('6'))
+	m = applyCommand(t, next, command)
+	m = load(t, m, resourcesJSON)
+	m = step(t, m, press('x'))
+	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
+		if !dryRun || kind != "platform.resource.destroy" || target != "node/app-01" {
+			t.Fatalf("wrong destroy plan: %s %s dry=%t", kind, target, dryRun)
+		}
+		if !strings.Contains(string(input), `"confirmation":"db"`) || strings.Contains(string(input), `"remove_volume":true`) {
+			t.Fatalf("destroy input is not bound: %s", input)
+		}
+		return json.RawMessage(previewJSON(kind, target)), nil
+	}
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view := render(m)
+	previewInput := append(json.RawMessage(nil), api.submits[len(api.submits)-1].input...)
+	for _, want := range []string{"Type db to confirm", "plan binding:", "DRY-RUN PREVIEW"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in destructive preview:\n%s", want, view)
+		}
+	}
+	before := len(api.submits)
+	m = step(t, m, special(tea.KeyEnter))
+	if len(api.submits) != before {
+		t.Fatal("destroy submitted without the typed confirmation")
+	}
+	m = typeText(m, "db")
+	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, key string, dryRun bool) (json.RawMessage, error) {
+		if dryRun || kind != "platform.resource.destroy" || target != "node/app-01" || key != "ui:test-key" {
+			t.Fatalf("unexpected destroy submission: %s %s %q dry=%t", kind, target, key, dryRun)
+		}
+		if string(input) != string(previewInput) {
+			t.Fatalf("submitted input differs from the previewed plan:\n%s\n%s", input, previewInput)
+		}
+		return operationFor(kind, target), nil
+	}
+	next, command = stepCmd(t, m, press('s'))
+	m = applyCommand(t, next, command)
+	if !strings.Contains(render(m), "ACCEPTED") {
+		t.Fatalf("destroy was not submitted:\n%s", render(m))
+	}
+}
+
+func TestBackupRestoreUsesResourceSpecAndConfirmation(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
+		switch collection {
+		case "resources":
+			return json.RawMessage(resourcesJSON), nil
+		case "backups":
+			return json.RawMessage(backupsJSON), nil
+		default:
+			return json.RawMessage(`{"collection":"` + collection + `","items":[]}`), nil
+		}
+	}
+	next, command := stepCmd(t, m, press('6'))
+	m = applyCommand(t, next, command)
+	m = load(t, m, resourcesJSON)
+	next, command = stepCmd(t, m, press('7'))
+	m = applyCommand(t, next, command)
+	m = load(t, m, backupsJSON)
+	m = step(t, m, press('R'))
+	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
+		if !dryRun || kind != "platform.backup.restore" || target != "node/app-01" {
+			t.Fatalf("wrong restore plan: %s %s dry=%t", kind, target, dryRun)
+		}
+		for _, want := range []string{`"name":"db"`, `"archive":"/var/backups/app/db-20261020.dump"`, `"confirmation":"db"`} {
+			if !strings.Contains(string(input), want) {
+				t.Fatalf("restore input missing %s: %s", want, input)
+			}
+		}
+		return json.RawMessage(previewJSON(kind, target)), nil
+	}
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view := render(m)
+	for _, want := range []string{"Type db to confirm", "plan binding:"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in restore preview:\n%s", want, view)
+		}
+	}
+}
+
+func TestCommandPaletteListsExactCLIEquivalents(t *testing.T) {
+	m, _, _ := testArgs(t)
+	m.width, m.height = 120, 60
+	m = step(t, m, press(':'))
+	view := render(m)
+	for _, want := range []string{"COMMAND DISCOVERY", "Create application", "backup", "eregion platform apps create", "eregion platform submit --kind platform.resource.destroy", "exact noninteractive CLI equivalent"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in palette:\n%s", want, view)
+		}
+	}
+	m = typeText(m, "backup")
+	view = render(m)
+	if !strings.Contains(view, "backup") || strings.Contains(view, "Create application") {
+		t.Fatalf("palette filter did not narrow actions:\n%s", view)
+	}
+	m = step(t, m, special(tea.KeyEsc))
+	if render(m) == view {
+		t.Fatal("palette did not close")
+	}
+}
+
+func TestMetricsUnavailableAndAvailable(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
+		return json.RawMessage(nodesJSON), nil
+	}
+	m = load(t, m, nodesJSON)
+	next, command := stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	if !strings.Contains(render(m), "no telemetry node is configured") {
+		t.Fatalf("missing honest no-telemetry state:\n%s", render(m))
+	}
+
+	source := &fakeMetrics{series: MetricsSeries{
+		Source: "telemetry-01", Metric: "node.cpu.utilization", Unit: "%", Window: 5 * time.Minute,
+		ObservedAt: time.Date(2026, 10, 20, 9, 59, 58, 0, time.UTC),
+		Samples: []MetricsSample{
+			{At: time.Date(2026, 10, 20, 9, 59, 50, 0, time.UTC), Value: 12},
+			{At: time.Date(2026, 10, 20, 9, 59, 55, 0, time.UTC), Value: 18},
+			{At: time.Date(2026, 10, 20, 9, 59, 58, 0, time.UTC), Value: 15},
+		},
+	}}
+	m.opts.Metrics = source
+	m = step(t, m, special(tea.KeyEsc))
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view := render(m)
+	for _, want := range []string{"telemetry-01", "node.cpu.utilization", "5m window", "3 samples", "last sample 2s ago"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in metric detail:\n%s", want, view)
+		}
+	}
+	if !strings.ContainsAny(view, "▁▂▃▄▅▆▇█.:-=+*#@") {
+		t.Fatalf("metric detail did not draw measured samples:\n%s", view)
+	}
+	if len(source.queries) != 1 || source.queries[0].Node != "main" {
+		t.Fatalf("metric query = %+v", source.queries)
+	}
+
+	source.series = MetricsSeries{Source: "telemetry-01", Metric: "node.cpu.utilization", Unit: "%", Window: 5 * time.Minute}
+	m = step(t, m, special(tea.KeyEsc))
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	if !strings.Contains(render(m), "returned no samples") {
+		t.Fatalf("missing honest no-data state:\n%s", render(m))
+	}
+}
+
+type fakeMetrics struct {
+	series  MetricsSeries
+	err     error
+	queries []MetricsQuery
+}
+
+func (f *fakeMetrics) Query(_ context.Context, query MetricsQuery) (MetricsSeries, error) {
+	f.queries = append(f.queries, query)
+	if f.err != nil {
+		return MetricsSeries{}, f.err
+	}
+	return f.series, nil
+}
+
+func operationFor(kind, target string) json.RawMessage {
+	var operation contract.Operation
+	_ = json.Unmarshal([]byte(operationJSON("queued")), &operation)
+	operation.Kind, operation.Target = kind, target
+	raw, _ := json.Marshal(operation)
+	return raw
+}
+
 const nodesJSON = `{"collection":"nodes","items":[
  {"name":"main","roles":["application","builder"],"capabilities":["docker","buildpacks"],"address":"10.77.0.1:22","status":"ready","last_seen_at":"2026-10-20T09:59:50Z","created_at":"2026-10-19T10:00:00Z","updated_at":"2026-10-20T09:59:50Z"},
  {"name":"builder-2","roles":["builder"],"capabilities":["buildpacks"],"address":"10.77.0.2:22","status":"unreachable","created_at":"2026-10-19T10:00:00Z","updated_at":"2026-10-20T09:00:00Z"}
@@ -448,7 +736,7 @@ func TestResourceInventoryUnavailableIsHonest(t *testing.T) {
 	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
 		return nil, contract.NewFault(contract.ValidationFailed, "unknown collection", "register a provider")
 	}
-	next, command := stepCmd(t, m, press('4'))
+	next, command := stepCmd(t, m, press('6'))
 	m = applyCommand(t, next, command)
 	view := render(m)
 	for _, want := range []string{"Resources inventory is not available", "No rows are invented", "r to retry"} {
@@ -489,8 +777,8 @@ func TestHostileTextIsSanitizedAndSecretRedacted(t *testing.T) {
 }
 
 func TestGenericResourceSecretFieldsAreRedacted(t *testing.T) {
-	raw := `{"collection":"resources","items":[{"id":"res_1","name":"db","status":"running","password":"hunter2","connection":{"token":"abc","host":"db.internal"}}]}`
-	items, err := decodeInventory(Resources, json.RawMessage(raw), func(text string) string { return Sanitize(nil, text) })
+	raw := `[{"id":"res_1","name":"db","status":"running","password":"hunter2","connection":{"token":"abc","host":"db.internal"}}]`
+	items, err := decodeGeneric(json.RawMessage(raw), func(text string) string { return Sanitize(nil, text) })
 	if err != nil {
 		t.Fatal(err)
 	}

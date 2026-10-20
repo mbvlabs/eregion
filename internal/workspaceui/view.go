@@ -3,6 +3,7 @@ package workspaceui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -52,6 +53,9 @@ func (m Model) render() string {
 	}
 	if m.op != nil {
 		return fitLines(m.renderOperation(width, height), width, height)
+	}
+	if m.paletteOpen {
+		return fitLines(m.renderPalette(width, height), width, height)
 	}
 	if m.showHelp {
 		return fitLines(m.renderHelp(width, height), width, height)
@@ -196,21 +200,104 @@ func (m Model) renderBody(width, height int) string {
 	capacity := height
 	if width >= 56 && height >= 8 {
 		header := fmt.Sprintf("%-*s %s", max(10, width-20), "NAME", "STATUS")
+		if m.tab == Fleet {
+			header = fleetHeader(width)
+		}
 		lines = append(lines, m.dim().Render(truncate(header, width)))
 		capacity--
 	}
+	if m.tab == Fleet && width >= 72 {
+		capacity = max(1, capacity-1)
+	}
 	selected := m.selected[m.tab]
 	start := windowStart(selected, len(items), capacity)
-	for index := start; index < len(items) && len(lines) < height; index++ {
+	for index := start; index < len(items) && len(lines) < capacity; index++ {
 		lines = append(lines, m.rowLine(items[index], index == selected, width))
 	}
-	if len(items) > capacity {
+	if m.tab == Fleet && width >= 72 {
+		if item, ok := m.selectedItem(); ok && len(lines) < height {
+			lines = append(lines, m.fleetFocusLine(item, width))
+		}
+	}
+	if len(items) > capacity && len(lines) < height {
 		lines = append(lines, m.dim().Render(fmt.Sprintf("%d–%d of %d · j/k to move", start+1, min(len(items), start+capacity), len(items))))
+	}
+	if m.notice != "" && len(lines) < height {
+		lines = append(lines, m.warnStyle().Render(truncate(m.clean(m.notice), width)))
 	}
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }
 
+func fleetHeader(width int) string {
+	roleWidth, healthWidth, observedWidth := 20, 14, 16
+	nameWidth := max(8, width-roleWidth-healthWidth-observedWidth-6)
+	return fmt.Sprintf("%-*s %-*s %-*s %-*s", nameWidth, "SERVER", roleWidth, "ROLE", healthWidth, "HEALTH", observedWidth, "OBSERVED")
+}
+
+// fleetRow shows role, explicit health, and the age of the last server
+// observation. A node with no observation says "never", not "0s".
+func (m Model) fleetRow(item Item, selected bool, width int) string {
+	role := item.Data["roles"]
+	if role == "" {
+		role = item.Data["role"]
+	}
+	role = strings.ReplaceAll(role, ",", ", ")
+	observed := m.observationAge(item)
+	if width < 72 {
+		line := m.rowLineGeneric(item, selected, width)
+		return line
+	}
+	roleWidth, healthWidth, observedWidth := 20, 14, 16
+	nameWidth := max(8, width-roleWidth-healthWidth-observedWidth-6)
+	prefix := "  "
+	titleStyle := m.boldStyle()
+	if selected {
+		prefix, titleStyle = "> ", m.selStyle()
+	}
+	name := truncate(item.Title, nameWidth)
+	health := truncate(item.Status, healthWidth)
+	roleText := truncate(role, roleWidth)
+	line := prefix + titleStyle.Render(fmt.Sprintf("%-*s", nameWidth, name))
+	line += " " + m.dim().Render(fmt.Sprintf("%-*s", roleWidth, roleText))
+	line += " " + m.statusStyle(item.Status).Render(fmt.Sprintf("%-*s", healthWidth, health))
+	line += " " + m.dim().Render(fmt.Sprintf("%-*s", observedWidth, observed))
+	return truncate(line, width)
+}
+
+func (m Model) fleetFocusLine(item Item, width int) string {
+	role := strings.ReplaceAll(item.Data["roles"], ",", ", ")
+	address := item.Data["address"]
+	if address == "" {
+		address = "address not reported"
+	}
+	line := fmt.Sprintf("focus: %s · role %s · health %s · observed %s · %s", item.Title, role, item.Status, m.observationAge(item), address)
+	return m.dim().Render(truncate(m.clean(line), width))
+}
+
+func (m Model) observationAge(item Item) string {
+	value := item.Data["last_seen_at"]
+	if value == "" {
+		return "never observed"
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return "observation time invalid"
+	}
+	age := m.now.Sub(parsed)
+	if age < 0 {
+		age = 0
+	}
+	return shortDuration(age) + " ago"
+}
+
 func (m Model) rowLine(item Item, selected bool, width int) string {
+	if m.tab == Fleet {
+		return m.fleetRow(item, selected, width)
+	}
+	return m.rowLineGeneric(item, selected, width)
+}
+
+func (m Model) rowLineGeneric(item Item, selected bool, width int) string {
 	prefix := "  "
 	titleStyle := m.boldStyle()
 	if selected {
@@ -285,6 +372,12 @@ func (m Model) renderEmpty(width, height int) string {
 		case Envs:
 			title = "No environments yet"
 			hint = "Press e to create an environment after an application exists."
+		case Releases:
+			title = "No releases reported"
+			hint = "Press i to create an image release for an environment."
+		case Deployments:
+			title = "No deployments reported"
+			hint = "Press d to deploy a ready release, or o to plan a rollback."
 		case Resources:
 			title = "No resources reported"
 			hint = "No resources inventory rows were returned by this control plane."
@@ -311,6 +404,11 @@ func (m Model) renderDetail(width, height int) string {
 		lines = append(lines, m.statusStyle(item.Status).Render(item.Status))
 	}
 	lines = append(lines, "")
+	if m.tab == Fleet || m.tab == Envs {
+		lines = append(lines, m.boldStyle().Render("GRAPH"))
+		lines = append(lines, m.metricsText(max(8, width-2))...)
+		lines = append(lines, "")
+	}
 	available := max(1, height-len(lines)-2)
 	_ = available
 	scroll := min(m.detailScroll, max(0, len(item.Details)-1))
@@ -331,8 +429,8 @@ func (m Model) renderDetail(width, height int) string {
 			break
 		}
 	}
-	if m.tab == Envs || m.tab == Resources || m.tab == Backups {
-		lines = append(lines, "", m.dim().Render("Telemetry: no provider configured; no graph is shown."))
+	if m.tab == Resources || m.tab == Backups {
+		lines = append(lines, "", m.dim().Render("Telemetry: no telemetry node is configured; no graph is shown."))
 	}
 	lines = append(lines, m.dim().Render("j/k scroll · r refresh · esc back · q detach"))
 	return fitLines(strings.Join(lines, "\n"), width, height)
@@ -348,9 +446,12 @@ func (m Model) renderFooter(width int) string {
 	if m.filterText != "" {
 		status += m.glyphSeparator() + m.infoStyle().Render("filter: "+m.clean(m.filterText))
 	}
-	hints := "r refresh · / filter · enter details · a/e/i/d forms · ? help · q detach"
+	if m.notice != "" {
+		status += m.glyphSeparator() + m.warnStyle().Render(m.clean(m.notice))
+	}
+	hints := "r refresh · / filter · : commands · enter details · ? help · q detach"
 	if width < 72 {
-		hints = "r / enter a e i d ? q"
+		hints = "r / : enter ? q"
 	}
 	helpModel := m.help
 	helpModel.SetWidth(max(1, width))
@@ -375,7 +476,57 @@ func (m Model) renderCompact(width, height int) string {
 			lines = append(lines, m.statusStyle(item.Status).Render(truncate(item.Status, width)))
 		}
 	}
-	lines = append(lines, m.dim().Render(truncate("? help · q detach", width)))
+	if m.notice != "" {
+		lines = append(lines, m.warnStyle().Render(truncate(m.clean(m.notice), width)))
+	}
+	lines = append(lines, m.dim().Render(truncate("? help · : commands · q detach", width)))
+	return fitLines(strings.Join(lines, "\n"), width, height)
+}
+
+func (m Model) renderPalette(width, height int) string {
+	actions := m.visibleActions()
+	lines := []string{
+		m.boldStyle().Render("COMMAND DISCOVERY"),
+		m.dim().Render("Every action lists its exact noninteractive CLI equivalent. Enter opens the guided form; esc closes."),
+	}
+	if m.paletteFilter.Value() != "" {
+		lines = append(lines, m.infoStyle().Render("/"+m.clean(m.paletteFilter.Value())))
+	} else {
+		lines = append(lines, m.dim().Render("type to filter actions"))
+	}
+	lines = append(lines, "")
+	if len(actions) == 0 {
+		lines = append(lines, m.dim().Render("No actions match this filter."))
+	}
+	capacity := max(1, height-len(lines)-2)
+	start := windowStart(m.paletteIndex, len(actions), capacity)
+	for index := start; index < len(actions) && len(lines) < height-2; index++ {
+		action := actions[index]
+		cursor := "  "
+		style := m.boldStyle()
+		if index == m.paletteIndex {
+			cursor, style = "> ", m.selStyle()
+		}
+		keys := action.Keys
+		if keys == "" {
+			keys = "-"
+		}
+		label := fmt.Sprintf("%s%-28s %-3s %s", cursor, action.Name, keys, action.ID)
+		if action.Destructive {
+			label += " · destructive"
+		}
+		lines = append(lines, style.Render(truncate(label, width)))
+		for _, line := range wrapText("cli: "+action.CLI, max(8, width-4)) {
+			if len(lines) >= height-2 {
+				break
+			}
+			lines = append(lines, "    "+m.dim().Render(truncate(line, max(8, width-4))))
+		}
+	}
+	if len(actions) > capacity {
+		lines = append(lines, m.dim().Render(fmt.Sprintf("%d–%d of %d", start+1, min(len(actions), start+capacity), len(actions))))
+	}
+	lines = append(lines, m.dim().Render("j/k move · type filter · enter open · esc close"))
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }
 
@@ -390,13 +541,16 @@ func (m Model) renderHelp(width, height int) string {
 		helpModel.View(m.keys),
 		"",
 		m.boldStyle().Render("Workspaces"),
-		m.dim().Render("1 fleet · 2 apps · 3 envs · 4 resources · 5 backups · tab cycles"),
+		m.dim().Render("1 fleet · 2 apps · 3 envs · 4 releases · 5 deployments · 6 resources · 7 backups · tab cycles"),
 		m.boldStyle().Render("Guided forms"),
-		m.dim().Render("a application · e environment · i image release · d deploy"),
+		m.dim().Render("a application · e environment · i image release · d deploy · o rollback · n node check"),
+		m.dim().Render("x destroy resource · b backup · v verify backup · R restore backup"),
 		m.dim().Render("enter next field · tab next · s submit after preview · e edit preview · esc cancel"),
+		m.boldStyle().Render("Discovery"),
+		m.dim().Render(": command palette shows every action with its exact noninteractive CLI equivalent."),
 		m.boldStyle().Render("Safety"),
-		m.dim().Render("Deploys require typing the environment name. A detached UI never cancels an operation."),
-		m.dim().Render("No telemetry provider is configured, so no graph is drawn."),
+		m.dim().Render("Deploys, rollbacks, resource destruction, and restores require typing the target name; submission is bound to the previewed plan. A detached UI never cancels an operation."),
+		m.dim().Render("No telemetry node is configured by default, so no graph is drawn. Operations do not need telemetry."),
 	}
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }
@@ -413,6 +567,9 @@ func (m Model) renderForm(width, height int) string {
 	lines = append(lines, "")
 	if form.errText != "" {
 		lines = append(lines, m.riskStyle().Render("error: "+m.clean(form.errText)), "")
+		if form.failed && form.preview != nil {
+			lines = append(lines, m.warnStyle().Render("Retry with the same key: "+form.key+". Do not start a new form after a timed-out submission."), "")
+		}
 	}
 	switch form.phase {
 	case formResult:
@@ -429,11 +586,6 @@ func (m Model) renderForm(width, height int) string {
 		lines = append(lines, m.dim().Render("No operation, domain row, or job is created by a dry run."))
 	default:
 		lines = append(lines, m.renderFormFields(form, width))
-	}
-	if form.errText != "" {
-		if form.failed && form.preview != nil {
-			lines = append(lines, m.warnStyle().Render("Retry with the same key: "+form.key+". Do not start a new form after a timed-out submission."))
-		}
 	}
 	lines = append(lines, "", m.dim().Render(m.formHint(form)))
 	return fitLines(strings.Join(lines, "\n"), width, height)
@@ -497,6 +649,16 @@ func (m Model) renderPreview(form *formState, width int) string {
 		lines = append(lines, m.boldStyle().Render(value))
 	}
 	lines = append(lines, "", m.dim().Render("idempotency key: "+form.key))
+	if form.planToken != "" {
+		token := form.planToken
+		if len(token) > 16 {
+			token = token[:16]
+		}
+		lines = append(lines, m.dim().Render("plan binding: "+token+" · submission is bound to this previewed input"))
+	}
+	if form.approved != nil && form.approved.ConfirmPhrase != "" {
+		lines = append(lines, m.warnStyle().Render("Typed confirmation is bound to this dry-run plan; editing the form requires a new preview."))
+	}
 	if form.approved != nil {
 		lines = append(lines, "", m.boldStyle().Render("Noninteractive equivalent"))
 		for _, command := range strings.Split(form.approved.Noninteractive(), "\n") {

@@ -1,0 +1,33 @@
+COMMAND DISCOVERY
+Every action lists its exact noninteractive CLI equivalent. Enter opens the guided form; esc closes.
+/backup
+
+> Create resource backup       b   backup.create
+    cli: eregion platform submit --kind platform.backup.create --target node/<host> --input-file
+    action.json --idempotency-key <key> --json
+  Verify backup archive        v   backup.verify
+    cli: eregion platform submit --kind platform.backup.verify --target node/<host> --input-file
+    action.json --idempotency-key <key> --json
+  Restore verified backup      R   backup.restore · destructive
+    cli: eregion platform submit --kind platform.backup.restore --target node/<host> --input-file
+    action.json --idempotency-key <key> --json
+j/k move · type filter · enter open · esc close
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

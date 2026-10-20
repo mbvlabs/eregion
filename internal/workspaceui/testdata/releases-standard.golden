@@ -1,0 +1,24 @@
+eregion · 127.0.0.1:8080 · Releases
+fresh · 1 rows
+1 Fleet  2 Apps  3 Envs  [4 Releases]  5 Deployments  6 Resources  7 Backups
+NAME                                                         STATUS
+> api/production rel_00000000000000000000000000000001 ghcr.io/acme/api...  ready
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+fresh
+r refresh · / filter · : commands · enter details · ? help · q detach
