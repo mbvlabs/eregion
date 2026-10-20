@@ -695,6 +695,108 @@ func (d *dropOnceTransport) Call(ctx context.Context, request node.Request, onEv
 	return response, nil
 }
 
+type staleAttemptTransport struct {
+	inner node.Transport
+	pool  *pgxpool.Pool
+	id    contract.OperationID
+	once  sync.Once
+	mu    sync.Mutex
+	runs  int
+	err   error
+}
+
+func (s *staleAttemptTransport) Name() string { return "stale-attempt" }
+
+func (s *staleAttemptTransport) Call(ctx context.Context, request node.Request, onEvent func(node.Event)) (node.Response, error) {
+	if request.Method == node.MethodRun {
+		s.mu.Lock()
+		s.runs++
+		s.mu.Unlock()
+	}
+	if request.Method == node.MethodStatus {
+		s.once.Do(func() {
+			_, err := s.pool.Exec(ctx, `UPDATE eregion_operations SET attempt=attempt+1 WHERE id=$1`, s.id)
+			s.mu.Lock()
+			s.err = err
+			s.mu.Unlock()
+		})
+	}
+	return s.inner.Call(ctx, request, onEvent)
+}
+
+func (s *staleAttemptTransport) runCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runs
+}
+
+func (s *staleAttemptTransport) bumpError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func TestIntegrationStaleAttemptDoesNotDispatchNodeWork(t *testing.T) {
+	pool, _ := testPool(t, true)
+	nodeDir := t.TempDir()
+	run := testRuntime(t, pool, 0, nodeDir)
+	ctx := context.Background()
+	op, err := run.Service.Submit(ctx, submission("stale-attempt", `{"steps":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, claimed, err := run.Service.claimAttempt(ctx, op.ID, 1, "diagnostic"); err != nil || !claimed {
+		t.Fatalf("claim attempt: %v %v", claimed, err)
+	}
+	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &staleAttemptTransport{inner: local, pool: pool, id: op.ID}
+	run.Service.transport = transport
+	var before uint64
+	if err := pool.QueryRow(ctx, "SELECT last_sequence FROM eregion_operations WHERE id=$1", op.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	worker := &testWorker{service: run.Service}
+	err = worker.runStep(ctx, op.ID, 1, 1, operations.TestInput{Steps: 1})
+	if !errors.Is(err, errNotOwned) {
+		t.Fatalf("stale attempt returned %v, want not-owned", err)
+	}
+	if err := transport.bumpError(); err != nil {
+		t.Fatal(err)
+	}
+	if got := transport.runCount(); got != 0 {
+		t.Fatalf("stale attempt dispatched %d node runs", got)
+	}
+	var after uint64
+	if err := pool.QueryRow(ctx, "SELECT last_sequence FROM eregion_operations WHERE id=$1", op.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("stale attempt appended %d events", after-before)
+	}
+	// The worker maps not-owned to a wait, not an early job completion.
+	settled := make(chan error, 1)
+	go func() { settled <- worker.settleAttempt(ctx, op.ID, 1, err) }()
+	select {
+	case err := <-settled:
+		t.Fatalf("stale attempt returned before the newer attempt settled: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='failed' WHERE id=$1`, op.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-settled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stale attempt did not observe the terminal operation")
+	}
+}
+
 func TestIntegrationLostTransportResponseRecovers(t *testing.T) {
 	pool, _ := testPool(t, true)
 	nodeDir := t.TempDir()

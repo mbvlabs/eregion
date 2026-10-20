@@ -110,7 +110,10 @@ func (*testWorker) NextRetry(job *river.Job[testArgs]) time.Time {
 	return time.Now().Add(time.Duration(job.Attempt) * time.Second)
 }
 
-var errOperationTerminal = errors.New("operation is terminal")
+var (
+	errOperationTerminal = errors.New("operation is terminal")
+	errNotOwned          = errors.New("operation is owned by a newer attempt")
+)
 
 func (w *testWorker) Work(ctx context.Context, job *river.Job[testArgs]) error {
 	attempt := uint32(job.Attempt)
@@ -126,10 +129,10 @@ func (w *testWorker) Work(ctx context.Context, job *river.Job[testArgs]) error {
 		return err
 	}
 	if op.State == contract.Cancelling {
-		return w.reconcileCancellation(ctx, op.ID, attempt, input)
+		return w.settleAttempt(ctx, op.ID, attempt, w.reconcileCancellation(ctx, op.ID, attempt, input))
 	}
 	if job.Attempt <= input.FailUntilAttempt {
-		return w.injectedFailure(ctx, op.ID, attempt, job)
+		return w.settleAttempt(ctx, op.ID, attempt, w.injectedFailure(ctx, op.ID, attempt, job))
 	}
 	for index := 1; index <= input.Steps; index++ {
 		state, currentAttempt, err := w.service.operationState(ctx, op.ID)
@@ -143,25 +146,32 @@ func (w *testWorker) Work(ctx context.Context, job *river.Job[testArgs]) error {
 			return nil
 		}
 		if state == contract.Cancelling {
-			return w.reconcileCancellation(ctx, op.ID, attempt, input)
+			return w.settleAttempt(ctx, op.ID, attempt, w.reconcileCancellation(ctx, op.ID, attempt, input))
 		}
 		if err := w.runStep(ctx, op.ID, attempt, index, input); err != nil {
-			if errors.Is(err, errOperationTerminal) {
-				return nil
-			}
-			return err
+			return w.settleAttempt(ctx, op.ID, attempt, err)
 		}
 	}
-	if _, err := w.service.finishSucceeded(ctx, op.ID, attempt); err != nil {
-		return err
+	_, err = w.service.finishSucceeded(ctx, op.ID, attempt)
+	return w.settleAttempt(ctx, op.ID, attempt, err)
+}
+
+// settleAttempt completes terminal work and makes a lost ownership race wait for
+// the newer attempt. River's completion query is not attempt-fenced.
+func (w *testWorker) settleAttempt(ctx context.Context, id contract.OperationID, attempt uint32, err error) error {
+	if errors.Is(err, errOperationTerminal) {
+		return nil
 	}
-	return nil
+	if errors.Is(err, errNotOwned) {
+		return w.service.waitForNewerAttempt(ctx, id, attempt)
+	}
+	return err
 }
 
 func diagnosticStepID(index int) string { return node.DiagnosticStepID(index) }
 
 func (w *testWorker) injectedFailure(ctx context.Context, id contract.OperationID, attempt uint32, job *river.Job[testArgs]) error {
-	op, _, err := w.service.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+	op, owned, err := w.service.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, current *contract.Operation) error {
 		if current.State.Terminal() {
 			return nil
 		}
@@ -178,6 +188,9 @@ func (w *testWorker) injectedFailure(ctx context.Context, id contract.OperationI
 	})
 	if err != nil {
 		return err
+	}
+	if !owned {
+		return errNotOwned
 	}
 	if op.State.Terminal() {
 		return nil
@@ -398,7 +411,11 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 		status, statusErr := s.transport.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
 		if statusErr != nil {
 			if errors.Is(statusErr, engine.ErrJournalCorrupt) {
-				return s.failOperation(ctx, id, op.Attempt, "Node journal is corrupt; inspect it before retrying.")
+				err := s.failOperation(ctx, id, op.Attempt, "Node journal is corrupt; inspect it before retrying.")
+				if errors.Is(err, errNotOwned) {
+					return nil
+				}
+				return err
 			}
 			return unavailable(statusErr)
 		}
@@ -413,6 +430,9 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 		}
 		if status.Status == engine.StatusCompleted {
 			if _, err := s.ackStep(ctx, id, op.Attempt, record.Step, record.InputsHash, status.ExecutionID, status.Result, input.Steps); err != nil {
+				if errors.Is(err, errNotOwned) {
+					return nil
+				}
 				return err
 			}
 			continue
@@ -427,6 +447,9 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 	}
 	if completed == input.Steps {
 		_, err := s.finishSucceeded(ctx, id, op.Attempt)
+		if errors.Is(err, errNotOwned) {
+			return nil
+		}
 		return err
 	}
 	if live {
@@ -445,6 +468,9 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 	}
 	if op.State == contract.Cancelling {
 		_, err := s.finishCancelled(ctx, id, op.Attempt, input.Steps)
+		if errors.Is(err, errNotOwned) {
+			return nil
+		}
 		return err
 	}
 	_, err = s.mutate(ctx, id, func(tx pgx.Tx, current *contract.Operation) error {
