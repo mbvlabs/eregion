@@ -20,66 +20,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
-func TestRolePackagesMatchBuildAndConnectivityNeeds(t *testing.T) {
-	main := fixture(t, RoleMain)
-	mainRole, _ := main.RoleConfig()
-	mainPackages := (&packagesStep{cfg: main, role: mainRole}).packages()
-	for _, want := range []string{"git"} {
-		if !containsString(mainPackages, want) {
-			t.Fatalf("main role lacks %s: %v", want, mainPackages)
-		}
-	}
-	for _, unwanted := range []string{"docker-compose"} {
-		if containsString(mainPackages, unwanted) {
-			t.Fatalf("main role installed %s: %v", unwanted, mainPackages)
-		}
-	}
-	builder := fixture(t, RoleBuilder)
-	builderRole, _ := builder.RoleConfig()
-	builderPackages := (&packagesStep{cfg: builder, role: builderRole}).packages()
-	for _, want := range []string{"git", "wireguard-tools"} {
-		if !containsString(builderPackages, want) {
-			t.Fatalf("builder role lacks %s: %v", want, builderPackages)
-		}
-	}
-	telemetry := fixture(t, RoleTelemetry)
-	telemetryRole, err := telemetry.RoleConfig()
-	if err != nil || !telemetryRole.Telemetry || telemetryRole.ControlPlane || !telemetryRole.Runtime {
-		t.Fatalf("telemetry role: %+v %v", telemetryRole, err)
-	}
-	telemetryPackages := (&packagesStep{cfg: telemetry, role: telemetryRole}).packages()
-	for _, want := range []string{"docker.io", "docker-compose", "wireguard-tools"} {
-		if !containsString(telemetryPackages, want) {
-			t.Fatalf("telemetry role lacks %s: %v", want, telemetryPackages)
-		}
-	}
-	for _, step := range mustSteps(t, telemetry) {
-		switch step.ID() {
-		case "host-buildpacks-v1", "host-registry-v1", "host-database-v1", "host-api-service-v1", "host-worker-service-v1":
-			t.Fatalf("telemetry role must not run %s", step.ID())
-		}
-	}
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
-}
-
-func mustSteps(t *testing.T, cfg Config) []Step {
-	t.Helper()
-	runner := testRunner(t, cfg, newFakeExec())
-	steps, err := runner.steps(Credentials{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return steps
-}
-
 func TestStatusReadsStateAndJournalWithoutApplyInputs(t *testing.T) {
 	cfg := fixture(t, RoleMain)
 	// Status must not require these apply-only inputs.
@@ -239,7 +179,7 @@ func TestReconcileExpiredCommitWithoutWatchdog(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner := testRunner(t, cfg, newFakeExec())
+	runner := commitRunner(t, cfg)
 	if err := runner.reconcileCommits(operation); err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +386,7 @@ func TestWatchdogScriptHonorsMarkersAndDisarms(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(commitDir, "manifest.json"), raw, 0o600); err != nil {
 			t.Fatal(err)
 		}
-		runner := testRunner(t, cfg, newFakeExec())
+		runner := commitRunner(t, cfg)
 		if err := runner.rollbackCommit("op_watchdog"); err != nil {
 			t.Fatal(err)
 		}
@@ -465,4 +405,16 @@ func TestWatchdogScriptHonorsMarkersAndDisarms(t *testing.T) {
 			t.Fatalf("old watchdog overwrote newer configuration: %q", raw)
 		}
 	})
+}
+
+// commitRunner drives only the commit-confirm file journal; it runs no host
+// commands.
+func commitRunner(t *testing.T, cfg Config) *Runner {
+	t.Helper()
+	runner, err := NewConfirmRunner(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.Now = func() time.Time { return time.Unix(1800000000, 0) }
+	return runner
 }

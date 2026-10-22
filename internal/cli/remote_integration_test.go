@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -167,99 +166,5 @@ func TestRemoteBootstrapPlanOverPinnedSSH(t *testing.T) {
 	}
 	if secondPlan.ConfigHash != plan.ConfigHash || secondPlan.Generation != plan.Generation || secondPlan.OperationID != plan.OperationID {
 		t.Fatalf("remote re-run did not resume: first=%+v second=%+v", plan, secondPlan)
-	}
-}
-
-// TestRemoteBootstrapApplyOverPinnedSSH runs the real root-only apply path
-// against the disposable SSH fixture with fake host tools. It skips without
-// Docker. It proves bundle stability, the CLI/remote handoff, the journal, and
-// an idempotent re-apply; it does not prove package installation, systemd, or a
-// fresh-host VM.
-func TestRemoteBootstrapApplyOverPinnedSSH(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	fixture, err := sshfixture.Start(ctx, sshfixture.Options{
-		Image: "eregion-ssh-fixture-bootstrap2", Root: true, NodeName: "fixture",
-		Files: map[string]string{
-			// Installed package/daemon stand-ins: the fixture has no systemd and
-			// no package network. They exercise the real Check scripts.
-			"/usr/local/bin/dpkg-query": "#!/bin/sh\nprintf 'ii '\n",
-			"/usr/local/bin/systemctl":  "#!/bin/sh\ncase \"$1\" in is-enabled) echo enabled ;; is-active) echo active ;; esac\nexit 0\n",
-			"/usr/local/bin/docker":     "#!/bin/sh\nexit 0\n",
-		},
-	})
-	if err != nil {
-		if errors.Is(err, sshfixture.ErrUnavailable) {
-			t.Skipf("the SSH fixture is unavailable: %v", err)
-		}
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = fixture.Close(context.Background()) })
-
-	cliBinary, nodeBinary := buildRemoteBinaries(t, ctx)
-	nodeRaw, err := os.ReadFile(nodeBinary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.InstallFile(ctx, "/usr/local/bin/eregion-node", string(nodeRaw)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.Exec(ctx, "groupadd docker 2>/dev/null || true"); err != nil {
-		t.Fatal(err)
-	}
-	// Match the desired node configuration byte-for-byte so this test does not
-	// arm an unrelated access-change rollback window.
-	nodeConfig := "{\n  \"node\": \"fixture\",\n  \"state_dir\": \"/var/lib/eregion/node\"\n}\n"
-	if _, err := fixture.Exec(ctx, "printf '%s' "+shellPath(nodeConfig)+" > /etc/eregion/node.json && chmod 600 /etc/eregion/node.json"); err != nil {
-		t.Fatal(err)
-	}
-
-	base := []string{
-		"bootstrap", "remote",
-		"--ssh-address", fixture.Address,
-		"--ssh-user", "root",
-		"--ssh-identity", fixture.IdentityFile,
-		"--ssh-known-hosts", fixture.KnownHostsFile,
-		"--role", "application", "--node", "fixture",
-		"--binary", cliBinary, "--node-binary", nodeBinary,
-	}
-	dry := append(append([]string(nil), base...), "--dry-run", "--json")
-	firstPlan := decodeRemoteData[host.Plan](t, runRemoteCLI(t, ctx, cliBinary, dry...))
-	secondPlan := decodeRemoteData[host.Plan](t, runRemoteCLI(t, ctx, cliBinary, dry...))
-	if firstPlan.ConfigHash != secondPlan.ConfigHash || firstPlan.OperationID != secondPlan.OperationID || firstPlan.Generation != secondPlan.Generation {
-		t.Fatalf("dry-runs did not resume: %+v %+v", firstPlan, secondPlan)
-	}
-
-	apply := append(append([]string(nil), base...), "--apply", "--json")
-	report := decodeRemoteData[host.ApplyReport](t, runRemoteCLI(t, ctx, cliBinary, apply...))
-	if report.OperationID != firstPlan.OperationID || report.Generation != firstPlan.Generation {
-		t.Fatalf("apply did not use the planned generation: plan=%+v report=%+v", firstPlan, report)
-	}
-	if len(report.Steps) == 0 {
-		t.Fatal("apply reported no steps")
-	}
-	executed := 0
-	for _, step := range report.Steps {
-		if !step.Complete {
-			t.Fatalf("step did not complete: %+v", step)
-		}
-		if step.Executed {
-			executed++
-		}
-	}
-	if executed == 0 {
-		t.Fatal("the first apply executed no step")
-	}
-
-	// A completed re-apply is the next generation, but every effect is
-	// acknowledged from the journal instead of repeated.
-	reapply := decodeRemoteData[host.ApplyReport](t, runRemoteCLI(t, ctx, cliBinary, apply...))
-	if reapply.Generation != report.Generation+1 {
-		t.Fatalf("re-apply generation: first=%d second=%d", report.Generation, reapply.Generation)
-	}
-	for _, step := range reapply.Steps {
-		if step.Executed {
-			t.Fatalf("re-apply repeated %s", step.ID)
-		}
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,7 +19,6 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
@@ -34,8 +32,8 @@ func put(t *testing.T, path, text string, mode os.FileMode) {
 	}
 }
 
-// Every test uses temporary paths and fake commands. No apt, usermod, Docker,
-// systemctl, real database migration, or host apply is executed by these tests.
+// Every test uses temporary paths. No apt, usermod, Docker, systemctl, database
+// migration, or host apply is executed by these tests.
 func fixture(t *testing.T, role Role) Config {
 	t.Helper()
 	root := t.TempDir()
@@ -63,55 +61,6 @@ func fixture(t *testing.T, role Role) Config {
 	cfg.DatabaseURL = "postgres://test:private-password@127.0.0.1/test?sslmode=disable"
 	cfg.OperatorTokenOut = filepath.Join(root, "exports/operator.token")
 	return cfg
-}
-
-type fakeExec struct {
-	runs      map[string]int
-	installed map[string]bool
-	fail      string
-	scripts   []string
-}
-
-func newFakeExec() *fakeExec { return &fakeExec{runs: map[string]int{}, installed: map[string]bool{}} }
-func (f *fakeExec) Run(_ context.Context, id, script string, _ map[string]string, _ engine.Reporter) error {
-	f.runs[id]++
-	f.scripts = append(f.scripts, script)
-	if f.fail == id {
-		f.fail = ""
-		return errors.New("fixture interruption")
-	}
-	f.installed[id] = true
-	return nil
-}
-func (f *fakeExec) Output(_ context.Context, script string) (string, error) {
-	id := ""
-	switch {
-	case strings.Contains(script, "dpkg-query"):
-		id = "host-packages-v1"
-	case strings.Contains(script, "getent"):
-		id = "host-users-v1"
-	case strings.Contains(script, "docker info"):
-		id = "host-docker-v1"
-	case strings.Contains(script, "--version"):
-		return BuildpackVersion, nil
-	default:
-		return "enabled:ok\nactive:ok", nil
-	}
-	if f.installed[id] {
-		return "fixture:ok", nil
-	}
-	return "fixture:missing", nil
-}
-
-func testRunner(t *testing.T, cfg Config, exec *fakeExec) *Runner {
-	t.Helper()
-	runner, err := NewRunner(cfg, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runner.Exec, runner.SkipRootCheck = exec, true
-	runner.Now = func() time.Time { return time.Unix(1800000000, 0) }
-	return runner
 }
 
 func TestSupportAndRoleMatrix(t *testing.T) {
@@ -145,282 +94,6 @@ func TestSupportAndRoleMatrix(t *testing.T) {
 	}
 	if cfg := DefaultConfig(RoleMain, ""); cfg.Node != "local" {
 		t.Fatal("main must match the core's local execution node")
-	}
-}
-
-func TestSSHExecutionIdentityManifest(t *testing.T) {
-	for _, role := range []Role{RoleApplication, RoleBuilder} {
-		cfg := DefaultConfig(role, "app1")
-		placement, _ := cfg.RoleConfig()
-		users := &usersStep{cfg: cfg, role: placement}
-		var found bool
-		for _, account := range users.accounts() {
-			if account.User == "eregion-node" {
-				found = account.Docker && account.Shell == "/bin/bash" && account.Group == "eregion-node"
-			}
-		}
-		if !found || !strings.Contains(users.applyScript(), "usermod -aG docker eregion-node") || !strings.Contains(users.checkScript(), "id -nG eregion-node") {
-			t.Fatal("SSH execution identity lacks Docker membership")
-		}
-		dirs := (&directoriesStep{cfg: cfg, role: placement}).specs()
-		for _, path := range []string{cfg.Layout.DataDir, cfg.Layout.NodeStateDir, users.nodeHome()} {
-			found = false
-			for _, dir := range dirs {
-				if dir.Path == path {
-					found = dir.Owner == cfg.Layout.NodeUser && dir.Group == cfg.Layout.NodeGroup
-				}
-			}
-			if !found {
-				t.Fatalf("%s is not owned by node execution identity", path)
-			}
-		}
-		for _, dir := range dirs {
-			if dir.Path == cfg.Layout.ConfigDir && dir.Group != cfg.Layout.NodeGroup {
-				t.Fatal("node cannot traverse config parent")
-			}
-		}
-		f := newFakeExec()
-		f.installed["host-users-v1"] = false
-		failing := &usersStep{cfg: cfg, role: placement, exec: outputExec{"member:eregion-node:docker:missing"}}
-		check, err := failing.Check(context.Background(), engine.Runtime{})
-		if err != nil || check.Complete || !strings.Contains(check.Detail, "eregion-node docker membership") {
-			t.Fatalf("%+v %v", check, err)
-		}
-	}
-}
-
-type outputExec struct{ output string }
-
-func (o outputExec) Output(context.Context, string) (string, error) { return o.output, nil }
-func (o outputExec) Run(context.Context, string, string, map[string]string, engine.Reporter) error {
-	return errors.New("unexpected apply")
-}
-
-func TestRoleAwareStepsInstallMainStackWithoutTelemetry(t *testing.T) {
-	main := fixture(t, RoleMain)
-	main.PlatformPath = filepath.Join(t.TempDir(), "os-release")
-	put(t, main.PlatformPath, "ID=ubuntu\nVERSION_ID=24.04\n", 0o600)
-	runner := testRunner(t, main, newFakeExec())
-	steps, err := runner.steps(Credentials{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ids := map[string]bool{}
-	for _, step := range steps {
-		ids[step.ID()] = true
-	}
-	for _, required := range []string{"host-platform-v1", "host-packages-v1", "host-docker-v1", "host-buildpacks-v1", "host-registry-v1", "host-database-v1", "host-api-service-v1", "host-worker-service-v1"} {
-		if !ids[required] {
-			t.Fatalf("main role is missing %s: %v", required, ids)
-		}
-	}
-	role, _ := main.RoleConfig()
-	if role.Telemetry {
-		t.Fatal("main role must not install telemetry")
-	}
-	application := fixture(t, RoleApplication)
-	appRunner := testRunner(t, application, newFakeExec())
-	appSteps, err := appRunner.steps(Credentials{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, step := range appSteps {
-		switch step.ID() {
-		case "host-buildpacks-v1", "host-registry-v1", "host-database-v1", "host-api-service-v1", "host-worker-service-v1":
-			t.Fatalf("application role must not run %s", step.ID())
-		}
-		if step.ID() == "host-docker-v1" || step.ID() == "host-binary-v1" || step.ID() == "host-node-config-v1" {
-			ids[step.ID()] = true
-		}
-	}
-	if !ids["host-docker-v1"] || !ids["host-binary-v1"] || !ids["host-node-config-v1"] {
-		t.Fatal("application role lacks its runtime, node binary, or node config")
-	}
-}
-
-func TestPlanResumeAndDrift(t *testing.T) {
-	ctx := context.Background()
-	cfg := fixture(t, RoleApplication)
-	exec := newFakeExec()
-	runner := testRunner(t, cfg, exec)
-	plan, err := runner.Plan(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Ready || !plan.Supported || plan.ApplyBlocked != "" {
-		t.Fatalf("%+v", plan)
-	}
-	if _, err := os.Stat(cfg.Layout.StateDir); !os.IsNotExist(err) {
-		t.Fatal("plan wrote bootstrap state")
-	}
-	if len(exec.scripts) != 0 {
-		t.Fatal("plan executed mutation")
-	}
-	if _, err := runner.Apply(ctx, "invalid", false); err == nil {
-		t.Fatal("unconfirmed apply")
-	}
-	if _, err := os.Stat(cfg.Layout.StateDir); !os.IsNotExist(err) {
-		t.Fatal("bad confirmation wrote state")
-	}
-	exec.fail = "host-docker-v1"
-	first, err := runner.Apply(ctx, plan.Confirmation.Token, false)
-	if err == nil {
-		t.Fatal("expected interrupted apply")
-	}
-	if _, err := os.Stat(JournalPath(cfg)); err != nil {
-		t.Fatal("no pre-database journal", err)
-	}
-	resumedPlan, err := runner.Plan(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !resumedPlan.Resumed || resumedPlan.OperationID != first.OperationID {
-		t.Fatal("did not preserve operation identity")
-	}
-	resumed, err := runner.Apply(ctx, resumedPlan.Confirmation.Token, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exec.runs["host-packages-v1"] != 1 || exec.runs["host-users-v1"] != 1 || exec.runs["host-docker-v1"] != 2 {
-		t.Fatal(exec.runs)
-	}
-	if resumed.Generation != first.Generation {
-		t.Fatal("resumed a new generation")
-	}
-	if _, err := os.Stat(filepath.Join(cfg.Layout.StateDir, "secrets/operator.token")); !os.IsNotExist(err) {
-		t.Fatal("node role generated an irrelevant operator credential")
-	}
-	if err := os.Chmod(cfg.Layout.NodeStateDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	drift, err := runner.Plan(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if drift.Ready || drift.Generation != resumed.Generation+1 {
-		t.Fatal("drift not detected")
-	}
-	if _, err := runner.Apply(ctx, drift.Confirmation.Token, false); err != nil {
-		t.Fatal(err)
-	}
-	info, _ := os.Stat(cfg.Layout.NodeStateDir)
-	if info.Mode().Perm() != 0o700 {
-		t.Fatal("drift not repaired")
-	}
-	for _, script := range exec.scripts {
-		if strings.Contains(script, "usermod") && !exec.installed["host-packages-v1"] {
-			t.Fatal("users precede packages")
-		}
-	}
-}
-
-func TestAccessChangeRequiresCommitAndRollsBack(t *testing.T) {
-	ctx := context.Background()
-	cfg := fixture(t, RoleApplication)
-	// An existing different node binary is an access-changing update.
-	dest := filepath.Join(cfg.Layout.BinDir, "eregion-node")
-	put(t, dest, "old node binary", 0o755)
-	exec := newFakeExec()
-	runner := testRunner(t, cfg, exec)
-	var scriptPath string
-	runner.SpawnWatchdog = func(path string) error { scriptPath = path; return nil }
-	plan, err := runner.Plan(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.AccessChanges) == 0 {
-		t.Fatal("binary update was not reported as an access change")
-	}
-	report, err := runner.Apply(ctx, plan.Confirmation.Token, false)
-	var fault *contract.Fault
-	if !errors.As(err, &fault) || fault.Code != contract.ConfirmationRequired {
-		t.Fatalf("access-changing apply did not require commit: %v", err)
-	}
-	if !report.Pending || report.OperationID == "" {
-		t.Fatalf("no pending commit identity: %+v", report)
-	}
-	state, exists, err := loadState(cfg)
-	if err != nil || !exists || state.CommitID != report.OperationID || !state.Active {
-		t.Fatalf("pending commit not journaled: %+v %v", state, err)
-	}
-	if scriptPath == "" {
-		t.Fatal("watchdog was not armed")
-	}
-	raw, err := os.ReadFile(scriptPath)
-	if err != nil || !bytes.Contains(raw, []byte("confirmed")) || !bytes.Contains(raw, []byte("rolled-back")) {
-		t.Fatalf("watchdog script does not implement commit-confirm: %q %v", raw, err)
-	}
-	if err := runner.rollbackCommit(report.OperationID); err != nil {
-		t.Fatal(err)
-	}
-	restored, _, _, err := fileState(dest)
-	if err != nil || string(restored) != "old node binary" {
-		t.Fatalf("rollback did not restore the previous binary: %q %v", restored, err)
-	}
-	if _, err := os.Stat(commitRolledBackPath(cfg, report.OperationID)); err != nil {
-		t.Fatal("rollback marker missing", err)
-	}
-}
-
-func TestCommitConfirmClosesWindow(t *testing.T) {
-	ctx := context.Background()
-	cfg := fixture(t, RoleApplication)
-	put(t, filepath.Join(cfg.Layout.BinDir, "eregion-node"), "old node binary", 0o755)
-	exec := newFakeExec()
-	runner := testRunner(t, cfg, exec)
-	runner.SpawnWatchdog = func(string) error { return nil }
-	plan, err := runner.Plan(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	report, err := runner.Apply(ctx, plan.Confirmation.Token, false)
-	if err == nil || report.OperationID == "" {
-		t.Fatalf("expected pending commit: %v", err)
-	}
-	confirmed, err := runner.Confirm(ctx, report.OperationID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if confirmed.AlreadyConfirmed || confirmed.OperationID != report.OperationID {
-		t.Fatalf("bad confirmation: %+v", confirmed)
-	}
-	state, _, err := loadState(cfg)
-	if err != nil || state.Active || state.CommitID != "" || state.CompletedAt.IsZero() {
-		t.Fatalf("commit did not finish state: %+v %v", state, err)
-	}
-	if _, err := os.Stat(commitConfirmedPath(cfg, report.OperationID)); err != nil {
-		t.Fatal("confirmation marker missing", err)
-	}
-	if again, err := runner.Confirm(ctx, report.OperationID); err != nil || !again.AlreadyConfirmed {
-		t.Fatalf("repeat confirmation: %+v %v", again, err)
-	}
-}
-
-func TestCommitConfirmRejectsExpiredWindow(t *testing.T) {
-	ctx := context.Background()
-	cfg := fixture(t, RoleApplication)
-	put(t, filepath.Join(cfg.Layout.BinDir, "eregion-node"), "old node binary", 0o755)
-	runner := testRunner(t, cfg, newFakeExec())
-	runner.SpawnWatchdog = func(string) error { return nil }
-	plan, err := runner.Plan(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	report, err := runner.Apply(ctx, plan.Confirmation.Token, false)
-	if err == nil || report.OperationID == "" {
-		t.Fatalf("expected pending commit: %v", err)
-	}
-	runner.Now = func() time.Time { return time.Unix(1800000000, 0).Add(DefaultCommitConfirmWindow + time.Second) }
-	if _, err := runner.Confirm(ctx, report.OperationID); err == nil {
-		t.Fatal("expired confirmation accepted")
-	}
-	hash, err := cfg.ConfigHash()
-	if err != nil {
-		t.Fatal(err)
-	}
-	projected, err := projectState(cfg, hash, runner.Now())
-	if err != nil || projected.CommitID != "" || !projected.Active {
-		t.Fatalf("expired window did not clear for a fresh plan: %+v %v", projected, err)
 	}
 }
 
@@ -654,48 +327,6 @@ func TestPackExtractionRejectsLinksAndTraversal(t *testing.T) {
 	if _, err := extractPack(archive("pack", tar.TypeReg), 2); err == nil {
 		t.Fatal("oversized member accepted")
 	}
-}
-
-func TestDatabasePolicyAndStep(t *testing.T) {
-	for _, dsn := range []string{"postgres://u:p@db.example/test?sslmode=disable", "postgres://u:p@db.example/test?sslmode=require", "postgres://u:p@127.0.0.1/test?sslmode=disable&host=evil.example"} {
-		if _, err := controlplane.ParseDatabaseConfig(dsn); err == nil {
-			t.Fatal("unsafe database policy", dsn)
-		}
-	}
-	if _, err := controlplane.ParseDatabaseConfig("postgres://u:p@db.example/test?sslmode=verify-full"); err != nil {
-		t.Fatal(err)
-	}
-	db := &fakeDatabase{}
-	step := &databaseStep{cfg: fixture(t, RoleMain), database: db}
-	check, err := step.Check(context.Background(), engine.Runtime{})
-	if err != nil || check.Complete {
-		t.Fatal(check, err)
-	}
-	if _, err := step.Apply(context.Background(), engine.Runtime{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	check, err = step.Check(context.Background(), engine.Runtime{})
-	if err != nil || !check.Complete || db.migrations != 1 {
-		t.Fatal(check, err)
-	}
-}
-
-type fakeDatabase struct {
-	current    bool
-	migrations int
-}
-
-func (f *fakeDatabase) Inspect(context.Context, string) (DatabaseState, error) {
-	state := DatabaseState{ServerVersion: 170000, TLS: true, CanCreateSchema: true, Required: 4, RiverRequired: 6}
-	if f.current {
-		state.Current, state.RiverCurrent = 4, 6
-	}
-	return state, nil
-}
-func (f *fakeDatabase) Migrate(ctx context.Context, dsn string) (DatabaseState, error) {
-	f.current = true
-	f.migrations++
-	return f.Inspect(ctx, dsn)
 }
 
 func TestAuthenticatedReadiness(t *testing.T) {

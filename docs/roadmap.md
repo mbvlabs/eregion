@@ -186,11 +186,12 @@ then reconnect/replay to completion. This does not establish later host/fleet/HA
 - [x] Guided terminal setup with noninteractive flag parity and a plan/diff view.
 - [x] Add a second control plane against the same database in integration tests.
 
-**Gate (local):** passed. Bootstrap plan/apply/resume, remote first contact over
-pinned SSH (disposable fixture), credential-once handoff, commit-confirm rollback,
-idempotent re-apply, competing migrations, and two control planes on one database.
-**Gate (fresh VM):** unproven. The container matrix stubs systemd/Docker/apt; no
-clean Debian/Ubuntu VM install was run here.
+**Gate (local):** passed for the control-plane side only: credential-once
+handoff, the commit-confirm watchdog script, competing migrations, and two
+control planes on one database. Host apply/resume/idempotency is not tested;
+simulated-host tests with stubbed systemd/Docker/apt were removed.
+**Gate (fresh VM):** unproven. Bootstrap apply has never converged a real host;
+no clean Debian/Ubuntu VM install was run here.
 
 **Delivered:** `eregion bootstrap` (local and pinned-SSH remote), resumable
 node-local journal, Debian 12/13 and Ubuntu 22.04/24.04 checks, role-specific

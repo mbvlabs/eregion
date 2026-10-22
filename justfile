@@ -29,11 +29,6 @@ dev-buildpacks:
 smoke:
     python3 scripts/smoke.py
 
-# Run bootstrap check/plan and journaled apply/resume/idempotency in disposable
-# Debian/Ubuntu containers. This is a proxy: no systemd, Docker daemon, or apt.
-bootstrap-matrix:
-    python3 scripts/bootstrap_matrix.py
-
 # Build the sample app from a directory with Buildpacks, deploy, and serve it (requires dev-up and dev-buildpacks).
 buildpacks-smoke:
     python3 scripts/buildpacks_smoke.py

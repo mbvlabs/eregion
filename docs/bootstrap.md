@@ -287,44 +287,18 @@ fails if a field lacks a flag. Machine output (`--json`) and non-TTY invocation
 never start the interface. The guided flow uses the same `host.Runner` and
 `Apply` path as the flag form; it is not a second implementation.
 
-## Fresh-host matrix
+## Fresh-host evidence
 
-```sh
-just bootstrap-matrix
-# or: python3 scripts/bootstrap_matrix.py --json
-```
+Bootstrap has no simulated-host test. Containers or SSH fixtures with stubbed
+`systemctl`, `docker`, `dpkg-query`, or `apt-get` were removed because they
+passed without proving package installation, service supervision, a live
+container runtime, registry pulls, Buildpacks execution, or migrations.
 
-The script builds the binaries and runs one disposable container per supported
-image: `debian:12`, `debian:13`, `ubuntu:22.04`, `ubuntu:24.04`. For each image
-it runs:
-
-- main-role `plan` (which must detect the release, include Docker, Buildpacks,
-  registry, and database, and include no telemetry);
-- application-role `plan`;
-- an interrupted `apply` at the Docker step, proving the journal is written
-  before PostgreSQL and the failure leaves a resumable generation;
-- a resumed `apply` (`resumed: true`, same operation);
-- a completed re-plan and re-apply with no step reporting `executed: true`.
-
-The opt-in SSH integration suite also runs `bootstrap remote` twice against the
-disposable fixture and asserts the same config hash, generation, and operation
-ID, then performs a real root apply with package/daemon stand-ins and a completed
-idempotent re-apply. That proves the stable bundle, credential-free node path,
-journal, and remote CLI bridge, not a fresh VM or a live daemon.
-
-Current result on this workstation (amd64): all four images pass. Containers are
-uniquely named, run with `--network none` and `--rm`, and never touch the host's
-systemd, Docker daemon, or existing containers.
-
-**Honest limits of the proxy.** Containers have no systemd, no Docker daemon, and
-no package network. The script installs local stubs for `systemctl`, `docker`,
-`dpkg-query`, and `apt-get`. That exercises the real CLI, os-release detection,
-role selection, journal, resume, idempotency, account/directory/file steps, and
-the real distro userland, but it does **not** prove service supervision, a live
-container runtime, real package installation, registry pulls, Buildpacks
-execution, PostgreSQL migrations, or kernel/network behaviour. Those need a
-fresh-host VM matrix. The remote SSH path is covered against the disposable
-fixture, but it still needs a real fresh VM for the same evidence.
+Unit tests in `internal/host` cover only logic that runs for real on temporary
+files: release detection, confirmation binding, credential and context files,
+artifact checksums, archive extraction, and the commit-confirm watchdog script.
+Whether `bootstrap apply` converges a host is **unverified** until it runs on a
+clean Debian/Ubuntu VM; see G8 in [release criteria](release-criteria.md).
 
 ## Database outage and competing migrations
 
