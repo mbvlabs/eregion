@@ -219,7 +219,7 @@ func TestIntegrationNodesApplicationAndBuilderEnrollAndReceiveOnlyTheirWork(t *t
 	wantViolation(t, err, ReasonRoleMissing)
 	// A build never runs on a node that only has the application role.
 	_, err = l.s.Submit(ctx, platformSubmission(platform.KindReleaseCreate, "env/api/production", "build-on-app", map[string]any{
-		"source": map[string]any{"type": "git", "url": "https://example.com/api.git"}}))
+		"source": map[string]any{"type": "git", "url": "https://github.com/example/api.git"}}))
 	wantViolation(t, err, ReasonBuilderRequired)
 	// A node that is not enrolled receives nothing, even if it was registered.
 	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindNodeRegister, "platform", "reg-ghost", map[string]any{
