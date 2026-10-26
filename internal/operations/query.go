@@ -6,8 +6,11 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 )
 
-// ListQuery is one bounded, actor-scoped operation history read. App selects the
-// app record and every environment below it; Environment narrows that to one.
+// ListQuery is one bounded operation history read. With no app filter the
+// history is scoped to the calling actor. App selects the app record and every
+// environment below it, plus their build operations; Environment narrows that
+// to one environment. An app/environment filter also includes operations
+// submitted by CI tokens and the push webhook.
 type ListQuery struct {
 	App         string
 	Environment string

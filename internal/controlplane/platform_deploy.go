@@ -568,9 +568,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 
 	// The previous release is no longer routed. Removing its containers is
 	// cleanup, not part of the success decision.
-	if err := w.service.removeDeploymentContainers(ctx, tr, id, attempt, previousDeploymentInstances(ctx, w.service, dep)); err != nil {
-		w.service.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup did not complete: "+contract.Classify(err).Message)
-	}
+	w.service.removePreviousDeploymentContainers(ctx, tr, env, id, attempt, dep)
 	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
@@ -896,15 +894,56 @@ func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transp
 	return nil
 }
 
-func previousDeploymentInstances(ctx context.Context, s *Service, deployment platform.Deployment) []platform.DeploymentInstance {
+func previousDeploymentInstances(ctx context.Context, s *Service, deployment platform.Deployment) ([]platform.DeploymentInstance, string) {
 	if deployment.PreviousDeploymentID == "" {
-		return nil
+		return nil, ""
 	}
 	dep, err := scanDeploymentRow(s.pool.QueryRow(ctx, deploymentSelect+` WHERE d.id=$1`, deployment.PreviousDeploymentID))
 	if err != nil {
-		return nil
+		return nil, ""
 	}
-	return dep.Instances
+	return dep.Instances, s.deploymentNode(ctx, dep)
+}
+
+// deploymentNode is where a deployment's containers ran. The deployment's
+// pinned revision records the runtime node; the environment's current node is
+// only a fallback for a deployment without a revision. Instance rows do not
+// carry a node name.
+func (s *Service) deploymentNode(ctx context.Context, deployment platform.Deployment) string {
+	if deployment.RevisionID != "" {
+		revision, err := s.revisionByID(ctx, deployment.RevisionID)
+		if err == nil && revision.Runtime.Node != "" {
+			return revision.Runtime.Node
+		}
+	}
+	return ""
+}
+
+// removePreviousDeploymentContainers cleans the previous release on the node
+// that actually ran it, not only the environment's current node. Cleanup is
+// best effort: an unreachable old node is reported and never turns a verified
+// switch into a failed deployment.
+func (s *Service) removePreviousDeploymentContainers(ctx context.Context, current node.Transport, env platform.Environment, id contract.OperationID, attempt uint32, deployment platform.Deployment) {
+	instances, nodeName := previousDeploymentInstances(ctx, s, deployment)
+	if len(instances) == 0 {
+		return
+	}
+	tr := current
+	if nodeName != "" && nodeName != env.Node {
+		if s.resolver == nil {
+			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup was not attempted: the worker has no node resolver.")
+			return
+		}
+		resolved, err := s.resolver.TransportFor(ctx, nodeName)
+		if err != nil {
+			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup could not reach node "+nodeName+": "+contract.Classify(err).Message)
+			return
+		}
+		tr = resolved
+	}
+	if err := s.removeDeploymentContainers(ctx, tr, id, attempt, instances); err != nil {
+		s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup did not complete: "+contract.Classify(err).Message)
+	}
 }
 
 // --------------------------------------------------------------- control steps

@@ -359,7 +359,7 @@ func (s *Service) appendNodeEvents(ctx context.Context, id contract.OperationID,
 			if event.Kind == "warning" {
 				kind = "warning"
 			}
-			message := event.Message
+			message := s.redact(event.Message)
 			if len(message) > 4096 {
 				message = message[:4096]
 			}

@@ -75,9 +75,9 @@ bin/eregion help app create --json
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle must carry the context, operator keys, admin user, WireGuard address/public key/endpoint and SSH host key. |
 | `context list/show/use/remove` | Saved contexts, target-confirmed removal with its key files. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. `context credential add` is removed: tokens are minted only through `token create` with the human factor (D7). |
-| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, queues its first deploy unless `--no-deploy`, then adds the domain as a separate `platform.domain.add` action. List/status read inventory. `status` shows the serving release, processes, per-domain state and recent operations; `delete` takes `--confirm <app>` (D13). |
-| `env create/update/list/status/delete` | `create` accepts an environment with its first revision and queues its first deploy unless `--no-deploy`; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` (D13). |
-| `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. No deploy is queued. |
+| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create` with the first domain, primary flag and main-node addresses; the binding commits in the same transaction before the first deploy is queued. List/status read inventory. `status` shows the serving release, processes, per-domain state and recent operations; `delete` takes `--confirm <app>` (D13). |
+| `env create/update/list/status/delete` | `create` accepts an environment with its first revision, optional domain binding and its first deploy unless `--no-deploy`; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` (D13). |
+| `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. A serving environment also queues a blue/green restart in the same transaction so the new formation runs immediately; without a serving deployment the next deploy applies it. |
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
 | `deploy <app> <env> [--ref REF \| --release ID]` | Node-mode `platform.deploy`. In a terminal it prints source, ref/commit, revision and processes, then follows the operation with the shared viewer (build log lines and stages). `--detach` returns after acceptance. |
 | `rollback <app> <env> [--to ID]` | Node-mode `platform.rollback`; requires `--confirm <app>/<env>`, validated by the node and control plane against the current target (D12). There is no plan-token scheme for rollback. |
@@ -88,7 +88,7 @@ bin/eregion help app create --json
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
 | `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
 | `ui` | Full-screen workspace over the same inventory and node-mode action service. The graph still uses the telemetry read adapter for metrics. |
-| `operations list/get/follow/cancel` | Actor-scoped operation history filtered by app, environment, state, build and limit, plus snapshot/follow observation and explicit cancellation. |
+| `operations list/get/follow/cancel` | Unfiltered list is actor-scoped; `--app`/`--environment` select the platform target regardless of submitting actor and include the environment's `build/<id>` operations, CI tokens and the push webhook. State, build and limit filters; snapshot/follow observation and explicit cancellation remain actor-scoped. |
 | `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
@@ -186,15 +186,17 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
   read credential) now records the build and deployment. Auto-deploy/push and
   the per-environment webhook remain work list row 8.
 - Deletion is deliberate, not SQL cascade alone. `platform.environment.delete`
-  and `platform.app.delete` first remove containers selected by ownership labels,
-  delete the row-6 domain state for the target environments, then rewrite the
-  routes through the one serialized writer (`syncRoutes`, one advisory lock) and
-  reload Caddy. Only then are deployments, releases, builds, revisions, change
-  rows, vault secret namespaces and the environment/app rows deleted. A failed
-  container or Caddy step leaves the platform rows available for retry. Operations
-  and operation events are never deleted; operation `--app`/`--environment`
-  history still shows the deletion after the platform record is gone. The node
-  validates the target-naming `--confirm` token against the records it loads.
+  and `platform.app.delete` first remove containers selected by ownership labels
+  on every node recorded by the target's deployment revisions (plus the current
+  environment node), delete the row-6 domain state for the target environments,
+  then rewrite the routes through the one serialized writer (`syncRoutes`, one
+  advisory lock) and reload Caddy. Only then are deployments, releases, builds,
+  revisions, change rows, vault secret namespaces and the environment/app rows
+  deleted. A failed container or Caddy step leaves the platform rows available
+  for retry. Operations and operation events are never deleted; operation
+  `--app`/`--environment` history still shows the deletion after the platform
+  record is gone. The node validates the target-naming `--confirm` token against
+  the records it loads.
 - The deleted resources/backup subsystem had no catalog tables in the
   control-plane migrations. DNS records live at the provider; a domain binding
   is not a DNS record.
@@ -288,6 +290,8 @@ otherwise the verified release artifact for this CLI's version
 (`upgrade.FetchNodeBinary`); a dev or unarchived build refuses with the fix
 instead of pushing a non-executable macOS binary. The binary is installed once
 at `/usr/local/bin/eregion`. The main role also gets
+`/etc/eregion/node.json` (node name, state directory and main hostname, owned by
+the control-plane account) and
 `/etc/eregion/vault-keyring.json` (0600, owned by the control-plane account and
 named by `EREGION_VAULT_KEY_FILE` in `control-plane.env`) and node_exporter
 1.11.1 with a pinned sha256 per architecture, listening only on
@@ -358,7 +362,7 @@ window.
 | `/etc/eregion/vault-keyring.json` | Vault master key, 0600 for the control-plane account; never in PostgreSQL and included in the handoff. Existing key material is never overwritten. |
 | `/etc/eregion/auth.json` | Owner-only deploy-token hashes, names, actors, scopes, grants and expiry. Setup mints no operator token; `token create` restarts the API so a new hash is loaded. |
 | `/etc/eregion/protect.json` | Root-only confirmed/pending TOTP secret and its replay/lockout state. Never in the database, revision, operation, or journal. |
-| `/etc/eregion/node.json` | Node name, state directory, main hostname and optional operator-installed helper configuration. |
+| `/etc/eregion/node.json` | Node name, state directory, main hostname and optional operator-installed helper configuration. The control-plane role writes it too, so node RPC, CI/push URLs and `secrets export` work on the main node. |
 | `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles, commit-confirm snapshots, the recorded host intent (`intent.json`) and owner-only copies of its TLS/key inputs (`inputs/`). |
 | `/var/lib/eregion/node/` | Node journal, per-effect records/locks, detached-task logs and identity. |
 | `/var/lib/eregion/access/` | Operator-access snapshot and lockdown state; separate from bootstrap commit-confirm. |
@@ -383,10 +387,10 @@ All use `POST /v1/operations`, the shared registry and one River job:
 
 | Kind | Target | Main input |
 | --- | --- | --- |
-| `platform.app.create` | `platform` | `name`; optional `environment` (first environment + first revision) and `deploy` to queue the first deploy from that revision. |
-| `platform.environment.create` | `app/<app>` | `name`, `node`, optional `build_node`, legacy ports/bind/health, `env`, `secret_refs`; revision `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`; optional `deploy` to queue the first deploy from that revision. |
+| `platform.app.create` | `platform` | `name`; optional `environment` (first environment + first revision, including its `domain`, `domain_primary` and `domain_addresses`) and `deploy` to queue the first deploy from that revision after the binding commits. |
+| `platform.environment.create` | `app/<app>` | `name`, `node`, optional `build_node`, legacy ports/bind/health, `env`, `secret_refs`; revision `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`; first `domain`, `domain_primary`, `domain_addresses`; optional `deploy` to queue the first deploy after the binding commits. |
 | `platform.environment.update` | `env/<app>/<env>` | Partial patch: `node`, `build_node`, `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`; produces a new full revision. |
-| `platform.process.scale` | `env/<app>/<env>` | `process`, `replicas`; produces a new revision. |
+| `platform.process.scale` | `env/<app>/<env>` | `process`, `replicas`; produces a new revision and, when a serving deployment exists, queues a blue/green `platform.restart` of the serving release in the same transaction. |
 | `platform.config.set/unset` | `env/<app>/<env>` | `config` map or `keys` list; produces a new revision and never queues a deploy. |
 | `platform.environment.secret.attach` | `env/<app>/<env>` | `name` only; the vault write is separate and no value enters the revision. |
 | `platform.release.create` | `env/<app>/<env>` | `source`, optional `build`, `command`, `pull`; records a build row for git/directory sources. |
@@ -411,19 +415,27 @@ Environment revisions are numbered per environment and immutable. The revision
 is the desired state; an accepted action is not an applied route or a running
 process. Deployability is the pure `platform.EvaluateDeployability` report over
 the current revision plus artifact/domain observations, with DNS reported as
-`unknown` until the domain row observes it. Inventory collections `revisions`
-and `deployability` expose it, and each environment record carries its current
-revision, processes and deployability.
+`unknown` until the domain row observes it. A deploy checks that report before
+recording a build or creating a container: source, runtime, a web process, a
+primary domain and an observed wrong/proxied DNS answer block with
+`precondition_failed` and a `missing` list. A merely unobserved DNS record does
+not block, matching deploycrate's gate on an unapplied managed binding; a source
+deploy produces its own artifact, so artifact readiness is not a blocker there.
+Inventory collections `revisions` and `deployability` expose the same report,
+and each environment record carries its current revision, processes and
+deployability.
 
 The CLI `app create` and `env create` preview the canonical action on the node,
 write the read credential and secret values through `vault.set`, then submit.
-Only names enter the revision; a domain is a separate `platform.domain.add`
-submission. The preview checks the target node placement, so a refused create
-does not leave vault values behind. `env update` reads the current revision and
-sends a merged patch; its terminal interview shows the diff before confirmation.
-`secret set` previews the attach action, writes the value, then submits
-`platform.environment.secret.attach` only when the current revision does not
-already name it.
+Only names enter the revision; the optional domain, its primary flag and
+main-node addresses travel in the create input and are inserted in the same
+transaction before the first deploy is queued, so the deploy cannot race its
+own route. The preview checks the target node placement and domain availability,
+so a refused create does not leave vault values behind. `env update` reads the
+current revision and sends a merged patch; its terminal interview shows the diff
+before confirmation. `secret set` previews the attach action, writes the value,
+then submits `platform.environment.secret.attach` only when the current revision
+does not already name it.
 
 Deploy-time secret resolution prefers the current revision's secret names,
 resolving each name's active latest revision and freezing the exact non-secret
@@ -445,15 +457,22 @@ transient node secret map, never in the build payload. A directory/git build on
 a distinct build node is refused before `pack`: registry push/pull and dedicated
 credentials do not exist. Installing a registry alone does not move images.
 
-Deploy sequence: preflight -> build from the revision when the release is
-pending -> release command -> candidate containers for every process replica on
-dynamic loopback ports -> health for every web replica -> Caddy upstream switch
-with all web replica backends -> public HTTPS verification through local Caddy ->
-remove the previous deployment's containers. A failure before the switch removes
+Deploy sequence: deployability gate -> preflight -> build from the revision when
+the release is pending -> release command -> candidate containers for every
+process replica on dynamic loopback ports -> health for every web replica ->
+Caddy upstream switch with all web replica backends -> public HTTPS verification
+through local Caddy -> remove the previous deployment's containers. The gate
+refuses before any build or container work. A failure before the switch removes
 the candidates and leaves the previous release serving; a failure after the
 switch restores the previous upstreams. Rollback and restart use the same path
 with the recorded revision/secret snapshot and the current revision respectively.
 Explicit retry creates new work; it does not rewrite a terminal failed record.
+Node step events are persisted while the step runs in bounded, attempt-fenced
+batches, so `build logs --follow` and the deploy viewer show build output live;
+the worker's own secrets (control DSN, vault keyring material and the values
+handed to a step) are redacted before an event is stored. Previous-deployment
+cleanup resolves the node recorded on that deployment's pinned revision, not only
+the environment's current node.
 
 `app status` and `env status` join durable inventory with a read-only node RPC
 Docker observation (`platform.workloads`). Each desired process replica is shown

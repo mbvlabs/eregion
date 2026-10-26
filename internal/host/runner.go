@@ -229,7 +229,11 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		// installed here and started by the access setup once wg0 exists.
 		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec})
 	}
-	if role.NodeAgent {
+	// The main node also needs /etc/eregion/node.json: node RPC, the CI URLs,
+	// push-to-deploy and secrets export all read the node identity and main
+	// hostname from it. Only a role with a node execution account installs
+	// forced-command operator keys.
+	if role.ControlPlane || role.NodeAgent {
 		steps = append(steps, &nodeConfigStep{cfg: r.Config})
 	}
 	return steps, nil

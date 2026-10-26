@@ -17,7 +17,7 @@ func (a *app) processSpecs() []spec {
 	list.Examples = []string{"eregion process list api production --json"}
 
 	scale := operationMeta("Change one process's replicas in a new revision", "eregion process scale api production worker 2 --json")
-	scale.WhenToUse = []string{"Change replicas without touching source, configuration or secrets. No deploy is queued; the next deploy applies the new revision."}
+	scale.WhenToUse = []string{"Change replicas without touching source, configuration or secrets. A serving environment restarts its release through the blue/green path immediately; otherwise the next deploy applies the new revision."}
 	scale.Mutating, scale.DryRun = true, true
 	scale.Examples = []string{
 		"eregion process scale api production worker 2 --json",
@@ -106,7 +106,7 @@ func (a *app) processScale(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, err
 	}
 	data["operation_id"] = op.ID
-	plain := fmt.Sprintf("Scaled process %s to %d replica(s) in a new revision.\noperation: %s\nnext: eregion env status %s %s --json\n",
+	plain := fmt.Sprintf("Scaled process %s to %d replica(s) in a new revision.\noperation: %s\na serving environment restarts the release through the blue/green path; otherwise the next deploy applies it.\nnext: eregion env status %s %s --json\n",
 		args[2], replicas, op.ID, args[0], args[1])
 	return result{data: data, plain: plain}, nil
 }

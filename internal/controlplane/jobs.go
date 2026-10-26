@@ -112,6 +112,9 @@ type WorkerConfig struct {
 	// exactly one cache and one WireGuard key lock per node. Nil builds the
 	// resolver from Nodes and Transport.
 	Resolver *NodeResolver
+	// Redaction is the process redaction registry. Nil builds one and still
+	// registers the worker's own environment secrets.
+	Redaction *secrets.Registry
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
@@ -119,6 +122,11 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
 	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots}
+	service.redaction = config.Redaction
+	if service.redaction == nil {
+		service.redaction = &secrets.Registry{}
+	}
+	registerRuntimeSecrets(service.redaction)
 	service.transport = config.Transport
 	if service.transport == nil && (config.Concurrency > 0 || config.NodeStateDir != "") {
 		stateDir := config.NodeStateDir
@@ -205,6 +213,35 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		return inserted.Job.ID, nil
 	}
 	return &Runtime{Service: service, Jobs: client, Nodes: service.resolver}, nil
+}
+
+// registerRuntimeSecrets registers the worker's own secrets so a child process
+// or a node observation that echoes them cannot persist them in operation
+// events. The values are read from the protected environment, never from an
+// operation input.
+func registerRuntimeSecrets(registry *secrets.Registry) {
+	dsn := os.Getenv("EREGION_DATABASE_URL")
+	registry.Add(os.Getenv("PGPASSWORD"), dsn)
+	if parsed, err := ParseDatabaseConfig(dsn); err == nil {
+		registry.Add(parsed.ConnConfig.Password)
+	}
+	if path := os.Getenv("EREGION_VAULT_KEY_FILE"); path != "" {
+		raw, err := os.ReadFile(path) //nolint:gosec // G304: the service's configured keyring path.
+		if err != nil {
+			return
+		}
+		registry.Add(string(raw))
+		var file struct {
+			Keys []struct {
+				Key string `json:"key"`
+			} `json:"keys"`
+		}
+		if json.Unmarshal(raw, &file) == nil {
+			for _, entry := range file.Keys {
+				registry.Add(entry.Key)
+			}
+		}
+	}
 }
 
 type testWorker struct {

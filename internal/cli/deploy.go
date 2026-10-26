@@ -19,9 +19,7 @@ import (
 // deliveryMeta is the common metadata for the release pipeline commands. They
 // are node-mode operations: the CLI never opens the database or enqueues work.
 func deliveryMeta(summary, example string) CommandMeta {
-	meta := platformMutationMeta(summary, example)
-	meta.ErrorCodes = append(meta.ErrorCodes, contract.ConfirmationRequired)
-	return meta
+	return platformMutationMeta(summary, example)
 }
 
 func deliveryReadMeta(summary, example string) CommandMeta {
@@ -72,6 +70,7 @@ func deliveryRollbackMeta() CommandMeta {
 	meta := deliveryMeta("Restore an earlier release with its recorded revision and secret revisions", "eregion rollback api production --to rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --confirm api/production --json")
 	meta.Destructive = true
 	meta.Confirmation = "target"
+	meta.ErrorCodes = append(meta.ErrorCodes, contract.ConfirmationRequired)
 	return meta
 }
 

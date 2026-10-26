@@ -13,8 +13,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-const deleteWorkloadStep = "platform-delete-01-v1"
-
 // lockPlatformTargets serializes a deletion with every operation that could
 // touch the same records. An app deletion takes the app target (which also
 // serializes environment creation) and every current environment target, so a
@@ -51,6 +49,43 @@ func (s *Service) environmentTargets(ctx context.Context, app string) ([]string,
 		out = append(out, target)
 	}
 	return out, rows.Err()
+}
+
+// environmentWorkloadNodes lists every node that may still hold this
+// environment's containers: its current node and the runtime node recorded on
+// each deployment's revision. A deployment's instances do not carry a node
+// name, so the pinned revision is the durable record of where they ran. This
+// reaches containers left behind after `env update --node`.
+func (s *Service) environmentWorkloadNodes(ctx context.Context, envID platform.EnvironmentID, current string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `SELECT DISTINCT coalesce(r.runtime->>'node','')
+        FROM eregion_platform_deployments d
+        LEFT JOIN eregion_platform_environment_revisions r ON r.id=d.revision_id
+        WHERE d.environment_id=$1`, envID)
+	if err != nil {
+		return nil, unavailable()
+	}
+	defer rows.Close()
+	nodes := []string{}
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			nodes = append(nodes, name)
+		}
+	}
+	add(current)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, unavailable()
+		}
+		add(name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, unavailable()
+	}
+	sort.Strings(nodes)
+	return nodes, nil
 }
 
 func (s *Service) lockTargets(ctx context.Context, targets []string) (func(), error) {
@@ -132,14 +167,21 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	tr, err := w.service.resolver.TransportFor(ctx, env.Node)
+	nodes, err := w.service.environmentWorkloadNodes(ctx, env.ID, env.Node)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if _, err := w.runStepOn(ctx, tr, id, attempt, deleteWorkloadStep, platform.DeletePayload{
-		Step: deleteWorkloadStep, App: env.App, Environment: env.Name,
-	}, nil); err != nil {
-		return w.settle(ctx, id, attempt, err)
+	for index, nodeName := range nodes {
+		tr, err := w.service.resolver.TransportFor(ctx, nodeName)
+		if err != nil {
+			return w.settle(ctx, id, attempt, err)
+		}
+		step := fmt.Sprintf("platform-delete-%02d-v1", index+1)
+		if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.DeletePayload{
+			Step: step, App: env.App, Environment: env.Name,
+		}, nil); err != nil {
+			return w.settle(ctx, id, attempt, err)
+		}
 	}
 	// Remove the row-6 domain state first, then let the one serialized route
 	// writer render from the remaining bindings and reload Caddy. There is no
@@ -172,7 +214,13 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 	byNode := map[string]bool{}
 	environmentIDs := make([]platform.EnvironmentID, 0, len(environments))
 	for _, env := range environments {
-		byNode[env.Node] = true
+		nodes, err := w.service.environmentWorkloadNodes(ctx, env.ID, env.Node)
+		if err != nil {
+			return w.settle(ctx, id, attempt, err)
+		}
+		for _, nodeName := range nodes {
+			byNode[nodeName] = true
+		}
 		environmentIDs = append(environmentIDs, env.ID)
 	}
 	nodes := make([]string, 0, len(byNode))

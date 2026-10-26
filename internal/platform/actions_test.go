@@ -102,3 +102,30 @@ func TestDeployNormalizesSourceAndReleaseForms(t *testing.T) {
 		t.Fatal("build retry requires a build target")
 	}
 }
+
+func TestEnvironmentSpecCarriesItsFirstDomain(t *testing.T) {
+	registry := NewRegistry()
+	raw, _ := json.Marshal(map[string]any{
+		"name": "production", "node": "app-1",
+		"domain": "API.Example.com.", "domain_primary": true,
+		"domain_addresses": []string{"203.0.113.10", "203.0.113.10"},
+	})
+	normalized, err := registry.Normalize(KindEnvironmentCreate, "app/api", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := normalized.Input.(*EnvironmentCreateInput).EnvironmentSpec
+	if spec.Domain != "api.example.com" || !spec.DomainPrimary || len(spec.DomainAddresses) != 1 || spec.DomainAddresses[0] != "203.0.113.10" {
+		t.Fatalf("domain binding was not normalized: %+v", spec)
+	}
+	if _, err := registry.Normalize(KindEnvironmentCreate, "app/api", mustJSONInput(map[string]any{
+		"name": "staging", "node": "app-1", "domain_primary": true,
+	})); err == nil {
+		t.Fatal("a primary flag without a domain must be refused")
+	}
+}
+
+func mustJSONInput(value any) json.RawMessage {
+	raw, _ := json.Marshal(value)
+	return raw
+}

@@ -141,10 +141,24 @@ func TestEvaluateDeployability(t *testing.T) {
 		t.Fatalf("ready report=%+v", ready)
 	}
 	empty := &EnvironmentRevision{}
-	blocked := EvaluateDeployability(empty, DeployabilityState{DNS: "missing"})
+	blocked := EvaluateDeployability(empty, DeployabilityState{DNS: string(DNSWrong)})
 	want := []string{"source", "artifact", "runtime", "web_process", "domain", "dns"}
 	if !reflect.DeepEqual(blocked.Missing, want) || blocked.Deployable {
 		t.Fatalf("blocked report=%+v", blocked)
+	}
+	// A merely unobserved DNS record does not block the first deploy; an
+	// observed proxied answer does.
+	unobserved := EvaluateDeployability(revision, DeployabilityState{
+		ArtifactReady: true, PrimaryDomain: "api.example.com", DNS: string(DNSPending),
+	})
+	if !unobserved.Deployable {
+		t.Fatalf("unobserved DNS blocked deployment: %+v", unobserved)
+	}
+	proxied := EvaluateDeployability(revision, DeployabilityState{
+		ArtifactReady: true, PrimaryDomain: "api.example.com", DNS: string(DNSProxied),
+	})
+	if proxied.Deployable || len(proxied.Missing) != 1 || proxied.Missing[0] != "dns" {
+		t.Fatalf("proxied DNS report=%+v", proxied)
 	}
 	if EvaluateDeployability(nil, DeployabilityState{ArtifactReady: true, PrimaryDomain: "api.example.com"}).Missing[0] != "source" {
 		t.Fatal("a nil revision must report a missing source")

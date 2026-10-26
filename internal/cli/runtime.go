@@ -294,7 +294,7 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
 		LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
-		Nodes:         a.fleetResolverConfig(logger), Resolver: nodes,
+		Nodes:         a.fleetResolverConfig(logger), Resolver: nodes, Redaction: a.secrets,
 	})
 	if err != nil {
 		closeTransport()

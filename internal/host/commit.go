@@ -173,7 +173,7 @@ func AccessChanges(cfg Config, credentials Credentials) ([]AccessChange, error) 
 			return nil, err
 		}
 	}
-	if role.NodeAgent {
+	if role.NodeAgent || role.ControlPlane {
 		node := &nodeConfigStep{cfg: cfg}
 		desired, err := node.config()
 		if err != nil {

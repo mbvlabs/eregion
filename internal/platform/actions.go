@@ -68,6 +68,14 @@ type EnvironmentSpec struct {
 	Processes         []ProcessSpec     `json:"processes,omitempty"`
 	Config            map[string]string `json:"config,omitempty"`
 	SecretNames       []string          `json:"secret_names,omitempty"`
+
+	// Domain optionally binds the environment's first public hostname in the
+	// same submission transaction, before any first deploy is queued. A first
+	// deploy needs a primary domain; submitting the binding separately races
+	// that deploy and fails the public verification.
+	Domain          string   `json:"domain,omitempty"`
+	DomainPrimary   bool     `json:"domain_primary,omitempty"`
+	DomainAddresses []string `json:"domain_addresses,omitempty"`
 }
 
 type EnvironmentCreateInput struct {
@@ -341,6 +349,14 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 	if spec.Processes == nil {
 		spec.Processes = []ProcessSpec{}
 	}
+	domain, addresses, err := normalizeDomainBinding(spec.Domain, spec.DomainAddresses)
+	if err != nil {
+		return err
+	}
+	if domain == "" && (spec.DomainPrimary || len(addresses) > 0) {
+		return invalid("domain", "A primary flag or addresses need a domain name.")
+	}
+	spec.Domain, spec.DomainAddresses = domain, addresses
 	state := RevisionState{
 		Source:            spec.Source,
 		AutoDeploy:        spec.AutoDeploy,
@@ -1341,26 +1357,43 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 		return nil, invalid("environment", "The app and environment fields must match the target, or be omitted.")
 	}
 	input.App, input.Environment = target.App, target.Environment
-	input.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Domain), "."))
-	if err := ValidateDomain(input.Domain); err != nil {
-		return nil, invalid("domain", err.Error())
+	domain, addresses, err := normalizeDomainBinding(input.Domain, input.Addresses)
+	if err != nil {
+		return nil, err
 	}
+	if domain == "" {
+		return nil, invalid("domain", "A domain action needs a hostname.")
+	}
+	input.Domain, input.Addresses = domain, addresses
 	if input.Confirm != "" {
 		input.Confirm = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Confirm), "."))
 		if input.Confirm != input.Domain {
 			return nil, invalid("confirm", "The confirmation token must name the hostname shown by --dry-run.")
 		}
 	}
-	addresses := make([]string, 0, len(input.Addresses))
+	return &input, nil
+}
+
+// normalizeDomainBinding validates a hostname and the main node's recorded
+// addresses. It is shared by domain actions and the domain carried in a first
+// environment specification.
+func normalizeDomainBinding(name string, rawAddresses []string) (string, []string, error) {
+	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	if name != "" {
+		if err := ValidateDomain(name); err != nil {
+			return "", nil, invalid("domain", err.Error())
+		}
+	}
+	addresses := make([]string, 0, len(rawAddresses))
 	seen := map[string]bool{}
-	for _, value := range input.Addresses {
+	for _, value := range rawAddresses {
 		value = strings.TrimSpace(value)
 		if value == "" {
 			continue
 		}
 		addr, err := netip.ParseAddr(value)
 		if err != nil {
-			return nil, invalid("addresses", "Use only literal IP addresses for the main node's DNS record.")
+			return "", nil, invalid("addresses", "Use only literal IP addresses for the main node's DNS record.")
 		}
 		value = addr.Unmap().String()
 		if !seen[value] {
@@ -1369,8 +1402,7 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 		}
 	}
 	sort.Strings(addresses)
-	input.Addresses = addresses
-	return &input, nil
+	return name, addresses, nil
 }
 
 // ValidateDomain checks a public DNS name such as app.example.com.

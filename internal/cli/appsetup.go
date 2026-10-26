@@ -486,7 +486,7 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 	case boolFlag(cmd, "no-deploy"):
 		ans.Deploy = false
 	case interactive && !flagChanged(cmd, "no-deploy"):
-		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from the new revision; --no-deploy skips it.", true)
+		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from the new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
 		if err != nil {
 			return nil, err
 		}
@@ -769,6 +769,10 @@ func (ans *setupAnswers) environmentSpec() (platform.EnvironmentSpec, error) {
 	}
 	sort.Strings(secretNames)
 
+	var domainAddresses []string
+	if ans.Domain != "" {
+		domainAddresses = mainNodeAddresses(context.Background())
+	}
 	return platform.EnvironmentSpec{
 		Name: ans.Environment, Node: ans.Node, BuildNode: ans.BuildNode,
 		ContainerPort: containerPort, Bind: platform.DefaultBind,
@@ -778,9 +782,12 @@ func (ans *setupAnswers) environmentSpec() (platform.EnvironmentSpec, error) {
 			Node: ans.Node, HealthType: ans.HealthType, HealthPath: ans.HealthPath,
 			HealthTimeoutSeconds: ans.HealthTimeout,
 		},
-		Processes:   processes,
-		Config:      ans.Config,
-		SecretNames: secretNames,
+		Processes:       processes,
+		Config:          ans.Config,
+		SecretNames:     secretNames,
+		Domain:          ans.Domain,
+		DomainPrimary:   ans.Domain != "",
+		DomainAddresses: domainAddresses,
 	}, nil
 }
 
@@ -999,7 +1006,7 @@ func setupPlan(ans *setupAnswers, preview platform.Preview) string {
 	if ans.Deploy {
 		fmt.Fprintln(&out, "first deploy: queued from the revision")
 		if ans.Domain == "" {
-			fmt.Fprintln(&out, "warning: the first deploy has no domain; public verification will fail until a domain is added")
+			fmt.Fprintln(&out, "warning: the first deploy has no domain; the deployability gate refuses it until a primary domain is bound")
 		}
 	} else {
 		fmt.Fprintln(&out, "first deploy: not requested")
@@ -1348,7 +1355,6 @@ type setupResult struct {
 	DNSRecord            *hostDNSRecord         `json:"dns_record,omitempty"`
 	Deploy               bool                   `json:"deploy"`
 	OperationID          contract.OperationID   `json:"operation_id,omitempty"`
-	DomainOperationID    contract.OperationID   `json:"domain_operation_id,omitempty"`
 	DryRun               bool                   `json:"dry_run,omitempty"`
 	Preview              *platform.Preview      `json:"preview,omitempty"`
 	Warnings             []string               `json:"warnings,omitempty"`
@@ -1384,9 +1390,6 @@ func (r setupResult) plainText() string {
 			fmt.Fprintf(&out, "DNS record:\n  %s  %s  %s\n", r.DNSRecord.Type, r.DNSRecord.Name, r.DNSRecord.Value)
 		} else {
 			fmt.Fprintf(&out, "DNS record: point %s at the main node's public IPv4 address\n", r.Domain)
-		}
-		if r.DomainOperationID != "" {
-			fmt.Fprintf(&out, "domain operation: %s\n", r.DomainOperationID)
 		}
 	}
 	for _, warning := range r.Warnings {

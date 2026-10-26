@@ -31,6 +31,32 @@ func (s *nodeConfigStep) configPath() string {
 func (s *nodeConfigStep) sshDir() string   { return filepath.Join(s.nodeHome(), ".ssh") }
 func (s *nodeConfigStep) keysPath() string { return filepath.Join(s.sshDir(), "authorized_keys") }
 
+// ownership selects the account that owns the node configuration. The main
+// (control-plane) role has no node execution account; its services read the
+// file as the service user, so bootstrap must not try to chown it to a user it
+// never created. A node-agent role owns it as the node account.
+func (s *nodeConfigStep) ownership() (string, string) {
+	role, err := s.cfg.RoleConfig()
+	if err == nil && role.NodeAgent {
+		return s.cfg.Layout.NodeUser, s.cfg.Layout.NodeGroup
+	}
+	user, group := s.cfg.Layout.User, s.cfg.Layout.Group
+	if user == "" {
+		user = "root"
+	}
+	if group == "" {
+		group = "root"
+	}
+	return user, group
+}
+
+// managesNodeKeys reports whether forced-command operator keys belong to this
+// role. Only a node agent accepts the pinned node transport's SSH keys.
+func (s *nodeConfigStep) managesNodeKeys() bool {
+	role, err := s.cfg.RoleConfig()
+	return err == nil && role.NodeAgent
+}
+
 func (s *nodeConfigStep) config() ([]byte, error) {
 	// Preserve operator-owned keys in an existing node.json. Bootstrap owns the
 	// node name and state directory; it must not erase a privileged
@@ -70,7 +96,7 @@ func (s *nodeConfigStep) config() ([]byte, error) {
 }
 
 func (s *nodeConfigStep) authorizedKeys() ([]byte, bool, error) {
-	if s.cfg.NodeAuthorizedKeysFile == "" {
+	if !s.managesNodeKeys() || s.cfg.NodeAuthorizedKeysFile == "" {
 		return nil, false, nil
 	}
 	raw, err := os.ReadFile(s.cfg.NodeAuthorizedKeysFile) //nolint:gosec // G304: operator-provided public key file.
@@ -139,7 +165,8 @@ func (s *nodeConfigStep) Check(_ context.Context, _ engine.Runtime) (engine.Chec
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
-	owned, err := ownershipMatches(info, s.cfg.Layout.NodeUser, s.cfg.Layout.NodeGroup)
+	user, group := s.ownership()
+	owned, err := ownershipMatches(info, user, group)
 	if err != nil || !owned {
 		return incomplete("node configuration has incorrect ownership")
 	}
@@ -164,7 +191,8 @@ func (s *nodeConfigStep) Apply(_ context.Context, _ engine.Runtime, _ engine.Rep
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writeReplacingSecret(s.configPath(), config, s.cfg.Layout.NodeUser, s.cfg.Layout.NodeGroup); err != nil {
+	user, group := s.ownership()
+	if err := writeReplacingSecret(s.configPath(), config, user, group); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	keys, hasKeys, err := s.authorizedKeys()
@@ -194,7 +222,7 @@ func (s *nodeConfigStep) Diff(context.Context, engine.Runtime) ([]string, error)
 		return nil, err
 	}
 	out := simpleDiff(s.configPath(), nil, config)
-	if s.cfg.NodeAuthorizedKeysFile != "" {
+	if s.managesNodeKeys() && s.cfg.NodeAuthorizedKeysFile != "" {
 		out = append(out, "+ install forced-command keys from "+s.cfg.NodeAuthorizedKeysFile+" at "+s.keysPath())
 	}
 	return out, nil

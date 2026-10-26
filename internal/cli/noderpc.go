@@ -1023,7 +1023,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		pool.Close()
 		return api.AppService{}, nil, err
 	}
-	a := &app{secrets: &secrets.Registry{}}
+	a := &app{secrets: registry}
 	parts, resolver, err := a.startExtensions(pool)
 	if err != nil {
 		pool.Close()
@@ -1031,6 +1031,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
+		Redaction: registry,
 	})
 	if err != nil {
 		pool.Close()

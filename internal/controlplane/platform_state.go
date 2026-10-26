@@ -252,9 +252,21 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return err
 		}
-		if _, err := publishEnvironmentRevisionTx(ctx, tx, env, id, actor, "process.scaled",
-			"Scaled process "+input.Process+" to "+fmt.Sprint(input.Replicas)+" replica(s) in a new revision.", state, nil); err != nil {
+		revisionID, err := publishEnvironmentRevisionTx(ctx, tx, env, id, actor, "process.scaled",
+			"Scaled process "+input.Process+" to "+fmt.Sprint(input.Replicas)+" replica(s) in a new revision.", state, nil)
+		if err != nil {
 			return err
+		}
+		// A serving environment applies the new formation immediately through
+		// the same blue/green restart as deploycrate. The restart is queued in
+		// this transaction, keyed by the revision it applies, so a retry never
+		// starts two. Without a serving deployment the next deploy applies it.
+		if env.ServingRelease != "" && env.ServingDeploymentID != "" {
+			target := "env/" + env.App + "/" + env.Name
+			restart := platform.RestartInput{App: env.App, Environment: env.Name}
+			if err := s.submitFollowupOperationTx(ctx, tx, platform.KindRestart, target, restart, actor, "scale-restart:"+string(revisionID)); err != nil {
+				return err
+			}
 		}
 	case *platform.ConfigSetInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
@@ -324,55 +336,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			}
 			return nil
 		}
-		node, err := nodeByNameTx(ctx, tx, env.Node)
-		if err != nil {
-			return err
-		}
-		if node.Transport != "local" {
-			return contract.NewFault(contract.PreconditionFailed, "domains route only to environments on the main node for now", "Create the environment on the main node.")
-		}
-		var existingEnvironment string
-		err = tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE name=$1`, input.Domain).Scan(&existingEnvironment)
-		switch {
-		case err == nil && existingEnvironment != string(env.ID):
-			return contract.NewFault(contract.Conflict, input.Domain+" is already routed to another environment", "Remove it from that environment first, or use another hostname.")
-		case err == nil:
-			// Re-adding the same binding is idempotent; --primary promotes it and
-			// refreshes the recorded main-node addresses for DNS observation.
-			if len(input.Addresses) > 0 {
-				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET expected_addresses=$2 WHERE name=$1`, input.Domain, input.Addresses); err != nil {
-					return unavailable()
-				}
-			}
-			if input.Primary {
-				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary AND name<>$2`, env.ID, input.Domain); err != nil {
-					return unavailable()
-				}
-				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=true, desired_revision=desired_revision+1 WHERE name=$1`, input.Domain); err != nil {
-					return unavailable()
-				}
-			}
-		case errors.Is(err, pgx.ErrNoRows):
-			primary := input.Primary
-			if !primary {
-				var hasPrimary bool
-				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_domains WHERE environment_id=$1 AND is_primary)`, env.ID).Scan(&hasPrimary); err != nil {
-					return unavailable()
-				}
-				primary = !hasPrimary
-			}
-			if primary {
-				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary`, env.ID); err != nil {
-					return unavailable()
-				}
-			}
-			if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary,expected_addresses)
-                VALUES($1,$2,$3,$4)`, input.Domain, env.ID, primary, input.Addresses); err != nil {
-				return platformWriteError(err, input.Domain+" is already routed")
-			}
-		default:
-			return unavailable()
-		}
+		return s.insertDomainTx(ctx, tx, env, *input)
 	case *platform.ReleaseCreateInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
@@ -459,6 +423,9 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 	case *platform.DeployInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
+			return err
+		}
+		if err := s.checkDeployabilityTx(ctx, tx, env); err != nil {
 			return err
 		}
 		releaseID := input.ReleaseID
@@ -578,10 +545,97 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 	return nil
 }
 
+// insertDomainTx writes or promotes one domain binding. It is shared by
+// platform.domain.add and by app/environment creation, which carry the first
+// binding so it commits before any first deploy is queued.
+func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.Environment, input platform.DomainInput) error {
+	node, err := nodeByNameTx(ctx, tx, env.Node)
+	if err != nil {
+		return err
+	}
+	if node.Transport != "local" {
+		return contract.NewFault(contract.PreconditionFailed, "domains route only to environments on the main node for now", "Create the environment on the main node.")
+	}
+	var existingEnvironment string
+	err = tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE name=$1`, input.Domain).Scan(&existingEnvironment)
+	switch {
+	case err == nil && existingEnvironment != string(env.ID):
+		return contract.NewFault(contract.Conflict, input.Domain+" is already routed to another environment", "Remove it from that environment first, or use another hostname.")
+	case err == nil:
+		// Re-adding the same binding is idempotent; --primary promotes it and
+		// refreshes the recorded main-node addresses for DNS observation.
+		if len(input.Addresses) > 0 {
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET expected_addresses=$2 WHERE name=$1`, input.Domain, input.Addresses); err != nil {
+				return unavailable()
+			}
+		}
+		if input.Primary {
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary AND name<>$2`, env.ID, input.Domain); err != nil {
+				return unavailable()
+			}
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=true, desired_revision=desired_revision+1 WHERE name=$1`, input.Domain); err != nil {
+				return unavailable()
+			}
+		}
+	case errors.Is(err, pgx.ErrNoRows):
+		primary := input.Primary
+		if !primary {
+			var hasPrimary bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_domains WHERE environment_id=$1 AND is_primary)`, env.ID).Scan(&hasPrimary); err != nil {
+				return unavailable()
+			}
+			primary = !hasPrimary
+		}
+		if primary {
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary`, env.ID); err != nil {
+				return unavailable()
+			}
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary,expected_addresses)
+            VALUES($1,$2,$3,$4)`, input.Domain, env.ID, primary, input.Addresses); err != nil {
+			return platformWriteError(err, input.Domain+" is already routed")
+		}
+	default:
+		return unavailable()
+	}
+	return nil
+}
+
 func envAppID(ctx context.Context, tx pgx.Tx, app string) string {
 	var id string
 	_ = tx.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&id)
 	return id
+}
+
+// checkDeployabilityTx refuses a deployment before any build or container work
+// when the pure deployability report lists blockers. Deploycrate's gate blocks
+// on source, registry/artifact, runtime, a web process, a primary domain and a
+// managed DNS binding that is not applied. A merely unobserved record does not
+// block the first deploy; an observed wrong or proxied answer does. A source
+// deploy creates its artifact, and an explicit release is checked separately,
+// so artifact readiness is not a blocker here.
+func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platform.Environment) error {
+	dns := ""
+	if env.PrimaryDomain != "" {
+		var state string
+		err := tx.QueryRow(ctx, `SELECT dns_state FROM eregion_platform_domains
+            WHERE environment_id=$1 AND is_primary LIMIT 1`, env.ID).Scan(&state)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return unavailable()
+		}
+		dns = state
+	}
+	report := platform.EvaluateDeployability(env.Revision, platform.DeployabilityState{
+		ArtifactReady: true, PrimaryDomain: env.PrimaryDomain, DNS: dns,
+	})
+	if report.Deployable {
+		return nil
+	}
+	fault := contract.NewFault(contract.PreconditionFailed,
+		"environment is not deployable: "+strings.Join(report.Missing, ", "),
+		"Fix the listed desired state before deploying; eregion env status shows the same report.")
+	fault.Details = map[string]any{"missing": report.Missing}
+	return fault
 }
 
 func (s *Service) prepareDeploymentTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, releaseID platform.ReleaseID, action platform.DeploymentAction, revisionID platform.RevisionID, previousDeploymentID platform.DeploymentID, secretRevisions []byte) error {
@@ -1121,6 +1175,7 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.buil
     e.health_state,e.health_detail,e.health_checked_at,
     coalesce((SELECT array_agg(d.name ORDER BY d.name) FROM eregion_platform_domains d WHERE d.environment_id=e.id),'{}'),
     coalesce((SELECT d.name FROM eregion_platform_domains d WHERE d.environment_id=e.id AND d.is_primary ORDER BY d.created_at,d.name LIMIT 1),''),
+    coalesce((SELECT d.dns_state FROM eregion_platform_domains d WHERE d.environment_id=e.id AND d.is_primary ORDER BY d.created_at,d.name LIMIT 1),''),
     EXISTS(SELECT 1 FROM eregion_platform_releases rr WHERE rr.environment_id=e.id AND rr.status='ready'),
     coalesce(e.current_revision_id,''),coalesce(r.number,0),coalesce(r.operation_id,''),
     coalesce(r.actor_kind,'system'),coalesce(r.actor_subject,''),coalesce(r.operation,''),coalesce(r.summary,''),
@@ -1137,14 +1192,14 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var rawEnv, rawRefs, rawSource, rawRuntime, rawProcesses, rawConfig []byte
 	var desired, applied, serving, servingDeployment, revisionID string
 	var revisionNumber int
-	var operationID, actorKind, actorSubject, operation, summary, webhookSecretName string
+	var operationID, actorKind, actorSubject, operation, summary, webhookSecretName, primaryDNS string
 	var autoDeploy, deployIntent bool
 	var secretNames []string
 	var revisionCreated *time.Time
 	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
 		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
-		&env.PrimaryDomain, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
+		&env.PrimaryDomain, &primaryDNS, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
 		&actorKind, &actorSubject, &operation, &summary, &rawSource, &autoDeploy, &webhookSecretName,
 		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &deployIntent, &revisionCreated,
 		&env.CreatedAt, &env.UpdatedAt)
@@ -1214,7 +1269,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 		env.Processes = []platform.ProcessSpec{}
 	}
 	env.Deployability = platform.EvaluateDeployability(env.Revision, platform.DeployabilityState{
-		ArtifactReady: env.ArtifactReady, PrimaryDomain: env.PrimaryDomain,
+		ArtifactReady: env.ArtifactReady, PrimaryDomain: env.PrimaryDomain, DNS: primaryDNS,
 	})
 	return env, nil
 }
@@ -1759,8 +1814,15 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		if err := checkPreviewDeploySource(input.Environment, input.Deploy); err != nil {
 			return preview, err
 		}
+		if err := s.checkPreviewDomainAvailable(ctx, input.Environment.Domain); err != nil {
+			return preview, err
+		}
 		preview.Steps = []string{"record application", "record first environment and revision", "allocate ports"}
 		preview.Summary = "Create application " + input.Name + " with environment " + input.Environment.Name + " on node " + input.Environment.Node + "."
+		if input.Environment.Domain != "" {
+			preview.Steps = append(preview.Steps, "record the primary domain binding before any first deploy")
+			preview.Summary += " Domain " + input.Environment.Domain + " is bound in the same submission."
+		}
 		if input.Environment.BuildNode != "" && input.Environment.BuildNode != input.Environment.Node && input.Environment.Source.Kind == "git" {
 			preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
 		}
@@ -1781,8 +1843,15 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		if err := checkPreviewDeploySource(&input.EnvironmentSpec, input.Deploy); err != nil {
 			return preview, err
 		}
+		if err := s.checkPreviewDomainAvailable(ctx, input.Domain); err != nil {
+			return preview, err
+		}
 		preview.Steps = []string{"record environment", "record first desired-state revision", "allocate stable and candidate ports"}
 		preview.Summary = "Create environment " + input.Name + " on node " + input.Node + "."
+		if input.Domain != "" {
+			preview.Steps = append(preview.Steps, "record the primary domain binding before any first deploy")
+			preview.Summary += " Domain " + input.Domain + " is bound in the same submission."
+		}
 		if input.BuildNode != "" {
 			preview.Summary += " Builds run on builder node " + input.BuildNode + "."
 			if input.BuildNode != input.Node && input.Source.Kind == "git" {
@@ -1823,7 +1892,7 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Summary = "Update environment " + input.Environment + " desired state as a new immutable revision; no deploy is queued."
 	case *platform.ProcessScaleInput:
 		preview.Steps = []string{"load current revision", "change replicas", "append a new revision"}
-		preview.Summary = "Scale process " + input.Process + " to " + fmt.Sprint(input.Replicas) + " replica(s); no deploy is queued."
+		preview.Summary = "Scale process " + input.Process + " to " + fmt.Sprint(input.Replicas) + " replica(s) in a new revision; a serving environment also restarts its release through the blue/green path."
 	case *platform.ConfigSetInput, *platform.ConfigUnsetInput:
 		preview.Steps = []string{"load current revision", "change plain configuration", "append a new revision"}
 		preview.Summary = "Change plain environment configuration as a new revision; no deploy is queued."
@@ -1919,6 +1988,21 @@ func (s *Service) checkPreviewApp(ctx context.Context, name string) error {
 		return contract.NewFault(contract.NotFound, "app "+name+" was not found", "Create the app first, or choose an existing app.")
 	}
 	return nil
+}
+
+func (s *Service) checkPreviewDomainAvailable(ctx context.Context, domain string) error {
+	if domain == "" {
+		return nil
+	}
+	var environment string
+	err := s.pool.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE name=$1`, domain).Scan(&environment)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return unavailable()
+	}
+	return contract.NewFault(contract.Conflict, domain+" is already routed to another environment", "Remove it from that environment first, or use another hostname.")
 }
 
 func (s *Service) checkPreviewEnvironmentAvailable(ctx context.Context, app, environment string) error {

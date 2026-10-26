@@ -14,6 +14,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
 
@@ -40,6 +41,10 @@ type Service struct {
 	secrets SecretResolver
 	// sourceRoots is the symlink-resolved directory-build allowlist.
 	sourceRoots []string
+	// redaction holds the worker's own secrets (control DSN, vault keyring
+	// material and the secret values handed to one node step). Node events are
+	// redacted with it before they are persisted.
+	redaction *secrets.Registry
 }
 
 // SecretResolver resolves opaque environment secret references without
@@ -59,6 +64,28 @@ type EnvironmentSecretResolver interface {
 // transitional pinned refs) and returns the exact non-secret revision identities.
 type EnvironmentSecretSnapshotResolver interface {
 	ResolveEnvironmentSnapshot(ctx context.Context, app, environment string, names []string, refs map[string]string) (map[string]string, map[string]vault.RevisionRef, error)
+}
+
+// redact removes the worker's own secrets from ordinary output before it is
+// persisted. A nil registry is a no-op.
+func (s *Service) redact(text string) string {
+	if s.redaction == nil {
+		return text
+	}
+	return s.redaction.Redact(text)
+}
+
+// registerSecretValues adds the values handed to one node step (environment
+// secrets and a git read credential) to the worker's redaction registry.
+func (s *Service) registerSecretValues(values map[string]string) {
+	if s.redaction == nil || len(values) == 0 {
+		return
+	}
+	list := make([]string, 0, len(values))
+	for _, value := range values {
+		list = append(list, value)
+	}
+	s.redaction.Add(list...)
 }
 
 func (s *Service) buildSourceRoots() []string {

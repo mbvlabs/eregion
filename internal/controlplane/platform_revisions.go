@@ -109,6 +109,17 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2,updated_at=clock_timestamp() WHERE id=$1`, envID, revisionID); err != nil {
 		return "", unavailable()
 	}
+	// The optional first domain commits before the caller queues a first
+	// deploy, so the deploy's deployability gate sees the primary binding.
+	if spec.Domain != "" {
+		env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: node.Name}
+		if err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
+			App: app.Name, Environment: spec.Name, Domain: spec.Domain,
+			Primary: spec.DomainPrimary, Addresses: spec.DomainAddresses,
+		}); err != nil {
+			return "", err
+		}
+	}
 	return envID, nil
 }
 

@@ -186,7 +186,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		summary.DNSRecord = &record
 	}
 	if ans.Deploy && ans.Domain == "" {
-		summary.Warnings = append(summary.Warnings, "The first deploy has no domain; public verification will fail until a domain is added.")
+		summary.Warnings = append(summary.Warnings, "The first deploy has no domain; the deployability gate refuses it until a primary domain is bound.")
 	}
 	if dry {
 		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
@@ -206,22 +206,6 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, err
 	}
 	summary.OperationID = op.ID
-	if ans.Domain != "" {
-		envTarget, err := platform.NewEnvironmentTarget(ans.App, ans.Environment)
-		if err != nil {
-			return result{}, err
-		}
-		domainOp, err := a.submitAccepted(cmd, platform.KindDomainAdd, envTarget.String(), platform.DomainInput{
-			App: ans.App, Environment: ans.Environment, Domain: ans.Domain,
-		}, "")
-		if err != nil {
-			fault := contract.Classify(err)
-			return result{}, contract.NewFault(fault.Code,
-				"environment "+ans.App+"/"+ans.Environment+" was created, but adding domain "+ans.Domain+" failed: "+fault.Message,
-				"Add it with eregion domain add "+ans.App+" "+ans.Environment+" "+ans.Domain+"; environment operation "+string(op.ID)+".")
-		}
-		summary.DomainOperationID = domainOp.ID
-	}
 	if interactive {
 		fmt.Fprintln(os.Stderr, "")
 		rows := [][2]string{

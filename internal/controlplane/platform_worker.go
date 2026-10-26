@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -588,6 +589,95 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 	return nil
 }
 
+// Streamed node events are persisted while the step runs, in bounded batches,
+// so build logs and the deploy viewer show output live. The attempt fence in
+// appendNodeEvents still decides ownership of every batch.
+const (
+	nodeEventBatch = 16
+	nodeEventFlush = 750 * time.Millisecond
+)
+
+type nodeEventStream struct {
+	mu      sync.Mutex
+	flushMu sync.Mutex
+	service *Service
+	ctx     context.Context
+	id      contract.OperationID
+	attempt uint32
+	pending []node.Event
+	err     error
+	stopped bool
+	done    chan struct{}
+}
+
+func (s *Service) newNodeEventStream(ctx context.Context, id contract.OperationID, attempt uint32) *nodeEventStream {
+	stream := &nodeEventStream{service: s, ctx: ctx, id: id, attempt: attempt, done: make(chan struct{})}
+	go func() {
+		ticker := time.NewTicker(nodeEventFlush)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stream.done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				stream.flush()
+			}
+		}
+	}()
+	return stream
+}
+
+func (stream *nodeEventStream) add(event node.Event) {
+	stream.mu.Lock()
+	if stream.stopped {
+		stream.mu.Unlock()
+		return
+	}
+	stream.pending = append(stream.pending, event)
+	full := len(stream.pending) >= nodeEventBatch
+	stream.mu.Unlock()
+	if full {
+		stream.flush()
+	}
+}
+
+func (stream *nodeEventStream) flush() {
+	stream.flushMu.Lock()
+	defer stream.flushMu.Unlock()
+	stream.mu.Lock()
+	events := stream.pending
+	stream.pending = nil
+	stream.mu.Unlock()
+	if len(events) == 0 {
+		return
+	}
+	if err := stream.service.appendNodeEvents(stream.ctx, stream.id, stream.attempt, events); err != nil {
+		stream.mu.Lock()
+		if stream.err == nil {
+			stream.err = err
+		}
+		stream.mu.Unlock()
+	}
+}
+
+// close stops the flush ticker and persists the remainder. It returns the
+// first persistence error so the caller keeps the old contract: a successful
+// step whose events could not be recorded is not silently history-free.
+func (stream *nodeEventStream) close() error {
+	stream.mu.Lock()
+	if !stream.stopped {
+		stream.stopped = true
+		close(stream.done)
+	}
+	stream.mu.Unlock()
+	stream.flush()
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	return stream.err
+}
+
 // runStep mirrors the diagnostic worker's durable effect protocol for a generic
 // platform payload. Database acknowledgement is attempt-fenced; node status is
 // always consulted before a retry dispatches another effect.
@@ -656,11 +746,12 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 	if already {
 		return record.Result, nil
 	}
-	var events []node.Event
+	w.service.registerSecretValues(secrets)
+	events := w.service.newNodeEventStream(ctx, id, attempt)
 	response, err := tr.Call(ctx, node.Request{
 		Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec, Payload: raw, Secrets: secrets,
-	}, func(event node.Event) { events = append(events, event) })
-	if appendErr := w.service.appendNodeEvents(ctx, id, attempt, events); appendErr != nil && err == nil {
+	}, events.add)
+	if appendErr := events.close(); appendErr != nil && err == nil {
 		err = appendErr
 	}
 	if err != nil {
@@ -966,7 +1057,13 @@ func (s *Service) reconcileDeploymentCleanup(ctx context.Context, op contract.Op
 		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup was not attempted: the worker has no node resolver.")
 		return
 	}
-	tr, err := s.resolver.TransportFor(ctx, env.Node)
+	// The candidate's pinned revision records the node it ran on; the
+	// environment may already point at another node.
+	nodeName := env.Node
+	if revision != nil && revision.Runtime.Node != "" {
+		nodeName = revision.Runtime.Node
+	}
+	tr, err := s.resolver.TransportFor(ctx, nodeName)
 	if err != nil {
 		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup could not reach the application node: "+contract.Classify(err).Message)
 		return
