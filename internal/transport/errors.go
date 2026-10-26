@@ -3,6 +3,7 @@ package transport
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/node"
@@ -84,8 +85,11 @@ var ErrPermanentTransport = node.ErrPermanentTransport
 // IsPermanentTransport reports whether a transport error is permanent.
 func IsPermanentTransport(err error) bool { return node.IsPermanentTransport(err) }
 
-// tailBuffer keeps the last bytes written to it.
+// tailBuffer keeps the last bytes written to it. The SSH session copies
+// standard error from its own goroutine while a failed call reads the tail, so
+// access is serialized.
 type tailBuffer struct {
+	mu    sync.Mutex
 	limit int
 	data  []byte
 }
@@ -93,6 +97,8 @@ type tailBuffer struct {
 // Write keeps the tail of the stream. It never fails: a full buffer drops the
 // oldest bytes instead of the newest.
 func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.data = append(t.data, p...)
 	if len(t.data) > t.limit {
 		t.data = t.data[len(t.data)-t.limit:]
@@ -101,7 +107,11 @@ func (t *tailBuffer) Write(p []byte) (int, error) {
 }
 
 // String returns the bounded tail.
-func (t *tailBuffer) String() string { return string(t.data) }
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.data)
+}
 
 // detail renders the tail for an error message. It is empty when the node
 // wrote nothing to standard error.
