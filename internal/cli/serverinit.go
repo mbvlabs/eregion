@@ -273,6 +273,10 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 				r.a.secrets.Add(f.value)
 			}
 		}
+		if err := h.seal(); err != nil {
+			return summary, err
+		}
+		r.a.secrets.Add(h.passphrase)
 		if err := h.show(os.Stderr); err != nil {
 			return summary, err
 		}

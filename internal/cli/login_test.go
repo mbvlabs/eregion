@@ -9,7 +9,7 @@ func TestHandoffRecordRoundTrips(t *testing.T) {
 		{"Operator", []handoffField{{"WireGuard address", "10.78.0.100"}, {"SSH private key", "\n" + pem}}},
 		{"Control plane API", []handoffField{{"URL", "http://127.0.0.1:8080 (on the server)"}, {"Context", "main"}}},
 	}}
-	rec := parseHandoffRecord(h.record())
+	rec := parseHandoffRecord(h.body())
 	for _, c := range []struct{ section, label, want string }{
 		{"Main node", "WireGuard address", "10.78.0.1"},
 		{"Operator", "WireGuard address", "10.78.0.100"},

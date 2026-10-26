@@ -1,15 +1,16 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/bundle"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
@@ -19,21 +20,23 @@ import (
 	"golang.org/x/term"
 )
 
-// loginSpecs is `eregion login`: take the secrets record from server init on
-// another machine (paste it, or --file) and turn it into a working context.
+// loginSpecs is `eregion login`, as vaire login: decrypt the transfer bundle
+// from server init's secrets handoff with its passphrase and turn it into a
+// working context on this machine.
 func (a *app) loginSpecs() []spec {
-	meta := readMeta("Log in to a main node with its secrets record",
-		[]string{"Use the secrets record server init handed off to operate the node from this machine."},
-		[]string{"eregion login", "eregion login --file main-secrets.txt --json"})
+	meta := readMeta("Log in to a main node with its transfer bundle",
+		[]string{"Paste the transfer bundle from server init's secrets handoff (or the whole copied handoff), then its passphrase."},
+		[]string{"eregion login", "eregion login --file main-secrets.txt --passphrase-file pass.txt --json"})
 	meta.Mutating, meta.Prompts, meta.Remote = true, true, true
 	meta.DryRunReason = "Login only writes the local context store and identity files."
-	meta.InputFlags = []string{"file"}
+	meta.InputFlags = []string{"file", "passphrase-file"}
 	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed)
 	return []spec{{
 		use:  "login",
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
-			cmd.Flags().String("file", "", "Secrets record file; otherwise it is read from standard input")
+			cmd.Flags().String("file", "", "File with the transfer bundle (or the whole handoff); otherwise it is read from standard input")
+			cmd.Flags().String("passphrase-file", "", "File whose first line is the bundle passphrase; asked for in a terminal")
 		},
 		run: a.login,
 	}}
@@ -83,23 +86,46 @@ func (h handoffRecord) field(prefix, label string) string {
 
 func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	path, _ := cmd.Flags().GetString("file")
-	var raw []byte
+	passFile, _ := cmd.Flags().GetString("passphrase-file")
+	interactive := term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: file descriptors fit in int.
+	var armored []byte
 	var err error
-	interactive := path == "" && term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: file descriptors fit in int.
-	switch {
-	case path != "":
-		raw, err = os.ReadFile(expandHome(path)) //nolint:gosec // G304: the operator's record.
-	case interactive:
-		fmt.Fprintln(cmd.ErrOrStderr(), "\n"+ui.Header("eregion login", 72))
-		fmt.Fprintln(cmd.ErrOrStderr(), "Paste the secrets record from eregion server init, then press Ctrl-D.")
-		raw, err = io.ReadAll(io.LimitReader(cmd.InOrStdin(), 1<<20))
-	default:
-		raw, err = io.ReadAll(io.LimitReader(cmd.InOrStdin(), 1<<20))
+	if path != "" {
+		var raw []byte
+		if raw, err = os.ReadFile(expandHome(path)); err == nil { //nolint:gosec // G304: the operator's bundle.
+			armored, err = bundle.Read(bytes.NewReader(raw))
+		}
+	} else {
+		if interactive {
+			fmt.Fprintln(cmd.ErrOrStderr(), "\n"+ui.Header("eregion login", 72))
+			fmt.Fprintln(cmd.ErrOrStderr(), "Paste the transfer bundle (from "+bundle.Header+" to "+bundle.Footer+"), or the whole copied handoff:")
+		}
+		armored, err = bundle.Read(cmd.InOrStdin())
 	}
 	if err != nil {
-		return result{}, contract.NewFault(contract.InputRequired, "could not read the secrets record", err.Error())
+		return result{}, contract.NewFault(contract.InputRequired, "could not read the transfer bundle", err.Error())
 	}
-	rec := parseHandoffRecord(string(raw))
+	var pass string
+	switch {
+	case passFile != "":
+		raw, err := os.ReadFile(expandHome(passFile)) //nolint:gosec // G304: the operator's passphrase file.
+		if err != nil {
+			return result{}, contract.NewFault(contract.InputRequired, "could not read the passphrase file", err.Error())
+		}
+		pass = strings.TrimSpace(strings.SplitN(string(raw), "\n", 2)[0])
+	case interactive:
+		if pass, err = ui.Secret("Bundle passphrase"); err != nil {
+			return result{}, err
+		}
+	default:
+		return result{}, contract.NewFault(contract.InputRequired, "--passphrase-file is required without a terminal", "Pass the bundle passphrase in a file.")
+	}
+	a.secrets.Add(pass)
+	plain, err := bundle.Decrypt(armored, pass)
+	if err != nil {
+		return result{}, contract.NewFault(contract.ValidationFailed, err.Error(), "Check the passphrase and the bundle, then retry.")
+	}
+	rec := parseHandoffRecord(string(plain))
 	get := func(section, label string) string { return rec.field(section, label) }
 	name := get("Control plane API", "Context")
 	token := get("Control plane API", "Operator token")
@@ -113,7 +139,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	for label, value := range required {
 		if value == "" {
-			return result{}, contract.NewFault(contract.ValidationFailed, "the secrets record has no "+label, "Paste the whole record eregion server init showed.")
+			return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has no "+label, "Use the bundle from eregion server init's secrets handoff.")
 		}
 	}
 	for _, v := range []string{token, sshKey, wgKey, get("Operator", "Sudo password")} {

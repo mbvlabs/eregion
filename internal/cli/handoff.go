@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/bundle"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 )
@@ -30,12 +31,36 @@ type handoffGroup struct {
 // keeps the operator token only in the local context, so this is the copy
 // that survives losing this machine.
 type secretsHandoff struct {
-	node   string
-	groups []handoffGroup
-	saved  string
+	node       string
+	groups     []handoffGroup
+	saved      string
+	passphrase string
+	bundle     []byte
 }
 
+// seal encrypts the record into the transfer bundle with a new passphrase,
+// as vaire does; eregion login takes the bundle and the passphrase.
+func (h *secretsHandoff) seal() error {
+	pass, err := bundle.NewPassphrase()
+	if err != nil {
+		return err
+	}
+	sealed, err := bundle.Encrypt([]byte(h.body()), pass)
+	if err != nil {
+		return err
+	}
+	h.passphrase, h.bundle = pass, sealed
+	return nil
+}
+
+// record is every value, then the transfer bundle and its passphrase.
 func (h *secretsHandoff) record() string {
+	return h.body() + "\n## Transfer bundle\n" +
+		"On another machine run eregion login and paste this block.\n" +
+		"Passphrase: " + h.passphrase + "\n" + string(h.bundle)
+}
+
+func (h *secretsHandoff) body() string {
 	var b strings.Builder
 	b.WriteString("eregion secrets handoff for main node " + h.node + "\n")
 	for _, g := range h.groups {
@@ -55,8 +80,11 @@ func (h *secretsHandoff) show(w io.Writer) error {
 	resume := ui.Suspend()
 	defer resume()
 	_, _ = fmt.Fprintln(w, "\n"+ui.Header("Secrets handoff", 72))
-	_, _ = fmt.Fprintln(w, "The main node's record: the operator token, the database URL and the server's identity.")
+	_, _ = fmt.Fprintln(w, "The main node's record: the operator's keys, the operator token, the database URL and the server's identity.")
 	_, _ = fmt.Fprintln(w, "eregion doesn't show it again. Store it in your password manager.")
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, ui.Dim("Bundle passphrase")+"  "+h.passphrase)
+	_, _ = fmt.Fprintln(w, ui.Note("To log in from another machine: eregion login, paste the transfer bundle, then this passphrase."))
 	_, _ = fmt.Fprintln(w)
 	for {
 		options := [][2]string{{"Copy everything to the clipboard", "copy"}}

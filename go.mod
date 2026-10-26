@@ -22,6 +22,8 @@ require (
 )
 
 require (
+	filippo.io/age v1.3.2 // indirect
+	filippo.io/hpke v0.4.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/catppuccin/go v0.2.0 // indirect
 	github.com/charmbracelet/harmonica v0.2.0 // indirect
