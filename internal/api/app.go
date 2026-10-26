@@ -101,28 +101,28 @@ func (s AppService) SubmitDiagnostic(ctx context.Context, actor contract.Actor, 
 	})
 }
 
-// GetOperation reads one actor-scoped operation.
-func (s AppService) GetOperation(ctx context.Context, actor contract.Actor, id contract.OperationID) (contract.Operation, error) {
+// GetOperation reads one operation under the caller's authority.
+func (s AppService) GetOperation(ctx context.Context, authority operations.Authority, id contract.OperationID) (contract.Operation, error) {
 	if s.Operations == nil {
 		return contract.Operation{}, contract.NewFault(contract.Unavailable, "the operation service is not configured", "Start the node's control plane service.")
 	}
-	return s.Operations.Get(ctx, actor, id)
+	return s.Operations.Get(ctx, authority, id)
 }
 
-// OperationEvents reads one bounded event page.
-func (s AppService) OperationEvents(ctx context.Context, actor contract.Actor, cursor contract.Cursor, limit int) (operations.EventPage, error) {
+// OperationEvents reads one bounded event page under the caller's authority.
+func (s AppService) OperationEvents(ctx context.Context, authority operations.Authority, cursor contract.Cursor, limit int) (operations.EventPage, error) {
 	if s.Operations == nil {
 		return operations.EventPage{}, contract.NewFault(contract.Unavailable, "the operation service is not configured", "Start the node's control plane service.")
 	}
-	return s.Operations.Events(ctx, actor, cursor, limit)
+	return s.Operations.Events(ctx, authority, cursor, limit)
 }
 
-// CancelOperation requests cancellation at a durable safe boundary.
-func (s AppService) CancelOperation(ctx context.Context, actor contract.Actor, id contract.OperationID) (contract.Operation, error) {
+// CancelOperation requests cancellation under the caller's authority.
+func (s AppService) CancelOperation(ctx context.Context, authority operations.Authority, id contract.OperationID) (contract.Operation, error) {
 	if s.Operations == nil {
 		return contract.Operation{}, contract.NewFault(contract.Unavailable, "the operation service is not configured", "Start the node's control plane service.")
 	}
-	return s.Operations.RequestCancel(ctx, actor, id)
+	return s.Operations.RequestCancel(ctx, authority, id)
 }
 
 // ParseInventoryQueryValues validates an inventory request supplied as values
@@ -135,16 +135,16 @@ func ParseInventoryQueryValues(filters map[string][]string) (platform.InventoryQ
 // bounded operation history. It is optional so existing test doubles keep
 // compiling and a missing implementation fails closed.
 type operationListService interface {
-	ListOperations(context.Context, contract.Actor, operations.ListQuery) (operations.ListPage, error)
+	ListOperations(context.Context, operations.Authority, operations.ListQuery) (operations.ListPage, error)
 }
 
-// ListOperations reads actor-scoped operation history.
-func (s AppService) ListOperations(ctx context.Context, actor contract.Actor, query operations.ListQuery) (operations.ListPage, error) {
+// ListOperations reads operation history under the caller's authority.
+func (s AppService) ListOperations(ctx context.Context, authority operations.Authority, query operations.ListQuery) (operations.ListPage, error) {
 	service, ok := s.Operations.(operationListService)
 	if !ok {
 		return operations.ListPage{}, contract.NewFault(contract.Unavailable, "operation history is not configured", "Use a control-plane service with durable operation state.")
 	}
-	return service.ListOperations(ctx, actor, query)
+	return service.ListOperations(ctx, authority, query)
 }
 
 // Inventory reads one bounded inventory collection.

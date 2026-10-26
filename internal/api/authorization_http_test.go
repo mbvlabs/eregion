@@ -26,16 +26,16 @@ func (s *grantService) Submit(_ context.Context, sub operations.Submission) (con
 	return op, nil
 }
 
-func (s *grantService) Get(context.Context, contract.Actor, contract.OperationID) (contract.Operation, error) {
+func (s *grantService) Get(context.Context, operations.Authority, contract.OperationID) (contract.Operation, error) {
 	return s.op, nil
 }
 
-func (s *grantService) Events(_ context.Context, _ contract.Actor, cursor contract.Cursor, _ int) (operations.EventPage, error) {
+func (s *grantService) Events(_ context.Context, _ operations.Authority, cursor contract.Cursor, _ int) (operations.EventPage, error) {
 	s.eventCalls++
 	return operations.EventPage{Events: []contract.Event{}, Cursor: cursor}, nil
 }
 
-func (s *grantService) RequestCancel(context.Context, contract.Actor, contract.OperationID) (contract.Operation, error) {
+func (s *grantService) RequestCancel(context.Context, operations.Authority, contract.OperationID) (contract.Operation, error) {
 	s.cancelCalls++
 	return s.op, nil
 }

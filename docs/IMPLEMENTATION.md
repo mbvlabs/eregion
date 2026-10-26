@@ -25,8 +25,10 @@ Before the first service call the CLI compares the node build with its own and
 refuses with `node_version_mismatch` unless the node was auto-upgraded.
 Read-only RPC methods `platform.workloads` and `platform.logs` read Docker
 directly and do not need the control database; `operations.list` uses the shared
-application service. The worker-to-node step transport is a separate protocol
-boundary.
+application service. Operation reads and cancellation over node RPC carry the
+SSH-authenticated operator's authority, so they may open any operation on the
+node; the public HTTP API stays actor- and grant-scoped. The worker-to-node step
+transport is a separate protocol boundary.
 
 API and worker are supervised separately by `eregion-api.service` and
 `eregion-worker.service`; `eregion node serve` can also run workers in-process.
@@ -88,7 +90,7 @@ bin/eregion help app create --json
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
 | `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
 | `ui` | Full-screen workspace over the same inventory and node-mode action service. The graph still uses the telemetry read adapter for metrics. |
-| `operations list/get/follow/cancel` | Unfiltered list is actor-scoped; `--app`/`--environment` select the platform target regardless of submitting actor and include the environment's `build/<id>` operations, CI tokens and the push webhook. State, build and limit filters; snapshot/follow observation and explicit cancellation remain actor-scoped. |
+| `operations list/get/follow/cancel` | Over node RPC the SSH-authenticated operator has server authority: an unfiltered list shows every operation on the node newest first (bounded by `--limit`), and snapshot/follow/cancel may open any operation, including CI tokens, the GitHub webhook and other operators' submissions. `--app`/`--environment` select the platform target and include the environment's `build/<id>` operations. State and limit filters apply. The public HTTP API remains strictly actor- and grant-scoped. |
 | `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
@@ -508,7 +510,8 @@ changing this path.
   only ready or not (database and schema); not worker availability or public app
   health.
 - `/v1/operations`: submit/preview; `/{id}`, `/{id}/events`, `/{id}/cancel`:
-  actor-scoped state, bounded cursor pages and explicit cancellation.
+  actor-scoped state, bounded cursor pages and explicit cancellation. CI tokens
+  and the webhook never gain another actor's operations through this route.
 - `/v1/platform?collection=…`: bounded inventory with app/environment/node/state/
   build filters. `build=<build ID>` returns that exact build for `build logs`.
   Base collections: summary, nodes, apps, environments, revisions,

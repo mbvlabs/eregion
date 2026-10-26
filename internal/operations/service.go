@@ -32,7 +32,7 @@ type EventPage struct {
 // A terminal viewer consumes this interface, not PostgreSQL, River, or SSH.
 type Service interface {
 	Submit(context.Context, Submission) (contract.Operation, error)
-	Get(context.Context, contract.Actor, contract.OperationID) (contract.Operation, error)
-	Events(context.Context, contract.Actor, contract.Cursor, int) (EventPage, error)
-	RequestCancel(context.Context, contract.Actor, contract.OperationID) (contract.Operation, error)
+	Get(context.Context, Authority, contract.OperationID) (contract.Operation, error)
+	Events(context.Context, Authority, contract.Cursor, int) (EventPage, error)
+	RequestCancel(context.Context, Authority, contract.OperationID) (contract.Operation, error)
 }

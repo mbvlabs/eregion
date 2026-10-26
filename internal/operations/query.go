@@ -7,10 +7,12 @@ import (
 )
 
 // ListQuery is one bounded operation history read. With no app filter the
-// history is scoped to the calling actor. App selects the app record and every
-// environment below it, plus their build operations; Environment narrows that
-// to one environment. An app/environment filter also includes operations
-// submitted by CI tokens and the push webhook.
+// history follows the caller's authority: a bare actor sees its own operations,
+// while the SSH-authenticated operator channel sees every operation on the
+// node. App selects the app record and every environment below it, plus their
+// build operations; Environment narrows that to one environment. An
+// app/environment filter also includes operations submitted by CI tokens and
+// the push webhook.
 type ListQuery struct {
 	App         string
 	Environment string

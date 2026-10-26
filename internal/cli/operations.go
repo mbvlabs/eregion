@@ -11,8 +11,8 @@ func (a *app) operationsListSpec() spec {
 	meta := operationMeta("List durable operations with app, environment and state filters",
 		"eregion operations list --app api --environment production --state failed --limit 20 --json")
 	meta.WhenToUse = []string{
-		"Find accepted work and its durable state. Operation history is ordered newest first. Without --app it is scoped to the calling operator; --app/--environment also include the environment's builds and CI/webhook-submitted operations.",
-		"Use operations get, events, follow or cancel with the returned operation ID.",
+		"Find accepted work and its durable state. Operation history is ordered newest first. Without --app the operator channel shows every operation on the node, including CI tokens, the GitHub webhook and other operators; --app/--environment filters by platform target.",
+		"Use operations get, events, follow or cancel with the returned operation ID. The SSH-authenticated operator may open any operation.",
 	}
 	meta.Examples = []string{
 		"eregion operations list --limit 20 --json",

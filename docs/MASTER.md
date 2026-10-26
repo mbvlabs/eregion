@@ -304,7 +304,7 @@ Schema: embedded migrations through 013.
 | Apps and environments | Revisions with source binding, processes, config and secret names; guided and flag-only `app create`, `env create|update`; `process`, `config`; deployability gate. | Real-host qualification. |
 | Build, release, deploy | Deploy from the bound source (public or private git) or a release; build lifecycle; per-process containers with replicas; blue/green switch with public verification; rollback with pinned secret revisions; restart. | Real-host qualification. |
 | Domains | Primary and aliases; DNS, route, certificate and public state; serialized atomic Caddy writes; reconciliation and observation. | Real-host qualification. |
-| Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. | CI/webhook operations are listed but `operations get|follow` stay actor-scoped. |
+| Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Real-host qualification. |
 | CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy`; `secrets export`/`secret export` behind the factor. | Real-host qualification. |
 | Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
 | Release | vaire pipeline: cosign keyless, `install.sh`, edge on push to `master`, stable on `v*` tags, origin `eregion.mbvlabs.com`. | First edge publish; `stable` environment secrets before the first tag. |

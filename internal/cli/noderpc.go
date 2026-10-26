@@ -1059,6 +1059,10 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 	if err != nil {
 		return nil, err
 	}
+	// The SSH-authenticated operator administers the server: reads, follow and
+	// cancellation may open any operation, not only submissions by this actor.
+	// Submissions keep the operator actor for the audit trail.
+	authority := operations.OperatorAuthority(actor)
 	switch request.Method {
 	case methodTest:
 		var params rpcSubmitParams
@@ -1086,7 +1090,7 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		if err := id.Validate(); err != nil {
 			return nil, err
 		}
-		return app.GetOperation(ctx, actor, id)
+		return app.GetOperation(ctx, authority, id)
 	case methodEvents:
 		var params rpcEventsParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1099,7 +1103,7 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		if params.Limit < 1 || params.Limit > 200 {
 			return nil, contract.NewFault(contract.ValidationFailed, "event limit out of range", "Use an event limit from 1 to 200.")
 		}
-		return app.OperationEvents(ctx, actor, contract.Cursor{OperationID: id, After: params.After}, params.Limit)
+		return app.OperationEvents(ctx, authority, contract.Cursor{OperationID: id, After: params.After}, params.Limit)
 	case methodCancel:
 		var params rpcOperationParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1109,7 +1113,7 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		if err := id.Validate(); err != nil {
 			return nil, err
 		}
-		return app.CancelOperation(ctx, actor, id)
+		return app.CancelOperation(ctx, authority, id)
 	case methodInventory:
 		var params rpcInventoryParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1132,7 +1136,7 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, err
 		}
 		query := operations.ListQuery{App: params.App, Environment: params.Environment, State: params.State, Limit: params.Limit}
-		return app.ListOperations(ctx, actor, query)
+		return app.ListOperations(ctx, authority, query)
 	case methodSecretSet:
 		var params rpcSecretParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {

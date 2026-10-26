@@ -49,6 +49,13 @@ func (a Actor) Validate() error {
 	return nil
 }
 
+// OperationAuthority makes a server-resolved Actor an actor-scoped operation
+// authority: it may open only operations it submitted. The SSH-authenticated
+// operator channel widens this through operations.OperatorAuthority.
+func (a Actor) OperationAuthority() (Actor, bool) {
+	return a, false
+}
+
 type State string
 
 const (

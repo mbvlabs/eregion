@@ -177,14 +177,21 @@ func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contra
 	return op, nil
 }
 
-func (s *Service) Get(ctx context.Context, actor contract.Actor, id contract.OperationID) (contract.Operation, error) {
-	if err := actor.Validate(); err != nil {
+func (s *Service) Get(ctx context.Context, authority operations.Authority, id contract.OperationID) (contract.Operation, error) {
+	actor, all, err := operations.ResolveAuthority(authority)
+	if err != nil {
 		return contract.Operation{}, err
 	}
 	if err := id.Validate(); err != nil {
 		return contract.Operation{}, err
 	}
-	op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 AND actor_kind=$2 AND actor_subject=$3", id, actor.Kind, actor.Subject))
+	statement := "SELECT " + columns + " FROM eregion_operations WHERE id=$1"
+	args := []any{id}
+	if !all {
+		statement += " AND actor_kind=$2 AND actor_subject=$3"
+		args = append(args, actor.Kind, actor.Subject)
+	}
+	op, err := scanOperation(s.pool.QueryRow(ctx, statement, args...))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return op, contract.NewFault(contract.NotFound, "operation not found", "Check the ID and authenticated identity.")
 	}
@@ -197,12 +204,12 @@ func (s *Service) Get(ctx context.Context, actor contract.Actor, id contract.Ope
 	return op, nil
 }
 
-func (s *Service) Events(ctx context.Context, actor contract.Actor, cursor contract.Cursor, limit int) (operations.EventPage, error) {
+func (s *Service) Events(ctx context.Context, authority operations.Authority, cursor contract.Cursor, limit int) (operations.EventPage, error) {
 	page := operations.EventPage{Events: []contract.Event{}, Cursor: cursor}
 	if limit < 1 || limit > 200 {
 		return page, contract.NewFault(contract.ValidationFailed, "event limit out of range", "Use an event limit from 1 to 200.")
 	}
-	op, err := s.Get(ctx, actor, cursor.OperationID)
+	op, err := s.Get(ctx, authority, cursor.OperationID)
 	if err != nil {
 		return page, err
 	}
@@ -243,8 +250,8 @@ func (s *Service) Events(ctx context.Context, actor contract.Actor, cursor contr
 	return page, nil
 }
 
-func (s *Service) RequestCancel(ctx context.Context, actor contract.Actor, id contract.OperationID) (contract.Operation, error) {
-	if _, err := s.Get(ctx, actor, id); err != nil {
+func (s *Service) RequestCancel(ctx context.Context, authority operations.Authority, id contract.OperationID) (contract.Operation, error) {
+	if _, err := s.Get(ctx, authority, id); err != nil {
 		return contract.Operation{}, err
 	}
 	return s.mutate(ctx, id, func(tx pgx.Tx, op *contract.Operation) error {

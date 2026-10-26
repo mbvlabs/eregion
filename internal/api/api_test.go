@@ -44,17 +44,17 @@ func (s *fakeService) Submit(_ context.Context, sub operations.Submission) (cont
 	s.actor = sub.Actor
 	return fakeOperation(contract.Queued), nil
 }
-func (s *fakeService) Get(_ context.Context, actor contract.Actor, _ contract.OperationID) (contract.Operation, error) {
+func (s *fakeService) Get(_ context.Context, authority operations.Authority, _ contract.OperationID) (contract.Operation, error) {
 	if s.panicOnGet {
 		panic("untrusted internal panic")
 	}
-	s.actor = actor
+	s.actor, _ = authority.OperationAuthority()
 	return fakeOperation(contract.Running), nil
 }
-func (*fakeService) Events(_ context.Context, _ contract.Actor, cursor contract.Cursor, _ int) (operations.EventPage, error) {
+func (*fakeService) Events(_ context.Context, _ operations.Authority, cursor contract.Cursor, _ int) (operations.EventPage, error) {
 	return operations.EventPage{Events: []contract.Event{}, Cursor: cursor}, nil
 }
-func (*fakeService) RequestCancel(context.Context, contract.Actor, contract.OperationID) (contract.Operation, error) {
+func (*fakeService) RequestCancel(context.Context, operations.Authority, contract.OperationID) (contract.Operation, error) {
 	return fakeOperation(contract.Cancelling), nil
 }
 

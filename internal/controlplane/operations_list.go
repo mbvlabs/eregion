@@ -8,15 +8,18 @@ import (
 	"github.com/mbvlabs/eregion/internal/operations"
 )
 
-// ListOperations reads durable operation history. Unfiltered history is scoped
-// to the calling actor. An app/environment filter selects by platform ownership
-// instead, so the environment's build stop/retry operations (target
-// build/<id>) and deploys submitted by a CI token or the GitHub webhook appear
-// beside the operator's own operations. Operation IDs remain the only handle;
-// get/follow still enforce the caller's actor scope.
-func (s *Service) ListOperations(ctx context.Context, actor contract.Actor, query operations.ListQuery) (operations.ListPage, error) {
+// ListOperations reads durable operation history. Unfiltered history follows
+// the caller's authority: a bare actor sees its own operations, while the
+// SSH-authenticated operator channel sees every operation on the node. An
+// app/environment filter selects by platform ownership instead, so the
+// environment's build stop/retry operations (target build/<id>) and deploys
+// submitted by a CI token or the GitHub webhook appear beside the operator's
+// own operations. Operation IDs remain the only handle; get/follow enforce the
+// caller's authority.
+func (s *Service) ListOperations(ctx context.Context, authority operations.Authority, query operations.ListQuery) (operations.ListPage, error) {
 	page := operations.ListPage{Items: []contract.Operation{}, Limit: query.Limit}
-	if err := actor.Validate(); err != nil {
+	actor, all, err := operations.ResolveAuthority(authority)
+	if err != nil {
 		return page, err
 	}
 	if err := query.Validate(); err != nil {
@@ -29,8 +32,10 @@ func (s *Service) ListOperations(ctx context.Context, actor contract.Actor, quer
 	statement := "SELECT " + columns + " FROM eregion_operations o WHERE 1=1"
 	args := []any{}
 	if query.App == "" {
-		statement += " AND o.actor_kind=$1 AND o.actor_subject=$2"
-		args = append(args, actor.Kind, actor.Subject)
+		if !all {
+			statement += " AND o.actor_kind=$1 AND o.actor_subject=$2"
+			args = append(args, actor.Kind, actor.Subject)
+		}
 	} else if query.Environment != "" {
 		args = append(args, "env/"+query.App+"/"+query.Environment)
 		targetFilter := fmt.Sprintf("o.target=$%d", len(args))
