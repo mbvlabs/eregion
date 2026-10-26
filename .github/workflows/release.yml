@@ -25,12 +25,12 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { goos: linux, goarch: amd64, node: true }
-          - { goos: linux, goarch: arm64, node: true }
-          - { goos: darwin, goarch: amd64, node: false }
-          - { goos: darwin, goarch: arm64, node: false }
-          - { goos: windows, goarch: amd64, node: false }
-          - { goos: windows, goarch: arm64, node: false }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,7 +43,6 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          WITH_NODE: ${{ matrix.node }}
           RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
@@ -62,14 +61,9 @@ jobs:
           go build -trimpath -ldflags "$ldflags" -o "${stage}/eregion${ext}" ./cmd/eregion
           name="eregion_${version}_${GOOS}_${GOARCH}.tar.gz"
           tar -C "$stage" -czf "dist/${name}" "eregion${ext}"
-          if [ "$WITH_NODE" = "true" ]; then
-            go build -trimpath -ldflags "$ldflags" -o "${stage}/eregion-node${ext}" ./cmd/eregion-node
-            node_name="eregion-node_${version}_linux_${GOARCH}.tar.gz"
-            tar -C "$stage" -czf "dist/${node_name}" "eregion-node${ext}"
-          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}-${{ matrix.node }}
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*.tar.gz
           if-no-files-found: error
 

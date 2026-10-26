@@ -20,7 +20,7 @@ import (
 
 // The enrollment integration tests run real control-plane workers against the
 // disposable SSH nodes of internal/sshfixture. Each fixture is a Debian 13
-// container running the real eregion-node binary behind a real sshd; the host
+// container running the real eregion binary as its node agent behind a real sshd; the host
 // tools the probe looks for (docker, pack) are small stand-ins installed per
 // node, so a node's capabilities are exactly what the test gives it.
 

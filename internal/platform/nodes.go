@@ -170,7 +170,7 @@ func normalizeNodeEnroll(target Target, raw json.RawMessage) (ActionInput, error
 	}
 	input.HostKey, input.HostKeyFingerprint = key, fingerprint
 	if input.IdentityFingerprint != "" && !fingerprintPattern.MatchString(input.IdentityFingerprint) {
-		return nil, invalid("identity fingerprint", "Use the SHA256:<base64> fingerprint printed by eregion-node identity.")
+		return nil, invalid("identity fingerprint", "Use the SHA256:<base64> fingerprint printed by eregion node-agent identity.")
 	}
 	hasBuilder := false
 	for _, role := range roles {

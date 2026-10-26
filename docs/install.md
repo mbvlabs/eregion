@@ -13,8 +13,8 @@ eregion help upgrade --json
 
 | Component | Supported platforms |
 | --- | --- |
-| `eregion` operator CLI / control plane | Linux (`amd64`, `arm64`), macOS (`amd64`, `arm64`), Windows (`amd64`, `arm64`) |
-| `eregion-node` | Linux only (`amd64`, `arm64`) |
+| `eregion` operator CLI | Linux (`amd64`, `arm64`), macOS (`amd64`, `arm64`), Windows (`amd64`, `arm64`) |
+| `eregion` control plane and node agent (`eregion node-agent`) | Linux only (`amd64`, `arm64`) |
 | Host bootstrap | Debian or Ubuntu on `amd64`/`arm64` |
 
 The control plane needs Linux, an external PostgreSQL 17+ database, and the
@@ -75,19 +75,18 @@ The same archive layout is used for macOS and Windows (`eregion.exe` on
 Windows). The operator CLI is a portable API client; control-plane-only commands
 (`serve`, `worker`, `system migrate`) require Linux.
 
-## Install the node binary
+## Install on a node by hand
 
-`eregion-node` is Linux-only. Install it from its own signed artifact, or let
-`eregion bootstrap` install it on a node role with `--node-binary`.
+A node runs the same `eregion` binary; the control plane reaches it as
+`eregion node-agent serve`. `eregion bootstrap` installs it on every role. By hand:
 
 ```sh
-tar -xzf eregion-node_1.1.0_linux_amd64.tar.gz -C /tmp/eregion-release eregion-node
+tar -xzf eregion_1.1.0_linux_amd64.tar.gz -C /tmp/eregion-release eregion
 sudo install -d -m 0755 /usr/local/bin
-sudo install -m 0755 /tmp/eregion-release/eregion-node /usr/local/bin/eregion-node
+sudo install -m 0755 /tmp/eregion-release/eregion /usr/local/bin/eregion
 sudo install -d -m 0700 -o eregion-node -g eregion-node /var/lib/eregion/node
 sudo install -m 0600 -o root -g root node.json /etc/eregion/node.json
-/usr/local/bin/eregion-node version
-/usr/local/bin/eregion-node version --json
+/usr/local/bin/eregion node-agent version
 ```
 
 The JSON form is also the upgrade health probe's identity check: a signed node
@@ -190,7 +189,7 @@ Flags implemented today:
 | `--operator-token-out PATH` | Required absolute output for the first operator token (mode `0600`). |
 | `--operator-token-file PATH` | Optional existing owner-only operator token input. |
 | `--automation-subject`, `--automation-scope`, `--automation-token-out` | Optional CI credential and its protected output file. |
-| `--binary PATH`, `--node-binary PATH` | Control-plane binary and the node binary for application/builder roles. |
+| `--binary PATH` | The eregion binary to install on the host (every role); defaults to the running executable. |
 | `--api-listen ADDR` | Literal `host:port`; non-loopback listeners require TLS. |
 | `--api-tls-cert`, `--api-tls-key` | TLS certificate and key sources. |
 | `--node-authorized-keys-file PATH` | SSH public keys for the node account (access-changing). |
@@ -203,10 +202,10 @@ Role notes:
 - `main` requires the external database URL and `--operator-token-out`; it
   installs the control-plane service units, applies migrations, and starts
   workers/API only after readiness. It also installs `git` for builds.
-- `application` and `builder` require `--node-binary` (and a builder-capable
-  host for Buildpacks builds). They install the node service, node account,
+- `application` and `builder` install the eregion binary as the node agent (a
+  builder needs a builder-capable host for Buildpacks builds), the node account,
   `wireguard-tools`, and `git` on a builder.
-- `telemetry` requires `--node-binary` and installs Docker, Compose, and the node
+- `telemetry` installs the eregion binary, Docker, Compose, and the node
   account on a dedicated host. It does not install a collector, storage, or any
   telemetry stack, and it is never co-located with the control plane.
 - Access-changing plans (non-loopback API, node authorized keys, TLS material)

@@ -1,31 +1,28 @@
-// Command eregion-node is the node-side binary. It owns the node's private
-// state directory and answers node requests; it never talks to a database and
-// never holds a credential for the control plane.
+// Package nodeagent is the node side of the eregion binary, reached as
+// "eregion node-agent". It owns the node's private state directory and answers
+// node requests; it never talks to a database and never holds a credential for
+// the control plane.
 //
-// The control plane reaches it over SSH by running "eregion-node serve" and
+// The control plane reaches it over SSH by running "eregion node-agent serve" and
 // exchanging the node protocol over the channel's standard input and output.
 // The request never appears in a command line, so nothing an operator or an
 // operation supplies is ever interpreted by a shell.
-package main
+package nodeagent
 
 import (
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/noded"
 )
 
-func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
-}
-
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+// Run executes one node-agent subcommand and returns the process exit code.
+func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: eregion-node <serve|task|compact|identity|version>")
+		fmt.Fprintln(stderr, "usage: eregion node-agent <serve|task|compact|identity|version>")
 		return 2
 	}
 	switch args[0] {
@@ -49,7 +46,7 @@ func report(stderr io.Writer, err error) int {
 	if err == nil {
 		return 0
 	}
-	fmt.Fprintf(stderr, "eregion-node: %v\n", err)
+	fmt.Fprintf(stderr, "eregion node-agent: %v\n", err)
 	return 1
 }
 
@@ -75,7 +72,7 @@ func versionCommand(args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, string(raw))
 		return nil
 	}
-	fmt.Fprintf(stdout, "eregion-node %s\ncommit: %s\nplatform: %s/%s\ngo: %s\ndirty: %t\n",
+	fmt.Fprintf(stdout, "eregion node-agent %s\ncommit: %s\nplatform: %s/%s\ngo: %s\ndirty: %t\n",
 		info.Version, info.Commit, info.OS, info.Arch, info.Go, info.Dirty)
 	return nil
 }

@@ -304,7 +304,7 @@ func TestSSHTransportRejectsACommandWithShellMetacharacters(t *testing.T) {
 		User:         "eregion",
 		IdentityFile: server.identity,
 		HostKeys:     NewHostKeys(),
-		Command:      "eregion-node serve; rm -rf /",
+		Command:      "eregion node-agent serve; rm -rf /",
 	})
 	if err == nil {
 		t.Fatal("a command with shell metacharacters was accepted")

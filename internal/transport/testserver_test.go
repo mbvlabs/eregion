@@ -261,7 +261,7 @@ func (s *testServer) transport(t *testing.T, keys *HostKeys) *SSHTransport {
 		User:         "eregion",
 		IdentityFile: s.identity,
 		HostKeys:     keys,
-		Command:      "eregion-node serve",
+		Command:      "eregion node-agent serve",
 		ExpectedNode: s.config.Node,
 		Timeout:      10 * time.Second,
 	}

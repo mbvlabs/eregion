@@ -26,7 +26,6 @@ func TestStatusReadsStateAndJournalWithoutApplyInputs(t *testing.T) {
 	cfg.DatabaseURL = ""
 	cfg.OperatorTokenOut = ""
 	cfg.BinaryPath = ""
-	cfg.NodeBinaryPath = ""
 
 	state := State{
 		Schema: stateSchema, Node: "main", Role: RoleMain, ConfigHash: "fixture-hash",
@@ -70,7 +69,7 @@ func TestStatusReadsStateAndJournalWithoutApplyInputs(t *testing.T) {
 
 func TestStatusWithoutStateIsNotAnError(t *testing.T) {
 	cfg := fixture(t, RoleMain)
-	cfg.DatabaseURL, cfg.OperatorTokenOut, cfg.BinaryPath, cfg.NodeBinaryPath = "", "", "", ""
+	cfg.DatabaseURL, cfg.OperatorTokenOut, cfg.BinaryPath = "", "", ""
 	runner, err := NewStatusRunner(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -91,7 +90,7 @@ func TestNodeConfigPreservesOperatorWireGuardHelper(t *testing.T) {
   "node": "old-name",
   "state_dir": "/old/state",
   "wireguard_apply": ["/usr/local/sbin/eregion-wg-apply"],
-  "task_command": ["/usr/local/bin/eregion-node", "task"]
+  "task_command": ["/usr/local/bin/eregion", "node-agent", "task"]
 }`, 0o600)
 	step := &nodeConfigStep{cfg: cfg}
 	raw, err := step.config()

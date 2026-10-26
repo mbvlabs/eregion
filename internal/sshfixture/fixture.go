@@ -583,7 +583,7 @@ func ensureImage(ctx context.Context, root, image string) (string, error) {
 	if err := os.WriteFile(filepath.Join(context, "Dockerfile"), dockerfile, 0o600); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(filepath.Join(context, "eregion-node"), binary, 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(context, "eregion"), binary, 0o700); err != nil {
 		return "", err
 	}
 	build := exec.CommandContext(ctx, "docker", "build", "-t", tag, context)
@@ -610,15 +610,15 @@ func pruneOldImages(ctx context.Context, repository, keep string) {
 	}
 }
 
-// buildNodeBinary builds the node binary for the fixture image.
+// buildNodeBinary builds the eregion binary the fixture image runs as its node agent.
 func buildNodeBinary(ctx context.Context, root string) ([]byte, error) {
-	directory, err := os.MkdirTemp("", "eregion-node-build")
+	directory, err := os.MkdirTemp("", "eregion-fixture-build")
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = os.RemoveAll(directory) }()
-	binary := filepath.Join(directory, "eregion-node")
-	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/eregion-node")
+	binary := filepath.Join(directory, "eregion")
+	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/eregion")
 	build.Dir = root
 	if output, err := build.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("build the node binary: %v: %s", err, output)

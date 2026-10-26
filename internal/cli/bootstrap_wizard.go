@@ -20,7 +20,7 @@ import (
 var bootstrapWizardFlagNames = []string{
 	"role", "node", "database-url-file", "operator-token-out",
 	"automation-subject", "automation-scope", "automation-token-out",
-	"binary", "node-binary", "api-listen", "api-tls-cert", "api-tls-key",
+	"binary", "api-listen", "api-tls-cert", "api-tls-key",
 	"node-authorized-keys-file", "worker-concurrency", "commit-confirm-seconds",
 }
 
@@ -40,8 +40,7 @@ func bootstrapWizardFields(cfg host.Config) []wizardField {
 		{Key: "automation-subject", Label: "Optional automation subject", Value: cfg.AutomationSubject},
 		{Key: "automation-scope", Label: "Optional automation scopes (comma separated)", Value: strings.Join(cfg.AutomationScopes, ",")},
 		{Key: "automation-token-out", Label: "Optional automation token output", Value: cfg.AutomationTokenOut},
-		{Key: "binary", Label: "Control-plane binary source", Value: cfg.BinaryPath},
-		{Key: "node-binary", Label: "Node binary source (node roles)", Value: cfg.NodeBinaryPath},
+		{Key: "binary", Label: "eregion binary source (defaults to this executable)", Value: cfg.BinaryPath},
 		{Key: "api-listen", Label: "API listener", Value: cfg.APIListen, Required: true},
 		{Key: "api-tls-cert", Label: "API TLS certificate source", Value: cfg.APITLSCert},
 		{Key: "api-tls-key", Label: "API TLS private key source", Value: cfg.APITLSKey},

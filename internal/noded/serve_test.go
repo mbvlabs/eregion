@@ -234,7 +234,7 @@ func TestCompactStillBoundsTheJournal(t *testing.T) {
 // the running binary, not whatever the argument vector happens to name.
 func TestTaskCommandUsesTheExecutablePath(t *testing.T) {
 	original := os.Args[0]
-	os.Args[0] = "eregion-node"
+	os.Args[0] = "eregion"
 	t.Cleanup(func() { os.Args[0] = original })
 	config := Config{Node: "test-node", StateDir: t.TempDir(), Path: "/etc/eregion/node.json"}
 	command := config.taskCommand()
@@ -245,7 +245,7 @@ func TestTaskCommandUsesTheExecutablePath(t *testing.T) {
 	if command[0] != executable {
 		t.Fatalf("the task command does not start the running binary: %v", command)
 	}
-	if len(command) != 4 || command[1] != "task" || command[2] != "--config" || command[3] != config.Path {
+	if len(command) != 5 || command[1] != "node-agent" || command[2] != "task" || command[3] != "--config" || command[4] != config.Path {
 		t.Fatalf("the task command does not pass the configuration: %v", command)
 	}
 }
@@ -264,7 +264,7 @@ func TestTaskCommandKeepsAConfiguredCommand(t *testing.T) {
 // program and never something the search path resolves.
 func TestConfigRejectsAnUnsafeTaskCommand(t *testing.T) {
 	for _, command := range [][]string{
-		{"eregion-node"},
+		{"eregion"},
 		{"", "task"},
 		{"/bin/true", ""},
 		{"/bin/true", "bad\nargument"},

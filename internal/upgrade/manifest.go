@@ -141,7 +141,7 @@ func (m Manifest) Validate() error {
 		arch   string
 	}
 	seen := map[key]bool{}
-	seenName := map[string]bool{}
+	seenName := map[string]Artifact{}
 	for _, artifact := range m.Artifacts {
 		if err := artifact.validate(); err != nil {
 			return err
@@ -150,10 +150,12 @@ func (m Manifest) Validate() error {
 		if seen[k] {
 			return contract.NewFault(contract.ValidationFailed, "release manifest has duplicate target/os/arch artifacts", "Publish exactly one artifact per platform.")
 		}
-		if seenName[artifact.Name] {
-			return contract.NewFault(contract.ValidationFailed, "release manifest repeats an artifact name", "Give every artifact a unique file name.")
+		// One eregion archive serves both the operator and node targets of a
+		// platform; a repeated name must describe exactly that same archive.
+		if prior, ok := seenName[artifact.Name]; ok && !sameArchive(prior, artifact) {
+			return contract.NewFault(contract.ValidationFailed, "release manifest repeats an artifact name for a different archive", "Give every distinct archive a unique file name.")
 		}
-		seen[k], seenName[artifact.Name] = true, true
+		seen[k], seenName[artifact.Name] = true, artifact
 	}
 	return nil
 }
@@ -346,4 +348,8 @@ func LoadPublicKey(path string) (ed25519.PublicKey, error) {
 		return nil, contract.NewFault(contract.ValidationFailed, "trusted release public key file could not be read", "Check EREGION_UPGRADE_PUBLIC_KEY_FILE.")
 	}
 	return ParsePublicKey(string(raw))
+}
+
+func sameArchive(a, b Artifact) bool {
+	return a.OS == b.OS && a.Arch == b.Arch && a.URL == b.URL && a.Size == b.Size && a.SHA256 == b.SHA256 && a.Entry == b.Entry
 }

@@ -97,9 +97,6 @@ func main() {
 			fail(fmt.Errorf("archive %s could not be hashed: %w", name, err))
 		}
 		entry := "eregion"
-		if spec.target == upgrade.TargetNode {
-			entry = "eregion-node"
-		}
 		if spec.goos == "windows" {
 			entry += ".exe"
 		}
@@ -107,7 +104,10 @@ func main() {
 			Name: name, Target: spec.target, OS: spec.goos, Arch: spec.arch, Entry: entry,
 			URL: strings.TrimRight(*baseURL, "/") + "/" + name, Size: info.Size(), SHA256: sha,
 		})
-		checksumLines = append(checksumLines, sha+"  "+name)
+		if spec.target == upgrade.TargetOperator {
+			// The node target reuses the operator archive; list it once.
+			checksumLines = append(checksumLines, sha+"  "+name)
+		}
 	}
 	if err := manifest.Sign(private); err != nil {
 		fail(err)
@@ -165,12 +165,10 @@ func signingKey(envName, path string) (ed25519.PrivateKey, error) {
 	return upgrade.ParsePrivateKey(os.Getenv(envName))
 }
 
+// archiveName is the same for both targets: one eregion binary serves the
+// operator CLI, the control plane, and the node agent.
 func archiveName(version string, spec artifactSpec) string {
-	base := "eregion"
-	if spec.target == upgrade.TargetNode {
-		base = "eregion-node"
-	}
-	return fmt.Sprintf("%s_%s_%s_%s.tar.gz", base, version, spec.goos, spec.arch)
+	return fmt.Sprintf("eregion_%s_%s_%s.tar.gz", version, spec.goos, spec.arch)
 }
 
 func fileDigest(path string) (string, error) {

@@ -242,8 +242,9 @@ dry run and apply the new plan.
 
 `.github/workflows/release.yml` runs on `v*` tags and manual dispatches. It:
 
-1. builds `eregion` and `eregion-node` with `-trimpath` and version metadata for
-   Linux, macOS, and Windows `amd64`/`arm64` (node archives are Linux-only);
+1. builds the one `eregion` binary with `-trimpath` and version metadata for
+   Linux, macOS, and Windows `amd64`/`arm64`; the manifest's node entries reuse
+   the Linux archives;
 2. packages one binary per `.tar.gz` with a stable entry name;
 3. writes `SHA256SUMS` for integrity listing;
 4. runs `internal/upgrade/releasegen`, which recomputes artifact sizes and

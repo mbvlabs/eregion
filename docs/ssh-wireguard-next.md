@@ -43,7 +43,7 @@ What shipped:
   through a `Dialer` seam (a `net.Conn` source), verifies a pinned host key
   before any request, runs the fixed node command, and exchanges the existing
   request/event/response shapes.
-- `internal/noded` and `cmd/eregion-node`: the node binary. It answers node
+- `internal/noded` and `internal/nodeagent`: the node agent, run as `eregion node-agent`. It answers node
   requests over the channel's standard input and output, dispatches by step name
   through a step registry, and runs each step as a **detached** task that
   outlives its caller. The request reaches the task through an inherited pipe,
@@ -64,7 +64,7 @@ What shipped:
   `known_hosts` markers are honoured: a revoked key is refused, a
   cert-authority line is skipped, and a hashed entry matches its host.
 - Node-side journal compaction with a retention policy, after every task and
-  through the explicit `eregion-node compact` command. A serving process never
+  through the explicit `eregion node-agent compact` command. A serving process never
   compacts, because every status poll starts a new one.
 - A machine-readable error code on the terminal state of a failed operation.
 

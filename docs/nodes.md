@@ -33,7 +33,7 @@ control plane deliberately never needs root on a node):
 1. Create an unprivileged account, for example `eregion`, with the control
    plane's public SSH key in `authorized_keys`. No sudo, no agent forwarding, no
    PTY (see the SSH plan).
-2. Install `eregion-node` at `/usr/local/bin/eregion-node` and write
+2. Install `eregion` at `/usr/local/bin/eregion` (it answers `eregion node-agent serve`) and write
    `/etc/eregion/node.json` (owned by the account, mode 0600):
 
    ```json
@@ -51,7 +51,7 @@ control plane deliberately never needs root on a node):
    packages (`git` for `main`/`builder`, `wireguard-tools` for node roles,
    `docker-compose` for `telemetry`) but never a telemetry stack.
 4. Optional but recommended: print the node's identity fingerprint and verify it
-   out of band: `eregion-node identity --config /etc/eregion/node.json` prints
+   out of band: `eregion node-agent identity --config /etc/eregion/node.json` prints
    `SHA256:...` and creates the key if needed. Also verify the host key
    (`ssh-keyscan -t ed25519 host`, compare with the console/provider).
 

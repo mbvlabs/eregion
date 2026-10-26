@@ -76,7 +76,7 @@ attempt produced the effect.
 
 The journal is an index and is compacted: terminal tasks older than the retention
 window are dropped unless they are among the most recent ones. The compaction runs
-after every node task and through the explicit `eregion-node compact` command. A
+after every node task and through the explicit `eregion node-agent compact` command. A
 serving process never compacts: every status poll starts a new serving process, and
 a compaction on every poll would take the journal lock away from a running step. The
 effect records are the durable exactly-once evidence and are **not** compacted
@@ -131,11 +131,11 @@ export EREGION_NODE_SSH_KNOWN_HOSTS='/etc/eregion/known_hosts'       # the pinne
 export EREGION_NODE_SSH_NODE='app-1'
 ```
 
-The node side needs the node binary and its configuration:
+The node side needs the eregion binary and its configuration:
 
 ```sh
-just build-node
-install -m 0755 bin/eregion-node /usr/local/bin/eregion-node
+just build
+install -m 0755 bin/eregion /usr/local/bin/eregion
 install -d -m 0700 -o eregion-node -g eregion-node /var/lib/eregion/node
 install -m 0600 -o root -g root node.json /etc/eregion/node.json
 ```

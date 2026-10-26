@@ -15,21 +15,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/sshfixture"
 )
 
-func buildRemoteBinaries(t *testing.T, ctx context.Context) (string, string) {
-	t.Helper()
-	dir := t.TempDir()
-	cliBinary := filepath.Join(dir, "eregion")
-	nodeBinary := filepath.Join(dir, "eregion-node")
-	for target, output := range map[string]string{"./cmd/eregion": cliBinary, "./cmd/eregion-node": nodeBinary} {
-		command := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", output, target)
-		command.Dir = "../.."
-		if raw, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("build %s: %v\n%s", target, err, raw)
-		}
-	}
-	return cliBinary, nodeBinary
-}
-
 func runRemoteCLI(t *testing.T, ctx context.Context, binary string, args ...string) []byte {
 	t.Helper()
 	command := exec.CommandContext(ctx, binary, args...)
@@ -84,13 +69,10 @@ func TestRemoteBootstrapPlanOverPinnedSSH(t *testing.T) {
 
 	dir := t.TempDir()
 	cliBinary := filepath.Join(dir, "eregion")
-	nodeBinary := filepath.Join(dir, "eregion-node")
-	for target, output := range map[string]string{"./cmd/eregion": cliBinary, "./cmd/eregion-node": nodeBinary} {
-		command := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", output, target)
-		command.Dir = "../.."
-		if raw, err := command.CombinedOutput(); err != nil {
-			t.Fatalf("build %s: %v\n%s", target, err, raw)
-		}
+	build := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", cliBinary, "./cmd/eregion")
+	build.Dir = "../.."
+	if raw, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build eregion: %v\n%s", err, raw)
 	}
 	command := exec.CommandContext(ctx, cliBinary,
 		"bootstrap", "remote",
@@ -101,7 +83,6 @@ func TestRemoteBootstrapPlanOverPinnedSSH(t *testing.T) {
 		"--role", "application",
 		"--node", "fixture",
 		"--binary", cliBinary,
-		"--node-binary", nodeBinary,
 		"--dry-run", "--json",
 	)
 	var stderr bytes.Buffer
@@ -142,7 +123,6 @@ func TestRemoteBootstrapPlanOverPinnedSSH(t *testing.T) {
 		"--role", "application",
 		"--node", "fixture",
 		"--binary", cliBinary,
-		"--node-binary", nodeBinary,
 		"--dry-run", "--json",
 	)
 	var secondErr bytes.Buffer

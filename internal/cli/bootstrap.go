@@ -203,8 +203,7 @@ func bootstrapInputFlags(cmd *cobra.Command) {
 	f.String("automation-subject", "", "Optional CI credential subject")
 	f.StringSlice("automation-scope", nil, "Explicit CI scopes")
 	f.String("automation-token-out", "", "Absolute CI token output; mode 0600")
-	f.String("binary", "", "Control-plane binary source; defaults to this executable")
-	f.String("node-binary", "", "eregion-node source for application/builder")
+	f.String("binary", "", "eregion binary to install on the host; defaults to this executable")
 	f.String("api-listen", "127.0.0.1:8080", "API listener; non-loopback apply is access-changing")
 	f.String("api-tls-cert", "", "TLS certificate source")
 	f.String("api-tls-key", "", "TLS private key source")
@@ -229,7 +228,7 @@ func (a *app) bootstrapConfig(cmd *cobra.Command) (host.Config, error) {
 	cfg.OperatorTokenFile, cfg.OperatorTokenOut = get("operator-token-file"), get("operator-token-out")
 	cfg.AutomationSubject, cfg.AutomationTokenOut = get("automation-subject"), get("automation-token-out")
 	cfg.AutomationScopes, _ = f.GetStringSlice("automation-scope")
-	cfg.BinaryPath, cfg.NodeBinaryPath = get("binary"), get("node-binary")
+	cfg.BinaryPath = get("binary")
 	cfg.APIListen, cfg.APITLSCert, cfg.APITLSKey = get("api-listen"), get("api-tls-cert"), get("api-tls-key")
 	cfg.NodeAuthorizedKeysFile = get("node-authorized-keys-file")
 	cfg.WorkerConcurrency, _ = f.GetInt("worker-concurrency")
@@ -340,7 +339,7 @@ func (a *app) remoteClient(cmd *cobra.Command) (*host.Remote, string, error) {
 func remoteBundleDir(cfg host.Config, address string) (string, error) {
 	hash := sha256.New()
 	hash.Write([]byte("eregion/remote-bundle/v1\x00" + address + "\x00" + cfg.Node + "\x00" + string(cfg.Role) + "\x00"))
-	paths := []string{cfg.BinaryPath, cfg.NodeBinaryPath}
+	paths := []string{cfg.BinaryPath}
 	if cfg.BinaryPath == "" {
 		if effective, err := cfg.EffectiveBinaryPath(); err == nil {
 			paths = append(paths, effective)
@@ -469,14 +468,6 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 			files = append(files, host.RemoteFile{Name: "eregion-source", Data: rawBinary, Mode: 0o755})
 			args = append(args, "--binary", filepath.Join(dir, "eregion-source"))
 		}
-	}
-	if cfg.NodeBinaryPath != "" {
-		nodeRaw, err := os.ReadFile(cfg.NodeBinaryPath) //nolint:gosec // G304: operator-provided node binary.
-		if err != nil {
-			return nil, nil, err
-		}
-		files = append(files, host.RemoteFile{Name: "eregion-node", Data: nodeRaw, Mode: 0o755})
-		args = append(args, "--node-binary", filepath.Join(dir, "eregion-node"))
 	}
 	if cfg.DatabaseURL != "" {
 		files = append(files, host.RemoteFile{Name: "database-url", Data: []byte(cfg.DatabaseURL + "\n"), Mode: 0o600})

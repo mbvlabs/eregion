@@ -8,6 +8,7 @@ import (
 	"io"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/nodeagent"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
@@ -15,6 +16,11 @@ import (
 // Run writes exactly one envelope in JSON mode, including parse/help failures,
 // except for follow commands whose presenter writes its own terminal protocol.
 func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer) int {
+	// The node agent speaks the node protocol on stdin/stdout, so it bypasses
+	// the result envelope entirely.
+	if len(args) > 0 && args[0] == "node-agent" {
+		return nodeagent.Run(args[1:], in, out, stderr)
+	}
 	return run(ctx, args, in, out, stderr, &secrets.Registry{})
 }
 

@@ -190,7 +190,7 @@ func (a *app) platformNodesSpec() spec {
 					cmd.Flags().String("host-key", "", "Pinned SSH host public key, one authorized_keys line (from ssh-keyscan; verify it out of band)")
 					cmd.Flags().String("host-key-file", "", "File holding the pinned SSH host public key")
 					cmd.Flags().String("host-key-fingerprint", "", "Optional SHA256:... fingerprint that must match the host key")
-					cmd.Flags().String("identity-fingerprint", "", "Optional SHA256:... fingerprint of the node identity key (eregion-node identity); pinned on first verification when omitted")
+					cmd.Flags().String("identity-fingerprint", "", "Optional SHA256:... fingerprint of the node identity key (eregion node-agent identity); pinned on first verification when omitted")
 					cmd.Flags().Int("build-concurrency", 0, "Builder nodes: concurrent builds (1–16, default 1)")
 					cmd.Flags().String("build-user", "", "Builder nodes: dedicated build account that must already exist")
 					cmd.Flags().String("private-network-endpoint", "", "Join the WireGuard private network; the node's public host:port (UDP)")

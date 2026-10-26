@@ -55,9 +55,8 @@ func fixture(t *testing.T, role Role) Config {
 	cfg.Layout.Group, cfg.Layout.NodeGroup = group.Name, group.Name
 	cfg.PlatformPath, cfg.Arch = filepath.Join(root, "os-release"), "amd64"
 	put(t, cfg.PlatformPath, "ID=debian\nVERSION_ID=13\n", 0o600)
-	cfg.BinaryPath, cfg.NodeBinaryPath = filepath.Join(root, "source-cli"), filepath.Join(root, "source-node")
+	cfg.BinaryPath = filepath.Join(root, "source-cli")
 	put(t, cfg.BinaryPath, "fixture CLI executable", 0o700)
-	put(t, cfg.NodeBinaryPath, "fixture node executable", 0o700)
 	cfg.DatabaseURL = "postgres://test:private-password@127.0.0.1/test?sslmode=disable"
 	cfg.OperatorTokenOut = filepath.Join(root, "exports/operator.token")
 	return cfg

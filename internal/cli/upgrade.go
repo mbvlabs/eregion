@@ -179,7 +179,7 @@ func upgradeManifestFlags(cmd *cobra.Command) {
 
 func upgradeTargetFlags(cmd *cobra.Command) {
 	cmd.Flags().String("target", string(upgrade.TargetOperator), "Upgrade target: operator or node")
-	cmd.Flags().String("binary", "", "Installed target binary path (defaults to this executable or its sibling eregion-node)")
+	cmd.Flags().String("binary", "", "Installed target binary path (defaults to this executable)")
 	cmd.Flags().String("state-dir", "", "Upgrade state directory (defaults to EREGION_UPGRADE_STATE_DIR)")
 }
 
@@ -279,16 +279,8 @@ func upgradeBinaryPath(cmd *cobra.Command, target upgrade.Target) (string, error
 		if err != nil {
 			return "", contract.NewFault(contract.Unavailable, "this executable's path could not be determined", "Pass --binary with the installed operator or node binary.")
 		}
-		executable, _ = filepath.EvalSymlinks(executable)
-		if target == upgrade.TargetNode {
-			name := "eregion-node"
-			if runtime.GOOS == "windows" {
-				name += ".exe"
-			}
-			path = filepath.Join(filepath.Dir(executable), name)
-		} else {
-			path = executable
-		}
+		// Operator and node targets are the same eregion binary.
+		path, _ = filepath.EvalSymlinks(executable)
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {

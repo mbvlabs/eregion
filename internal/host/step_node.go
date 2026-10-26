@@ -79,7 +79,7 @@ func (s *nodeConfigStep) authorizedKeys() ([]byte, bool, error) {
 		if !validPublicKey(line) {
 			return nil, true, fmt.Errorf("%s contains a line that is not an ssh public key", s.cfg.NodeAuthorizedKeysFile)
 		}
-		lines = append(lines, `restrict,command="/usr/local/bin/eregion-node serve" `+line)
+		lines = append(lines, `restrict,command="/usr/local/bin/eregion node-agent serve" `+line)
 	}
 	if len(lines) == 0 {
 		return nil, true, fmt.Errorf("%s contains no public keys", s.cfg.NodeAuthorizedKeysFile)

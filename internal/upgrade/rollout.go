@@ -127,11 +127,10 @@ func BuildRolloutPlan(m Manifest, env Environment, database DatabasePlan, invent
 		},
 		{
 			Order: 4, Stage: "nodes", Name: "Roll node agents last",
-			Action: "Replace eregion-node on one node at a time and restart only that node service. Nodes must speak the release's node protocol; keep the control plane and nodes on the same protocol version before accepting new work on a node.",
+			Action: "Replace the eregion binary on one node at a time; the node agent starts per SSH session, so no service restarts. Nodes must speak the release's node protocol; keep the control plane and nodes on the same protocol version before accepting new work on a node.",
 			Commands: []string{
 				fmt.Sprintf("eregion upgrade apply %s --target node --confirm TOKEN", manifest),
-				"systemctl restart eregion-node.service",
-				"eregion-node version",
+				"eregion node-agent version",
 			},
 			Verify: []string{
 				"the node process starts and reports its identity",

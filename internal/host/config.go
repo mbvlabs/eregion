@@ -116,10 +116,9 @@ type Config struct {
 	// the new access state live before a detached watchdog reverts it.
 	CommitConfirmSeconds int `json:"commit_confirm_seconds,omitempty"`
 
-	// BinaryPath is the eregion CLI/API binary. NodeBinaryPath is the
-	// eregion-node binary for application and builder roles.
-	BinaryPath     string `json:"binary_path,omitempty"`
-	NodeBinaryPath string `json:"node_binary_path,omitempty"`
+	// BinaryPath is the eregion binary installed on every role. It defaults to
+	// the running executable.
+	BinaryPath string `json:"binary_path,omitempty"`
 
 	// NodeAuthorizedKeysFile optionally installs forced-command SSH keys for
 	// the node account. Key distribution and enrollment identity remain the
@@ -237,9 +236,6 @@ func (c Config) Validate() error {
 		if c.Layout.NodeUser == "" || c.Layout.NodeGroup == "" {
 			return contract.NewFault(contract.ValidationFailed, "node roles require a node account and group", "Use the default eregion-node execution identity.")
 		}
-		if c.NodeBinaryPath == "" {
-			return contract.NewFault(contract.InputRequired, "the eregion-node binary is required for a node role", "Supply --node-binary; build it with just build-node.")
-		}
 	}
 	if role.ControlPlane {
 		if _, err := c.EffectiveBinaryPath(); err != nil {
@@ -328,7 +324,6 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 		RegistryListen     string   `json:"registry_listen"`
 		CommitConfirm      int      `json:"commit_confirm_seconds"`
 		BinaryPath         string   `json:"binary_path"`
-		NodeBinaryPath     string   `json:"node_binary_path"`
 		NodeAuthorizedKeys string   `json:"node_authorized_keys"`
 	}
 	scopes := append([]string(nil), c.AutomationScopes...)
@@ -339,8 +334,8 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 		AutomationScopes: scopes, AutomationTokenOut: c.AutomationTokenOut,
 		APIListen: c.APIListen, APITLSCert: c.APITLSCert, APITLSKey: c.APITLSKey,
 		WorkerConcurrency: c.WorkerConcurrency, RegistryListen: c.RegistryListen,
-		CommitConfirm: c.CommitConfirmSeconds,
-		BinaryPath:    c.BinaryPath, NodeBinaryPath: c.NodeBinaryPath,
+		CommitConfirm:      c.CommitConfirmSeconds,
+		BinaryPath:         c.BinaryPath,
 		NodeAuthorizedKeys: c.NodeAuthorizedKeysFile,
 	}
 	return json.Marshal(value)
@@ -357,12 +352,12 @@ func (c Config) ConfigHash() (string, error) {
 	hash.Write([]byte("eregion/host/config/v1\x00"))
 	hash.Write(raw)
 	binaryPath := c.BinaryPath
-	if binaryPath == "" && c.Role == RoleMain {
+	if binaryPath == "" {
 		if executable, err := c.EffectiveBinaryPath(); err == nil {
 			binaryPath = executable
 		}
 	}
-	for _, path := range []string{binaryPath, c.NodeBinaryPath, c.APITLSCert, c.APITLSKey, c.NodeAuthorizedKeysFile, c.OperatorTokenFile} {
+	for _, path := range []string{binaryPath, c.APITLSCert, c.APITLSKey, c.NodeAuthorizedKeysFile, c.OperatorTokenFile} {
 		if path == "" {
 			continue
 		}

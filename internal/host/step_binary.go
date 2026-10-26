@@ -20,25 +20,17 @@ type binaryStep struct {
 }
 
 func (s *binaryStep) ID() string                      { return "host-binary-v1" }
-func (s *binaryStep) Describe() string                { return "Install the pinned eregion/eregion-node executable" }
+func (s *binaryStep) Describe() string                { return "Install the pinned eregion executable" }
 func (s *binaryStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
 func (s *binaryStep) binaries() ([]binarySpec, error) {
-	var specs []binarySpec
-	if s.role.ControlPlane {
-		source, err := s.cfg.EffectiveBinaryPath()
-		if err != nil {
-			return nil, err
-		}
-		specs = append(specs, binarySpec{Source: source, Dest: filepath.Join(s.cfg.Layout.BinDir, "eregion")})
+	// Every role runs the same binary: the control plane serves the API and
+	// workers from it, and node roles answer "eregion node-agent serve".
+	source, err := s.cfg.EffectiveBinaryPath()
+	if err != nil {
+		return nil, err
 	}
-	if s.role.NodeAgent {
-		if s.cfg.NodeBinaryPath == "" {
-			return nil, fmt.Errorf("the node binary is required")
-		}
-		specs = append(specs, binarySpec{Source: s.cfg.NodeBinaryPath, Dest: filepath.Join(s.cfg.Layout.BinDir, "eregion-node")})
-	}
-	return specs, nil
+	return []binarySpec{{Source: source, Dest: filepath.Join(s.cfg.Layout.BinDir, "eregion")}}, nil
 }
 
 func (s *binaryStep) Inputs() ([]byte, error) {

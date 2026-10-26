@@ -182,12 +182,14 @@ func AccessChanges(cfg Config, credentials Credentials) ([]AccessChange, error) 
 		if err := compare("node-identity", node.configPath(), desired, true); err != nil {
 			return nil, err
 		}
-		if cfg.NodeBinaryPath != "" {
-			if differs, err := binaryDiffers(filepath.Join(cfg.Layout.BinDir, "eregion-node"), cfg.NodeBinaryPath); err != nil {
-				return nil, err
-			} else if differs {
-				changes = append(changes, AccessChange{Kind: "binary", Path: filepath.Join(cfg.Layout.BinDir, "eregion-node"), Detail: "installed executable differs from the supplied source"})
-			}
+		source, sourceErr := cfg.EffectiveBinaryPath()
+		if sourceErr != nil {
+			return nil, sourceErr
+		}
+		if differs, err := binaryDiffers(filepath.Join(cfg.Layout.BinDir, "eregion"), source); err != nil {
+			return nil, err
+		} else if differs {
+			changes = append(changes, AccessChange{Kind: "binary", Path: filepath.Join(cfg.Layout.BinDir, "eregion"), Detail: "installed executable differs from the supplied source"})
 		}
 	}
 	sort.Slice(changes, func(i, j int) bool {
@@ -240,7 +242,6 @@ func accessFiles(cfg Config) []string {
 		filepath.Join(cfg.Layout.SystemdDir, "eregion-registry.service"),
 		filepath.Join(cfg.Layout.ConfigDir, "registry", "config.yml"),
 		filepath.Join(cfg.Layout.BinDir, "eregion"),
-		filepath.Join(cfg.Layout.BinDir, "eregion-node"),
 	}
 	if role.NodeAgent {
 		paths = append(paths, filepath.Join(filepath.Dir(cfg.Layout.DataDir), cfg.Layout.NodeUser, ".ssh", "authorized_keys"))

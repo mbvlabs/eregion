@@ -35,15 +35,11 @@ func TestBootstrapStatusNeedsNoApplyInputs(t *testing.T) {
 func TestRemoteBundleDirIsStablePerHostAndContent(t *testing.T) {
 	dir := t.TempDir()
 	binary := filepath.Join(dir, "eregion")
-	nodeBinary := filepath.Join(dir, "eregion-node")
 	if err := os.WriteFile(binary, []byte("cli-v1"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(nodeBinary, []byte("node-v1"), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	cfg := host.DefaultConfig(host.RoleMain, "main")
-	cfg.BinaryPath, cfg.NodeBinaryPath = binary, nodeBinary
+	cfg.BinaryPath = binary
 
 	first, err := remoteBundleDir(cfg, "203.0.113.10:22")
 	if err != nil {

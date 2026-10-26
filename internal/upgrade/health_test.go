@@ -146,32 +146,27 @@ exit 0
 	}
 }
 
-func TestHealthProbeNodeRequiresIdentity(t *testing.T) {
+func TestHealthProbeNodeUsesTheEregionVersion(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the probe fixture is a POSIX shell script")
 	}
-	ok := writeProbeScript(t, "#!/bin/sh\necho 'eregion-node 1.1.0'\n")
+	// A node runs the same eregion binary, so it answers the same enveloped
+	// version --json. A development build or a different release must never
+	// satisfy a signed artifact.
+	envelope := func(version string) string {
+		return "#!/bin/sh\nif [ \"$1\" = \"version\" ] && [ \"$2\" = \"--json\" ]; then echo '{\"ok\":true,\"data\":{\"version\":\"" + version + "\"}}'; exit 0; fi\nexit 1\n"
+	}
 	probe := NewHealthProbe(ProbeConfig{Target: TargetNode, Manifest: Manifest{Version: "1.1.0"}, Timeout: 5 * time.Second})
-	if detail, err := probe(context.Background(), ok); err != nil || !strings.Contains(detail, "node version probe") {
+	if detail, err := probe(context.Background(), writeProbeScript(t, envelope("1.1.0"))); err != nil || !strings.Contains(detail, "version probe: 1.1.0") {
 		t.Fatalf("detail = %q, err = %v", detail, err)
 	}
-	bad := writeProbeScript(t, "#!/bin/sh\necho 'not-a-node'\n")
-	if _, err := probe(context.Background(), bad); err == nil {
-		t.Fatal("an unrelated binary passed the node probe")
-	}
-	// The released node binary answers version --json. A development build or a
-	// different release must never satisfy a signed node artifact.
-	jsonVersion := func(version string) string {
-		return "#!/bin/sh\nif [ \"$1\" = \"version\" ] && [ \"$2\" = \"--json\" ]; then echo '{\"version\":\"" + version + "\"}'; exit 0; fi\nexit 1\n"
-	}
-	good := writeProbeScript(t, jsonVersion("1.1.0"))
-	if detail, err := probe(context.Background(), good); err != nil || !strings.Contains(detail, "node JSON version probe: eregion-node 1.1.0") {
-		t.Fatalf("json detail = %q, err = %v", detail, err)
-	}
 	for _, wrong := range []string{"dev", "1.0.0", "9.9.9"} {
-		if _, err := probe(context.Background(), writeProbeScript(t, jsonVersion(wrong))); err == nil {
+		if _, err := probe(context.Background(), writeProbeScript(t, envelope(wrong))); err == nil {
 			t.Fatalf("node version %q was accepted for a 1.1.0 manifest", wrong)
 		}
+	}
+	if _, err := probe(context.Background(), writeProbeScript(t, "#!/bin/sh\necho 'eregion-node 1.1.0'\n")); err == nil {
+		t.Fatal("a separate node binary passed the eregion version probe")
 	}
 }
 

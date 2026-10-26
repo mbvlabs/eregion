@@ -47,7 +47,7 @@ Changes land with unit and integration tests (`just check`), then get built and
 exercised by hand on a real test host:
 
 ```sh
-just build build-node
+just build
 bin/eregion bootstrap --help   # converge a fresh Debian/Ubuntu host over pinned SSH
 ```
 

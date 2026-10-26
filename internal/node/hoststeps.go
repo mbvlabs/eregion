@@ -575,7 +575,7 @@ func (s *wireguardStep) Apply(ctx context.Context, rt engine.Runtime, report eng
 // and is not part of any step input or result.
 func RenderWireGuardConfig(privateKey string, payload WireGuardPayload) string {
 	var out strings.Builder
-	out.WriteString("# Rendered by eregion-node; edits are overwritten.\n[Interface]\n")
+	out.WriteString("# Rendered by eregion node-agent; edits are overwritten.\n[Interface]\n")
 	out.WriteString("PrivateKey = " + privateKey + "\n")
 	out.WriteString("Address = " + payload.Address + "\n")
 	fmt.Fprintf(&out, "ListenPort = %d\n", payload.ListenPort)

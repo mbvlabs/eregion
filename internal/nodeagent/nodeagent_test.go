@@ -1,4 +1,4 @@
-package main
+package nodeagent
 
 import (
 	"bytes"
@@ -15,15 +15,15 @@ func TestVersionUsesBuildMetadata(t *testing.T) {
 	buildinfo.Version = "1.2.3"
 
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"version"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+	if code := Run([]string{"version"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("version exit = %d stderr=%s", code, stderr.String())
 	}
-	if !strings.HasPrefix(stdout.String(), "eregion-node 1.2.3\n") {
+	if !strings.HasPrefix(stdout.String(), "eregion node-agent 1.2.3\n") {
 		t.Fatalf("plain version output = %q", stdout.String())
 	}
 
 	stdout.Reset()
-	if code := run([]string{"version", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
+	if code := Run([]string{"version", "--json"}, strings.NewReader(""), &stdout, &stderr); code != 0 {
 		t.Fatalf("version --json exit = %d stderr=%s", code, stderr.String())
 	}
 	var info struct {
@@ -40,7 +40,7 @@ func TestVersionUsesBuildMetadata(t *testing.T) {
 
 func TestVersionRejectsUnknownArguments(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"version", "extra"}, strings.NewReader(""), &stdout, &stderr); code == 0 {
+	if code := Run([]string{"version", "extra"}, strings.NewReader(""), &stdout, &stderr); code == 0 {
 		t.Fatal("version accepted a positional argument")
 	}
 }

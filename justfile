@@ -3,13 +3,9 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 default:
     @just --list
 
-# Build the operator CLI.
+# Build the one eregion binary: operator CLI, control plane, and node agent.
 build:
     go build -trimpath -o bin/eregion ./cmd/eregion
-
-# Build the node binary that answers node requests on a node.
-build-node:
-    go build -trimpath -o bin/eregion-node ./cmd/eregion-node
 
 # Format Go sources.
 fmt:
@@ -55,9 +51,9 @@ postgres-stop:
 # Build the disposable SSH node fixture image used by the transport tests. The
 # same image runs the node behind kernel WireGuard for the WireGuard tests.
 ssh-fixture:
-    go build -trimpath -o testdata/ssh/eregion-node ./cmd/eregion-node
+    go build -trimpath -o testdata/ssh/eregion ./cmd/eregion
     docker build -t eregion-ssh-fixture:latest testdata/ssh
-    rm -f testdata/ssh/eregion-node
+    rm -f testdata/ssh/eregion
 
 # Run the transport tests, including the disposable SSH node fixture.
 transport:

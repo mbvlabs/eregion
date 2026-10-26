@@ -20,7 +20,7 @@ import (
 // NodeCommand is the fixed command the control plane runs on a node. It
 // carries no request value: the request travels over the channel's standard
 // input, so nothing an operation supplies is ever interpreted by a shell.
-const NodeCommand = "/usr/local/bin/eregion-node serve"
+const NodeCommand = "/usr/local/bin/eregion node-agent serve"
 
 // DefaultTimeout bounds one connection and handshake.
 const DefaultTimeout = 30 * time.Second

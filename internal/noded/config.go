@@ -38,7 +38,7 @@ type Config struct {
 	// Path is where the configuration was read from.
 	Path string `json:"-"`
 	// TaskCommand starts a detached node task. It defaults to this binary's
-	// own "task" subcommand. A test fixture replaces it.
+	// own "node-agent task" subcommand. A test fixture replaces it.
 	//
 	// The command is the node operator's own local program: it is never
 	// derived from a request, and it is validated before it is executed.
@@ -136,5 +136,5 @@ func (c Config) taskCommand() []string {
 	if err != nil {
 		executable = os.Args[0]
 	}
-	return []string{executable, "task", "--config", c.Path}
+	return []string{executable, "node-agent", "task", "--config", c.Path}
 }

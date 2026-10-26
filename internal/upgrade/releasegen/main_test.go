@@ -63,7 +63,8 @@ func TestArchiveNamesMatchManifestRules(t *testing.T) {
 		t.Fatalf("operator archive = %q", operator)
 	}
 	node := archiveName("1.2.3", artifactSpec{target: upgrade.TargetNode, goos: "linux", arch: "arm64"})
-	if node != "eregion-node_1.2.3_linux_arm64.tar.gz" {
+	// The node target ships the same eregion archive.
+	if node != "eregion_1.2.3_linux_arm64.tar.gz" {
 		t.Fatalf("node archive = %q", node)
 	}
 }

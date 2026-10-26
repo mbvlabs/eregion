@@ -133,7 +133,7 @@ func (n *wgTestNode) transport(t *testing.T, dialer Dialer) *SSHTransport {
 		User:         "eregion",
 		IdentityFile: n.server.identity,
 		HostKeys:     keys,
-		Command:      "eregion-node serve",
+		Command:      "eregion node-agent serve",
 		ExpectedNode: n.server.config.Node,
 		Timeout:      10 * time.Second,
 		PollInterval: 50 * time.Millisecond,
@@ -337,7 +337,7 @@ func TestWireGuardStillPinsTheSSHHostKey(t *testing.T) {
 	keys.Pin(testNodeSSH, other)
 	client, err := NewSSHTransport(SSHConfig{
 		Address: testNodeSSH, User: "eregion", IdentityFile: wg.server.identity,
-		HostKeys: keys, Command: "eregion-node serve", Timeout: 10 * time.Second, Dialer: dialer,
+		HostKeys: keys, Command: "eregion node-agent serve", Timeout: 10 * time.Second, Dialer: dialer,
 	})
 	if err != nil {
 		t.Fatal(err)
