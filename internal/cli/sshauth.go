@@ -162,3 +162,37 @@ func hostKeyPinned(path, address string) bool {
 	keys, err := transport.LoadHostKeys(path)
 	return err == nil && keys.Pinned(address)
 }
+
+// pinnedKeyMatches reports whether key is one of the keys pinned for address.
+func pinnedKeyMatches(path, address string, key ssh.PublicKey) bool {
+	keys, err := transport.LoadHostKeys(path)
+	if err != nil {
+		return false
+	}
+	return keys.Callback(address)(address, nil, key) == nil
+}
+
+// unpinHostKey drops every known_hosts line for address.
+func unpinHostKey(path, address string) error {
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: eregion's own known_hosts.
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	host := knownhosts.Normalize(address)
+	var kept []string
+	for _, line := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && fields[0] == host {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	out := strings.Join(kept, "\n")
+	if out != "" {
+		out += "\n"
+	}
+	return os.WriteFile(path, []byte(out), 0o600)
+}

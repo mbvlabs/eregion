@@ -120,7 +120,16 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	address := net.JoinHostPort(ans.Host, ans.Port)
 	if store, err := host.LoadContextStore(""); err == nil {
 		if existing, err := store.Get(ans.Context); err == nil && existing.SSH != nil && existing.SSH.WireGuard != nil {
-			return serverInitSummary{}, contract.NewFault(contract.PreconditionFailed, "main node "+ans.Context+" is already set up and its public SSH is closed", "Use the context: eregion platform fleet. A new server needs another --context-name.")
+			if !r.interactive {
+				return serverInitSummary{}, contract.NewFault(contract.PreconditionFailed, "context "+ans.Context+" already points at a locked-down main node", "Pick another --context-name, or run in a terminal to replace it after a rebuild.")
+			}
+			ok, err := ui.YesNoDefault("Context "+ans.Context+" already points at a set-up main node. Replace it?", "Only after the server was rebuilt or reinstalled; the old context stops working.", false)
+			if err != nil {
+				return serverInitSummary{}, err
+			}
+			if !ok {
+				return serverInitSummary{}, contract.NewFault(contract.Cancelled, "kept context "+ans.Context, "Pick another --context-name for a new server.")
+			}
 		}
 	}
 	summary := serverInitSummary{Server: ans.User + "@" + address, Node: ans.Node, Context: ans.Context}
@@ -395,12 +404,42 @@ func parseTarget(v string) (user, hostPart, port string, err error) {
 // trustHostKey pins the server's key on first contact: a matching
 // --host-key-fingerprint, --accept-new-host-key, or a yes in a terminal.
 func (r *serverInit) trustHostKey(ctx context.Context, knownHosts, address string) error {
+	approved := false
 	if hostKeyPinned(knownHosts, address) {
-		if key, err := probeHostKey(ctx, address); err == nil {
+		key, err := probeHostKey(ctx, address)
+		if err != nil {
+			return contract.NewFault(contract.Unavailable, "the server does not answer on SSH", err.Error())
+		}
+		if pinnedKeyMatches(knownHosts, address, key) {
 			r.hostKey = key.Type() + " " + ssh.FingerprintSHA256(key)
 			r.hostPub = key
+			return nil
 		}
-		return nil
+		// A rebuilt server has new host keys. Replacing the pin is a decision.
+		fp := ssh.FingerprintSHA256(key)
+		want, _ := r.cmd.Flags().GetString("host-key-fingerprint")
+		accept, _ := r.cmd.Flags().GetBool("accept-new-host-key")
+		switch {
+		case want != "" && (want == fp || "SHA256:"+want == fp):
+		case accept:
+		case r.interactive:
+			r.note(ui.Warn("the host key of " + address + " changed to " + key.Type() + " " + fp))
+			ok, err := ui.YesNoDefault("Replace the pinned host key?", "Expected after a rebuild or reinstall. Otherwise someone may be intercepting the connection.", false)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return contract.NewFault(contract.Cancelled, "the changed host key was not trusted", "Check it on the provider console with ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub.")
+			}
+		default:
+			return contract.NewFault(contract.PreconditionFailed, "the host key of "+address+" changed to "+fp, "After a rebuild pass --host-key-fingerprint "+fp+" or --accept-new-host-key.")
+		}
+		for _, pinned := range []string{address, net.JoinHostPort(access.NodeAddress, "22")} {
+			if err := unpinHostKey(knownHosts, pinned); err != nil {
+				return err
+			}
+		}
+		approved = true
 	}
 	task := r.start("hostkey", "Reading the host key of "+address)
 	key, err := probeHostKey(ctx, address)
@@ -415,6 +454,7 @@ func (r *serverInit) trustHostKey(ctx context.Context, knownHosts, address strin
 	want, _ := r.cmd.Flags().GetString("host-key-fingerprint")
 	accept, _ := r.cmd.Flags().GetBool("accept-new-host-key")
 	switch {
+	case approved:
 	case want != "":
 		if want != fp && "SHA256:"+want != fp {
 			return contract.NewFault(contract.PreconditionFailed, "the host key "+fp+" does not match --host-key-fingerprint", "Check it on the provider console with ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub.")
