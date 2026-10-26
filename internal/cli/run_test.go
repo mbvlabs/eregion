@@ -129,7 +129,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 		}
 		seen[command.Path] = true
 		events := command.Path == "eregion operations follow" && command.Output == "events"
-		prompts := command.Prompts && command.Path != "eregion server init" && command.Path != "eregion login"
+		prompts := command.Prompts && command.Path != "eregion server init" && command.Path != "eregion login" && command.Path != "eregion upgrade"
 		if prompts || (command.Output != "result" && !events) {
 			t.Fatalf("advertised unimplemented behavior: %+v", command)
 		}
@@ -144,7 +144,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 			t.Fatalf("missing inherited/help flags: %+v", command)
 		}
 	}
-	for _, path := range []string{"eregion operations follow", "eregion platform submit", "eregion platform fleet", "eregion ui", "eregion secret list", "eregion upgrade check"} {
+	for _, path := range []string{"eregion operations follow", "eregion platform submit", "eregion platform fleet", "eregion ui", "eregion secret list", "eregion upgrade"} {
 		if !seen[path] {
 			t.Fatalf("missing implemented product command: %s", path)
 		}

@@ -1,9 +1,5 @@
-// Package upgrade implements signed release verification, bounded downloads,
-// compatibility checks, and atomic operator/node binary replacement with a
-// journal and explicit rollback.
+// Package upgrade plans and applies a local self-update of the eregion CLI.
 //
-// The package is deliberately narrower than a release manager: it does not
-// restart services, execute a downloaded binary, coordinate live control-plane
-// instances, or prove high availability. Apply expects a manifest that the
-// caller has already verified with Manifest.Verify.
+// It never upgrades a node: a node runs the CLI's exact build and is moved by
+// `eregion apply --auto-upgrade-nodes`, which uses FetchNodeBinary below.
 package upgrade

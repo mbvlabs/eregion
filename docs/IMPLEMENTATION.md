@@ -44,7 +44,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
 | `internal/resources`, `internal/integrations`, `internal/telemetry` | Existing optional resource/backup, DNS/access and telemetry mechanisms. |
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
-| `internal/upgrade`, `.github/workflows/release.yml` | Signed releases and one-host binary replacement. |
+| `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement only. Nodes are not upgraded by this path. |
 
 ## Current command surface
 
@@ -71,11 +71,29 @@ bin/eregion help platform environments create --json
 | `platform nodes …`, `platform inventory/submit/fleet` | Existing low-level placement, enrollment, inventory and action tools. |
 | `resources …`, `dns …`, `access …`, `logs …`, `metrics …`, `ui` | Optional subsystem surfaces; see focused references. |
 | `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
-| `upgrade …`, `commands`, `help`, `guide`, `version` | Upgrade and discovery. No `skill install` yet. |
+| `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide` and `commands` are discovery. No `skill install` yet. |
 
 The target tree is MASTER section 5. Its commands (`app create`, `env update`,
 `deploy`, `doctor`, `ssh`, …) do not exist yet; renaming is not a substitute for
 implementing the flow. `resources …` leaves the surface entirely (MASTER D19).
+
+## Release and local upgrade
+
+`internal/buildinfo` carries `Version`, `Commit`, `Channel` and the public
+`ReleaseBaseURL` (currently a documented placeholder). `internal/release`
+resolves a channel or version manifest, verifies its sigstore bundle against
+the pinned publish workflow identity, validates the manifest against the
+channel, and caches the platform binary only after its signed SHA256 matches.
+TUF/sigstore trust material is cached, not pinned in the binary.
+
+`internal/upgrade` holds the local-only plan/preflight/atomic swap. `upgrade`
+downloads the verified binary, checks its reported version and channel, and
+replaces only the running CLI. `upgrade.FetchNodeBinary` is the verified
+linux/amd64 or linux/arm64 download for the future
+`apply --auto-upgrade-nodes`; no node install or restart is implemented here.
+There is no Ed25519 manifest, trusted public-key file, rollback journal or
+one-host operator/node replacement state any more. Release mechanics are in
+[upgrades](upgrades.md).
 
 ## Database: embedded schema 010
 

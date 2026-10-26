@@ -304,7 +304,7 @@ embedded migrations through 010.
 | Secrets | Encrypted revisioned vault, write-only set/list/archive/export. | Keyring at init, per-deploy resolution (D18), `config` commands, export behind the human factor. |
 | CI | Scoped API auth; signed GitHub webhook with durable delivery deduplication, one server-wide secret and an environment-variable allowlist, building a release only. | Deploy endpoint through Caddy, D7 tokens, `protect init`; per-environment webhook URL and secret from the revision, deploying on push (D28). |
 | Observability | Operation events/follow, terminal viewer and workspace, telemetry install/read adapters. | node_exporter on WireGuard, `logs` over the operator channel, `app/env status`. |
-| Release | Ed25519-signed manifests, one-host binary replacement, tag workflow (includes Windows). | D14–D15: edge on push, `1.x`, cosign, install script, channel manifests, Linux/macOS only, `skill install`, `guide agents`. |
+| Release | Cosign keyless channel pipeline: `scripts/build-release.sh`, `sign-release.sh`, `upload-release.sh`, `install.sh`; `publish-edge.yml`, `publish-stable.yml`; `internal/release`; local-only `upgrade`; Linux/macOS only. | First bucket/origin configuration and a qualified edge/stable publish; `apply --auto-upgrade-nodes`; `skill install`, `guide agents`. |
 | Off the v1 surface | Node enrollment and placement, resources and backups, Cloudflare DNS, private-access grants, telemetry stack install. | Removed from the operator surface. Resources and backups go entirely (D19); the rest returns in its after-v1 phase. |
 
 ## 9. Work list

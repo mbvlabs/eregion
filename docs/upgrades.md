@@ -1,99 +1,125 @@
-# Signed releases and binary replacement
+# Signed releases and CLI upgrade
 
-Reference for the current code. The target is vaire's model (MASTER D14–D15):
-edge on every push to `master`, the `1.x` line with `v1.0.0-alpha.N` tags, cosign
-keyless signatures with a pinned workflow identity, `install.sh` and channel
-manifests, and `upgrade` (CLI only) followed by `apply --auto-upgrade-nodes`.
-The Ed25519 scheme below is replaced by work list row 10.
+Reference for the current code. Product decisions are MASTER D14–D15: `master`
+is the edge channel, `1.x` is the whole v1 line, and tags are
+`v1.0.0-alpha.N`, then `v1.0.0`. This replaces the earlier Ed25519 manifests,
+the one-host replacement journal and the Windows release matrix.
 
-## Trust and distribution
+## Channels
 
-`internal/upgrade` uses an **Ed25519-signed** `eregion/release/v1` manifest, not
-vaire/deploycrate's Sigstore scheme. It names version/channel/time, contract,
-node protocol, required DB schema, supported upgrade sources and artifact
-target/OS/arch/entry/URL/size/SHA-256. `Manifest.Sign` is the canonical signer:
-Go JSON struct serialization with the signature field empty. Strict loading
-refuses unknown fields/trailing JSON. Never hand-edit canonical signed content.
+| Channel | Published by | Pointer under the release origin | Installer |
+| --- | --- | --- | --- |
+| `edge` | every push to `master` | `/edge/manifest.json` | `/edge/install.sh` |
+| `stable-<major>.x` | tags on the `<major>.x` line | `/<major>.x/manifest.json` | `/<major>.x/install.sh` |
+| `stable` | the same stable tags, highest version only | `/manifest.json` | `/install.sh` |
 
-Pin a trusted public key out of band using `EREGION_UPGRADE_PUBLIC_KEY_FILE`
-(or the supported public-key value configuration). A key downloaded beside an
-artifact is not independently trusted. `SHA256SUMS` alone is not authentication.
-Verify the manifest, then signed artifact size/hash, before executing a binary.
-A first install needs a separately trusted verifier/key; there is no documented
-trustworthy shortcut that starts by executing the unverified downloaded CLI.
+A tag `v1.0.0-alpha.N` builds channel `stable-1.x`; its manifest says `stable`
+because the stable workflow signs it, and its binary's `Channel` is `stable`.
+With no `--channel`, `eregion upgrade` follows its own line (`stable-1.x` for a
+1.x binary), so a final release does not move a pinned line by accident.
+`--channel stable` follows the root pointer, and `--channel edge` follows
+`master`. A `dev` build has no channel and must pass `--channel`.
 
-Downloads use direct HTTPS without redirects/proxy environment, with response
-bounds and DNS/address safety checks. GitHub asset URLs redirect and are refused;
-use direct signed object URLs or `--artifact-dir` offline mirror. Mirror files
-still require regular-file/containment/size/hash checks. An optional
-`EREGION_UPGRADE_ALLOWED_HOSTS` allowlist restricts destinations.
+Immutable artifacts live under `/releases/<version>/<os>/<arch>/eregion`, with
+`.sha256` and `.sigstore.json` sidecars. Supported platforms are linux/amd64,
+linux/arm64, darwin/amd64 and darwin/arm64; there are no Windows builds.
 
-## Existing commands
+Each channel manifest is a small JSON file with `schemaVersion`, `channel`,
+`version`, `releaseBaseUrl` and one URL/SHA256 pair per platform. It is strict:
+unknown fields, an unexpected channel, version or base URL, a missing platform
+or a malformed digest fail closed.
 
-| Command | Current behavior |
+## Trust
+
+Signing is cosign keyless through GitHub Actions OIDC. The pinned identity is
+the workflow and ref, not a key file:
+
+- stable: `github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v<version>`
+- edge: `github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master`
+
+`internal/release` verifies the channel manifest and its bundle against that
+identity, then downloads the platform binary and checks the SHA256 bound by
+that signed manifest. `upgrade` additionally runs the downloaded binary's
+`version --output json` and refuses it unless `version` and `channel` match the
+manifest. `scripts/install.sh` also verifies each binary's own sigstore bundle.
+The digest check and smoke test catch a build or upload mismatch before
+replacement.
+
+`scripts/install.sh` performs the same manifest and binary verification with
+the pinned cosign version and checksum, then installs atomically. No public key
+or signing secret is needed by an installer or by `upgrade`. GitHub asset URLs
+redirect and are not used; the object-store origin must serve direct HTTPS.
+
+## `eregion upgrade`
+
+`eregion upgrade [--version V] [--channel C] [--dry-run] [--yes]` replaces only
+the local CLI binary:
+
+1. resolve the channel (or exact version) manifest and verify its signature;
+2. plan the from/to version and channel, warning on a downgrade, a major-line
+   change or a channel change;
+3. download and verify this platform's binary into the release cache;
+4. preflight the staged binary's version and channel;
+5. copy it beside the target, fsync, and rename atomically, keeping the
+   previous binary at `<path>.prev` when a hard link is possible.
+
+`--dry-run` stops after the plan. A terminal prompts for confirmation unless
+`--yes` is given; JSON and no-TTY use never prompt. A binary under Homebrew or
+Nix is refused. A non-writable install directory is an error that points at the
+channel installer, not a silent sudo. The result reports from/to, path,
+previous path, changed, and `nodes: "not upgraded"`.
+
+It never upgrades a node. Nodes are unchanged:
+`eregion apply --auto-upgrade-nodes` is the node path. The verified download
+half exists as `upgrade.FetchNodeBinary(ctx, channel, version, arch)`, which
+returns the linux/amd64 or linux/arm64 binary from the channel manifest. The
+`apply` command itself is work list row 3 and does not exist yet.
+
+## Release scripts and workflows
+
+| File | Purpose |
 | --- | --- |
-| `upgrade verify` | Signature/structure only; no install or compatibility claim. |
-| `upgrade check` | Verify manifest, platform/contract/protocol/schema/version compatibility and current binary facts. |
-| `upgrade plan` | Document migrate -> workers -> API -> nodes order; optional supplied inventory checks, not live rollout. |
-| `upgrade apply --dry-run` | Replacement plan and intent-bound confirmation token. |
-| `upgrade apply --confirm …` | Lock, reconcile journal, verify/stage artifact, save previous binary, replace atomically and health-probe. |
-| `upgrade rollback --dry-run/--confirm …` | Plan/restore a recorded hash-verified backup, never an arbitrary path. |
-| `upgrade status` | Binary/process/journal version facts, backups and interrupted state. |
-| `guide`, `upgrade guide` | Guide generated from current command metadata, not a complete-feature guarantee. |
+| `scripts/build-release.sh VERSION CHANNEL BASE_URL` | Four-platform build with `buildinfo` version/commit/channel ldflags, version manifest, per-platform SHA256, channel manifest and substituted `install.sh`. |
+| `scripts/sign-release.sh RELEASE_ROOT` | `cosign sign-blob` and `verify-blob` for the channel manifest, version manifest and all four binaries, pinned to `GITHUB_WORKFLOW_REF`. |
+| `scripts/upload-release.sh RELEASE_ROOT CHANNEL BUCKET ENDPOINT [all\|artifacts\|channel]` | Uploads immutable `/releases/<version>/` objects, then the channel manifest, bundle and installer last. |
+| `scripts/install.sh` | Per-channel installer template; verifies cosign, manifest, binary digest and the smoke version/channel, then installs. |
+| `internal/release/cmd/promote` | Prints `yes`/`no` for a stable channel move using the same monotonic prerelease policy; reads the current pointer fail-closed from the bucket. |
+| `.github/workflows/publish-edge.yml` | Every push to `master`: verify, build `edge-<12-hex>`, sign, upload. |
+| `.github/workflows/publish-stable.yml` | Tag `v*`: require the commit on `origin/<major>.x`, verify, build `stable-<major>.x`, sign, refuse an existing version, upload artifacts, promote the line and root pointers forward only. |
 
-Common inputs include target (`operator`/`node`), binary/state directory,
-manifest/public key, artifact mirror, current/schema version and health policy.
-Inspect current help; do not infer vaire's `upgrade --yes` or automatic node
-upgrade flags exist here.
+`just release-local VERSION CHANNEL BASE_URL` builds an unsigned tree under
+`dist/release-<channel>` for inspection. It contacts no bucket. Signing is
+only in the workflow.
 
-Compatibility checks enforce target OS/arch, envelope contract, node protocol,
-schema direction and version transition. A dev version is not evidence of a
-published release. Schema is currently embedded through 010, not the example
-version 3 from older manifests. Live database inspection must supply the actual
-current version rather than assuming it.
+The stable workflow publishes a pre-release only while that channel has no
+final release, and never replaces a final with an alpha, beta or rc. Immutable
+artifacts are never overwritten: an existing `/releases/<version>/` prefix
+fails the run.
 
-## Replacement/recovery guarantees and limits
+## Configuration placeholders
 
-State defaults under the OS state directory (`eregion/upgrade`), overridden by
-`EREGION_UPGRADE_STATE_DIR`. Production paths must be deliberate and protected:
-directories 0700, journal/metadata 0600, installed/staged binary 0755. Refuse
-symlink/nonregular/group-world-writable targets. Per-target journals/backups record
-hashes; staging/rename and directory sync are atomic on the destination filesystem.
-The exclusive upgrade lock prevents concurrent replacement.
+`internal/buildinfo.ReleaseBaseURL` is a documented placeholder
+(`https://releases.eregion.example`) until the public release origin exists.
+Both publish workflows refuse to run unless the `EREGION_RELEASE_BASE_URL`
+repository variable exactly equals it. Before the first publish, set:
 
-After install, the new binary's version must match the signed manifest. When
-configured with a DB URL, the probe also checks read-only migration readiness
-against the manifest schema. A failed probe restores the recorded previous
-binary. `--health-check=false` is an explicit opt-out, not normal qualification.
+- repository variable `EREGION_RELEASE_BASE_URL` to the bucket's public HTTPS
+  origin, and change `ReleaseBaseURL` in the same commit;
+- repository variable `EREGION_RELEASE_BUCKET` to the R2 bucket name (for
+  example the placeholder `eregion-releases`);
+- environment `edge` and environment `stable` with secrets
+  `EREGION_R2_ENDPOINT`, `EREGION_R2_ACCESS_KEY_ID` and
+  `EREGION_R2_SECRET_ACCESS_KEY`.
 
-Interrupted installing/verifying/rollback journals are reconciled under the lock
-on the **next** apply/rollback; unknown/corrupt state fails closed. Unconfirmed
-verification is not promoted to a successful install. Recompute dry-run approval
-after recovery changes target state. No background process watches it afterward.
+No endpoint, account ID, bucket credential or base URL is recorded in this
+repository. The stable environment must exist before the first tag. Tags and
+the `1.x` branch are created only when the user authorizes them.
 
-This replaces **one binary on one host**. It executes the new binary for its
-probe, but does not restart/drain the running services, confirm their application
-health, drive a fleet or guarantee failover. Restoring a binary does not roll back
-DB migrations. Migrations are forward-only; an old binary incompatible with the
-current DB cannot be made safe by calling binary rollback.
+## Qualification
 
-## Release workflow
-
-`.github/workflows/release.yml` builds on `v*` tags or explicit existing-tag
-dispatch. Current artifact matrix includes Linux/macOS/Windows amd64/arm64;
-Linux archives also supply node targets. This build matrix is broader than the
-decided Linux/macOS operator product and does not qualify macOS `server init`.
-
-The workflow builds versioned archives, runs source checks, generates/signs the
-manifest, uploads to configured S3-compatible storage and publishes convenience
-GitHub assets. Required configuration: signing secret
-`EREGION_RELEASE_SIGNING_KEY`, variables `EREGION_RELEASE_BASE_URL` and
-`EREGION_RELEASE_S3_URI`; optional endpoint/region, OIDC role or AWS credential
-secrets use the `EREGION_RELEASE_*` names in the workflow. It refuses missing
-signing/destination configuration. Inspect upload ordering before claiming
-atomic manifest-last publication; the current file loop is not that guarantee.
-
-Manual upgrade qualification includes tampered signature/artifact refusal,
-incompatible schema/protocol, unsafe file permissions, interrupted replacement/
-rollback, lock contention, failed health-probe restoration and explicit rollback.
-Record running-service results separately from binary replacement results.
+Local verification is `build-release.sh` plus inspection of the generated
+manifest and installer; signing, upload and promotion are workflow-only. A
+real release qualification installs from a channel on Linux and macOS, checks
+that a tampered manifest or binary is refused, moves between two edge builds
+with `upgrade`, verifies the previous-binary copy, and confirms that upgrade
+left the node untouched. Record that separately from the binary build.

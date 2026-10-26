@@ -1,11 +1,15 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
+commit := `git rev-parse --short=12 HEAD`
+ldflags := "-s -w -X github.com/mbvlabs/eregion/internal/buildinfo.Version=dev -X github.com/mbvlabs/eregion/internal/buildinfo.Commit=" + commit + " -X github.com/mbvlabs/eregion/internal/buildinfo.Channel=dev"
+
 default:
     @just --list
 
 # Build the one eregion binary: operator CLI, control plane, and node agent.
 build:
-    go build -trimpath -o bin/eregion ./cmd/eregion
+    mkdir -p bin
+    CGO_ENABLED=0 go build -trimpath -ldflags "{{ldflags}}" -o bin/eregion ./cmd/eregion
 
 # Format Go sources.
 fmt:
@@ -67,3 +71,7 @@ wireguard:
 
 # Check formatting, static analysis, and tests.
 check: fmt-check lint test
+
+# Build an unsigned channel tree under dist/release-<channel>.
+release-local VERSION CHANNEL BASE_URL:
+    scripts/build-release.sh "{{VERSION}}" "{{CHANNEL}}" "{{BASE_URL}}"

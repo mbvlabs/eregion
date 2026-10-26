@@ -157,7 +157,7 @@ func (a *app) specs() []spec {
 			meta: readMeta("Print binary and build information", []string{"Identify the binary before reporting issues or checking compatibility."}, []string{"eregion version", "eregion version --json"}, "eregion commands --json"),
 			run: func(_ *cobra.Command, _ []string) (result, error) {
 				info := buildinfo.Current()
-				return result{data: info, plain: fmt.Sprintf("eregion %s\ncommit: %s\nplatform: %s/%s\ngo: %s\ndirty: %t", info.Version, info.Commit, info.OS, info.Arch, info.Go, info.Dirty)}, nil
+				return result{data: info, plain: fmt.Sprintf("eregion %s\nchannel: %s\ncommit: %s\nplatform: %s/%s\ngo: %s\ndirty: %t", info.Version, info.Channel, info.Commit, info.OS, info.Arch, info.Go, info.Dirty)}, nil
 			},
 		},
 		{

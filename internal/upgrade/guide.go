@@ -30,15 +30,13 @@ type GuideCommand struct {
 	ErrorCodes  []string `json:"error_codes"`
 }
 
-// UpgradeGuide is the upgrade-specific part of the versioned guide.
+// UpgradeGuide is the release-specific part of the versioned guide.
 type UpgradeGuide struct {
-	ManifestSchema string   `json:"manifest_schema"`
-	TrustAnchor    []string `json:"trust_anchor"`
-	Workflow       []string `json:"workflow"`
-	Recovery       []string `json:"recovery"`
-	SchemaPolicy   string   `json:"schema_policy"`
-	Compatibility  string   `json:"compatibility"`
-	Limitations    []string `json:"limitations"`
+	Channels    []string `json:"channels"`
+	TrustAnchor []string `json:"trust_anchor"`
+	Workflow    []string `json:"workflow"`
+	Nodes       []string `json:"nodes"`
+	Limitations []string `json:"limitations"`
 }
 
 // Guide is the generated, versioned agent guide.
@@ -64,31 +62,32 @@ func NewGuide(binaryVersion, contract string, nodeProtocol int, commands []Guide
 		NodeProtocol:  nodeProtocol,
 		Commands:      sorted,
 		Upgrade: UpgradeGuide{
-			ManifestSchema: ManifestSchema,
+			Channels: []string{
+				"edge follows every push to master and publishes edge-<12-hex>.",
+				"stable-<major>.x follows one major line; a stable build without --channel follows its own line.",
+				"stable follows the highest published stable line, including v1.0.0-alpha.N before the first final.",
+				"install.sh per channel: / for stable, /1.x for the v1 line, /edge for edge.",
+			},
 			TrustAnchor: []string{
-				"EREGION_UPGRADE_PUBLIC_KEY_FILE points at the published Ed25519 public key (preferred; regular non-symlink file, not group/world writable).",
-				"EREGION_UPGRADE_PUBLIC_KEY may carry the same public key inline. Public keys are not secrets; private keys are never accepted by the CLI.",
+				"cosign keyless signatures from GitHub Actions OIDC; there is no release public key to configure.",
+				"A manifest is signed by publish-stable.yml at refs/tags/v<version> or publish-edge.yml at refs/heads/master; the workflow identity is checked, not just the signature.",
+				"Artifacts are verified by their signed SHA256 and again by the downloaded binary's reported version and channel.",
 			},
 			Workflow: []string{
-				"upgrade check --manifest MANIFEST --target operator --schema-version N",
-				"upgrade plan --manifest MANIFEST --schema-version N (rolling order migrate -> workers -> API -> nodes)",
-				"upgrade apply --manifest MANIFEST --target operator --schema-version N --dry-run",
-				"review changes and rerun with --confirm TOKEN; the new binary's version/readiness probe runs before the journal records success",
-				"upgrade status --target operator",
+				"upgrade --dry-run resolves the channel manifest and prints the from/to plan",
+				"upgrade downloads and verifies the local CLI, checks the staged binary, then replaces it atomically",
+				"upgrade keeps the previous binary at <path>.prev when the filesystem allows a hard link",
+				"upgrade --channel edge|stable|stable-<major>.x selects a different channel; a dev build requires --channel",
 			},
-			Recovery: []string{
-				"An interrupted apply or rollback leaves a journal entry; the next apply or rollback reconciles it under the upgrade lock.",
-				"A failed health probe restores the verified previous binary automatically and records the failure in the journal.",
-				"upgrade rollback --target operator --dry-run prints a restore plan and token.",
-				"upgrade rollback --target operator --confirm TOKEN restores one verified recorded backup; it never restores an arbitrary path.",
+			Nodes: []string{
+				"upgrade replaces only the operator CLI on this host.",
+				"Nodes are not touched: run apply --auto-upgrade-nodes to move them to the CLI's build.",
+				"An operator never installs a node binary from a different version than the CLI it runs.",
 			},
-			SchemaPolicy:  "Database migrations are forward-only. A release may require a newer schema; a newer schema with an older release is incompatible and is never downgraded in place.",
-			Compatibility: "OS, architecture, contract version, node protocol, upgrade_from, and the forward-only schema direction must all pass before an artifact is downloaded.",
 			Limitations: []string{
-				"Applying an operator binary does not restart services or prove a coordinated control-plane rollout; upgrade plan documents the operator-run rolling order.",
-				"CheckControlPlaneCompatibility validates an operator-supplied inventory; it does not observe live processes, drain traffic, or prove HA.",
-				"Downloads refuse redirects, so GitHub release-asset redirect URLs are not followed; publish direct HTTPS object URLs or use --artifact-dir.",
-				"The node target is Linux-only and must match the control plane's node protocol.",
+				"A package-manager-managed binary is refused; upgrade with the package manager instead.",
+				"Upgrading the CLI does not restart a service or prove that its node is compatible; the version lockstep check happens on the next operator command.",
+				"Only linux and darwin amd64/arm64 builds are published.",
 			},
 		},
 	}
@@ -125,16 +124,16 @@ func RenderMarkdown(guide Guide) string {
 	for _, step := range guide.Upgrade.Workflow {
 		fmt.Fprintf(&out, "- `%s`\n", step)
 	}
+	out.WriteString("\n### Channels\n\n")
+	for _, item := range guide.Upgrade.Channels {
+		fmt.Fprintf(&out, "- %s\n", item)
+	}
 	out.WriteString("\n### Trust anchor\n\n")
 	for _, item := range guide.Upgrade.TrustAnchor {
 		fmt.Fprintf(&out, "- %s\n", item)
 	}
-	out.WriteString("\n### Compatibility\n\n")
-	fmt.Fprintf(&out, "%s\n\n", guide.Upgrade.Compatibility)
-	out.WriteString("### Schema policy\n\n")
-	fmt.Fprintf(&out, "%s\n\n", guide.Upgrade.SchemaPolicy)
-	out.WriteString("### Recovery\n\n")
-	for _, item := range guide.Upgrade.Recovery {
+	out.WriteString("\n### Nodes\n\n")
+	for _, item := range guide.Upgrade.Nodes {
 		fmt.Fprintf(&out, "- %s\n", item)
 	}
 	out.WriteString("\n### Limitations\n\n")
