@@ -197,6 +197,7 @@ func bootstrapInputFlags(cmd *cobra.Command) {
 	f.String("api-listen", "127.0.0.1:8080", "API listener; non-loopback apply is access-changing")
 	f.String("api-tls-cert", "", "TLS certificate source")
 	f.String("api-tls-key", "", "TLS private key source")
+	f.String("hostname", "", "Public hostname of the main node (<node>.<domain>); Caddy serves it with an ACME certificate")
 	f.String("node-authorized-keys-file", "", "SSH public keys source; apply is access-changing")
 	f.Int("worker-concurrency", 2, "Worker concurrency (1–16)")
 	f.Int("commit-confirm-seconds", int(host.DefaultCommitConfirmWindow/time.Second), "Rollback window for access-changing apply (30–900)")
@@ -221,6 +222,7 @@ func (a *app) bootstrapConfig(cmd *cobra.Command) (host.Config, error) {
 	cfg.BinaryPath = get("binary")
 	cfg.APIListen, cfg.APITLSCert, cfg.APITLSKey = get("api-listen"), get("api-tls-cert"), get("api-tls-key")
 	cfg.NodeAuthorizedKeysFile = get("node-authorized-keys-file")
+	cfg.Hostname = strings.TrimSpace(get("hostname"))
 	cfg.WorkerConcurrency, _ = f.GetInt("worker-concurrency")
 	cfg.CommitConfirmSeconds, _ = f.GetInt("commit-confirm-seconds")
 	return cfg, nil
@@ -495,6 +497,9 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 	}
 	args = append(args, "--api-listen", cfg.APIListen, "--worker-concurrency", fmt.Sprint(cfg.WorkerConcurrency))
 	args = append(args, "--commit-confirm-seconds", fmt.Sprint(cfg.CommitConfirmSeconds))
+	if cfg.Hostname != "" {
+		args = append(args, "--hostname", cfg.Hostname)
+	}
 	operatorOut := cfg.OperatorTokenOut
 	if operatorOut == "" {
 		operatorOut = filepath.Join(host.DefaultLayout().StateDir, "operator.handoff")

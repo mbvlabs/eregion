@@ -199,6 +199,9 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 	if role.ControlPlane {
 		steps = append(steps, newAPIService(r.Config, r.Exec), newWorkerService(r.Config, r.Exec))
 		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe, token: credentials.Operator})
+		if r.Config.Hostname != "" {
+			steps = append(steps, &ingressStep{cfg: r.Config, exec: r.Exec})
+		}
 	}
 	if role.NodeAgent {
 		steps = append(steps, &nodeConfigStep{cfg: r.Config})

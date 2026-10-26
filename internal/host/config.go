@@ -111,7 +111,10 @@ type Config struct {
 	APITLSCert        string `json:"api_tls_cert,omitempty"`
 	APITLSKey         string `json:"api_tls_key,omitempty"`
 	WorkerConcurrency int    `json:"worker_concurrency"`
-	RegistryListen    string `json:"registry_listen"`
+	// Hostname is the main node's public name, <node>.<domain>. Caddy serves
+	// it with an ACME certificate and exposes only the CI endpoint.
+	Hostname       string `json:"hostname,omitempty"`
+	RegistryListen string `json:"registry_listen"`
 	// CommitConfirmSeconds bounds how long an access-changing apply may leave
 	// the new access state live before a detached watchdog reverts it.
 	CommitConfirmSeconds int `json:"commit_confirm_seconds,omitempty"`
@@ -195,6 +198,11 @@ func (c Config) Validate() error {
 		}
 		if (c.APITLSCert == "") != (c.APITLSKey == "") {
 			return contract.NewFault(contract.ValidationFailed, "API TLS requires both a certificate and a key", "Supply --api-tls-cert and --api-tls-key together.")
+		}
+		if c.Hostname != "" {
+			if err := ValidateHostname(c.Hostname); err != nil {
+				return contract.NewFault(contract.ValidationFailed, "invalid hostname "+c.Hostname, err.Error())
+			}
 		}
 		if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 16 {
 			return contract.NewFault(contract.ValidationFailed, "worker concurrency out of range", "Use --worker-concurrency 1–16.")
