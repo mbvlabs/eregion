@@ -142,6 +142,14 @@ flags only and never prompts.
 - **D5** Every server runs the telemetry collector for its own host data; storage
   and the telemetry UI run on a separate telemetry node. **No ClickHouse.**
 - **D6** Command tree as §6; `platform …` and `resources …` are replaced.
+- **D7** API tokens are per use and human-approved, never one long-lived
+  token. No token is minted at setup or handed off. Each token (GitHub
+  Actions, a script, an agent session) is created for one purpose with a
+  scope and an expiry date, and creating one needs a human factor like vaire's
+  `protect init`: a TOTP code from an authenticator (or a master password),
+  read without echo at a terminal, so an agent cannot mint its own. Tokens are
+  listed and revocable; the secret is shown once. Operator CLI access does not
+  need a token: it goes over SSH inside WireGuard (D1).
 
 ## 8. Order of work
 
@@ -149,8 +157,9 @@ flags only and never prompts.
    operator peer + embedded userspace tunnel, commit-confirm switch of SSH to
    wg0, version lockstep, age transfer bundle + `login`, contexts on
    WireGuard/SSH. Operator commands run in node mode over that channel.
-2. Domain question + DNS check + Caddy with ACME for `<node>.<domain>`; the CI
-   endpoint with deploy-scoped tokens.
+2. Domain question + DNS check + Caddy with ACME for `<node>.<domain>` (done);
+   the CI endpoint with per-use, expiring tokens (D7, later: TOTP setup,
+   `token create --scope --expires`, list, revoke; drop the setup token).
 3. Guided `app create` → `deploy` on the main node; app domains through Caddy.
    First end-to-end test on your server.
 4. Telemetry collector on every server (D5); `doctor`, `ssh`, `node add`.
