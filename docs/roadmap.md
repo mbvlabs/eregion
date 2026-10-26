@@ -20,21 +20,13 @@ they occur. Browser sketches use synthetic data.
 
 ## Evidence in this tree
 
-Run these from a clean checkout. Container/dev prerequisites skip explicitly and
-never silently pass.
+Run these from a clean checkout. There are no local Docker launchers or drills;
+everything past these tests is exercised by hand on a real test host.
 
 ```sh
-just check                     # formatting, vet, unit/contract/schema/scripts
+just check                     # formatting, vet, unit/contract/schema tests
 just integration-norace        # PostgreSQL/River/API/process integration
 just transport                 # pinned SSH + WireGuard exactly-once scenarios
-just dev-up
-just smoke                     # real image deploy, dedup, failed candidate, rollback
-just buildpacks-smoke          # directory-source Buildpacks release + deploy
-just terminal-smoke            # real PTY viewer matrix, detach, replay
-just recovery-drill            # resource backup/verify/restore + failed restore
-just controlplane-recovery-drill
-just upgrade-drill             # signed release, apply, rollback, health restore
-just release-check             # the full local v0.1 gate
 ```
 
 The v0.1 line does not claim fresh-VM support, real Cloudflare behavior, a live
@@ -166,7 +158,7 @@ real interactive terminal. No renderer is required for execution or diagnosis.
 
 **Delivered (2026-10-20):** real Charm v2 operation viewer, shared reducer and
 poll/replay loop, JSON/NDJSON/plain presenters, accessibility options, fixture and
-render tests. `just terminal-smoke` passed against a live PostgreSQL/API/worker:
+render tests. A local PTY smoke harness (since removed) passed against a live PostgreSQL/API/worker:
 resize down to 18×5, help/navigation, detach with exit 130 without cancellation,
 then reconnect/replay to completion. This does not establish later host/fleet/HA gates.
 
@@ -248,10 +240,11 @@ and the keyboard-driven fleet workspace. See [nodes](nodes.md).
 - [x] Expand the terminal operation view with per-target state, build logs, explicit
   health observations, and a visible statement of which release is serving.
 
-**Gate (local CLI/API):** passed. `just smoke` builds and deploys real images,
-deduplicates submissions, preserves the serving release after a failed candidate,
-follows events through the CLI, and rolls back. `just buildpacks-smoke` builds the
-sample directory source with Buildpacks, deploys it, and verifies the served body.
+**Gate (local CLI/API):** passed on 2026-10-20 with local smoke harnesses (since
+removed): real images were built and deployed, submissions deduplicated, the
+serving release preserved after a failed candidate, events followed through the
+CLI, and a rollback completed. A Buildpacks build of the sample directory source
+was deployed and its served body verified.
 Worker loss, lost acknowledgements, competing operations, and node loss during a
 deploy are covered by PostgreSQL integration tests.
 **Gate (CI end-to-end):** partially proven. A signed GitHub delivery is tested

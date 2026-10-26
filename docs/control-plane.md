@@ -260,17 +260,13 @@ umask 077
 mkdir -p .local
 export EREGION_API_TOKEN="$(openssl rand -hex 32)"
 export EREGION_AUTH_FILE="$PWD/.local/api-auth.json"
-python3 - <<'PY'
-import hashlib, json, os
-from pathlib import Path
-path = Path(os.environ['EREGION_AUTH_FILE'])
-path.write_text(json.dumps([{
-    'actor': {'kind': 'operator', 'subject': 'local-operator'},
-    'token_sha256': hashlib.sha256(os.environ['EREGION_API_TOKEN'].encode()).hexdigest(),
-    'scopes': ['operations:submit', 'operations:read', 'operations:cancel', 'system:read'],
-}]))
-path.chmod(0o600)
-PY
+token_sha256="$(printf '%s' "$EREGION_API_TOKEN" | sha256sum | cut -d' ' -f1)"
+cat > "$EREGION_AUTH_FILE" <<JSON
+[{"actor": {"kind": "operator", "subject": "local-operator"},
+  "token_sha256": "$token_sha256",
+  "scopes": ["operations:submit", "operations:read", "operations:cancel", "system:read"]}]
+JSON
+chmod 600 "$EREGION_AUTH_FILE"
 bin/eregion serve --listen 127.0.0.1:8080
 ```
 
@@ -381,16 +377,9 @@ its node effect still holds a live local lock.
 
 The external control-plane database has a separate recovery procedure in
 [resources and recovery](resources.md#separate-external-control-plane-database-recovery).
-Part of it is exercised automatically:
+The integration suite exercises it through Ready/PlanMigrations:
 
 ```sh
-# Prerequisites: pg_dump, pg_restore, psql on PATH; a built bin/eregion (the
-# target builds it); and EREGION_TEST_DATABASE_URL or EREGION_DATABASE_URL
-# pointing at an already-migrated eregion control-plane database, or a running
-# just dev-up environment.
-just controlplane-recovery-drill
-
-# In-process equivalent through Ready/PlanMigrations:
 EREGION_TEST_DATABASE_URL=... \
   go test -count=1 ./internal/controlplane -run TestIntegrationControlPlaneRecoveryDrill -v
 ```

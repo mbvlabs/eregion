@@ -1,74 +1,7 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
 default:
     @just --list
-
-# Start a disposable loopback PostgreSQL + API + worker; never touches host services.
-dev-up:
-    python3 scripts/dev.py up
-
-# Stop the development API and discard only this checkout's disposable database.
-dev-down:
-    python3 scripts/dev.py down
-
-# Check local development readiness without printing credentials.
-dev-status:
-    python3 scripts/dev.py status
-
-# Rebuild/restart API+workers and apply new migrations, retaining the dev database.
-dev-restart:
-    python3 scripts/dev.py restart
-
-# Check development launcher permissions, identity guards, and atomic writes.
-dev-test:
-    python3 -m unittest discover -s scripts -p 'test_*.py'
-
-# Install checksum-pinned pack into .local/dev/tools, never system-wide.
-dev-buildpacks:
-    python3 scripts/buildpacks.py
-
-# Build real sample images, deploy, reject a bad candidate, and roll back (requires dev-up).
-smoke:
-    python3 scripts/smoke.py
-
-# Build the sample app from a directory with Buildpacks, deploy, and serve it (requires dev-up and dev-buildpacks).
-buildpacks-smoke:
-    python3 scripts/buildpacks_smoke.py
-
-# Exercise the real interactive viewer in a resizable pseudo-terminal (requires dev-up).
-terminal-smoke:
-    python3 scripts/terminal_smoke.py
-
-# Run the disposable PostgreSQL backup/restore drill. Prerequisites: Docker is
-# installed and reachable, and the image below is available locally. Without
-# them this target prints a skip and exits successfully.
-recovery-drill:
-    @if ! command -v docker >/dev/null 2>&1; then echo "skip: Docker is not installed"; elif ! docker info >/dev/null 2>&1; then echo "skip: Docker daemon is not reachable"; elif ! docker image inspect postgres:17 >/dev/null 2>&1; then echo "skip: postgres:17 is not available locally; pull it explicitly to run this drill"; else python3 scripts/recovery_drill.py; fi
-
-# Exercise the separate external control-plane database recovery procedure:
-# dump a migrated source, restore into two generated temporary databases on the
-# same server, verify migration/River readiness and key tables, then compare the
-# restores. Prerequisites: PostgreSQL client tools, a built bin/eregion, and
-# EREGION_TEST_DATABASE_URL or EREGION_DATABASE_URL pointing at an already-migrated
-# control-plane database (or a running just dev-up environment). It never drops or
-# writes the source database and refuses names outside its generated prefix.
-controlplane-recovery-drill: build
-    python3 scripts/controlplane_recovery_drill.py
-
-# Run the signed upgrade drill: build disposable 1.0.0/1.1.0 binaries and a
-# signed manifest, then exercise verify/check/apply/rollback/status and the
-# automatic restore after a failed health probe.
-upgrade-drill:
-    python3 scripts/upgrade_drill.py
-
-# Run every release drill. Container prerequisites skip clearly and never
-# silently pass a failed drill.
-release-drill:
-    @just recovery-drill
-    @just upgrade-drill
-
-# Run the interactive TERM matrix when a development environment is ready;
-# otherwise print a clear skip.
-release-terminal:
-    @if python3 scripts/dev.py status >/dev/null 2>&1; then python3 scripts/terminal_smoke.py; else echo "skip: development environment is not ready; run just dev-up"; fi
 
 # Build the operator CLI.
 build:
@@ -137,19 +70,4 @@ wireguard:
     go test -count=1 ./internal/transport -run 'WireGuard' -v -timeout 600s
 
 # Check formatting, static analysis, and tests.
-check: fmt-check lint test dev-test
-
-# Run the v0.1 release gate. Drills and the terminal matrix skip explicitly when
-# Docker or a dev environment is unavailable; skipped evidence is not a pass.
-release-check:
-    just fmt-check
-    go vet ./...
-    go test ./...
-    go -C examples/hello test ./...
-    python3 -m unittest discover -s scripts -p 'test_*.py'
-    @just release-drill
-    @just release-terminal
-
-# Run the interactive terminal TERM matrix (requires just dev-up).
-terminal-matrix:
-    python3 scripts/terminal_smoke.py
+check: fmt-check lint test

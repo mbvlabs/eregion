@@ -198,11 +198,6 @@ key. A missing journal is not an error; it reports that no interrupted restore
 was present. `restore` itself first recovers an incomplete journal before taking
 a fresh safety backup.
 
-The recovery drill (`scripts/recovery_drill.py`) exercises backup → verify →
-restore → failed-restore recovery against disposable PostgreSQL containers it
-creates and removes. It refuses to touch `eregion-dev-*`, `dev-postgres`, or
-`eregion-platform-test-pg`.
-
 ## Backup policy declarations and automatic backups
 
 `resources schedule set` validates an interval or five-field cron expression, a
@@ -329,53 +324,11 @@ actions must not have.
 
 ### Exercised recovery subset
 
-The automated drill exercises the dump/restore/readiness portion of the
-procedure above, not a production cutover:
-
-```text
-just controlplane-recovery-drill
-```
-
-Prerequisites, exactly:
-
-- PostgreSQL client tools `pg_dump`, `pg_restore`, and `psql` on `PATH`, with a
-  client version able to read the server.
-- A built `bin/eregion` (`just build`; the `just` target builds it first) or
-  `EREGION_BINARY` pointing at an executable.
-- `EREGION_TEST_DATABASE_URL` or `EREGION_DATABASE_URL` naming an
-  **already-migrated** eregion control-plane database, or a running `just dev-up`
-  environment whose `.local/dev/env` supplies the development URL. An empty
-  server or an unrelated database is refused before any temp database is made.
-- A role that can `CREATE`/`DROP DATABASE` on the same server. It does not need
-  superuser for this drill, but production recovery may need more.
-
-The script (`scripts/controlplane_recovery_drill.py`):
-
-1. reads the source DSN without printing it and verifies
-   `eregion_schema_migrations` exists and is non-empty;
-2. takes a `pg_dump --format=custom` archive, checks its SHA-256, and inspects it
-   with `pg_restore --list`;
-3. creates two databases named exactly
-   `eregion_cp_recovery_drill_<16 hex characters>` on the **same server** and
-   restores the archive into each;
-4. checks key tables (`eregion_schema_migrations`, `eregion_operations`,
-   `eregion_operation_events`, `eregion_operation_steps`,
-   `eregion_platform_nodes`, `river_job`, `river_migration`);
-5. runs `eregion system migrate --dry-run --json` against each restored
-   database and requires the application and River migration versions to match;
-6. compares a migration/table/operation-count fingerprint between the two
-   restores, proving a repeated restore produces the same verified state;
-7. drops only the generated databases it created, even on failure, and re-checks
-   that the source migration state is unchanged.
-
-The source is opened by `pg_dump` and read probes only. The drill never drops,
-renames, or writes to the source database, and refuses any database name outside
-its generated prefix. It also refuses a source with no applied migrations. This
-is not a production failover test: it does not stop writers, move the service
-DSN, exercise a maintenance window, or prove recovery time/point objectives.
 The Go integration test `TestIntegrationControlPlaneRecoveryDrill` (run with
-`EREGION_TEST_DATABASE_URL` and `just integration`) exercises the same
-dump/restore/`Ready`/`PlanMigrations` path in-process.
+`EREGION_TEST_DATABASE_URL` and `just integration`) exercises the
+dump/restore/`Ready`/`PlanMigrations` portion of the procedure above. It is not
+a production failover test: it does not stop writers, move the service DSN,
+exercise a maintenance window, or prove recovery time/point objectives.
 
 ## Verification
 
@@ -386,8 +339,6 @@ go test ./...
 EREGION_TEST_DATABASE_URL=... go test -count=1 ./internal/controlplane -run 'TestIntegrationDeclaredBackupSchedule' -v
 EREGION_TEST_DATABASE_URL=... go test -count=1 ./internal/controlplane -run 'TestIntegrationControlPlaneRecoveryDrill' -v
 EREGION_TEST_RESOURCES_DOCKER=1 go test -count=1 ./internal/resources -run Integration -v
-python3 scripts/recovery_drill.py
-just controlplane-recovery-drill
 ```
 
 The scheduler integration test declares a policy, runs one tick, asserts exactly

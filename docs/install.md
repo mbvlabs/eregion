@@ -257,13 +257,6 @@ eregion context credential add \
 `--action-grant` is repeatable and uses the server's exact `kind:target` rules;
 scopes alone do not authorize platform actions.
 
-For a development loopback instead of production:
-
-```sh
-just dev-up
-# Load .local/dev/env only in a trusted shell; never paste it into an issue.
-```
-
 ## First deploy of `examples/hello`
 
 The hello fixture is a tiny HTTP service with `GET /healthz` and `GET /`.

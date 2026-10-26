@@ -185,8 +185,7 @@ An explicit origin never receives a saved token for a different origin. If the
 origin is explicit but no token is available, the command fails with
 `input_required` instead of silently reusing another context's credential. The
 same origin may reuse the saved token. `EREGION_API_URL`/`EREGION_API_TOKEN`
-continue to work exactly as before for `scripts/dev.py`, `scripts/smoke.py`, and
-the existing tests.
+continue to work exactly as before for scripts and the existing tests.
 
 `context export` writes a token only to an explicit absolute owner-only file; it
 never writes a credential to stdout.

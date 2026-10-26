@@ -40,33 +40,18 @@ stdout. Plain output is append-only, with errors on stderr. Neither mode prompts
 or probes the terminal. Only implemented commands appear in discovery. Mutating
 commands support dry-run/preview semantics and stable idempotency keys.
 
-## Run it locally
+## Testing
 
-The development launcher creates a disposable loopback PostgreSQL, API, and
-worker. It never touches host services, and it refuses to stop containers it does
-not own.
-
-```sh
-just dev-up          # print the loopback URL and how to load credentials
-source .local/dev/env
-bin/eregion ui --interactive
-just dev-status
-just dev-down        # discard only this checkout's disposable database
-```
-
-End-to-end drills against the running development stack:
+There are no local test harnesses: no Docker launchers, drills, or scratch VMs.
+Changes land with unit and integration tests (`just check`), then get built and
+exercised by hand on a real test host:
 
 ```sh
-just smoke           # real image build, deploy, failed candidate, rollback
-just buildpacks-smoke  # directory-source Buildpacks release, deploy, served body
-just terminal-smoke  # real PTY viewer matrix, detach, replay
-just recovery-drill  # disposable PostgreSQL backup/verify/restore drill
-just controlplane-recovery-drill  # dump/restore the control-plane database
-just upgrade-drill   # signed release, apply, rollback, health restore
+just build build-node
+bin/eregion bootstrap --help   # converge a fresh Debian/Ubuntu host over pinned SSH
 ```
 
-`just release-check` runs the full local release gate. Container prerequisites
-skip explicitly and never silently pass.
+See [bootstrap](docs/bootstrap.md) for the full first-contact flow.
 
 ## Host bootstrap and nodes
 

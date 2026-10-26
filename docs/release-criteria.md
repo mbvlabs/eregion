@@ -11,11 +11,11 @@ failed gate blocks the release; it is never waived by prose.
 | Gate | Required evidence | Status in this tree |
 | --- | --- | --- |
 | G1 Formatting and static checks | `just fmt-check`, `go vet ./...` | Runnable locally; must be recorded for the tag |
-| G2 Unit/contract/schema tests | `go test ./...`, examples tests, script tests | Runnable locally; must be recorded for the tag |
+| G2 Unit/contract/schema tests | `go test ./...`, examples tests | Runnable locally; must be recorded for the tag |
 | G3 PostgreSQL/River integration | isolated test DB, `go test -count=1 ./internal/controlplane -run TestIntegration` | Requires a disposable database; not run in a plain checkout |
 | G4 Signed release artifacts | `upgrade verify` with the published key; manifest/artifact hashes | Workflow now uploads to S3 and fails without a destination; requires the release workflow, signing secret, and object-store credentials. Not executed here |
-| G5 Upgrade and rollback drills | `just upgrade-drill`, `just recovery-drill`, plus [upgrades.md](upgrades.md#recovery-drills) | Automated drills are runnable; full disposable-host drills still need an operator |
-| G6 Terminal compatibility | `just release-terminal` under the TERM matrix | Runs when `just dev-up` is ready; otherwise prints a clear skip |
+| G5 Upgrade and rollback drills | [upgrades.md](upgrades.md#recovery-drills) on a test host | Manual; needs an operator and a disposable host |
+| G6 Terminal compatibility | golden/program tests plus the TERM matrix by hand on a test host | Golden tests runnable locally; matrix is manual |
 | G7 Security review | [security-review.md](security-review.md), findings triaged | S1, S2, and S4 fixed; S3 accepted for v0.1 with owner and mitigation; S5–S6 accepted |
 | G8 Fresh-VM install | documented matrix on clean Debian/Ubuntu VMs | **Unproven here** |
 | G9 Real Cloudflare | real zone/token, DNS and private-access path | **Unproven here** |
@@ -32,12 +32,11 @@ go -C examples/hello vet ./...
 Pass criteria: no `gofmt -l cmd internal schema examples` output; vet exits 0.
 Record the commit SHA and toolchain (`go version`) with the evidence.
 
-## G2 — Unit, contract, schema, and script tests
+## G2 — Unit, contract, schema, and example tests
 
 ```sh
 go test ./...
 go -C examples/hello test ./...
-python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 Pass criteria: all packages pass with no skipped release-blocking test. The
@@ -131,16 +130,8 @@ verified offline mirror (`--artifact-dir`).
 
 ## G5 — Upgrade and recovery drills
 
-Run every drill in [upgrades.md](upgrades.md#recovery-drills) on disposable
-hosts and test roots. Two drills are automated:
-
-```sh
-just upgrade-drill     # signed manifest, verify/check/apply/rollback/health
-just recovery-drill    # backup/verify/restore/failed restore; Docker required
-just release-drill     # both, with explicit skips when prerequisites are absent
-```
-
-The remaining operator drills:
+Run every drill in [upgrades.md](upgrades.md#recovery-drills) by hand on a
+disposable test host and test roots:
 
 1. tampered signature;
 2. tampered artifact (size and SHA256);
@@ -160,16 +151,8 @@ recorded as not run, not as a pass.
 
 ## G6 — Terminal compatibility
 
-Requires a running development environment:
-
-```sh
-just dev-up
-just dev-status           # must report ready
-just release-terminal     # runs the TERM matrix, or prints a clear skip
-just terminal-smoke       # direct run when the environment is known ready
-```
-
-The matrix is `TERM=dumb`, `xterm-256color`, `screen-256color`, `NO_COLOR`,
+Run the interactive viewer by hand on a test host with a running API. The
+matrix is `TERM=dumb`, `xterm-256color`, `screen-256color`, `NO_COLOR`,
 ASCII, reduced motion, CJK/emoji labels, and 20×6/300×80 sizes. Golden and
 program tests run without a dev environment:
 
@@ -181,8 +164,7 @@ Pass criteria: detach exits 130 without cancelling the operation; the operation
 completes and replays; no terminal escape renders as a control sequence; ASCII
 and no-color modes stay readable; wide labels fit the declared width.
 
-**If `just dev-status` is not ready, record the gate as not run.** A skipped
-terminal drill is not a pass.
+**If the matrix was not run on a test host, record the gate as not run.**
 
 ## G7 — Security review
 
@@ -288,16 +270,15 @@ commit. A skipped row is recorded as `not run`, never as `pass`.
 
 | Gate | Command to run | Result | Evidence (commit, toolchain, log/URL) |
 | --- | --- | --- | --- |
-| G1/G2 offline gate | `just release-check` | | |
+| G1/G2 offline gate | `just check` | | |
 | G2 upgrade suite | `go test ./internal/upgrade ./internal/cli -run 'Upgrade\|Rollout\|Health\|Guide\|Manifest' -count=1` | | |
 | G2 webhook unit | `go test ./internal/api -run Webhook -count=1` | | |
 | G3 integration | `just integration` (or `integration-norace`) | | |
 | G3 outage/node-loss drills | `go test -count=1 ./internal/controlplane -run 'TestIntegration(DatabaseOutage\|NodeLossDuringDeploy\|CompetingSubmissions)'` | | |
 | G4 signed manifest | `eregion upgrade verify --manifest ... --json` | | |
 | G4 publish | release workflow run URL and object-store prefix | | |
-| G5 signed upgrade drill | `just upgrade-drill` | | |
-| G5 recovery drill | `just recovery-drill` | | |
-| G6 terminal matrix | `just release-terminal` | | |
+| G5 upgrade and recovery drills | manual on a test host | | |
+| G6 terminal matrix | manual on a test host | | |
 | G7 security decisions | [security-review.md](security-review.md) | | |
 | G8 fresh VM | external matrix | not run | |
 | G9 Cloudflare | external account drill | not run | |

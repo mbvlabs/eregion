@@ -310,20 +310,7 @@ A release is publishable only when all of these hold:
 Run these on disposable hosts and test roots. Do not replace a real user binary
 as part of the drill.
 
-Two drills are automated and wired into `just release-check`:
-
-- `just upgrade-drill` runs `scripts/upgrade_drill.py`. It builds disposable
-  `1.0.0`/`1.1.0` binaries and a signed manifest in a temporary directory, then
-  verifies the signature (including a tampered manifest), checks compatibility,
-  applies, inspects the journal/backup, rolls back, and confirms that a failed
-  version probe restores the previous binary. It needs only Go and Linux
-  `amd64`; it skips clearly otherwise.
-- `just recovery-drill` runs `scripts/recovery_drill.py` against a disposable
-  PostgreSQL container: backup, verify, restore, a failed restore, and safety
-  recovery. It prints a skip when Docker, the daemon, or the `postgres:17` image
-  is unavailable.
-
-The remaining drills below still require an operator and disposable hosts.
+These drills require an operator and disposable hosts.
 
 1. **Tampered signature:** change one manifest byte after signing. Check,
    dry-run, and apply must fail before any download; the binary must be

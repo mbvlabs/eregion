@@ -47,15 +47,9 @@ Use a distinct actor subject per automation integration. Keep each submission's
 idempotency key stable across retries, and retain its operation ID. A lost HTTP
 response is not evidence that submission or a remote effect failed.
 
-## Local testing boundary
+## Testing boundary
 
-`just dev-up` creates a disposable loopback PostgreSQL container and local
-API/worker, with protected credentials under `.local/dev/`. It does not bootstrap
-the workstation or install host services. Load `.local/dev/env` only in a trusted
-shell; do not paste its contents into issues or terminal recordings.
-
-`just smoke` exercises real Docker images and leaves a sample application running
-for experimentation. `just terminal-smoke` exercises the interactive viewer in a
-pseudo-terminal and checks that detaching does not cancel execution. These are
-development drills, not evidence of fresh-host, remote-fleet, telemetry, or HA
-release readiness. See the roadmap for the separate acceptance gates.
+There are no local test harnesses. Unit and integration tests run with
+`just check` and `just integration`; everything else is exercised by hand on a
+real test host. Passing tests are not evidence of fresh-host, remote-fleet,
+telemetry, or HA release readiness. See the roadmap for the acceptance gates.
