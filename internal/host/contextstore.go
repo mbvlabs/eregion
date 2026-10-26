@@ -77,6 +77,9 @@ type ContextView struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 	Fingerprint string    `json:"token_fingerprint"`
 	Current     bool      `json:"current"`
+	// Route is how the CLI reaches the API, e.g. admin@10.78.0.1:22 over
+	// WireGuard via 203.0.113.10:51820.
+	Route string `json:"route,omitempty"`
 }
 
 // ContextStore is the on-disk context file.
@@ -303,7 +306,21 @@ func viewOf(context Context, current bool) ContextView {
 		Name: context.Name, APIURL: context.APIURL, Scopes: append([]string(nil), context.Scopes...),
 		CreatedAt: context.CreatedAt, UpdatedAt: context.UpdatedAt,
 		Fingerprint: tokenFingerprint(context.Token), Current: current,
+		Route: routeOf(context.SSH),
 	}
+}
+
+func routeOf(route *ContextSSH) string {
+	if route == nil {
+		return ""
+	}
+	out := route.User + "@" + route.Address
+	if route.WireGuard != nil {
+		out += " over WireGuard via " + route.WireGuard.Endpoint
+	} else {
+		out += " over SSH"
+	}
+	return out
 }
 
 func tokenFingerprint(token string) string {

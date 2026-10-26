@@ -77,10 +77,15 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 	if r.Method == http.MethodGet && r.URL.Path == "/healthz" {
 		return map[string]bool{"alive": true}, http.StatusOK, nil
 	}
+	// Readiness is public (Caddy exposes it): it says ready or not, nothing else.
+	if r.Method == http.MethodGet && r.URL.Path == "/readyz" {
+		if err := s.ready(r.Context()); err != nil {
+			return nil, 0, contract.NewFault(contract.Unavailable, "control plane is not ready", "Check database connectivity, migration versions, and binary compatibility.")
+		}
+		return map[string]bool{"ready": true}, http.StatusOK, nil
+	}
 	scope := "operations:read"
-	if r.URL.Path == "/readyz" {
-		scope = "system:read"
-	} else if r.Method == http.MethodPost {
+	if r.Method == http.MethodPost {
 		scope = "operations:submit"
 		if strings.HasSuffix(r.URL.Path, "/cancel") {
 			scope = "operations:cancel"
@@ -92,12 +97,6 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 	actor, err := s.auth.authenticate(r.Header.Get("Authorization"), scope)
 	if err != nil {
 		return nil, 0, err
-	}
-	if r.Method == http.MethodGet && r.URL.Path == "/readyz" {
-		if err := s.ready(r.Context()); err != nil {
-			return nil, 0, contract.NewFault(contract.Unavailable, "control plane is not ready", "Check database connectivity, migration versions, and binary compatibility.")
-		}
-		return map[string]bool{"ready": true}, http.StatusOK, nil
 	}
 	if r.Method == http.MethodPost && r.URL.Path == "/v1/operations" {
 		if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
