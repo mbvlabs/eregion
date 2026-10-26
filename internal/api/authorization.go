@@ -98,7 +98,7 @@ func (a *Auth) authorizeInventory(header string, query platform.InventoryQuery) 
 		return nil
 	}
 	switch query.Collection {
-	case "environments", "releases", "deployments", "changes":
+	case "environments", "releases", "builds", "deployments", "changes":
 		if platform.ValidateName(query.App) == nil && platform.ValidateName(query.Environment) == nil {
 			target := "env/" + query.App + "/" + query.Environment
 			for _, grant := range principal.ActionGrants {

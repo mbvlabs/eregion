@@ -108,7 +108,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 011
+## Database: embedded schema 012
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -127,6 +127,7 @@ node protocol version and database migration version are independent.
 | `009_platform_build_node.sql` | Optional environment build-node FK. Does not implement image transfer. |
 | `010_platform_domains.sql` | Globally unique domain name -> environment FK; creation timestamp only. |
 | `011_environment_revisions.sql` | Immutable numbered environment revisions, current-revision pointer, deployment revision/secret snapshots and domain primary flag. Backfills one baseline revision per existing environment. |
+| `012_platform_deploy.sql` | First-class builds with exact commit and lifecycle; release build/commit links; deployment runtime instances, previous deployment and `restart` action; environment serving-deployment pointer. Backfills the serving deployment for existing successful environments. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -138,10 +139,11 @@ Tables below have the literal `eregion_` prefix:
 | `operation_steps` | `(operation_id, step)`; inputs hash, execution identity, attempt, state, timestamps and result/error. |
 | `platform_nodes` | Name; roles/capabilities, status, SSH address/user/**host key**, attested identity, probes, build concurrency/user and WireGuard public state. Private keys stay in files. |
 | `platform_apps` | Opaque app ID and unique name. No stored setup wizard/source configuration. |
-| `platform_environments` | App FK + name; runtime/build node, stable/candidate/container ports, bind, health settings/observation, config, pinned secret refs, desired/applied/serving release IDs and `current_revision_id`. The mutable config/health/container fields mirror the current revision for the existing single-container deploy worker; they go away with the per-process deploy row. `secret_refs` remains the transitional pinned form, used only when the current revision names no secrets. |
+| `platform_environments` | App FK + name; runtime/build node, stable/candidate/container ports, bind, health settings/observation, config, pinned secret refs, desired/applied/serving release IDs, `serving_deployment_id` and `current_revision_id`. The deploy worker reads the revision and the serving deployment's recorded instance ports; the mutable legacy config/health/port fields remain only as mirrored compatibility columns for the older CLI surface. `secret_refs` remains the transitional pinned form, used only when the current revision names no secrets. |
 | `platform_environment_revisions` | Immutable `erv_…` ID and per-environment number; operation/actor/operation/summary change record; source binding, auto-deploy flag, webhook secret NAME, runtime JSON, processes JSON, plain config and secret NAMEs, plus the first-deploy intent flag. An UPDATE trigger refuses edits; deleting the environment still cascades. |
-| `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, pending/ready/failed status and error. |
-| `platform_deployments` | Deployment ID and unique operation FK; action, release, previous release, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), state and errors. |
+| `platform_builds` | `bld_…` ID and unique operation FK; app/env, pinned revision and release, source, exact commit, pending/running/succeeded/failed/cancelled lifecycle, timestamps and error. Logs are the owning operation's events. |
+| `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, build link, exact commit, pending/ready/failed status and error. |
+| `platform_deployments` | Deployment ID and unique operation FK; action (`deploy`, `rollback`, `restart`), release, previous release/deployment, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), recorded process instances/ports, state and errors. |
 | `platform_changes` | App/env history, sequence, operation/actor, desired/applied JSON and summary. |
 | `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment, creation timestamp. Still no backend, TLS, observation or failure columns. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
@@ -150,22 +152,20 @@ Tables below have the literal `eregion_` prefix:
 
 Boundaries around the MASTER app-model work (work list rows 4–5):
 
-- Runtime and candidate ports are globally unique in the current schema, not
-  scoped per node. Defaults allocate 20000–29999 and 30000–39999 respectively.
-  The environment revision is now the source of truth, but the deploy worker
-  still reads these mirrored legacy columns.
-- Source/build configuration exists both on releases (for the current release
-  action) and on environment revisions. Deploying from the revision's bound
-  source, including private git credentials and auto-deploy, is work list row 5.
-- Environments still hold pinned `secret_refs` for compatibility with the
-  current deploy worker. New revisions use secret NAMEs and resolve their
-  current revisions per deploy (D18); the fallback and the legacy column go away
-  with row 5 once all deployment paths use revisions.
-- One container per environment on a stable port; the revision already declares
-  the per-process formation and replicas, but MASTER D17/D21 per-process
-  containers on dynamic loopback ports are implemented by row 5.
-- The first-deploy flag on a revision records intent only; no build or
-  deployment is queued until deploy-from-revision lands.
+- The environment revision and the deployment's recorded process instances are
+  the deploy worker's source of truth. The legacy stable/candidate columns are
+  still allocated for older clients but no deployment path reads them; Caddy
+  reads the serving deployment's dynamic loopback web ports.
+- Releases from source run through the `platform_builds` lifecycle. A build's
+  exact commit, state and release link are durable; its log stream is the
+  operation event stream. `platform.build.stop` signals a running pack process,
+  and `platform.build.retry` creates a new build and release at the same commit.
+- Environments still hold pinned `secret_refs` only as a fallback for revisions
+  that name no secrets. Revisions use secret NAMEs, resolved per deploy (D18);
+  rollback resolves the target deployment's recorded exact revisions.
+- Deploying from the revision's bound source (including a private HTTPS git
+  read credential) now records the build and deployment. Auto-deploy/push and
+  the per-environment webhook remain work list row 8.
 - SQL `ON DELETE CASCADE` is not a safe application deletion implementation:
   release/history references, secret namespaces, containers, Caddy and file-backed
   state need deliberate handling. There are no app/env delete actions today.
@@ -311,15 +311,18 @@ All use `POST /v1/operations`, the shared registry and one River job:
 
 | Kind | Target | Main input |
 | --- | --- | --- |
-| `platform.app.create` | `platform` | `name`; optional `environment` (first environment + first revision) and `deploy` intent. |
+| `platform.app.create` | `platform` | `name`; optional `environment` (first environment + first revision) and `deploy` to queue the first deploy from that revision. |
 | `platform.environment.create` | `app/<app>` | `name`, `node`, optional `build_node`, legacy ports/bind/health, `env`, `secret_refs`; revision `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`. |
 | `platform.environment.update` | `env/<app>/<env>` | Partial patch: `node`, `build_node`, `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`; produces a new full revision. |
 | `platform.process.scale` | `env/<app>/<env>` | `process`, `replicas`; produces a new revision. |
 | `platform.config.set/unset` | `env/<app>/<env>` | `config` map or `keys` list; produces a new revision and never queues a deploy. |
 | `platform.environment.secret.attach` | `env/<app>/<env>` | `name` only; the vault write is separate and no value enters the revision. |
-| `platform.release.create` | `env/<app>/<env>` | `source`, optional `build`, `command`, `pull` |
-| `platform.deploy` | `env/<app>/<env>` | `release_id`; pins the current environment revision and resolved secret revisions. |
-| `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, not simply current applied release. |
+| `platform.release.create` | `env/<app>/<env>` | `source`, optional `build`, `command`, `pull`; records a build row for git/directory sources. |
+| `platform.build.stop` | `build/<build ID>` | Cancels the build, marks its operation cancelling, and signals the running pack process. |
+| `platform.build.retry` | `build/<build ID>` | New build and release of the same exact commit; it does not deploy. |
+| `platform.deploy` | `env/<app>/<env>` | Optional `release_id` and `ref`. Without a release it resolves the current revision's bound source to an exact commit, builds, records the release digest and deploys it with the current revision. With a release it redeploys that release with the current revision. |
+| `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, then uses that deployment's revision and exact secret revisions. |
+| `platform.restart` | `env/<app>/<env>` | Reapplies the serving release with the current revision through the same blue/green path, so a scaled formation takes effect. |
 | `platform.domain.add/remove` | `env/<app>/<env>` | `domain` (app/env resolved from target) |
 
 Names: lowercase letters/digits/hyphens, start with a letter, max 40 characters.
@@ -337,31 +340,42 @@ revision, processes and deployability.
 
 Deploy-time secret resolution prefers the current revision's secret names,
 resolving each name's active latest revision and freezing the exact non-secret
-revision identities on the deployment. The transitional pinned `secret_refs`
-path is used only when the revision names no secrets. A first deploy requested by
-`platform.app.create` is recorded on the revision as intent; deploy-from-revision
-is work list row 5.
+revision identities on the deployment. A private git read credential is resolved
+by NAME at build execution and passed only to the askpass child environment; the
+value never enters the revision, operation input, events or logs. The
+transitional pinned `secret_refs` path is used only when the revision names no
+secrets. `platform.app.create` with deploy intent queues the first
+deploy-from-revision operation in the same submission transaction.
 
 Image releases inspect/pull the image. Buildpacks builds require builder role
 and capability, allowed source roots for directories, and allowlisted HTTPS git
 hosts. `EREGION_BUILD_SOURCE_ROOTS` controls directory roots;
 `EREGION_GIT_ALLOWED_HOSTS` replaces the public-forge allowlist. Git is rechecked
-at execution, with redirects/other protocols disabled. A directory/git build on
+at execution, with redirects/other protocols disabled; a private HTTPS read
+credential is supplied to git through the embedded askpass helper and the
+transient node secret map, never in the build payload. A directory/git build on
 a distinct build node is refused before `pack`: registry push/pull and dedicated
 credentials do not exist. Installing a registry alone does not move images.
 
-Deploy sequence: preflight -> optional release command -> candidate -> candidate
-health -> stable-port serving replacement -> serving health -> cleanup. Failed
-candidates preserve the previous server; post-switch failures attempt restoration.
-This is not Caddy backend blue/green. Rollback is another deployment with history.
+Deploy sequence: preflight -> build from the revision when the release is
+pending -> release command -> candidate containers for every process replica on
+dynamic loopback ports -> health for every web replica -> Caddy upstream switch
+with all web replica backends -> public HTTPS verification through local Caddy ->
+remove the previous deployment's containers. A failure before the switch removes
+the candidates and leaves the previous release serving; a failure after the
+switch restores the previous upstreams. Rollback and restart use the same path
+with the recorded revision/secret snapshot and the current revision respectively.
 Explicit retry creates new work; it does not rewrite a terminal failed record.
 
 Domains are changed in the submission transaction, then the worker reads all
-bindings, writes routes to localhost stable ports and reloads Caddy. A rejected
-reload restores the prior **file**, not the domain rows. Writes are currently
-not atomic/serialized globally; domain actions are not journaled node steps;
-there is no general route reconciler. Inventory/list exposes desired bindings
-even after a failed apply. See [network](network.md) before changing this path.
+bindings, writes one Caddy site per domain with the serving deployment's web
+replica upstreams and reloads Caddy. A deployment switch writes the same file
+with candidate upstreams and verifies the primary domain through local Caddy
+before removing the previous containers. A rejected reload restores the prior
+**file**, not the domain rows. Writes are currently not atomic/serialized
+globally; there is no general route reconciler. Inventory/list exposes desired
+bindings even after a failed apply. See [network](network.md) before changing
+this path.
 
 ## API and extension seams
 
@@ -372,9 +386,9 @@ even after a failed apply. See [network](network.md) before changing this path.
   actor-scoped state, bounded cursor pages and explicit cancellation.
 - `/v1/platform?collection=…`: bounded inventory with app/environment/node/state
   filters. Base collections: summary, nodes, apps, environments, revisions,
-  deployability, releases, deployments and changes; the internal DNS/access
-  extensions add their own. The removed resources/backups and telemetry
-  collections are not registered.
+  deployability, releases, builds, deployments and changes; the internal
+  DNS/access extensions add their own. The removed resources/backups and
+  telemetry collections are not registered.
 - `/v1/secrets…`: separate authenticated credential API; values are encrypted
   directly, never placed in ordinary action input.
 - `/v1/webhooks/github`: bounded HMAC-verified push with one server-wide secret
@@ -387,7 +401,8 @@ even after a failed apply. See [network](network.md) before changing this path.
   enrollment implementation.
 
 Caddy currently exposes only `/readyz` and `/v1/webhooks/github` on the main
-hostname. There is **no public deploy trigger path** yet. Do not expose all of
+hostname. There is **no public deploy trigger path** yet; the CI endpoint and
+per-environment push-to-deploy routing remain work list row 8. Do not expose all of
 `/v1` as a shortcut. Main-node application hostnames are separate Caddy sites.
 
 The operator `Backend` (`internal/cli`) and HTTP handlers share the

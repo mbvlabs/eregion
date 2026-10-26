@@ -28,8 +28,8 @@ type AppCreateInput struct {
 	// Environment optionally creates the first environment and its first
 	// desired-state revision in the same submission transaction.
 	Environment *EnvironmentSpec `json:"environment,omitempty"`
-	// Deploy records the intent to build and deploy the first revision. Building
-	// from a revision is implemented by the deploy work list row.
+	// Deploy queues the first build-and-deploy of the new revision in the same
+	// submission transaction.
 	Deploy bool `json:"deploy,omitempty"`
 }
 
@@ -167,7 +167,10 @@ func (in *ReleaseCreateInput) Preview() any { return in }
 type DeployInput struct {
 	App         string    `json:"app,omitempty"`
 	Environment string    `json:"environment,omitempty"`
-	ReleaseID   ReleaseID `json:"release_id"`
+	ReleaseID   ReleaseID `json:"release_id,omitempty"`
+	// Ref optionally overrides the current revision's git ref for a source
+	// deploy. It is ignored when ReleaseID is set.
+	Ref string `json:"ref,omitempty"`
 }
 
 func (in *DeployInput) Target() Target {
@@ -185,6 +188,35 @@ func (in *RollbackInput) Target() Target {
 	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
 }
 func (in *RollbackInput) Preview() any { return in }
+
+// BuildStopInput cancels one build and its running pack process. The target is
+// build/<build ID>; the optional field must match it.
+type BuildStopInput struct {
+	BuildID BuildID `json:"build_id,omitempty"`
+}
+
+func (in *BuildStopInput) Target() Target { return Target{Kind: TargetBuild, Build: in.BuildID} }
+func (in *BuildStopInput) Preview() any   { return in }
+
+// BuildRetryInput starts a new build of the original build's exact commit.
+type BuildRetryInput struct {
+	BuildID BuildID `json:"build_id,omitempty"`
+}
+
+func (in *BuildRetryInput) Target() Target { return Target{Kind: TargetBuild, Build: in.BuildID} }
+func (in *BuildRetryInput) Preview() any   { return in }
+
+// RestartInput reapplies the serving release with the environment's current
+// revision through the same blue/green path, so a scaled formation takes effect.
+type RestartInput struct {
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+}
+
+func (in *RestartInput) Target() Target {
+	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
+}
+func (in *RestartInput) Preview() any { return in }
 
 type NodeRegisterInput struct {
 	Name         string   `json:"name"`
@@ -219,8 +251,11 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindConfigUnset, Summary: "Unset plain environment configuration in a new revision", Normalize: normalizeConfigUnset})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentSecretAttach, Summary: "Attach a vault secret name to the environment's next revision", Normalize: normalizeEnvironmentSecretAttach})
 	r.registerBuiltin(Definition{Kind: KindReleaseCreate, Summary: "Record or build a release", Normalize: normalizeReleaseCreate})
-	r.registerBuiltin(Definition{Kind: KindDeploy, Summary: "Deploy a release with health-first switching", Normalize: normalizeDeploy})
-	r.registerBuiltin(Definition{Kind: KindRollback, Summary: "Deploy a previous release", Normalize: normalizeRollback})
+	r.registerBuiltin(Definition{Kind: KindBuildStop, Summary: "Stop a running build", Normalize: normalizeBuildStop})
+	r.registerBuiltin(Definition{Kind: KindBuildRetry, Summary: "Retry a build of the same commit", Normalize: normalizeBuildRetry})
+	r.registerBuiltin(Definition{Kind: KindDeploy, Summary: "Build from the revision or deploy a release with blue/green switching", Normalize: normalizeDeploy})
+	r.registerBuiltin(Definition{Kind: KindRollback, Summary: "Redeploy a previous release with its revision and secret snapshot", Normalize: normalizeRollback})
+	r.registerBuiltin(Definition{Kind: KindRestart, Summary: "Reapply the serving release with the current revision", Normalize: normalizeRestart})
 	r.registerBuiltin(Definition{Kind: KindDomainAdd, Summary: "Route a public hostname to an environment through Caddy", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindDomainRemove, Summary: "Remove a public hostname's route", Normalize: normalizeDomain})
 }
@@ -1034,6 +1069,7 @@ func validateCommand(command *CommandSpec) error {
 }
 
 func normalizeSource(input *ReleaseCreateInput) error {
+	input.Source.CredentialSecretName = strings.TrimSpace(input.Source.CredentialSecretName)
 	switch input.Source.Type {
 	case "image":
 		if input.Build != nil {
@@ -1042,11 +1078,11 @@ func normalizeSource(input *ReleaseCreateInput) error {
 		if err := ValidateImage(input.Source.Image); err != nil {
 			return err
 		}
-		if input.Source.Path != "" || input.Source.URL != "" || input.Source.Ref != "" {
+		if input.Source.Path != "" || input.Source.URL != "" || input.Source.Ref != "" || input.Source.CredentialSecretName != "" {
 			return invalid("source", "An image source uses only source.image.")
 		}
 	case "directory":
-		if input.Source.Image != "" || input.Source.URL != "" || input.Source.Ref != "" {
+		if input.Source.Image != "" || input.Source.URL != "" || input.Source.Ref != "" || input.Source.CredentialSecretName != "" {
 			return invalid("source", "A directory source uses only source.path.")
 		}
 		if !filepath.IsAbs(input.Source.Path) || strings.ContainsRune(input.Source.Path, 0) || strings.ContainsAny(input.Source.Path, "\r\n") {
@@ -1061,6 +1097,11 @@ func normalizeSource(input *ReleaseCreateInput) error {
 		}
 		if err := ValidateGitSourceURL(input.Source.URL); err != nil {
 			return invalid("source URL", err.Error())
+		}
+		if input.Source.CredentialSecretName != "" {
+			if !secretNamePattern.MatchString(input.Source.CredentialSecretName) {
+				return invalid("credential secret name", "Use a vault secret NAME such as GIT_READ_TOKEN; the value is never part of the release.")
+			}
 		}
 		if input.Source.Ref != "" && !validGitRef(input.Source.Ref) {
 			return invalid("source ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
@@ -1110,9 +1151,65 @@ func normalizeDeploy(target Target, raw json.RawMessage) (ActionInput, error) {
 		return nil, invalid("environment", "The environment field must match the target environment, or be omitted.")
 	}
 	input.App, input.Environment = target.App, target.Environment
-	if err := input.ReleaseID.Validate(); err != nil {
+	if input.ReleaseID != "" {
+		if err := input.ReleaseID.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if input.Ref != "" {
+		input.Ref = strings.TrimSpace(input.Ref)
+		if !validGitRef(input.Ref) {
+			return nil, invalid("ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
+		}
+	}
+	if input.ReleaseID != "" && input.Ref != "" {
+		return nil, invalid("ref", "Omit ref when redeploying an existing release.")
+	}
+	return &input, nil
+}
+
+func normalizeBuildStop(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetBuild {
+		return nil, invalid("target", "platform.build.stop requires target build/<build ID>.")
+	}
+	var input BuildStopInput
+	if err := strictDecode(raw, &input); err != nil {
 		return nil, err
 	}
+	if input.BuildID != "" && input.BuildID != target.Build {
+		return nil, invalid("build_id", "The build_id field must match the target build, or be omitted.")
+	}
+	input.BuildID = target.Build
+	return &input, nil
+}
+
+func normalizeBuildRetry(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetBuild {
+		return nil, invalid("target", "platform.build.retry requires target build/<build ID>.")
+	}
+	var input BuildRetryInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if input.BuildID != "" && input.BuildID != target.Build {
+		return nil, invalid("build_id", "The build_id field must match the target build, or be omitted.")
+	}
+	input.BuildID = target.Build
+	return &input, nil
+}
+
+func normalizeRestart(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetEnvironment {
+		return nil, invalid("target", "platform.restart requires target env/<app>/<env>.")
+	}
+	var input RestartInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if (input.App != "" && input.App != target.App) || (input.Environment != "" && input.Environment != target.Environment) {
+		return nil, invalid("environment", "The app and environment fields must match the target, or be omitted.")
+	}
+	input.App, input.Environment = target.App, target.Environment
 	return &input, nil
 }
 

@@ -15,7 +15,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
-	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/riverqueue/river"
 )
 
@@ -30,19 +29,24 @@ const platformStepTotal = 16
 // viewer. A restored switch is proven by the completed step record, never by a
 // message.
 const (
-	deploymentPreflightStep   = "platform-preflight-01-v1"
-	deploymentCandidateStep   = "platform-container-01-v1"
-	deploymentHealthStep      = "platform-health-01-v1"
-	deploymentSwitchStep      = "platform-container-02-v1"
-	deploymentVerifyStep      = "platform-health-02-v1"
-	deploymentRestoreStep     = "platform-container-03-v1"
-	deploymentRestoreHealth   = "platform-health-03-v1"
-	deploymentCleanupStep     = "platform-cleanup-01-v1"
-	deploymentCommandStep     = "platform-command-01-v1"
-	deploymentPackStep        = "platform-pack-01-v1"
-	deploymentImageStep       = "platform-image-01-v1"
-	deploymentPullStep        = "platform-pull-01-v1"
-	deploymentBuildStageLabel = "build"
+	deploymentPreflightStep    = "platform-preflight-01-v1"
+	deploymentCommandStep      = "platform-command-01-v1"
+	deploymentPackStep         = "platform-pack-01-v1"
+	deploymentImageStep        = "platform-image-01-v1"
+	deploymentPullStep         = "platform-pull-01-v1"
+	deploymentRouteStep        = "platform-routes-01-v1"
+	deploymentPublicStep       = "platform-public-01-v1"
+	deploymentRestoreRouteStep = "platform-route-restore-01-v1"
+	deploymentBuildStopStep    = "platform-build-stop-01-v1"
+	deploymentBuildStageLabel  = "build"
+)
+
+// Dynamic step prefixes: one container/health/cleanup effect per process
+// replica, so the exact names are derived from the deployment plan.
+const (
+	deploymentContainerStepPrefix = "platform-container-"
+	deploymentHealthStepPrefix    = "platform-health-"
+	deploymentCleanupStepPrefix   = "platform-cleanup-"
 )
 
 type platformWorker struct {
@@ -105,7 +109,11 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runNodeReconcile(ctx, op.ID, attempt, normalized)
 	case platform.KindReleaseCreate:
 		return w.runRelease(ctx, op.ID, attempt, normalized)
-	case platform.KindDeploy, platform.KindRollback:
+	case platform.KindBuildStop:
+		return w.runBuildStop(ctx, op.ID, attempt, normalized)
+	case platform.KindBuildRetry:
+		return w.runBuildRetry(ctx, op.ID, attempt, normalized)
+	case platform.KindDeploy, platform.KindRollback, platform.KindRestart:
 		return w.runDeployment(ctx, op.ID, attempt, normalized)
 	case platform.KindDomainAdd, platform.KindDomainRemove:
 		return w.runDomain(ctx, op.ID, attempt, normalized)
@@ -209,13 +217,6 @@ func (w *platformWorker) runRecordAction(ctx context.Context, id contract.Operat
 			if input.Environment == nil {
 				return nil
 			}
-			if input.Deploy {
-				if err := appendEvent(ctx, tx, op, contract.Event{
-					Kind: "warning", Stage: "environment", Message: "A first deploy was requested and is recorded on the revision as intent; deploy-from-revision is not implemented yet.",
-				}); err != nil {
-					return err
-				}
-			}
 			return recordRevisionChange(ctx, tx, op, "environment.created", input.Name, input.Environment.Name,
 				"Created environment "+input.Environment.Name+" and its first desired-state revision.")
 		case *platform.EnvironmentCreateInput:
@@ -302,413 +303,12 @@ func (w *platformWorker) runNodeCheck(ctx context.Context, id contract.Operation
 	return nil
 }
 
-func (w *platformWorker) runRelease(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
-	input := normalized.Input.(*platform.ReleaseCreateInput)
-	env, err := w.service.environment(ctx, input.App, input.Environment)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	// Image verification and builds both run on a node with an authenticated
-	// transport. A build uses the environment's explicit builder placement.
-	if err := crossNodeBuildUnsupported(env, input.Source.Type); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	nodeName := env.Node
-	role, capability := platform.RoleApplication, platform.CapabilityDocker
-	if input.Source.Type != "image" {
-		nodeName = env.BuildNodeName()
-		role, capability = platform.RoleBuilder, platform.CapabilityBuildpacks
-	}
-	n, err := w.service.node(ctx, nodeName)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.checkPlacement(n, role, capability); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	tr, err := w.service.resolver.TransportFor(ctx, n.Name)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	release, err := w.service.releaseForOperation(ctx, id)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	var result json.RawMessage
-	if input.Source.Type == "image" {
-		if input.Pull {
-			if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentPullStep, platform.ArgvPayload{
-				Step: deploymentPullStep, Argv: []string{"docker", "pull", release.Image}, TimeoutSeconds: 600,
-			}, nil); err != nil {
-				return w.settle(ctx, id, attempt, err)
-			}
-		}
-		result, err = w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
-			Step:           deploymentImageStep,
-			Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.Image},
-			TimeoutSeconds: 30,
-		}, nil)
-		if err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-	} else {
-		path := input.Source.Path
-		if input.Source.Type == "directory" {
-			path, err = platform.ResolveBuildSource(path, w.service.buildSourceRoots())
-			if err != nil {
-				return w.settle(ctx, id, attempt, err)
-			}
-		}
-		build := input.Build
-		if build == nil {
-			build = &platform.Build{Builder: platform.DefaultBuilder}
-		}
-		limit := buildLimit(n)
-		releaseSlot, err := w.service.acquireBuildSlot(ctx, n.Name, limit, func() {
-			w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
-				fmt.Sprintf("build_queued on node %s; all %d build slot(s) are busy", n.Name, limit))
-		})
-		if err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-		w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
-			fmt.Sprintf("build_running on node %s; %d of %d build slot(s) in use", n.Name, 1, limit))
-		_, buildErr := w.runStepOn(ctx, tr, id, attempt, deploymentPackStep, platform.PackPayload{
-			Step: deploymentPackStep, Image: release.Image, Path: path,
-			GitURL: input.Source.URL, GitRef: input.Source.Ref,
-			Builder: build.Builder, Env: build.Env, TimeoutSeconds: 900,
-		}, nil)
-		releaseSlot()
-		if buildErr != nil {
-			return w.settle(ctx, id, attempt, buildErr)
-		}
-		result, err = w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
-			Step:           deploymentImageStep,
-			Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.Image},
-			TimeoutSeconds: 30,
-		}, nil)
-		if err != nil {
-			return w.settle(ctx, id, attempt, err)
-		}
-	}
-	imageID := stepStdout(result)
-	if !strings.HasPrefix(imageID, "sha256:") || len(imageID) != 71 {
-		return w.settle(ctx, id, attempt, contract.NewFault(contract.PreconditionFailed, "image inspection did not return an immutable image ID", "Inspect the node image and release operation before retrying."))
-	}
-	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases
-            SET status='ready',image_id=$2,completed_at=clock_timestamp(),error='',error_code=''
-            WHERE id=$1`, release.ID, imageID); err != nil {
-			return err
-		}
-		if err := appendEvent(ctx, tx, op, contract.Event{
-			Kind: "log", Stage: "release", ReleaseID: string(release.ID),
-			Message: "Release " + string(release.ID) + " is ready with image " + imageID + ".",
-		}); err != nil {
-			return err
-		}
-		return insertPlatformChange(ctx, tx, op, "release.ready", release.App, release.Environment,
-			"Release "+string(release.ID)+" is ready from "+release.Source.Type+" source.",
-			map[string]any{"release_id": release.ID, "image": release.Image},
-			map[string]any{"release_id": release.ID, "image": release.Image, "image_id": imageID})
-	}); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	return nil
-}
-
 func stepStdout(raw json.RawMessage) string {
 	var value struct {
 		Stdout string `json:"stdout"`
 	}
 	_ = json.Unmarshal(raw, &value)
 	return strings.TrimSpace(value.Stdout)
-}
-
-func (w *platformWorker) runDeployment(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
-	var dep platform.Deployment
-	var env platform.Environment
-	var release platform.Release
-	var previous platform.Release
-	var err error
-	// The deployment row freezes the rollback target at acceptance. Recomputing
-	// a default rollback on retry could silently select a different release.
-	dep, env, release, previous, err = w.service.deploymentPlan(ctx, id)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	tr, err := w.service.resolver.TransportFor(ctx, env.Node)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	secrets, secretRevisions, err := w.service.resolveEnvironmentSecrets(ctx, env)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.recordDeploymentSecretSnapshot(ctx, id, env.RevisionID, secretRevisions); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	secretKeys := sortedPlatformKeys(secrets)
-	containerEnv := env.Env
-	releaseCommand := release.Command
-	if env.Revision != nil {
-		containerEnv = env.Revision.Config
-		if env.Revision.Runtime.ReleaseCommand != nil {
-			releaseCommand = env.Revision.Runtime.ReleaseCommand
-		}
-	}
-	candidateName := platform.CandidateContainerName(env.ID, id)
-	servingName := env.ID.Container("serving")
-	// A candidate step row may already exist from an earlier attempt. Cleanup is
-	// a durable step, so a container created before a failure is removed instead
-	// of leaking; but a retryable failure keeps it for the next attempt.
-	candidateMayExist := w.service.stepExists(ctx, id, deploymentCandidateStep)
-	finish := func(cause error) error {
-		return w.finishDeploymentAttempt(ctx, tr, id, attempt, candidateName, candidateMayExist, cause)
-	}
-
-	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return finish(err)
-	}
-	// Preflight is durable and visible: it proves the immutable image is present
-	// on the application node before the pipeline touches the serving container.
-	if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentPreflightStep, platform.ArgvPayload{
-		Step:           deploymentPreflightStep,
-		Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.ImageID},
-		TimeoutSeconds: 30,
-	}, nil); err != nil {
-		return finish(err)
-	}
-	if releaseCommand != nil {
-		commandArgs := []string{"docker", "run", "--rm", "--name", candidateName + "-cmd", "--pull", "never"}
-		for _, key := range sortedPlatformKeys(containerEnv) {
-			commandArgs = append(commandArgs, "-e", key)
-		}
-		for _, key := range secretKeys {
-			commandArgs = append(commandArgs, "-e", key)
-		}
-		commandArgs = append(commandArgs, release.ImageID)
-		commandArgs = append(commandArgs, releaseCommand.Argv...)
-		if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentCommandStep, platform.ArgvPayload{
-			Step: deploymentCommandStep, Argv: commandArgs,
-			Env: containerEnv, SecretEnvKeys: secretKeys, TimeoutSeconds: releaseCommand.TimeoutSeconds,
-		}, secrets); err != nil {
-			return finish(err)
-		}
-	}
-	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return finish(err)
-	}
-
-	candidatePayload := platform.ContainerPayload{
-		Step: deploymentCandidateStep, Name: candidateName, Image: release.ImageID,
-		ContainerPort: env.ContainerPort, HostPort: env.CandidatePort, Bind: env.Bind,
-		Env: containerEnv, SecretEnvKeys: secretKeys, Restart: "no",
-		Labels: map[string]string{
-			"io.eregion.app": env.App, "io.eregion.environment": env.Name,
-			"io.eregion.release": string(release.ID), "io.eregion.role": "candidate",
-		},
-	}
-	candidateMayExist = true // docker may have created a container even on error.
-	if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentCandidateStep, candidatePayload, secrets); err != nil {
-		return finish(err)
-	}
-
-	candidateHealth, healthErr := w.runStepOn(ctx, tr, id, attempt, deploymentHealthStep, platform.HealthPayload{
-		Step: deploymentHealthStep, Type: env.Health.Type, Target: platformHealthTarget(env, env.CandidatePort),
-		TimeoutSeconds: env.Health.TimeoutSeconds, IntervalMS: 500,
-	}, nil)
-	w.observeHealth(ctx, id, attempt, deploymentHealthStep, platformHealthTarget(env, env.CandidatePort), env.Health, candidateHealth, healthErr)
-	if healthErr != nil {
-		return finish(healthErr)
-	}
-	if err := w.service.checkCancelled(ctx, id); err != nil {
-		return finish(err)
-	}
-
-	servingPayload := platform.ContainerPayload{
-		Step: deploymentSwitchStep, Name: servingName, Image: release.ImageID,
-		ContainerPort: env.ContainerPort, HostPort: env.HostPort, Bind: env.Bind,
-		Env: containerEnv, SecretEnvKeys: secretKeys, Restart: "unless-stopped",
-		Labels: map[string]string{
-			"io.eregion.app": env.App, "io.eregion.environment": env.Name,
-			"io.eregion.release": string(release.ID), "io.eregion.role": "serving",
-		},
-	}
-	if previous.Image != "" {
-		servingPayload.FallbackImage = previous.ImageID
-	}
-	if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentSwitchStep, servingPayload, secrets); err != nil {
-		return finish(err)
-	}
-	// An explicit acknowledgement makes the serving identity observable without
-	// inferring it from a Docker log line.
-	w.service.appendWorkerEventWith(ctx, id, attempt, contract.Event{
-		Kind: "log", Stage: deploymentSwitchStep, Step: deploymentSwitchStep,
-		ReleaseID: string(release.ID), ServingReleaseID: string(release.ID),
-		Message: "Traffic switch acknowledged: release " + string(release.ID) + " now serves " + env.App + "/" + env.Name + ".",
-	})
-
-	verifyResult, verifyErr := w.runStepOn(ctx, tr, id, attempt, deploymentVerifyStep, platform.HealthPayload{
-		Step: deploymentVerifyStep, Type: env.Health.Type, Target: platformHealthTarget(env, env.HostPort),
-		TimeoutSeconds: env.Health.TimeoutSeconds, IntervalMS: 500,
-	}, nil)
-	w.observeHealth(ctx, id, attempt, deploymentVerifyStep, platformHealthTarget(env, env.HostPort), env.Health, verifyResult, verifyErr)
-	if verifyErr != nil {
-		// The candidate was healthy but the serving container is not. Restore the
-		// previous release before reporting failure, so a failed verify never
-		// leaves the environment stranded on an unverified release.
-		restored := false
-		restoredHealthy := false
-		if previous.Image != "" {
-			restore := platform.ContainerPayload{
-				Step: deploymentRestoreStep, Name: servingName, Image: previous.ImageID,
-				ContainerPort: env.ContainerPort, HostPort: env.HostPort, Bind: env.Bind,
-				Env: containerEnv, SecretEnvKeys: secretKeys, Restart: "unless-stopped",
-				Labels: map[string]string{
-					"io.eregion.app": env.App, "io.eregion.environment": env.Name,
-					"io.eregion.release": string(previous.ID), "io.eregion.role": "serving",
-				},
-			}
-			if _, restoreErr := w.runStepOn(ctx, tr, id, attempt, deploymentRestoreStep, restore, secrets); restoreErr == nil {
-				restored = true
-				restoreResult, restoreHealthErr := w.runStepOn(ctx, tr, id, attempt, deploymentRestoreHealth, platform.HealthPayload{
-					Step: deploymentRestoreHealth, Type: env.Health.Type, Target: platformHealthTarget(env, env.HostPort),
-					TimeoutSeconds: env.Health.TimeoutSeconds, IntervalMS: 500,
-				}, nil)
-				w.observeHealth(ctx, id, attempt, deploymentRestoreHealth, platformHealthTarget(env, env.HostPort), env.Health, restoreResult, restoreHealthErr)
-				restoredHealthy = restoreHealthErr == nil
-				if err := w.service.recordRestoredServing(ctx, id, attempt, env, previous.ID, restoredHealthy); err != nil {
-					return finish(err)
-				}
-				w.service.appendWorkerEventWith(ctx, id, attempt, contract.Event{
-					Kind: "log", Stage: deploymentRestoreStep, Step: deploymentRestoreStep,
-					ReleaseID: string(previous.ID), ServingReleaseID: string(previous.ID),
-					Message: "Previous release " + string(previous.ID) + " is serving again after failed verification.",
-				})
-				verifyErr = fmt.Errorf("%w; the previous release %s was restored", verifyErr, previous.ID)
-			}
-		}
-		if !restored {
-			// The new container may still be serving with unverified health.
-			w.service.appendWorkerEventWith(ctx, id, attempt, contract.Event{
-				Kind: "log", Stage: deploymentVerifyStep, Step: deploymentVerifyStep,
-				ReleaseID: string(release.ID),
-				Message:   "Serving release " + string(release.ID) + " was not verified and no previous release could be restored; health is unknown.",
-			})
-		}
-		return finish(verifyErr)
-	}
-	if err := w.cleanupCandidate(ctx, tr, id, attempt, candidateName); err != nil {
-		return finish(err)
-	}
-	candidateMayExist = false
-	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		now := time.Now().UTC()
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
-            SET state='succeeded',completed_at=$2,updated_at=$2,message=$3,error_code=''
-            WHERE operation_id=$1 AND state IN ('pending','running')`, id, now, "Serving release "+string(release.ID)+" passed health verification."); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,applied_release_id=$2,health_state='healthy',health_detail='serving release passed health verification',health_checked_at=$3,updated_at=$3
-            WHERE id=$1`, env.ID, release.ID, now); err != nil {
-			return err
-		}
-		if err := appendEvent(ctx, tx, op, contract.Event{
-			Kind: "log", Stage: "deploy", ReleaseID: string(release.ID), ServingReleaseID: string(release.ID),
-			Message: "Deployment succeeded; serving release " + string(release.ID) + " with healthy verification.",
-		}); err != nil {
-			return err
-		}
-		return insertPlatformChange(ctx, tx, op, string(dep.Action)+".succeeded", env.App, env.Name,
-			"Serving release "+string(release.ID)+" for "+env.App+"/"+env.Name+".",
-			map[string]any{"release_id": release.ID, "image": release.Image},
-			map[string]any{"serving_release_id": release.ID, "image": release.Image, "health": "healthy"})
-	}); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	return nil
-}
-
-// finishDeploymentAttempt cleans up the candidate when this attempt ends the
-// operation (success, terminal failure, or cancellation). A retryable failure
-// keeps the candidate and its durable step for the next attempt.
-func (w *platformWorker) finishDeploymentAttempt(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, candidateName string, candidateMayExist bool, cause error) error {
-	if cause == nil {
-		return nil
-	}
-	if candidateMayExist && deploymentAttemptIsTerminal(cause) {
-		if cleanupErr := w.cleanupCandidate(context.WithoutCancel(ctx), tr, id, attempt, candidateName); cleanupErr != nil {
-			w.service.appendWorkerEvent(ctx, id, attempt, "cleanup", "Candidate cleanup did not complete: "+cleanupErr.Error())
-			if contract.Classify(cleanupErr).Code == contract.Unavailable {
-				// Do not terminalise with the candidate still present; retry the
-				// cleanup before recording the outcome.
-				return w.settle(ctx, id, attempt, cleanupErr)
-			}
-		}
-	}
-	return w.settle(ctx, id, attempt, cause)
-}
-
-// deploymentAttemptIsTerminal mirrors settle: only terminal faults and explicit
-// cancellation end the operation. Unavailable faults (and unknown errors) retry.
-func deploymentAttemptIsTerminal(err error) bool {
-	if errors.Is(err, errPlatformCancelled) || errors.Is(err, errOperationTerminal) {
-		return true
-	}
-	switch contract.Classify(err).Code {
-	case contract.Unavailable:
-		return false
-	case contract.Cancelled:
-		return true
-	case contract.ValidationFailed, contract.PreconditionFailed, contract.NotFound, contract.Forbidden, contract.Conflict:
-		return true
-	default:
-		return false
-	}
-}
-
-// cleanupCandidate is a durable, idempotent node step. It is visible in operation
-// history and reconciled after a crash instead of being an invisible defer.
-func (w *platformWorker) cleanupCandidate(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, candidateName string) error {
-	if tr == nil {
-		return contract.NewFault(contract.Unavailable, "node transport is not configured", "Run this work in a worker configured with a node transport.")
-	}
-	// Cleanup must run even when the caller's context is being cancelled, but it
-	// is bounded: a dead node cannot hold the operation open indefinitely.
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
-	defer cancel()
-	_, err := w.runStepOn(cleanupCtx, tr, id, attempt, deploymentCleanupStep, platform.ArgvPayload{
-		Step: deploymentCleanupStep, Argv: []string{"docker", "rm", "-f", candidateName},
-		AllowFailure: true, TimeoutSeconds: 30,
-	}, nil)
-	return err
-}
-
-// recordRestoredServing records the release that actually serves after a failed
-// verification was rolled back. It is a domain write, not a guess from a log.
-func (s *Service) recordRestoredServing(ctx context.Context, id contract.OperationID, attempt uint32, env platform.Environment, release platform.ReleaseID, healthy bool) error {
-	state, detail := platform.HealthUnknown, "previous release restored after failed verification; health was not observed"
-	if healthy {
-		state, detail = platform.HealthHealthy, "previous release restored and passed its health check"
-	}
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		if op.State.Terminal() {
-			return nil
-		}
-		_, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,applied_release_id=$2,health_state=$3,health_detail=$4,health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE id=$1`, env.ID, release, string(state), detail)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	if !owned {
-		return errNotOwned
-	}
-	return nil
 }
 
 // observeHealth emits a structured health observation beside the node's log
@@ -740,20 +340,6 @@ func (w *platformWorker) observeHealth(ctx context.Context, id contract.Operatio
 	})
 }
 
-// platformHealthTarget always probes loopback. A container bound to 0.0.0.0 is
-// reachable there; a bind to one specific external address is not, which is an
-// honest unsupported placement rather than an unbounded network probe.
-func platformHealthTarget(env platform.Environment, port int) string {
-	if env.Health.Type == "tcp" {
-		return fmt.Sprintf("127.0.0.1:%d", port)
-	}
-	path := env.Health.Path
-	if path == "" {
-		path = "/"
-	}
-	return fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
-}
-
 func sortedPlatformKeys(values map[string]string) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -766,136 +352,6 @@ func sortedPlatformKeys(values map[string]string) []string {
 		}
 	}
 	return keys
-}
-
-func (s *Service) resolveEnvironmentSecrets(ctx context.Context, env platform.Environment) (map[string]string, map[string]platform.SecretRevisionRef, error) {
-	names := []string{}
-	if env.Revision != nil {
-		names = env.Revision.SecretNames
-	}
-	if len(names) == 0 && len(env.SecretRefs) == 0 {
-		return map[string]string{}, map[string]platform.SecretRevisionRef{}, nil
-	}
-	if s.secrets == nil {
-		return nil, nil, contract.NewFault(contract.PreconditionFailed, "secret injection is not configured", "Set EREGION_VAULT_KEY_FILE on every control-plane worker and declare secret names before deploying.")
-	}
-	var values map[string]string
-	var resolved map[string]vault.RevisionRef
-	var err error
-	if snapshot, ok := s.secrets.(EnvironmentSecretSnapshotResolver); ok {
-		values, resolved, err = snapshot.ResolveEnvironmentSnapshot(ctx, env.App, env.Name, names, env.SecretRefs)
-	} else if len(names) > 0 {
-		return nil, nil, contract.NewFault(contract.PreconditionFailed, "secret name resolution is not configured", "Use a worker whose secret resolver supports environment revision secret names.")
-	} else if scoped, ok := s.secrets.(EnvironmentSecretResolver); ok {
-		values, err = scoped.ResolveEnvironment(ctx, env.App, env.Name, env.SecretRefs)
-	} else {
-		values, err = s.secrets.Resolve(ctx, env.SecretRefs)
-	}
-	if err != nil {
-		return nil, nil, contract.NewFault(contract.Unavailable, "environment secrets could not be resolved", "Check the vault agent and secret names, then retry the deployment.")
-	}
-	out := make(map[string]string, len(values))
-	for key, value := range values {
-		if value == "" {
-			return nil, nil, contract.NewFault(contract.PreconditionFailed, "a declared environment secret is missing", "Resolve every configured secret name before deploying.")
-		}
-		out[key] = value
-	}
-	refs := make(map[string]platform.SecretRevisionRef, len(resolved))
-	for name, ref := range resolved {
-		refs[name] = platform.SecretRevisionRef{
-			Revision: ref.Revision, Hash: ref.Hash, KeyID: ref.KeyID, CreatedAt: ref.CreatedAt,
-		}
-	}
-	return out, refs, nil
-}
-
-// recordDeploymentSecretSnapshot freezes the exact revisions the first attempt
-// resolved. A retry keeps that snapshot even if the vault has since rotated.
-func (s *Service) recordDeploymentSecretSnapshot(ctx context.Context, id contract.OperationID, revisionID platform.RevisionID, refs map[string]platform.SecretRevisionRef) error {
-	raw, err := json.Marshal(refs)
-	if err != nil {
-		return unavailable(err)
-	}
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_deployments
-        SET revision_id=coalesce(revision_id,$2),
-            secret_revisions=CASE WHEN secret_revisions='{}'::jsonb THEN $3 ELSE secret_revisions END,
-            updated_at=clock_timestamp()
-        WHERE operation_id=$1`, id, nullableRevisionID(revisionID), raw); err != nil {
-		return unavailable()
-	}
-	return nil
-}
-
-func (s *Service) deploymentPlan(ctx context.Context, operationID contract.OperationID) (platform.Deployment, platform.Environment, platform.Release, platform.Release, error) {
-	dep, err := scanDeploymentRow(s.pool.QueryRow(ctx, deploymentSelect+` WHERE d.operation_id=$1`, operationID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return dep, platform.Environment{}, platform.Release{}, platform.Release{}, contract.NewFault(contract.NotFound, "deployment record is missing", "Do not retry an operation that has no durable deployment row.")
-	}
-	if err != nil {
-		return dep, platform.Environment{}, platform.Release{}, platform.Release{}, unavailable()
-	}
-	env, err := s.environment(ctx, dep.App, dep.Environment)
-	if err != nil {
-		return dep, env, platform.Release{}, platform.Release{}, err
-	}
-	// A deployment pins the revision accepted with it. Later environment
-	// changes must not silently alter a retry or a queued deployment.
-	if dep.RevisionID != "" && (env.Revision == nil || env.Revision.ID != dep.RevisionID) {
-		revision, err := s.revisionByID(ctx, dep.RevisionID)
-		if err != nil {
-			return dep, env, platform.Release{}, platform.Release{}, err
-		}
-		env.RevisionID, env.Revision = revision.ID, &revision
-		env.Processes = revision.Processes
-		env.Env = revision.Config
-		if revision.Runtime.Node != "" {
-			env.Node = revision.Runtime.Node
-		}
-		if revision.Runtime.HealthPath != "" {
-			env.Health = platform.HealthConfig{Type: revision.Runtime.HealthType, Path: revision.Runtime.HealthPath, TimeoutSeconds: revision.Runtime.HealthTimeoutSeconds}
-		}
-		for _, process := range revision.Processes {
-			if process.Kind == "web" && process.ContainerPort > 0 {
-				env.ContainerPort = process.ContainerPort
-				break
-			}
-		}
-	}
-	// Capture the actual predecessor after acquiring the distributed target
-	// lock, not the potentially stale serving value seen at submission. Once
-	// steps exist, keep the plan stable for journal recovery.
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_deployments SET previous_release_id=$2
-        WHERE operation_id=$1 AND NOT EXISTS (SELECT 1 FROM eregion_operation_steps WHERE operation_id=$1)`, operationID, nullableReleaseID(env.ServingRelease)); err != nil {
-		return dep, env, platform.Release{}, platform.Release{}, unavailable(err)
-	}
-	var previousID string
-	if err := s.pool.QueryRow(ctx, `SELECT coalesce(previous_release_id,'') FROM eregion_platform_deployments WHERE operation_id=$1`, operationID).Scan(&previousID); err != nil {
-		return dep, env, platform.Release{}, platform.Release{}, unavailable(err)
-	}
-	dep.PreviousReleaseID = platform.ReleaseID(previousID)
-	release, err := s.releaseByID(ctx, dep.ReleaseID)
-	if err != nil {
-		return dep, env, release, platform.Release{}, err
-	}
-	if release.App != env.App || release.Environment != env.Name || release.Status != platform.ReleaseReady {
-		return dep, env, release, platform.Release{}, contract.NewFault(contract.PreconditionFailed, "release is not ready for this environment", "Wait for the release operation to succeed, then retry the deployment.")
-	}
-	n, err := s.node(ctx, env.Node)
-	if err != nil {
-		return dep, env, release, platform.Release{}, err
-	}
-	if err := s.checkPlacement(n, platform.RoleApplication, platform.CapabilityDocker); err != nil {
-		return dep, env, release, platform.Release{}, err
-	}
-	var previous platform.Release
-	if dep.PreviousReleaseID != "" {
-		previous, err = s.releaseByID(ctx, dep.PreviousReleaseID)
-		if err != nil {
-			return dep, env, release, platform.Release{}, err
-		}
-	}
-	return dep, env, release, previous, nil
 }
 
 func (s *Service) releaseForOperation(ctx context.Context, operationID contract.OperationID) (platform.Release, error) {
@@ -1030,6 +486,10 @@ func (s *Service) failPlatformOperation(ctx context.Context, id contract.Operati
 		if op.State.Terminal() {
 			return nil
 		}
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_builds SET state='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
+            WHERE operation_id=$1 AND state IN ('pending','running')`, id, string(code), message); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET status='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
             WHERE operation_id=$1 AND status='pending'`, id, string(code), message); err != nil {
 			return err
@@ -1084,6 +544,16 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
+		}
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_builds
+            SET state='cancelled',error_code=$2,error=$3,completed_at=clock_timestamp()
+            WHERE operation_id=$1 AND state IN ('pending','running')`, id, string(contract.Cancelled), message); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases
+            SET status='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
+            WHERE operation_id=$1 AND status='pending'`, id, string(contract.Cancelled), message); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
             SET state='cancelled',message=$2,completed_at=clock_timestamp(),updated_at=clock_timestamp()
@@ -1241,14 +711,14 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 // action committed, and otherwise records failure with the serving release that
 // the environment actually had (or a switched release with unknown health).
 func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Operation) error {
-	if op.Kind == platform.KindDeploy || op.Kind == platform.KindRollback {
+	if op.Kind == platform.KindDeploy || op.Kind == platform.KindRollback || op.Kind == platform.KindRestart {
 		return s.reconcileDeployment(ctx, op)
 	}
 	if op.State == contract.Cancelling {
 		return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation reconciled after the River job ended.")
 	}
 	switch op.Kind {
-	case platform.KindReleaseCreate:
+	case platform.KindReleaseCreate, platform.KindBuildRetry:
 		release, err := s.releaseForOperation(ctx, op.ID)
 		if err != nil {
 			if fault := contract.Classify(err); fault.Code == contract.NotFound {
@@ -1260,6 +730,24 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
 		}
 		return s.failReconciledPlatform(ctx, op, "release execution ended before the image was verified or built", contract.Unavailable)
+	case platform.KindBuildStop:
+		var raw []byte
+		if err := s.pool.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {
+			return unavailable()
+		}
+		normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
+		if err != nil {
+			return err
+		}
+		input := normalized.Input.(*platform.BuildStopInput)
+		build, err := s.buildByID(ctx, input.BuildID)
+		if err != nil {
+			return err
+		}
+		if build.State == platform.BuildCancelled {
+			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+		}
+		return s.failReconciledPlatform(ctx, op, "build stop ended before the build was recorded as cancelled", contract.Unavailable)
 	case platform.KindNodeCheck, platform.KindNodeReconcile:
 		return s.failReconciledPlatform(ctx, op, "the node action ended before it recorded a result; it is idempotent, so submit it again", contract.Unavailable)
 	case platform.KindNodeEnroll:
@@ -1364,36 +852,44 @@ func (s *Service) reconcileDeployment(ctx context.Context, op contract.Operation
 		return s.failReconciledPlatform(ctx, op, "deployment record is missing", contract.Unavailable)
 	}
 	env, envErr := s.environment(ctx, dep.App, dep.Environment)
-	if envErr == nil {
-		s.reconcileDeploymentCleanup(ctx, op, env, dep)
-	}
 	if dep.State == "succeeded" {
 		return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
 	}
-	restored := s.completedStep(ctx, op.ID, deploymentRestoreStep)
-	switched := s.completedStep(ctx, op.ID, deploymentSwitchStep)
-	verified := s.completedStep(ctx, op.ID, deploymentVerifyStep)
+	restored := s.completedStep(ctx, op.ID, deploymentRestoreRouteStep)
+	switched := s.completedStep(ctx, op.ID, deploymentRouteStep)
+	verified := s.completedStep(ctx, op.ID, deploymentPublicStep)
 	cancelling := op.State == contract.Cancelling
 
 	if restored {
-		// The new release failed verification and the previous release was put
-		// back. Recording the failed new release as serving would be a lie.
-		healthy := s.completedStep(ctx, op.ID, deploymentRestoreHealth)
+		// The new release failed verification and the previous upstreams were
+		// put back. Recording the failed new release as serving would be a lie.
 		if envErr != nil {
 			return envErr
 		}
-		return s.failAfterRestore(ctx, op, dep, env, healthy)
+		s.reconcileDeploymentCleanup(ctx, op, env, dep)
+		return s.failAfterRestore(ctx, op, dep, env, false)
 	}
 	if switched {
-		if cancelling && verified {
-			// Cancellation arrived after the switch and verification completed;
-			// the worker would have finished successfully.
+		if verified {
+			// The switch and public verification both committed before the
+			// process died; the worker would have finished successfully.
 			return s.finishDeploymentAfterSwitch(ctx, op, dep, env)
 		}
+		// The switch committed but the public check did not. Restore the
+		// previous upstreams from the still-old serving deployment and remove
+		// the unverified candidate formation.
+		restoreErr := s.syncRoutes(context.WithoutCancel(ctx))
+		s.reconcileDeploymentCleanup(ctx, op, env, dep)
 		if cancelling {
-			return s.cancelAfterSwitch(ctx, op, dep, env, verified)
+			return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation reconciled after the switch; the previous serving release was restored.")
 		}
-		return s.failAfterSwitch(ctx, op, dep, env, verified)
+		if restoreErr != nil {
+			return s.failReconciledPlatform(ctx, op, "execution ended after the switch and restoring the previous upstreams failed: "+restoreErr.Error(), contract.Unavailable)
+		}
+		return s.failReconciledPlatform(ctx, op, "execution ended after the switch before public verification; the previous serving release was restored", contract.Unavailable)
+	}
+	if envErr == nil {
+		s.reconcileDeploymentCleanup(ctx, op, env, dep)
 	}
 	if cancelling {
 		return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation reconciled before the traffic switch; the previous serving release is unchanged.")
@@ -1411,7 +907,23 @@ func (s *Service) completedStep(ctx context.Context, id contract.OperationID, st
 // an unreachable node must not keep the operation running forever, but the
 // failure is visible.
 func (s *Service) reconcileDeploymentCleanup(ctx context.Context, op contract.Operation, env platform.Environment, dep platform.Deployment) {
-	if !s.stepExists(ctx, op.ID, deploymentCandidateStep) {
+	instances := dep.Instances
+	revision := env.Revision
+	if dep.RevisionID != "" && (revision == nil || revision.ID != dep.RevisionID) {
+		pinned, err := s.revisionByID(ctx, dep.RevisionID)
+		if err == nil {
+			revision = &pinned
+		}
+	}
+	if len(instances) == 0 && revision != nil && s.hasStepPrefix(ctx, op.ID, deploymentContainerStepPrefix) {
+		plan, err := platform.PlanDeployment(env.App, env.Name, revision.RevisionState, dep.ReleaseID, dep.ID)
+		if err == nil {
+			for _, planned := range plan {
+				instances = append(instances, platform.DeploymentInstance{Name: planned.Name})
+			}
+		}
+	}
+	if len(instances) == 0 {
 		return
 	}
 	if s.resolver == nil {
@@ -1423,50 +935,22 @@ func (s *Service) reconcileDeploymentCleanup(ctx context.Context, op contract.Op
 		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup could not reach the application node: "+contract.Classify(err).Message)
 		return
 	}
-	worker := &platformWorker{service: s}
-	if err := worker.cleanupCandidate(ctx, tr, op.ID, op.Attempt, platform.CandidateContainerName(env.ID, op.ID)); err != nil {
+	if err := s.removeDeploymentContainers(ctx, tr, op.ID, op.Attempt, instances); err != nil {
 		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup did not complete: "+contract.Classify(err).Message)
 	}
 }
 
-func (s *Service) failAfterSwitch(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, verified bool) error {
-	health, detail := platform.HealthUnknown, "deployment interrupted after the switch; health verification did not commit"
-	if verified {
-		health, detail = platform.HealthHealthy, "deployment interrupted after a verified switch; health check had passed"
-	}
-	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx pgx.Tx, current *contract.Operation) error {
-		if current.State.Terminal() {
-			return nil
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
-            SET state='failed',error_code=$2,message=$3,completed_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE operation_id=$1 AND state IN ('pending','running')`,
-			op.ID, string(contract.Unavailable), "The serving container was switched, but the operation did not commit; serving release recorded with "+string(health)+" health."); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,applied_release_id=$2,health_state=$3,health_detail=$4,health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE id=$1`, env.ID, dep.ReleaseID, string(health), detail); err != nil {
-			return err
-		}
-		if err := appendEvent(ctx, tx, current, contract.Event{
-			Kind: "log", Stage: "deploy", ReleaseID: string(dep.ReleaseID), ServingReleaseID: string(dep.ReleaseID),
-			Message: "Execution ended after the switched release " + string(dep.ReleaseID) + " began serving; recorded health is " + string(health) + ".",
-		}); err != nil {
-			return err
-		}
-		if err := markIncompleteSteps(ctx, tx, op.ID, contract.Unavailable, "operation reconciled after the serving switch"); err != nil {
-			return err
-		}
-		return transition(ctx, tx, current, contract.Failed, contract.Unavailable, "Execution ended after the serving switch but before completion; release "+string(dep.ReleaseID)+" is recorded with "+string(health)+" health.")
-	})
+func (s *Service) hasStepPrefix(ctx context.Context, id contract.OperationID, prefix string) bool {
+	records, err := s.stepRecords(ctx, id)
 	if err != nil {
-		return err
+		return false
 	}
-	if !owned {
-		return nil
+	for _, record := range records {
+		if strings.HasPrefix(record.Step, prefix) {
+			return true
+		}
 	}
-	return nil
+	return false
 }
 
 // failAfterRestore records the previous release as serving after a completed
@@ -1488,8 +972,8 @@ func (s *Service) failAfterRestore(ctx context.Context, op contract.Operation, d
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,applied_release_id=$2,health_state=$3,health_detail=$4,health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE id=$1`, env.ID, serving, string(health), detail); err != nil {
+            SET serving_release_id=$2,serving_deployment_id=$3,applied_release_id=$2,health_state=$4,health_detail=$5,health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
+            WHERE id=$1`, env.ID, serving, dep.PreviousDeploymentID, string(health), detail); err != nil {
 			return err
 		}
 		if err := appendEvent(ctx, tx, current, contract.Event{
@@ -1513,49 +997,6 @@ func (s *Service) failAfterRestore(ctx context.Context, op contract.Operation, d
 	return nil
 }
 
-// cancelAfterSwitch records a switch that completed before cancellation was
-// reconciled. The operation is cancelled, but the served release and its health
-// are recorded instead of leaving the environment claiming an older release.
-func (s *Service) cancelAfterSwitch(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, verified bool) error {
-	health, detail := platform.HealthUnknown, "deployment was cancelled after the switch; health verification did not commit"
-	if verified {
-		health, detail = platform.HealthHealthy, "deployment was cancelled after a verified switch; health check had passed"
-	}
-	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx pgx.Tx, current *contract.Operation) error {
-		if current.State.Terminal() {
-			return nil
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
-            SET state='cancelled',message=$2,completed_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE operation_id=$1 AND state IN ('pending','running')`,
-			op.ID, "Cancellation reconciled after the switch; release "+string(dep.ReleaseID)+" is serving with "+string(health)+" health."); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,applied_release_id=$2,health_state=$3,health_detail=$4,health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE id=$1`, env.ID, dep.ReleaseID, string(health), detail); err != nil {
-			return err
-		}
-		if err := appendEvent(ctx, tx, current, contract.Event{
-			Kind: "log", Stage: "deploy", ReleaseID: string(dep.ReleaseID), ServingReleaseID: string(dep.ReleaseID),
-			Message: "Cancellation reconciled after the switch; release " + string(dep.ReleaseID) + " serves with " + string(health) + " health.",
-		}); err != nil {
-			return err
-		}
-		if err := markIncompleteSteps(ctx, tx, op.ID, contract.Cancelled, "operation reconciled after the serving switch"); err != nil {
-			return err
-		}
-		return transition(ctx, tx, current, contract.Canceled, "", "Cancellation reconciled after the switch; release "+string(dep.ReleaseID)+" is serving with "+string(health)+" health.")
-	})
-	if err != nil {
-		return err
-	}
-	if !owned {
-		return nil
-	}
-	return nil
-}
-
 func (s *Service) finishDeploymentAfterSwitch(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment) error {
 	return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(tx pgx.Tx, current *contract.Operation) error {
 		now := time.Now().UTC()
@@ -1566,8 +1007,8 @@ func (s *Service) finishDeploymentAfterSwitch(ctx context.Context, op contract.O
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,applied_release_id=$2,health_state='healthy',health_detail='serving release passed health verification',health_checked_at=$3,updated_at=$3
-            WHERE id=$1`, env.ID, dep.ReleaseID, now); err != nil {
+            SET serving_release_id=$2,serving_deployment_id=$3,applied_release_id=$2,health_state='healthy',health_detail='serving release passed health verification',health_checked_at=$4,updated_at=$4
+            WHERE id=$1`, env.ID, dep.ReleaseID, dep.ID, now); err != nil {
 			return err
 		}
 		if err := appendEvent(ctx, tx, current, contract.Event{

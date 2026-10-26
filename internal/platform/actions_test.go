@@ -46,3 +46,37 @@ func TestEnvironmentPreviewMentionsDistinctBuildNode(t *testing.T) {
 		t.Fatalf("preview lost build node: %+v", got)
 	}
 }
+
+func TestDeployNormalizesSourceAndReleaseForms(t *testing.T) {
+	registry := NewRegistry()
+	normalize := func(kind, target string, input map[string]any) (Normalized, error) {
+		raw, _ := json.Marshal(input)
+		return registry.Normalize(kind, target, raw)
+	}
+	source, err := normalize(KindDeploy, "env/api/production", map[string]any{"ref": "release/1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploy := source.Input.(*DeployInput)
+	if deploy.ReleaseID != "" || deploy.Ref != "release/1" {
+		t.Fatalf("source deploy=%+v", deploy)
+	}
+	release, err := normalize(KindDeploy, "env/api/production", map[string]any{"release_id": "rel_00000000000000000000000000000001"})
+	if err != nil || release.Input.(*DeployInput).ReleaseID == "" {
+		t.Fatalf("release deploy err=%v", err)
+	}
+	if _, err := normalize(KindDeploy, "env/api/production", map[string]any{"release_id": "rel_00000000000000000000000000000001", "ref": "main"}); err == nil {
+		t.Fatal("release and ref together must be refused")
+	}
+	buildTarget := "build/bld_00000000000000000000000000000001"
+	stop, err := normalize(KindBuildStop, buildTarget, map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stop.Input.(*BuildStopInput).BuildID != "bld_00000000000000000000000000000001" {
+		t.Fatalf("build stop input=%+v", stop.Input)
+	}
+	if _, err := normalize(KindBuildRetry, "env/api/production", map[string]any{}); err == nil {
+		t.Fatal("build retry requires a build target")
+	}
+}

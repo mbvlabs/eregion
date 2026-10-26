@@ -111,8 +111,16 @@ func platformAcceptedMessage(kind string) string {
 		return "Environment desired state accepted durably as a new revision; no deploy was queued."
 	case platform.KindReleaseCreate:
 		return "Release accepted durably; the image is verified or built before it becomes ready."
-	case platform.KindDeploy, platform.KindRollback:
-		return "Deployment accepted durably; the serving release is unchanged until a candidate is healthy."
+	case platform.KindBuildStop:
+		return "Build stop accepted durably; the running pack process will be cancelled."
+	case platform.KindBuildRetry:
+		return "Build retry accepted durably; a new build of the same commit will run."
+	case platform.KindDeploy:
+		return "Deployment accepted durably; the serving release is unchanged until the candidate passes health and the public check."
+	case platform.KindRollback:
+		return "Rollback accepted durably; it redeploys the earlier release with its recorded revision and secret snapshot."
+	case platform.KindRestart:
+		return "Restart accepted durably; the serving release is reapplied with the current revision."
 	case platform.KindNodeRegister:
 		return "Node placement facts accepted durably. This does not install or verify host state."
 	case platform.KindNodeCheck:
@@ -142,10 +150,16 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			app := platform.App{ID: appID, Name: input.Name}
 			summary := "Created environment " + input.Environment.Name + " with its first desired-state revision."
 			if input.Deploy {
-				summary += " A first deploy was requested and is recorded as intent until deploy-from-revision is implemented."
+				summary += " The first deploy was queued from that revision."
 			}
-			if _, err := s.insertEnvironmentTx(ctx, tx, app, input.Environment, id, actor, "environment.created", summary, input.Deploy); err != nil {
+			envID, err := s.insertEnvironmentTx(ctx, tx, app, input.Environment, id, actor, "environment.created", summary, input.Deploy)
+			if err != nil {
 				return err
+			}
+			if input.Deploy {
+				if err := s.queueFirstDeployTx(ctx, tx, envID, actor); err != nil {
+					return err
+				}
 			}
 		}
 	case *platform.NodeRegisterInput:
@@ -293,7 +307,9 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if node.Transport != "local" {
 			return contract.NewFault(contract.PreconditionFailed, "domains route only to environments on the main node for now", "Create the environment on the main node.")
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id) VALUES($1,$2)`, input.Domain, env.ID); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary)
+            VALUES($1,$2,NOT EXISTS(SELECT 1 FROM eregion_platform_domains WHERE environment_id=$2 AND is_primary))`,
+			input.Domain, env.ID); err != nil {
 			return platformWriteError(err, input.Domain+" is already routed")
 		}
 	case *platform.ReleaseCreateInput:
@@ -346,36 +362,66 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			releaseID, id, envAppID(ctx, tx, env.App), env.ID, image, source, nullableJSON(build), nullableJSON(command)); err != nil {
 			return platformWriteError(err, "release could not be recorded")
 		}
+		if input.Source.Type != "image" {
+			buildID, err := insertBuildTx(ctx, tx, id, env, releaseID, env.RevisionID, input.Source, "")
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET build_id=$2 WHERE id=$1`, releaseID, buildID); err != nil {
+				return unavailable()
+			}
+		}
+	case *platform.BuildStopInput:
+		build, err := s.buildByID(ctx, input.BuildID)
+		if err != nil {
+			return err
+		}
+		if build.State == platform.BuildSucceeded {
+			return contract.NewFault(contract.Conflict, "build already succeeded", "Retry with a new build after changing the source if another artifact is needed.")
+		}
+		return nil
+	case *platform.BuildRetryInput:
+		old, err := s.buildByID(ctx, input.BuildID)
+		if err != nil {
+			return err
+		}
+		if old.State != platform.BuildFailed && old.State != platform.BuildCancelled {
+			return contract.NewFault(contract.PreconditionFailed, "build is not in a retryable state", "Wait for the build to finish, or stop a running build first.")
+		}
+		env, err := environmentByNameTx(ctx, tx, old.App, old.Environment)
+		if err != nil {
+			return err
+		}
+		if err := s.createRetryReleaseTx(ctx, tx, id, env, old); err != nil {
+			return err
+		}
 	case *platform.DeployInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
 			return err
 		}
-		release, err := releaseByIDTx(ctx, tx, input.ReleaseID)
+		releaseID := input.ReleaseID
+		if releaseID == "" {
+			releaseID, err = s.createReleaseFromRevisionTx(ctx, tx, id, env, input.Ref)
+			if err != nil {
+				return err
+			}
+		}
+		release, err := releaseByIDTx(ctx, tx, releaseID)
 		if err != nil {
 			return err
 		}
 		if release.App != env.App || release.Environment != env.Name {
 			return contract.NewFault(contract.ValidationFailed, "release belongs to another environment", "Use a release created for this app and environment.")
 		}
-		if release.Status != platform.ReleaseReady {
+		if release.Status != platform.ReleaseReady && input.ReleaseID != "" {
 			return contract.NewFault(contract.PreconditionFailed, "release is not ready", "Wait for the release operation to succeed, then deploy it.")
 		}
 		if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
 			return err
 		}
-		depID, err := platform.NewDeploymentID()
-		if err != nil {
-			return unavailable()
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_deployments
-            (id,operation_id,app_id,environment_id,action,release_id,previous_release_id,revision_id)
-            VALUES($1,$2,$3,$4,'deploy',$5,$6,$7)`,
-			depID, id, envAppID(ctx, tx, env.App), env.ID, release.ID, nullableReleaseID(env.ServingRelease), nullableRevisionID(env.RevisionID)); err != nil {
-			return unavailable()
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET desired_release_id=$2, updated_at=clock_timestamp() WHERE id=$1`, env.ID, release.ID); err != nil {
-			return unavailable()
+		if err := s.prepareDeploymentTx(ctx, tx, id, env, release.ID, platform.ActionDeploy, env.RevisionID, env.ServingDeploymentID, nil); err != nil {
+			return err
 		}
 	case *platform.RollbackInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
@@ -405,18 +451,33 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
 			return err
 		}
-		depID, err := platform.NewDeploymentID()
+		revisionID, secrets, err := rollbackSnapshotTx(ctx, tx, env, release.ID)
 		if err != nil {
-			return unavailable()
+			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_deployments
-            (id,operation_id,app_id,environment_id,action,release_id,previous_release_id,revision_id)
-            VALUES($1,$2,$3,$4,'rollback',$5,$6,$7)`,
-			depID, id, envAppID(ctx, tx, env.App), env.ID, release.ID, nullableReleaseID(env.ServingRelease), nullableRevisionID(env.RevisionID)); err != nil {
-			return unavailable()
+		if err := s.prepareDeploymentTx(ctx, tx, id, env, release.ID, platform.ActionRollback, revisionID, env.ServingDeploymentID, secrets); err != nil {
+			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET desired_release_id=$2, updated_at=clock_timestamp() WHERE id=$1`, env.ID, release.ID); err != nil {
-			return unavailable()
+	case *platform.RestartInput:
+		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
+		if err != nil {
+			return err
+		}
+		if env.ServingRelease == "" || env.ServingDeploymentID == "" {
+			return contract.NewFault(contract.PreconditionFailed, "no serving deployment is available to restart", "Deploy a release before restarting the environment.")
+		}
+		release, err := releaseByIDTx(ctx, tx, env.ServingRelease)
+		if err != nil {
+			return err
+		}
+		if release.Status != platform.ReleaseReady {
+			return contract.NewFault(contract.PreconditionFailed, "serving release is not ready", "Deploy a ready release before restarting.")
+		}
+		if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+			return err
+		}
+		if err := s.prepareDeploymentTx(ctx, tx, id, env, release.ID, platform.ActionRestart, env.RevisionID, env.ServingDeploymentID, nil); err != nil {
+			return err
 		}
 	case *platform.NodeCheckInput:
 		if _, err := nodeByNameTx(ctx, tx, input.Node); err != nil {
@@ -439,6 +500,255 @@ func envAppID(ctx context.Context, tx pgx.Tx, app string) string {
 	var id string
 	_ = tx.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&id)
 	return id
+}
+
+func (s *Service) prepareDeploymentTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, releaseID platform.ReleaseID, action platform.DeploymentAction, revisionID platform.RevisionID, previousDeploymentID platform.DeploymentID, secretRevisions []byte) error {
+	depID, err := platform.NewDeploymentID()
+	if err != nil {
+		return unavailable()
+	}
+	if len(secretRevisions) == 0 {
+		secretRevisions = []byte(`{}`)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_deployments
+        (id,operation_id,app_id,environment_id,action,release_id,previous_release_id,previous_deployment_id,revision_id,secret_revisions)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		depID, opID, envAppID(ctx, tx, env.App), env.ID, string(action), releaseID,
+		nullableReleaseID(env.ServingRelease), nullableDeploymentID(previousDeploymentID),
+		nullableRevisionID(revisionID), secretRevisions); err != nil {
+		return platformWriteError(err, "deployment could not be recorded")
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET desired_release_id=$2, updated_at=clock_timestamp() WHERE id=$1`, env.ID, releaseID); err != nil {
+		return unavailable()
+	}
+	return nil
+}
+
+func nullableDeploymentID(id platform.DeploymentID) any {
+	if id == "" {
+		return nil
+	}
+	return string(id)
+}
+
+// createReleaseFromRevisionTx records the pending release and build for a
+// deploy from the environment's current revision. The worker resolves the git
+// ref to an exact commit, builds, records the digest, then deploys.
+func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, refOverride string) (platform.ReleaseID, error) {
+	if env.Revision == nil {
+		return "", contract.NewFault(contract.PreconditionFailed, "environment has no current revision", "Save an environment revision before deploying.")
+	}
+	state := env.Revision.RevisionState
+	source := state.Source
+	if refOverride != "" && source.Kind != "git" {
+		return "", contract.NewFault(contract.ValidationFailed, "ref is only valid for a git source", "Omit ref when the environment revision binds an image.")
+	}
+	releaseID, err := platform.NewReleaseID()
+	if err != nil {
+		return "", unavailable()
+	}
+	var sourceJSON []byte
+	var buildJSON []byte
+	var buildSource platform.Source
+	commit := ""
+	switch source.Kind {
+	case "image":
+		buildSource = platform.Source{Type: "image", Image: source.Image}
+		sourceJSON, _ = json.Marshal(buildSource)
+	case "git":
+		if env.BuildNodeName() != env.Node {
+			return "", contract.NewFault(contract.PreconditionFailed, "build_node is distinct from the application node; moving the built image requires a shared registry", "Use build_node equal to the environment node, or deploy an image release.")
+		}
+		ref := refOverride
+		if ref == "" {
+			ref = source.Ref
+		}
+		if err := platform.ValidateGitSourceURL(source.URL); err != nil {
+			return "", contract.NewFault(contract.PreconditionFailed, "the environment's git source is invalid", err.Error())
+		}
+		buildSource = platform.Source{
+			Type: "git", URL: source.URL, Ref: ref, Path: source.ContextPath,
+			CredentialSecretName: source.CredentialSecretName,
+		}
+		sourceJSON, _ = json.Marshal(buildSource)
+		build := platform.Build{Builder: source.Builder, Env: source.BuildEnv}
+		buildJSON, _ = json.Marshal(build)
+	default:
+		return "", contract.NewFault(contract.PreconditionFailed, "environment source is not deployable", "Bind an image or HTTPS git source in the environment revision.")
+	}
+	image := "eregion/" + env.App + "-" + env.Name + ":" + strings.TrimPrefix(string(opID), "op_")[:12]
+	if source.Kind == "image" {
+		image = source.Image
+	}
+	if err := platform.ValidateImage(image); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_releases
+        (id,operation_id,app_id,environment_id,image,source,build,status,commit_sha)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8)`,
+		releaseID, opID, envAppID(ctx, tx, env.App), env.ID, image, sourceJSON, nullableJSON(buildJSON), commit); err != nil {
+		return "", platformWriteError(err, "release could not be recorded")
+	}
+	if source.Kind == "git" {
+		buildID, err := insertBuildTx(ctx, tx, opID, env, releaseID, env.RevisionID, buildSource, commit)
+		if err != nil {
+			return "", err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET build_id=$2 WHERE id=$1`, releaseID, buildID); err != nil {
+			return "", unavailable()
+		}
+	}
+	return releaseID, nil
+}
+
+func (s *Service) createRetryReleaseTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, old platform.BuildRecord) error {
+	oldRelease, err := releaseByIDTx(ctx, tx, old.ReleaseID)
+	if err != nil {
+		return err
+	}
+	image := "eregion/" + env.App + "-" + env.Name + ":" + strings.TrimPrefix(string(opID), "op_")[:12]
+	if old.Source.Type == "image" {
+		image = old.Source.Image
+	}
+	if err := platform.ValidateImage(image); err != nil {
+		return err
+	}
+	if old.Source.Type == "git" {
+		if old.CommitSHA != "" {
+			old.Source.Ref = old.CommitSHA
+		}
+		if old.Source.Ref == "" {
+			return contract.NewFault(contract.PreconditionFailed, "build has no exact commit to retry", "Start a new deploy so the ref resolves to a commit first.")
+		}
+	}
+	sourceJSON, _ := json.Marshal(old.Source)
+	var buildJSON []byte
+	if oldRelease.Build != nil {
+		buildJSON, _ = json.Marshal(oldRelease.Build)
+	}
+	releaseID, err := platform.NewReleaseID()
+	if err != nil {
+		return unavailable()
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_releases
+        (id,operation_id,app_id,environment_id,image,source,build,status,commit_sha)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8)`,
+		releaseID, opID, envAppID(ctx, tx, env.App), env.ID, image, sourceJSON, nullableJSON(buildJSON), old.CommitSHA); err != nil {
+		return platformWriteError(err, "retry release could not be recorded")
+	}
+	revisionID := old.RevisionID
+	if revisionID == "" {
+		revisionID = env.RevisionID
+	}
+	buildID, err := insertBuildTx(ctx, tx, opID, env, releaseID, revisionID, old.Source, old.CommitSHA)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET build_id=$2 WHERE id=$1`, releaseID, buildID); err != nil {
+		return unavailable()
+	}
+	return nil
+}
+
+func insertBuildTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, releaseID platform.ReleaseID, revisionID platform.RevisionID, source platform.Source, commit string) (platform.BuildID, error) {
+	buildID, err := platform.NewBuildID()
+	if err != nil {
+		return "", unavailable()
+	}
+	sourceJSON, _ := json.Marshal(source)
+	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_builds
+        (id,operation_id,app_id,environment_id,revision_id,release_id,source,commit_sha,state)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'pending')`,
+		buildID, opID, envAppID(ctx, tx, env.App), env.ID, nullableRevisionID(revisionID),
+		nullableReleaseID(releaseID), sourceJSON, commit); err != nil {
+		return "", platformWriteError(err, "build could not be recorded")
+	}
+	return buildID, nil
+}
+
+// rollbackSnapshotTx finds the revision and exact secret revisions the target
+// release used when it last served (MASTER D18).
+func rollbackSnapshotTx(ctx context.Context, tx pgx.Tx, env platform.Environment, releaseID platform.ReleaseID) (platform.RevisionID, []byte, error) {
+	var revisionID string
+	var secretRevisions []byte
+	err := tx.QueryRow(ctx, `SELECT coalesce(revision_id,''),secret_revisions
+        FROM eregion_platform_deployments
+        WHERE environment_id=$1 AND release_id=$2 AND state='succeeded'
+        ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1`, env.ID, releaseID).
+		Scan(&revisionID, &secretRevisions)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return env.RevisionID, []byte(`{}`), nil
+	}
+	if err != nil {
+		return "", nil, unavailable()
+	}
+	if revisionID == "" {
+		revisionID = string(env.RevisionID)
+	}
+	if len(secretRevisions) == 0 {
+		secretRevisions = []byte(`{}`)
+	}
+	return platform.RevisionID(revisionID), secretRevisions, nil
+}
+
+func (s *Service) queueFirstDeployTx(ctx context.Context, tx pgx.Tx, envID platform.EnvironmentID, actor contract.Actor) error {
+	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE e.id=$1 FOR UPDATE OF e", envID))
+	if err != nil {
+		return unavailable()
+	}
+	if env.Revision == nil || !env.Revision.DeployIntent {
+		return nil
+	}
+	input := platform.DeployInput{App: env.App, Environment: env.Name}
+	return s.submitFollowupOperationTx(ctx, tx, platform.KindDeploy, "env/"+env.App+"/"+env.Name, input, actor, "first-deploy:"+string(env.RevisionID))
+}
+
+// submitFollowupOperationTx records one additional operation and River job in
+// the caller's transaction. It is used for the first deploy requested by app
+// create, so the intent is durable with the revision that requested it.
+func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind, target string, input any, actor contract.Actor, key string) error {
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	normalized, err := platform.Default().Normalize(kind, target, raw)
+	if err != nil {
+		return err
+	}
+	id, err := contract.NewOperationID()
+	if err != nil {
+		return err
+	}
+	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'queued')
+        ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`,
+		id, kind, normalized.Target.String(), actor.Kind, actor.Subject, key, hashInput(normalized.Canonical), normalized.Canonical)
+	if err != nil {
+		return unavailable()
+	}
+	if inserted.RowsAffected() == 0 {
+		return nil
+	}
+	if err := s.preparePlatform(ctx, tx, id, normalized, actor); err != nil {
+		return err
+	}
+	if s.enqueuePlatform == nil {
+		return unavailable()
+	}
+	op := contract.Operation{ID: id, Kind: kind, Target: normalized.Target.String(), Actor: actor}
+	jobID, err := s.enqueuePlatform(ctx, tx, op)
+	if err != nil {
+		return unavailable()
+	}
+	if _, err := tx.Exec(ctx, "UPDATE eregion_operations SET job_id=$2 WHERE id=$1", id, jobID); err != nil {
+		return unavailable()
+	}
+	op, err = scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
+	if err != nil {
+		return unavailable()
+	}
+	return appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: platformAcceptedMessage(kind)})
 }
 
 func nullableReleaseID(id platform.ReleaseID) any {
@@ -624,6 +934,12 @@ func (s *Service) Inventory(ctx context.Context, actor contract.Actor, query pla
 			return inventory, err
 		}
 		inventory.Items = items
+	case "builds":
+		items, err := s.inventoryBuilds(ctx, query)
+		if err != nil {
+			return inventory, err
+		}
+		inventory.Items = items
 	case "deployments":
 		items, err := s.inventoryDeployments(ctx, query)
 		if err != nil {
@@ -648,7 +964,7 @@ func (s *Service) Inventory(ctx context.Context, actor contract.Actor, query pla
 			inventory.Items = items
 			return inventory, nil
 		}
-		return inventory, contract.NewFault(contract.ValidationFailed, "unknown inventory collection", "Use summary, nodes, apps, environments, revisions, deployability, releases, deployments, or changes.")
+		return inventory, contract.NewFault(contract.ValidationFailed, "unknown inventory collection", "Use summary, nodes, apps, environments, revisions, deployability, releases, builds, deployments, or changes.")
 	}
 	return inventory, nil
 }
@@ -658,6 +974,7 @@ func (s *Service) inventorySummary(ctx context.Context) (map[string]int64, error
 	rows, err := s.pool.Query(ctx, `SELECT 'apps', count(*) FROM eregion_platform_apps
         UNION ALL SELECT 'environments', count(*) FROM eregion_platform_environments
         UNION ALL SELECT 'releases', count(*) FROM eregion_platform_releases
+        UNION ALL SELECT 'builds', count(*) FROM eregion_platform_builds
         UNION ALL SELECT 'deployments', count(*) FROM eregion_platform_deployments
         UNION ALL SELECT 'nodes', count(*) FROM eregion_platform_nodes
         UNION ALL SELECT 'serving', count(*) FROM eregion_platform_environments WHERE serving_release_id IS NOT NULL`)
@@ -712,7 +1029,7 @@ func (s *Service) inventoryApps(ctx context.Context, query platform.InventoryQue
 
 const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.build_node,''),e.host_port,e.candidate_port,e.container_port,
     e.bind_address,e.health_type,e.health_path,e.health_timeout_seconds,e.env,e.secret_refs,e.secret_revision,
-    coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,''),coalesce(e.serving_release_id,''),
+    coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,''),coalesce(e.serving_release_id,''),coalesce(e.serving_deployment_id,''),
     e.health_state,e.health_detail,e.health_checked_at,
     coalesce((SELECT array_agg(d.name ORDER BY d.name) FROM eregion_platform_domains d WHERE d.environment_id=e.id),'{}'),
     coalesce((SELECT d.name FROM eregion_platform_domains d WHERE d.environment_id=e.id AND d.is_primary ORDER BY d.created_at,d.name LIMIT 1),''),
@@ -730,7 +1047,7 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.buil
 func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var env platform.Environment
 	var rawEnv, rawRefs, rawSource, rawRuntime, rawProcesses, rawConfig []byte
-	var desired, applied, serving, revisionID string
+	var desired, applied, serving, servingDeployment, revisionID string
 	var revisionNumber int
 	var operationID, actorKind, actorSubject, operation, summary, webhookSecretName string
 	var autoDeploy, deployIntent bool
@@ -738,7 +1055,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var revisionCreated *time.Time
 	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
-		&desired, &applied, &serving, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
+		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
 		&env.PrimaryDomain, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
 		&actorKind, &actorSubject, &operation, &summary, &rawSource, &autoDeploy, &webhookSecretName,
 		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &deployIntent, &revisionCreated,
@@ -746,6 +1063,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	if err != nil {
 		return env, err
 	}
+	env.ServingDeploymentID = platform.DeploymentID(servingDeployment)
 	env.Env = map[string]string{}
 	env.SecretRefs = map[string]string{}
 	if len(rawEnv) > 0 {
@@ -850,8 +1168,8 @@ func (s *Service) inventoryEnvironments(ctx context.Context, query platform.Inve
 	return items, rows.Err()
 }
 
-const releaseSelect = `SELECT r.id,a.name,e.name,r.image,r.image_id,r.source,r.build,r.command,r.status,
-    r.error_code,r.error,r.created_at,r.completed_at
+const releaseSelect = `SELECT r.id,r.operation_id,a.name,e.name,r.image,r.image_id,r.source,r.build,r.command,r.status,
+    r.error_code,r.error,r.created_at,r.completed_at,coalesce(r.build_id,''),r.commit_sha
     FROM eregion_platform_releases r
     JOIN eregion_platform_apps a ON a.id=r.app_id
     JOIN eregion_platform_environments e ON e.id=r.environment_id`
@@ -859,11 +1177,14 @@ const releaseSelect = `SELECT r.id,a.name,e.name,r.image,r.image_id,r.source,r.b
 func scanReleaseRow(row pgx.Row) (platform.Release, error) {
 	var release platform.Release
 	var source, build, command []byte
-	err := row.Scan(&release.ID, &release.App, &release.Environment, &release.Image, &release.ImageID,
-		&source, &build, &command, &release.Status, &release.ErrorCode, &release.Error, &release.CreatedAt, &release.CompletedAt)
+	var buildID string
+	err := row.Scan(&release.ID, &release.OperationID, &release.App, &release.Environment, &release.Image, &release.ImageID,
+		&source, &build, &command, &release.Status, &release.ErrorCode, &release.Error, &release.CreatedAt, &release.CompletedAt,
+		&buildID, &release.CommitSHA)
 	if err != nil {
 		return release, err
 	}
+	release.BuildID = platform.BuildID(buildID)
 	if len(source) > 0 {
 		if err := json.Unmarshal(source, &release.Source); err != nil {
 			return release, err
@@ -919,25 +1240,110 @@ func (s *Service) inventoryReleases(ctx context.Context, query platform.Inventor
 	return items, rows.Err()
 }
 
+const buildSelect = `SELECT b.id,b.operation_id,a.name,e.name,coalesce(b.revision_id,''),coalesce(b.release_id,''),
+    b.source,b.commit_sha,b.state,b.error_code,b.error,b.created_at,b.started_at,b.completed_at
+    FROM eregion_platform_builds b
+    JOIN eregion_platform_apps a ON a.id=b.app_id
+    JOIN eregion_platform_environments e ON e.id=b.environment_id`
+
+func scanBuildRow(row pgx.Row) (platform.BuildRecord, error) {
+	var build platform.BuildRecord
+	var revisionID, releaseID string
+	var source []byte
+	err := row.Scan(&build.ID, &build.OperationID, &build.App, &build.Environment,
+		&revisionID, &releaseID, &source, &build.CommitSHA, &build.State,
+		&build.ErrorCode, &build.Error, &build.CreatedAt, &build.StartedAt, &build.CompletedAt)
+	build.RevisionID = platform.RevisionID(revisionID)
+	build.ReleaseID = platform.ReleaseID(releaseID)
+	if len(source) > 0 {
+		if err := json.Unmarshal(source, &build.Source); err != nil {
+			return build, err
+		}
+	}
+	return build, err
+}
+
+func (s *Service) inventoryBuilds(ctx context.Context, query platform.InventoryQuery) ([]platform.BuildRecord, error) {
+	items := []platform.BuildRecord{}
+	statement := buildSelect + " WHERE 1=1"
+	args := []any{}
+	if query.App != "" {
+		args = append(args, query.App)
+		statement += fmt.Sprintf(" AND a.name=$%d", len(args))
+	}
+	if query.Environment != "" {
+		args = append(args, query.Environment)
+		statement += fmt.Sprintf(" AND e.name=$%d", len(args))
+	}
+	if query.State != "" {
+		args = append(args, query.State)
+		statement += fmt.Sprintf(" AND b.state=$%d", len(args))
+	}
+	args = append(args, query.Limit)
+	statement += fmt.Sprintf(" ORDER BY b.created_at DESC LIMIT $%d", len(args))
+	rows, err := s.pool.Query(ctx, statement, args...)
+	if err != nil {
+		return nil, unavailable()
+	}
+	defer rows.Close()
+	for rows.Next() {
+		build, err := scanBuildRow(rows)
+		if err != nil {
+			return nil, unavailable()
+		}
+		items = append(items, build)
+	}
+	return items, rows.Err()
+}
+
+func (s *Service) buildByID(ctx context.Context, id platform.BuildID) (platform.BuildRecord, error) {
+	build, err := scanBuildRow(s.pool.QueryRow(ctx, buildSelect+" WHERE b.id=$1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return build, contract.NewFault(contract.NotFound, "build not found", "Use a build ID from inventory.")
+	}
+	if err != nil {
+		return build, unavailable()
+	}
+	return build, nil
+}
+
+func (s *Service) buildByOperation(ctx context.Context, id contract.OperationID) (platform.BuildRecord, bool, error) {
+	build, err := scanBuildRow(s.pool.QueryRow(ctx, buildSelect+" WHERE b.operation_id=$1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return build, false, nil
+	}
+	if err != nil {
+		return build, false, unavailable()
+	}
+	return build, true, nil
+}
+
 const deploymentSelect = `SELECT d.id,d.operation_id,a.name,e.name,d.action,d.release_id,
     coalesce(d.previous_release_id,''),d.state,d.error_code,d.message,d.created_at,d.updated_at,d.completed_at,
-    coalesce(d.revision_id,''),d.secret_revisions
+    coalesce(d.revision_id,''),d.secret_revisions,coalesce(d.previous_deployment_id,''),d.instances
     FROM eregion_platform_deployments d
     JOIN eregion_platform_apps a ON a.id=d.app_id
     JOIN eregion_platform_environments e ON e.id=d.environment_id`
 
 func scanDeploymentRow(row pgx.Row) (platform.Deployment, error) {
 	var dep platform.Deployment
-	var previous, revisionID string
-	var secretRevisions []byte
+	var previous, revisionID, previousDeployment string
+	var secretRevisions, instances []byte
 	err := row.Scan(&dep.ID, &dep.OperationID, &dep.App, &dep.Environment, &dep.Action, &dep.ReleaseID,
 		&previous, &dep.State, &dep.ErrorCode, &dep.Message, &dep.CreatedAt, &dep.UpdatedAt, &dep.CompletedAt,
-		&revisionID, &secretRevisions)
+		&revisionID, &secretRevisions, &previousDeployment, &instances)
 	dep.PreviousReleaseID = platform.ReleaseID(previous)
 	dep.RevisionID = platform.RevisionID(revisionID)
+	dep.PreviousDeploymentID = platform.DeploymentID(previousDeployment)
 	dep.SecretRevisions = map[string]platform.SecretRevisionRef{}
 	if len(secretRevisions) > 0 {
 		if err := json.Unmarshal(secretRevisions, &dep.SecretRevisions); err != nil {
+			return dep, err
+		}
+	}
+	dep.Instances = []platform.DeploymentInstance{}
+	if len(instances) > 0 {
+		if err := json.Unmarshal(instances, &dep.Instances); err != nil {
 			return dep, err
 		}
 	}
@@ -1128,13 +1534,52 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	preview := platform.Preview{Kind: normalized.Kind, Target: normalized.Target.String(), DryRun: true, Input: normalized.Input.Preview(), Summary: normalized.Summary}
 	switch input := normalized.Input.(type) {
 	case *platform.DeployInput:
+		if input.ReleaseID == "" {
+			env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
+			if err != nil {
+				return preview, err
+			}
+			if env.Revision == nil {
+				return preview, contract.NewFault(contract.PreconditionFailed, "environment has no current revision", "Save an environment revision before deploying.")
+			}
+			preview.Steps = deploymentSteps()
+			preview.Summary = fmt.Sprintf("Build %s from %s source, then deploy it to %s/%s with a blue/green switch.", env.App, env.Revision.Source.Kind, env.App, env.Name)
+			if env.ServingRelease != "" {
+				preview.Warnings = append(preview.Warnings, "The serving release stays until the candidate passes health and the public route check.")
+			}
+			break
+		}
 		env, release, err := s.planDeployment(ctx, normalized.Target, input.ReleaseID)
 		if err != nil {
 			return preview, err
 		}
 		preview.Steps = deploymentSteps()
-		preview.Summary = fmt.Sprintf("Deploy %s to %s/%s after a candidate health check; the serving release stays until the switch.", release.Image, env.App, env.Name)
+		preview.Summary = fmt.Sprintf("Deploy %s to %s/%s with the current revision after candidate health and public verification.", release.Image, env.App, env.Name)
 		addReleaseWarnings(&preview, release, env)
+	case *platform.BuildStopInput:
+		build, err := s.buildByID(ctx, input.BuildID)
+		if err != nil {
+			return preview, err
+		}
+		preview.Steps = []string{"mark the build cancelled", "mark the build operation cancelling", "signal the running pack process"}
+		preview.Summary = fmt.Sprintf("Stop build %s for %s/%s.", build.ID, build.App, build.Environment)
+	case *platform.BuildRetryInput:
+		build, err := s.buildByID(ctx, input.BuildID)
+		if err != nil {
+			return preview, err
+		}
+		preview.Steps = []string{"record a new build of the same commit", "pack build", "verify image digest"}
+		preview.Summary = fmt.Sprintf("Retry build %s at commit %s as a new build; it does not deploy.", build.ID, build.CommitSHA)
+	case *platform.RestartInput:
+		env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
+		if err != nil {
+			return preview, err
+		}
+		if env.ServingRelease == "" {
+			return preview, contract.NewFault(contract.PreconditionFailed, "no serving deployment is available to restart", "Deploy a release before restarting the environment.")
+		}
+		preview.Steps = deploymentSteps()
+		preview.Summary = fmt.Sprintf("Reapply the serving release %s to %s/%s with the current revision.", env.ServingRelease, env.App, env.Name)
 	case *platform.RollbackInput:
 		target := input.ToReleaseID
 		env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
@@ -1165,7 +1610,8 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Steps = []string{"record application", "record first environment and revision", "allocate ports"}
 		preview.Summary = "Create application " + input.Name + " with environment " + input.Environment.Name + " on node " + input.Environment.Node + "."
 		if input.Deploy {
-			preview.Warnings = append(preview.Warnings, "The first deploy is recorded as intent only; deploy-from-revision is implemented by the deploy work list row.")
+			preview.Steps = append(preview.Steps, "queue the first deploy from the new revision")
+			preview.Summary += " A first deploy is queued from the new revision."
 		}
 	case *platform.EnvironmentCreateInput:
 		preview.Steps = []string{"record environment", "record first desired-state revision", "allocate stable and candidate ports"}
@@ -1230,7 +1676,7 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 }
 
 func deploymentSteps() []string {
-	return []string{"preflight (verify the release image on the node)", "release command", "candidate", "health", "switch", "verify", "cleanup"}
+	return []string{"preflight", "build from the revision when needed", "release command", "candidate containers per process replica on dynamic loopback ports", "candidate web health", "Caddy upstream switch", "public route verification", "remove the previous release containers"}
 }
 
 func addReleaseWarnings(preview *platform.Preview, release platform.Release, env platform.Environment) {
@@ -1239,9 +1685,6 @@ func addReleaseWarnings(preview *platform.Preview, release platform.Release, env
 	}
 	if env.ServingRelease == "" {
 		preview.Warnings = append(preview.Warnings, "No release is serving yet; a candidate failure leaves the environment without a serving container.")
-	}
-	if env.Health.Type == "http" {
-		preview.Warnings = append(preview.Warnings, "Direct Docker switching has a short restart window; zero-downtime edge switching is not implemented.")
 	}
 }
 

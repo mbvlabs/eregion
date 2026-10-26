@@ -120,8 +120,8 @@ type RevisionState struct {
 	Processes         []ProcessSpec     `json:"processes"`
 	Config            map[string]string `json:"config"`
 	SecretNames       []string          `json:"secret_names"`
-	// DeployIntent records that the operator asked for a first deploy. Building
-	// from a revision is implemented by the deploy work list row, not here.
+	// DeployIntent records that the operator asked for a first deploy. The
+	// control plane queues that deploy with the revision.
 	DeployIntent bool `json:"deploy_intent,omitempty"`
 }
 
@@ -229,22 +229,26 @@ type Environment struct {
 	// BuildNode optionally places Buildpacks execution on a distinct builder
 	// node. When empty, builds run on Node. It must have builder + buildpacks,
 	// and it is always authenticated through the node transport, never a name.
-	BuildNode       string            `json:"build_node,omitempty"`
-	HostPort        int               `json:"host_port"`
-	CandidatePort   int               `json:"candidate_port"`
-	ContainerPort   int               `json:"container_port"`
-	Bind            string            `json:"bind"`
-	Health          HealthConfig      `json:"health"`
-	Env             map[string]string `json:"env"`
-	SecretRefs      map[string]string `json:"secret_refs,omitempty"`
-	SecretRevision  int64             `json:"secret_revision,omitempty"`
-	DesiredRelease  ReleaseID         `json:"desired_release_id,omitempty"`
-	AppliedRelease  ReleaseID         `json:"applied_release_id,omitempty"`
-	ServingRelease  ReleaseID         `json:"serving_release_id,omitempty"`
-	HealthState     HealthState       `json:"health_state"`
-	HealthDetail    string            `json:"health_detail,omitempty"`
-	HealthCheckedAt *time.Time        `json:"health_checked_at,omitempty"`
-	// Domains are the public hostnames Caddy routes to HostPort.
+	BuildNode      string            `json:"build_node,omitempty"`
+	HostPort       int               `json:"host_port"`
+	CandidatePort  int               `json:"candidate_port"`
+	ContainerPort  int               `json:"container_port"`
+	Bind           string            `json:"bind"`
+	Health         HealthConfig      `json:"health"`
+	Env            map[string]string `json:"env"`
+	SecretRefs     map[string]string `json:"secret_refs,omitempty"`
+	SecretRevision int64             `json:"secret_revision,omitempty"`
+	DesiredRelease ReleaseID         `json:"desired_release_id,omitempty"`
+	AppliedRelease ReleaseID         `json:"applied_release_id,omitempty"`
+	ServingRelease ReleaseID         `json:"serving_release_id,omitempty"`
+	// ServingDeploymentID identifies the deployment whose recorded instance
+	// ports are the Caddy upstreams.
+	ServingDeploymentID DeploymentID `json:"serving_deployment_id,omitempty"`
+	HealthState         HealthState  `json:"health_state"`
+	HealthDetail        string       `json:"health_detail,omitempty"`
+	HealthCheckedAt     *time.Time   `json:"health_checked_at,omitempty"`
+	// Domains are the public hostnames routed through Caddy to the serving web
+	// process replicas.
 	Domains       []string             `json:"domains"`
 	PrimaryDomain string               `json:"primary_domain,omitempty"`
 	ArtifactReady bool                 `json:"artifact_ready"`
@@ -281,6 +285,9 @@ type Source struct {
 	Path  string `json:"path,omitempty"`
 	URL   string `json:"url,omitempty"`
 	Ref   string `json:"ref,omitempty"`
+	// CredentialSecretName is the vault NAME used by a private HTTPS clone. The
+	// value is resolved at execution and never stored here.
+	CredentialSecretName string `json:"credential_secret_name,omitempty"`
 }
 
 type Build struct {
@@ -299,19 +306,52 @@ type CommandSpec struct {
 }
 
 type Release struct {
-	ID          ReleaseID     `json:"id"`
-	App         string        `json:"app"`
-	Environment string        `json:"environment"`
-	Image       string        `json:"image"`
-	ImageID     string        `json:"image_id,omitempty"`
-	Source      Source        `json:"source"`
-	Build       *Build        `json:"build,omitempty"`
-	Command     *CommandSpec  `json:"command,omitempty"`
-	Status      ReleaseStatus `json:"status"`
-	ErrorCode   contract.Code `json:"error_code,omitempty"`
-	Error       string        `json:"error,omitempty"`
-	CreatedAt   time.Time     `json:"created_at"`
-	CompletedAt *time.Time    `json:"completed_at,omitempty"`
+	ID          ReleaseID            `json:"id"`
+	OperationID contract.OperationID `json:"operation_id,omitempty"`
+	App         string               `json:"app"`
+	Environment string               `json:"environment"`
+	Image       string               `json:"image"`
+	ImageID     string               `json:"image_id,omitempty"`
+	Source      Source               `json:"source"`
+	Build       *Build               `json:"build,omitempty"`
+	Command     *CommandSpec         `json:"command,omitempty"`
+	BuildID     BuildID              `json:"build_id,omitempty"`
+	CommitSHA   string               `json:"commit_sha,omitempty"`
+	Status      ReleaseStatus        `json:"status"`
+	ErrorCode   contract.Code        `json:"error_code,omitempty"`
+	Error       string               `json:"error,omitempty"`
+	CreatedAt   time.Time            `json:"created_at"`
+	CompletedAt *time.Time           `json:"completed_at,omitempty"`
+}
+
+type BuildState string
+
+const (
+	BuildPending   BuildState = "pending"
+	BuildRunning   BuildState = "running"
+	BuildSucceeded BuildState = "succeeded"
+	BuildFailed    BuildState = "failed"
+	BuildCancelled BuildState = "cancelled"
+)
+
+// BuildRecord is one attempt to turn an exact source commit into an image. Its
+// log stream is the owning operation's events; the record keeps the durable
+// lifecycle and commit identity.
+type BuildRecord struct {
+	ID          BuildID              `json:"id"`
+	OperationID contract.OperationID `json:"operation_id"`
+	App         string               `json:"app"`
+	Environment string               `json:"environment"`
+	RevisionID  RevisionID           `json:"revision_id,omitempty"`
+	ReleaseID   ReleaseID            `json:"release_id,omitempty"`
+	Source      Source               `json:"source"`
+	CommitSHA   string               `json:"commit_sha,omitempty"`
+	State       BuildState           `json:"state"`
+	ErrorCode   contract.Code        `json:"error_code,omitempty"`
+	Error       string               `json:"error,omitempty"`
+	CreatedAt   time.Time            `json:"created_at"`
+	StartedAt   *time.Time           `json:"started_at,omitempty"`
+	CompletedAt *time.Time           `json:"completed_at,omitempty"`
 }
 
 type DeploymentAction string
@@ -319,7 +359,22 @@ type DeploymentAction string
 const (
 	ActionDeploy   DeploymentAction = "deploy"
 	ActionRollback DeploymentAction = "rollback"
+	ActionRestart  DeploymentAction = "restart"
 )
+
+// DeploymentInstance records one process container created for a deployment.
+// Web and service instances carry the dynamic loopback host port Caddy and
+// private access use; a worker has no port.
+type DeploymentInstance struct {
+	Name        string    `json:"name"`
+	Process     string    `json:"process"`
+	Kind        string    `json:"kind"`
+	Replica     string    `json:"replica"`
+	ReleaseID   ReleaseID `json:"release_id"`
+	HostPort    int       `json:"host_port,omitempty"`
+	ContainerID string    `json:"container_id,omitempty"`
+	State       string    `json:"state"`
+}
 
 type DeploymentState string
 
@@ -340,21 +395,23 @@ type SecretRevisionRef struct {
 }
 
 type Deployment struct {
-	ID                DeploymentID                 `json:"id"`
-	OperationID       contract.OperationID         `json:"operation_id"`
-	App               string                       `json:"app"`
-	Environment       string                       `json:"environment"`
-	Action            DeploymentAction             `json:"action"`
-	ReleaseID         ReleaseID                    `json:"release_id"`
-	PreviousReleaseID ReleaseID                    `json:"previous_release_id,omitempty"`
-	RevisionID        RevisionID                   `json:"revision_id,omitempty"`
-	SecretRevisions   map[string]SecretRevisionRef `json:"secret_revisions,omitempty"`
-	State             DeploymentState              `json:"state"`
-	ErrorCode         contract.Code                `json:"error_code,omitempty"`
-	Message           string                       `json:"message,omitempty"`
-	CreatedAt         time.Time                    `json:"created_at"`
-	UpdatedAt         time.Time                    `json:"updated_at"`
-	CompletedAt       *time.Time                   `json:"completed_at,omitempty"`
+	ID                   DeploymentID                 `json:"id"`
+	OperationID          contract.OperationID         `json:"operation_id"`
+	App                  string                       `json:"app"`
+	Environment          string                       `json:"environment"`
+	Action               DeploymentAction             `json:"action"`
+	ReleaseID            ReleaseID                    `json:"release_id"`
+	PreviousReleaseID    ReleaseID                    `json:"previous_release_id,omitempty"`
+	PreviousDeploymentID DeploymentID                 `json:"previous_deployment_id,omitempty"`
+	RevisionID           RevisionID                   `json:"revision_id,omitempty"`
+	SecretRevisions      map[string]SecretRevisionRef `json:"secret_revisions,omitempty"`
+	Instances            []DeploymentInstance         `json:"instances"`
+	State                DeploymentState              `json:"state"`
+	ErrorCode            contract.Code                `json:"error_code,omitempty"`
+	Message              string                       `json:"message,omitempty"`
+	CreatedAt            time.Time                    `json:"created_at"`
+	UpdatedAt            time.Time                    `json:"updated_at"`
+	CompletedAt          *time.Time                   `json:"completed_at,omitempty"`
 }
 
 type Change struct {

@@ -22,8 +22,11 @@ const (
 	KindConfigUnset             = "platform.config.unset"
 	KindEnvironmentSecretAttach = "platform.environment.secret.attach"
 	KindReleaseCreate           = "platform.release.create"
+	KindBuildStop               = "platform.build.stop"
+	KindBuildRetry              = "platform.build.retry"
 	KindDeploy                  = "platform.deploy"
 	KindRollback                = "platform.rollback"
+	KindRestart                 = "platform.restart"
 	KindDomainAdd               = "platform.domain.add"
 	KindDomainRemove            = "platform.domain.remove"
 )

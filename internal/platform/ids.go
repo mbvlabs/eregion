@@ -20,6 +20,7 @@ type RevisionID string
 type ReleaseID string
 type DeploymentID string
 type ChangeID string
+type BuildID string
 
 var (
 	appIDPattern         = regexp.MustCompile(`^app_[0-9a-f]{32}$`)
@@ -28,6 +29,7 @@ var (
 	releaseIDPattern     = regexp.MustCompile(`^rel_[0-9a-f]{32}$`)
 	deploymentIDPattern  = regexp.MustCompile(`^dep_[0-9a-f]{32}$`)
 	changeIDPattern      = regexp.MustCompile(`^chg_[0-9a-f]{32}$`)
+	buildIDPattern       = regexp.MustCompile(`^bld_[0-9a-f]{32}$`)
 	namePattern          = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$`)
 	imagePattern         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$`)
 	capabilityPattern    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
@@ -73,6 +75,11 @@ func NewChangeID() (ChangeID, error) {
 	return ChangeID(value), err
 }
 
+func NewBuildID() (BuildID, error) {
+	value, err := newID("bld_")
+	return BuildID(value), err
+}
+
 func (id AppID) Validate() error {
 	if !appIDPattern.MatchString(string(id)) {
 		return contract.NewFault(contract.ValidationFailed, "invalid app ID", "Use the app ID returned by inventory.")
@@ -115,6 +122,13 @@ func (id ChangeID) Validate() error {
 	return nil
 }
 
+func (id BuildID) Validate() error {
+	if !buildIDPattern.MatchString(string(id)) {
+		return contract.NewFault(contract.ValidationFailed, "invalid build ID", "Use the build ID returned by inventory.")
+	}
+	return nil
+}
+
 // ValidateName validates an app, environment, or node name.
 func ValidateName(name string) error {
 	if !namePattern.MatchString(name) {
@@ -139,6 +153,7 @@ const (
 	TargetApp         TargetKind = "app"
 	TargetEnvironment TargetKind = "env"
 	TargetNode        TargetKind = "node"
+	TargetBuild       TargetKind = "build"
 )
 
 // Target is a parsed canonical operation target.
@@ -147,6 +162,7 @@ type Target struct {
 	App         string
 	Environment string
 	Node        string
+	Build       BuildID
 }
 
 func PlatformTarget() Target { return Target{Kind: TargetPlatform} }
@@ -175,6 +191,13 @@ func NewNodeTarget(node string) (Target, error) {
 	return Target{Kind: TargetNode, Node: node}, nil
 }
 
+func NewBuildTarget(build BuildID) (Target, error) {
+	if err := build.Validate(); err != nil {
+		return Target{}, err
+	}
+	return Target{Kind: TargetBuild, Build: build}, nil
+}
+
 func (t Target) String() string {
 	switch t.Kind {
 	case TargetPlatform:
@@ -185,6 +208,8 @@ func (t Target) String() string {
 		return "env/" + t.App + "/" + t.Environment
 	case TargetNode:
 		return "node/" + t.Node
+	case TargetBuild:
+		return "build/" + string(t.Build)
 	default:
 		return ""
 	}
@@ -207,8 +232,10 @@ func (t Target) Validate() error {
 		return ValidateName(t.Environment)
 	case TargetNode:
 		return ValidateName(t.Node)
+	case TargetBuild:
+		return t.Build.Validate()
 	default:
-		return contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, or node/<node>.")
+		return contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, node/<node>, or build/<id>.")
 	}
 }
 
@@ -227,42 +254,45 @@ func ParseTarget(raw string) (Target, error) {
 		return NewEnvironmentTarget(parts[1], parts[2])
 	case len(parts) == 2 && parts[0] == "node":
 		return NewNodeTarget(parts[1])
+	case len(parts) == 2 && parts[0] == "build":
+		return NewBuildTarget(BuildID(parts[1]))
 	default:
-		return Target{}, contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, or node/<node>.")
+		return Target{}, contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, node/<node>, or build/<id>.")
 	}
 }
 
-// ContainerName returns the deterministic Docker container name for one
-// environment role. It is bounded and derived only from validated values.
-func ContainerName(environmentID EnvironmentID, role string) string {
-	short := strings.TrimPrefix(string(environmentID), "env_")
-	if len(short) > 12 {
-		short = short[:12]
+// WorkloadContainerName is deploycrate's readable, bounded form:
+// <app>-<environment>-<process>-<replica>-<deployment>. The deployment suffix
+// makes every release attempt's formation distinct, so old and new containers
+// can run side by side during a blue/green switch.
+func WorkloadContainerName(app, environment, process, replica string, deployment DeploymentID) string {
+	dep := strings.TrimPrefix(string(deployment), "dep_")
+	if len(dep) > 12 {
+		dep = dep[:12]
 	}
-	switch role {
-	case "serving", "candidate", "previous":
-	default:
-		role = "candidate"
+	readable := strings.Join([]string{app, environment, process, replica}, "-")
+	maximum := 63 - len(dep) - 1
+	if len(readable) > maximum {
+		readable = strings.TrimRight(readable[:maximum], "-._")
 	}
-	return "eregion-" + short + "-" + role
+	if readable == "" {
+		readable = "workload"
+	}
+	return readable + "-" + dep
 }
 
-// CandidateContainerName includes the operation identity so two deployments of
-// the same environment cannot share a candidate effect key or container.
-func CandidateContainerName(environmentID EnvironmentID, operationID contract.OperationID) string {
-	short := strings.TrimPrefix(string(environmentID), "env_")
-	if len(short) > 12 {
-		short = short[:12]
+// WorkloadLabels are the ownership labels for every managed process container.
+// Names alone never establish ownership.
+func WorkloadLabels(app, environment, process, kind, replica string, release ReleaseID, deployment DeploymentID) map[string]string {
+	return map[string]string{
+		"io.eregion.app":             app,
+		"io.eregion.environment":     environment,
+		"io.eregion.process":         process,
+		"io.eregion.process.kind":    kind,
+		"io.eregion.process.replica": replica,
+		"io.eregion.release":         string(release),
+		"io.eregion.deployment":      string(deployment),
 	}
-	op := strings.TrimPrefix(string(operationID), "op_")
-	if len(op) > 12 {
-		op = op[:12]
-	}
-	return "eregion-" + short + "-candidate-" + op
-}
-
-func (id EnvironmentID) Container(role string) string {
-	return ContainerName(id, role)
 }
 
 func trimForError(value string) string {
