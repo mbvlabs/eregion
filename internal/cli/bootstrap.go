@@ -43,9 +43,9 @@ func (a *app) bootstrapSpecs() []spec {
 		a.bootstrapRemoteSpec(parentMeta),
 	}
 	return []spec{{
-		use:  "bootstrap",
-		meta: parentMeta,
-		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
+		use:      "bootstrap",
+		meta:     parentMeta,
+		run:      func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: children,
 	}}
 }

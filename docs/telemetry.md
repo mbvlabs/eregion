@@ -274,7 +274,7 @@ Time windows use `--since`/`--end` or an absolute `--start`/`--end`; missing
 configuration is the explicit `absent` state, not zero samples. `tail` stops on
 interrupt (exit 130) and supports `--once` for a bounded read.
 
-`eregion ui --interactive` accepts the same `--telemetry-url`, `--logs-url`,
+`eregion ui` accepts the same `--telemetry-url`, `--logs-url`,
 `--metrics-url`, and token-file flags (and the same `EREGION_TELEMETRY_*`
 environment) and adapts `telemetry.DataSource` to the workspace graph boundary.
 With no telemetry configuration the fleet/env detail view says no telemetry node

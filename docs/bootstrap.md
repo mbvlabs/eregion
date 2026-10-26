@@ -272,19 +272,9 @@ changes and completes without a rollback window.
 
 ## Guided terminal setup
 
-```sh
-eregion bootstrap --interactive
-```
-
-The Bubble Tea flow collects role, node, database URL file, token outputs,
-automation inputs, binaries, listeners/TLS, node keys, worker concurrency, and
-the commit-confirm window. It shows every step and diff, highlights access
-changes and the rollback window, and requires typing `apply` before mutation.
-
-Every guided field has the same flag on `eregion bootstrap`; the parity test
-fails if a field lacks a flag. Machine output (`--json`) and non-TTY invocation
-never start the interface. The guided flow uses the same `host.Runner` and
-`Apply` path as the flag form; it is not a second implementation.
+A human sets up a main node with `eregion server init`: preflight, questions
+with defaults, plan, confirm, live progress, hardening and the WireGuard
+lockdown, then the secrets handoff. Every question has a flag for agents.
 
 ## Fresh-host evidence
 

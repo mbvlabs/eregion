@@ -21,7 +21,7 @@ import (
 // the noninteractive command path.
 func (a *app) workspaceSpecs() []spec {
 	meta := operationMeta("Browse and act on the platform in an interactive terminal",
-		"eregion ui --interactive --tab fleet")
+		"eregion ui --tab fleet")
 	meta.Audience = []string{"human"}
 	meta.Output = "result"
 	meta.Mutating = true
@@ -33,10 +33,10 @@ func (a *app) workspaceSpecs() []spec {
 		"Requires --interactive and a real terminal on stdin and stdout. Machine output never starts the interface.",
 	}
 	meta.Examples = []string{
-		"eregion ui --interactive",
-		"eregion ui --interactive --tab apps --ascii --no-color --reduced-motion",
-		"eregion ui --interactive --tab deployments",
-		"eregion ui --interactive --tab fleet --telemetry-url http://10.77.0.10",
+		"eregion ui",
+		"eregion ui --tab apps --ascii --no-color --reduced-motion",
+		"eregion ui --tab deployments",
+		"eregion ui --tab fleet --telemetry-url http://10.77.0.10",
 	}
 	meta.Environment = append(meta.Environment, telemetryEnvironment...)
 	return []spec{{
