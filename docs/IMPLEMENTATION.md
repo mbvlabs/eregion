@@ -41,6 +41,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps and Caddy route renderer. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
 | `internal/host`, `internal/access` | Bootstrap steps and host journal; admin/firewall/WireGuard/SSH lockdown scripts. |
+| `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
 | `internal/resources`, `internal/integrations`, `internal/telemetry` | Existing optional resource/backup, DNS/access and telemetry mechanisms. |
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
@@ -71,7 +72,7 @@ bin/eregion help platform environments create --json
 | `platform nodes …`, `platform inventory/submit/fleet` | Existing low-level placement, enrollment, inventory and action tools. |
 | `resources …`, `dns …`, `access …`, `logs …`, `metrics …`, `ui` | Optional subsystem surfaces; see focused references. |
 | `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
-| `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide` and `commands` are discovery. No `skill install` yet. |
+| `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
 The target tree is MASTER section 5. Its commands (`app create`, `env update`,
 `deploy`, `doctor`, `ssh`, …) do not exist yet; renaming is not a substitute for

@@ -129,7 +129,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 		}
 		seen[command.Path] = true
 		events := command.Path == "eregion operations follow" && command.Output == "events"
-		prompts := command.Prompts && command.Path != "eregion server init" && command.Path != "eregion login" && command.Path != "eregion upgrade"
+		prompts := command.Prompts && command.Path != "eregion server init" && command.Path != "eregion login" && command.Path != "eregion upgrade" && command.Path != "eregion skill install"
 		if prompts || (command.Output != "result" && !events) {
 			t.Fatalf("advertised unimplemented behavior: %+v", command)
 		}

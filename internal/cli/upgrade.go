@@ -3,7 +3,6 @@ package cli
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/release"
 	"github.com/mbvlabs/eregion/internal/upgrade"
 	"github.com/spf13/cobra"
@@ -40,10 +38,6 @@ type upgradeResult struct {
 // upgradeSpecs is attached by the root orchestrator. It advertises only the
 // local CLI upgrade; node upgrades belong to `apply --auto-upgrade-nodes`.
 func (a *app) upgradeSpecs() []spec {
-	guideMeta := readMeta("Generate the versioned agent guide from implemented commands",
-		[]string{"Produce discovery text or JSON that matches this binary's implemented command registry."},
-		[]string{"eregion guide --format markdown", "eregion guide --format json --json"})
-
 	meta := readMeta("Install a signed eregion release for this CLI only",
 		[]string{"Move this operator CLI to a newer signed release on its release channel. Nodes are never upgraded by this command."},
 		[]string{"eregion upgrade --dry-run --json", "eregion upgrade", "eregion upgrade --channel edge"}, "eregion version")
@@ -69,13 +63,6 @@ func (a *app) upgradeSpecs() []spec {
 			cmd.Flags().Bool("dry-run", false, "Resolve and print the from/to plan without downloading or replacing")
 		},
 		run: a.upgradeRun,
-	}, {
-		use:  "guide",
-		meta: guideMeta,
-		flags: func(cmd *cobra.Command) {
-			cmd.Flags().String("format", "markdown", "Output format: markdown or json")
-		},
-		run: a.upgradeGuide,
 	}}
 }
 
@@ -211,40 +198,6 @@ func upgradeDirWritable(dir string) bool {
 	_ = f.Close()
 	_ = os.Remove(name)
 	return true
-}
-
-func (a *app) upgradeGuide(cmd *cobra.Command, _ []string) (result, error) {
-	format, _ := cmd.Flags().GetString("format")
-	if format != "markdown" && format != "json" {
-		return result{}, contract.NewFault(contract.ValidationFailed, "--format must be markdown or json", "Use --format markdown or --format json.")
-	}
-	guide := a.currentUpgradeGuide()
-	if format == "json" {
-		raw, err := json.MarshalIndent(guide, "", "  ")
-		if err != nil {
-			return result{}, contract.NewFault(contract.Internal, "agent guide could not be rendered", "Report the command and binary version.")
-		}
-		return result{data: guide, plain: string(raw)}, nil
-	}
-	return result{data: guide, plain: upgrade.RenderMarkdown(guide)}, nil
-}
-
-func (a *app) currentUpgradeGuide() upgrade.Guide {
-	catalog := a.meta.catalog(a.root)
-	commands := make([]upgrade.GuideCommand, 0, len(catalog))
-	for _, command := range catalog {
-		codes := make([]string, 0, len(command.ErrorCodes))
-		for _, code := range command.ErrorCodes {
-			codes = append(codes, string(code))
-		}
-		commands = append(commands, upgrade.GuideCommand{
-			Path: command.Path, Summary: command.Summary, Mutating: command.Mutating,
-			Destructive: command.Destructive, DryRun: command.DryRun, Prompts: command.Prompts,
-			Remote: command.Remote, InputFlags: command.InputFlags, Examples: command.Examples,
-			Next: command.Next, ErrorCodes: codes,
-		})
-	}
-	return upgrade.NewGuide(buildinfo.Current().Version, contract.Schema, node.ProtocolVersion, commands)
 }
 
 func upgradeFlag(cmd *cobra.Command, name string) string {
