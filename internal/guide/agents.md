@@ -100,7 +100,9 @@ terminal, some need a human, and a retry may need the same idempotency key.
   idempotency key or a log.
 - `secret set` reads plaintext from a protected file (`--file`), not a flag.
   `secret export` writes only to an explicit protected destination
-  (`--dest`) and never prints the value. `secret list` shows metadata only.
+  (`--dest`), never prints the value, and needs a TOTP code at a human's
+  terminal. `secret list` shows metadata only. `secrets export` rebuilds the
+  whole server handoff behind the same factor.
 - A command that prints a secret once is a human handoff: show it to the human
   and do not retain it.
 - Token issuance needs a human factor at the human's terminal, such as a code

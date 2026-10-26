@@ -215,35 +215,56 @@ func samePath(left, right string) bool {
 	return err1 == nil && err2 == nil && l == r
 }
 
+// handoffRecordInput is every field of the server-init record. Both init and
+// secrets export build the same groups from it.
+type handoffRecordInput struct {
+	NodeName                 string
+	Context                  string
+	Hostname                 string
+	PublicAddress            string
+	Platform                 string
+	SSHHostKey               string
+	WireGuardEndpoint        string
+	WireGuardNodeAddress     string
+	WireGuardNodePublicKey   string
+	AdminUser                string
+	SudoPassword             string
+	OperatorWireGuardAddress string
+	OperatorWireGuardKey     string
+	OperatorSSHKey           string
+	DatabaseURL              string
+	VaultKeyring             string
+}
+
 // handoffGroups is the password-manager shape of the record. Every value here
 // is a handoff exception: it is shown once and never becomes ordinary output.
-func (r *serverInit) handoffGroups() []handoffGroup {
-	groups := []handoffGroup{
-		{title: "Main node " + r.answers.Node, fields: []handoffField{
-			{"Node name", r.answers.Node},
-			{"Context", r.answers.Context},
-			{"Hostname", r.answers.Hostname},
-			{"Public address", r.answers.Host},
-			{"Platform", r.platform.String()},
-			{"SSH host key", r.hostKey},
-			{"WireGuard endpoint", net.JoinHostPort(r.answers.Host, strconv.Itoa(access.ListenPort))},
-			{"WireGuard address", access.NodeAddress},
-			{"WireGuard public key", r.pending.NodePublicKey},
+func handoffGroups(in handoffRecordInput) []handoffGroup {
+	return []handoffGroup{
+		{title: "Main node " + in.NodeName, fields: []handoffField{
+			{"Node name", in.NodeName},
+			{"Context", in.Context},
+			{"Hostname", in.Hostname},
+			{"Public address", in.PublicAddress},
+			{"Platform", in.Platform},
+			{"SSH host key", in.SSHHostKey},
+			{"WireGuard endpoint", in.WireGuardEndpoint},
+			{"WireGuard address", in.WireGuardNodeAddress},
+			{"WireGuard public key", in.WireGuardNodePublicKey},
 		}},
 		{title: "Operator", fields: []handoffField{
-			{"Admin user", r.answers.AdminUser},
-			{"Context", r.answers.Context},
-			{"SSH user", r.answers.AdminUser},
-			{"Sudo password", r.identity.sudoPassword},
-			{"WireGuard address", access.OperatorAddress},
-			{"WireGuard private key", r.identity.wg.Encode()},
-			{"SSH private key", strings.TrimSpace(r.identity.sshKeyPEM)},
+			{"Admin user", in.AdminUser},
+			{"Context", in.Context},
+			{"SSH user", in.AdminUser},
+			{"Sudo password", in.SudoPassword},
+			{"WireGuard address", in.OperatorWireGuardAddress},
+			{"WireGuard private key", in.OperatorWireGuardKey},
+			{"SSH private key", strings.TrimSpace(in.OperatorSSHKey)},
 		}},
 		{title: "Control-plane database", fields: []handoffField{
-			{"URL", r.answers.DatabaseURL},
+			{"URL", in.DatabaseURL},
 		}},
 		{title: "Vault keyring", fields: []handoffField{
-			{"EREGION_VAULT_KEY_FILE content", r.vaultKeyring},
+			{"EREGION_VAULT_KEY_FILE content", in.VaultKeyring},
 		}},
 		{title: "Break-glass", fields: []handoffField{
 			{"When", "Only when WireGuard or the node is unreachable."},
@@ -252,5 +273,18 @@ func (r *serverInit) handoffGroups() []handoffGroup {
 			{"Recovery", "The transfer bundle above rebuilds the context on another machine. Without it, use the provider console and this record."},
 		}},
 	}
-	return groups
+}
+
+// handoffGroups is the init record built from the answers and operator identity.
+func (r *serverInit) handoffGroups() []handoffGroup {
+	return handoffGroups(handoffRecordInput{
+		NodeName: r.answers.Node, Context: r.answers.Context, Hostname: r.answers.Hostname,
+		PublicAddress: r.answers.Host, Platform: r.platform.String(), SSHHostKey: r.hostKey,
+		WireGuardEndpoint:    net.JoinHostPort(r.answers.Host, strconv.Itoa(access.ListenPort)),
+		WireGuardNodeAddress: access.NodeAddress, WireGuardNodePublicKey: r.pending.NodePublicKey,
+		AdminUser: r.answers.AdminUser, SudoPassword: r.identity.sudoPassword,
+		OperatorWireGuardAddress: access.OperatorAddress, OperatorWireGuardKey: r.identity.wg.Encode(),
+		OperatorSSHKey: strings.TrimSpace(r.identity.sshKeyPEM),
+		DatabaseURL:    r.answers.DatabaseURL, VaultKeyring: r.vaultKeyring,
+	})
 }

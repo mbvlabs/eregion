@@ -43,6 +43,8 @@ func (a *app) envSpecs() []spec {
 		"eregion env update api production",
 		"eregion env update api production --health-path /readyz --json",
 		"eregion env update api production --process 'web=web:8080:2:' --json",
+		"eregion env update api production --auto-deploy",
+		"eregion env update api production --rotate-webhook-secret",
 	}
 	update.Next = []string{"eregion env status <app> <environment> --json"}
 
@@ -115,6 +117,8 @@ func addEnvironmentUpdateFlags(cmd *cobra.Command) {
 	f.Int("health-timeout", 0, "Health timeout in seconds (1–300)")
 	f.String("release-command", "", "One-off release command line; empty clears it")
 	f.StringArray("process", nil, "Complete process formation entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces all processes)")
+	f.Bool("auto-deploy", false, "Enable push to deploy for a GitHub source; --auto-deploy=false disables it")
+	f.Bool("rotate-webhook-secret", false, "Replace the push-to-deploy secret and show the new one once")
 	f.String("idempotency-key", "", "Stable submission key; one is generated when empty")
 	f.Bool("dry-run", false, "Validate and show the new revision without accepting work or writing secrets")
 }
@@ -260,9 +264,13 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		clearBytes(credential)
 		return result{}, err
 	}
+	webhookRequested := flagChanged(cmd, "auto-deploy")
+	if !webhookRequested {
+		webhookRequested, _ = cmd.Flags().GetBool("rotate-webhook-secret")
+	}
 	guided := false
 	var diff []string
-	if len(changed) == 0 && humanInteractive(cmd) {
+	if len(changed) == 0 && !webhookRequested && humanInteractive(cmd) {
 		edit, err := a.envUpdateGuided(current)
 		if err != nil {
 			clearBytes(credential)
@@ -272,17 +280,55 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		changed, diff = edit.Changed, edit.Diff
 		guided = true
 	}
-	defer func() { clearBytes(credential) }()
+	var webhook webhookUpdate
+	if !guided {
+		webhook, err = a.readWebhookUpdate(cmd, appName, environment, current, patch)
+		if err != nil {
+			clearBytes(credential)
+			return result{}, err
+		}
+		applyWebhookPatch(&patch, webhook)
+		if webhook.Enabled != nil {
+			changed = append(changed, "auto_deploy")
+		}
+	}
+	defer clearBytes(credential)
+	rotateOnly := webhook.Rotated && len(changed) == 0
 	if len(changed) == 0 {
 		if guided {
 			fmt.Fprintln(os.Stderr, ui.Note("No changes; nothing was submitted."))
 			return result{streamed: true}, nil
 		}
-		return result{}, contract.NewFault(contract.InputRequired, "nothing to update", "Pass at least one of --node, --build-node, a source flag, --health-path, --release-command or --process.")
+		if !rotateOnly && !webhook.AlreadyEnabled {
+			return result{}, contract.NewFault(contract.InputRequired, "nothing to update", "Pass at least one of --node, --build-node, a source flag, --health-type, --health-path, --health-timeout, --release-command, --process, --auto-deploy or --rotate-webhook-secret.")
+		}
 	}
-	preview, err := a.previewAction(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch)
-	if err != nil {
-		return result{}, err
+	var preview platform.Preview
+	if len(changed) > 0 {
+		preview, err = a.previewAction(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch)
+		if err != nil {
+			return result{}, err
+		}
+	}
+	resultData := struct {
+		App                  string                          `json:"app"`
+		Environment          string                          `json:"environment"`
+		OperationID          contract.OperationID            `json:"operation_id,omitempty"`
+		Changed              []string                        `json:"changed"`
+		CredentialSecretName string                          `json:"credential_secret_name,omitempty"`
+		WebhookSecretName    string                          `json:"webhook_secret_name,omitempty"`
+		WebhookURL           string                          `json:"webhook_url,omitempty"`
+		WebhookBranch        string                          `json:"webhook_branch,omitempty"`
+		WebhookRotated       bool                            `json:"webhook_rotated,omitempty"`
+		Patch                platform.EnvironmentUpdateInput `json:"patch"`
+		DryRun               bool                            `json:"dry_run,omitempty"`
+	}{App: appName, Environment: environment, Changed: changed, CredentialSecretName: credentialName,
+		WebhookSecretName: webhook.SecretName, WebhookURL: webhook.URL, WebhookBranch: webhook.Branch, WebhookRotated: webhook.Rotated, Patch: patch}
+	if webhook.AlreadyEnabled && len(changed) == 0 {
+		return result{
+			data:  resultData,
+			plain: "Push to deploy is already enabled for " + appName + "/" + environment + " at " + webhook.URL + ".\nUse --rotate-webhook-secret to replace the secret.\n",
+		}, nil
 	}
 	if guided {
 		body := strings.Join(diff, "\n")
@@ -304,21 +350,20 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		if !ok {
 			return result{}, contract.NewFault(contract.Cancelled, "environment update was not confirmed", "Nothing was submitted and no secret value was written.")
 		}
-	}
-	resultData := struct {
-		App                  string                          `json:"app"`
-		Environment          string                          `json:"environment"`
-		OperationID          contract.OperationID            `json:"operation_id,omitempty"`
-		Changed              []string                        `json:"changed"`
-		CredentialSecretName string                          `json:"credential_secret_name,omitempty"`
-		Patch                platform.EnvironmentUpdateInput `json:"patch"`
-		DryRun               bool                            `json:"dry_run,omitempty"`
-	}{App: appName, Environment: environment, Changed: changed, CredentialSecretName: credentialName, Patch: patch}
-	if dryRun(cmd) {
+	} else if dryRun(cmd) {
 		resultData.DryRun = true
 		var plain strings.Builder
 		fmt.Fprintf(&plain, "Dry run: update %s/%s\n", appName, environment)
-		plain.WriteString(updatePreviewText(preview))
+		if len(changed) > 0 {
+			plain.WriteString(updatePreviewText(preview))
+		}
+		if webhook.URL != "" {
+			if webhook.Rotated {
+				fmt.Fprintf(&plain, "Would rotate the push-to-deploy secret for %s (branch %s).\n", webhook.URL, webhook.Branch)
+			} else {
+				fmt.Fprintf(&plain, "Push to deploy: %s (branch %s)\n", webhook.URL, webhook.Branch)
+			}
+		}
 		return result{data: resultData, plain: plain.String()}, nil
 	}
 
@@ -331,11 +376,22 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 			return result{}, err
 		}
 	}
+	if err := a.writeWebhookSecret(cmd, appName, environment, webhook); err != nil {
+		return result{}, err
+	}
+	if rotateOnly {
+		printWebhookOnce(cmd, webhook)
+		return result{
+			data:  resultData,
+			plain: "Rotated the push-to-deploy secret for " + appName + "/" + environment + "; the new value is active immediately.\n" + webhook.URL + "\n",
+		}, nil
+	}
 	op, err := a.submitAccepted(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch)
 	if err != nil {
 		return result{}, err
 	}
 	resultData.OperationID = op.ID
+	printWebhookOnce(cmd, webhook)
 	if guided {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, ui.Card("Environment "+appName+"/"+environment+" updated", [][2]string{
@@ -350,6 +406,9 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 	}
 	plain := fmt.Sprintf("Updated %s/%s desired state.\noperation: %s\nchanged: %s\nnext: eregion env status %s %s --json\n",
 		appName, environment, op.ID, strings.Join(changed, ", "), appName, environment)
+	if webhook.URL != "" {
+		plain += "push to deploy: " + webhook.URL + " (secret shown once on stderr)\n"
+	}
 	return result{data: resultData, plain: plain}, nil
 }
 

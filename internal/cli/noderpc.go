@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/buildinfo"
@@ -27,8 +28,10 @@ import (
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/protect"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/tokens"
 	"github.com/mbvlabs/eregion/internal/upgrade"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
@@ -53,6 +56,15 @@ type Backend interface {
 	GetSecretMetadata(context.Context, vault.Namespace) (vault.Metadata, error)
 	ListSecrets(context.Context, string, string, int) ([]vault.Metadata, error)
 	ExportSecret(context.Context, vault.Namespace) (vault.Metadata, []byte, error)
+	ProtectInit(context.Context, bool, string, string) (protect.Setup, error)
+	ProtectConfirm(context.Context, string) (protect.Status, error)
+	ProtectVerify(context.Context, string) error
+	ProtectStatus(context.Context) (protect.Status, error)
+	TokenCreate(context.Context, tokens.CreateRequest, string) (tokens.Issued, error)
+	TokenList(context.Context) ([]tokens.Metadata, error)
+	TokenRevoke(context.Context, string, string) (tokens.Metadata, error)
+	HandoffExport(context.Context, string) (rpcHandoffExportResult, error)
+	NodeInfo(context.Context) (rpcNodeInfoResult, error)
 }
 
 const (
@@ -76,6 +88,15 @@ const (
 	methodHostApply      = "host.apply"
 	methodHostDoctor     = "host.doctor"
 	methodHostStatus     = "host.status"
+	methodProtectInit    = "protect.init"
+	methodProtectConfirm = "protect.confirm"
+	methodProtectVerify  = "protect.verify"
+	methodProtectStatus  = "protect.status"
+	methodTokenCreate    = "token.create"
+	methodTokenList      = "token.list"
+	methodTokenRevoke    = "token.revoke"
+	methodHandoffExport  = "handoff.export"
+	methodNodeInfo       = "node.info"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -135,6 +156,38 @@ type rpcSecretExportResult struct {
 type rpcInstallParams struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
+}
+
+type rpcProtectInitParams struct {
+	Rotate bool   `json:"rotate"`
+	Label  string `json:"label"`
+}
+
+type rpcTokenCreateParams struct {
+	App         string `json:"app"`
+	Environment string `json:"environment"`
+	Name        string `json:"name,omitempty"`
+	TTLSeconds  int64  `json:"ttl_seconds"`
+}
+
+type rpcTokenRevokeParams struct {
+	Name    string `json:"name"`
+	Confirm string `json:"confirm"`
+}
+
+type rpcNodeInfoResult struct {
+	Node     string `json:"node"`
+	Hostname string `json:"hostname"`
+	Platform string `json:"platform"`
+}
+
+type rpcHandoffExportResult struct {
+	Node         string `json:"node"`
+	Hostname     string `json:"hostname"`
+	Platform     string `json:"platform"`
+	SSHHostKey   string `json:"ssh_host_key"`
+	DatabaseURL  string `json:"database_url"`
+	VaultKeyring string `json:"vault_keyring"`
 }
 
 type rpcCallOptions struct {
@@ -335,6 +388,115 @@ func (n *nodeClient) ExportSecret(ctx context.Context, namespace vault.Namespace
 		return vault.Metadata{}, nil, invalidNodeData("secret export")
 	}
 	return response.Secret, value, nil
+}
+
+func (n *nodeClient) ProtectInit(ctx context.Context, rotate bool, label, code string) (protect.Setup, error) {
+	options := rpcCallOptions{}
+	if code != "" {
+		options.Secrets = map[string]string{protect.CodeSecret: code}
+	}
+	raw, err := n.call(ctx, methodProtectInit, rpcProtectInitParams{Rotate: rotate, Label: label}, options)
+	if err != nil {
+		return protect.Setup{}, err
+	}
+	var setup protect.Setup
+	if json.Unmarshal(raw, &setup) != nil || setup.Secret == "" || setup.URI == "" {
+		return protect.Setup{}, invalidNodeData("two-factor setup")
+	}
+	return setup, nil
+}
+
+func (n *nodeClient) ProtectConfirm(ctx context.Context, code string) (protect.Status, error) {
+	raw, err := n.call(ctx, methodProtectConfirm, struct{}{}, rpcCallOptions{Secrets: map[string]string{protect.CodeSecret: code}})
+	if err != nil {
+		return protect.Status{}, err
+	}
+	var status protect.Status
+	if json.Unmarshal(raw, &status) != nil || !status.Configured {
+		return protect.Status{}, invalidNodeData("two-factor confirmation")
+	}
+	return status, nil
+}
+
+func (n *nodeClient) ProtectVerify(ctx context.Context, code string) error {
+	_, err := n.call(ctx, methodProtectVerify, struct{}{}, rpcCallOptions{Secrets: map[string]string{protect.CodeSecret: code}})
+	return err
+}
+
+func (n *nodeClient) ProtectStatus(ctx context.Context) (protect.Status, error) {
+	raw, err := n.call(ctx, methodProtectStatus, struct{}{}, rpcCallOptions{})
+	if err != nil {
+		return protect.Status{}, err
+	}
+	var status protect.Status
+	if json.Unmarshal(raw, &status) != nil {
+		return protect.Status{}, invalidNodeData("two-factor status")
+	}
+	return status, nil
+}
+
+func (n *nodeClient) TokenCreate(ctx context.Context, request tokens.CreateRequest, code string) (tokens.Issued, error) {
+	raw, err := n.call(ctx, methodTokenCreate, rpcTokenCreateParams{
+		App: request.App, Environment: request.Environment, Name: request.Name, TTLSeconds: int64(request.TTL / time.Second),
+	}, rpcCallOptions{Secrets: map[string]string{protect.CodeSecret: code}})
+	if err != nil {
+		return tokens.Issued{}, err
+	}
+	var issued tokens.Issued
+	if json.Unmarshal(raw, &issued) != nil || issued.Token == "" || issued.Metadata.Name == "" {
+		return tokens.Issued{}, invalidNodeData("token creation")
+	}
+	return issued, nil
+}
+
+func (n *nodeClient) TokenList(ctx context.Context) ([]tokens.Metadata, error) {
+	raw, err := n.call(ctx, methodTokenList, struct{}{}, rpcCallOptions{})
+	if err != nil {
+		return nil, err
+	}
+	var page struct {
+		Tokens []tokens.Metadata `json:"tokens"`
+	}
+	if json.Unmarshal(raw, &page) != nil || page.Tokens == nil {
+		return nil, invalidNodeData("token list")
+	}
+	return page.Tokens, nil
+}
+
+func (n *nodeClient) TokenRevoke(ctx context.Context, name, confirmation string) (tokens.Metadata, error) {
+	raw, err := n.call(ctx, methodTokenRevoke, rpcTokenRevokeParams{Name: name, Confirm: confirmation}, rpcCallOptions{})
+	if err != nil {
+		return tokens.Metadata{}, err
+	}
+	var metadata tokens.Metadata
+	if json.Unmarshal(raw, &metadata) != nil || metadata.Name == "" {
+		return tokens.Metadata{}, invalidNodeData("token revocation")
+	}
+	return metadata, nil
+}
+
+func (n *nodeClient) HandoffExport(ctx context.Context, code string) (rpcHandoffExportResult, error) {
+	raw, err := n.call(ctx, methodHandoffExport, struct{}{}, rpcCallOptions{Secrets: map[string]string{protect.CodeSecret: code}})
+	if err != nil {
+		return rpcHandoffExportResult{}, err
+	}
+	var exported rpcHandoffExportResult
+	if json.Unmarshal(raw, &exported) != nil || exported.Node == "" || exported.DatabaseURL == "" {
+		return rpcHandoffExportResult{}, invalidNodeData("handoff export")
+	}
+	return exported, nil
+}
+
+func (n *nodeClient) NodeInfo(ctx context.Context) (rpcNodeInfoResult, error) {
+	raw, err := n.call(ctx, methodNodeInfo, struct{}{}, rpcCallOptions{})
+	if err != nil {
+		return rpcNodeInfoResult{}, err
+	}
+	var info rpcNodeInfoResult
+	if json.Unmarshal(raw, &info) != nil || info.Node == "" || info.Hostname == "" {
+		return rpcNodeInfoResult{}, invalidNodeData("node info")
+	}
+	return info, nil
 }
 
 func invalidNodeData(what string) *contract.Fault {
@@ -668,6 +830,12 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 		data, err := streamNodeLogs(ctx, params, stdout, registry)
 		return writeRPCResult(stdout, data, err)
 	}
+	// The human factor, token store and handoff exist without the control
+	// database: a recovery export must work while PostgreSQL is unreachable.
+	if data, handled, err := dispatchLocalMethod(ctx, request); handled {
+		registerRPCMethodSecrets(registry, request.Method, data)
+		return writeRPCResult(stdout, data, err)
+	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	app, closeRuntime, err := openNodeApp(ctx, logger, registry)
@@ -676,15 +844,159 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	}
 	defer closeRuntime()
 	data, err := dispatchNodeMethod(ctx, app, request)
-	if request.Method == methodSecretExport {
-		if exported, ok := data.(rpcSecretExportResult); ok {
-			registry.Add(exported.ValueBase64)
-		}
-	}
+	registerRPCMethodSecrets(registry, request.Method, data)
 	if err != nil {
 		return writeRPCResult(stdout, nil, err)
 	}
 	return writeRPCResult(stdout, data, nil)
+}
+
+func registerRPCMethodSecrets(registry *secrets.Registry, method string, data any) {
+	switch method {
+	case methodSecretExport:
+		if exported, ok := data.(rpcSecretExportResult); ok {
+			registry.Add(exported.ValueBase64)
+		}
+	case methodProtectInit:
+		if setup, ok := data.(protect.Setup); ok {
+			registry.Add(setup.Secret)
+		}
+	case methodTokenCreate:
+		if issued, ok := data.(tokens.Issued); ok {
+			registry.Add(issued.Token)
+		}
+	case methodHandoffExport:
+		if exported, ok := data.(rpcHandoffExportResult); ok {
+			registry.Add(exported.DatabaseURL, exported.VaultKeyring)
+		}
+	}
+}
+
+// dispatchLocalMethod handles node-local requests that need no control-plane
+// pool. The boolean reports whether the method was handled.
+func dispatchLocalMethod(ctx context.Context, request rpc.Request) (any, bool, error) {
+	switch request.Method {
+	case methodProtectInit:
+		var params rpcProtectInitParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, true, err
+		}
+		setup, err := protect.NewStore().Init(params.Rotate, params.Label, request.Secrets[protect.CodeSecret])
+		return setup, true, err
+	case methodProtectConfirm:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		status, err := protect.NewStore().Confirm(request.Secrets[protect.CodeSecret])
+		return status, true, err
+	case methodProtectVerify:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		if err := protect.NewStore().Verify(request.Secrets[protect.CodeSecret]); err != nil {
+			return nil, true, err
+		}
+		return map[string]bool{"verified": true}, true, nil
+	case methodProtectStatus:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		status, err := protect.NewStore().Status()
+		return status, true, err
+	case methodTokenCreate:
+		var params rpcTokenCreateParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, true, err
+		}
+		if err := protect.NewStore().Verify(request.Secrets[protect.CodeSecret]); err != nil {
+			return nil, true, err
+		}
+		issued, err := tokens.Create(authFilePath(), tokens.CreateRequest{
+			App: params.App, Environment: params.Environment, Name: params.Name,
+			TTL: time.Duration(params.TTLSeconds) * time.Second,
+		}, time.Now())
+		if err != nil {
+			return nil, true, err
+		}
+		if err := restartAPIService(ctx); err != nil {
+			// The plaintext token was never returned to the operator, so leave
+			// no unusable principal behind.
+			_, _ = tokens.Revoke(authFilePath(), issued.Metadata.Name)
+			return nil, true, err
+		}
+		return issued, true, nil
+	case methodTokenList:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		list, err := tokens.List(authFilePath())
+		if err != nil {
+			return nil, true, err
+		}
+		return map[string]any{"tokens": list}, true, nil
+	case methodTokenRevoke:
+		var params rpcTokenRevokeParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, true, err
+		}
+		if params.Confirm != params.Name {
+			return nil, true, contract.NewFault(contract.ConfirmationRequired, "token revocation requires exact name confirmation", "Pass --confirm "+params.Name+" after checking eregion token list.")
+		}
+		metadata, err := tokens.Revoke(authFilePath(), params.Name)
+		if err != nil {
+			return nil, true, err
+		}
+		if err := restartAPIService(ctx); err != nil {
+			return nil, true, err
+		}
+		return metadata, true, nil
+	case methodNodeInfo:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		config, err := host.LoadNodeFile(host.DefaultNodeConfigPath())
+		if err != nil {
+			return nil, true, err
+		}
+		if strings.TrimSpace(config.Hostname) == "" {
+			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before using CI or push-to-deploy URLs.")
+		}
+		return rpcNodeInfoResult{Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary()}, true, nil
+	case methodHandoffExport:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		if err := protect.NewStore().Verify(request.Secrets[protect.CodeSecret]); err != nil {
+			return nil, true, err
+		}
+		config, err := host.LoadNodeFile(host.DefaultNodeConfigPath())
+		if err != nil {
+			return nil, true, err
+		}
+		if strings.TrimSpace(config.Hostname) == "" {
+			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before re-exporting the handoff.")
+		}
+		hostKey, err := host.HostKeySummary()
+		if err != nil {
+			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node's SSH host key is not readable", err.Error())
+		}
+		if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
+			return nil, true, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())
+		}
+		dsn := os.Getenv("EREGION_DATABASE_URL")
+		if strings.TrimSpace(dsn) == "" {
+			return nil, true, contract.NewFault(contract.InputRequired, "the node has no control database URL", "Check "+host.ServiceEnvPath+" on the node.")
+		}
+		keyring, err := os.ReadFile(filepath.Join(host.DefaultLayout().ConfigDir, host.VaultKeyringName)) //nolint:gosec // G304: the fixed root-only keyring path.
+		if err != nil {
+			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node's vault keyring is not readable", "Check "+host.VaultKeyringName+" under the configuration directory.")
+		}
+		return rpcHandoffExportResult{
+			Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary(),
+			SSHHostKey: hostKey, DatabaseURL: dsn, VaultKeyring: strings.TrimSpace(string(keyring)),
+		}, true, nil
+	}
+	return nil, false, nil
 }
 
 func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry) (api.AppService, func(), error) {
@@ -984,6 +1296,22 @@ func installNodeBinary(ctx context.Context, params rpcInstallParams) error {
 
 func nodeBinaryPathDir() string {
 	return filepath.Dir(nodeBinaryPath)
+}
+
+// authFilePath is the owner-only node token store.
+func authFilePath() string {
+	return filepath.Join(host.DefaultLayout().ConfigDir, "auth.json")
+}
+
+// restartAPIService makes a token change effective. api.LoadAuth reads the file
+// once at startup; silently leaving a new token unusable would be a false
+// success.
+func restartAPIService(ctx context.Context) error {
+	command := exec.CommandContext(ctx, "systemctl", "restart", "eregion-api.service")
+	if output, err := command.CombinedOutput(); err != nil {
+		return contract.NewFault(contract.Unavailable, "the token store was written but eregion-api.service did not restart", strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func clearBytes(value []byte) {

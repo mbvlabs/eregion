@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,7 +17,6 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/api"
-	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
@@ -195,40 +193,6 @@ func TestCredentialHandoffNoPlaintextInputs(t *testing.T) {
 		if err != nil || info.Mode().Perm() != 0o600 {
 			t.Fatalf("unsafe credential file %s: %v", path, err)
 		}
-	}
-}
-
-func TestCredentialAddBoundAndScoped(t *testing.T) {
-	root := t.TempDir()
-	authPath := filepath.Join(root, "auth.json")
-	token := strings.Repeat("o", 43)
-	if err := WriteAuthFile(authPath, []api.Principal{principal(contract.Actor{Kind: "operator", Subject: "operator"}, token, KnownScopes())}, "", ""); err != nil {
-		t.Fatal(err)
-	}
-	r := CredentialAddRequest{AuthFile: authPath, Actor: contract.Actor{Kind: "ci", Subject: "ci"}, Scopes: []string{"operations:read"}, TokenOut: filepath.Join(root, "ci.token")}
-	now := time.Unix(1800000000, 0)
-	plan, err := r.Confirmation(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := r.Apply(plan.Token, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	principals, err := ReadAuthFile(authPath)
-	if err != nil || len(principals) != 2 {
-		t.Fatalf("%v %v", principals, err)
-	}
-	if len(principals[1].Scopes) != 1 || principals[1].Scopes[0] != "operations:read" {
-		t.Fatal("scope broadened")
-	}
-	raw, _ := os.ReadFile(r.TokenOut)
-	encoded, _ := json.Marshal(result)
-	if bytes.Contains(encoded, bytes.TrimSpace(raw)) {
-		t.Fatal("credential-add output leaks token")
-	}
-	if _, err := r.Apply(plan.Token, now); err == nil {
-		t.Fatal("stale auth revision accepted")
 	}
 }
 

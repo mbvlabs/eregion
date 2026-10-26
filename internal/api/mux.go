@@ -19,9 +19,13 @@ type MuxConfig struct {
 	Default http.Handler
 	// Vault serves /v1/secrets*. It authenticates itself (NewVaultHandler).
 	Vault http.Handler
-	// Webhook serves POST /v1/webhooks/github. It must bypass bearer auth: GitHub
-	// cannot send a token, and the handler verifies its own HMAC signature.
-	Webhook http.Handler
+	// PushWebhook serves /v1/webhooks/github/<app>/<env>. It must bypass bearer
+	// auth: GitHub cannot send a token, and each environment verifies its own
+	// HMAC secret.
+	PushWebhook http.Handler
+	// Deploy serves /v1/environments/<app>/<env>/deployments. It authenticates
+	// a deploy-scoped Bearer token itself.
+	Deploy http.Handler
 	// Private serves PrivatePrefix. It must already be wrapped in the access
 	// enforcement middleware; nil leaves private access disabled.
 	Private http.Handler
@@ -38,8 +42,10 @@ func NewMux(config MuxConfig) http.Handler {
 		switch {
 		case config.Vault != nil && (path == "/v1/secrets" || strings.HasPrefix(path, "/v1/secrets/")):
 			config.Vault.ServeHTTP(w, r)
-		case config.Webhook != nil && path == "/v1/webhooks/github":
-			config.Webhook.ServeHTTP(w, r)
+		case config.PushWebhook != nil && strings.HasPrefix(path, "/v1/webhooks/github/"):
+			config.PushWebhook.ServeHTTP(w, r)
+		case config.Deploy != nil && strings.HasPrefix(path, "/v1/environments/"):
+			config.Deploy.ServeHTTP(w, r)
 		case config.Private != nil && strings.HasPrefix(path, PrivatePrefix):
 			config.Private.ServeHTTP(w, r)
 		default:

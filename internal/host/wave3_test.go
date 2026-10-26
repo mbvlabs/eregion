@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mbvlabs/eregion/internal/api"
-	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
@@ -200,82 +195,6 @@ func TestReconcileExpiredCommitWithoutWatchdog(t *testing.T) {
 	}
 	if err := runner.reconcileCommits(operation); err == nil {
 		t.Fatal("a second rollback window was allowed")
-	}
-}
-
-func TestCredentialAddStoresActionGrants(t *testing.T) {
-	root := t.TempDir()
-	authPath := filepath.Join(root, "auth.json")
-	token := strings.Repeat("o", 43)
-	if err := WriteAuthFile(authPath, []api.Principal{principal(contract.Actor{Kind: "operator", Subject: "operator"}, token, KnownScopes())}, "", ""); err != nil {
-		t.Fatal(err)
-	}
-	grant, err := ParseActionGrant("platform.deploy:env/api/production")
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := CredentialAddRequest{
-		AuthFile: authPath, Actor: contract.Actor{Kind: "ci", Subject: "ci-deploy"},
-		Scopes: []string{"operations:submit"}, Grants: []api.ActionGrant{grant},
-		TokenOut: filepath.Join(root, "ci.token"),
-	}
-	now := time.Unix(1800000000, 0)
-	plan, err := request.Confirmation(now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := request.Apply(plan.Token, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	principals, err := ReadAuthFile(authPath)
-	if err != nil || len(principals) != 2 {
-		t.Fatalf("principals: %+v %v", principals, err)
-	}
-	if len(principals[1].ActionGrants) != 1 || principals[1].ActionGrants[0] != grant {
-		t.Fatalf("grant was not stored: %+v", principals[1].ActionGrants)
-	}
-	// The stored file must remain acceptable to the server to which it will be
-	// copied; NewAuth applies the same grant validation as authorization.
-	auth, err := api.NewAuth(principals)
-	if err != nil {
-		t.Fatalf("server rejected the created credential: %v", err)
-	}
-	encoded, _ := json.Marshal(result)
-	raw, _ := os.ReadFile(request.TokenOut)
-	if bytes.Contains(encoded, bytes.TrimSpace(raw)) {
-		t.Fatal("credential result leaked the token")
-	}
-	// Exercise the real API authorization path with the created token: the
-	// granted target is accepted for a dry-run, another environment is not.
-	apiToken := strings.TrimSpace(string(raw))
-	handler := api.NewHandler(auth, nil, nil)
-	releaseID := "rel_" + strings.Repeat("a", 32)
-	for _, testCase := range []struct {
-		target string
-		status int
-	}{
-		{"env/api/production", http.StatusOK},
-		{"env/api/staging", http.StatusForbidden},
-	} {
-		body := fmt.Sprintf(`{"kind":"platform.deploy","target":%q,"dry_run":true,"input":{"release_id":%q}}`, testCase.target, releaseID)
-		requestHTTP := httptest.NewRequest(http.MethodPost, "/v1/operations", strings.NewReader(body))
-		requestHTTP.Header.Set("Authorization", "Bearer "+apiToken)
-		requestHTTP.Header.Set("Content-Type", "application/json")
-		recorder := httptest.NewRecorder()
-		handler.ServeHTTP(recorder, requestHTTP)
-		if recorder.Code != testCase.status {
-			t.Fatalf("authorization for %s: got %d want %d: %s", testCase.target, recorder.Code, testCase.status, recorder.Body.String())
-		}
-	}
-	for _, bad := range []string{"platform.deploy", "platform.deploy:", ":env/api/production", "platform.deploy:env/*/production", "platform.*:env/api/production"} {
-		if _, err := ParseActionGrant(bad); err == nil {
-			t.Fatalf("accepted invalid action grant %q", bad)
-		}
-	}
-	// A duplicate grant is rejected by the same server validation.
-	if err := validateActionGrants([]api.ActionGrant{grant, grant}); err == nil {
-		t.Fatal("accepted duplicate action grants")
 	}
 }
 

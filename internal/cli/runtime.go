@@ -90,8 +90,6 @@ func (a *app) runtimeSpecs() []spec {
 			cmd.Flags().String("tls-key", "", "TLS private-key file")
 			cmd.Flags().Bool("workers", true, "Run River workers alongside the API")
 			cmd.Flags().Int("concurrency", 2, "Diagnostic workers in this process (1–16)")
-			cmd.Flags().String("webhook-secret-file", "", "GitHub webhook secret file (0600); defaults to EREGION_WEBHOOK_SECRET_FILE")
-			cmd.Flags().StringArray("webhook-allow", nil, "Allowed push owner/repo@branch=app/environment (repeatable); defaults to EREGION_WEBHOOK_ALLOW")
 			cmd.Flags().String("private-upstream", "", "Private upstream URL enforced by access grants under /private/; defaults to EREGION_PRIVATE_UPSTREAM")
 		}, run: a.serve},
 		{use: "worker", meta: workerMeta, flags: func(cmd *cobra.Command) {

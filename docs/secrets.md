@@ -37,7 +37,7 @@ securely: DB restore without it cannot decrypt secrets.
 eregion secret set --app api --environment production --name DATABASE_URL --file /run/secrets/database-url --expected-revision 0 --json
 eregion secret list --app api --environment production --json
 eregion secret archive --app api --environment production --name DATABASE_URL --expected-revision 1 --json
-eregion secret export --app api --environment production --name DATABASE_URL --dest /run/secrets/exported-url --json
+eregion secret export --app api --environment production --name DATABASE_URL --dest /run/secrets/exported-url
 ```
 
 Set reads an absolute protected file, creates/rotates under compare-and-swap and
@@ -51,6 +51,39 @@ containing plaintext. Each route requires appropriate transport scope and
 `platform.secret.set/list/archive/export` authorization for
 `env/<app>/<environment>`. A scope alone does not grant CI secret access. Plaintext
 transport requires TLS or a literal loopback peer; export must remain explicit.
+
+## Human factor and exports
+
+`eregion protect init` stores a TOTP secret root-only in
+`/etc/eregion/protect.json` and shows it once as a QR code/otpauth URI at a
+terminal. Minting a per-use deploy token (`eregion token create`) and exporting
+(`eregion secret export`, `eregion secrets export`) need a current code typed
+without echo. `--yes`, `--json`/structured output and a non-terminal stdin are
+refused; there is no flag or environment variable for the code. Codes are
+single-use and five wrong codes lock them out for 15 minutes.
+
+`eregion token create --app api --environment production [--expires 24h]`
+writes only a hash, a name and an expiry to `/etc/eregion/auth.json`, scoped to
+`platform.deploy` on `env/api/production`. `token list` shows metadata;
+`token revoke <name> --confirm <name>` removes the hash. The API process is
+restarted after a change because the auth file is loaded at startup. No token
+is minted by setup or carried in the handoff.
+
+`eregion secrets export` rebuilds the server-init record (operator keys,
+hostname, control-plane database URL, vault keyring and break-glass note) with
+the same group/field format and a new age passphrase; `--secrets-out` also
+writes it to a new 0600 file. `eregion secret export --dest` is the narrower
+plaintext value export. Both are explicit protected exceptions to the
+no-plaintext rule; the values are written to the terminal or the named 0600
+file, never the operation, revision or journal.
+
+Push to deploy generates a per-environment secret into the environment's vault
+namespace under the name in the revision's `webhook_secret_name` (default
+`EREGION_WEBHOOK_SECRET`). `env update <app> <env> --auto-deploy` shows the URL
+and secret once; `--auto-deploy=false` stops deployments and clears the
+recorded name; `--rotate-webhook-secret` replaces the value and shows it once.
+The webhook handler resolves the active revision per delivery, so rotation
+needs no API restart.
 
 ## Deployment injection is separate from storage
 

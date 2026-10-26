@@ -41,11 +41,13 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `cmd/eregion` | One executable entry point, including `node-agent` and hidden `node rpc`. |
 | `internal/cli/tree.go`, `meta.go`, `run.go` | Command catalog, safety metadata, output selection and dispatch. |
 | `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup (preflight, answers/pending, plan/confirm, apply, guarded handoff), first contact, DNS, private access and token-free age handoff/import. |
-| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host RPC, Docker workload/log reads, SSH/WireGuard route. |
+| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host and local RPC, Docker workload/log reads, SSH/WireGuard route. |
 | `internal/cli/observe.go`, `internal/cli/logs.go`, `internal/cli/delete.go`, `internal/cli/operations.go` | Extended app/environment status, container logs over the operator channel, target-confirmed deletion and operation-history filters. |
 | `internal/cli/host.go`, `internal/cli/serverstatus.go`, `internal/cli/nodeunlock.go` | `plan`, `apply`, `doctor`, `ssh`, `server status` and hidden `node unlock-ssh`. |
+| `internal/protect`, `internal/totp`, `internal/tokens` | Root-only TOTP gate on the node and hashed per-use deploy tokens in `/etc/eregion/auth.json`. |
+| `internal/cli/protect.go`, `token.go`, `webhook.go`, `secretexport.go` | TOTP setup/status, token mint/list/revoke, push-to-deploy helpers used by `env update`, and the protected handoff re-export. |
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
-| `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, webhook and private proxy adapters. |
+| `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, CI deploy, per-environment push webhook and private proxy adapters. |
 | `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
 | `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps, Caddy route renderer and the domain DNS/TLS/HTTP observation helpers. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
@@ -72,15 +74,17 @@ bin/eregion help app create --json
 | `plan`, `apply [--dry-run]`, `doctor`, `ssh [node]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. |
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). |
-| `context list/show/use/remove`, `context credential add` | Saved contexts, target-confirmed removal with its key files, and local server-auth-file editing. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. |
-| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, queues its first deploy unless `--no-deploy`, then adds the domain as a separate `platform.domain.add` action. List/status read inventory. No delete yet. `status` shows the serving release, processes, per-domain state and recent operations; `delete` takes `--confirm <app>` (D13). |
-| `env create/update/list/status/delete` | `create` accepts an environment with its first revision and queues its first deploy unless `--no-deploy`; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags, `update` walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. No delete yet. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` (D13). |
+| `context list/show/use/remove` | Saved contexts, target-confirmed removal with its key files. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. `context credential add` is removed: tokens are minted only through `token create` with the human factor (D7). |
+| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, queues its first deploy unless `--no-deploy`, then adds the domain as a separate `platform.domain.add` action. List/status read inventory. `status` shows the serving release, processes, per-domain state and recent operations; `delete` takes `--confirm <app>` (D13). |
+| `env create/update/list/status/delete` | `create` accepts an environment with its first revision and queues its first deploy unless `--no-deploy`; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` (D13). |
 | `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. No deploy is queued. |
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
 | `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. Transitional until the deploy row replaces it. |
 | `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. Transitional until the deploy row replaces it. |
 | `domain add/remove <app> <environment> <hostname> [--primary]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `remove` takes `--confirm <hostname>` and refuses the primary. |
-| `secret set/list/archive/export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. |
+| `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused. `secrets export` rebuilds the server-init handoff (including the vault keyring) and honours `--secrets-out`. |
+| `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
+| `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
 | `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
 | `platform inventory`, `ui` | Read-only inventory and the full-screen workspace. The workspace graph still uses the telemetry read adapter for metrics. |
 | `operations list/get/events/follow/cancel` | Actor-scoped operation history filtered by app, environment, state and limit, plus snapshot/event observation and explicit cancellation. |
@@ -353,8 +357,9 @@ window.
 | --- | --- |
 | `/etc/eregion/control-plane.env` | Service environment incl. DSN, auth/state, vault keyring and transport paths; bootstrap preserves operator-added lines. |
 | `/etc/eregion/vault-keyring.json` | Vault master key, 0600 for the control-plane account; never in PostgreSQL and included in the handoff. Existing key material is never overwritten. |
-| `/etc/eregion/auth.json` | Owner-only CI/webhook token hashes, actors, scopes and grants. Setup mints no operator token. |
-| `/etc/eregion/node.json` | Node name/state directory and optional operator-installed helper configuration. |
+| `/etc/eregion/auth.json` | Owner-only deploy-token hashes, names, actors, scopes, grants and expiry. Setup mints no operator token; `token create` restarts the API so a new hash is loaded. |
+| `/etc/eregion/protect.json` | Root-only confirmed/pending TOTP secret and its replay/lockout state. Never in the database, revision, operation, or journal. |
+| `/etc/eregion/node.json` | Node name, state directory, main hostname and optional operator-installed helper configuration. |
 | `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles, commit-confirm snapshots, the recorded host intent (`intent.json`) and owner-only copies of its TLS/key inputs (`inputs/`). |
 | `/var/lib/eregion/node/` | Node journal, per-effect records/locks, detached-task logs and identity. |
 | `/var/lib/eregion/access/` | Operator-access snapshot and lockdown state; separate from bootstrap commit-confirm. |
@@ -388,7 +393,7 @@ All use `POST /v1/operations`, the shared registry and one River job:
 | `platform.release.create` | `env/<app>/<env>` | `source`, optional `build`, `command`, `pull`; records a build row for git/directory sources. |
 | `platform.build.stop` | `build/<build ID>` | Cancels the build, marks its operation cancelling, and signals the running pack process. |
 | `platform.build.retry` | `build/<build ID>` | New build and release of the same exact commit; it does not deploy. |
-| `platform.deploy` | `env/<app>/<env>` | Optional `release_id` and `ref`. Without a release it resolves the current revision's bound source to an exact commit, builds, records the release digest and deploys it with the current revision. With a release it redeploys that release with the current revision. |
+| `platform.deploy` | `env/<app>/<env>` | Optional `release_id` and `ref`. Without a release it resolves the current revision's bound source to an exact commit, builds, records the release digest and deploys it with the current revision. With a release it redeploys that release with the current revision. CI and push to deploy submit `ref`. |
 | `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, then uses that deployment's revision and exact secret revisions. |
 | `platform.restart` | `env/<app>/<env>` | Reapplies the serving release with the current revision through the same blue/green path, so a scaled formation takes effect. |
 | `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary` and `addresses` (the main node's public A/AAAA targets). Removal also requires `confirm` equal to the current hostname; removing the primary is refused. |
@@ -490,19 +495,27 @@ changing this path.
   telemetry collections are not registered.
 - `/v1/secrets…`: separate authenticated credential API; values are encrypted
   directly, never placed in ordinary action input.
-- `/v1/webhooks/github`: bounded HMAC-verified push with one server-wide secret
-  (`EREGION_WEBHOOK_SECRET_FILE`) and a repo/branch → app/env allowlist
-  (`EREGION_WEBHOOK_ALLOW`); deduplicated **release build** only.
-  `internal/api/webhook.go` already accepts a different action kind and input
-  per event, and `webhook_deliveries` survives operation retention; MASTER D28
-  moves secret and routing into the environment revision and deploys.
+- `/v1/environments/<app>/<env>/deployments`: the public CI deploy endpoint.
+  `POST {"ref":"…"}` authenticates a deploy-scoped Bearer token (the grant is
+  exactly `platform.deploy` on that environment), submits `platform.deploy`
+  with `ref`, and returns the operation and its status URL. `GET` the returned
+  operation only; expired, revoked, wrong-environment and wrong-action tokens
+  fail. No other `/v1` route is public.
+- `/v1/webhooks/github/<app>/<env>`: per-environment GitHub push delivery. The
+  current revision must have auto-deploy on and a `webhook_secret_name`; the
+  HMAC secret is read from that environment's vault namespace per delivery.
+  The signature is checked over the raw body before parsing, the repository and
+  bound branch must match, `X-GitHub-Delivery` is deduplicated in
+  `webhook_deliveries`, and an accepted push submits `platform.deploy` with the
+  pushed commit SHA. A redelivery returns the original operation. The old
+  server-wide secret file, allowlist and release-only webhook are removed.
 - `/private/…`: optional authenticated subject/device-grant proxy, not a VPN
   enrollment implementation.
 
-Caddy currently exposes only `/readyz` and `/v1/webhooks/github` on the main
-hostname. There is **no public deploy trigger path** yet; the CI endpoint and
-per-environment push-to-deploy routing remain work list row 8. Do not expose all of
-`/v1` as a shortcut. Main-node application hostnames are separate Caddy sites.
+Caddy is generated by the bootstrap ingress step and exposes only `/readyz`,
+`/v1/environments/*/deployments*` and `/v1/webhooks/github/*/*` on the main
+hostname. Do not expose all of `/v1` as a shortcut. Main-node application
+hostnames are separate Caddy sites.
 
 The operator `Backend` (`internal/cli`) and HTTP handlers share the
 `api.AppService` functions for action submission/preview, inventory and vault

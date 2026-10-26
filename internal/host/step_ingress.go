@@ -14,10 +14,16 @@ import (
 const CaddyfilePath = platform.CaddyfilePath
 
 // PublicAPIPaths are the only API paths Caddy exposes on the main node's
-// hostname: readiness and the GitHub webhook, which verifies its own HMAC
-// signature. Everything else of the API stays on loopback, reached by the CLI
-// through SSH over WireGuard.
-var PublicAPIPaths = []string{"/readyz", "/v1/webhooks/github"}
+// hostname: readiness, the per-environment CI deploy endpoint, and the
+// per-environment GitHub webhook, which verifies its own HMAC signature.
+// Everything else of the API stays on loopback, reached by the CLI through SSH
+// over WireGuard.
+var PublicAPIPaths = []string{
+	"/readyz",
+	"/v1/environments/*/deployments",
+	"/v1/environments/*/deployments/*",
+	"/v1/webhooks/github/*/*",
+}
 
 // ValidateHostname checks a DNS name such as main.example.com.
 func ValidateHostname(name string) error { return platform.ValidateDomain(name) }

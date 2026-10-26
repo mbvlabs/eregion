@@ -11,11 +11,11 @@ func tagged(tag string) http.Handler {
 }
 
 func TestMuxRoutesByPathClass(t *testing.T) {
-	mux := NewMux(MuxConfig{Default: tagged("default"), Vault: tagged("vault"), Webhook: tagged("webhook"), Private: tagged("private")})
+	mux := NewMux(MuxConfig{Default: tagged("default"), Vault: tagged("vault"), PushWebhook: tagged("webhook"), Deploy: tagged("deploy"), Private: tagged("private")})
 	for path, want := range map[string]string{
 		"/v1/secrets": "vault", "/v1/secrets/shop/production/NAME": "vault", "/v1/secrets/archive": "vault",
-		"/v1/webhooks/github": "webhook", "/private/grafana": "private",
-		"/v1/operations": "default", "/v1/secretsx": "default", "/v1/webhooks/github/extra": "default", "/privateer": "default", "/healthz": "default",
+		"/v1/webhooks/github/shop/production": "webhook", "/v1/environments/shop/production/deployments": "deploy", "/private/grafana": "private",
+		"/v1/operations": "default", "/v1/secretsx": "default", "/v1/webhooks/github": "default", "/v1/environmentsx": "default", "/privateer": "default", "/healthz": "default",
 	} {
 		recorder := httptest.NewRecorder()
 		mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))

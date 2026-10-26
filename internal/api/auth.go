@@ -11,11 +11,14 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 )
 
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32,256}$`)
+
+var tokenNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{1,63}$`)
 
 var knownScopes = []string{"operations:submit", "operations:read", "operations:cancel", "system:read"}
 
@@ -24,6 +27,13 @@ type Principal struct {
 	TokenSHA256  string         `json:"token_sha256"`
 	Scopes       []string       `json:"scopes"`
 	ActionGrants []ActionGrant  `json:"action_grants,omitempty"`
+	// Name identifies a managed per-use token for listing and revocation.
+	// Operator and system principals leave it empty.
+	Name string `json:"name,omitempty"`
+	// TokenPrefix is the first few characters of the token, safe to list.
+	TokenPrefix string     `json:"token_prefix,omitempty"`
+	CreatedAt   *time.Time `json:"created_at,omitempty"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
 }
 
 type Auth struct{ principals map[[32]byte]Principal }
@@ -71,6 +81,23 @@ func NewAuth(principals []Principal) (*Auth, error) {
 		if _, exists := auth.principals[key]; exists {
 			return nil, contract.NewFault(contract.ValidationFailed, "duplicate API credential hash", "Each token must resolve to exactly one principal.")
 		}
+		if principal.Name != "" && !tokenNamePattern.MatchString(principal.Name) {
+			return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential name", "Use 2–64 lowercase letters, digits, dots, underscores, or hyphens.")
+		}
+		if principal.TokenPrefix != "" && len(principal.TokenPrefix) > 16 {
+			return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential prefix", "Store at most the first 16 characters for listing.")
+		}
+		if principal.CreatedAt != nil && principal.CreatedAt.IsZero() {
+			return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential creation time", "Omit created_at or use an RFC 3339 time.")
+		}
+		if principal.ExpiresAt != nil {
+			if principal.ExpiresAt.IsZero() {
+				return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential expiry", "Omit expires_at or use an RFC 3339 time.")
+			}
+			if principal.CreatedAt != nil && !principal.ExpiresAt.After(*principal.CreatedAt) {
+				return nil, contract.NewFault(contract.ValidationFailed, "invalid API credential expiry", "Expiry must be after creation.")
+			}
+		}
 		for _, scope := range principal.Scopes {
 			if !slices.Contains(knownScopes, scope) {
 				return nil, contract.NewFault(contract.ValidationFailed, "unknown API scope", "Use operations:submit, operations:read, operations:cancel, or system:read.")
@@ -97,6 +124,23 @@ func (a *Auth) authenticate(header, scope string) (contract.Actor, error) {
 	return principal.Actor, nil
 }
 
+// authenticateAction resolves a credential and checks one action grant after
+// normalization. CI handlers use it so a deploy token can only reach its own
+// environment.
+func (a *Auth) authenticateAction(header, scope, kind, target string) (Principal, error) {
+	principal, err := a.resolvePrincipal(header)
+	if err != nil {
+		return Principal{}, err
+	}
+	if !slices.Contains(principal.Scopes, scope) {
+		return Principal{}, contract.NewFault(contract.Forbidden, "API credential lacks the required scope", "Use a credential explicitly authorized for this action.")
+	}
+	if err := authorizePrincipalAction(principal, kind, target); err != nil {
+		return Principal{}, err
+	}
+	return principal, nil
+}
+
 func (a *Auth) resolvePrincipal(header string) (Principal, error) {
 	const prefix = "Bearer "
 	if !strings.HasPrefix(header, prefix) || !tokenPattern.MatchString(strings.TrimPrefix(header, prefix)) {
@@ -108,6 +152,9 @@ func (a *Auth) resolvePrincipal(header string) (Principal, error) {
 	principal, ok := a.principals[sha256.Sum256([]byte(strings.TrimPrefix(header, prefix)))]
 	if !ok {
 		return Principal{}, contract.NewFault(contract.Unauthenticated, "API authentication failed", "Check the token and configured server credentials.")
+	}
+	if principal.ExpiresAt != nil && !principal.ExpiresAt.After(time.Now()) {
+		return Principal{}, contract.NewFault(contract.Unauthenticated, "API credential expired", "Mint a new per-use token with eregion token create.")
 	}
 	return principal, nil
 }

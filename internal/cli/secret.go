@@ -80,6 +80,7 @@ func (a *app) secretSpecs() []spec {
 				cmd.Flags().String("environment", "", "Environment name")
 				cmd.Flags().String("name", "", "Secret name")
 				cmd.Flags().String("dest", "", "Explicit new destination file; created 0600 and never overwritten")
+				cmd.Flags().Bool("yes", false, "Refused: export needs a code from the authenticator app")
 			}, run: a.exportSecret},
 		},
 	}}
@@ -229,8 +230,18 @@ func (a *app) exportSecret(cmd *cobra.Command, _ []string) (result, error) {
 	if err := validateExportDestination(dest); err != nil {
 		return result{}, err
 	}
+	if err := requireHuman(cmd, "eregion secret export"); err != nil {
+		return result{}, err
+	}
+	code, err := readProtectCode(cmd, "Code from the authenticator app")
+	if err != nil {
+		return result{}, err
+	}
 	client, err := a.client(cmd)
 	if err != nil {
+		return result{}, err
+	}
+	if err := client.ProtectVerify(cmd.Context(), code); err != nil {
 		return result{}, err
 	}
 	metadata, value, err := client.ExportSecret(cmd.Context(), namespace)

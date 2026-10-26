@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -33,8 +32,6 @@ var extensionEnvironment = []string{
 
 // serveExtensionEnvironment lists the variables only the API listener reads.
 var serveExtensionEnvironment = []string{
-	"EREGION_WEBHOOK_SECRET_FILE",
-	"EREGION_WEBHOOK_ALLOW",
 	"EREGION_PRIVATE_UPSTREAM",
 }
 
@@ -43,6 +40,7 @@ type extensionRuntime struct {
 	Vault      *vault.Service
 	Extensions *controlplane.Extensions
 	Deliveries *controlplane.PostgresWebhookDeliveries
+	Webhooks   *controlplane.PushWebhookResolver
 }
 
 // startExtensions builds the vault service and registers the extension actions.
@@ -74,6 +72,7 @@ func (a *app) startExtensions(pool *pgxpool.Pool) (extensionRuntime, *vault.Envi
 	}
 	parts.Extensions = extensions
 	parts.Deliveries = controlplane.NewWebhookDeliveryStore(pool)
+	parts.Webhooks = controlplane.NewPushWebhookResolver(pool, parts.Vault)
 	return parts, vault.NewEnvironmentResolver(parts.Vault), nil
 }
 
@@ -157,15 +156,14 @@ func (a *app) buildMux(cmd *cobra.Command, logger *slog.Logger, auth *api.Auth, 
 	} else {
 		logger.Info("secret API disabled", "reason", "EREGION_VAULT_KEY_FILE is not set")
 	}
-	webhook, err := a.webhookHandler(cmd, service, parts.Deliveries)
-	if err != nil {
-		return nil, err
+	if parts.Webhooks != nil {
+		push, err := api.NewPushWebhookHandler(api.PushWebhookConfig{Resolver: parts.Webhooks, Deliveries: parts.Deliveries}, service)
+		if err != nil {
+			return nil, err
+		}
+		config.PushWebhook = push
 	}
-	if webhook != nil {
-		config.Webhook = webhook
-	} else {
-		logger.Info("GitHub webhook disabled", "reason", "no webhook secret file and allow-list configured")
-	}
+	config.Deploy = api.NewCIDeployHandler(auth, service)
 	upstream := serveFlag(cmd, "private-upstream", "EREGION_PRIVATE_UPSTREAM")
 	switch {
 	case upstream == "":
@@ -189,55 +187,7 @@ func (a *app) buildMux(cmd *cobra.Command, logger *slog.Logger, auth *api.Auth, 
 	return api.NewMux(config), nil
 }
 
-// webhookHandler builds the GitHub handler when a secret file and an allow-list
-// are both configured, and returns nil when neither is. Half a configuration is
-// an error: a webhook must never be mounted without its allow-list.
-func (a *app) webhookHandler(cmd *cobra.Command, service operations.Service, deliveries api.WebhookDeliveryStore) (http.Handler, error) {
-	secretFile := serveFlag(cmd, "webhook-secret-file", "EREGION_WEBHOOK_SECRET_FILE")
-	allow, _ := cmd.Flags().GetStringArray("webhook-allow")
-	if len(allow) == 0 {
-		allow = splitList(os.Getenv("EREGION_WEBHOOK_ALLOW"))
-	}
-	if secretFile == "" && len(allow) == 0 {
-		return nil, nil
-	}
-	if secretFile == "" || len(allow) == 0 {
-		return nil, contract.NewFault(contract.InputRequired, "the GitHub webhook needs both a secret file and an allow-list", "Set EREGION_WEBHOOK_SECRET_FILE and EREGION_WEBHOOK_ALLOW (owner/repo@branch=app/environment, comma-separated), or neither.")
-	}
-	secret, err := readWebhookSecret(secretFile)
-	if err != nil {
-		return nil, err
-	}
-	a.secrets.Add(string(secret))
-	var entries []api.AllowedPush
-	for _, item := range allow {
-		entry, err := parseAllowedPush(item)
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry)
-	}
-	return api.NewWebhookHandler(api.WebhookConfig{Secret: secret, Allowed: entries, Deliveries: deliveries}, service)
-}
-
-// parseAllowedPush parses owner/repo@branch=app/environment.
-func parseAllowedPush(text string) (api.AllowedPush, error) {
-	bad := contract.NewFault(contract.ValidationFailed, "invalid webhook allow-list entry", "Use owner/repo@branch=app/environment.")
-	left, placement, ok := strings.Cut(strings.TrimSpace(text), "=")
-	if !ok {
-		return api.AllowedPush{}, bad
-	}
-	repository, branch, ok := strings.Cut(left, "@")
-	if !ok {
-		return api.AllowedPush{}, bad
-	}
-	app, environment, ok := strings.Cut(placement, "/")
-	if !ok || repository == "" || branch == "" || app == "" || environment == "" {
-		return api.AllowedPush{}, bad
-	}
-	return api.AllowedPush{Repository: repository, Branch: branch, App: app, Environment: environment}, nil
-}
-
+// splitList parses a comma-separated environment value.
 func splitList(text string) []string {
 	var out []string
 	for _, item := range strings.Split(text, ",") {
@@ -246,24 +196,4 @@ func splitList(text string) []string {
 		}
 	}
 	return out
-}
-
-// readWebhookSecret reads the GitHub shared secret from a private regular file.
-// Permissions are checked on the opened file, never on the path.
-func readWebhookSecret(path string) ([]byte, error) {
-	unsafe := contract.NewFault(contract.ValidationFailed, "the webhook secret file is unsafe or unreadable", "Use a regular file readable only by its owner (0600 or 0400) holding the GitHub webhook secret.")
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, unsafe
-	}
-	defer file.Close()
-	stat, err := file.Stat()
-	if err != nil || !stat.Mode().IsRegular() || stat.Mode().Perm()&0o077 != 0 {
-		return nil, unsafe
-	}
-	raw, err := io.ReadAll(io.LimitReader(file, 1025))
-	if err != nil || len(raw) > 1024 {
-		return nil, unsafe
-	}
-	return []byte(strings.TrimRight(string(raw), "\r\n")), nil
 }

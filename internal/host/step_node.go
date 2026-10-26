@@ -55,6 +55,13 @@ func (s *nodeConfigStep) config() ([]byte, error) {
 		return nil, err
 	}
 	values["node"], values["state_dir"] = node, stateDir
+	if s.cfg.Hostname != "" {
+		hostname, err := json.Marshal(s.cfg.Hostname)
+		if err != nil {
+			return nil, err
+		}
+		values["hostname"] = hostname
+	}
 	merged, err := json.MarshalIndent(values, "", "  ")
 	if err != nil {
 		return nil, err
@@ -112,7 +119,8 @@ func (s *nodeConfigStep) Inputs() ([]byte, error) {
 		ConfigPath string `json:"config_path"`
 		KeysPath   string `json:"keys_path"`
 		Home       string `json:"home"`
-	}{contentSHA256(config), contentSHA256(keys), hasKeys, s.configPath(), s.keysPath(), s.nodeHome()})
+		Hostname   string `json:"hostname,omitempty"`
+	}{contentSHA256(config), contentSHA256(keys), hasKeys, s.configPath(), s.keysPath(), s.nodeHome(), s.cfg.Hostname})
 }
 
 func (s *nodeConfigStep) Check(_ context.Context, _ engine.Runtime) (engine.CheckResult, error) {

@@ -41,6 +41,21 @@ func GitAllowedHosts() []string {
 	return hosts
 }
 
+// GitHubRepository returns owner/repository for an https://github.com URL.
+// The webhook is GitHub-specific; another forge has no signed push delivery.
+func GitHubRepository(raw string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || strings.ToLower(strings.TrimSuffix(parsed.Hostname(), ".")) != "github.com" {
+		return "", false
+	}
+	path := strings.TrimSuffix(strings.Trim(parsed.Path, "/"), ".git")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", false
+	}
+	return strings.ToLower(parts[0] + "/" + parts[1]), true
+}
+
 // ValidateGitSourceURL accepts only credential-free HTTPS repository URLs on an
 // explicitly allowed hostname. IP literals, loopback/local names, non-443 ports,
 // credentials, queries, and fragments are refused before git runs. Git is also

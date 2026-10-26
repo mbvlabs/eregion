@@ -4,9 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"time"
 
-	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/spf13/cobra"
@@ -101,7 +99,6 @@ func (a *app) contextSpecs() []spec {
 				return hostResult(view), err
 			}},
 			a.contextRemoveSpec(meta),
-			a.contextCredentialSpec(meta),
 		}}}
 }
 
@@ -160,73 +157,6 @@ func (a *app) contextRemoveSpec(meta func(string, string, bool) CommandMeta) spe
 			return result{data: map[string]any{"removed": name, "changed": removed}, plain: "removed context " + name}, nil
 		},
 	}
-}
-
-// contextCredentialSpec adds a scoped automation actor to an existing server
-// auth file. It is a plan-bound mutation: dry-run returns the revision and
-// token, and apply requires that exact token. The credential is written once to
-// an owner-only file; neither the plan nor the result prints it.
-func (a *app) contextCredentialSpec(meta func(string, string, bool) CommandMeta) spec {
-	credentialMeta := meta("Add a scoped automation credential to the server auth file", "eregion context credential add --auth-file /etc/eregion/auth.json --subject ci-deploy --scope operations:submit --action-grant platform.deploy:env/api/production --token-out /root/ci.token --dry-run --json", true)
-	credentialMeta.Mutating, credentialMeta.DryRun, credentialMeta.Confirmation = true, true, "plan-bound"
-	credentialMeta.DryRunReason = ""
-	return spec{use: "credential", meta: meta("Manage scoped automation credentials", "eregion context credential add --dry-run --json", false),
-		run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
-		children: []spec{
-			{use: "add", meta: credentialMeta, flags: func(cmd *cobra.Command) {
-				cmd.Flags().String("auth-file", "/etc/eregion/auth.json", "Server auth file containing token hashes")
-				cmd.Flags().String("subject", "", "Stable CI actor subject")
-				cmd.Flags().StringSlice("scope", nil, "Explicit scopes (operations:submit, operations:read, operations:cancel, system:read)")
-				cmd.Flags().StringArray("action-grant", nil, "Repeatable kind:target grant, for example platform.deploy:env/api/production")
-				cmd.Flags().String("token-out", "", "Absolute owner-only token output; never printed")
-				cmd.Flags().Bool("dry-run", false, "Show the base revision and confirmation token without writing")
-				cmd.Flags().String("confirm", "", "Exact plan-bound confirmation token")
-			}, run: func(cmd *cobra.Command, _ []string) (result, error) {
-				authFile, _ := cmd.Flags().GetString("auth-file")
-				subject, _ := cmd.Flags().GetString("subject")
-				scopes, _ := cmd.Flags().GetStringSlice("scope")
-				grantFlags, _ := cmd.Flags().GetStringArray("action-grant")
-				grants := make([]api.ActionGrant, 0, len(grantFlags))
-				for _, raw := range grantFlags {
-					grant, err := host.ParseActionGrant(raw)
-					if err != nil {
-						return result{}, err
-					}
-					grants = append(grants, grant)
-				}
-				tokenOut, _ := cmd.Flags().GetString("token-out")
-				request := host.CredentialAddRequest{
-					AuthFile: authFile, Actor: contract.Actor{Kind: "ci", Subject: subject},
-					Scopes: scopes, Grants: grants, TokenOut: tokenOut,
-				}
-				if err := request.Validate(); err != nil {
-					return result{}, err
-				}
-				revision, err := host.AuthRevision(authFile)
-				if err != nil {
-					return result{}, err
-				}
-				now := time.Now()
-				plan, err := request.Confirmation(now)
-				if err != nil {
-					return result{}, err
-				}
-				dryRun, _ := cmd.Flags().GetBool("dry-run")
-				if dryRun {
-					return hostResult(map[string]any{
-						"auth_file": authFile, "actor_kind": "ci", "actor_subject": subject,
-						"scopes": scopes, "action_grants": grants, "base_revision": revision,
-						"confirmation": plan, "dry_run": true,
-					}), nil
-				}
-				confirmation, _ := cmd.Flags().GetString("confirm")
-				if confirmation == "" {
-					return result{}, contract.NewFault(contract.ConfirmationRequired, "--confirm is required to add a credential", "Run context credential add --dry-run and pass its confirmation token.")
-				}
-				report, err := request.Apply(confirmation, now)
-				return hostResult(report), err
-			}},
-		}}
 }
 
 func contextNameFlag(cmd *cobra.Command) {

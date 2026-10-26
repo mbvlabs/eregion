@@ -61,12 +61,30 @@ the route; a later run overwrites them. The command's success message proves an
 accepted operation, not DNS, TLS or a healthy app; only `domain list` readiness
 aggregates all four observations.
 
-The main hostname's Caddy site exposes **only** `/readyz` and
-`/v1/webhooks/github`, forwarding to loopback. The per-environment CI deploy
-endpoint and per-environment webhook path (MASTER section 6.7, D28) are not
-wired yet. Never expose the whole admin API
-as a workaround. Caddy's admin endpoint must stay local; access to it is
-administrative authority.
+The main hostname's Caddy site exposes **only** `/readyz`,
+`/v1/environments/*/deployments*` (the per-environment CI endpoint) and
+`/v1/webhooks/github/*/*` (per-environment push delivery), forwarding to
+loopback. Never expose the whole admin API as a workaround. Caddy's admin
+endpoint must stay local; access to it is administrative authority.
+
+```sh
+# CI: a deploy token scoped to this environment (minted at a terminal with
+# eregion token create --app hello --environment production)
+curl -X POST -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"ref":"main"}' https://main.example.com/v1/environments/hello/production/deployments
+curl -H "Authorization: Bearer <token>" \
+  https://main.example.com/v1/environments/hello/production/deployments/op_…
+
+# Push to deploy: printed once by
+eregion env update hello production --auto-deploy
+```
+
+A push delivery is accepted only when the current revision has auto-deploy on,
+the payload repository and branch match the revision's source, and the HMAC
+over the raw body matches the environment's vault secret. Deliveries are
+deduplicated by `X-GitHub-Delivery`; a redelivery returns the original
+operation. The URL is not an authorization token: without the secret the
+endpoint ignores everything.
 
 This is MASTER section 6.5/D3/D17's route path: a primary hostname plus aliases,
 desired/applied/observed state, serialized atomic writes, startup and retry
