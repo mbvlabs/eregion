@@ -31,6 +31,9 @@ type RemoteConfig struct {
 	KnownHosts   string
 	Timeout      time.Duration
 	Auth         []ssh.AuthMethod
+	// Dial replaces the direct TCP dial, for example with a userspace
+	// WireGuard tunnel.
+	Dial func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 var remoteUserPattern = regexp.MustCompile(`^[a-z_][a-z0-9._-]{0,31}$`)
@@ -102,8 +105,11 @@ func NewRemote(config RemoteConfig) (*Remote, error) {
 func (r *Remote) Dial(ctx context.Context) (*ssh.Client, error) { return r.connect(ctx) }
 
 func (r *Remote) connect(ctx context.Context) (*ssh.Client, error) {
-	dialer := &net.Dialer{Timeout: r.config.Timeout}
-	raw, err := dialer.DialContext(ctx, "tcp", r.config.Address)
+	dial := r.config.Dial
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: r.config.Timeout}).DialContext
+	}
+	raw, err := dial(ctx, "tcp", r.config.Address)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", r.config.Address, err)
 	}

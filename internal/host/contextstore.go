@@ -43,6 +43,18 @@ type ContextSSH struct {
 	User       string `json:"user"`
 	Identity   string `json:"identity,omitempty"`
 	KnownHosts string `json:"known_hosts"`
+	// WireGuard, when set, carries the SSH connection inside an embedded
+	// userspace tunnel to the node (public SSH is closed).
+	WireGuard *ContextWireGuard `json:"wireguard,omitempty"`
+}
+
+// ContextWireGuard is the operator peer of a node's wg0.
+type ContextWireGuard struct {
+	PrivateKeyFile string `json:"private_key_file"`
+	Address        string `json:"address"`
+	NodeAddress    string `json:"node_address"`
+	NodePublicKey  string `json:"node_public_key"`
+	Endpoint       string `json:"endpoint"`
 }
 
 // SetSSH records the SSH route of an existing context and saves the store.

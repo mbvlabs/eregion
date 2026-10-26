@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/mbvlabs/eregion/internal/access"
 	"io"
 
 	"github.com/mbvlabs/eregion/internal/buildinfo"
@@ -22,7 +23,7 @@ import (
 // Run executes one node-agent subcommand and returns the process exit code.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: eregion node-agent <serve|task|compact|identity|version>")
+		fmt.Fprintln(stderr, "usage: eregion node-agent <serve|task|compact|identity|version|access>")
 		return 2
 	}
 	switch args[0] {
@@ -36,6 +37,8 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return report(stderr, identityCommand(args[1:], stdout))
 	case "version":
 		return report(stderr, versionCommand(args[1:], stdout))
+	case "access":
+		return report(stderr, access.Run(args[1:], stdout, stderr))
 	default:
 		fmt.Fprintf(stderr, "unknown node command %q\n", args[0])
 		return 2

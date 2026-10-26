@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"charm.land/huh/v2"
+	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
@@ -85,6 +86,7 @@ type serverInit struct {
 	live        *ui.Live
 	answers     serverInitAnswers
 	hostKey     string
+	hostPub     ssh.PublicKey
 }
 
 func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error) {
@@ -116,6 +118,11 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	}
 	ans := r.answers
 	address := net.JoinHostPort(ans.Host, ans.Port)
+	if store, err := host.LoadContextStore(""); err == nil {
+		if existing, err := store.Get(ans.Context); err == nil && existing.SSH != nil && existing.SSH.WireGuard != nil {
+			return serverInitSummary{}, contract.NewFault(contract.PreconditionFailed, "main node "+ans.Context+" is already set up and its public SSH is closed", "Use the context: eregion platform fleet. A new server needs another --context-name.")
+		}
+	}
 	summary := serverInitSummary{Server: ans.User + "@" + address, Node: ans.Node, Context: ans.Context}
 
 	// Preflight: the binary that is uploaded is this one.
@@ -191,12 +198,33 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	}
 	summary.OperationID = report.OperationID
 
-	// Handoff: the operator token is read once over SSH and saved in a context
-	// that reaches the loopback API through the pinned SSH route.
+	// The operator token is read once over root SSH, before root login closes.
+	task = r.start("token", "Reading the operator token")
+	token, err := r.readToken(ctx, remote, cfg)
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return summary, err
+	}
+	task.end(ui.EndOK, "")
+	if err := session.Remove(ctx); err != nil {
+		r.note("uploaded bundle cleanup failed: " + err.Error())
+	}
+
+	// Access, the vaire way: admin user, WireGuard, public SSH closed.
+	id, err := loadOrCreateIdentity(ans.Context)
+	if err != nil {
+		return summary, err
+	}
+	_, apiPortText, _ := net.SplitHostPort(cfg.APIListen)
+	apiPort, _ := strconv.Atoi(apiPortText)
+	route, err := r.secureAccess(ctx, remote, id, apiPort, knownHosts)
+	if err != nil {
+		return summary, err
+	}
+
 	task = r.start("handoff", "Saving context "+ans.Context)
 	apiURL := "http://" + cfg.APIListen
-	token, err := r.saveContext(ctx, remote, cfg, apiURL, address, knownHosts)
-	if err != nil {
+	if err := r.saveContext(token, apiURL, route); err != nil {
 		task.end(ui.EndFail, "")
 		return summary, err
 	}
@@ -208,17 +236,34 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 		task.end(ui.EndFail, "")
 		return summary, err
 	}
-	task.end(ui.EndOK, "API answers through SSH")
-	if err := session.Remove(ctx); err != nil {
-		r.note("uploaded bundle cleanup failed: " + err.Error())
-	}
-	summary.API = apiURL + " via ssh " + summary.Server
+	task.end(ui.EndOK, "API answers through SSH over WireGuard")
+	summary.API = apiURL + " via " + access.AdminUser + "@" + access.NodeAddress + " over WireGuard"
 	if r.interactive {
 		h := &secretsHandoff{node: ans.Node, groups: []handoffGroup{
-			{"Main node " + ans.Node, []handoffField{{"Server", summary.Server}, {"Platform", summary.Platform}, {"SSH host key", r.hostKey}}},
-			{"Control plane API", []handoffField{{"URL", apiURL + " (on the server; reached through SSH)"}, {"Operator token", token}, {"Context", ans.Context}}},
+			{"Main node " + ans.Node, []handoffField{
+				{"Public address", ans.Host},
+				{"Platform", summary.Platform},
+				{"SSH host key", r.hostKey},
+				{"WireGuard endpoint", route.WireGuard.Endpoint},
+				{"WireGuard address", route.WireGuard.NodeAddress},
+				{"WireGuard public key", route.WireGuard.NodePublicKey},
+			}},
+			{"Operator", []handoffField{
+				{"Admin user", access.AdminUser},
+				{"Sudo password", id.sudoPassword},
+				{"WireGuard address", route.WireGuard.Address},
+				{"WireGuard private key", id.wg.Encode()},
+				{"SSH private key", "\n" + strings.TrimSpace(id.sshKeyPEM)},
+			}},
+			{"Control plane API", []handoffField{{"URL", apiURL + " (on the server)"}, {"Operator token", token}, {"Context", ans.Context}}},
 			{"Control-plane database", []handoffField{{"URL", r.answers.DatabaseURL}}},
+			{"Break-glass", []handoffField{{"Public SSH closed", "From the provider console, as root: eregion node-agent access revert"}}},
 		}}
+		for _, g := range h.groups {
+			for _, f := range g.fields {
+				r.a.secrets.Add(f.value)
+			}
+		}
 		if err := h.show(os.Stderr); err != nil {
 			return summary, err
 		}
@@ -353,6 +398,7 @@ func (r *serverInit) trustHostKey(ctx context.Context, knownHosts, address strin
 	if hostKeyPinned(knownHosts, address) {
 		if key, err := probeHostKey(ctx, address); err == nil {
 			r.hostKey = key.Type() + " " + ssh.FingerprintSHA256(key)
+			r.hostPub = key
 		}
 		return nil
 	}
@@ -364,6 +410,7 @@ func (r *serverInit) trustHostKey(ctx context.Context, knownHosts, address strin
 	}
 	fp := ssh.FingerprintSHA256(key)
 	r.hostKey = key.Type() + " " + fp
+	r.hostPub = key
 	task.end(ui.EndOK, key.Type()+" "+fp)
 	want, _ := r.cmd.Flags().GetString("host-key-fingerprint")
 	accept, _ := r.cmd.Flags().GetBool("accept-new-host-key")
@@ -571,24 +618,24 @@ func (r *serverInit) line(state, title, detail string) {
 	fmt.Fprintf(r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", title, state, detail)
 }
 
-func (r *serverInit) saveContext(ctx context.Context, remote *host.Remote, cfg host.Config, apiURL, address, knownHosts string) (string, error) {
-	operatorOut := cfg.OperatorTokenOut
-	if operatorOut == "" {
-		operatorOut = host.DefaultLayout().StateDir + "/operator.handoff"
-	}
-	token, err := consumeRemoteToken(ctx, remote, operatorOut)
+func (r *serverInit) readToken(ctx context.Context, remote *host.Remote, cfg host.Config) (string, error) {
+	token, err := consumeRemoteToken(ctx, remote, cfg.OperatorTokenOut)
 	if err != nil {
 		return "", err
 	}
 	r.a.secrets.Add(token)
+	return token, nil
+}
+
+func (r *serverInit) saveContext(token, apiURL string, route *host.ContextSSH) error {
 	store, err := host.LoadContextStore("")
 	if err != nil {
-		return "", err
+		return err
 	}
 	if _, err := store.Login(r.answers.Context, apiURL, token, host.KnownScopes()); err != nil {
-		return "", err
+		return err
 	}
-	return token, store.SetSSH(r.answers.Context, &host.ContextSSH{Address: address, User: r.answers.User, Identity: r.answers.Identity, KnownHosts: knownHosts})
+	return store.SetSSH(r.answers.Context, route)
 }
 
 func (r *serverInit) finish(s serverInitSummary) {
