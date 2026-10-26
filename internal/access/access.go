@@ -127,18 +127,36 @@ func PublicKey(output string) (string, error) {
 // Run is `eregion node-agent access <lockdown|confirm|revert>` on the node.
 func Run(args []string, stdout, stderr io.Writer) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: eregion node-agent access <lockdown|confirm|revert>")
+		return fmt.Errorf("usage: eregion node-agent access <lockdown|confirm|revert|relock>")
 	}
 	env := map[string]string{"STATE_DIR": StateDir}
 	switch args[0] {
 	case "lockdown":
 		env["TIMEOUT_S"] = strconv.Itoa(LockdownSeconds)
-	case "confirm", "revert":
+	case "confirm", "revert", "relock":
 	default:
 		return fmt.Errorf("unknown access action %q", args[0])
 	}
+	return run(args[0], env, stdout, stderr)
+}
+
+// Unlock reopens public SSH for minutes and schedules the re-lock. It is the
+// break-glass path from the provider console, not an operator command.
+func Unlock(minutes int, stdout, stderr io.Writer) error {
+	if minutes < 1 || minutes > 240 {
+		return fmt.Errorf("unlock minutes must be 1–240")
+	}
+	return run("unlock", map[string]string{"STATE_DIR": StateDir, "MINUTES": strconv.Itoa(minutes)}, stdout, stderr)
+}
+
+// Relock closes public SSH again without arming the lockdown revert window.
+func Relock(stdout, stderr io.Writer) error {
+	return run("relock", map[string]string{"STATE_DIR": StateDir}, stdout, stderr)
+}
+
+func run(name string, env map[string]string, stdout, stderr io.Writer) error {
 	cmd := exec.Command("/bin/bash", "-s") //nolint:gosec // G204: an embedded script.
-	cmd.Stdin = strings.NewReader(Program(args[0], env))
+	cmd.Stdin = strings.NewReader(Program(name, env))
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	cmd.Env = append(os.Environ(), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	return cmd.Run()

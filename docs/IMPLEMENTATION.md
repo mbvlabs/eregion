@@ -38,18 +38,19 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `cmd/eregion` | One executable entry point, including `node-agent` and hidden `node rpc`. |
 | `internal/cli/tree.go`, `meta.go`, `run.go` | Command catalog, safety metadata, output selection and dispatch. |
 | `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup, first contact, DNS, private access and token-free age handoff/import. |
-| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep and SSH/WireGuard route. |
+| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host RPC and SSH/WireGuard route. |
+| `internal/cli/host.go`, `internal/cli/serverstatus.go`, `internal/cli/nodeunlock.go` | `plan`, `apply`, `doctor`, `ssh`, `server status` and hidden `node unlock-ssh`. |
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
 | `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, webhook and private proxy adapters. |
 | `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
 | `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps and Caddy route renderer. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
-| `internal/host`, `internal/access` | Bootstrap steps and host journal; admin/firewall/WireGuard/SSH lockdown scripts. |
+| `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
 | `internal/integrations`, `internal/telemetry` | Internal DNS/private-access actions (no operator CLI before v1) and the telemetry read adapters used by `logs` and the workspace graph. |
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
-| `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement only. Nodes are not upgraded by this path. |
+| `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement plus the verified linux/<node arch> binary used by `apply --auto-upgrade-nodes`. |
 
 ## Current command surface
 
@@ -64,6 +65,8 @@ bin/eregion help platform environments create --json
 | Current commands | Meaning/limit |
 | --- | --- |
 | `server init` | Guided root first contact; Linux operator, matching server arch, IPv4-oriented DNS/access setup. |
+| `plan`, `apply [--dry-run]`, `doctor`, `ssh [node]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. |
+| `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). |
 | `context list/show/use`, `context credential add` | Saved contexts and local server-auth-file editing. `use` takes `--name`; no remove command. |
 | `platform apps create/list/status` | App record only; no guided full setup, update or delete. |
@@ -77,8 +80,8 @@ bin/eregion help platform environments create --json
 | `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
-The target tree is MASTER section 5. Its commands (`app create`, `env update`,
-`deploy`, `doctor`, `ssh`, …) do not exist yet; renaming is not a substitute for
+The target tree is MASTER section 5. Its application commands (`app create`,
+`env update`, `deploy`, …) do not exist yet; renaming is not a substitute for
 implementing the flow. `resources …` and the backup code are deleted (MASTER
 D19), the Docker Compose telemetry stack install is deleted (D5), and `dns …`,
 `access …`, `platform nodes …`, `platform fleet`, `platform submit`, `metrics …`
@@ -97,8 +100,10 @@ TUF/sigstore trust material is cached, not pinned in the binary.
 `internal/upgrade` holds the local-only plan/preflight/atomic swap. `upgrade`
 downloads the verified binary, checks its reported version and channel, and
 replaces only the running CLI. `upgrade.FetchNodeBinary` is the verified
-linux/amd64 or linux/arm64 download for the future
-`apply --auto-upgrade-nodes`; no node install or restart is implemented here.
+linux/amd64 or linux/arm64 download used when a macOS CLI or an architecture
+mismatch prevents pushing the operator's own executable: the node receives the
+release matching the CLI's version, the uploaded checksum is verified, and the
+API/worker units restart.
 There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
@@ -233,8 +238,10 @@ installs `/etc/sudoers.d/eregion-node` with only
 setup/break-glass lockdown.
 
 Current bootstrap accepts an identity, ssh-agent/default keys and interactive
-encrypted-key passphrases. There is no answers TOML, password-stdin, robust local
-pending-init phase machine or cross-platform binary selection. Low-level journal
+encrypted-key passphrases. There is no answers TOML, password-stdin or robust
+local pending-init phase machine, and `server init` still uploads only the
+running operator binary (Linux, matching architecture); the separate node
+auto-upgrade path fetches a verified linux release. Low-level journal
 resumption is not proof that re-running `server init` after root SSH closes works.
 The age handoff is shown only on the interactive setup path; unattended handoff
 parity is not established. DNS/TLS pending is currently a warning. Its HTTPS
@@ -244,12 +251,45 @@ not authenticated readiness or an application response.
 `server init --dry-run` still connects, pins trust and uploads a planning bundle.
 It stops before host apply; it is not an entirely side-effect-free local command.
 
+## Host convergence and inspection
+
+`eregion plan`, `apply`, `doctor`, `ssh` and `server status` are node-mode
+commands: the CLI resolves the saved context, opens pinned SSH inside the
+embedded WireGuard tunnel, and runs `eregion node rpc` on the node. Host RPC
+methods do not open the application service, so plan and doctor still observe a
+node whose database migrations are pending or whose API is down.
+
+After a completed host apply the node records its non-secret intent at
+`/var/lib/eregion/bootstrap/intent.json`; the database URL stays only in
+`/etc/eregion/control-plane.env`, and TLS/key inputs are copied to
+`inputs/` because the operator's original upload paths are temporary. Later
+plan/apply runs reconstruct the same desired state from that file instead of
+requiring flags or plaintext secrets over RPC. The engine still decides each
+step by its `Check`; a new step version appears as a different step ID and is
+applied, while a second apply reports the remaining steps as skipped.
+
+`apply --auto-upgrade-nodes` runs the version lockstep first. A linux CLI on
+the node's architecture uploads its own executable; a macOS CLI or an
+architecture mismatch downloads the cosign-verified linux release matching the
+CLI's version with `upgrade.FetchNodeBinary`, verifies the upload checksum and
+installs it. A development build has no release to fetch and fails with a clear
+error instead of refusing silently. `doctor` covers pending steps, sshd root and
+password login, the WireGuard-only public SSH rule, the firewall, the Caddy
+certificate for the main hostname, disk, CLI/node/schema/River versions and the
+role's systemd units; any `fail` finding makes the command exit non-zero.
+`ssh` is an interactive shell only (a terminal is required) and uses the
+context's pinned host key and identity. `node unlock-ssh` is hidden from the
+operator tree: it runs only on Linux as root from the provider console, opens
+public SSH for 1–240 minutes through the embedded access scripts, and arms a
+transient systemd timer that re-locks without reopening the commit-confirm
+window.
+
 | Current path | Ownership/purpose |
 | --- | --- |
 | `/etc/eregion/control-plane.env` | Service environment incl. DSN, auth/state and transport paths; bootstrap preserves operator-added lines. |
 | `/etc/eregion/auth.json` | Owner-only CI/webhook token hashes, actors, scopes and grants. Setup mints no operator token. |
 | `/etc/eregion/node.json` | Node name/state directory and optional operator-installed helper configuration. |
-| `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles and commit-confirm snapshots. |
+| `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles, commit-confirm snapshots, the recorded host intent (`intent.json`) and owner-only copies of its TLS/key inputs (`inputs/`). |
 | `/var/lib/eregion/node/` | Node journal, per-effect records/locks, detached-task logs and identity. |
 | `/var/lib/eregion/access/` | Operator-access snapshot and lockdown state; separate from bootstrap commit-confirm. |
 | `/etc/caddy/Caddyfile` | Bootstrap-owned main hostname config, importing routes. |

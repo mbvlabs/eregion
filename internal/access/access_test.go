@@ -11,6 +11,7 @@ func TestScriptsParse(t *testing.T) {
 	for name, env := range map[string]map[string]string{
 		"setup": setup.Env(), "lockdown": {"STATE_DIR": StateDir, "TIMEOUT_S": "120"},
 		"confirm": {"STATE_DIR": StateDir}, "revert": {"STATE_DIR": StateDir},
+		"unlock": {"STATE_DIR": StateDir, "MINUTES": "15"}, "relock": {"STATE_DIR": StateDir},
 	} {
 		cmd := exec.Command("bash", "-n")
 		cmd.Stdin = strings.NewReader(Program(name, env))

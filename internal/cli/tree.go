@@ -77,11 +77,12 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.bootstrapSpecs(), a.serverSpecs(), a.loginSpecs(), a.domainSpecs(), a.contextSpecs(), a.platformSpecs(), a.secretSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.workspaceSpecs(), a.logsSpecs()} {
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.bootstrapSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.contextSpecs(), a.platformSpecs(), a.secretSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.workspaceSpecs(), a.logsSpecs()} {
 		for _, s := range specs {
 			a.attach(a.root, s)
 		}
 	}
+	a.attachServerExtras()
 	a.root.SetHelpFunc(func(cmd *cobra.Command, _ []string) {
 		a.started = true
 		a.result = a.help(cmd)

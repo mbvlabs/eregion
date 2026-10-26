@@ -23,10 +23,12 @@ import (
 	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
+	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/upgrade"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -66,6 +68,10 @@ const (
 	methodSecretList     = "vault.list"
 	methodSecretExport   = "vault.export"
 	methodReady          = "ready"
+	methodHostPlan       = "host.plan"
+	methodHostApply      = "host.apply"
+	methodHostDoctor     = "host.doctor"
+	methodHostStatus     = "host.status"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -130,7 +136,10 @@ type rpcInstallParams struct {
 type rpcCallOptions struct {
 	Secrets        map[string]string
 	DryRun         bool
+	Confirm        string
 	IdempotencyKey string
+	// OnEvent receives progress lines from methods that stream their work.
+	OnEvent func(rpc.EventBody)
 }
 
 type nodeClient struct {
@@ -175,6 +184,70 @@ func (n *nodeClient) SubmitAction(ctx context.Context, kind, target string, inpu
 
 func (n *nodeClient) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {
 	return n.call(ctx, methodInventory, rpcInventoryParams{Collection: collection, Filters: filters}, rpcCallOptions{})
+}
+
+func (n *nodeClient) HostPlan(ctx context.Context) (host.Plan, error) {
+	var plan host.Plan
+	err := n.hostCall(ctx, methodHostPlan, rpcCallOptions{}, &plan)
+	return plan, err
+}
+
+func (n *nodeClient) HostApply(ctx context.Context, dryRun bool, confirm string) (host.ApplyReport, host.Plan, error) {
+	var report host.ApplyReport
+	var plan host.Plan
+	opts := rpcCallOptions{DryRun: dryRun, Confirm: confirm, OnEvent: n.progress}
+	raw, err := n.call(ctx, methodHostApply, struct{}{}, opts)
+	if err != nil {
+		return report, plan, err
+	}
+	if dryRun {
+		if err := json.Unmarshal(raw, &plan); err != nil {
+			return report, plan, invalidNodeData("host plan")
+		}
+		return report, plan, nil
+	}
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return report, plan, invalidNodeData("host apply report")
+	}
+	return report, plan, nil
+}
+
+func (n *nodeClient) HostDoctor(ctx context.Context) (doctor.Report, error) {
+	var report doctor.Report
+	err := n.hostCall(ctx, methodHostDoctor, rpcCallOptions{}, &report)
+	return report, err
+}
+
+func (n *nodeClient) HostStatus(ctx context.Context) (host.NodeStatus, error) {
+	var status host.NodeStatus
+	err := n.hostCall(ctx, methodHostStatus, rpcCallOptions{}, &status)
+	return status, err
+}
+
+func (n *nodeClient) hostCall(ctx context.Context, method string, opts rpcCallOptions, target any) error {
+	raw, err := n.call(ctx, method, struct{}{}, opts)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return invalidNodeData(strings.TrimPrefix(method, "host."))
+	}
+	return nil
+}
+
+// progress writes node-side step progress to stderr so a human can follow an
+// apply while JSON output stays a single envelope.
+func (n *nodeClient) progress(event rpc.EventBody) {
+	if n.stderr == nil {
+		return
+	}
+	message := strings.TrimSpace(event.Message)
+	if message == "" {
+		message = event.Kind
+	}
+	if message != "" {
+		fmt.Fprintln(n.stderr, message)
+	}
 }
 
 func (n *nodeClient) SetSecret(ctx context.Context, namespace vault.Namespace, value []byte, expectedRevision uint64) (vault.Metadata, error) {
@@ -284,32 +357,66 @@ func (n *nodeClient) ensureVersion(ctx context.Context) error {
 		return err
 	}
 	want := rpc.Build{Version: buildinfo.Version, Commit: buildinfo.Commit}
-	gotBuild := rpc.Build{Version: got.Version, Commit: got.Commit}
-	if rpc.SameBuild(gotBuild, want) {
+	if nodeBuildMatches(got, want) {
 		n.checked = true
 		return nil
 	}
 	if !n.autoUpgrade {
-		return nodeVersionMismatch(gotBuild, want)
+		return nodeVersionMismatch(nodeBuild(got), want)
 	}
-	if runtime.GOOS != "linux" {
-		return contract.NewFault(contract.PreconditionFailed, "this CLI cannot push a node binary", "Run the upgrade from a linux build of eregion, or install the matching build on the node.")
+	mode, fault := nodeUpgradeMode(got)
+	if fault != nil {
+		return fault
 	}
-	if got.Arch != "" && runtime.GOARCH != got.Arch {
-		return contract.NewFault(contract.PreconditionFailed, "this CLI is built for "+runtime.GOARCH+" but the node is "+got.Arch, "Run an eregion build for the node's architecture.")
+	if mode == "fetch" {
+		err = n.installFetchedNodeBuild(ctx, got.Arch)
+	} else {
+		err = n.installOwnBuild(ctx)
 	}
-	if err := n.installOwnBuild(ctx); err != nil {
+	if err != nil {
 		return err
 	}
 	got, err = n.version(ctx)
 	if err != nil {
 		return err
 	}
+	gotBuild := nodeBuild(got)
 	if !rpc.SameBuild(gotBuild, want) {
 		return nodeVersionMismatch(gotBuild, want)
 	}
 	n.checked = true
 	return nil
+}
+
+func nodeBuild(got rpcVersionResult) rpc.Build {
+	return rpc.Build{Version: got.Version, Commit: got.Commit}
+}
+
+// nodeBuildMatches is the single comparison used before and after an upgrade.
+// The post-upgrade call must pass the freshly read version, never the stale
+// result that triggered the install.
+func nodeBuildMatches(got rpcVersionResult, want rpc.Build) bool {
+	return rpc.SameBuild(nodeBuild(got), want)
+}
+
+// nodeUpgradeMode decides how a mismatched node is brought to this CLI's build.
+// A linux CLI on the matching architecture uploads itself. A macOS CLI, or a
+// different architecture, cannot execute its own binary on the node, so it
+// downloads the verified linux/<node arch> release for this CLI's version.
+func nodeUpgradeMode(got rpcVersionResult) (string, *contract.Fault) {
+	return nodeUpgradeModeFor(got, runtime.GOOS, runtime.GOARCH, buildinfo.Version, buildinfo.Channel)
+}
+
+func nodeUpgradeModeFor(got rpcVersionResult, goos, goarch, version, channel string) (string, *contract.Fault) {
+	if goos != "linux" || (got.Arch != "" && goarch != got.Arch) {
+		if version == "dev" || channel == "" || channel == "dev" {
+			return "", contract.NewFault(contract.PreconditionFailed,
+				"this development CLI cannot push a matching node binary",
+				"Install the same development build on the node, or use a released linux build of eregion for --auto-upgrade-nodes.")
+		}
+		return "fetch", nil
+	}
+	return "own", nil
 }
 
 func (n *nodeClient) version(ctx context.Context) (rpcVersionResult, error) {
@@ -341,16 +448,33 @@ func (n *nodeClient) installOwnBuild(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return n.installUploadedBuild(ctx, raw)
+}
+
+// installFetchedNodeBuild downloads the verified linux/<arch> artifact for this
+// CLI's own version. It is the only path for a macOS CLI or a different
+// architecture: the operator's executable cannot run on the node.
+func (n *nodeClient) installFetchedNodeBuild(ctx context.Context, nodeArch string) error {
+	_, path, err := upgrade.FetchNodeBinary(ctx, buildinfo.Channel, buildinfo.Version, nodeArch)
+	if err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: the release client's verified cached artifact.
+	if err != nil {
+		return contract.NewFault(contract.Unavailable, "the verified node binary is not readable", err.Error())
+	}
+	return n.installUploadedBuild(ctx, raw)
+}
+
+func (n *nodeClient) installUploadedBuild(ctx context.Context, raw []byte) error {
 	sum := sha256.Sum256(raw)
 	dir := "/tmp/eregion-upgrade-" + hex.EncodeToString(sum[:6])
 	if err := n.remote.Upload(ctx, dir, []host.RemoteFile{{Name: "eregion", Data: raw, Mode: 0o755}}); err != nil {
 		return contract.NewFault(contract.Unavailable, "could not upload the node binary", err.Error())
 	}
 	defer func() { _ = n.remote.Remove(context.Background(), dir) }()
-	if _, err := n.callRaw(ctx, methodUpgradeInstall, rpcInstallParams{Path: dir + "/eregion", SHA256: hex.EncodeToString(sum[:])}, rpcCallOptions{}); err != nil {
-		return err
-	}
-	return nil
+	_, err := n.callRaw(ctx, methodUpgradeInstall, rpcInstallParams{Path: dir + "/eregion", SHA256: hex.EncodeToString(sum[:])}, rpcCallOptions{})
+	return err
 }
 
 func (n *nodeClient) callRaw(ctx context.Context, method string, params any, opts rpcCallOptions) (json.RawMessage, error) {
@@ -364,7 +488,7 @@ func (n *nodeClient) callRaw(ctx context.Context, method string, params any, opt
 	}
 	request := rpc.Request{
 		Schema: rpc.Schema, RequestID: rpc.NewRequestID(), Method: method, Params: rawParams,
-		Secrets: opts.Secrets, DryRun: opts.DryRun, IdempotencyKey: opts.IdempotencyKey,
+		Secrets: opts.Secrets, DryRun: opts.DryRun, Confirm: opts.Confirm, IdempotencyKey: opts.IdempotencyKey,
 		Operator: n.operator, ClientVersion: buildinfo.Version, ClientCommit: buildinfo.Commit,
 	}
 	payload, err := json.Marshal(request)
@@ -384,7 +508,7 @@ func (n *nodeClient) callRaw(ctx context.Context, method string, params any, opt
 		_ = pw.CloseWithError(io.EOF)
 		runErr <- err
 	}()
-	result, got, parseErr := readRPCResult(pr)
+	result, got, parseErr := readRPCResult(pr, opts.OnEvent)
 	err = <-runErr
 	if got {
 		if parseErr != nil {
@@ -416,19 +540,22 @@ func (n *nodeClient) remoteTarget() string {
 	return n.route.User + "@" + n.route.Address
 }
 
-func readRPCResult(r io.Reader) (rpc.Result, bool, error) {
+func readRPCResult(r io.Reader, onEvent func(rpc.EventBody)) (rpc.Result, bool, error) {
 	reader := bufio.NewReaderSize(r, 256*1024)
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(bytes.TrimSpace(line)) > 0 {
 			var envelope struct {
 				rpc.Result
-				Event json.RawMessage `json:"event"`
+				Event *rpc.EventBody `json:"event"`
 			}
 			if jerr := json.Unmarshal(line, &envelope); jerr == nil {
 				if envelope.Type == "result" {
 					_, _ = io.Copy(io.Discard, reader)
 					return envelope.Result, true, nil
+				}
+				if envelope.Type == "event" && envelope.Event != nil && onEvent != nil {
+					onEvent(*envelope.Event)
 				}
 			}
 		}
@@ -515,6 +642,10 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	}
 	if err := checkNodeClientVersion(request); err != nil {
 		return writeRPCResult(stdout, nil, err)
+	}
+	if isHostMethod(request.Method) {
+		data, err := dispatchHostMethod(ctx, request, stdout, registry)
+		return writeRPCResult(stdout, data, err)
 	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))

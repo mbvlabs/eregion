@@ -6,12 +6,24 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strconv"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/nodeagent"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
+
+// exitStatusError preserves an interactive remote command's exit status. It is
+// used only by commands that own the terminal (ssh); the normal envelope path
+// keeps contract exit codes.
+type exitStatusError struct {
+	code int
+}
+
+func (e *exitStatusError) Error() string {
+	return "remote command exited with status " + strconv.Itoa(e.code)
+}
 
 // Run writes exactly one envelope in JSON mode, including parse/help failures,
 // except for follow commands whose presenter writes its own terminal protocol.
@@ -20,6 +32,9 @@ func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 	// the result envelope entirely. Node RPC speaks its own NDJSON protocol.
 	if len(args) == 2 && args[0] == "node" && args[1] == "rpc" {
 		return serveNodeRPC(ctx, in, out, stderr)
+	}
+	if len(args) >= 2 && args[0] == "node" && args[1] == "unlock-ssh" {
+		return runNodeUnlockSSH(args[2:], out, stderr)
 	}
 	if len(args) > 0 && args[0] == "node-agent" {
 		return nodeagent.Run(args[1:], in, out, stderr)
@@ -81,8 +96,12 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 		envelope = contract.Success(a.result.command, a.result.data, a.result.next)
 	}
 	if a.result.streamed {
-		// The follow presenter already wrote its protocol (NDJSON result,
-		// stable plain summary, or restored TUI plus summary).
+		// The presenter already wrote its protocol (NDJSON result, stable plain
+		// summary, restored TUI plus summary, or an interactive SSH shell).
+		var status *exitStatusError
+		if errors.As(err, &status) {
+			return status.code
+		}
 		return contract.ExitCode(err)
 	}
 	if selection.Active && followMode == "ndjson" {

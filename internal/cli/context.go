@@ -19,11 +19,19 @@ func hostResult(data any) result {
 // There is no direct HTTP or token path: every operator command reaches the
 // node through SSH inside WireGuard.
 func (a *app) contextClient(cmd *cobra.Command) (Backend, error) {
+	return a.nodeClient(cmd)
+}
+
+func (a *app) nodeClient(cmd *cobra.Command) (*nodeClient, error) {
+	return a.nodeClientFor(cmd, "")
+}
+
+func (a *app) nodeClientFor(cmd *cobra.Command, name string) (*nodeClient, error) {
 	store, err := host.LoadContextStore("")
 	if err != nil {
 		return nil, err
 	}
-	current, err := store.Get("")
+	current, err := store.Get(name)
 	if err != nil {
 		return nil, err
 	}

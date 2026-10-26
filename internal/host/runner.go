@@ -51,10 +51,25 @@ type Plan struct {
 	AccessRisks   []string       `json:"access_risks,omitempty"`
 	AccessChanges []AccessChange `json:"access_changes,omitempty"`
 	Steps         []PlanEntry    `json:"steps"`
-	Confirmation  Confirmation   `json:"confirmation"`
-	Journal       string         `json:"journal"`
-	StateFile     string         `json:"state_file"`
-	ApplyBlocked  string         `json:"apply_blocked,omitempty"`
+	// Total is the number of selected steps; WouldChange counts the steps that
+	// are incomplete or report an error, so a second apply can be a no-op.
+	Total        int          `json:"total"`
+	WouldChange  int          `json:"would_change"`
+	Confirmation Confirmation `json:"confirmation"`
+	Journal      string       `json:"journal"`
+	StateFile    string       `json:"state_file"`
+	ApplyBlocked string       `json:"apply_blocked,omitempty"`
+}
+
+// Pending returns the steps an apply would change.
+func (p Plan) Pending() []PlanEntry {
+	var pending []PlanEntry
+	for _, entry := range p.Steps {
+		if !entry.Complete || entry.Error != "" {
+			pending = append(pending, entry)
+		}
+	}
+	return pending
 }
 
 // ApplyReport is returned after a successful convergence. A failed apply is a
@@ -65,6 +80,9 @@ type ApplyReport struct {
 	OperationID string       `json:"operation_id"`
 	Generation  uint32       `json:"generation"`
 	Steps       []ApplyEntry `json:"steps"`
+	Applied     int          `json:"applied"`
+	Skipped     int          `json:"skipped"`
+	Total       int          `json:"total"`
 	Resumed     bool         `json:"resumed"`
 	CompletedAt time.Time    `json:"completed_at"`
 	// Pending is true when an access-changing apply is live but not yet
@@ -230,6 +248,7 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 			entry.Error = fmt.Sprintf("%s is not in the verified matrix (Debian 13, Ubuntu 26.04; amd64/arm64)", platform)
 		}
 		plan.Steps = []PlanEntry{entry}
+		plan.Total, plan.WouldChange = 1, 1
 		return plan, nil
 	}
 	plan.Supported = true
@@ -270,9 +289,11 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 		}
 		if !entry.Complete || entry.Error != "" {
 			ready = false
+			plan.WouldChange++
 		}
 		plan.Steps = append(plan.Steps, entry)
 	}
+	plan.Total = len(plan.Steps)
 	risks := r.Config.AccessRisks()
 	plan.AccessRisks = risks
 	bindingRisks := append(append([]string(nil), risks...), changeStrings(changes)...)
@@ -412,12 +433,24 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 		}
 		entry := ApplyEntry{ID: step.ID(), Complete: status.Status == engine.StatusCompleted, Executed: status.Executed, Detail: status.Detail}
 		report.Steps = append(report.Steps, entry)
+		report.Total++
+		if entry.Executed {
+			report.Applied++
+		} else {
+			report.Skipped++
+		}
 		if !entry.Complete {
 			if len(changes) > 0 {
 				_ = r.rollbackCommit(state.OperationID)
 			}
 			return report, contract.NewFault(contract.Internal, "host step did not complete", "Inspect the bootstrap journal and re-run apply with a fresh plan.")
 		}
+	}
+	// Record the non-secret host intent on the node so later plan/apply runs
+	// reconstruct the same desired state without the operator's original
+	// flags or uploaded files.
+	if err := saveIntent(r.Config); err != nil {
+		return report, contract.NewFault(contract.PreconditionFailed, "the host converged but its intent could not be recorded", err.Error())
 	}
 	if len(changes) > 0 {
 		if err := markCommitPending(r.Config, state.OperationID, commit); err != nil {
