@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -35,7 +33,7 @@ func (a *app) serverSpecs() []spec {
 	meta.Summary = "Set up a fresh server as an eregion control plane"
 	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass --host, --yes and a host key decision; every question has a flag."}
 	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
-	meta.InputFlags = []string{"host", "identity", "node", "database", "database-url-file", "context-name", "host-key-fingerprint", "accept-new-host-key", "yes"}
+	meta.InputFlags = []string{"host", "identity", "node", "database-url-file", "context-name", "host-key-fingerprint", "accept-new-host-key", "yes"}
 	meta.NeedsRestart = "never"
 	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired)
 	return []spec{{
@@ -50,7 +48,6 @@ func (a *app) serverSpecs() []spec {
 				f.String("host", "", "Server to set up: user@host or user@host:port")
 				f.String("identity", "", "SSH private key; default: ssh-agent and ~/.ssh keys")
 				f.String("node", "", "Node name (default main)")
-				f.String("database", "", "local (PostgreSQL on the server) or external")
 				f.String("database-url-file", "", "External PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
 				f.String("context-name", "", "Local context name (default: the node name)")
 				f.String("host-key-fingerprint", "", "Expected SHA256 host key fingerprint")
@@ -67,7 +64,6 @@ type serverInitAnswers struct {
 	Host, User, Port string
 	Identity         string
 	Node             string
-	Database         string
 	DatabaseURL      string
 	Context          string
 }
@@ -76,7 +72,6 @@ type serverInitSummary struct {
 	Server      string `json:"server"`
 	Node        string `json:"node"`
 	Platform    string `json:"platform"`
-	Database    string `json:"database"`
 	Context     string `json:"context"`
 	API         string `json:"api"`
 	OperationID string `json:"operation_id"`
@@ -120,7 +115,7 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	}
 	ans := r.answers
 	address := net.JoinHostPort(ans.Host, ans.Port)
-	summary := serverInitSummary{Server: ans.User + "@" + address, Node: ans.Node, Database: ans.Database, Context: ans.Context}
+	summary := serverInitSummary{Server: ans.User + "@" + address, Node: ans.Node, Context: ans.Context}
 
 	// Preflight: the binary that is uploaded is this one.
 	task := r.start("preflight", "Local preflight")
@@ -157,24 +152,8 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	summary.Platform = platform.String()
 	task.end(ui.EndOK, platform.PrettyName+", "+platform.Arch)
 
-	if ans.Database == "local" && !dryRun(r.cmd) {
-		task = r.start("database", "Installing PostgreSQL on the server")
-		url, err := installLocalPostgres(ctx, remote)
-		if err != nil {
-			task.end(ui.EndFail, "")
-			return summary, err
-		}
-		r.answers.DatabaseURL = url
-		r.a.secrets.Add(url)
-		task.end(ui.EndOK, "eregion database on 127.0.0.1:5432")
-	}
-
 	cfg := host.DefaultConfig(host.RoleMain, ans.Node)
 	cfg.DatabaseURL = r.answers.DatabaseURL
-	if ans.Database == "local" && dryRun(r.cmd) {
-		// The plan needs a URL; the real one is created on apply.
-		cfg.DatabaseURL = "postgres://eregion:planonly@127.0.0.1:5432/eregion?sslmode=disable"
-	}
 	if err := cfg.Validate(); err != nil {
 		return summary, err
 	}
@@ -238,7 +217,7 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 func (r *serverInit) collect() error {
 	cmd := r.cmd
 	get := func(name string) string { v, _ := cmd.Flags().GetString(name); return strings.TrimSpace(v) }
-	ans := serverInitAnswers{Identity: get("identity"), Node: get("node"), Database: get("database"), Context: get("context-name")}
+	ans := serverInitAnswers{Identity: get("identity"), Node: get("node"), Context: get("context-name")}
 	target := get("host")
 	if target == "" {
 		if !r.interactive {
@@ -262,10 +241,7 @@ func (r *serverInit) collect() error {
 			return err
 		}
 		ans.DatabaseURL = strings.TrimSpace(string(raw))
-		if ans.Database == "" {
-			ans.Database = "external"
-		}
-	} else if env := os.Getenv("EREGION_DATABASE_URL"); env != "" && ans.Database != "local" {
+	} else if env := os.Getenv("EREGION_DATABASE_URL"); env != "" {
 		ans.DatabaseURL = env
 	}
 
@@ -277,17 +253,11 @@ func (r *serverInit) collect() error {
 	if ans.Node == "" {
 		ans.Node = "main"
 	}
-	if ans.Database == "" {
-		ans.Database = "local"
-	}
 	if ans.Context == "" {
 		ans.Context = ans.Node
 	}
-	if ans.Database != "local" && ans.Database != "external" {
-		return contract.NewFault(contract.ValidationFailed, "--database must be local or external", "")
-	}
-	if ans.Database == "external" && ans.DatabaseURL == "" {
-		return contract.NewFault(contract.InputRequired, "an external database needs a URL", "Pass --database-url-file or set EREGION_DATABASE_URL.")
+	if ans.DatabaseURL == "" {
+		return contract.NewFault(contract.InputRequired, "the control plane needs an external PostgreSQL URL", "Pass --database-url-file or set EREGION_DATABASE_URL.")
 	}
 	r.a.secrets.Add(ans.DatabaseURL)
 	r.answers = ans
@@ -307,26 +277,16 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	if !r.cmd.Flags().Changed("context-name") {
 		ans.Context = ""
 	}
-	if ans.Database == "" {
-		ans.Database = "local"
-		if ans.DatabaseURL != "" {
-			ans.Database = "external"
-		}
-		fields = append(fields, huh.NewSelect[string]().
-			Title("Control-plane database").
-			Options(huh.NewOption("PostgreSQL on this server", "local"), huh.NewOption("External PostgreSQL URL", "external")).
-			Value(&ans.Database))
-	}
 	groups := []*huh.Group{}
 	if len(fields) > 0 {
 		groups = append(groups, huh.NewGroup(fields...))
 	}
 	if ans.DatabaseURL == "" {
 		groups = append(groups, huh.NewGroup(
-			huh.NewInput().Title("PostgreSQL URL").
+			huh.NewInput().Title("External PostgreSQL URL").
 				Description("postgres://user:password@host:5432/db — sslmode=verify-full, or disable for loopback and tailnet hosts.").
 				EchoMode(huh.EchoModePassword).Value(&ans.DatabaseURL).Validate(nonEmpty),
-		).WithHideFunc(func() bool { return ans.Database != "external" }))
+		))
 	}
 	if len(groups) > 0 {
 		if err := ui.RunForm(groups...); err != nil {
@@ -336,11 +296,7 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	if ans.Context == "" {
 		ans.Context = ans.Node
 	}
-	database := "PostgreSQL on this server"
-	if ans.Database == "external" {
-		database = "external PostgreSQL"
-	}
-	r.live.Println(ui.Note("node " + ans.Node + " · " + database + " · context " + ans.Context))
+	r.live.Println(ui.Note("node " + ans.Node + " · external PostgreSQL · context " + ans.Context))
 	return nil
 }
 
@@ -426,41 +382,6 @@ func firstContact(ctx context.Context, remote *host.Remote) (host.Platform, erro
 		return platform, contract.NewFault(contract.PreconditionFailed, "the server is "+lines[3]+" but this eregion is built for "+runtime.GOARCH, "Run a "+lines[3]+" build of eregion.")
 	}
 	return platform, nil
-}
-
-// installLocalPostgres installs the distribution's PostgreSQL, creates the
-// eregion role and database, and returns a loopback URL. Re-running resets
-// the role's password, so the URL is always current.
-func installLocalPostgres(ctx context.Context, remote *host.Remote) (string, error) {
-	secret := make([]byte, 24)
-	if _, err := rand.Read(secret); err != nil {
-		return "", err
-	}
-	password := hex.EncodeToString(secret)
-	script := `set -eu
-export DEBIAN_FRONTEND=noninteractive
-if ! command -v pg_ctlcluster >/dev/null 2>&1; then
-  apt-get update -qq
-  apt-get install -y -qq postgresql >/dev/null
-fi
-systemctl enable --now postgresql >/dev/null 2>&1
-for i in $(seq 1 30); do runuser -u postgres -- pg_isready -q && break; sleep 1; done
-cd /
-runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q <<'SQL'
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'eregion') THEN CREATE ROLE eregion LOGIN; END IF;
-END $$;
-ALTER ROLE eregion PASSWORD '` + password + `';
-SQL
-if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'eregion'" | grep -q 1; then
-  runuser -u postgres -- createdb -O eregion eregion
-fi
-`
-	var stderr strings.Builder
-	if err := remote.Run(ctx, "bash -s", strings.NewReader(script), io.Discard, &stderr); err != nil {
-		return "", contract.NewFault(contract.Unavailable, "installing PostgreSQL failed", strings.TrimSpace(stderr.String()))
-	}
-	return "postgres://eregion:" + password + "@127.0.0.1:5432/eregion?sslmode=disable", nil
 }
 
 func (r *serverInit) showPlan(plan host.Plan) {
@@ -621,7 +542,7 @@ func (r *serverInit) finish(s serverInitSummary) {
 	r.live.Println(ui.Card("Server "+s.Node+" is ready", [][2]string{
 		{"server", s.Server},
 		{"platform", s.Platform},
-		{"database", map[string]string{"local": "PostgreSQL on the server", "external": "external PostgreSQL"}[s.Database]},
+		{"database", "external PostgreSQL"},
 		{"API", s.API},
 		{"context", s.Context + " (current)"},
 	}, []string{
