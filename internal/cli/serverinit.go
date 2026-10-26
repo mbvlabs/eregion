@@ -28,13 +28,13 @@ import (
 func (a *app) serverSpecs() []spec {
 	parent := readMeta("Set up and manage eregion servers",
 		[]string{"Set up a fresh Debian 13 or Ubuntu 26.04 server as an eregion control plane."},
-		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --domain example.com --yes --accept-new-host-key --json"})
+		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --hostname app.example.com --yes --accept-new-host-key --json"})
 	parent.Platforms = []string{"linux"}
 	meta := parent
 	meta.Summary = "Set up a fresh server as the main node (control plane)"
 	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass --host, --yes and a host key decision; every question has a flag."}
 	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
-	meta.InputFlags = []string{"host", "identity", "node", "domain", "database-url-file", "context-name", "host-key-fingerprint", "accept-new-host-key", "dns-ready", "yes"}
+	meta.InputFlags = []string{"host", "identity", "node", "hostname", "database-url-file", "context-name", "host-key-fingerprint", "accept-new-host-key", "dns-ready", "yes"}
 	meta.NeedsRestart = "never"
 	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired)
 	return []spec{{
@@ -49,7 +49,7 @@ func (a *app) serverSpecs() []spec {
 				f.String("host", "", "Server to set up: user@host or user@host:port")
 				f.String("identity", "", "SSH private key; default: ssh-agent and ~/.ssh keys")
 				f.String("node", "", "Main node name (default main)")
-				f.String("domain", "", "Base domain; the main node is <node>.<domain>")
+				f.String("hostname", "", "Public hostname of the main node, used as given (e.g. app.example.com)")
 				f.Bool("dns-ready", false, "The DNS record exists; don't wait for 'confirmed'")
 				f.String("database-url-file", "", "External PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
 				f.String("context-name", "", "Local context name (default: the node name)")
@@ -67,7 +67,7 @@ type serverInitAnswers struct {
 	Host, User, Port string
 	Identity         string
 	Node             string
-	Domain           string
+	Hostname         string
 	DatabaseURL      string
 	Context          string
 }
@@ -94,8 +94,8 @@ type serverInit struct {
 	publicIPv4  string
 }
 
-// hostname is the main node's public name, <node>.<domain>.
-func (a serverInitAnswers) hostname() string { return a.Node + "." + a.Domain }
+// hostname is the main node's public name, as the operator gave it.
+func (a serverInitAnswers) hostname() string { return a.Hostname }
 
 func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error) {
 	jsonMode, _ := cmd.Flags().GetBool("json")
@@ -310,7 +310,7 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 func (r *serverInit) collect() error {
 	cmd := r.cmd
 	get := func(name string) string { v, _ := cmd.Flags().GetString(name); return strings.TrimSpace(v) }
-	ans := serverInitAnswers{Identity: get("identity"), Node: get("node"), Domain: strings.ToLower(strings.TrimSuffix(get("domain"), ".")), Context: get("context-name")}
+	ans := serverInitAnswers{Identity: get("identity"), Node: get("node"), Hostname: strings.ToLower(strings.TrimSuffix(get("hostname"), ".")), Context: get("context-name")}
 	target := get("host")
 	if target == "" {
 		if !r.interactive {
@@ -349,8 +349,8 @@ func (r *serverInit) collect() error {
 	if ans.Context == "" {
 		ans.Context = ans.Node
 	}
-	if ans.Domain == "" {
-		return contract.NewFault(contract.InputRequired, "--domain is required without a terminal", "Pass --domain example.com; the main node is <node>.<domain>.")
+	if ans.Hostname == "" {
+		return contract.NewFault(contract.InputRequired, "--hostname is required without a terminal", "Pass --hostname app.example.com.")
 	}
 	if err := host.ValidateHostname(ans.hostname()); err != nil {
 		return contract.NewFault(contract.ValidationFailed, "invalid hostname "+ans.hostname(), err.Error())
@@ -376,11 +376,11 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	if !r.cmd.Flags().Changed("context-name") {
 		ans.Context = ""
 	}
-	askDomain := ans.Domain == ""
-	if askDomain {
-		fields = append(fields, huh.NewInput().Title("Base domain").
-			Description("The main node is <node name>.<domain>: you create one DNS record for it. Caddy gets its certificate.").
-			Value(&ans.Domain).Validate(validateDomain))
+	askHostname := ans.Hostname == ""
+	if askHostname {
+		fields = append(fields, huh.NewInput().Title("Public hostname").
+			Description("The main node's name, used as given, e.g. app.example.com. You create one DNS record for it; Caddy gets its certificate.").
+			Value(&ans.Hostname).Validate(validateHostname))
 	}
 	groups := []*huh.Group{}
 	if len(fields) > 0 {
@@ -403,9 +403,9 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	if !r.cmd.Flags().Changed("node") {
 		r.live.Println(ui.Answered("Main node name", ans.Node))
 	}
-	ans.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ans.Domain), "."))
-	if askDomain {
-		r.live.Println(ui.Answered("Base domain", ans.Domain))
+	ans.Hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ans.Hostname), "."))
+	if askHostname {
+		r.live.Println(ui.Answered("Public hostname", ans.Hostname))
 	}
 	if askURL {
 		r.live.Println(ui.Answered("External PostgreSQL URL", ui.SecretAnswer))
@@ -417,12 +417,12 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	return nil
 }
 
-func validateDomain(v string) error {
+func validateHostname(v string) error {
 	v = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(v), "."))
 	if v == "" {
-		return errors.New("a domain is required")
+		return errors.New("a hostname is required")
 	}
-	return host.ValidateHostname("node." + v)
+	return host.ValidateHostname(v)
 }
 
 func nonEmpty(v string) error {

@@ -111,7 +111,7 @@ type Config struct {
 	APITLSCert        string `json:"api_tls_cert,omitempty"`
 	APITLSKey         string `json:"api_tls_key,omitempty"`
 	WorkerConcurrency int    `json:"worker_concurrency"`
-	// Hostname is the main node's public name, <node>.<domain>. Caddy serves
+	// Hostname is the main node's public name, as the operator gave it. Caddy serves
 	// it with an ACME certificate and exposes only the CI endpoint.
 	Hostname       string `json:"hostname,omitempty"`
 	RegistryListen string `json:"registry_listen"`

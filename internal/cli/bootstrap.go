@@ -197,7 +197,7 @@ func bootstrapInputFlags(cmd *cobra.Command) {
 	f.String("api-listen", "127.0.0.1:8080", "API listener; non-loopback apply is access-changing")
 	f.String("api-tls-cert", "", "TLS certificate source")
 	f.String("api-tls-key", "", "TLS private key source")
-	f.String("hostname", "", "Public hostname of the main node (<node>.<domain>); Caddy serves it with an ACME certificate")
+	f.String("hostname", "", "Public hostname of the main node; Caddy serves it with an ACME certificate")
 	f.String("node-authorized-keys-file", "", "SSH public keys source; apply is access-changing")
 	f.Int("worker-concurrency", 2, "Worker concurrency (1–16)")
 	f.Int("commit-confirm-seconds", int(host.DefaultCommitConfirmWindow/time.Second), "Rollback window for access-changing apply (30–900)")

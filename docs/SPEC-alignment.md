@@ -33,18 +33,18 @@ SSH inside WireGuard to the node, and runs the same command there in node mode
 WireGuard identity and an SSH key from the handoff bundle, not a bearer token.
 
 **CI and other automation get one public endpoint with a scoped token.** GitHub
-Actions and similar trigger deployments over HTTPS at `https://<node>.<domain>`
+Actions and similar trigger deployments over HTTPS at `https://<hostname>`
 (Caddy, ACME certificate) with a deploy-scoped token: submit a deploy, read its
 status. Nothing else of the API is public. Tokens are created with
 `eregion token create --scope deploy` and shown once.
 
-**`server init` asks for a domain, like vaire.** Each node is `<node>.<domain>`;
+**`server init` asks for the main node's public hostname,** used exactly as given (e.g. `db2.mbvlabs.com`, no node prefix);
 init shows the DNS record, waits, checks it against public resolvers, and Caddy
 gets the certificate. A load balancer for HA later gets its own name in front of
 the main node; nothing else changes.
 
 ```
- operator / agent                                  VPS: main node <node>.<domain>
+ operator / agent                                  VPS: main node <hostname>     
 ┌──────────────────────────┐   WireGuard (UDP)   ┌──────────────────────────────────┐
 │ eregion (operator mode)  │═════════════════════▶│ sshd on wg0 only                 │
 │  context from handoff    │   SSH inside WG      │ eregion node <cmd> --json        │
@@ -71,7 +71,7 @@ the main node; nothing else changes.
 | 7 | Hardening (vaire): admin user + sudo password, root login and passwords off, firewall | None | Port from vaire (D2) |
 | 8 | WireGuard hub `10.x.0.1`, operator peer, embedded userspace tunnel | Node WireGuard transport exists; no operator peer | Add operator peer + userspace tunnel |
 | 9 | **Commit-confirm switchover**: SSH moves to wg0, public 22 closes, server timer reverts unless confirmed | Engine supports commit-confirm; not wired | Wire it |
-| 10 | **Domain question** (`<node>.<domain>`), show the DNS record, wait, check against public resolvers, ACME certificate | None | Add: it gives the API its URL (§3) and ingress its hostnames (§5) |
+| 10 | **Hostname question** (used as given), show the DNS record, wait, check against public resolvers, ACME certificate | None | Add: it gives the API its URL (§3) and ingress its hostnames (§5) |
 | 11 | Secrets handoff: plain record + **age transfer bundle** + generated passphrase, copy/save/show, type `stored`, clear screen | Plain record only (today) | Add bundle + passphrase |
 | 12 | `login`: paste bundle → context | None | Add |
 | 13 | `context list/use/remove`; current context | Token-based, SSH tunnel (stopgap) | WireGuard + SSH identity (D1) |
@@ -157,7 +157,7 @@ flags only and never prompts.
    operator peer + embedded userspace tunnel, commit-confirm switch of SSH to
    wg0, version lockstep, age transfer bundle + `login`, contexts on
    WireGuard/SSH. Operator commands run in node mode over that channel.
-2. Domain question + DNS check + Caddy with ACME for `<node>.<domain>` (done);
+2. Domain question + DNS check + Caddy with ACME for the hostname (done);
    the CI endpoint with per-use, expiring tokens (D7, later: TOTP setup,
    `token create --scope --expires`, list, revoke; drop the setup token).
 3. Guided `app create` → `deploy` on the main node; app domains through Caddy.
