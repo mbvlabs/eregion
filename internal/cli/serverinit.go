@@ -286,7 +286,7 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	if ans.DatabaseURL == "" {
 		groups = append(groups, huh.NewGroup(
 			huh.NewInput().Title("External PostgreSQL URL").
-				Description("postgres://user:password@host:5432/db — sslmode=verify-full, or disable for loopback and tailnet hosts.").
+				Description("postgres://user:password@host:5432/db").
 				EchoMode(huh.EchoModePassword).Value(&ans.DatabaseURL).Validate(nonEmpty),
 		))
 	}
