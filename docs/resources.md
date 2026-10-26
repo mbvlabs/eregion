@@ -1,349 +1,87 @@
-# Resources and recovery
+# Existing resources and recovery subsystem
 
-**Status:** M4 implementation notes · 2026-10-20  
-**Scope:** PostgreSQL application resources, logical backups, credential
-references, restore recovery, and the separate external control-plane database
-procedure. Every mutation is a durable `platform.resource.*` or
-`platform.backup.*` operation submitted through `POST /v1/operations`; the CLI
-never opens Docker, PostgreSQL, or a River job directly.
+Reference for code that leaves the operator surface before v1: eregion does not
+manage application databases (MASTER D19), and work list row 9 removes
+`resources …`. The control-state recovery procedure at the end stays relevant
+(D4, D9).
 
-## Resource model
+## Current boundary
 
-A resource is one PostgreSQL container plus one labelled named volume on one
-explicit application host:
+`internal/resources` manages a PostgreSQL 17 container and labelled volume on
+one explicitly configured **local** Docker host. The worker must have
+`EREGION_RESOURCES_HOST`, `EREGION_RESOURCES_STATE_DIR` and, for backups,
+`EREGION_RESOURCES_BACKUP_DIR`. Host identity is checked against Docker;
+unconfigured or mismatched placement fails. This is not per-environment remote
+resource placement or a general service catalog.
 
-```json
-{
-  "name": "appdb",
-  "engine": "postgresql",
-  "version": "17",
-  "host": "main",
-  "address": "127.0.0.1",
-  "port": 0,
-  "database": "app",
-  "username": "app",
-  "volume": "eregion-pg-appdb-data"
-}
-```
+Resource state, password files, schedules and restore journals are protected
+host files; archives have manifests. There are no resource/backup inventory
+tables in migrations 001–010. Domain operation history remains in PostgreSQL.
+Multiple control planes do not automatically share these host files.
 
-- `host` is the worker's verified Docker node identity. A local `ExecRunner`
-  only acts when `docker info --format {{.Name}}` matches it. A different host
-  fails with `precondition_failed`; remote placement is a later task.
-- The address must be a literal specified IP. `0.0.0.0` and `::` are refused.
-  `port: 0` lets Docker allocate an ephemeral loopback port.
-- The container and volume carry `io.eregion.*` ownership labels. A foreign
-  container or volume with a matching name is never adopted, mutated, or
-  deleted.
-- The password is generated once by the service, stored in a `0600` file under
-  the service state directory, and mounted read-only into the container. It is
-  never part of action input, River arguments, events, inventory, or CLI output.
+Existing commands: `resources create/list/status/connect-info/credentials/destroy/recover`,
+`resources backups create/list/verify/restore`, `resources schedule set`.
+Inspect current help for flags. Mutations use registered platform actions and
+the normal durable operation path. Dry-run is a static validated plan, not live
+Docker inspection. Default idempotency keys derive from intent; use a fresh
+explicit key for a second intentional identical backup, and the same key for a
+retry after ambiguity.
 
-## Commands
+## Safety and credentials
 
-All commands are portable clients of the authenticated API. Reads use
-`GET /v1/platform?collection=resources|backups`; mutations submit registered
-actions. `--output json` is exactly one envelope; plain output is append-only
-text. `--follow` reuses the shared operation follower after a successful
-submission (`--output ndjson` remains reserved for `operations follow`).
+- Only owned labelled containers/volumes may be mutated. Matching foreign names
+  are never adopted. Unspecified public bind addresses are refused.
+- Generated passwords live in owner-only files and are not action input/results.
+  `credentials --output-file` writes to an explicit **application-host path**,
+  not the laptop; create-only semantics prevent overwriting a different file.
+- `connect-info` gives metadata/references, not plaintext. Manual export -> vault
+  -> pinned environment reference is currently needed for app injection. That is
+  not automatic deploycrate resource-to-secret/network projection.
+- Destroy/restore require exact intent/target confirmation. Resource extension
+  checks and CLI confirmation are distinct; inspect both before extending them.
+- The external control-plane database is **never** an ordinary app resource.
+  Configuration-derived database protection rejects destructive resource actions
+  even when a request omits its protection marker.
 
-```text
-eregion resources create <name> --host <node> --database <db> --username <user>
-eregion resources list [--node <node>] [--state <state>] [--limit N]
-eregion resources status <name> [--node <node>]
-eregion resources connect-info <name> [--node <node>]
-eregion resources credentials <name> --output-file <absolute path>
-eregion resources destroy <name> [--remove-volume] --dry-run
-eregion resources recover <name>
-eregion resources backups create <name> [--reason manual|scheduled|safety]
-eregion resources backups list [--node <node>] [--limit N]
-eregion resources backups verify <name> --archive <archive>
-eregion resources backups restore <name> --archive <archive> --dry-run
-eregion resources schedule set <name> --cron "0 3 * * *" --keep-last 7
-```
+## Backup and restore behavior
 
-Choose a supported version explicitly (`--version 17` is the default) and use
-the same database/username/volume on every converge. Changing the identity of an
-existing resource is a conflict, not an implicit recreate.
+Backups are custom-format `pg_dump` archives in the configured directory, with
+resource/effect identity, SHA-256, size and time in manifests. Verification checks
+digest and `pg_restore --list`. This is not S3/R2 storage, off-site protection,
+PITR or server snapshots.
 
-### Dry-run
+Restore verifies source identity, makes/verifies a safety backup, restores to a
+temporary database, probes it, and renames the current database aside before
+switching. A protected phase journal supports interruption recovery. Failed
+post-switch probes attempt restoration of the previous database and keep the
+operation failed. If rollback fails, stop and inspect the journal/safety archive;
+do not start another restore. `resources recover` is the existing journal recovery
+primitive, not permission to add more repair commands.
 
-`--dry-run` asks the API to normalize and validate the action without inserting
-an operation, domain row, or River job. The resources extension returns a static
-plan with ordered steps, destructive markers, confirmation requirements, and
-warnings. A dry run does not read live Docker state; use `resources status` for
-the current observation. A plan is not an authorization token: the executor
-revalidates the request, the exact confirmation, and the control-plane guard.
+Schedules declare interval/cron, timezone and retention. The existing River
+periodic job submits one operation per due slot, then optional verification and
+retention. It does not invent successful archives if the resource worker is
+unconfigured. No second queue/scheduler is needed.
 
-### Idempotency keys
+## Separate external control-state recovery
 
-Every real submission carries an `Idempotency-Key` scoped by the authenticated
-actor, kind, and target.
+Use the external PostgreSQL administrator's recovery tooling, not
+`resources backups restore`. A maintenance-window procedure must:
 
-- `--idempotency-key <key>` is used verbatim after validation.
-- When omitted, the CLI derives
-  `resources:<kind>:<sha256(kind, target, canonical input)[:32]>`.
-- The same key and input return the original operation. The same key with
-  different input is a conflict. A timed-out submission is ambiguous: reuse the
-  key; never generate a fresh one for the same intent.
+1. Stop every API/worker/writer. Preserve the old DB, sanitized schema/version
+   facts and current configuration. No two independent restored writers.
+2. Take/verify a protected custom dump with PostgreSQL tools and a credential
+   source that does not expose passwords in process arguments or logs.
+3. Restore to a **new** database, never over the live source. Check table contents,
+   operation history, migrations/checksums and River versions with the same binary.
+4. Restore/verify the matching vault keyring, node identities/transport credentials
+   and relevant host state. A DB dump alone is not complete recovery.
+5. Repoint the protected service DSN deliberately, start one API/worker pair,
+   check readiness and reconcile in-flight effects without inventing success.
+6. Account for operations accepted after the dump. Retain old DB and backups until
+   the restored setup and a new backup are proven. Reverting DSNs after new writes
+   is not lossless rollback; reconcile divergence first.
 
-A derived key is stable for identical input. To take a second deliberate backup
-with identical options, pass a fresh explicit key. Backups also derive a
-deterministic archive name from the operation/effect identity, so a retry after a
-lost acknowledgement reuses one verified-able archive instead of creating a
-duplicate.
-
-### Confirmation binding for destructive actions
-
-`resources destroy` and `resources backups restore` are plan-bound:
-
-```text
-eregion resources destroy appdb --remove-volume --dry-run --json
-# data.preview is the plan; data.confirmation_token is bound to kind, target,
-# and the canonical input, including the exact resource name.
-eregion resources destroy appdb --remove-volume \
-  --confirm <token> --idempotency-key ops:appdb-destroy --json
-```
-
-The token digest covers kind, canonical target, and canonical input. A mismatched
-or missing token fails before submission with `confirmation_required` or
-`precondition_failed`. The action itself also requires the exact resource name.
-Rotating options (for example adding `--remove-volume`) changes the input and
-therefore requires a new dry run.
-
-## Credentials and application access
-
-`resources credentials` writes one new `0600` JSON document to an explicit
-**absolute path on the application host** and returns only non-secret metadata
-(destination, mode, username, database, endpoint). The document contains the
-password and a ready DSN. It is created with `O_EXCL`; an existing different file
-is a conflict, never an overwrite. Retrying the same operation against an
-identical file is accepted as the durable effect.
-
-`resources connect-info` prints the published endpoint, the protected
-`password_file` reference, and guidance. It never prints the password.
-
-The application environment must receive a **secret reference**, not plaintext:
-
-1. Read the exported file on the application host through the operator's secret
-   workflow and write the value into the control-plane vault, for example:
-
-   ```text
-   eregion secret set --app api --environment production \
-     --name DATABASE_URL --file /run/secrets/appdb-database-url \
-     --expected-revision 0 --json
-   ```
-
-2. Create or update the environment with a pinned reference (use the generic
-   action path until the convenience flag is available):
-
-   ```json
-   {
-     "name": "production",
-     "node": "main",
-     "container_port": 8080,
-     "env": {"APP_ENV": "production"},
-     "secret_refs": {"DATABASE_URL": "vault:api/production/DATABASE_URL@1"}
-   }
-   ```
-
-   ```text
-   eregion platform submit --kind platform.environment.create \
-     --target app/api --input-file /run/secrets/env.json \
-     --idempotency-key ops:env-api-production --json
-   ```
-
-3. Confirm inventory shows `secret_refs` and no secret value. At deploy time the
-   vault resolver injects the referenced revision into the container; the
-   plaintext never enters the canonical operation input, the node payload,
-   events, River arguments, or history.
-
-The resource service results contain only a `CredentialReference` (username,
-database, password file path, mode). The integration test asserts that a
-credential export result does not contain the password.
-
-## Backup and restore guarantees
-
-- Backups are `pg_dump --format=custom` archives in one dedicated protected
-  directory, with a manifest recording resource identity, effect identity,
-  SHA-256, size, reason, and time.
-- Verification recomputes the digest and runs `pg_restore --list` inside the
-  owned container. An archive is not marked verified until both checks pass.
-- Restore verifies the archive and its manifest resource identity, takes and
-  verifies a **safety backup**, restores into a temporary database, probes it,
-  then terminates target connections and renames the databases. The pre-restore
-  database is renamed aside, not dropped first.
-- Every stage is recorded in a protected restore journal with explicit phases
-  (`prepared`, `temporary-created`, `cutover`, `previous-renamed`, `switched`,
-  `switched-healthy`).
-- A retry after a lost acknowledgement observes the journal and effect phase and
-  finalizes without repeating the cutover.
-- If the restored database fails its post-cutover probe, the service renames the
-  previous database back, drops the failed/temporary databases, and returns a
-  failed operation with `recovery.succeeded: true` and the safety archive path.
-  The old database is serving again; the failed restore is not reported as
-  success.
-- If that automatic rollback itself fails, the operation fails with
-  `internal_error`, identifies the restore error and safety archive, and says not
-  to run another restore. Operator action is required.
-
-### Recovering an interrupted restore
-
-```text
-eregion resources recover appdb --node main --idempotency-key ops:appdb-recover --json
-```
-
-`recover` reads the durable journal and database names, chooses the last known
-good name, and repairs the rename sequence. It is safe to retry with the same
-key. A missing journal is not an error; it reports that no interrupted restore
-was present. `restore` itself first recovers an incomplete journal before taking
-a fresh safety backup.
-
-## Backup policy declarations and automatic backups
-
-`resources schedule set` validates an interval or five-field cron expression, a
-timezone, and at least one retention bound (`--keep-last`,
-`--max-age-seconds`), then submits `platform.backup.schedule`. The action writes
-a secret-free policy declaration to the protected resource state directory and
-records the same policy in the durable operation input. The result includes the
-exact `platform.backup.create` declaration key, kind, target, schedule, and
-policy.
-
-The worker's existing River periodic job evaluates declarations every minute:
-
-- a due window submits one `platform.backup.create` with reason `scheduled`;
-- the idempotency key is derived from the resource and the exact schedule
-  slot, so a restart, a concurrent worker, or a repeated tick resolves to the
-  same operation instead of a duplicate backup for that window;
-- the most recent attempt advances the next window. A worker that was down
-  does not backfill every missed window in one tick; it submits the next window
-  and advances one window per tick;
-- `verify_after` submits `platform.backup.verify` once for each completed
-  scheduled backup whose archive can be read, keyed from the backup operation
-  ID;
-- the declared retention bounds are applied with `SelectRetained` to the
-  manifests in the configured backup directory. Expired archives and their
-  manifests are removed; the newest `keep_last` artifacts and anything inside
-  `max_age_seconds` are kept;
-- a later successful `platform.resource.destroy` stops the schedule.
-
-Policies embedded in an earlier `platform.backup.create` input keep working as a
-compatibility path; an explicit `platform.backup.schedule` declaration for the
-same resource takes precedence. Automatic execution requires the worker to have
-`EREGION_RESOURCES_HOST`, `EREGION_RESOURCES_STATE_DIR`, and
-`EREGION_RESOURCES_BACKUP_DIR` configured. Without the resource host, scheduled
-backup operations are still accepted durably but fail in the worker with
-"resource host is not configured", and no archive is pruned; the scheduler does
-not pretend the policy ran.
-
-There is no second queue and no in-process scheduler beyond this periodic job.
-Verification is submitted, not awaited by the scheduler: the verification
-operation has its own durable state, retries, and event history.
-
-## Control-plane database exclusion
-
-The control-plane database is **not** an application resource. It is excluded at
-three layers:
-
-1. A request with `protection: "control-plane"` is refused during platform
-   normalization.
-2. A service configured with `ControlPlaneResource` or `ControlPlaneDatabase`
-   refuses destroy, backup, restore, schedule, and credential export even when
-   the request omits the protection marker. Only read-only health and archive
-   verification remain available.
-3. CLI requests never include the control-plane identity as an ordinary
-   resource; `resources` inventory only sees service-created application
-   resources.
-
-`TestControlPlaneDatabaseExcludedFromOrdinaryActions` proves that destroy,
-backup, schedule, and credential export fail with `precondition_failed` before
-Docker is contacted, including when only `ControlPlaneDatabase` is configured.
-
-## Separate external control-plane database recovery
-
-Do **not** use `eregion resources` or `platform.resource.*` for this database.
-Use the PostgreSQL client tools against the external server, with credentials
-from a secret manager or `~/.pgpass`, not command-line arguments. Keep the old
-database and take a fresh verified dump before changing any DSN.
-
-1. **Stop writers and API/worker processes.** Stop the control-plane API and
-   worker (and any other process using the database). Do not run migrations or
-   accept operations during recovery. A second control plane pointed at a
-   restored copy would be a second writer; do not start one.
-2. **Record the target.** Record the current `EREGION_DATABASE_URL` (without
-   printing its password), the PostgreSQL version, the River schema version, and
-   the application migration versions from `eregion system migrate --dry-run`.
-3. **Take a fresh dump** into a protected directory on the database host:
-
-   ```text
-   pg_dump --format=custom --no-owner --no-privileges \
-     --dbname "$EREGION_CONTROL_PLANE_DSN" \
-     --file /var/backups/eregion/control-plane-<timestamp>.dump
-   sha256sum /var/backups/eregion/control-plane-<timestamp>.dump
-   pg_restore --list /var/backups/eregion/control-plane-<timestamp>.dump \
-     > /var/backups/eregion/control-plane-<timestamp>.toc
-   ```
-
-   A nonzero exit or an empty table of contents is a failure. Do not continue.
-4. **Restore to a new database**, not over the live database:
-
-   ```text
-   psql "$EREGION_CONTROL_PLANE_DSN" -v ON_ERROR_STOP=1 \
-     -c 'CREATE DATABASE eregion_control_plane_restore_<timestamp>'
-   pg_restore --no-owner --no-privileges --exit-on-error \
-     --dbname "$EREGION_CONTROL_PLANE_RESTORE_DSN" \
-     /var/backups/eregion/control-plane-<timestamp>.dump
-   ```
-
-5. **Verify the restored copy** with the same binary before repointing:
-
-   ```text
-   EREGION_DATABASE_URL="$EREGION_CONTROL_PLANE_RESTORE_DSN" \
-     eregion system migrate --dry-run --json
-   ```
-
-   The plan must report no checksum mismatch and no unexpected missing or newer
-   migration. Then start one API/worker pair against the restored copy in an
-   isolated maintenance window and read operation history and inventory.
-6. **Cut over by configuration.** Update the service's protected environment or
-   secret-manager entry so `EREGION_DATABASE_URL` points at the restored
-   database. Restart the API and worker together. Confirm readiness, a read-only
-   `operations get` of a known operation, and a harmless diagnostic submission
-   with a new key.
-7. **Reconcile in-flight work.** River jobs and operation rows restored from the
-   dump reflect the dump time. Work accepted after the dump is not in the
-   restored database. Do not invent terminal states; use the normal
-   reconciliation and retry rules. If the old database is still authoritative,
-   keep it read-only until the restored copy is proven.
-8. **Retain the old database and dump.** Rollback is repointing the DSN back.
-   Drop the old database only after the restored copy has served successfully
-   and a fresh backup of it exists.
-
-This procedure is deliberately outside the ordinary resource executor: it needs
-server-level privileges and a maintenance window that application-resource
-actions must not have.
-
-### Exercised recovery subset
-
-The Go integration test `TestIntegrationControlPlaneRecoveryDrill` (run with
-`EREGION_TEST_DATABASE_URL` and `just integration`) exercises the
-dump/restore/`Ready`/`PlanMigrations` portion of the procedure above. It is not
-a production failover test: it does not stop writers, move the service DSN,
-exercise a maintenance window, or prove recovery time/point objectives.
-
-## Verification
-
-```text
-gofmt -l cmd internal schema examples
-go vet ./...
-go test ./...
-EREGION_TEST_DATABASE_URL=... go test -count=1 ./internal/controlplane -run 'TestIntegrationDeclaredBackupSchedule' -v
-EREGION_TEST_DATABASE_URL=... go test -count=1 ./internal/controlplane -run 'TestIntegrationControlPlaneRecoveryDrill' -v
-EREGION_TEST_RESOURCES_DOCKER=1 go test -count=1 ./internal/resources -run Integration -v
-```
-
-The scheduler integration test declares a policy, runs one tick, asserts exactly
-one scheduled backup, marks its archive readable, runs a second tick, and asserts
-the verify-after submission and retention pruning. The fake host cannot dump a
-real database, so the test does not claim a real archive was produced. The
-Docker integration test is opt-in and creates uniquely named containers and
-volumes. It never uses an existing database, container, or volume.
+The existing `TestIntegrationControlPlaneRecoveryDrill` exercises a narrower
+dump/restore/readiness subset against generated test databases. It is not evidence
+of live writer quiescence, DSN cutover, keyring recovery, HA or recovery-time goals.

@@ -1,130 +1,73 @@
-# Agent and operation contracts
+# Machine and operation contracts
 
-**Schema:** `eregion/v1` · **Scope:** M0.1 CLI contracts, M0.2 diagnostic execution, the M0.3 local node boundary, and the M0.3 pinned SSH transport (optionally inside userspace WireGuard).
+Reference for current mechanisms. Product requirements and gaps are tracked only
+in [MASTER](MASTER.md). Authority: `internal/contract`, `internal/output`, command
+metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
 
-CLI discovery, operation persistence, HTTP transport, scoped authorization,
-transactional River insertion, local node dispatch, and the pinned SSH node
-transport, plain or inside a userspace WireGuard tunnel, are implemented. Token
-issuance, destructive-operation confirmations, and interactive viewing are not. See
-[control-plane setup](control-plane.md) for the current API and limitations.
+## Discovery and output
 
-## Compatibility
-
-Use **`eregion/v1`** for response envelopes and stream records. Binary release
-versions are independent. JSON Schema lives at [`schema/eregion-v1.json`](../schema/eregion-v1.json).
-Tests validate actual CLI envelopes and serialized stream records against it.
-
-Within this schema version, readers must ignore unknown object fields. Optional
-fields and new command entries can be added. Do not rename existing fields, change
-their meaning/types, add required fields to existing records, or change exit-code
-meanings without a new schema version. Treat new enum members as unknown values
-and report them explicitly rather than assuming success. Breaking operation contract
-changes during development must update the schema/version and tests deliberately.
-
-JSON Schema checks shape; domain validation adds cross-field constraints, unsigned
-64-bit numeric range checks, state transitions, authorization, and expiry/revision
-checks. For example, measured progress cannot exceed its total even though both
-counts are wire-encoded decimal strings.
-
-## Implemented command surface
-
-The root, `commands`, `help`, and `version` provide discovery. M0.2 adds `serve`,
-`worker`, `system migrate`, and `operations test/get/events/cancel`, plus their
-help-only groups. There are no deployment stubs or implicit completion commands.
-Planned capabilities appear in the roadmap, not the catalog.
-
-`commands --path version` returns the exact command descriptor, including inherited
-flags. `commands --json` lists the complete implemented tree, including root/help.
-Metadata validation gates **every invocation**, not just discovery. Missing metadata,
-handlers, safety declarations, flag references, or unknown error codes fail closed.
-
-Descriptors include usage, flags, audience, platforms, mutation/destruction behavior,
-dry-run support or a reason it is unavailable, noninteractive input flags, restart
-requirements, output shape, stable error codes, examples, and next steps. Metadata
-is a build/test gate, not an authorization mechanism or proof of handler safety.
-
-## Output and noninteractive behavior
-
-- `--output plain` is the default for both terminals and pipes. It is
-  append-only text: successful output on stdout; errors and hints on stderr.
-- `--output json` / `--json` emits exactly one newline-terminated result envelope
-  on stdout. Expected failures do not also print usage, diagnostics, or a second
-  copy to stderr. Help also has structured output.
-- Conflicting output modes fail. If JSON was explicitly selected, output-selection
-  failures are JSON too. Early command/flag failures recover output intent from
-  arguments; values belonging to known flags and arguments after `--` are not
-  mistaken for output flags.
-- Commands never read stdin, prompt, start Bubble Tea, query terminal capabilities,
-  or emit ANSI. Missing values fail with `input_required`, naming the flag.
-- Output I/O failure exits 70. A partial write cannot be repaired by appending
-  another envelope; the CLI emits only a fixed safe diagnostic on stderr.
-- `NO_COLOR` and `TERM=dumb` require no special handling yet because output is
-  already unstyled. Interactive presentation is reserved for M0.4. Foreground
-  service commands log lifecycle information to stderr and emit their final result
-  only on shutdown; request commands retain the one-envelope behavior.
-
-Success example (build information abbreviated):
+- `eregion commands --json` lists implemented commands, their flags, platforms,
+  safety declarations, error codes, examples and next steps. `help <path> --json`
+  describes one command. Metadata validation runs before normal dispatch.
+- Plain is append-only by default. JSON (`--json` or `--output json`) returns one
+  newline-terminated `eregion/v1` envelope. Help and expected errors use it too.
+- Streaming commands opt into NDJSON; ordinary commands do not accept an arbitrary
+  streaming mode. Service commands log on stderr and return their final result on
+  shutdown. Explicit machine mode must never start Charm or prompt.
+- Structured/no-TTY parity is a product requirement. Some newer setup/login paths
+  still need qualification; discovery metadata is not proof that they comply.
+- Output write failure exits 70; do not append a second envelope after a partial
+  write. Human messages are not machine identifiers.
 
 ```json
-{"schema":"eregion/v1","ok":true,"command":"eregion version","data":{"version":"dev"},"next":["eregion commands --json"]}
+{"schema":"eregion/v1","ok":true,"command":"eregion version","data":{"version":"dev"}}
 ```
-
-Failure example:
 
 ```json
-{"schema":"eregion/v1","ok":false,"command":"eregion","error":{"code":"usage_error","message":"unknown command","hint":"Discover available commands with eregion commands --json."}}
+{"schema":"eregion/v1","ok":false,"command":"eregion","error":{"code":"usage_error","message":"unknown command"}}
 ```
 
-Messages are for humans; agents branch on `ok`, `error.code`, and the process exit
-status. Do not parse prose or treat stderr silence as success.
+MASTER adds vaire's codes to this table as their flows land: `missing_tool`
+(preflight), `node_version_mismatch` (lockstep), `remote_unreachable` and
+`partial_failure`.
 
-## Error/exit contract
+Readers ignore unknown optional object fields and handle unknown enum members
+explicitly, never as success. Breaking changes to existing field meaning/type,
+required fields or exit meanings require deliberate contract/schema changes.
+Binary, node-protocol and database versions are separate from envelope version.
 
-- **0:** successful request. Submission success will mean accepted durably, not
-  completed successfully; inspect operation state separately.
-- **2:** `usage_error`, `invalid_output_mode`, `input_required`, `validation_failed`.
-- **3:** `not_found`.
-- **4:** `unauthenticated`, `forbidden`.
-- **5:** `precondition_failed`, `confirmation_required`, `conflict`.
-- **6:** `unavailable` (including a request deadline).
-- **70:** `internal_error`, including failure to write output.
-- **130:** `cancelled` for an interrupted client request/viewer.
+| Exit | Error codes / meaning |
+| --- | --- |
+| 0 | Successful request/observation. Submission means accepted, not completed. |
+| 2 | `usage_error`, `invalid_output_mode`, `input_required`, `validation_failed` |
+| 3 | `not_found` |
+| 4 | `unauthenticated`, `forbidden` |
+| 5 | `precondition_failed`, `confirmation_required`, `conflict` |
+| 6 | `unavailable`, including request deadlines |
+| 70 | `internal_error`, including output failure |
+| 130 | `cancelled` for interrupted client/viewer |
 
-A domain operation in state `cancelled` is not the same as an interrupted viewer.
-Typed errors expose code/message/hint/details; wrapped implementation causes never
-serialize. Untyped errors become a generic internal error, not raw implementation
-text. Cobra argument/flag errors become typed usage/input errors.
+## Submission, identity and retry
 
-## Operation identity, actors, and submission deduplication
+Operation IDs are opaque `op_` + 32 lowercase hex digits. Actor kind is operator,
+ci, webhook or system; authenticated provenance is not itself authorization.
+Remote input cannot choose its own actor.
 
-- IDs are opaque strings: `op_` followed by 32 lowercase hex digits from 128 random
-  bits. Callers retain the returned ID; do not infer placement, time, or order.
-- An actor has `kind` (`operator`, `ci`, `webhook`, `system`) and a nonempty stable
-  `subject` of at most 256 UTF-8 bytes. Actor kinds describe provenance, not privilege.
-- The authenticated service resolves actors. A remote body cannot choose its own
-  identity or gain authority by claiming `kind: system`.
-- Submission keys use 1–128 ASCII letters/digits or `. _ : -`. Scope them by
-  authenticated actor, operation kind, and target. The service must bind the key to
-  a digest of normalized validated inputs.
-- The same scoped key/input returns the original operation; the same scoped key
-  with different input fails with `conflict`. Database constraints and transactional
-  insertion enforce this across control-plane processes in M0.2.
-- A different idempotency key is deliberately a different operation, even with the
-  same input. Its node effect key also differs. Deduplication is scoped by
-  authenticated actor, kind, target, and key, not by input alone.
-- A timed-out submission is ambiguous: reuse its idempotency key to discover the
-  original outcome. Never blindly submit again with a fresh key.
+Submission deduplication is scoped by **actor + kind + target + idempotency key**,
+bound to normalized input hash. Same key/input returns original work; changed
+input conflicts. A different key is deliberately different work. Reuse the key
+after a timeout; a lost response is an unknown outcome, not proof nothing ran.
+Keys contain 1–128 ASCII letters/digits or `._:-`.
 
-The `operations.Service` interface is shared by future application/transport/UI
-adapters. It defines submit/get/events/request-cancel without coupling consumers
-to River, PostgreSQL, Cobra, or Charm. Submission inputs and job arguments must not
-contain credential plaintext. The implemented diagnostic accepts bounded numeric
-input only; River arguments contain only the operation ID. The PostgreSQL service
-and HTTP client/handler are concrete adapters, not separate business-logic paths.
+Current platform create/deploy helpers require an explicit key. Domain commands
+generate one if omitted; resources derive one from intent if omitted. For safe
+manual retry after an ambiguous response, supply and retain an explicit key.
+Dry-run validates through the service without operation/job insertion. It does
+not prove current host readiness, provider diff or future execution success.
 
-## State transitions and retry
-
-Allowed transitions:
+Operations, initial event, relevant domain intent and River insertion commit
+together. River jobs contain identity, not secret payloads. Queue status is not
+the operation's authoritative domain state.
 
 ```text
 queued     -> running | cancelling | failed
@@ -132,174 +75,86 @@ running    -> cancelling | succeeded | failed
 cancelling -> cancelled | succeeded | failed
 ```
 
-`succeeded`, `failed`, and `cancelled` are terminal. Repeated observations do not
-constitute state transitions. River retries within a still-running operation
-increment `attempt`; they do not rewrite terminal state. Attempt 0 means execution
-has not started. An explicit retry of terminal work creates a new linked operation;
-the corrective-link persistence model and terminal retry command remain future work.
+Terminal states are immutable. River retry increments the attempt of unfinished
+work. Explicit retry of a failed deployment submits new work with the same frozen
+target/release; it does not reset the failed operation. Do not assert a universal
+corrective-link model that is not present in the schema.
 
-A cancellation request is not an acknowledgement. Work can complete while a
-request is in flight or after reaching a noninterruptible boundary. Leaving a
-viewer never invokes request-cancel. The worker observes cancellation at explicit
-step boundaries: it starts no new step, but lets an atomic in-flight step finish and
-acknowledges its effect. Completed effects are not rolled back. If every step had
-already completed, `succeeded` is the honest terminal state; otherwise `cancelled`.
+Cancellation is requested explicitly. Viewer detach, request timeout and worker
+shutdown are not cancellation requests. Atomic in-flight effects finish and are
+acknowledged at safe boundaries. Deploy cancellation before switch preserves old
+serving state; after switch the worker verifies/completes or reconciles. No
+general remote-kill RPC or automatic rollback of all prior effects is promised.
 
-“Connecting”, “loading”, “stale”, and “reconnecting” are client observation states,
-not operation states. A stale viewer must say **last known**, not assert execution
-has stopped or is still healthy.
+## Node effects and recovery
 
-## Node execution identity and reconciliation
+- Effect key: `operation:step`, stable through River retries. Execution identity:
+  `operation:attempt:step`. Request ID is correlation, not effect deduplication.
+- Check the DB acknowledgement and node status before dispatch. Completed matching
+  effects are acknowledged, not repeated. Hash mismatch/corrupt journal fails closed.
+- Detached tasks outlive SSH sessions. A lost stream/tunnel does not imply a stopped
+  task. A retried worker asks status before starting another effect.
+- Per-effect/host file locks coordinate one host. PostgreSQL row/attempt fencing
+  protects state writes; environment advisory locks serialize deployments across
+  workers. River concurrency is not a distributed environment lock.
+- External effects are at-least-once with convergent Check/Apply and effect evidence.
+  The diagnostic marker's exactly-once test is not a universal exactly-once claim
+  for Docker, DNS, Caddy or arbitrary commands. Domain reload currently bypasses
+  journaled node steps; see [network](network.md).
 
-M0.3 introduces two internal identifiers, both derived from the public operation ID:
+## Events and following
 
-- **execution identity:** `op_<id>:<attempt>:<step>`, persisted in the node journal
-  and in the step row while running;
-- **effect key:** `op_<id>:<step>`, stable across attempts.
+Sequences, not timestamps, order events. Cursor `after` is exclusive and starts
+at 0; events start at 1. Pages are bounded (1–200). 64-bit cursor/sequence/progress
+counters are decimal JSON **strings**; attempt is a bounded JSON integer.
+Kinds: state, step, log, warning and measured progress. Optional health, duration,
+release and serving-release observations are rendered only when present.
 
-The public operation snapshot and event sequence do not change. A `step` event may
-carry the optional additive `execution_id` field. No other event kind may carry it,
-and no client needs it to submit, read, follow, or cancel an operation.
+`operations events` reads a JSON page. `operations follow` polls snapshots/pages,
+deduplicates sequences and refreshes after reconnect. Missing history/gaps are
+explicit, not silently skipped. Connecting/live/stale/reconnecting are viewer
+states, separate from operation state. Stale means **last known**, not stopped.
 
-Before dispatching a step, the worker checks the PostgreSQL step row and then the
-node's durable status. A completed effect is acknowledged, not re-run. A live-running
-node effect is attached/retried, never started a second time. A completed effect with
-a different canonical inputs hash is `precondition_failed`. River arguments still
-contain only the operation ID; no secret material enters events, step rows, or River
-arguments.
-
-Exactly-once applies to the **effect key**. Duplicate submissions with one scoped
-idempotency key share one operation and one effect key. River retries and lost
-acknowledgements reuse the same effect key. A different idempotency key is a different
-operation and therefore a different effect; future corrected retries of terminal work
-must make their steps convergent rather than assuming the old effect is reused.
-
-The local transport uses node-local `flock` plus a journal. It coordinates processes
-on one host; it is not a distributed lock. The pinned SSH transport reuses the same
-journal, effect records, and node-local locks on the node; the control plane's
-decision procedure does not change. Userspace WireGuard only replaces the
-connection under SSH, so it does not change the decision procedure either: a lost
-tunnel is a lost stream, and the retry asks the node for its status first.
-
-## Terminal failure codes
-
-A failed operation carries a machine-readable `error_code` in the `eregion/v1`
-operation snapshot and on its terminal state event. It uses the same code
-taxonomy the CLI and API already use, so a caller never has to parse the
-message text:
-
-| Code | Meaning for a failed operation |
-| --- | --- |
-| `precondition_failed` | The node can never converge this effect: the effect was recorded under other inputs, the node journal is corrupt, the node reported a permanent failure, or the transport refused the request (for example a host-key mismatch). |
-| `unavailable` | The work could not be completed in time: the node was unreachable, the step kept failing, or the execution ended without an acknowledged result. |
-| `internal_error` | An unexpected failure without a more specific classification. |
-
-The code is optional and additive: an operation that fails without a code is
-still valid, and every other state carries no code. The PostgreSQL operation row
-and the step rows store the same code, so a reader does not have to reconstruct
-it from the event history.
-
-## Remote node execution
-
-A node answers two requests: `run` and `status`. Both carry the request ID, the
-execution identity, the effect key inputs, and optional transient secrets. The
-node owns its state directory and has no database access and no credential for
-the control plane.
-
-- A run request starts a **detached** node task. The task outlives the
-  connection that started it; the transport asks for the task's status until it
-  is terminal.
-- A lost stream is an explicit outcome. It never means the node stopped, and the
-  retry path asks for status before it runs anything.
-- The node protocol version is exchanged before any request is accepted. A
-  mismatch fails closed.
-- Request secrets are registered with a per-request redaction registry before
-  any event, log, error, or journal write. The secrets travel to the node over
-  the encrypted channel and reach a detached task through an inherited pipe, so
-  they never touch the node's disk.
-- The control plane pins the node's host key and refuses a node without a
-  pinned key. No request value is ever placed in a command line or interpreted
-  by a shell.
-
-The [M0.3 SSH plan](m0.3-ssh-plan.md) records the full decisions.
-
-## Events, cursors, and NDJSON
-
-Events have operation ID, monotonically increasing per-operation sequence,
-timestamp, kind, and attempt, with optional stage/message/state/measurement fields.
-A `step` event may also carry the optional additive `execution_id`; M0.2 readers that
-ignore unknown fields remain compatible.
-Timestamps are RFC 3339; producers use UTC. Sequences—not timestamps—define order.
-Sequence starts at 1. Cursor `after` may be 0. Accepted M0.2 snapshots contain at
-least their accepted-event sequence; zero represents pre-acceptance in shared types.
-
-64-bit counters (`sequence`, `last_sequence`, `after`, progress counts) are canonical
-decimal **strings** on the wire to avoid JavaScript precision loss. Readers must
-parse/check the unsigned 64-bit range. `attempt` is a bounded 32-bit JSON integer.
-
-- `state`: carries a valid domain operation state.
-- `step`: names an observed execution stage.
-- `log`: redacted diagnostic text.
-- `warning`: nonfatal diagnostic text.
-- `progress`: measured current/total/unit; total must be positive and current must
-  not exceed it. Unknown duration is not a percentage.
-
-A cursor is `{operation_id, after}`. Fetch returns bounded ascending events strictly
-after `after`. Reconnect reuses it and refreshes the snapshot. Clients deduplicate
-by operation ID/sequence. The service must report expired retention cursors as
-`precondition_failed`, not silently skip history. Sequence allocation, event/snapshot
-transactionality, authorization, and bounded paging are implemented in M0.2.
-Events are not pruned yet, gaps are explicit errors, and no live event-stream
-transport or wake-up mechanism is exposed yet.
-
-The tested NDJSON serializer emits records shaped as:
+- `--json` waits and returns one final observation envelope.
+- `--output ndjson` streams events and a terminal result record.
+- `--interactive` explicitly requests the terminal viewer and requires a TTY.
+- Current follower exits 0 when it observes any terminal operation state, including
+  **failed**. Check `data.state`/error code; exit 0 is not deployment success.
+- Early detach exits 130 and never invokes cancellation.
 
 ```json
-{"schema":"eregion/v1","type":"event","event":{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sequence":"1","at":"2026-10-16T12:00:00Z","kind":"state","attempt":0,"state":"queued"}}
-{"schema":"eregion/v1","type":"result","result":{"schema":"eregion/v1","ok":true,"command":"eregion operations follow","data":{"state":"running"}}}
+{"schema":"eregion/v1","type":"event","event":{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sequence":"1","at":"2026-10-26T12:00:00Z","kind":"state","attempt":0,"state":"queued"}}
+{"schema":"eregion/v1","type":"result","result":{"schema":"eregion/v1","ok":true,"command":"eregion operations follow","data":{"state":"succeeded"}}}
 ```
 
-Exactly one final result terminates an ordinarily completed viewer request, not
-necessarily the operation. A lost transport/partial write can truncate a stream;
-absence of a final result means the request outcome is incomplete. The serializer
-rejects invalid events, mixed operation IDs, nonincreasing sequences, and writes
-after the final record. It never appends after a partial write.
+An incomplete stream without its final record is not a complete request result.
 
-There is **no `operations follow` command yet**. The example specifies its future
-wire shape only. `operations events` currently returns a bounded JSON page.
-`--output ndjson` remains rejected; future following commands will opt into streaming.
+## Confirmation is not authorization
 
-## Confirmation binding
+Target binding, revision/intent checks, authorization and human approval are
+different protections. Current mechanisms vary:
 
-`PlanBinding` hashes a fixed JSON representation of actor, action, target, base
-revision, normalized input SHA-256, and expiry (canonicalized to UTC). Changing any
-bound value changes the digest. **The digest is not an authorization token.**
+- Bootstrap/credential-add use intent/revision/expiry-bound confirmation checks.
+- CLI rollback uses a deterministic kind/target/input digest checked **client-side**;
+  this is not an unforgeable server approval. Generic authenticated action
+  submission can bypass that CLI check.
+- Resources and upgrades have their own confirmation/precondition mechanisms.
+- Current `server init --yes` bypasses its interactive apply question; it must
+  never be reused as the human factor for future token issuance.
 
-A future destructive-operation service must issue unforgeable confirmations, enforce expiry,
-re-resolve identity, revalidate the current revision/inputs, and compare the binding
-before enqueueing a confirmed operation. Token signing/key distribution and replay
-policy need design before destructive commands ship. There is no `--yes` bypass,
-token issuer, or destructive operation command in M0.2.
+The target is MASTER D12: destructive commands take `--confirm <target>`
+(`<app>`, `<app>/<env>`, `<server>`), `--yes` alone never suffices, and the node
+validates the token against current state. Token issuance needs the D7 human
+factor. A public digest is never a credential.
 
-## Redaction and safe terminal text
+## Secret and terminal safety
 
-Adapted from eru's longest-first pattern, with invocation/request-scoped registries
-instead of global mutable state. Register all nonempty secrets, including short
-values, **before** emitting derived data. Common Go-quoted representations are also
-registered because Cobra/pflag can quote rejected inputs before formatting errors.
-One-pass replacement prevents overlapping values or the replacement marker itself
-from producing partial leaks.
+Register secrets before output; redact exact values and relevant encoded forms.
+Redaction is a last defense, not permission to persist plaintext in action input,
+events, River or journals. Credential endpoints/export/handoff are explicit
+exceptions with their own protected output rules. Secret environment injection
+travels transiently through `node.Request.Secrets`, not its persisted payload.
 
-Dynamic JSON payloads are decoded/redacted/re-encoded so quoted, multiline strings
-and object keys are redacted without invalidating JSON. Fixed protocol keys,
-schema/error-code constants, and typed event identity/counters remain intact even
-if a secret happens to match a public protocol literal. Numeric precision is preserved. Failure to
-serialize never falls back to printing raw sensitive values. Plain rendering makes
-terminal control and bidi-format characters visible; it does not execute ANSI/OSC.
-
-Redaction is a final defense, not permission to place secrets in domain history.
-It only recognizes registered exact values; encoded/transformed variants must be
-registered explicitly or omitted. CLI environment credentials are registered before
-parsing; API response registries include the request's Bearer credential; service
-logs use a redacting, terminal-safe writer. Diagnostic jobs/events never accept
-arbitrary secret material.
+Untrusted text is sanitized for control/ANSI/OSC and bidi formatting before human
+presentation. JSON redaction decodes/re-encodes without corrupting precision or
+protocol identity. Never fall back to printing raw sensitive values on errors.
