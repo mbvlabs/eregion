@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"strings"
@@ -41,6 +42,7 @@ func (a *app) contextClient(cmd *cobra.Command) (*api.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	var route *host.ContextSSH
 	if store.Current != "" {
 		current, err := store.Get("")
 		if err != nil {
@@ -48,6 +50,7 @@ func (a *app) contextClient(cmd *cobra.Command) (*api.Client, error) {
 		}
 		if endpoint == "" {
 			endpoint = current.APIURL
+			route = current.SSH
 		}
 		if token == "" {
 			if sameOrigin(endpoint, current.APIURL) {
@@ -61,7 +64,20 @@ func (a *app) contextClient(cmd *cobra.Command) (*api.Client, error) {
 		endpoint = "http://127.0.0.1:8080"
 	}
 	a.secrets.Add(token)
-	return api.NewClient(endpoint, token)
+	client, err := api.NewClient(endpoint, token)
+	if err != nil || route == nil {
+		return client, err
+	}
+	ctx := context.Background()
+	if cmd != nil && cmd.Context() != nil {
+		ctx = cmd.Context()
+	}
+	tunnel, err := contextTunnel(ctx, route)
+	if err != nil {
+		return nil, err
+	}
+	client.UseDialer(tunnel.DialContext)
+	return client, nil
 }
 
 func sameOrigin(left, right string) bool {

@@ -22,13 +22,15 @@ import (
 // RemoteConfig describes one first-contact SSH target. The host key is pinned
 // through the same known_hosts implementation the node transport uses; there
 // is no trust-on-first-use. The identity must be an unencrypted, owner-only
-// private key.
+// private key, unless Auth supplies the credential (ssh-agent or default keys
+// chosen by server init).
 type RemoteConfig struct {
 	Address      string
 	User         string
 	IdentityFile string
 	KnownHosts   string
 	Timeout      time.Duration
+	Auth         []ssh.AuthMethod
 }
 
 var remoteUserPattern = regexp.MustCompile(`^[a-z_][a-z0-9._-]{0,31}$`)
@@ -46,7 +48,7 @@ type RemoteFile struct {
 // uploaded eregion binary, not an interactive shell.
 type Remote struct {
 	config RemoteConfig
-	signer ssh.Signer
+	auth   []ssh.AuthMethod
 	keys   *transport.HostKeys
 }
 
@@ -60,6 +62,19 @@ func NewRemote(config RemoteConfig) (*Remote, error) {
 	}
 	if !remoteUserPattern.MatchString(config.User) {
 		return nil, fmt.Errorf("the remote SSH user %q is not a plain account name", config.User)
+	}
+	keys, err := transport.LoadHostKeys(config.KnownHosts)
+	if err != nil {
+		return nil, err
+	}
+	if !keys.Pinned(config.Address) {
+		return nil, fmt.Errorf("no host key is pinned for %s; add it to %s", config.Address, config.KnownHosts)
+	}
+	if config.Timeout <= 0 {
+		config.Timeout = 30 * time.Second
+	}
+	if len(config.Auth) > 0 {
+		return &Remote{config: config, auth: config.Auth, keys: keys}, nil
 	}
 	info, err := os.Stat(config.IdentityFile)
 	if err != nil {
@@ -80,18 +95,11 @@ func NewRemote(config RemoteConfig) (*Remote, error) {
 		}
 		return nil, fmt.Errorf("parse the remote identity: %w", err)
 	}
-	keys, err := transport.LoadHostKeys(config.KnownHosts)
-	if err != nil {
-		return nil, err
-	}
-	if !keys.Pinned(config.Address) {
-		return nil, fmt.Errorf("no host key is pinned for %s; add it to %s", config.Address, config.KnownHosts)
-	}
-	if config.Timeout <= 0 {
-		config.Timeout = 30 * time.Second
-	}
-	return &Remote{config: config, signer: signer, keys: keys}, nil
+	return &Remote{config: config, auth: []ssh.AuthMethod{ssh.PublicKeys(signer)}, keys: keys}, nil
 }
+
+// Dial opens one pinned SSH connection, for example to tunnel the API.
+func (r *Remote) Dial(ctx context.Context) (*ssh.Client, error) { return r.connect(ctx) }
 
 func (r *Remote) connect(ctx context.Context) (*ssh.Client, error) {
 	dialer := &net.Dialer{Timeout: r.config.Timeout}
@@ -106,7 +114,7 @@ func (r *Remote) connect(ctx context.Context) (*ssh.Client, error) {
 	_ = raw.SetDeadline(deadline)
 	config := &ssh.ClientConfig{
 		User:              r.config.User,
-		Auth:              []ssh.AuthMethod{ssh.PublicKeys(r.signer)},
+		Auth:              r.auth,
 		HostKeyCallback:   r.keys.Callback(r.config.Address),
 		HostKeyAlgorithms: r.keys.Algorithms(r.config.Address),
 		Timeout:           r.config.Timeout,

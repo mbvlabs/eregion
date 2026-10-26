@@ -1,0 +1,678 @@
+package cli
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+
+	"charm.land/huh/v2"
+	"github.com/mbvlabs/eregion/internal/cli/ui"
+	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/term"
+)
+
+// serverSpecs is the operator entry point: eregion server init walks a human
+// through first contact in a terminal (preflight, interview, plan, apply,
+// handoff), and takes the same answers as flags for agents.
+func (a *app) serverSpecs() []spec {
+	parent := readMeta("Set up and manage eregion servers",
+		[]string{"Set up a fresh Debian 13 or Ubuntu 26.04 server as an eregion control plane."},
+		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --yes --accept-new-host-key --json"})
+	parent.Platforms = []string{"linux"}
+	meta := parent
+	meta.Summary = "Set up a fresh server as an eregion control plane"
+	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass --host, --yes and a host key decision; every question has a flag."}
+	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
+	meta.InputFlags = []string{"host", "identity", "node", "database", "database-url-file", "context-name", "host-key-fingerprint", "accept-new-host-key", "yes"}
+	meta.NeedsRestart = "never"
+	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired)
+	return []spec{{
+		use:  "server",
+		meta: parent,
+		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
+		children: []spec{{
+			use:  "init",
+			meta: meta,
+			flags: func(cmd *cobra.Command) {
+				f := cmd.Flags()
+				f.String("host", "", "Server to set up: user@host or user@host:port")
+				f.String("identity", "", "SSH private key; default: ssh-agent and ~/.ssh keys")
+				f.String("node", "", "Node name (default main)")
+				f.String("database", "", "local (PostgreSQL on the server) or external")
+				f.String("database-url-file", "", "External PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
+				f.String("context-name", "", "Local context name (default: the node name)")
+				f.String("host-key-fingerprint", "", "Expected SHA256 host key fingerprint")
+				f.Bool("accept-new-host-key", false, "Trust an unpinned host key without checking it")
+				f.Bool("yes", false, "Apply without the confirmation prompt")
+				f.Bool("dry-run", false, "Stop after showing the plan")
+			},
+			run: a.serverInit,
+		}},
+	}}
+}
+
+type serverInitAnswers struct {
+	Host, User, Port string
+	Identity         string
+	Node             string
+	Database         string
+	DatabaseURL      string
+	Context          string
+}
+
+type serverInitSummary struct {
+	Server      string `json:"server"`
+	Node        string `json:"node"`
+	Platform    string `json:"platform"`
+	Database    string `json:"database"`
+	Context     string `json:"context"`
+	API         string `json:"api"`
+	OperationID string `json:"operation_id"`
+	DryRun      bool   `json:"dry_run,omitempty"`
+}
+
+type serverInit struct {
+	a           *app
+	cmd         *cobra.Command
+	interactive bool
+	live        *ui.Live
+	answers     serverInitAnswers
+}
+
+func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error) {
+	jsonMode, _ := cmd.Flags().GetBool("json")
+	outputMode, _ := cmd.Flags().GetString("output")
+	r := &serverInit{a: a, cmd: cmd}
+	r.interactive = !jsonMode && outputMode != "json" && term.IsTerminal(int(os.Stdin.Fd())) && ui.Enabled(os.Stderr) //nolint:gosec // G115: file descriptors fit in int.
+	if r.interactive {
+		r.live = ui.Start(os.Stderr)
+		defer func() {
+			ui.Finish(err != nil)
+			if errors.Is(err, ui.ErrAborted) {
+				err = contract.NewFault(contract.Cancelled, "server init cancelled", "Nothing was changed after the last finished step; run eregion server init again to resume.")
+			}
+		}()
+		r.live.Println("")
+		r.live.Println(ui.Header("eregion server init", r.live.Width()))
+	}
+	summary, err := r.run(cmd.Context())
+	if err != nil {
+		return result{}, err
+	}
+	return result{data: summary, streamed: r.interactive}, nil
+}
+
+func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
+	if err := r.collect(); err != nil {
+		return serverInitSummary{}, err
+	}
+	ans := r.answers
+	address := net.JoinHostPort(ans.Host, ans.Port)
+	summary := serverInitSummary{Server: ans.User + "@" + address, Node: ans.Node, Database: ans.Database, Context: ans.Context}
+
+	// Preflight: the binary that is uploaded is this one.
+	task := r.start("preflight", "Local preflight")
+	if runtime.GOOS != "linux" {
+		task.end(ui.EndFail, "")
+		return summary, contract.NewFault(contract.PreconditionFailed, "server init uploads this binary, which is built for "+runtime.GOOS, "Run eregion server init from a linux build of eregion.")
+	}
+	task.end(ui.EndOK, "eregion "+runtime.GOOS+"/"+runtime.GOARCH)
+
+	// Host key: pinned in eregion's known_hosts, trusted on first contact.
+	knownHosts, err := knownHostsPath()
+	if err != nil {
+		return summary, err
+	}
+	if err := r.trustHostKey(ctx, knownHosts, address); err != nil {
+		return summary, err
+	}
+	auth, err := sshAuth(ans.Identity, r.interactive)
+	if err != nil {
+		return summary, err
+	}
+	remote, err := host.NewRemote(host.RemoteConfig{Address: address, User: ans.User, KnownHosts: knownHosts, Auth: auth})
+	if err != nil {
+		return summary, contract.NewFault(contract.ValidationFailed, "the SSH target is not usable", err.Error())
+	}
+
+	// First contact: root, a supported release, a matching architecture.
+	task = r.start("contact", "Connecting to "+summary.Server)
+	platform, err := firstContact(ctx, remote)
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return summary, err
+	}
+	summary.Platform = platform.String()
+	task.end(ui.EndOK, platform.PrettyName+", "+platform.Arch)
+
+	if ans.Database == "local" && !dryRun(r.cmd) {
+		task = r.start("database", "Installing PostgreSQL on the server")
+		url, err := installLocalPostgres(ctx, remote)
+		if err != nil {
+			task.end(ui.EndFail, "")
+			return summary, err
+		}
+		r.answers.DatabaseURL = url
+		r.a.secrets.Add(url)
+		task.end(ui.EndOK, "eregion database on 127.0.0.1:5432")
+	}
+
+	cfg := host.DefaultConfig(host.RoleMain, ans.Node)
+	cfg.DatabaseURL = r.answers.DatabaseURL
+	if ans.Database == "local" && dryRun(r.cmd) {
+		// The plan needs a URL; the real one is created on apply.
+		cfg.DatabaseURL = "postgres://eregion:planonly@127.0.0.1:5432/eregion?sslmode=disable"
+	}
+	if err := cfg.Validate(); err != nil {
+		return summary, err
+	}
+
+	task = r.start("upload", "Uploading eregion and planning")
+	session, err := newRemoteSession(ctx, remote, cfg, ans.Host)
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return summary, err
+	}
+	plan, err := remotePlan(ctx, session)
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return summary, err
+	}
+	task.end(ui.EndOK, fmt.Sprintf("%d steps", len(plan.Steps)))
+	r.showPlan(plan)
+	if plan.ApplyBlocked != "" {
+		return summary, contract.NewFault(contract.PreconditionFailed, "the server cannot be set up: "+plan.ApplyBlocked, "Fix the reported precondition and run eregion server init again.")
+	}
+	if dryRun(r.cmd) {
+		summary.DryRun = true
+		return summary, nil
+	}
+	if err := r.confirm(summary.Server); err != nil {
+		return summary, err
+	}
+
+	report, err := r.apply(ctx, session, plan)
+	if err != nil {
+		return summary, err
+	}
+	summary.OperationID = report.OperationID
+
+	// Handoff: the operator token is read once over SSH and saved in a context
+	// that reaches the loopback API through the pinned SSH route.
+	task = r.start("handoff", "Saving context "+ans.Context)
+	apiURL := "http://" + cfg.APIListen
+	if err := r.saveContext(ctx, remote, cfg, apiURL, address, knownHosts); err != nil {
+		task.end(ui.EndFail, "")
+		return summary, err
+	}
+	client, err := r.a.contextClient(r.cmd)
+	if err == nil {
+		err = client.Ready(ctx)
+	}
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return summary, err
+	}
+	task.end(ui.EndOK, "API answers through SSH")
+	if err := session.Remove(ctx); err != nil {
+		r.note("uploaded bundle cleanup failed: " + err.Error())
+	}
+	summary.API = apiURL + " via ssh " + summary.Server
+	r.finish(summary)
+	return summary, nil
+}
+
+// collect reads flags, then asks for what is missing in a terminal.
+func (r *serverInit) collect() error {
+	cmd := r.cmd
+	get := func(name string) string { v, _ := cmd.Flags().GetString(name); return strings.TrimSpace(v) }
+	ans := serverInitAnswers{Identity: get("identity"), Node: get("node"), Database: get("database"), Context: get("context-name")}
+	target := get("host")
+	if target == "" {
+		if !r.interactive {
+			return contract.NewFault(contract.InputRequired, "--host is required without a terminal", "Pass --host root@203.0.113.10.")
+		}
+		v, err := ui.Input("Server to set up", "user@host or user@host:port, as root", "")
+		if err != nil {
+			return err
+		}
+		target = v
+	}
+	user, hostPart, port, err := parseTarget(target)
+	if err != nil {
+		return err
+	}
+	ans.User, ans.Host, ans.Port = user, hostPart, port
+
+	if path := get("database-url-file"); path != "" {
+		raw, err := host.ReadPrivateInput(path)
+		if err != nil {
+			return err
+		}
+		ans.DatabaseURL = strings.TrimSpace(string(raw))
+		if ans.Database == "" {
+			ans.Database = "external"
+		}
+	} else if env := os.Getenv("EREGION_DATABASE_URL"); env != "" && ans.Database != "local" {
+		ans.DatabaseURL = env
+	}
+
+	if r.interactive {
+		if err := r.interview(&ans); err != nil {
+			return err
+		}
+	}
+	if ans.Node == "" {
+		ans.Node = "main"
+	}
+	if ans.Database == "" {
+		ans.Database = "local"
+	}
+	if ans.Context == "" {
+		ans.Context = ans.Node
+	}
+	if ans.Database != "local" && ans.Database != "external" {
+		return contract.NewFault(contract.ValidationFailed, "--database must be local or external", "")
+	}
+	if ans.Database == "external" && ans.DatabaseURL == "" {
+		return contract.NewFault(contract.InputRequired, "an external database needs a URL", "Pass --database-url-file or set EREGION_DATABASE_URL.")
+	}
+	r.a.secrets.Add(ans.DatabaseURL)
+	r.answers = ans
+	return nil
+}
+
+// interview asks the setup questions the flags did not answer, each with
+// its default filled in.
+func (r *serverInit) interview(ans *serverInitAnswers) error {
+	if ans.Node == "" {
+		ans.Node = "main"
+	}
+	var fields []huh.Field
+	if !r.cmd.Flags().Changed("node") {
+		fields = append(fields, huh.NewInput().Title("Node name").Description("How this server is named in eregion.").Value(&ans.Node).Validate(nonEmpty))
+	}
+	if !r.cmd.Flags().Changed("context-name") {
+		ans.Context = ""
+	}
+	if ans.Database == "" {
+		ans.Database = "local"
+		if ans.DatabaseURL != "" {
+			ans.Database = "external"
+		}
+		fields = append(fields, huh.NewSelect[string]().
+			Title("Control-plane database").
+			Options(huh.NewOption("PostgreSQL on this server", "local"), huh.NewOption("External PostgreSQL URL", "external")).
+			Value(&ans.Database))
+	}
+	groups := []*huh.Group{}
+	if len(fields) > 0 {
+		groups = append(groups, huh.NewGroup(fields...))
+	}
+	if ans.DatabaseURL == "" {
+		groups = append(groups, huh.NewGroup(
+			huh.NewInput().Title("PostgreSQL URL").
+				Description("postgres://user:password@host:5432/db — sslmode=verify-full, or disable for loopback and tailnet hosts.").
+				EchoMode(huh.EchoModePassword).Value(&ans.DatabaseURL).Validate(nonEmpty),
+		).WithHideFunc(func() bool { return ans.Database != "external" }))
+	}
+	if len(groups) > 0 {
+		if err := ui.RunForm(groups...); err != nil {
+			return err
+		}
+	}
+	if ans.Context == "" {
+		ans.Context = ans.Node
+	}
+	database := "PostgreSQL on this server"
+	if ans.Database == "external" {
+		database = "external PostgreSQL"
+	}
+	r.live.Println(ui.Note("node " + ans.Node + " · " + database + " · context " + ans.Context))
+	return nil
+}
+
+func nonEmpty(v string) error {
+	if strings.TrimSpace(v) == "" {
+		return errors.New("required")
+	}
+	return nil
+}
+
+func parseTarget(v string) (user, hostPart, port string, err error) {
+	user = "root"
+	if at := strings.LastIndex(v, "@"); at >= 0 {
+		user, v = v[:at], v[at+1:]
+	}
+	hostPart, port = v, "22"
+	if h, p, splitErr := net.SplitHostPort(v); splitErr == nil {
+		hostPart, port = h, p
+	}
+	if hostPart == "" || user == "" {
+		return "", "", "", contract.NewFault(contract.ValidationFailed, "the server must be user@host or user@host:port", "For example root@203.0.113.10.")
+	}
+	if _, convErr := strconv.Atoi(port); convErr != nil {
+		return "", "", "", contract.NewFault(contract.ValidationFailed, "the SSH port must be a number", "")
+	}
+	return user, hostPart, port, nil
+}
+
+// trustHostKey pins the server's key on first contact: a matching
+// --host-key-fingerprint, --accept-new-host-key, or a yes in a terminal.
+func (r *serverInit) trustHostKey(ctx context.Context, knownHosts, address string) error {
+	if hostKeyPinned(knownHosts, address) {
+		return nil
+	}
+	task := r.start("hostkey", "Reading the host key of "+address)
+	key, err := probeHostKey(ctx, address)
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return contract.NewFault(contract.Unavailable, "the server does not answer on SSH", err.Error())
+	}
+	fp := ssh.FingerprintSHA256(key)
+	task.end(ui.EndOK, key.Type()+" "+fp)
+	want, _ := r.cmd.Flags().GetString("host-key-fingerprint")
+	accept, _ := r.cmd.Flags().GetBool("accept-new-host-key")
+	switch {
+	case want != "":
+		if want != fp && "SHA256:"+want != fp {
+			return contract.NewFault(contract.PreconditionFailed, "the host key "+fp+" does not match --host-key-fingerprint", "Check it on the provider console with ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub.")
+		}
+	case accept:
+	case r.interactive:
+		ok, err := ui.YesNoDefault("Trust host key "+fp+"?", "Compare with ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on the provider console.", true)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return contract.NewFault(contract.Cancelled, "the host key was not trusted", "Pass --host-key-fingerprint "+fp+" once it is checked.")
+		}
+	default:
+		return contract.NewFault(contract.InputRequired, "first contact needs the host key "+fp+" to be confirmed", "Pass --host-key-fingerprint "+fp+" or --accept-new-host-key.")
+	}
+	return pinHostKey(knownHosts, address, key)
+}
+
+func firstContact(ctx context.Context, remote *host.Remote) (host.Platform, error) {
+	out, err := remote.Output(ctx, `. /etc/os-release; echo "$ID"; echo "$VERSION_ID"; echo "$PRETTY_NAME"; uname -m; id -u`)
+	if err != nil {
+		return host.Platform{}, contract.NewFault(contract.Unavailable, "could not log in over SSH", err.Error())
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 5 {
+		return host.Platform{}, contract.NewFault(contract.Unavailable, "the server returned unexpected platform output", "")
+	}
+	arch := map[string]string{"x86_64": "amd64", "aarch64": "arm64"}[strings.TrimSpace(lines[3])]
+	platform := host.Platform{ID: lines[0], VersionID: lines[1], PrettyName: lines[2], Arch: arch}
+	if strings.TrimSpace(lines[4]) != "0" {
+		return platform, contract.NewFault(contract.PreconditionFailed, "server init needs root on the server", "Use root@host; the setup installs packages and system services.")
+	}
+	if !platform.Supported() {
+		return platform, contract.NewFault(contract.PreconditionFailed, "the server runs "+platform.PrettyName+", which eregion does not support", "Use Debian 13 or Ubuntu 26.04.")
+	}
+	if arch != runtime.GOARCH {
+		return platform, contract.NewFault(contract.PreconditionFailed, "the server is "+lines[3]+" but this eregion is built for "+runtime.GOARCH, "Run a "+lines[3]+" build of eregion.")
+	}
+	return platform, nil
+}
+
+// installLocalPostgres installs the distribution's PostgreSQL, creates the
+// eregion role and database, and returns a loopback URL. Re-running resets
+// the role's password, so the URL is always current.
+func installLocalPostgres(ctx context.Context, remote *host.Remote) (string, error) {
+	secret := make([]byte, 24)
+	if _, err := rand.Read(secret); err != nil {
+		return "", err
+	}
+	password := hex.EncodeToString(secret)
+	script := `set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v pg_ctlcluster >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y -qq postgresql >/dev/null
+fi
+systemctl enable --now postgresql >/dev/null 2>&1
+for i in $(seq 1 30); do runuser -u postgres -- pg_isready -q && break; sleep 1; done
+cd /
+runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q <<'SQL'
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'eregion') THEN CREATE ROLE eregion LOGIN; END IF;
+END $$;
+ALTER ROLE eregion PASSWORD '` + password + `';
+SQL
+if ! runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'eregion'" | grep -q 1; then
+  runuser -u postgres -- createdb -O eregion eregion
+fi
+`
+	var stderr strings.Builder
+	if err := remote.Run(ctx, "bash -s", strings.NewReader(script), io.Discard, &stderr); err != nil {
+		return "", contract.NewFault(contract.Unavailable, "installing PostgreSQL failed", strings.TrimSpace(stderr.String()))
+	}
+	return "postgres://eregion:" + password + "@127.0.0.1:5432/eregion?sslmode=disable", nil
+}
+
+func (r *serverInit) showPlan(plan host.Plan) {
+	var b strings.Builder
+	for _, step := range plan.Steps {
+		mark := ui.Dim("○")
+		if step.Complete {
+			mark = ui.Dim(ui.SymOK)
+		}
+		fmt.Fprintf(&b, "%s %s\n", mark, step.Description)
+	}
+	for _, risk := range plan.AccessRisks {
+		b.WriteString(ui.Warn(risk) + "\n")
+	}
+	body := strings.TrimRight(b.String(), "\n")
+	if r.live == nil {
+		fmt.Fprintln(r.cmd.ErrOrStderr(), "plan:\n"+body)
+		return
+	}
+	r.live.Println(ui.PanelFit("Plan for "+plan.Node+" on "+plan.Platform.String(), body, r.live.Width()))
+}
+
+func (r *serverInit) confirm(server string) error {
+	if yes, _ := r.cmd.Flags().GetBool("yes"); yes {
+		return nil
+	}
+	if !r.interactive {
+		return contract.NewFault(contract.ConfirmationRequired, "server init needs confirmation", "Review the plan with --dry-run, then pass --yes.")
+	}
+	ok, err := ui.YesNoDefault("Set up "+server+" now?", "Installs packages, services and the eregion control plane.", true)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return contract.NewFault(contract.Cancelled, "server init was not confirmed", "Nothing was applied.")
+	}
+	return nil
+}
+
+// apply runs the remote apply and turns its step log into live tasks. An
+// access-changing apply is confirmed from a fresh connection right away:
+// reaching the host again is the proof the new access path works.
+func (r *serverInit) apply(ctx context.Context, session *remoteSession, plan host.Plan) (host.ApplyReport, error) {
+	steps := map[string]string{}
+	for _, step := range plan.Steps {
+		steps[step.ID] = step.Description
+	}
+	progress := &applyProgress{r: r, steps: steps}
+	report, err := remoteApply(ctx, session, plan.Confirmation.Token, progress)
+	var fault *contract.Fault
+	if err != nil && errors.As(err, &fault) && fault.Code == contract.ConfirmationRequired {
+		if id, _ := fault.Details["operation_id"].(string); id != "" {
+			progress.close(ui.EndOK)
+			task := r.start("confirm", "Confirming access change from a fresh connection")
+			raw, runErr := session.run(ctx, "confirm", []string{id}, io.Discard)
+			if runErr == nil {
+				_, runErr = decodeRemoteEnvelope[host.ConfirmReport](raw, "confirm")
+			}
+			if runErr != nil {
+				task.end(ui.EndFail, "")
+				return report, runErr
+			}
+			task.end(ui.EndOK, "")
+			return host.ApplyReport{Node: plan.Node, Role: plan.Role, OperationID: id}, nil
+		}
+	}
+	if err != nil {
+		progress.close(ui.EndFail)
+		return report, err
+	}
+	progress.close(ui.EndOK)
+	return report, nil
+}
+
+// applyProgress reads "bootstrap <step>: <message>" lines from the remote
+// stderr: a new step ends the previous one.
+type applyProgress struct {
+	r       *serverInit
+	steps   map[string]string
+	mu      sync.Mutex
+	buf     []byte
+	current string
+	task    *initTask
+}
+
+func (p *applyProgress) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.buf = append(p.buf, b...)
+	for {
+		i := strings.IndexByte(string(p.buf), '\n')
+		if i < 0 {
+			break
+		}
+		line := string(p.buf[:i])
+		p.buf = p.buf[i+1:]
+		p.line(line)
+	}
+	return len(b), nil
+}
+
+func (p *applyProgress) line(line string) {
+	rest, ok := strings.CutPrefix(line, "bootstrap ")
+	if !ok {
+		return
+	}
+	step, message, _ := strings.Cut(rest, ": ")
+	message = p.r.a.secrets.Redact(message)
+	if step != p.current {
+		if p.task != nil {
+			p.task.end(ui.EndOK, "")
+		}
+		title := p.steps[step]
+		if title == "" {
+			title = step
+		}
+		p.current, p.task = step, p.r.start("step-"+step, title)
+	}
+	if message != "" && message != step {
+		p.task.detail(message)
+	}
+}
+
+func (p *applyProgress) close(state string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.task != nil {
+		p.task.end(state, "")
+		p.task = nil
+	}
+}
+
+func (r *serverInit) saveContext(ctx context.Context, remote *host.Remote, cfg host.Config, apiURL, address, knownHosts string) error {
+	operatorOut := cfg.OperatorTokenOut
+	if operatorOut == "" {
+		operatorOut = host.DefaultLayout().StateDir + "/operator.handoff"
+	}
+	token, err := consumeRemoteToken(ctx, remote, operatorOut)
+	if err != nil {
+		return err
+	}
+	r.a.secrets.Add(token)
+	store, err := host.LoadContextStore("")
+	if err != nil {
+		return err
+	}
+	if _, err := store.Login(r.answers.Context, apiURL, token, host.KnownScopes()); err != nil {
+		return err
+	}
+	return store.SetSSH(r.answers.Context, &host.ContextSSH{Address: address, User: r.answers.User, Identity: r.answers.Identity, KnownHosts: knownHosts})
+}
+
+func (r *serverInit) finish(s serverInitSummary) {
+	if r.live == nil {
+		return
+	}
+	r.live.Println("")
+	r.live.Println(ui.Card("Server "+s.Node+" is ready", [][2]string{
+		{"server", s.Server},
+		{"platform", s.Platform},
+		{"database", map[string]string{"local": "PostgreSQL on the server", "external": "external PostgreSQL"}[s.Database]},
+		{"API", s.API},
+		{"context", s.Context + " (current)"},
+	}, []string{
+		ui.Dim("next:"),
+		"  " + ui.Code("eregion platform fleet"),
+		"  " + ui.Code("eregion ui"),
+	}))
+}
+
+// initTask is a live task in a terminal, or plain lines otherwise.
+type initTask struct {
+	r     *serverInit
+	t     *ui.Task
+	title string
+}
+
+func (r *serverInit) start(key, title string) *initTask {
+	if r.live != nil {
+		return &initTask{r: r, t: r.live.Start(key, title), title: title}
+	}
+	fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: "+title)
+	return &initTask{r: r, title: title}
+}
+
+func (t *initTask) detail(s string) {
+	if t.t != nil {
+		t.t.Detail(s)
+		return
+	}
+	fmt.Fprintln(t.r.cmd.ErrOrStderr(), "  "+s)
+}
+
+func (t *initTask) end(state, detail string) {
+	if t.t != nil {
+		t.t.End(state, detail)
+		return
+	}
+	if detail != "" {
+		fmt.Fprintf(t.r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", t.title, state, detail)
+	}
+}
+
+func (r *serverInit) note(s string) {
+	if r.live != nil {
+		r.live.Println(ui.Note(s))
+		return
+	}
+	fmt.Fprintln(r.cmd.ErrOrStderr(), "server init: "+s)
+}
+
+func dryRun(cmd *cobra.Command) bool {
+	v, _ := cmd.Flags().GetBool("dry-run")
+	return v
+}

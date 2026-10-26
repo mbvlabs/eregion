@@ -25,12 +25,35 @@ var contextNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 // Context is one operator context. The token is stored only in the owner-only
 // context file and is never included in Show/List output.
 type Context struct {
-	Name      string    `json:"name"`
-	APIURL    string    `json:"api_url"`
-	Token     string    `json:"token"`
-	Scopes    []string  `json:"scopes,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Name   string   `json:"name"`
+	APIURL string   `json:"api_url"`
+	Token  string   `json:"token"`
+	Scopes []string `json:"scopes,omitempty"`
+	// SSH, when set, reaches APIURL through a pinned SSH tunnel to the host
+	// that server init bootstrapped; the API itself stays on loopback.
+	SSH       *ContextSSH `json:"ssh,omitempty"`
+	CreatedAt time.Time   `json:"created_at"`
+	UpdatedAt time.Time   `json:"updated_at"`
+}
+
+// ContextSSH is the SSH route of a context. Identity is empty when ssh-agent
+// or the default ~/.ssh keys authenticate.
+type ContextSSH struct {
+	Address    string `json:"address"`
+	User       string `json:"user"`
+	Identity   string `json:"identity,omitempty"`
+	KnownHosts string `json:"known_hosts"`
+}
+
+// SetSSH records the SSH route of an existing context and saves the store.
+func (s *ContextStore) SetSSH(name string, route *ContextSSH) error {
+	for index := range s.Contexts {
+		if s.Contexts[index].Name == name {
+			s.Contexts[index].SSH = route
+			return s.Save()
+		}
+	}
+	return contract.NewFault(contract.NotFound, "context not found", "List contexts with eregion context list.")
 }
 
 // ContextView is safe to serialize.

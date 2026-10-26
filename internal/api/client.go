@@ -164,3 +164,29 @@ func (c *Client) request(ctx context.Context, method, path string, body any, key
 	}
 	return envelope.Data, nil
 }
+
+// UseDialer sends every request through dial, for example an SSH tunnel to a
+// control plane whose API listens only on its own loopback.
+func (c *Client) UseDialer(dial func(ctx context.Context, network, address string) (net.Conn, error)) {
+	c.http.Transport = &http.Transport{DialContext: dial, ForceAttemptHTTP2: false}
+}
+
+// Ready calls the authenticated readiness endpoint and reports whether the
+// control plane answered 200.
+func (c *Client) Ready(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/readyz", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return contract.NewFault(contract.Unavailable, "the control plane did not answer", err.Error())
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	if resp.StatusCode != http.StatusOK {
+		return contract.NewFault(contract.Unavailable, "the control plane is not ready", "readyz answered "+strconv.Itoa(resp.StatusCode)+".")
+	}
+	return nil
+}
