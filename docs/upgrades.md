@@ -100,13 +100,12 @@ fails the run.
 
 Same setup as vaire. `internal/buildinfo.ReleaseBaseURL` is
 `https://eregion.mbvlabs.com`; both publish workflows refuse to run unless the
-`RELEASE_BASE_URL` repository variable equals it exactly. Configure:
+`RELEASE_BASE_URL` variable equals it exactly. The GitHub environments `edge`
+and `stable` each carry:
 
-- repository variable `RELEASE_BASE_URL` = `https://eregion.mbvlabs.com`;
-- repository variable `RELEASE_BUCKET` = the R2 bucket served at that origin;
-- environment `edge` and environment `stable` with secrets
-  `R2_ENDPOINT`, `R2_ACCESS_KEY_ID` and
-  `R2_SECRET_ACCESS_KEY`.
+- variables `RELEASE_BASE_URL` = `https://eregion.mbvlabs.com` and
+  `RELEASE_BUCKET` = `eregion`;
+- secrets `R2_ENDPOINT`, `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`.
 
 No endpoint, account ID or bucket credential is recorded in this
 repository. The stable environment must exist before the first tag. Tags and
