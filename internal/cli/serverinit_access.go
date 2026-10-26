@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/access"
@@ -140,11 +141,27 @@ func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts
 	}
 }
 
-// wireGuardDial is the dial function for a context's WireGuard route.
+// wireGuardDialers holds one tunnel per operator key for the whole process.
+// The node has one peer per key: a second tunnel with the same key steals the
+// peer, and the first one's keepalives steal it back, which drops the SSH
+// connections running over either.
+var (
+	wireGuardMu      sync.Mutex
+	wireGuardDialers = map[string]*transport.WireGuardDialer{}
+)
+
+// wireGuardDial is the dial function for a context's WireGuard route. Every
+// route with the same key and node shares one tunnel.
 func wireGuardDial(wg *host.ContextWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
 	key, err := transport.ReadWireGuardKey(wg.PrivateKeyFile)
 	if err != nil {
 		return nil, err
+	}
+	id := key.PublicKey().String() + "|" + wg.NodePublicKey + "|" + wg.Endpoint + "|" + wg.Address + "|" + wg.NodeAddress
+	wireGuardMu.Lock()
+	defer wireGuardMu.Unlock()
+	if dialer, ok := wireGuardDialers[id]; ok {
+		return dialer.DialContext, nil
 	}
 	peer, err := transport.ParseWireGuardPublicKey(wg.NodePublicKey)
 	if err != nil {
@@ -162,6 +179,14 @@ func wireGuardDial(wg *host.ContextWireGuard) (func(context.Context, string, str
 	if err != nil {
 		return nil, err
 	}
+	// A different tunnel for the same key (a rebuilt node) replaces the old one.
+	for other, d := range wireGuardDialers {
+		if strings.HasPrefix(other, key.PublicKey().String()+"|") {
+			_ = d.Close()
+			delete(wireGuardDialers, other)
+		}
+	}
+	wireGuardDialers[id] = dialer
 	return dialer.DialContext, nil
 }
 
@@ -218,7 +243,7 @@ func (r *serverInit) secureAccess(ctx context.Context, root *host.Remote, id *op
 	armed := time.Now()
 	if err := runWithRetry(ctx, route, "sudo -n /usr/local/bin/eregion node-agent access lockdown", 30*time.Second); err != nil {
 		task.end(ui.EndFail, "")
-		return nil, contract.NewFault(contract.Unavailable, "the lockdown could not be armed", err.Error())
+		return nil, contract.NewFault(contract.Unavailable, "the lockdown could not be armed", err.Error()+" — if it was armed, the server reopens public SSH within "+strconv.Itoa(access.LockdownSeconds)+"s")
 	}
 	// A fresh connection proves the new path works before it is kept.
 	if err := runWithRetry(ctx, route, "sudo -n /usr/local/bin/eregion node-agent access confirm", 60*time.Second); err != nil {
