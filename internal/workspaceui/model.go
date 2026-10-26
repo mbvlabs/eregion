@@ -646,10 +646,6 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 	case "r":
 		command := m.refresh()
 		return m, command
-	case "a":
-		m.openForm("app")
-	case "e":
-		m.openForm("env")
 	case "i":
 		m.openForm("release")
 	case "d":
@@ -703,10 +699,6 @@ func (m Model) handleDetailKey(pressed string) (tea.Model, tea.Cmd) {
 	case "r":
 		command := m.refresh()
 		return m, command
-	case "a":
-		m.openForm("app")
-	case "e":
-		m.openForm("env")
 	case "i":
 		m.openForm("release")
 	case "d":
@@ -883,7 +875,7 @@ func defaultKeys() keyMap {
 		Discovery: key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "commands")),
 		Details:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "details")),
 		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Actions:   key.NewBinding(key.WithKeys("a", "e", "i", "d", "o"), key.WithHelp("a e i d o", "guided actions")),
+		Actions:   key.NewBinding(key.WithKeys("i", "d", "o"), key.WithHelp("i d o", "guided actions")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Detach:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "detach")),
 		Form:      key.NewBinding(key.WithKeys("enter", "tab", "esc"), key.WithHelp("enter/tab", "field")),

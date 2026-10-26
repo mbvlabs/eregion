@@ -26,15 +26,6 @@ type CommandAction struct {
 func CommandActions() []CommandAction {
 	return []CommandAction{
 		{
-			ID: "app.create", Name: "Create application", Keys: "a", Form: "app",
-			CLI: "eregion platform apps create <app> --idempotency-key <key> --json", CommandPath: "eregion platform apps create",
-		},
-		{
-			ID: "environment.create", Name: "Create environment", Keys: "e", Form: "env",
-			CLI:         "eregion platform environments create <app> <environment> --node <node> --container-port <port> --host-port <port> --health-path <path> --idempotency-key <key> --json",
-			CommandPath: "eregion platform environments create",
-		},
-		{
 			ID: "release.create", Name: "Create image release", Keys: "i", Form: "release",
 			CLI:         "eregion platform releases create <app> <environment> --image <image> --idempotency-key <key> --json",
 			CommandPath: "eregion platform releases create",
@@ -133,10 +124,6 @@ func (m *Model) openForm(id string) {
 	}
 	var form *formState
 	switch id {
-	case "app":
-		form = m.newAppForm()
-	case "env":
-		form = m.newEnvironmentForm()
 	case "release":
 		form = m.newReleaseForm()
 	case "deploy":

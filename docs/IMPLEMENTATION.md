@@ -59,7 +59,7 @@ Use the **built binary**, not a stale `bin/eregion`, to inspect exact arguments:
 ```sh
 just build
 bin/eregion commands --json
-bin/eregion help platform environments create --json
+bin/eregion help app create --json
 ```
 
 | Current commands | Meaning/limit |
@@ -69,23 +69,29 @@ bin/eregion help platform environments create --json
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). |
 | `context list/show/use/remove`, `context credential add` | Saved contexts, target-confirmed removal with its key files, and local server-auth-file editing. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. |
-| `platform apps create/list/status` | App record only; no guided full setup, update or delete. |
-| `platform environments create/list/status` | Separate env record with node, port, bind, health and `--env`; no update/delete or secret-reference convenience flags. |
-| `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. |
-| `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. |
+| `app create/list/status` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, then adds the domain as a separate `platform.domain.add` action. List/status read inventory. No delete yet. |
+| `env create/update/list/status` | `create` accepts an environment with its first revision; `update` merges source, placement, runtime and process changes into a new immutable revision. List/status include revision, processes and deployability. No delete yet. |
+| `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. No deploy is queued. |
+| `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
+| `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. Transitional until the deploy row replaces it. |
+| `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. Transitional until the deploy row replaces it. |
 | `domain add/remove <app> <environment> <hostname>`, `domain list` | Main-node desired host bindings + Caddy reload. Not observed TLS/route status. |
-| `secret set/list/archive/export` | Metadata/write-only storage and explicit file export; no plaintext `get`. |
+| `secret set/list/archive/export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. |
 | `platform inventory`, `logs search/tail`, `ui` | Read-only inventory, telemetry reads and the full-screen workspace. |
 | `operations get/events/follow/cancel` | Durable operation observation and explicit cancellation. |
 | `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
-The target tree is MASTER section 5. Its application commands (`app create`,
-`env update`, `deploy`, …) do not exist yet; renaming is not a substitute for
-implementing the flow. `resources …` and the backup code are deleted (MASTER
-D19), the Docker Compose telemetry stack install is deleted (D5), and `dns …`,
-`access …`, `platform nodes …`, `platform fleet`, `platform submit`, `metrics …`
-and `operations test` are no longer registered (D6, D22, D26). Their internal
+`app create`, `env create`, `process`, `config` and `domain` are the current
+application surface. `platform releases …` and `platform deployments …` are the
+remaining transitional names. The rest of MASTER section 5 (`deploy`, `rollback`,
+`build`, `release`, `app/env delete`, `logs`, `restart`, tokens)
+does not exist yet; renaming is not a substitute for implementing the flow.
+`platform apps …` and `platform environments …` are deleted (pre-v1, no
+aliases). `resources …` and the backup code are deleted (MASTER D19), the Docker
+Compose telemetry stack install is deleted (D5), and `dns …`, `access …`,
+`platform nodes …`, `platform fleet`, `platform submit`, `metrics …` and
+`operations test` are no longer registered (D6, D22, D26). Their internal
 packages remain for the after-v1 phases where the work list says they return.
 
 ## Release and local upgrade
@@ -382,6 +388,13 @@ the current revision plus artifact/domain observations, with DNS reported as
 `unknown` until the domain row observes it. Inventory collections `revisions`
 and `deployability` expose it, and each environment record carries its current
 revision, processes and deployability.
+
+The CLI `app create` and `env create` preview the canonical action on the node,
+write the read credential and secret values through `vault.set`, then submit.
+Only names enter the revision; a domain is a separate `platform.domain.add`
+submission. `env update` reads the current revision and sends a merged patch.
+`secret set` writes the value and submits `platform.environment.secret.attach`
+only when the current revision does not already name it.
 
 Deploy-time secret resolution prefers the current revision's secret names,
 resolving each name's active latest revision and freezing the exact non-secret

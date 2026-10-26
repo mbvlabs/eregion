@@ -149,8 +149,9 @@ func TestPlatformCommandMetadata(t *testing.T) {
 	}
 	for _, path := range [][]string{
 		{"platform", "inventory"},
-		{"platform", "apps", "create"}, {"platform", "apps", "list"}, {"platform", "apps", "status"},
-		{"platform", "environments", "create"}, {"platform", "deployments", "retry"}, {"platform", "deployments", "rollback"},
+		{"platform", "releases", "create"}, {"platform", "releases", "list"},
+		{"platform", "deployments", "plan"}, {"platform", "deployments", "deploy"},
+		{"platform", "deployments", "list"}, {"platform", "deployments", "retry"}, {"platform", "deployments", "rollback"},
 	} {
 		cmd, remaining, err := a.root.Find(path)
 		if err != nil || len(remaining) != 0 || cmd.RunE == nil {

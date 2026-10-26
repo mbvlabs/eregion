@@ -1012,7 +1012,7 @@ func (s *Service) inventoryNodes(ctx context.Context, query platform.InventoryQu
 
 func (s *Service) inventoryApps(ctx context.Context, query platform.InventoryQuery) ([]platform.App, error) {
 	items := []platform.App{}
-	rows, err := s.pool.Query(ctx, `SELECT id,name,created_at,updated_at FROM eregion_platform_apps ORDER BY name LIMIT $1`, query.Limit)
+	rows, err := s.pool.Query(ctx, `SELECT id,name,created_at,updated_at FROM eregion_platform_apps WHERE ($2='' OR name=$2) ORDER BY name LIMIT $1`, query.Limit, query.App)
 	if err != nil {
 		return nil, unavailable()
 	}

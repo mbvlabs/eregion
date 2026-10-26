@@ -5,9 +5,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -59,6 +61,7 @@ func (a *app) secretSpecs() []spec {
 				cmd.Flags().String("name", "", "Secret name (environment-variable form)")
 				cmd.Flags().String("file", "", "Protected 0600 file containing the plaintext value")
 				cmd.Flags().Uint64("expected-revision", 0, "CAS guard: 0 creates, otherwise the current latest revision")
+				cmd.Flags().String("idempotency-key", "", "Stable key for attaching the name to the environment; one is generated when empty")
 			}, run: a.setSecret},
 			{use: "list", meta: secretMeta("List secret metadata for one environment", "eregion secret list --app api --environment production --json"), flags: func(cmd *cobra.Command) {
 				cmd.Flags().String("app", "", "Application name")
@@ -93,6 +96,9 @@ func secretNamespace(cmd *cobra.Command) (vault.Namespace, error) {
 }
 
 func (a *app) setSecret(cmd *cobra.Command, _ []string) (result, error) {
+	if err := validateIdempotencyFlag(cmd); err != nil {
+		return result{}, err
+	}
 	namespace, err := secretNamespace(cmd)
 	if err != nil {
 		return result{}, err
@@ -108,6 +114,11 @@ func (a *app) setSecret(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	defer clearSecretBytes(value)
 	a.secrets.Add(string(value))
+	env, _, err := a.readEnvironment(cmd, namespace.App, namespace.Environment)
+	if err != nil {
+		return result{}, err
+	}
+	attached := env.Revision != nil && slices.Contains(env.Revision.SecretNames, namespace.Name)
 	client, err := a.client(cmd)
 	if err != nil {
 		return result{}, err
@@ -116,10 +127,29 @@ func (a *app) setSecret(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	return result{
-		data:  metadata,
-		plain: formatSecretMetadata(metadata) + "\n",
-	}, nil
+	data := map[string]any{"secret": metadata, "attached": true, "revision_updated": false}
+	plain := formatSecretMetadata(metadata) + "\n"
+	if attached {
+		plain += namespace.Name + " is already in the environment revision.\n"
+		return result{data: data, plain: plain}, nil
+	}
+	target, err := platform.NewEnvironmentTarget(namespace.App, namespace.Environment)
+	if err != nil {
+		return result{}, err
+	}
+	op, err := a.submitAccepted(cmd, platform.KindEnvironmentSecretAttach, target.String(), platform.EnvironmentSecretAttachInput{
+		App: namespace.App, Environment: namespace.Environment, Name: namespace.Name,
+	})
+	if err != nil {
+		fault := contract.Classify(err)
+		return result{}, contract.NewFault(fault.Code,
+			"the secret value was stored, but attaching "+namespace.Name+" failed: "+fault.Message,
+			"Check secret metadata, then re-run eregion secret set with the current --expected-revision.")
+	}
+	data["revision_updated"] = true
+	data["operation_id"] = op.ID
+	plain += "Attached " + namespace.Name + " to " + namespace.App + "/" + namespace.Environment + " in a new revision.\noperation: " + string(op.ID) + "\n"
+	return result{data: data, plain: plain}, nil
 }
 
 func (a *app) listSecrets(cmd *cobra.Command, _ []string) (result, error) {

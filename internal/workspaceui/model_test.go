@@ -240,14 +240,14 @@ func TestCommandPaletteListsExactCLIEquivalents(t *testing.T) {
 	m.width, m.height = 120, 60
 	m = step(t, m, press(':'))
 	view := render(m)
-	for _, want := range []string{"COMMAND DISCOVERY", "Create application", "Deploy release", "eregion platform apps create", "eregion platform deployments deploy", "exact noninteractive CLI equivalent"} {
+	for _, want := range []string{"COMMAND DISCOVERY", "Create image release", "Deploy release", "eregion platform releases create", "eregion platform deployments deploy", "exact noninteractive CLI equivalent"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("missing %q in palette:\n%s", want, view)
 		}
 	}
 	m = typeText(m, "deploy")
 	view = render(m)
-	if !strings.Contains(view, "Deploy release") || strings.Contains(view, "Create application") {
+	if !strings.Contains(view, "Deploy release") || strings.Contains(view, "Create image release") {
 		t.Fatalf("palette filter did not narrow actions:\n%s", view)
 	}
 	m = step(t, m, special(tea.KeyEsc))
@@ -420,7 +420,7 @@ func TestFilterSearchAndDetails(t *testing.T) {
 	}
 }
 
-func TestAppFormPreviewSubmitAndStableKey(t *testing.T) {
+func TestReleaseFormPreviewSubmitAndStableKey(t *testing.T) {
 	m, api, _ := testArgs(t)
 	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
 		return json.RawMessage(appsJSON), nil
@@ -428,22 +428,27 @@ func TestAppFormPreviewSubmitAndStableKey(t *testing.T) {
 	next, command := stepCmd(t, m, press('2'))
 	m = applyCommand(t, next, command)
 	m = load(t, m, appsJSON)
-	m = step(t, m, press('a'))
-	m = typeText(m, "api")
-	next, command = stepCmd(t, m, special(tea.KeyEnter))
-	m = next
+	m = step(t, m, press('i'))
+	m = step(t, m, special(tea.KeyEnter)) // app (prefilled) -> environment
+	m = typeText(m, "production")
+	m = step(t, m, special(tea.KeyEnter)) // environment -> image
+	m = typeText(m, "ghcr.io/acme/api:2026-10-20")
 	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, key string, dryRun bool) (json.RawMessage, error) {
+		if !dryRun || kind != "platform.release.create" || target != "env/api/production" {
+			t.Fatalf("wrong release preview: %s %s dry=%t", kind, target, dryRun)
+		}
+		if !strings.Contains(string(input), `"type":"image"`) {
+			t.Fatalf("release form advertised another source: %s", input)
+		}
 		return json.RawMessage(previewJSON(kind, target)), nil
 	}
-	m = applyCommand(t, m, command)
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
 	if len(api.submits) != 1 || !api.submits[0].dryRun || api.submits[0].key != "" {
 		t.Fatalf("unexpected dry-run: %+v", api.submits)
 	}
-	if api.submits[0].kind != "platform.app.create" || api.submits[0].target != "platform" {
-		t.Fatalf("wrong action: %+v", api.submits[0])
-	}
 	view := render(m)
-	for _, want := range []string{"DRY-RUN PREVIEW", "nothing has been submitted", "eregion platform apps create", "ui:test-key", "s submit"} {
+	for _, want := range []string{"DRY-RUN PREVIEW", "nothing has been submitted", "eregion platform releases create", "ui:test-key", "s submit"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("missing %q in preview:\n%s", want, view)
 		}
@@ -463,7 +468,7 @@ func TestAppFormPreviewSubmitAndStableKey(t *testing.T) {
 	}
 
 	api.submit = func(_ context.Context, kind, target string, _ json.RawMessage, _ string, _ bool) (json.RawMessage, error) {
-		return json.RawMessage(operationJSON("queued")), nil
+		return operationFor(kind, target), nil
 	}
 	next, command = stepCmd(t, m, press('s'))
 	m = applyCommand(t, next, command)
@@ -478,70 +483,6 @@ func TestAppFormPreviewSubmitAndStableKey(t *testing.T) {
 	}
 	if len(m.summary.Operations) != 1 || m.summary.Operations[0] != testOperationID {
 		t.Fatalf("summary did not record the operation: %+v", m.summary)
-	}
-}
-
-func TestGuidedEnvironmentAndImageReleaseForms(t *testing.T) {
-	m, api, _ := testArgs(t)
-	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
-		return json.RawMessage(appsJSON), nil
-	}
-	next, command := stepCmd(t, m, press('2'))
-	m = applyCommand(t, next, command)
-	m = load(t, m, appsJSON)
-
-	// The selected app is prefilled, and every required field is named before
-	// the dry run starts.
-	m = step(t, m, press('e'))
-	m = step(t, m, special(tea.KeyEnter)) // app (prefilled) -> name
-	m = typeText(m, "production")
-	m = step(t, m, special(tea.KeyEnter)) // name -> node
-	m = typeText(m, "main")
-	m = step(t, m, special(tea.KeyEnter)) // node -> container port
-	m = step(t, m, special(tea.KeyEnter)) // container port
-	m = step(t, m, special(tea.KeyEnter)) // host port
-	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
-		if !dryRun {
-			t.Fatal("env form submitted without a preview")
-		}
-		if kind != "platform.environment.create" || target != "app/api" {
-			t.Fatalf("wrong environment action %s %s", kind, target)
-		}
-		var decoded map[string]any
-		if err := json.Unmarshal(input, &decoded); err != nil {
-			t.Fatal(err)
-		}
-		if decoded["name"] != "production" || decoded["node"] != "main" {
-			t.Fatalf("wrong environment input: %s", input)
-		}
-		return json.RawMessage(previewJSON(kind, target)), nil
-	}
-	next, command = stepCmd(t, m, special(tea.KeyEnter))
-	m = applyCommand(t, next, command)
-	if !strings.Contains(render(m), "platform.environment.create") {
-		t.Fatalf("environment preview missing:\n%s", render(m))
-	}
-	m = step(t, m, special(tea.KeyEsc))
-
-	// The image release form only advertises an image source.
-	m = step(t, m, press('i'))
-	m = step(t, m, special(tea.KeyEnter)) // app (prefilled) -> environment
-	m = typeText(m, "production")
-	m = step(t, m, special(tea.KeyEnter)) // environment -> image
-	m = typeText(m, "ghcr.io/acme/api:2026-10-20")
-	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
-		if !dryRun || kind != "platform.release.create" || target != "env/api/production" {
-			t.Fatalf("wrong release action: %s %s dry=%t", kind, target, dryRun)
-		}
-		if !strings.Contains(string(input), `"type":"image"`) {
-			t.Fatalf("release form advertised another source: %s", input)
-		}
-		return json.RawMessage(previewJSON(kind, target)), nil
-	}
-	next, command = stepCmd(t, m, special(tea.KeyEnter))
-	m = applyCommand(t, next, command)
-	if !strings.Contains(render(m), "platform.release.create") {
-		t.Fatalf("release preview missing:\n%s", render(m))
 	}
 }
 
@@ -658,15 +599,18 @@ func TestOperationFollowAndDetachDoesNotCancel(t *testing.T) {
 	next, command := stepCmd(t, m, press('2'))
 	m = applyCommand(t, next, command)
 	m = load(t, m, appsJSON)
-	m = step(t, m, press('a'))
-	m = typeText(m, "api")
+	m = step(t, m, press('i'))
+	m = step(t, m, special(tea.KeyEnter)) // app (prefilled) -> environment
+	m = typeText(m, "production")
+	m = step(t, m, special(tea.KeyEnter)) // environment -> image
+	m = typeText(m, "ghcr.io/acme/api:2026-10-20")
 	next, command = stepCmd(t, m, special(tea.KeyEnter))
 	m = next
 	api.submit = func(_ context.Context, kind, target string, _ json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
 		if dryRun {
 			return json.RawMessage(previewJSON(kind, target)), nil
 		}
-		return json.RawMessage(operationJSON("queued")), nil
+		return operationFor(kind, target), nil
 	}
 	m = applyCommand(t, m, command)
 	next, command = stepCmd(t, m, press('s'))
@@ -729,10 +673,6 @@ func TestNoninteractiveEquivalentUsesTheDirectPlatformCommand(t *testing.T) {
 		action Action
 		want   string
 	}{
-		{
-			action: Action{Kind: platform.KindAppCreate, Input: json.RawMessage(`{"name":"api"}`), IdempotencyKey: "ui:key"},
-			want:   "eregion platform apps create api --idempotency-key ui:key --json",
-		},
 		{
 			action: Action{Kind: platform.KindDeploy, Input: json.RawMessage(`{"app":"api","environment":"production","release_id":"` + testReleaseID + `"}`), IdempotencyKey: "ui:key"},
 			want:   "eregion platform deployments deploy api production --release-id " + testReleaseID + " --idempotency-key ui:key --json",

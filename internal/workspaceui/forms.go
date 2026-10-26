@@ -3,7 +3,6 @@ package workspaceui
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"strings"
 	"time"
 
@@ -76,28 +75,6 @@ func (m Model) formContext() (app, environment, node string) {
 		app, environment, node = item.Data["app"], item.Data["environment"], item.Data["node"]
 	}
 	return app, environment, node
-}
-
-func (m Model) newAppForm() *formState {
-	form := newForm(platform.KindAppCreate, "Create application", "platform", "", m.opts.Key(), []*formField{
-		field("name", "", "api", true),
-	})
-	form.input.Focus()
-	return form
-}
-
-func (m Model) newEnvironmentForm() *formState {
-	app, _, node := m.formContext()
-	form := newForm(platform.KindEnvironmentCreate, "Create environment", "", "", m.opts.Key(), []*formField{
-		field("app", app, "api", true),
-		field("name", "", "production", true),
-		field("node", node, "main", true),
-		field("container port", "8080", "8080", true),
-		field("host port", "0", "0 allocates a stable port", true),
-		field("health path", "/", "/healthz", false),
-	})
-	form.input.Focus()
-	return form
 }
 
 func (m Model) newReleaseForm() *formState {
@@ -354,54 +331,6 @@ func (form *formState) action() (Action, int, error) {
 		return -1
 	}
 	switch form.kind {
-	case platform.KindAppCreate:
-		name := value("name")
-		if err := requiredValue("name", name, fieldIndex("name")); err != nil {
-			return Action{}, fieldIndex("name"), err
-		}
-		if err := platform.ValidateName(name); err != nil {
-			return Action{}, fieldIndex("name"), err
-		}
-		raw, _ := json.Marshal(platform.AppCreateInput{Name: name})
-		return Action{Kind: form.kind, Target: "platform", Input: raw, IdempotencyKey: form.key, Title: form.title}, -1, nil
-	case platform.KindEnvironmentCreate:
-		app, name, node := value("app"), value("name"), value("node")
-		if app == "" || name == "" || node == "" {
-			for _, label := range []string{"app", "name", "node"} {
-				if value(label) == "" {
-					return Action{}, fieldIndex(label), requiredValue(label, "", fieldIndex(label))
-				}
-			}
-		}
-		if err := platform.ValidateName(app); err != nil {
-			return Action{}, fieldIndex("app"), err
-		}
-		if err := platform.ValidateName(name); err != nil {
-			return Action{}, fieldIndex("name"), err
-		}
-		if err := platform.ValidateName(node); err != nil {
-			return Action{}, fieldIndex("node"), err
-		}
-		containerPort, err := portValue(value("container port"), 1, fieldIndex("container port"))
-		if err != nil {
-			return Action{}, fieldIndex("container port"), err
-		}
-		hostPort, err := portValue(value("host port"), 0, fieldIndex("host port"))
-		if err != nil {
-			return Action{}, fieldIndex("host port"), err
-		}
-		healthPath := value("health path")
-		if healthPath == "" {
-			healthPath = "/"
-		}
-		if !strings.HasPrefix(healthPath, "/") || strings.ContainsAny(healthPath, " \t\r\n?#") {
-			return Action{}, fieldIndex("health path"), contract.NewFault(contract.ValidationFailed, "invalid health path", "Use an absolute path without whitespace, query, or fragment.")
-		}
-		raw, _ := json.Marshal(platform.EnvironmentCreateInput{
-			App: app, Name: name, Node: node, ContainerPort: containerPort, HostPort: hostPort,
-			Health: platform.HealthInput{Type: "http", Path: healthPath, TimeoutSeconds: platform.DefaultHealthTimeout},
-		})
-		return Action{Kind: form.kind, Target: "app/" + app, Input: raw, IdempotencyKey: form.key, Title: form.title}, -1, nil
 	case platform.KindReleaseCreate:
 		app, environment, image := value("app"), value("environment"), value("image")
 		if app == "" || environment == "" || image == "" {
@@ -484,15 +413,4 @@ func requiredValue(label, value string, _ int) error {
 		return contract.NewFault(contract.InputRequired, label+" is required", "Type a value for "+label+".")
 	}
 	return nil
-}
-
-func portValue(text string, minimum int, _ int) (int, error) {
-	value, err := strconv.Atoi(strings.TrimSpace(text))
-	if err != nil || value < minimum || value > 65535 {
-		if minimum == 0 {
-			return 0, contract.NewFault(contract.ValidationFailed, "invalid host port", "Use 0 to allocate, or 1–65535.")
-		}
-		return 0, contract.NewFault(contract.ValidationFailed, "invalid container port", "Use 1–65535.")
-	}
-	return value, nil
 }

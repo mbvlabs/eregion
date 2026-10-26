@@ -100,124 +100,8 @@ func (a *app) platformSpecs() []spec {
 					},
 					run: a.platformInventory,
 				},
-				a.platformAppsSpec(),
-				a.platformEnvironmentsSpec(),
 				a.platformReleasesSpec(),
 				a.platformDeploymentsSpec(),
-			},
-		},
-	}
-}
-
-func (a *app) platformAppsSpec() spec {
-	return spec{
-		use:  "apps",
-		meta: platformMeta("Inspect and create applications", "eregion platform apps list --json"),
-		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
-		children: []spec{
-			{
-				use:  "create <app>",
-				meta: platformMutationMeta("Create an application record", "eregion platform apps create api --idempotency-key ci:app-api --json"),
-				args: platformOneName("app"),
-				flags: func(cmd *cobra.Command) {
-					addSubmissionFlags(cmd)
-				},
-				run: func(cmd *cobra.Command, args []string) (result, error) {
-					return a.submitPlatform(cmd, platform.KindAppCreate, platform.PlatformTarget().String(), platform.AppCreateInput{Name: args[0]})
-				},
-			},
-			{
-				use:  "list",
-				meta: platformMeta("List application records", "eregion platform apps list --json"),
-				args: platformReadArgs,
-				flags: func(cmd *cobra.Command) {
-					addInventoryFlags(cmd)
-				},
-				run: func(cmd *cobra.Command, _ []string) (result, error) {
-					return a.platformInventoryCollection(cmd, "apps")
-				},
-			},
-			{
-				use:  "status <app>",
-				meta: platformMeta("Show one application and its inventory environments", "eregion platform apps status api --json"),
-				args: platformOneName("app"),
-				run: func(cmd *cobra.Command, args []string) (result, error) {
-					return a.platformAppStatus(cmd, args[0])
-				},
-			},
-		},
-	}
-}
-
-func (a *app) platformEnvironmentsSpec() spec {
-	return spec{
-		use:  "environments",
-		meta: platformMeta("Inspect and create application environments", "eregion platform environments list --app api --json"),
-		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
-		children: []spec{
-			{
-				use:  "create <app> <environment>",
-				meta: platformMutationMeta("Create an environment with explicit node placement and non-secret configuration", "eregion platform environments create api production --node main --container-port 8080 --env APP_ENV=production --idempotency-key ci:env-api-production --json"),
-				args: platformTwoNames("app", "environment"),
-				flags: func(cmd *cobra.Command) {
-					addSubmissionFlags(cmd)
-					cmd.Flags().String("node", "", "Node that must have the application role and docker capability")
-					cmd.Flags().String("build-node", "", "Optional builder node (builder + buildpacks) for releases; defaults to --node")
-					cmd.Flags().Int("container-port", platform.DefaultContainerPort, "Container port")
-					cmd.Flags().Int("host-port", 0, "Stable host port; 0 allocates one from 20000–29999")
-					cmd.Flags().String("bind", platform.DefaultBind, "Literal bind address")
-					cmd.Flags().String("health-type", "http", "Health check type: http or tcp")
-					cmd.Flags().String("health-path", platform.DefaultHealthPath, "Loopback HTTP health path")
-					cmd.Flags().Int("health-timeout", platform.DefaultHealthTimeout, "Health timeout in seconds (1–300)")
-					cmd.Flags().StringArray("env", nil, "Non-secret configuration KEY=VALUE (repeatable)")
-				},
-				run: func(cmd *cobra.Command, args []string) (result, error) {
-					node, _ := cmd.Flags().GetString("node")
-					if node == "" {
-						return result{}, contract.NewFault(contract.InputRequired, "--node is required", "Choose a registered node with the application role and docker capability.")
-					}
-					buildNode, _ := cmd.Flags().GetString("build-node")
-					containerPort, _ := cmd.Flags().GetInt("container-port")
-					hostPort, _ := cmd.Flags().GetInt("host-port")
-					bind, _ := cmd.Flags().GetString("bind")
-					healthType, _ := cmd.Flags().GetString("health-type")
-					healthPath, _ := cmd.Flags().GetString("health-path")
-					healthTimeout, _ := cmd.Flags().GetInt("health-timeout")
-					envValues, _ := cmd.Flags().GetStringArray("env")
-					env, err := parsePlatformEnv(envValues)
-					if err != nil {
-						return result{}, err
-					}
-					target, err := platform.NewAppTarget(args[0])
-					if err != nil {
-						return result{}, err
-					}
-					return a.submitPlatform(cmd, platform.KindEnvironmentCreate, target.String(), platform.EnvironmentCreateInput{
-						App: args[0], Name: args[1], Node: node, BuildNode: buildNode, ContainerPort: containerPort,
-						HostPort: hostPort, Bind: bind,
-						Health: platform.HealthInput{Type: healthType, Path: healthPath, TimeoutSeconds: healthTimeout},
-						Env:    env,
-					})
-				},
-			},
-			{
-				use:  "list",
-				meta: platformMeta("List environments and their serving/health observations", "eregion platform environments list --app api --json"),
-				args: platformReadArgs,
-				flags: func(cmd *cobra.Command) {
-					addInventoryFlags(cmd)
-				},
-				run: func(cmd *cobra.Command, _ []string) (result, error) {
-					return a.platformInventoryCollection(cmd, "environments")
-				},
-			},
-			{
-				use:  "status <app> <environment>",
-				meta: platformMeta("Show one environment inventory observation", "eregion platform environments status api production --json"),
-				args: platformTwoNames("app", "environment"),
-				run: func(cmd *cobra.Command, args []string) (result, error) {
-					return a.platformEnvironmentStatus(cmd, args[0], args[1])
-				},
 			},
 		},
 	}
@@ -386,52 +270,6 @@ func (a *app) platformInventoryCollection(cmd *cobra.Command, collection string)
 		return result{}, err
 	}
 	return platformInventoryResult(collection, raw), nil
-}
-
-func (a *app) platformInventoryItem(cmd *cobra.Command, collection, filter, name string) (result, error) {
-	raw, err := a.platformReadInventoryWith(cmd, collection, url.Values{filter: {name}})
-	if err != nil {
-		return result{}, err
-	}
-	item, err := platformSelectItem(raw, name)
-	if err != nil {
-		return result{}, err
-	}
-	return platformItemResult(collection, name, item, raw), nil
-}
-
-func (a *app) platformAppStatus(cmd *cobra.Command, app string) (result, error) {
-	apps, err := a.platformReadInventoryWith(cmd, "apps", url.Values{"app": {app}})
-	if err != nil {
-		return result{}, err
-	}
-	appItem, err := platformSelectItem(apps, app)
-	if err != nil {
-		return result{}, err
-	}
-	environments, err := a.platformReadInventoryWith(cmd, "environments", url.Values{"app": {app}})
-	if err != nil {
-		return result{}, err
-	}
-	data := map[string]json.RawMessage{"app": appItem, "environments": environments}
-	encoded, _ := json.Marshal(data)
-	var plain strings.Builder
-	fmt.Fprintf(&plain, "App %s\n", app)
-	plain.WriteString("Environments\n")
-	plain.WriteString(platformTable(environments, []string{"name", "node", "serving_release_id", "health", "updated_at"}))
-	return result{data: encoded, plain: plain.String()}, nil
-}
-
-func (a *app) platformEnvironmentStatus(cmd *cobra.Command, app, environment string) (result, error) {
-	raw, err := a.platformReadInventoryWith(cmd, "environments", url.Values{"app": {app}, "environment": {environment}})
-	if err != nil {
-		return result{}, err
-	}
-	item, err := platformSelectItem(raw, environment)
-	if err != nil {
-		return result{}, err
-	}
-	return platformItemResult("environments", app+"/"+environment, item, raw), nil
 }
 
 // retryDeployment re-submits a failed deployment through the ordinary action
@@ -677,12 +515,6 @@ func platformOperationResult(raw json.RawMessage, dryRun bool) result {
 	return apiResult(raw)
 }
 
-func platformItemResult(collection, name string, item, raw json.RawMessage) result {
-	var pretty bytes.Buffer
-	_ = json.Indent(&pretty, item, "", "  ")
-	return result{data: item, plain: fmt.Sprintf("%s %s\n%s", strings.TrimSuffix(collection, "s"), name, pretty.String())}
-}
-
 func platformSelectItem(raw json.RawMessage, name string) (json.RawMessage, error) {
 	var page struct {
 		Items []json.RawMessage `json:"items"`
@@ -702,71 +534,11 @@ func platformSelectItem(raw json.RawMessage, name string) (json.RawMessage, erro
 	return nil, contract.NewFault(contract.NotFound, "platform item not found", "List the collection to choose an existing name.")
 }
 
+// platformPretty renders canonical JSON for a preview or error context.
 func platformPretty(raw json.RawMessage) string {
 	var pretty bytes.Buffer
 	_ = json.Indent(&pretty, raw, "", "  ")
 	return pretty.String()
-}
-
-// platformTable renders a compact read-only snapshot. It intentionally has no
-// colour, cursor movement, or terminal capability probing. Untrusted values are
-// sanitized by the output writer before they reach a terminal.
-func platformTable(raw json.RawMessage, columns []string) string {
-	var page struct {
-		Items []map[string]any `json:"items"`
-	}
-	if err := json.Unmarshal(raw, &page); err != nil || len(page.Items) == 0 {
-		return "(none)\n"
-	}
-	widths := make([]int, len(columns))
-	for i, column := range columns {
-		widths[i] = len(column)
-	}
-	rows := make([][]string, 0, len(page.Items))
-	for _, item := range page.Items {
-		row := make([]string, len(columns))
-		for i, column := range columns {
-			row[i] = platformCell(item[column])
-			if len(row[i]) > widths[i] {
-				widths[i] = len(row[i])
-			}
-		}
-		rows = append(rows, row)
-	}
-	var out strings.Builder
-	for i, column := range columns {
-		fmt.Fprintf(&out, "%-*s", widths[i]+2, strings.ToUpper(column))
-	}
-	out.WriteString("\n")
-	for _, row := range rows {
-		for i, value := range row {
-			fmt.Fprintf(&out, "%-*s", widths[i]+2, value)
-		}
-		out.WriteString("\n")
-	}
-	return out.String()
-}
-
-func platformCell(value any) string {
-	switch typed := value.(type) {
-	case nil:
-		return "-"
-	case string:
-		if typed == "" {
-			return "-"
-		}
-		return typed
-	case []any:
-		items := make([]string, 0, len(typed))
-		for _, item := range typed {
-			items = append(items, fmt.Sprint(item))
-		}
-		return strings.Join(items, ",")
-	case map[string]any:
-		return platformPretty(mustJSON(typed))
-	default:
-		return fmt.Sprint(typed)
-	}
 }
 
 func mustJSON(value any) json.RawMessage {

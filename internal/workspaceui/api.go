@@ -69,24 +69,6 @@ func (a Action) PlanToken() string {
 func (a Action) Noninteractive() string {
 	suffix := " --idempotency-key " + a.IdempotencyKey + " --json"
 	switch a.Kind {
-	case platform.KindAppCreate:
-		var input platform.AppCreateInput
-		if json.Unmarshal(a.Input, &input) != nil {
-			return ""
-		}
-		return "eregion platform apps create " + input.Name + suffix
-	case platform.KindEnvironmentCreate:
-		var input platform.EnvironmentCreateInput
-		if json.Unmarshal(a.Input, &input) != nil {
-			return ""
-		}
-		command := "eregion platform environments create " + input.App + " " + input.Name +
-			" --node " + input.Node +
-			fmt.Sprintf(" --container-port %d --host-port %d", input.ContainerPort, input.HostPort)
-		if input.Health.Path != "" {
-			command += " --health-path " + input.Health.Path
-		}
-		return command + suffix
 	case platform.KindReleaseCreate:
 		var input platform.ReleaseCreateInput
 		if json.Unmarshal(a.Input, &input) != nil {
