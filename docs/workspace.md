@@ -2,7 +2,7 @@
 
 **Status:** M2/M3/M4/M6 terminal views implemented · 2026-10-20
 
-`eregion ui --interactive` opens the keyboard-driven workspace. It reads the
+`eregion ui` opens the keyboard-driven workspace. It reads the
 same authenticated platform API as every noninteractive command and submits
 through the same action contract. The workspace never opens SSH, touches a
 database, enqueues a River job, or cancels work when it detaches.

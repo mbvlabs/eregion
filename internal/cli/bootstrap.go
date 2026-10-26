@@ -45,17 +45,7 @@ func (a *app) bootstrapSpecs() []spec {
 	return []spec{{
 		use:  "bootstrap",
 		meta: parentMeta,
-		flags: func(cmd *cobra.Command) {
-			bootstrapInputFlags(cmd)
-			cmd.Flags().Bool("interactive", false, "Collect the same inputs as flags in a guided terminal flow")
-		},
-		run: func(cmd *cobra.Command, _ []string) (result, error) {
-			interactive, _ := cmd.Flags().GetBool("interactive")
-			if interactive {
-				return a.bootstrapWizard(cmd)
-			}
-			return a.help(cmd), nil
-		},
+		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: children,
 	}}
 }

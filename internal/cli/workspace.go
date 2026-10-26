@@ -43,7 +43,6 @@ func (a *app) workspaceSpecs() []spec {
 		use:  "ui",
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
-			cmd.Flags().Bool("interactive", false, "Accepted for compatibility; a terminal always opens the workspace")
 			cmd.Flags().String("tab", "fleet", "Initial workspace: fleet, apps, envs, releases, deployments, resources, or backups")
 			cmd.Flags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 			cmd.Flags().Bool("ascii", false, "Use ASCII glyphs instead of Unicode")

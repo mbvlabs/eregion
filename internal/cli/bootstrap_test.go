@@ -13,39 +13,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	tea "charm.land/bubbletea/v2"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
-	"github.com/mbvlabs/eregion/internal/secrets"
 )
-
-func TestWizardRequiresTypedApply(t *testing.T) {
-	cfg := host.DefaultConfig(host.RoleApplication, "app1")
-	model := wizardModel{
-		app: &app{secrets: &secrets.Registry{}}, cmd: nil,
-		fields: bootstrapWizardFields(cfg), phase: wizardReview,
-		input: newWizardInput("", 32),
-	}
-	updated, _ := model.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	next := updated.(wizardModel)
-	if next.phase != wizardReview || next.err == nil {
-		t.Fatalf("empty confirmation was accepted: %+v", next)
-	}
-	model.input.Set("apply")
-	updated, command := model.handleKey(tea.KeyPressMsg{Code: tea.KeyEnter})
-	next = updated.(wizardModel)
-	if next.phase != wizardApplying || command == nil {
-		t.Fatalf("typed confirmation did not start apply: %+v", next)
-	}
-}
-
-func TestInteractiveBootstrapRequiresATerminal(t *testing.T) {
-	code, _, _ := invoke(t, "bootstrap", "--interactive")
-	if code != 2 {
-		t.Fatalf("non-TTY guided bootstrap: code=%d", code)
-	}
-}
 
 func TestBootstrapAndContextAreAttached(t *testing.T) {
 	for _, path := range [][]string{{"bootstrap"}, {"bootstrap", "plan"}, {"bootstrap", "apply"}, {"bootstrap", "confirm"}, {"bootstrap", "remote"}, {"context"}, {"context", "login"}, {"context", "credential", "add"}} {
@@ -56,26 +27,6 @@ func TestBootstrapAndContextAreAttached(t *testing.T) {
 		envelope := decodeOne(t, stdout)
 		if !envelope.OK {
 			t.Fatalf("%v: %+v", path, envelope.Error)
-		}
-	}
-}
-
-func TestBootstrapWizardFlagParity(t *testing.T) {
-	a := newApp()
-	cmd, _, err := a.root.Find([]string{"bootstrap"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	seen := map[string]bool{}
-	for _, name := range bootstrapWizardFlagNames {
-		if flagFor(cmd, name) == nil {
-			t.Fatalf("guided field --%s has no noninteractive flag", name)
-		}
-		seen[name] = true
-	}
-	for _, field := range bootstrapWizardFields(host.DefaultConfig(host.RoleMain, "main")) {
-		if !seen[field.Key] {
-			t.Fatalf("guided field %s is not in the parity list", field.Key)
 		}
 	}
 }
