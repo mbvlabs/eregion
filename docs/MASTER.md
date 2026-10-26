@@ -150,8 +150,8 @@ dry-run where it mutates, and appears in `eregion commands --json`. Node-only
 commands are marked Linux-only and hidden from the operator listing.
 
 ```
-eregion server init [--resume | --discard] [--answers FILE] | status | doctor
-eregion plan | apply [--auto-upgrade-nodes]           # converge host steps
+eregion server init [--resume | --discard] [--answers FILE] | status
+eregion plan | apply [--auto-upgrade-nodes] | doctor  # converge and check host steps
 eregion login | context list|show|use|remove
 eregion secrets export                                 # server handoff, human factor
 eregion app create|list|status|delete
@@ -290,22 +290,24 @@ tagged build. "Builds" or "appears in `commands --json`" is never the gate.
 
 ## 8. Current state
 
-Source audit 2026-10-26; no real-host run recorded for this build. Schema:
-embedded migrations through 010.
+Source state 2026-10-26: rows 1–10 are implemented on `master` and pass build,
+vet, the darwin build and the unit tests of the changed packages; a read-only
+audit traced every MANUAL-TESTING check and its blocking defects are fixed.
+**Nothing is qualified:** no real-host run is recorded for this build.
+Schema: embedded migrations through 013.
 
-| Area | What exists | Gap to v1 |
+| Area | What exists | Open before the alpha |
 | --- | --- | --- |
-| `server init` | MASTER 6.1 flow: local preflight, first contact with `--identity`/agent/default keys/encrypted passphrase/`--password-stdin`, host-key TOFU, read-only remote preflight, flags/`--answers` with defaults, plan and `--confirm <server>`, versioned apply with live progress, arch-matching node binary installed once, vault keyring and node_exporter host steps, `ready` gate, terminal/written guarded handoff, local pending init with `--resume`/`--discard`, `context remove`. | Manual qualification on a real server (interrupted init, lockdown revert, handoff storage, node_exporter reachability); `doctor`/`status` are row 3. |
-| Operator channel | Contexts, pinned SSH, embedded WireGuard, node-mode dispatch, version lockstep, token-free contexts, `context remove`. | `plan`/`apply`, `--auto-upgrade-nodes` convergence, `doctor`, `status`, `ssh`, `unlock-ssh` (row 3). |
-| Host convergence | Journaled engine, bootstrap steps. | `plan`/`apply`, `--auto-upgrade-nodes`, `doctor`, `status`, `ssh`, `unlock-ssh`. |
-| Apps and environments | `platform apps|environments create/list/status`; ports, health, config, pinned secret refs. | Source binding, revisions, processes, `app create` flow, `env update`, deployability, deletion. |
-| Build, release, deploy | Image/directory/HTTPS git releases, Buildpacks, durable deploy stages, health probes, rollback, retry, crash reconciliation; stable-port replacement. | `deploy` from the bound source, private git credential, build lifecycle commands, per-process containers and replicas, blue/green switch, public verification. |
-| Domains | `domain add/list/remove`, routes file, Caddy reload. | Primary/aliases, applied/observed state, atomic serialized writes, reconciliation, status reporting. |
-| Secrets | Encrypted revisioned vault, write-only set/list/archive/export; `server init` generates the keyring and includes it in the handoff. | Per-deploy resolution (D18), `config` commands, export behind the human factor. |
-| CI | Scoped API auth; signed GitHub webhook with durable delivery deduplication, one server-wide secret and an environment-variable allowlist, building a release only. | Deploy endpoint through Caddy, D7 tokens, `protect init`; per-environment webhook URL and secret from the revision, deploying on push (D28). |
-| Observability | Operation events/follow, terminal viewer and workspace, telemetry read adapters for `logs` and workspace graphs; node_exporter installed at init on the WireGuard address. | `logs` over the operator channel, `app/env status`. |
-| Release | Cosign keyless channel pipeline: `scripts/build-release.sh`, `sign-release.sh`, `upload-release.sh`, `install.sh`; `publish-edge.yml`, `publish-stable.yml`; `internal/release`; local-only `upgrade`; Linux/macOS only. | First bucket/origin configuration and a qualified edge/stable publish; `apply --auto-upgrade-nodes`. |
-| Off the v1 surface | Node enrollment and placement, resources and backups, Cloudflare DNS, private-access grants, telemetry stack install. | Removed from the operator surface. Resources and backups go entirely (D19); the rest returns in its after-v1 phase. |
+| `server init` | vaire flow: preflight, `--answers`, `--password-stdin`, plan with `--confirm <server>`, binary installed once, vault keyring, node_exporter on WireGuard, guarded handoff with `--secrets-out`, `--resume`/`--discard`, `context remove`. SSH on port 22 only. | Real-host qualification. |
+| Operator channel | `eregion node rpc` over SSH in WireGuard; token-free contexts and handoff; version lockstep and `--auto-upgrade-nodes`. | Real-host qualification. |
+| Host convergence | `plan`, `apply`, `doctor`, `server status`, `ssh`, `node unlock-ssh`. | Real-host qualification. |
+| Apps and environments | Revisions with source binding, processes, config and secret names; guided and flag-only `app create`, `env create|update`; `process`, `config`; deployability gate. | Real-host qualification. |
+| Build, release, deploy | Deploy from the bound source (public or private git) or a release; build lifecycle; per-process containers with replicas; blue/green switch with public verification; rollback with pinned secret revisions; restart. | Real-host qualification. |
+| Domains | Primary and aliases; DNS, route, certificate and public state; serialized atomic Caddy writes; reconciliation and observation. | Real-host qualification. |
+| Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. | CI/webhook operations are listed but `operations get|follow` stay actor-scoped. |
+| CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy`; `secrets export`/`secret export` behind the factor. | Real-host qualification. |
+| Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
+| Release | vaire pipeline: cosign keyless, `install.sh`, edge on push to `master`, stable on `v*` tags, origin `eregion.mbvlabs.com`. | First edge publish; `stable` environment secrets before the first tag. |
 
 ## 9. Work list
 
