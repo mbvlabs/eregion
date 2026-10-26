@@ -2,10 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -69,6 +71,102 @@ func boundedOutput(value []byte) string {
 	return string(value)
 }
 
+// recoveryDrillRunner runs pg_dump/pg_restore where they can read the server.
+// A local client older than the server aborts the dump, so a newer server gets
+// tools from the matching postgres image. Both paths receive the same PG*
+// environment; the container receives the archive through one mounted
+// directory and reaches a loopback test server through the host gateway.
+type recoveryDrillRunner struct {
+	image     string
+	directory string
+}
+
+func recoveryDrillTools(t *testing.T, ctx context.Context, admin *pgxpool.Pool) recoveryDrillRunner {
+	t.Helper()
+	var version string
+	if err := admin.QueryRow(ctx, "SHOW server_version_num").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	number, err := strconv.Atoi(version)
+	if err != nil {
+		t.Fatalf("read the server version %q: %v", version, err)
+	}
+	major := number / 10000
+	if pgToolMajor("pg_dump") >= major && pgToolMajor("pg_restore") >= major {
+		return recoveryDrillRunner{directory: t.TempDir()}
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("pg_dump/pg_restore are older than PostgreSQL %d and docker is unavailable", major)
+	}
+	return recoveryDrillRunner{
+		image:     fmt.Sprintf("postgres:%d-alpine", major),
+		directory: t.TempDir(),
+	}
+}
+
+// pgToolMajor reports the client major version, or zero when the tool is not
+// installed.
+func pgToolMajor(name string) int {
+	out, err := exec.Command(name, "--version").Output()
+	if err != nil {
+		return 0
+	}
+	for _, field := range strings.Fields(string(out)) {
+		major, _, _ := strings.Cut(field, ".")
+		if version, err := strconv.Atoi(major); err == nil {
+			return version
+		}
+	}
+	return 0
+}
+
+func (r recoveryDrillRunner) path(hostPath string) string {
+	if r.image == "" {
+		return hostPath
+	}
+	return "/archive/" + filepath.Base(hostPath)
+}
+
+func (r recoveryDrillRunner) run(t *testing.T, env []string, name string, args ...string) []byte {
+	t.Helper()
+	if r.image == "" {
+		return recoveryDrillRun(t, env, name, args...)
+	}
+	dockerArgs := []string{
+		"run", "--rm", "--add-host", "host.docker.internal:host-gateway",
+		"-v", r.directory + ":/archive", "-w", "/archive",
+		"-e", "PGHOST", "-e", "PGPORT", "-e", "PGDATABASE", "-e", "PGUSER",
+		"-e", "PGPASSWORD", "-e", "PGCONNECT_TIMEOUT", "-e", "PGAPPNAME",
+		"-e", "PGSSLMODE", "-e", "PGSSLROOTCERT", "-e", "PGSSLCERT",
+		"-e", "PGSSLKEY", "-e", "PGSSLCRL",
+		r.image, name,
+	}
+	command := exec.Command("docker", append(dockerArgs, args...)...)
+	command.Env = recoveryDrillContainerEnv(env)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s in %s failed: %v: %s", name, r.image, err, boundedOutput(output))
+	}
+	return output
+}
+
+// recoveryDrillContainerEnv points a loopback database host at the host
+// running Docker; a container's own loopback is not the test server.
+func recoveryDrillContainerEnv(env []string) []string {
+	container := append([]string(nil), env...)
+	for i, entry := range container {
+		host, ok := strings.CutPrefix(entry, "PGHOST=")
+		if !ok {
+			continue
+		}
+		switch host {
+		case "127.0.0.1", "localhost", "::1", "[::1]":
+			container[i] = "PGHOST=host.docker.internal"
+		}
+	}
+	return container
+}
+
 func recoveryDrillCreate(t *testing.T, ctx context.Context, admin *pgxpool.Pool, created map[string]bool) string {
 	t.Helper()
 	id, err := contract.NewOperationID()
@@ -104,10 +202,10 @@ func recoveryDrillDSN(t *testing.T, base *url.URL, database string) string {
 	return value.String()
 }
 
-func recoveryDrillRestore(t *testing.T, dsn, database, archive string) string {
+func recoveryDrillRestore(t *testing.T, tools recoveryDrillRunner, dsn, database, archive string) string {
 	t.Helper()
 	env := recoveryDrillEnv(t, dsn, database)
-	recoveryDrillRun(t, env, "pg_restore", "--no-owner", "--no-privileges", "--exit-on-error", "--dbname", database, archive)
+	tools.run(t, env, "pg_restore", "--no-owner", "--no-privileges", "--exit-on-error", "--dbname", database, tools.path(archive))
 	return recoveryDrillDSN(t, mustParseURL(t, dsn), database)
 }
 
@@ -165,11 +263,6 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 	if os.Getenv("EREGION_TEST_DATABASE_URL") == "" {
 		t.Skip("set EREGION_TEST_DATABASE_URL to run isolated PostgreSQL integration tests")
 	}
-	for _, tool := range []string{"pg_dump", "pg_restore"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not installed; the control-plane recovery drill needs PostgreSQL client tools", tool)
-		}
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -202,25 +295,26 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 		}
 	})
 
+	tools := recoveryDrillTools(t, ctx, admin)
 	sourceName := strings.TrimPrefix(mustParseURL(t, sourceDSN).Path, "/")
-	archive := filepath.Join(t.TempDir(), "control-plane.dump")
+	archive := filepath.Join(tools.directory, "control-plane.dump")
 	env := recoveryDrillEnv(t, sourceDSN, sourceName)
-	recoveryDrillRun(t, env, "pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--file", archive)
+	tools.run(t, env, "pg_dump", "--format=custom", "--no-owner", "--no-privileges", "--file", tools.path(archive))
 	info, err := os.Stat(archive)
 	if err != nil || info.Size() == 0 {
 		t.Fatalf("pg_dump archive is missing or empty: %v", err)
 	}
-	listing := recoveryDrillRun(t, env, "pg_restore", "--list", archive)
+	listing := tools.run(t, env, "pg_restore", "--list", tools.path(archive))
 	if len(listing) == 0 || !strings.Contains(strings.ToUpper(string(listing)), "TABLE") {
 		t.Fatal("pg_restore --list returned an unusable table of contents")
 	}
 
 	first := recoveryDrillCreate(t, ctx, admin, created)
-	firstDSN := recoveryDrillRestore(t, sourceDSN, first, archive)
+	firstDSN := recoveryDrillRestore(t, tools, sourceDSN, first, archive)
 	firstFingerprint, firstPlan := recoveryDrillVerify(t, ctx, firstDSN)
 
 	second := recoveryDrillCreate(t, ctx, admin, created)
-	secondDSN := recoveryDrillRestore(t, sourceDSN, second, archive)
+	secondDSN := recoveryDrillRestore(t, tools, sourceDSN, second, archive)
 	secondFingerprint, secondPlan := recoveryDrillVerify(t, ctx, secondDSN)
 
 	if firstFingerprint != sourceFingerprint || secondFingerprint != sourceFingerprint {

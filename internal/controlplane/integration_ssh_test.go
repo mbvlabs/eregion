@@ -284,7 +284,7 @@ func TestIntegrationSSHTransportRunsTheDiagnosticOperation(t *testing.T) {
 func TestIntegrationSSHTransportRecoversFromALostResponse(t *testing.T) {
 	pool, _ := testPool(t, true)
 	fixture := startSSHFixture(t)
-	proxy, err := sshfixture.NewCutProxy(fixture.Address, 50*time.Millisecond, 300*time.Millisecond)
+	proxy, err := sshfixture.NewCutProxy(fixture.Address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,11 +292,20 @@ func TestIntegrationSSHTransportRecoversFromALostResponse(t *testing.T) {
 	run := testRuntime(t, pool, 2)
 	run.Service.transport = sshTransport(t, fixture, proxy.Address())
 	ctx := context.Background()
-	op, err := run.Service.Submit(ctx, submission("ssh-lost-response", `{"steps":1,"step_delay_ms":800}`))
+	op, err := run.Service.Submit(ctx, submission("ssh-lost-response", `{"steps":1,"step_delay_ms":1000}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	startWorkers(t, run)
+	// Cut only after the node journal records the running task, so the cut is
+	// a lost response rather than a handshake that happened to be slow.
+	await(t, 30*time.Second, func() bool {
+		pid, err := fixture.TaskOwnerPID(ctx, string(op.ID))
+		return err == nil && pid != 0
+	})
+	if proxy.Cut() == 0 {
+		t.Fatal("the proxy cut no connection")
+	}
 	await(t, 90*time.Second, func() bool {
 		current, err := run.Service.Get(ctx, testActor, op.ID)
 		return err == nil && current.State == contract.Succeeded

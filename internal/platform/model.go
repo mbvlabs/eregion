@@ -150,8 +150,12 @@ type Deployability struct {
 // DeployabilityState supplies the non-revision observations.
 type DeployabilityState struct {
 	ArtifactReady bool
-	PrimaryDomain string
-	DNS           string
+	// ExplicitRelease is true when the deploy names an existing release. That
+	// release supplies the artifact, so the revision's source binding is not
+	// required.
+	ExplicitRelease bool
+	PrimaryDomain   string
+	DNS             string
 }
 
 type EnvironmentDeployabilityReport struct {
@@ -168,7 +172,7 @@ func EvaluateDeployability(revision *EnvironmentRevision, state DeployabilitySta
 		dns = "unknown"
 	}
 	missing := make([]string, 0, 6)
-	if revision == nil || !sourceReady(revision.Source) {
+	if !state.ExplicitRelease && (revision == nil || !sourceReady(revision.Source)) {
 		missing = append(missing, "source")
 	}
 	if !state.ArtifactReady {

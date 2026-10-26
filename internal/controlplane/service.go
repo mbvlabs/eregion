@@ -36,6 +36,10 @@ type Service struct {
 	// afterNode is a test-only seam between a node effect and its database
 	// acknowledgement. Production leaves it nil.
 	afterNode func(contract.OperationID, string) error
+	// routeSwitch and publicVerify are test-only seams for deployments that
+	// run no Caddy on the test host. Production leaves them nil.
+	routeSwitch  func(context.Context, platform.Environment, []string) error
+	publicVerify func(context.Context, platform.Environment, string) error
 	// secrets resolves environment secret references into transient values. Nil
 	// means referenced secrets fail honestly instead of being injected.
 	secrets SecretResolver

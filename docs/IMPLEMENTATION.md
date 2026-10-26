@@ -251,9 +251,12 @@ maintenance-window recovery must:
    new writes is not lossless rollback; reconcile divergence first.
 
 `TestIntegrationControlPlaneRecoveryDrill` exercises a narrower
-dump/restore/readiness subset against generated test databases. It is not
-evidence of live writer quiescence, DSN cutover, keyring recovery, HA or
-recovery-time goals.
+dump/restore/readiness subset against generated test databases. It runs the
+local PostgreSQL client tools when their major version is at least the
+server's, and otherwise runs `pg_dump`/`pg_restore` from the matching
+`postgres:<major>-alpine` image, so an older runner client cannot abort the
+dump. It is not evidence of live writer quiescence, DSN cutover, keyring
+recovery, HA or recovery-time goals.
 
 ## Bootstrap and local state
 
@@ -423,6 +426,8 @@ primary domain and an observed wrong/proxied DNS answer block with
 `precondition_failed` and a `missing` list. A merely unobserved DNS record does
 not block, matching deploycrate's gate on an unapplied managed binding; a source
 deploy produces its own artifact, so artifact readiness is not a blocker there.
+An explicit release already carries its artifact, so that deploy does not need
+the revision's source binding.
 Inventory collections `revisions` and `deployability` expose the same report,
 and each environment record carries its current revision, processes and
 deployability.

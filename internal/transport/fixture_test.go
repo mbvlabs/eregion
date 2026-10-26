@@ -172,7 +172,7 @@ func TestSSHFixtureCancellationDoesNotKillTheNodeTask(t *testing.T) {
 
 func TestSSHFixtureRecoversThroughStatusAfterALostResponse(t *testing.T) {
 	fixture := startFixture(t)
-	proxy, err := sshfixture.NewCutProxy(fixture.Address, 50*time.Millisecond, 150*time.Millisecond)
+	proxy, err := sshfixture.NewCutProxy(fixture.Address)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,18 +195,58 @@ func TestSSHFixtureRecoversThroughStatusAfterALostResponse(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec := testExecution(t, node.DiagnosticStepID(1))
-	_, err = client.Call(context.Background(), runRequest(t, exec, 0), nil)
-	if err == nil {
+	request := runRequest(t, exec, 1000)
+	type result struct {
+		response node.Response
+		err      error
+	}
+	results := make(chan result, 1)
+	go func() {
+		response, callErr := client.Call(context.Background(), request, nil)
+		results <- result{response: response, err: callErr}
+	}()
+	// Cut only after the node journal records the running task. A time-based
+	// cut can land in the SSH handshake on a loaded runner and is then an
+	// ordinary connect failure, not a lost response.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		select {
+		case got := <-results:
+			t.Fatalf("the call ended before the node task started: %v", got.err)
+		default:
+		}
+		pid, err := fixture.TaskOwnerPID(context.Background(), string(exec.OperationID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pid != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the node task did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if proxy.Cut() == 0 {
+		t.Fatal("the proxy cut no connection")
+	}
+	var got result
+	select {
+	case got = <-results:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the cut call did not return")
+	}
+	if got.err == nil {
 		t.Fatal("the cut connection was reported as success")
 	}
-	if !node.IsStreamLost(err) {
-		t.Fatalf("the lost response is not explicit: %v", err)
+	if !node.IsStreamLost(got.err) {
+		t.Fatalf("the lost response is not explicit: %v", got.err)
 	}
 	if proxy.Cuts() == 0 {
 		t.Fatal("the proxy did not cut the connection")
 	}
 	// The node task outlived the caller: the effect is applied.
-	deadline := time.Now().Add(20 * time.Second)
+	effectDeadline := time.Now().Add(20 * time.Second)
 	for {
 		count, err := fixture.EffectCount(context.Background(), string(exec.OperationID))
 		if err != nil {
@@ -215,7 +255,7 @@ func TestSSHFixtureRecoversThroughStatusAfterALostResponse(t *testing.T) {
 		if count == 1 {
 			break
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(effectDeadline) {
 			t.Fatal("the node task did not survive the lost response")
 		}
 		time.Sleep(50 * time.Millisecond)

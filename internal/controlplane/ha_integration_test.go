@@ -230,6 +230,9 @@ func stepKey(request node.Request) string {
 }
 
 func scriptedResult(request node.Request) json.RawMessage {
+	if strings.HasPrefix(request.Execution.Step, "platform-port-") {
+		return json.RawMessage(`{"stdout":"127.0.0.1:18080"}`)
+	}
 	if request.Execution.Step != "platform-image-01-v1" {
 		return json.RawMessage(`{}`)
 	}
@@ -315,10 +318,11 @@ func servingRelease(t *testing.T, pool *pgxpool.Pool) string {
 	return *id
 }
 
-// TestIntegrationNodeLossDuringDeploy exercises a node that commits the serving
-// container switch and then loses the transport. The operation stays visible,
-// a retry asks status instead of repeating the switch, and the environment does
-// not report the new release as serving until verification committed.
+// TestIntegrationNodeLossDuringDeploy exercises a node that commits the
+// candidate container and then loses the transport. The operation stays
+// visible, a retry asks status instead of repeating the effect, and the
+// environment does not report the new release as serving until verification
+// committed.
 func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
@@ -327,6 +331,10 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This test exercises container effect recovery, not Caddy; the test host
+	// has no routes file or admin endpoint.
+	run.Service.routeSwitch = func(context.Context, platform.Environment, []string) error { return nil }
+	run.Service.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
 	startWorkers(t, run)
 	s := run.Service
 
@@ -337,6 +345,7 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "ha-app", map[string]any{"name": "live"}), contract.Succeeded)
 	platformAwait(t, s, platformSubmit(t, s, platform.KindEnvironmentCreate, "app/live", "ha-env", map[string]any{
 		"name": "production", "node": "local", "container_port": 80, "health": map[string]any{"timeout_seconds": 2},
+		"domain": "live.example.com", "domain_primary": true,
 	}), contract.Succeeded)
 
 	createRelease := func(key, image string) string {
@@ -353,12 +362,13 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 
 	second := createRelease("ha-release-2", "registry.example/live:v2")
 	deploy := platformSubmit(t, s, platform.KindDeploy, "env/live/production", "ha-deploy-2", map[string]any{"release_id": second})
-	fake.lose("platform-container-02-v1", deploy.ID)
+	containerStep := containerStepID("web", "1")
+	fake.lose(containerStep, deploy.ID)
 
-	// Wait until the node committed the switch but the worker has not yet
-	// acknowledged it. Serving must still name the old release.
+	// Wait until the node committed the candidate container but the worker has
+	// not yet acknowledged it. Serving must still name the old release.
 	await(t, 30*time.Second, func() bool {
-		return fake.runCount(deploy.ID, "platform-container-02-v1") > 0
+		return fake.runCount(deploy.ID, containerStep) > 0
 	})
 	current, err := s.Get(ctx, testActor, deploy.ID)
 	if err != nil {
@@ -372,10 +382,7 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 	}
 
 	platformAwait(t, s, deploy, contract.Succeeded)
-	if got := fake.runCount(deploy.ID, "platform-container-02-v1"); got != 1 {
-		t.Fatalf("serving switch ran %d times; a retry duplicated the effect", got)
-	}
-	if got := fake.runCount(deploy.ID, "platform-container-01-v1"); got != 1 {
+	if got := fake.runCount(deploy.ID, containerStep); got != 1 {
 		t.Fatalf("candidate container ran %d times; a retry duplicated the effect", got)
 	}
 	if got := servingRelease(t, pool); got != second {

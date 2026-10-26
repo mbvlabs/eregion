@@ -541,6 +541,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	switched, err := w.service.runControlStep(ctx, id, attempt, deploymentRouteStep, map[string]any{
 		"environment": env.ID, "upstreams": candidateUpstreams, "release": release.ID,
 	}, func() error {
+		if w.service.routeSwitch != nil {
+			return w.service.routeSwitch(ctx, env, candidateUpstreams)
+		}
 		return w.service.switchRoutesForDeployment(ctx, env, candidateUpstreams)
 	})
 	if err != nil {
@@ -557,6 +560,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if _, err := w.service.runControlStep(ctx, id, attempt, deploymentPublicStep, map[string]any{
 		"domain": env.PrimaryDomain, "path": env.Revision.Runtime.HealthPath,
 	}, func() error {
+		if w.service.publicVerify != nil {
+			return w.service.publicVerify(ctx, env, env.Revision.Runtime.HealthPath)
+		}
 		return w.service.verifyPublicRoute(ctx, env, env.Revision.Runtime.HealthPath)
 	}); err != nil {
 		_ = w.service.syncRoutes(context.WithoutCancel(ctx))
@@ -954,7 +960,8 @@ func (s *Service) runControlStep(ctx context.Context, id contract.OperationID, a
 		return false, err
 	}
 	inputsHash := engine.InputsHash(step, raw)
-	already, err := s.beginStep(ctx, id, attempt, step, inputsHash, "control:"+step)
+	// A control step has no node execution identity; only node steps carry one.
+	already, err := s.beginStep(ctx, id, attempt, step, inputsHash, "")
 	if err != nil {
 		return false, err
 	}
@@ -965,7 +972,7 @@ func (s *Service) runControlStep(ctx context.Context, id contract.OperationID, a
 		_ = s.failStep(ctx, id, attempt, step, contract.Classify(err).Code, contract.Classify(err).Message)
 		return false, err
 	}
-	if _, err := s.ackStep(ctx, id, attempt, step, inputsHash, "control:"+step, nil, platformStepTotal); err != nil {
+	if _, err := s.ackStep(ctx, id, attempt, step, inputsHash, "", nil, platformStepTotal); err != nil {
 		return false, err
 	}
 	return true, nil

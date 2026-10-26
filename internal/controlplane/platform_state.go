@@ -425,7 +425,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return err
 		}
-		if err := s.checkDeployabilityTx(ctx, tx, env); err != nil {
+		if err := s.checkDeployabilityTx(ctx, tx, env, input.ReleaseID != ""); err != nil {
 			return err
 		}
 		releaseID := input.ReleaseID
@@ -613,8 +613,9 @@ func envAppID(ctx context.Context, tx pgx.Tx, app string) string {
 // managed DNS binding that is not applied. A merely unobserved record does not
 // block the first deploy; an observed wrong or proxied answer does. A source
 // deploy creates its artifact, and an explicit release is checked separately,
-// so artifact readiness is not a blocker here.
-func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platform.Environment) error {
+// so artifact readiness is not a blocker here. An explicit release also carries
+// its own artifact, so it does not need the revision's source binding.
+func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platform.Environment, explicitRelease bool) error {
 	dns := ""
 	if env.PrimaryDomain != "" {
 		var state string
@@ -626,7 +627,7 @@ func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platf
 		dns = state
 	}
 	report := platform.EvaluateDeployability(env.Revision, platform.DeployabilityState{
-		ArtifactReady: true, PrimaryDomain: env.PrimaryDomain, DNS: dns,
+		ArtifactReady: true, ExplicitRelease: explicitRelease, PrimaryDomain: env.PrimaryDomain, DNS: dns,
 	})
 	if report.Deployable {
 		return nil

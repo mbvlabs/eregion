@@ -163,4 +163,21 @@ func TestEvaluateDeployability(t *testing.T) {
 	if EvaluateDeployability(nil, DeployabilityState{ArtifactReady: true, PrimaryDomain: "api.example.com"}).Missing[0] != "source" {
 		t.Fatal("a nil revision must report a missing source")
 	}
+	// An explicit release supplies its artifact, so it deploys without the
+	// revision's source binding.
+	noSource := &EnvironmentRevision{RevisionState: RevisionState{
+		Runtime:   RuntimeSpec{Node: "app-1", HealthPath: "/"},
+		Processes: []ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+	}}
+	byRelease := EvaluateDeployability(noSource, DeployabilityState{
+		ArtifactReady: true, ExplicitRelease: true, PrimaryDomain: "api.example.com",
+	})
+	if !byRelease.Deployable {
+		t.Fatalf("an explicit release still required a source binding: %+v", byRelease)
+	}
+	if fromSource := EvaluateDeployability(noSource, DeployabilityState{
+		ArtifactReady: true, PrimaryDomain: "api.example.com",
+	}); len(fromSource.Missing) != 1 || fromSource.Missing[0] != "source" {
+		t.Fatalf("a source deploy without a binding=%+v", fromSource)
+	}
 }
