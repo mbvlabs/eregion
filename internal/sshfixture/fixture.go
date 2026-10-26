@@ -327,7 +327,7 @@ func Start(ctx context.Context, options Options) (*Fixture, error) {
 		}
 		return fixture, nil
 	}
-	if err := waitForPort(ctx, address, 30*time.Second); err != nil {
+	if err := waitForSSH(ctx, address, user, identityPath, hostKey, 30*time.Second); err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -700,17 +700,42 @@ func publishedAddress(ctx context.Context, container, port string) (string, erro
 	return fields[0], nil
 }
 
-// waitForPort waits until the node accepts connections.
-func waitForPort(ctx context.Context, address string, timeout time.Duration) error {
+// waitForSSH waits until a full SSH handshake with the pinned host key and the
+// fixture identity succeeds. A published port can accept TCP before sshd has
+// finished starting; only the handshake proves the node is ready.
+func waitForSSH(ctx context.Context, address, user, identityFile string, hostKey ssh.PublicKey, timeout time.Duration) error {
+	raw, err := os.ReadFile(identityFile) //nolint:gosec // G304: the fixture's own identity.
+	if err != nil {
+		return err
+	}
+	signer, err := ssh.ParsePrivateKey(raw)
+	if err != nil {
+		return err
+	}
+	config := &ssh.ClientConfig{
+		User:              user,
+		Auth:              []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback:   ssh.FixedHostKey(hostKey),
+		HostKeyAlgorithms: []string{hostKey.Type()},
+	}
 	deadline := time.Now().Add(timeout)
+	var last error
 	for {
-		conn, err := netDialTimeout(address, time.Second)
-		if err == nil {
+		conn, dialErr := netDialTimeout(address, 5*time.Second)
+		if dialErr != nil {
+			last = dialErr
+		} else {
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			sshConn, _, _, handshakeErr := ssh.NewClientConn(conn, address, config)
+			if handshakeErr == nil {
+				_ = sshConn.Close()
+				return nil
+			}
 			_ = conn.Close()
-			return nil
+			last = handshakeErr
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the node did not accept connections on %s: %w", address, err)
+			return fmt.Errorf("the node did not complete an SSH handshake on %s: %w", address, last)
 		}
 		select {
 		case <-ctx.Done():

@@ -145,16 +145,51 @@ func TestSSHFixtureCancellationDoesNotKillTheNodeTask(t *testing.T) {
 	client := fixtureTransport(t, fixture)
 	exec := testExecution(t, node.DiagnosticStepID(1))
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		cancel()
-	}()
-	if _, err := client.Call(ctx, runRequest(t, exec, 400), nil); err == nil {
-		t.Fatal("a cancelled call reported success")
-	} else if !node.IsStreamLost(err) {
-		t.Fatalf("a cancelled call is not an explicit unknown outcome: %v", err)
+	type result struct {
+		response node.Response
+		err      error
 	}
-	deadline := time.Now().Add(20 * time.Second)
+	results := make(chan result, 1)
+	go func() {
+		response, callErr := client.Call(ctx, runRequest(t, exec, 1000), nil)
+		results <- result{response: response, err: callErr}
+	}()
+	// Cancel only after the node journal records the running task. A cancel
+	// during the SSH handshake never dispatched the request, so it is not this
+	// scenario's unknown outcome.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		select {
+		case got := <-results:
+			t.Fatalf("the call ended before the node task started: %v", got.err)
+		default:
+		}
+		pid, err := fixture.TaskOwnerPID(context.Background(), string(exec.OperationID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pid != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the node task did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	var got result
+	select {
+	case got = <-results:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the cancelled call did not return")
+	}
+	if got.err == nil {
+		t.Fatal("a cancelled call reported success")
+	}
+	if !node.IsStreamLost(got.err) {
+		t.Fatalf("a cancelled call is not an explicit unknown outcome: %v", got.err)
+	}
+	effectDeadline := time.Now().Add(20 * time.Second)
 	for {
 		count, err := fixture.EffectCount(context.Background(), string(exec.OperationID))
 		if err != nil {
@@ -163,7 +198,7 @@ func TestSSHFixtureCancellationDoesNotKillTheNodeTask(t *testing.T) {
 		if count == 1 {
 			return
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(effectDeadline) {
 			t.Fatal("the node task was killed by the cancellation")
 		}
 		time.Sleep(50 * time.Millisecond)
