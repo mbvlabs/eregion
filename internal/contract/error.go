@@ -17,6 +17,7 @@ const (
 	InvalidOutputMode    Code = "invalid_output_mode"
 	InputRequired        Code = "input_required"
 	ValidationFailed     Code = "validation_failed"
+	MissingTool          Code = "missing_tool"
 	NotFound             Code = "not_found"
 	Unauthenticated      Code = "unauthenticated"
 	Forbidden            Code = "forbidden"
@@ -24,16 +25,17 @@ const (
 	ConfirmationRequired Code = "confirmation_required"
 	Conflict             Code = "conflict"
 	NodeVersionMismatch  Code = "node_version_mismatch"
+	RemoteUnreachable    Code = "remote_unreachable"
 	Unavailable          Code = "unavailable"
 	Cancelled            Code = "cancelled"
 	Internal             Code = "internal_error"
 )
 
 var exits = map[Code]int{
-	Usage: 2, InvalidOutputMode: 2, InputRequired: 2, ValidationFailed: 2,
+	Usage: 2, InvalidOutputMode: 2, InputRequired: 2, ValidationFailed: 2, MissingTool: 2,
 	NotFound: 3, Unauthenticated: 4, Forbidden: 4,
 	PreconditionFailed: 5, ConfirmationRequired: 5, Conflict: 5, NodeVersionMismatch: 5,
-	Unavailable: 6, Internal: 70, Cancelled: 130,
+	RemoteUnreachable: 6, Unavailable: 6, Internal: 70, Cancelled: 130,
 }
 
 func KnownCode(code Code) bool { _, ok := exits[code]; return ok }

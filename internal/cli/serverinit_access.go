@@ -125,10 +125,10 @@ func (id *operatorIdentity) authorizedKey() string {
 
 // wireGuardRoute is the context route to a locked-down node: SSH as the admin
 // user inside the embedded WireGuard tunnel.
-func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts string) *host.ContextSSH {
+func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts, adminUser string) *host.ContextSSH {
 	return &host.ContextSSH{
 		Address:    net.JoinHostPort(access.NodeAddress, "22"),
-		User:       access.AdminUser,
+		User:       adminUser,
 		Identity:   id.sshKeyPath,
 		KnownHosts: knownHosts,
 		WireGuard: &host.ContextWireGuard{
@@ -190,6 +190,27 @@ func wireGuardDial(wg *host.ContextWireGuard) (func(context.Context, string, str
 	return dialer.DialContext, nil
 }
 
+// closeWireGuardRoute closes the process's tunnel for a removed context so
+// nothing keeps the node peer alive after its key files are gone.
+func closeWireGuardRoute(route *host.ContextSSH) {
+	if route == nil || route.WireGuard == nil {
+		return
+	}
+	key, err := transport.ReadWireGuardKey(route.WireGuard.PrivateKeyFile)
+	if err != nil {
+		return
+	}
+	prefix := key.PublicKey().String() + "|"
+	wireGuardMu.Lock()
+	defer wireGuardMu.Unlock()
+	for id, dialer := range wireGuardDialers {
+		if strings.HasPrefix(id, prefix) {
+			_ = dialer.Close()
+			delete(wireGuardDialers, id)
+		}
+	}
+}
+
 // routeRemote opens a host.Remote for a context route.
 func routeRemote(route *host.ContextSSH, prompt bool) (*host.Remote, error) {
 	auth, err := sshAuth(route.Identity, prompt)
@@ -208,30 +229,63 @@ func routeRemote(route *host.ContextSSH, prompt bool) (*host.Remote, error) {
 // secureAccess hardens the server and moves SSH onto WireGuard (vaire §5.2):
 // setup over public SSH as root, a login as the admin user over WireGuard,
 // then the commit-confirm lockdown confirmed from a fresh connection.
-func (r *serverInit) secureAccess(ctx context.Context, root *host.Remote, id *operatorIdentity, apiPort int, knownHosts string) (*host.ContextSSH, error) {
-	port, _ := strconv.Atoi(r.answers.Port)
-	task := r.start("harden", "Hardening the server and bringing up WireGuard")
-	setup := access.Setup{AdminUser: access.AdminUser, OperatorSSHKey: id.authorizedKey(), SudoPassword: id.sudoPassword, OperatorPublicKey: id.wg.PublicKey().String(), SSHPort: port, APIPort: apiPort}
-	var out, stderr strings.Builder
-	if err := root.Run(ctx, "bash -s", strings.NewReader(access.Program("setup", setup.Env())), &out, &stderr); err != nil {
-		task.end(ui.EndFail, "")
-		return nil, contract.NewFault(contract.Unavailable, "hardening the server failed", lastLine(stderr.String(), err))
-	}
-	nodeKey, err := access.PublicKey(out.String())
-	if err != nil {
-		task.end(ui.EndFail, "")
-		return nil, contract.NewFault(contract.Unavailable, err.Error(), "")
-	}
-	task.end(ui.EndOK, "admin user "+access.AdminUser+", wg0 "+access.NodeAddress+", ufw, sshd")
-
-	route := id.wireGuardRoute(r.answers.Host, nodeKey, knownHosts)
-	if !hostKeyPinned(knownHosts, route.Address) && r.hostPub != nil {
-		if err := pinHostKey(knownHosts, route.Address, r.hostPub); err != nil {
+func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, publicHost, knownHosts string) (*host.ContextSSH, error) {
+	nodeKey := r.pending.NodePublicKey
+	if !r.pending.Done(phaseAccessSetup) {
+		root := r.remote
+		if root == nil {
+			return nil, contract.NewFault(contract.InputRequired, "the access setup needs the root first-contact connection", "Run server init --resume with the first-contact credential; root SSH is still open before the access setup runs.")
+		}
+		port, _ := strconv.Atoi(r.answers.Port)
+		cfg := host.DefaultConfig(host.RoleMain, r.answers.Node)
+		_, apiPortText, _ := net.SplitHostPort(cfg.APIListen)
+		apiPort, _ := strconv.Atoi(apiPortText)
+		task := r.start("harden", "Hardening the server and bringing up WireGuard")
+		setup := access.Setup{AdminUser: r.answers.AdminUser, OperatorSSHKey: id.authorizedKey(), SudoPassword: id.sudoPassword, OperatorPublicKey: id.wg.PublicKey().String(), SSHPort: port, APIPort: apiPort}
+		var out, stderr strings.Builder
+		if err := root.Run(ctx, "bash -s", strings.NewReader(access.Program("setup", setup.Env())), &out, &stderr); err != nil {
+			task.end(ui.EndFail, "")
+			return nil, contract.NewFault(contract.Unavailable, "hardening the server failed", lastLine(stderr.String(), err))
+		}
+		got, err := access.PublicKey(out.String())
+		if err != nil {
+			task.end(ui.EndFail, "")
+			return nil, contract.NewFault(contract.Unavailable, err.Error(), "")
+		}
+		nodeKey = got
+		// Record the node key before the lockdown so an interruption between
+		// setup and confirmation can still build the WireGuard route.
+		r.pending.NodePublicKey = nodeKey
+		if err := r.savePending(); err != nil {
+			task.end(ui.EndFail, "")
 			return nil, err
+		}
+		if err := r.mark(phaseAccessSetup); err != nil {
+			task.end(ui.EndFail, "")
+			return nil, err
+		}
+		task.end(ui.EndOK, "admin user "+r.answers.AdminUser+", wg0 "+access.NodeAddress+", ufw, sshd")
+	}
+	if nodeKey == "" {
+		return nil, contract.NewFault(contract.PreconditionFailed, "the pending init has no node WireGuard key", "Run server init --discard and start again; the access setup did not finish.")
+	}
+
+	route := id.wireGuardRoute(publicHost, nodeKey, knownHosts, r.answers.AdminUser)
+	if !hostKeyPinned(knownHosts, route.Address) {
+		// The node presents the same host keys on every address. Pin the key
+		// learned over public SSH for the WireGuard address too; on a resume
+		// that skipped first contact it comes from the pending known_hosts.
+		public := net.JoinHostPort(publicHost, r.answers.Port)
+		if keys, err := transport.LoadHostKeys(knownHosts); err == nil {
+			for _, key := range keys.Keys(public) {
+				if err := pinHostKey(knownHosts, route.Address, key); err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 
-	task = r.start("wireguard", "SSH as "+access.AdminUser+" over WireGuard")
+	task := r.start("wireguard", "SSH as "+r.answers.AdminUser+" over WireGuard")
 	if err := runWithRetry(ctx, route, "true", 45*time.Second); err != nil {
 		task.end(ui.EndFail, "")
 		return nil, contract.NewFault(contract.Unavailable, "SSH over WireGuard does not answer", err.Error()+" — check that UDP "+strconv.Itoa(access.ListenPort)+" reaches the server (provider firewall). Public SSH is still open.")

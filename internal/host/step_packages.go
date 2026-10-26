@@ -23,7 +23,7 @@ func (s *packagesStep) Describe() string {
 func (s *packagesStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
 func (s *packagesStep) packages() []string {
-	packages := []string{"ca-certificates", "passwd"}
+	packages := []string{"ca-certificates", "passwd", "curl", "tar"}
 	if s.role.Runtime {
 		packages = append(packages, "docker.io")
 	}

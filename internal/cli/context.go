@@ -2,6 +2,8 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/api"
@@ -98,8 +100,66 @@ func (a *app) contextSpecs() []spec {
 				view, err := store.Use(name)
 				return hostResult(view), err
 			}},
+			a.contextRemoveSpec(meta),
 			a.contextCredentialSpec(meta),
 		}}}
+}
+
+// contextRemoveSpec deletes a context and its key files. It is destructive and
+// takes the context name as the confirmation token (MASTER D12).
+func (a *app) contextRemoveSpec(meta func(string, string, bool) CommandMeta) spec {
+	removeMeta := meta("Remove a saved context and its local key files", "eregion context remove production --confirm production --json", true)
+	removeMeta.Mutating, removeMeta.Destructive, removeMeta.Confirmation = true, true, "target"
+	removeMeta.DryRunReason = "Removal deletes local files; inspect the context with context show first and name it in --confirm."
+	return spec{
+		use:  "remove <name>",
+		meta: removeMeta,
+		args: func(_ *cobra.Command, args []string) error {
+			if len(args) != 1 {
+				return contract.NewFault(contract.InputRequired, "the context name is required", "Use eregion context remove <name> --confirm <name>.")
+			}
+			return host.ValidateContextName(args[0])
+		},
+		flags: func(cmd *cobra.Command) {
+			cmd.Flags().String("confirm", "", "The context name; must match exactly")
+		},
+		run: func(cmd *cobra.Command, args []string) (result, error) {
+			name := args[0]
+			path, _ := cmd.Flags().GetString("context-file")
+			store, err := host.LoadContextStore(path)
+			if err != nil {
+				return result{}, err
+			}
+			saved, err := store.Get(name)
+			if err != nil {
+				return result{}, err
+			}
+			confirm, _ := cmd.Flags().GetString("confirm")
+			if confirm == "" || confirm != name {
+				fault := contract.NewFault(contract.ConfirmationRequired, "--confirm must name the context", "Pass --confirm "+name+".")
+				fault.Details = map[string]any{"confirm_token": name}
+				return result{}, fault
+			}
+			// A live tunnel for this context would hold the node's peer.
+			closeWireGuardRoute(saved.SSH)
+			removed, err := store.Remove(name)
+			if err != nil {
+				return result{}, err
+			}
+			dir := ""
+			if store.Path != "" {
+				dir = filepath.Join(filepath.Dir(store.Path), "servers", name)
+			} else if resolved, err := identityDir(name); err == nil {
+				dir = resolved
+			}
+			if dir != "" {
+				if err := os.RemoveAll(dir); err != nil {
+					return result{}, err
+				}
+			}
+			return result{data: map[string]any{"removed": name, "changed": removed}, plain: "removed context " + name}, nil
+		},
+	}
 }
 
 // contextCredentialSpec adds a scoped automation actor to an existing server

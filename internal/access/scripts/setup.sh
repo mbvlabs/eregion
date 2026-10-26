@@ -91,6 +91,9 @@ for rule in "allow ${WG_PORT}/udp" "allow 80/tcp" "allow 443/tcp" "allow in on w
   read -r -a args <<< "${rule}"
   ufw "${args[@]}" >/dev/null
 done
+# node_exporter is reachable only from peers on wg0. The default deny covers
+# every other interface, so no public rule is ever added for 9100.
+ufw allow in on wg0 to "${WG_ADDRESS%%/*}" port 9100 proto tcp >/dev/null
 if [ ! -f "${STATE_DIR}/locked" ]; then
   ufw allow "${SSH_PORT}/tcp" >/dev/null
 fi
@@ -101,6 +104,13 @@ if wg show wg0 >/dev/null 2>&1; then
   wg syncconf wg0 <(wg-quick strip wg0)
 else
   systemctl restart wg-quick@wg0
+fi
+
+# node_exporter is installed by the host-node-exporter-v1 step before this
+# runs; it can only bind to the WireGuard address once wg0 exists.
+systemctl enable node-exporter.service >/dev/null 2>&1 || true
+if systemctl cat node-exporter.service >/dev/null 2>&1; then
+  systemctl restart node-exporter.service >/dev/null 2>&1 || true
 fi
 
 install -d -m 0700 "${STATE_DIR}"

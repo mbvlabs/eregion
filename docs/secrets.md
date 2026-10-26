@@ -8,8 +8,12 @@ plaintext read, behind the human factor.
 ## Storage and service wiring
 
 `internal/cli/extensions.go` builds the vault when `EREGION_VAULT_KEY_FILE` is set;
-`internal/api/mux.go` mounts its authenticated `/v1/secrets` handler. Bootstrap
-does not generate the keyring yet; `server init` will (work list row 2).
+`internal/api/mux.go` mounts its authenticated `/v1/secrets` handler. `server
+init` generates the keyring at `/etc/eregion/vault-keyring.json`, wires
+`EREGION_VAULT_KEY_FILE` into `control-plane.env`, and includes the ring in the
+secrets handoff. Root creates it and hands it to the unprivileged control-plane
+account (mode 0600), because the API and worker must read it at startup; an
+existing ring is verified, never overwritten.
 
 PostgreSQL holds AES-256-GCM ciphertext, key ID, namespace/revision bindings and
 metadata. The master key stays outside PostgreSQL in an absolute, owner-only,

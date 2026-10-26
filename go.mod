@@ -12,6 +12,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.9
 	github.com/charmbracelet/x/term v0.2.2
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/riverqueue/river v0.40.0
 	github.com/riverqueue/river/riverdriver/riverpgxv5 v0.40.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2

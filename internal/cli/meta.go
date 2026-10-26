@@ -122,8 +122,8 @@ func (r registry) validate(root *cobra.Command) error {
 		if (meta.Destructive || len(meta.DestructiveFlags) > 0) && meta.Confirmation == "" {
 			add("destructive actions require confirmation")
 		}
-		if meta.Confirmation != "" && (meta.Confirmation != "plan-bound" || flagFor(cmd, "confirm") == nil) {
-			add("confirmation must be plan-bound and expose --confirm")
+		if meta.Confirmation != "" && (meta.Confirmation != "plan-bound" && meta.Confirmation != "target" || flagFor(cmd, "confirm") == nil) {
+			add("confirmation must be plan-bound or target and expose --confirm")
 		}
 		if flag := flagFor(cmd, "confirm"); meta.Confirmation != "" && flag != nil && flag.Value.Type() != "string" {
 			add("--confirm must accept a token string")

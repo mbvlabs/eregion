@@ -37,7 +37,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | --- | --- |
 | `cmd/eregion` | One executable entry point, including `node-agent` and hidden `node rpc`. |
 | `internal/cli/tree.go`, `meta.go`, `run.go` | Command catalog, safety metadata, output selection and dispatch. |
-| `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup, first contact, DNS, private access and token-free age handoff/import. |
+| `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup (preflight, answers/pending, plan/confirm, apply, guarded handoff), first contact, DNS, private access and token-free age handoff/import. |
 | `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host RPC and SSH/WireGuard route. |
 | `internal/cli/host.go`, `internal/cli/serverstatus.go`, `internal/cli/nodeunlock.go` | `plan`, `apply`, `doctor`, `ssh`, `server status` and hidden `node unlock-ssh`. |
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
@@ -45,7 +45,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
 | `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps and Caddy route renderer. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
-| `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
+| `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps (incl. vault keyring and node_exporter), local pending-init state, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
 | `internal/integrations`, `internal/telemetry` | Internal DNS/private-access actions (no operator CLI before v1) and the telemetry read adapters used by `logs` and the workspace graph. |
@@ -64,11 +64,11 @@ bin/eregion help platform environments create --json
 
 | Current commands | Meaning/limit |
 | --- | --- |
-| `server init` | Guided root first contact; Linux operator, matching server arch, IPv4-oriented DNS/access setup. |
+| `server init` | Guided root first contact; Linux/macOS operator, arch-matching linux node binary, preflight, answer flags/TOML, plan/confirm, vault keyring and node_exporter steps, pending-init resume/discard, guarded handoff. |
 | `plan`, `apply [--dry-run]`, `doctor`, `ssh [node]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. |
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). |
-| `context list/show/use`, `context credential add` | Saved contexts and local server-auth-file editing. `use` takes `--name`; no remove command. |
+| `context list/show/use/remove`, `context credential add` | Saved contexts, target-confirmed removal with its key files, and local server-auth-file editing. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. |
 | `platform apps create/list/status` | App record only; no guided full setup, update or delete. |
 | `platform environments create/list/status` | Separate env record with node, port, bind, health and `--env`; no update/delete or secret-reference convenience flags. |
 | `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. |
@@ -227,29 +227,71 @@ recovery-time goals.
 
 ## Bootstrap and local state
 
-`server init` collects host/identity, node/context name, hostname and external DSN;
-pins the host key; checks root/OS/arch; uploads the running binary; previews and
-applies bootstrap; sets up admin/WireGuard; tests the private channel; arms and
-confirms lockdown from a fresh connection; saves its token-free context and
-offers the interactive handoff. `login` imports that handoff. Bootstrap installs
-the binary once at `/usr/local/bin/eregion` (the systemd units use that path) and
-installs `/etc/sudoers.d/eregion-node` with only
-`NOPASSWD: /usr/local/bin/eregion node rpc`; the separate access rule covers
-setup/break-glass lockdown.
+`server init` follows MASTER 6.1. A local preflight requires the OpenSSH client
+(`ssh`, `ssh-keygen`: `missing_tool` with the platform install command), checks
+that the target answers, and requires an SSH credential. First contact is root:
+host-key TOFU with a fingerprint confirmation in a terminal,
+`--host-key-fingerprint` or `--accept-new-host-key`; the credential is
+`--identity`, ssh-agent/the default keys (an encrypted key asks for its
+passphrase only in a terminal), or `--password-stdin`. A read-only remote
+preflight then refuses an unsupported OS or architecture (Debian 13, Ubuntu
+26.04; amd64/arm64), a non-root login, less than 1 GiB RAM or 8 GiB free on `/`,
+a missing `tar` (`missing_tool` with the apt command), and existing eregion
+state. A pending init continues its own state; a new init never adopts a host
+that already has eregion state.
 
-Current bootstrap accepts an identity, ssh-agent/default keys and interactive
-encrypted-key passphrases. There is no answers TOML, password-stdin or robust
-local pending-init phase machine, and `server init` still uploads only the
-running operator binary (Linux, matching architecture); the separate node
-auto-upgrade path fetches a verified linux release. Low-level journal
-resumption is not proof that re-running `server init` after root SSH closes works.
-The age handoff is shown only on the interactive setup path; unattended handoff
-parity is not established. DNS/TLS pending is currently a warning. Its HTTPS
-probe accepts an HTTP response irrespective of status: it proves a TLS connection,
-not authenticated readiness or an application response.
+Answers are defaulted and each has a flag and an `--answers` TOML key: node
+name, server/context name, public hostname (used exactly as given, only the
+trailing dot is trimmed), external DSN file (owner-only; `EREGION_DATABASE_URL`
+is the environment fallback) and admin user. A terminal is asked only for what
+no flag or answer supplied.
 
-`server init --dry-run` still connects, pins trust and uploads a planning bundle.
-It stops before host apply; it is not an entirely side-effect-free local command.
+```toml
+host = "root@203.0.113.10"
+node = "main"
+context = "prod"
+hostname = "app.example.com"
+database_url_file = "/root/eregion-db.url"
+admin_user = "admin"
+``` The remote host plan is shown, then confirmed: a TTY
+asks, JSON/no-TTY requires `--confirm <server>`.
+
+Apply runs the versioned host steps with live progress. The node receives an
+arch-matching linux binary: the running binary when it is linux/<arch>,
+otherwise the verified release artifact for this CLI's version
+(`upgrade.FetchNodeBinary`); a dev or unarchived build refuses with the fix
+instead of pushing a non-executable macOS binary. The binary is installed once
+at `/usr/local/bin/eregion`. The main role also gets
+`/etc/eregion/vault-keyring.json` (0600, owned by the control-plane account and
+named by `EREGION_VAULT_KEY_FILE` in `control-plane.env`) and node_exporter
+1.11.1 with a pinned sha256 per architecture, listening only on
+`10.78.0.1:9100`; the access setup allows 9100 on `wg0` and starts the unit once
+`wg0` exists. `internal/access` remains the hardening/WireGuard/commit-confirm
+lockdown implementation.
+
+After lockdown the CLI pins the WireGuard host key, saves the token-free context,
+and calls node RPC `ready` as the final gate. It then checks node_exporter over
+the tunnel and builds the handoff: every server secret in plain text (operator
+keys, sudo password, DSN, vault keyring) plus an armored age transfer bundle with
+a generated passphrase and break-glass instructions. A terminal waits for
+`stored`; JSON/no-TTY requires `--secrets-out` before any change and writes the
+whole record to a new 0600 file. No API token is in the handoff.
+
+The unfinished init is saved locally under the context store directory:
+`pending/<server>/init.json` (answers, learned facts, completed phases),
+`known_hosts` and the captured `vault-keyring.json`, all 0600. `--resume`
+continues at the first incomplete phase (first contact, operator identity, host
+bootstrap, WireGuard access, context, handoff). `--discard --confirm <server>`
+drops the local state and the generated identity and warns when the host was
+already bootstrapped. New init refuses while a context or pending init for the
+same server exists. `server init --dry-run`
+still connects, pins the host key and uploads a planning bundle; it stops before
+apply and removes the pending state it created.
+
+The age handoff is shown on the interactive path and written to `--secrets-out`
+on the unattended path; both carry the same record. DNS/TLS pending is a
+warning. Its HTTPS probe accepts an HTTP response irrespective of status: it
+proves a TLS connection, not authenticated readiness or an application response.
 
 ## Host convergence and inspection
 
@@ -286,7 +328,8 @@ window.
 
 | Current path | Ownership/purpose |
 | --- | --- |
-| `/etc/eregion/control-plane.env` | Service environment incl. DSN, auth/state and transport paths; bootstrap preserves operator-added lines. |
+| `/etc/eregion/control-plane.env` | Service environment incl. DSN, auth/state, vault keyring and transport paths; bootstrap preserves operator-added lines. |
+| `/etc/eregion/vault-keyring.json` | Vault master key, 0600 for the control-plane account; never in PostgreSQL and included in the handoff. Existing key material is never overwritten. |
 | `/etc/eregion/auth.json` | Owner-only CI/webhook token hashes, actors, scopes and grants. Setup mints no operator token. |
 | `/etc/eregion/node.json` | Node name/state directory and optional operator-installed helper configuration. |
 | `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles, commit-confirm snapshots, the recorded host intent (`intent.json`) and owner-only copies of its TLS/key inputs (`inputs/`). |
@@ -294,8 +337,10 @@ window.
 | `/var/lib/eregion/access/` | Operator-access snapshot and lockdown state; separate from bootstrap commit-confirm. |
 | `/etc/caddy/Caddyfile` | Bootstrap-owned main hostname config, importing routes. |
 | `/etc/caddy/eregion.d/routes.caddy` | Worker-owned generated app host routes. |
+| `/usr/local/bin/node_exporter`, `/etc/systemd/system/node-exporter.service` | Pinned exporter and its unit, bound to the WireGuard address only; the access setup opens 9100 on `wg0`. |
 | OS config dir + `/eregion/contexts.json` | Owner-only context store (SSH/WireGuard route and `auto_upgrade_nodes`); overridden by `EREGION_CONTEXT_FILE`. No API token. |
 | Context store's parent + `/servers/<context>/` | Operator SSH key, WireGuard key and sudo password files. |
+| Context store's parent + `/pending/<server>/` | Unfinished `server init`: answers, phases, pinned host keys and the captured vault keyring (0700 directory, 0600 files). |
 | `/etc/sudoers.d/eregion-node` | Admin's passwordless `/usr/local/bin/eregion node rpc` rule, validated by `visudo`. |
 
 Node effect identity is `operation:step`, stable across attempts. Execution

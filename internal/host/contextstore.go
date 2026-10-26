@@ -131,6 +131,15 @@ func validateContext(context Context) error {
 	return nil
 }
 
+// ValidateContextName checks a server/context name before any local state is
+// written.
+func ValidateContextName(name string) error {
+	if !contextNamePattern.MatchString(name) {
+		return contract.NewFault(contract.ValidationFailed, "invalid server name "+name, "Use lowercase letters, digits, hyphens, or underscores, starting with a letter or digit.")
+	}
+	return nil
+}
+
 // Save writes the store atomically with mode 0600.
 func (s *ContextStore) Save() error {
 	if s.Path == "" {

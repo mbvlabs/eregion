@@ -413,29 +413,17 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 	var files []host.RemoteFile
 	binary, err := cfg.EffectiveBinaryPath()
 	if err != nil {
-		return nil, nil, contract.NewFault(contract.ValidationFailed, "cannot locate the eregion binary", "Supply --binary explicitly.")
+		return nil, nil, contract.NewFault(contract.ValidationFailed, "cannot locate the node binary", "Supply --binary explicitly.")
 	}
-	raw, err := os.ReadFile(binary) //nolint:gosec // G304: the running/operator-selected binary.
+	raw, err := os.ReadFile(binary) //nolint:gosec // G304: the operator-selected node binary.
 	if err != nil {
 		return nil, nil, err
 	}
 	files = append(files, host.RemoteFile{Name: "eregion", Data: raw, Mode: 0o755})
 	args := []string{"--role", string(cfg.Role), "--node", cfg.Node}
-	if cfg.BinaryPath == "" {
-		cfg.BinaryPath = filepath.Join(dir, "eregion")
-		args = append(args, "--binary", cfg.BinaryPath)
-	} else {
-		rawBinary, err := os.ReadFile(cfg.BinaryPath) //nolint:gosec // G304: operator-provided binary.
-		if err != nil {
-			return nil, nil, err
-		}
-		if contentEqual(rawBinary, raw) {
-			args = append(args, "--binary", filepath.Join(dir, "eregion"))
-		} else {
-			files = append(files, host.RemoteFile{Name: "eregion-source", Data: rawBinary, Mode: 0o755})
-			args = append(args, "--binary", filepath.Join(dir, "eregion-source"))
-		}
-	}
+	// The uploaded binary is the one the step installs at /usr/local/bin, so a
+	// macOS operator never tries to execute its own binary on the node.
+	args = append(args, "--binary", filepath.Join(dir, "eregion"))
 	if cfg.DatabaseURL != "" {
 		files = append(files, host.RemoteFile{Name: "database-url", Data: []byte(cfg.DatabaseURL + "\n"), Mode: 0o600})
 		args = append(args, "--database-url-file", filepath.Join(dir, "database-url"))
@@ -485,10 +473,6 @@ func shellPath(value string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
-}
-
-func contentEqual(left, right []byte) bool {
-	return bytes.Equal(left, right)
 }
 
 func decodeRemoteEnvelope[T any](raw []byte, action string) (T, error) {

@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,11 +15,53 @@ import (
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/transport"
+	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
+
+// firstContactAuth is the server init credential choice (MASTER 6.1 step 2):
+// --password-stdin, then --identity, then ssh-agent and the default ~/.ssh
+// keys. The password is read from stdin, never a flag. An encrypted identity is
+// unlocked with a prompt only in a terminal.
+func firstContactAuth(cmd *cobra.Command, identity string, prompt bool, registry *secrets.Registry) ([]ssh.AuthMethod, error) {
+	if flag, _ := cmd.Flags().GetBool("password-stdin"); flag {
+		password, err := readFirstLine(cmd.InOrStdin())
+		if err != nil {
+			return nil, err
+		}
+		if password == "" {
+			return nil, contract.NewFault(contract.InputRequired, "--password-stdin read an empty line", "Pipe the root password as the first line of standard input.")
+		}
+		if registry != nil {
+			registry.Add(password)
+		}
+		answers := func(_, _ string, questions []string, echos []bool) ([]string, error) {
+			replies := make([]string, len(questions))
+			for i := range questions {
+				if !echos[i] {
+					replies[i] = password
+				}
+			}
+			return replies, nil
+		}
+		return []ssh.AuthMethod{ssh.Password(password), ssh.KeyboardInteractive(answers)}, nil
+	}
+	return sshAuth(identity, prompt)
+}
+
+// readFirstLine reads one line, bounded, for a password supplied on stdin.
+func readFirstLine(r io.Reader) (string, error) {
+	reader := bufio.NewReader(io.LimitReader(r, 4096))
+	line, err := reader.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return "", contract.NewFault(contract.InputRequired, "could not read the SSH password from stdin", err.Error())
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
 
 // sshAuth picks the SSH credential the way OpenSSH does: an explicit
 // identity, otherwise ssh-agent keys plus the default ~/.ssh keys in one

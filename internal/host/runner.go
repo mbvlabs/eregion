@@ -211,6 +211,9 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 			steps = append(steps, &tlsStep{cfg: r.Config})
 		}
 		steps = append(steps, &databaseStep{cfg: r.Config, database: r.Database})
+		// Before the credentials file that names EREGION_VAULT_KEY_FILE and
+		// before the services that load it.
+		steps = append(steps, &vaultKeyringStep{cfg: r.Config})
 		steps = append(steps, &credentialsStep{cfg: r.Config, credentials: credentials})
 		// Before the services: the worker's unit makes the routes dir writable,
 		// which must exist when it starts.
@@ -222,6 +225,9 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 	if role.ControlPlane {
 		steps = append(steps, newAPIService(r.Config, r.Exec), newWorkerService(r.Config, r.Exec))
 		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe})
+		// node_exporter listens on the node's WireGuard address only. It is
+		// installed here and started by the access setup once wg0 exists.
+		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec})
 	}
 	if role.NodeAgent {
 		steps = append(steps, &nodeConfigStep{cfg: r.Config})

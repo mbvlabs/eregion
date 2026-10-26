@@ -113,19 +113,25 @@ terminal, some need a human, and a retry may need the same idempotency key.
 ### Server setup and login
 
 `eregion server init` contacts the server, shows a plan and applies versioned
-host steps. In JSON or no-TTY use, pass every answer and
-`--accept-new-host-key` or `--host-key-fingerprint`; it never prompts.
+host steps, then shows or writes the secrets handoff. In JSON or no-TTY use,
+pass every answer, `--accept-new-host-key` or `--host-key-fingerprint`,
+`--secrets-out` and `--confirm <server>`; it never prompts. The external
+database URL is a protected file, never an argument.
 
 ```sh
 eregion server init --host root@203.0.113.10 --hostname app.example.com \
-  --database-url-file /protected/database-url \
-  --accept-new-host-key --dry-run --json
+  --database-url-file /protected/database-url --context-name prod \
+  --accept-new-host-key --secrets-out /protected/prod-secrets.txt \
+  --confirm prod --json
 ```
 
-`eregion login` imports the transfer bundle from the handoff into a local
+An interrupted init is resumed with `--resume --context-name <server>` and a
+first-contact credential; `--discard --confirm <server>` drops only the local
+state. `eregion login` imports the transfer bundle from the handoff into a local
 context. Use `--file` and `--passphrase-file` when no terminal is available.
 `eregion context list|show|use` inspects and selects contexts without printing
-credentials.
+credentials; `context remove <name> --confirm <name>` deletes one with its key
+files.
 
 ### Domains
 

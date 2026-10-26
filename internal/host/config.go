@@ -155,6 +155,23 @@ func plainAccount(value string) bool {
 	return true
 }
 
+// ValidateAccountName checks a Unix account name before it reaches a host
+// script.
+func ValidateAccountName(name string) error {
+	if !plainAccount(name) {
+		return contract.NewFault(contract.ValidationFailed, "invalid account name "+name, "Use a plain lowercase Unix account name of at most 32 characters.")
+	}
+	return nil
+}
+
+// ValidateNodeName checks a node name before bootstrap records it.
+func ValidateNodeName(name string) error {
+	if err := engine.ValidateNodeName(name); err != nil {
+		return contract.NewFault(contract.ValidationFailed, "invalid node name "+name, "Use 1–64 lowercase letters, digits, hyphens, or underscores.")
+	}
+	return nil
+}
+
 // Validate checks the complete intent before it can reach a step. It does not
 // require the host filesystem to be writable; Plan uses the same validation so
 // an unsupported mode is visible before apply.

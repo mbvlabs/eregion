@@ -56,6 +56,9 @@ func (s *credentialsStep) managedEnv() []string {
 		envLine("EREGION_NODE_WG_KEY_DIR", filepath.Join(s.cfg.Layout.DataDir, "control-plane", "wireguard")),
 		envLine("EREGION_NODE_WG_ADDRESS", "10.77.0.1"),
 		envLine("EREGION_NODE_WG_SUBNET", "10.77.0.0/24"),
+		// server init generates this keyring before the control plane starts;
+		// the secrets service refuses rather than silently running without it.
+		envLine("EREGION_VAULT_KEY_FILE", VaultKeyringPath(s.cfg)),
 	}
 }
 

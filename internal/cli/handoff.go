@@ -1,17 +1,22 @@
 package cli
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/bundle"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/engine"
 )
 
 // clearScreen clears the screen and, where the terminal supports it, the
@@ -27,30 +32,35 @@ type handoffGroup struct {
 	fields []handoffField
 }
 
-// secretsHandoff is the record server init hands to the operator: eregion keeps
-// only the operator's SSH and WireGuard keys in the local context, so this is
-// the copy that survives losing this machine.
+// secretsHandoff is the record server init hands to the operator: every server
+// secret in plain text plus an armored age transfer bundle. eregion keeps only
+// the operator's SSH and WireGuard keys in the local context, so this is the
+// copy that survives losing this machine.
 type secretsHandoff struct {
 	node       string
 	groups     []handoffGroup
-	saved      string
 	passphrase string
 	bundle     []byte
+	// path is the --secrets-out record; empty when the operator only sees it
+	// on screen.
+	path string
 }
 
-// seal encrypts the record into the transfer bundle with a new passphrase,
-// as vaire does; eregion login takes the bundle and the passphrase.
-func (h *secretsHandoff) seal() error {
+// newSecretsHandoff encrypts the record into a transfer bundle with a new
+// passphrase. Nothing is written here; writeRecord is the explicit
+// --secrets-out step.
+func newSecretsHandoff(node string, groups []handoffGroup) (*secretsHandoff, error) {
+	h := &secretsHandoff{node: node, groups: groups}
 	pass, err := bundle.NewPassphrase()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sealed, err := bundle.Encrypt([]byte(h.body()), pass)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	h.passphrase, h.bundle = pass, sealed
-	return nil
+	return h, nil
 }
 
 // record is every value, then the transfer bundle and its passphrase.
@@ -62,44 +72,87 @@ func (h *secretsHandoff) record() string {
 
 func (h *secretsHandoff) body() string {
 	var b strings.Builder
-	b.WriteString("eregion secrets handoff for main node " + h.node + "\n")
+	b.WriteString("eregion secrets handoff for server " + h.node + "\n")
 	for _, g := range h.groups {
 		b.WriteString("\n## " + g.title + "\n")
 		for _, f := range g.fields {
-			if f.value != "" {
-				b.WriteString(f.label + ": " + f.value + "\n")
+			v := strings.TrimRight(f.value, "\n")
+			if v == "" {
+				continue
 			}
+			if strings.Contains(v, "\n") {
+				b.WriteString(f.label + ":\n" + strings.TrimLeft(v, "\r\n") + "\n")
+				continue
+			}
+			b.WriteString(f.label + ": " + v + "\n")
 		}
 	}
 	return b.String()
 }
 
-// show is the handoff gate: copy, save or show the record, then type
-// 'stored'. Like vaire, nothing is written unless the operator saves it.
+// writeRecord writes the whole record (secrets, bundle and passphrase) to an
+// explicit owner-only file, atomically. It never overwrites a file the operator
+// did not name for this init.
+func (h *secretsHandoff) writeRecord(path string, overwrite bool) error {
+	path = expandHome(strings.TrimSpace(path))
+	if path == "" {
+		return contract.NewFault(contract.InputRequired, "--secrets-out needs a path", "Pass a new file path.")
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	if !overwrite {
+		if _, err := os.Lstat(path); err == nil {
+			fault := contract.NewFault(contract.PreconditionFailed, path+" already exists", "Move it away or choose another --secrets-out path.")
+			fault.Details = map[string]any{"reason": "secrets_out_exists", "path": path}
+			return fault
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return contract.NewFault(contract.ValidationFailed, "could not inspect the secrets handoff path", err.Error())
+		}
+	}
+	if err := engine.WriteFileAtomic(path, []byte(h.record()), 0o600); err != nil {
+		return contract.NewFault(contract.ValidationFailed, "could not write the secrets handoff", err.Error())
+	}
+	h.path = path
+	return nil
+}
+
+// show is the handoff gate: copy or show the record, then type 'stored'. It
+// never writes a file by itself.
 func (h *secretsHandoff) show(w io.Writer) error {
 	resume := ui.Suspend()
 	defer resume()
 	_, _ = fmt.Fprintln(w, "\n"+ui.Header("Secrets handoff", 72))
-	_, _ = fmt.Fprintln(w, "The main node's record: the operator's keys, the database URL and the server's identity.")
+	_, _ = fmt.Fprintln(w, "The server's record: the operator's keys, the sudo password, the database URL and the vault keyring.")
 	_, _ = fmt.Fprintln(w, "eregion doesn't show it again. Store it in your password manager.")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, ui.Dim("Bundle passphrase")+"  "+h.passphrase)
+	if h.path != "" {
+		_, _ = fmt.Fprintln(w, ui.Note("The full record was written to "+h.path+". Keep the passphrase apart from the file."))
+	}
 	_, _ = fmt.Fprintln(w, ui.Note("To log in from another machine: eregion login, paste the transfer bundle, then this passphrase."))
 	_, _ = fmt.Fprintln(w)
 	for {
-		options := [][2]string{{"Copy everything to the clipboard", "copy"}}
-		if h.saved == "" {
-			options = append(options, [2]string{"Save everything to a file", "save"})
-		}
-		options = append(options, [2]string{"Show everything on screen", "print"}, [2]string{"Done", "done"})
-		choice, err := ui.Choose("Secrets handoff", "", options)
+		choice, err := ui.Choose("Secrets handoff", "", [][2]string{
+			{"Copy everything to the clipboard", "copy"},
+			{"Show everything on screen", "print"},
+			{"Done", "done"},
+		})
 		if err != nil {
 			return err
 		}
-		if choice == "done" {
-			break
-		}
 		switch choice {
+		case "done":
+			if err := ui.TypeWord("Type 'stored' once the record is in your password manager", "", "stored"); err != nil {
+				if errors.Is(err, ui.ErrAborted) {
+					return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the context is saved locally; run server init --resume to show the handoff again.")
+				}
+				return err
+			}
+			if clear, err := ui.YesNoDefault("Clear the screen now?", "", true); err == nil && clear {
+				_, _ = fmt.Fprint(w, clearScreen)
+			}
+			return nil
 		case "copy":
 			_, _ = fmt.Fprint(w, osc52(h.record()))
 			_, _ = fmt.Fprintln(w, ui.Note("Copied to your clipboard. Nothing pasted? Pick Show everything on screen."))
@@ -107,60 +160,97 @@ func (h *secretsHandoff) show(w io.Writer) error {
 			_, _ = fmt.Fprintln(w)
 			_, _ = fmt.Fprint(w, h.record())
 			_, _ = fmt.Fprintln(w)
-		case "save":
-			if err := h.save(); err != nil {
-				_, _ = fmt.Fprintln(w, ui.Note(err.Error()))
-				continue
-			}
-			_, _ = fmt.Fprintln(w, ui.Note("Saved everything to "+h.saved+" (plain text, readable only by you)."))
 		}
 	}
-	if err := ui.TypeWord("Type 'stored' once the record is in your password manager", "", "stored"); err != nil {
-		if errors.Is(err, ui.ErrAborted) {
-			return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the context is saved locally.")
-		}
-		return err
-	}
-	if clear, err := ui.YesNoDefault("Clear the screen now?", "", true); err == nil && clear {
-		_, _ = fmt.Fprint(w, clearScreen)
-	}
-	return nil
-}
-
-// save writes the record to a path relative to the current directory, owner
-// only, and never overwrites a file.
-func (h *secretsHandoff) save() error {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	path, err := ui.Input("Save everything to (relative to "+cwd+")", "", "./"+h.node+"-secrets.txt")
-	if err != nil {
-		return err
-	}
-	path = expandHome(path)
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(cwd, path)
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) //nolint:gosec // G304: the operator chose this path.
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return errors.New(path + " already exists; pick another path")
-		}
-		return err
-	}
-	if _, err := file.WriteString(h.record()); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	h.saved = path
-	return nil
 }
 
 // osc52 asks the terminal to put s on the system clipboard; it works over SSH.
 func osc52(s string) string {
 	return "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(s)) + "\a"
+}
+
+// handoff builds and delivers the record. Without a terminal the early gate has
+// already required --secrets-out; with one, init waits for 'stored'.
+func (r *serverInit) handoff(_ context.Context, summary *serverInitSummary) error {
+	task := r.start("handoff", "Building the secrets handoff")
+	// Register the actual secrets, not public labels: the JSON summary and
+	// ordinary output stay readable while credentials are redacted.
+	r.a.secrets.Add(r.identity.sudoPassword, r.identity.wg.Encode(), r.identity.sshKeyPEM, r.answers.DatabaseURL, r.vaultKeyring)
+	h, err := newSecretsHandoff(r.answers.Context, r.handoffGroups())
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return err
+	}
+	r.a.secrets.Add(h.passphrase)
+	out := flagString(r.cmd, "secrets-out")
+	if out == "" {
+		out = r.pending.SecretsOut
+	}
+	if out != "" {
+		overwrite := r.pending.SecretsOut != "" && samePath(out, r.pending.SecretsOut)
+		if err := h.writeRecord(out, overwrite); err != nil {
+			task.end(ui.EndFail, "")
+			return err
+		}
+		r.pending.SecretsOut = h.path
+		if err := r.savePending(); err != nil {
+			task.end(ui.EndFail, "")
+			return err
+		}
+		summary.SecretsOut = h.path
+	}
+	task.end(ui.EndOK, h.path)
+	if !r.interactive {
+		return nil
+	}
+	if err := h.show(r.cmd.ErrOrStderr()); err != nil {
+		return err
+	}
+	return nil
+}
+
+func samePath(left, right string) bool {
+	l, err1 := filepath.Abs(expandHome(left))
+	r, err2 := filepath.Abs(expandHome(right))
+	return err1 == nil && err2 == nil && l == r
+}
+
+// handoffGroups is the password-manager shape of the record. Every value here
+// is a handoff exception: it is shown once and never becomes ordinary output.
+func (r *serverInit) handoffGroups() []handoffGroup {
+	groups := []handoffGroup{
+		{title: "Main node " + r.answers.Node, fields: []handoffField{
+			{"Node name", r.answers.Node},
+			{"Context", r.answers.Context},
+			{"Hostname", r.answers.Hostname},
+			{"Public address", r.answers.Host},
+			{"Platform", r.platform.String()},
+			{"SSH host key", r.hostKey},
+			{"WireGuard endpoint", net.JoinHostPort(r.answers.Host, strconv.Itoa(access.ListenPort))},
+			{"WireGuard address", access.NodeAddress},
+			{"WireGuard public key", r.pending.NodePublicKey},
+		}},
+		{title: "Operator", fields: []handoffField{
+			{"Admin user", r.answers.AdminUser},
+			{"Context", r.answers.Context},
+			{"SSH user", r.answers.AdminUser},
+			{"Sudo password", r.identity.sudoPassword},
+			{"WireGuard address", access.OperatorAddress},
+			{"WireGuard private key", r.identity.wg.Encode()},
+			{"SSH private key", strings.TrimSpace(r.identity.sshKeyPEM)},
+		}},
+		{title: "Control-plane database", fields: []handoffField{
+			{"URL", r.answers.DatabaseURL},
+		}},
+		{title: "Vault keyring", fields: []handoffField{
+			{"EREGION_VAULT_KEY_FILE content", r.vaultKeyring},
+		}},
+		{title: "Break-glass", fields: []handoffField{
+			{"When", "Only when WireGuard or the node is unreachable."},
+			{"How", "Use the provider console as root and run `eregion node unlock-ssh` (on builds before that command lands: `/usr/local/bin/eregion node-agent access revert`). It reopens public SSH for its fixed window."},
+			{"Public SSH", "Closed after server init; sshd accepts the admin user over WireGuard only."},
+			{"Recovery", "The transfer bundle above rebuilds the context on another machine. Without it, use the provider console and this record."},
+		}},
+	}
+	return groups
 }

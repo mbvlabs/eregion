@@ -28,8 +28,8 @@ metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
 ```
 
 MASTER adds vaire's codes to this table as their flows land: `missing_tool`
-(preflight), `remote_unreachable` and `partial_failure`. `node_version_mismatch`
-is implemented for node RPC lockstep.
+(preflight, with `details.install_command`), `remote_unreachable` and
+`partial_failure`. `node_version_mismatch` is implemented for node RPC lockstep.
 
 Readers ignore unknown optional object fields and handle unknown enum members
 explicitly, never as success. Breaking changes to existing field meaning/type,
@@ -39,11 +39,11 @@ Binary, node-protocol and database versions are separate from envelope version.
 | Exit | Error codes / meaning |
 | --- | --- |
 | 0 | Successful request/observation. Submission means accepted, not completed. |
-| 2 | `usage_error`, `invalid_output_mode`, `input_required`, `validation_failed` |
+| 2 | `usage_error`, `invalid_output_mode`, `input_required`, `validation_failed`, `missing_tool` |
 | 3 | `not_found` |
 | 4 | `unauthenticated`, `forbidden` |
 | 5 | `precondition_failed`, `confirmation_required`, `conflict`, `node_version_mismatch` |
-| 6 | `unavailable`, including request deadlines |
+| 6 | `unavailable`, `remote_unreachable`, including request deadlines |
 | 70 | `internal_error`, including output failure |
 | 130 | `cancelled` for interrupted client/viewer |
 
@@ -153,13 +153,14 @@ different protections. Current mechanisms vary:
   this is not an unforgeable server approval. An authenticated client can submit
   the same registered action directly.
 - Upgrades have their own confirmation/precondition mechanisms.
-- Current `server init --yes` bypasses its interactive apply question; it must
-  never be reused as the human factor for future token issuance.
+- `server init` asks in a terminal and requires `--confirm <server>` otherwise.
+  `--yes` no longer exists; it was never a human factor.
 
 The target is MASTER D12: destructive commands take `--confirm <target>`
 (`<app>`, `<app>/<env>`, `<server>`), `--yes` alone never suffices, and the node
-validates the token against current state. Token issuance needs the D7 human
-factor. A public digest is never a credential.
+validates the token against current state. Metadata marks those target-naming
+tokens `"confirmation": "target"`; plan-digest commands use `"plan-bound"`.
+Token issuance needs the D7 human factor. A public digest is never a credential.
 
 ## Secret and terminal safety
 
