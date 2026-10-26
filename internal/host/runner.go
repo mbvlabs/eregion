@@ -86,7 +86,7 @@ type ApplyReport struct {
 	Resumed     bool         `json:"resumed"`
 	CompletedAt time.Time    `json:"completed_at"`
 	// Pending is true when an access-changing apply is live but not yet
-	// committed by bootstrap confirm.
+	// committed by node bootstrap confirm.
 	Pending        bool           `json:"pending,omitempty"`
 	CommitDeadline time.Time      `json:"commit_deadline,omitempty"`
 	AccessChanges  []AccessChange `json:"access_changes,omitempty"`
@@ -103,8 +103,8 @@ type ApplyEntry struct {
 
 // Status is the node-local bootstrap state plus the persisted step journal. It
 // deliberately does not evaluate drift: status works without the database URL,
-// binary, or other apply-only inputs. Run `bootstrap plan` when those inputs
-// are available to observe drift.
+// binary, or other apply-only inputs. Run `node bootstrap plan` when those
+// inputs are available to observe drift.
 type Status struct {
 	Bootstrapped bool `json:"bootstrapped"`
 	Complete     bool `json:"complete"`
@@ -139,7 +139,7 @@ func NewRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
 	return newRunner(cfg, registry), nil
 }
 
-// NewConfirmRunner is the narrow constructor for `bootstrap confirm`. It needs
+// NewConfirmRunner is the narrow constructor for `node bootstrap confirm`. It needs
 // only the host layout, not the database URL or credential outputs that the
 // original apply used; those values are in the journal.
 func NewConfirmRunner(cfg Config, registry *secrets.Registry) (*Runner, error) {
@@ -391,7 +391,7 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 		if r.now().Before(state.CommitDeadline) {
 			return report, pendingCommitFault(report, "this access-changing apply is already waiting for confirmation")
 		}
-		return report, contract.NewFault(contract.PreconditionFailed, "the previous rollback window has expired", "Inspect the host, then run bootstrap plan again. Do not assume the pending access change is live.")
+		return report, contract.NewFault(contract.PreconditionFailed, "the previous rollback window has expired", "Inspect the host, then run node bootstrap plan again. Do not assume the pending access change is live.")
 	}
 	if err := ensureState(r.Config); err != nil {
 		return ApplyReport{}, err
@@ -484,7 +484,7 @@ func pendingCommitFault(report ApplyReport, message string) error {
 	return &contract.Fault{
 		Code:    contract.ConfirmationRequired,
 		Message: message,
-		Hint:    "Verify the host is reachable over the new access path, then run: eregion bootstrap confirm " + report.OperationID,
+		Hint:    "Verify the host is reachable over the new access path, then run: eregion node bootstrap confirm " + report.OperationID,
 		Details: map[string]any{
 			"operation_id":   report.OperationID,
 			"deadline":       report.CommitDeadline.UTC().Format(time.RFC3339),

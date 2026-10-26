@@ -12,7 +12,7 @@ import (
 
 func TestBootstrapStatusNeedsNoApplyInputs(t *testing.T) {
 	t.Setenv("EREGION_DATABASE_URL", "")
-	code, stdout, stderr := invoke(t, "bootstrap", "status", "--role", "main", "--node", "main", "--json")
+	code, stdout, stderr := invoke(t, "node", "bootstrap", "status", "--role", "main", "--node", "main", "--json")
 	if code != 0 {
 		t.Fatalf("status: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}

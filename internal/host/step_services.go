@@ -169,7 +169,7 @@ func applyUnit(ctx context.Context, exec Exec, path string, desired []byte, serv
 }
 
 func apiServiceUnit(cfg Config) []byte {
-	args := []string{"serve", "--listen", cfg.APIListen, "--workers=false"}
+	args := []string{"node", "serve", "--listen", cfg.APIListen, "--workers=false"}
 	if cfg.APITLSCert != "" {
 		args = append(args, "--tls-cert", filepath.Join(cfg.Layout.ConfigDir, "tls", "server.crt"))
 		args = append(args, "--tls-key", filepath.Join(cfg.Layout.ConfigDir, "tls", "server.key"))
@@ -215,7 +215,7 @@ User=%s
 Group=%s
 SupplementaryGroups=docker
 EnvironmentFile=%s
-ExecStart=%s worker --concurrency %d
+ExecStart=%s node worker --concurrency %d
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

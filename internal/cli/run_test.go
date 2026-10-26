@@ -119,13 +119,22 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 		t.Fatal(err)
 	}
 	implemented := newApp()
-	if len(data.Commands) != len(walk(implemented.root)) {
-		t.Fatalf("catalog does not match implemented tree: %d commands", len(data.Commands))
+	visible := 0
+	for _, cmd := range walk(implemented.root) {
+		if !commandHidden(cmd) {
+			visible++
+		}
+	}
+	if len(data.Commands) != visible {
+		t.Fatalf("catalog does not match the operator tree: %d commands", len(data.Commands))
 	}
 	seen := map[string]bool{}
 	for _, command := range data.Commands {
 		if seen[command.Path] {
 			t.Fatalf("duplicate catalog command: %s", command.Path)
+		}
+		if strings.HasPrefix(command.Path, "eregion node") {
+			t.Fatalf("node-mode command leaked into the operator catalog: %s", command.Path)
 		}
 		seen[command.Path] = true
 		events := command.Path == "eregion operations follow" && command.Output == "events"

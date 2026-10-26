@@ -37,8 +37,8 @@ func (c AccessChange) String() string {
 }
 
 // CommitState is the persisted view of one armed rollback window. It is part of
-// the bootstrap state file, so a later `bootstrap confirm` can find it without
-// depending on the platform database.
+// the bootstrap state file, so a later `node bootstrap confirm` can find it
+// without depending on the platform database.
 type CommitState struct {
 	Path     string    `json:"path"`
 	Deadline time.Time `json:"deadline"`
@@ -459,7 +459,7 @@ func (r *Runner) Confirm(ctx context.Context, operationID string) (ConfirmReport
 		return ConfirmReport{}, err
 	}
 	if !exists {
-		return ConfirmReport{}, contract.NewFault(contract.NotFound, "no bootstrap state is present", "Run bootstrap plan and apply first.")
+		return ConfirmReport{}, contract.NewFault(contract.NotFound, "no bootstrap state is present", "Run node bootstrap plan and apply first.")
 	}
 	if operationID == "" {
 		operationID = state.OperationID
@@ -488,7 +488,7 @@ func (r *Runner) Confirm(ctx context.Context, operationID string) (ConfirmReport
 	if _, _, rolledBack, err := fileState(commitRolledBackPath(r.Config, operationID)); err != nil {
 		return ConfirmReport{}, err
 	} else if rolledBack {
-		return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the access change was already rolled back", "Inspect the host and run bootstrap plan again; do not confirm a state that is no longer live.")
+		return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the access change was already rolled back", "Inspect the host and run node bootstrap plan again; do not confirm a state that is no longer live.")
 	}
 	now := r.now()
 	if now.After(manifest.Deadline) {
@@ -498,7 +498,7 @@ func (r *Runner) Confirm(ctx context.Context, operationID string) (ConfirmReport
 		if err := r.rollbackCommit(operationID); err != nil {
 			return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed and the snapshot could not be restored", "Inspect the host and the commit snapshot manually; do not assume the new state is live.")
 		}
-		return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed", "The previous access state was restored. Inspect the host and run bootstrap plan again; do not assume the new state is live.")
+		return ConfirmReport{}, contract.NewFault(contract.PreconditionFailed, "the rollback deadline has passed", "The previous access state was restored. Inspect the host and run node bootstrap plan again; do not assume the new state is live.")
 	}
 	if err := os.WriteFile(commitConfirmedPath(r.Config, operationID), []byte(now.UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
 		return ConfirmReport{}, err
@@ -659,7 +659,7 @@ func engineWithStateLock(cfg Config, mutate func(*State) error) error {
 			return err
 		}
 		if !exists {
-			return contract.NewFault(contract.PreconditionFailed, "the bootstrap state is missing", "Run bootstrap plan and apply again.")
+			return contract.NewFault(contract.PreconditionFailed, "the bootstrap state is missing", "Run node bootstrap plan and apply again.")
 		}
 		if err := mutate(&state); err != nil {
 			return err

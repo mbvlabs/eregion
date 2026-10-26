@@ -2,7 +2,7 @@
 
 [tui-design.md](tui-design.md) remains the dedicated **design specification** and
 links to the synthetic interactive sketches. [MASTER](MASTER.md) owns product
-scope/status. This file maps the existing views, not another UI roadmap.
+scope/status. This file maps the existing views, not another UI plan.
 
 ## Presentation boundaries
 

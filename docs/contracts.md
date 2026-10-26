@@ -110,7 +110,7 @@ counters are decimal JSON **strings**; attempt is a bounded JSON integer.
 Kinds: state, step, log, warning and measured progress. Optional health, duration,
 release and serving-release observations are rendered only when present.
 
-`operations events` reads a JSON page. `operations follow` polls snapshots/pages,
+`operations follow` polls snapshots and event pages,
 deduplicates sequences and refreshes after reconnect. Missing history/gaps are
 explicit, not silently skipped. Connecting/live/stale/reconnecting are viewer
 states, separate from operation state. Stale means **last known**, not stopped.

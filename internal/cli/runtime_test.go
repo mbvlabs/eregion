@@ -187,20 +187,3 @@ func TestWireGuardTransportRefusesAnUnsafeConfiguration(t *testing.T) {
 		})
 	}
 }
-
-// TestWorkerMetadataListsTheWireGuardEnvironment proves that the command
-// catalog advertises the WireGuard variables next to the SSH ones.
-func TestWorkerMetadataListsTheWireGuardEnvironment(t *testing.T) {
-	code, out, _ := invoke(t, "commands", "--json")
-	if code != 0 {
-		t.Fatalf("commands failed: %s", out)
-	}
-	for _, name := range []string{"EREGION_NODE_WG_PRIVATE_KEY_FILE", "EREGION_NODE_WG_ADDRESS", "EREGION_NODE_WG_PEER_PUBLIC_KEY", "EREGION_NODE_WG_ENDPOINT", "EREGION_NODE_WG_ALLOWED_IPS", "EREGION_NODE_WG_KEEPALIVE"} {
-		if !strings.Contains(out, name) {
-			t.Fatalf("the command catalog does not list %s", name)
-		}
-	}
-	if strings.Contains(out, `"EREGION_NODE_WG_PRIVATE_KEY"`) {
-		t.Fatal("the catalog advertises a private key value variable")
-	}
-}

@@ -49,7 +49,7 @@ type RoleConfig struct {
 	// Builder installs the pinned Cloud Native Buildpacks pack CLI.
 	Builder bool `json:"buildpacks"`
 	// Registry runs the local OCI registry. Only the main role has it by
-	// default, matching the roadmap's placement decision.
+	// default: builds run on the main node before v1.
 	Registry bool `json:"registry"`
 	// NodeAgent installs the node binary, node configuration, and state
 	// directory reached over the pinned node transport.

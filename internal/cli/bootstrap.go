@@ -21,14 +21,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// bootstrapSpecs is attached by newApp. It is the local control-plane
-// bootstrap surface plus a pinned-SSH first-contact command. No placeholder
-// actions are registered: every child below runs real Check/Apply steps or a
-// real remote command.
+// bootstrapSpecs is attached under the hidden node group by newApp. It is the
+// local control-plane bootstrap surface plus a pinned-SSH first-contact command.
+// No placeholder actions are registered: every child below runs real
+// Check/Apply steps or a real remote command.
 func (a *app) bootstrapSpecs() []spec {
 	parentMeta := readMeta("Bootstrap a supported Debian/Ubuntu host",
 		[]string{"Plan and converge one fresh host with a node-local journal that never depends on PostgreSQL. Access-changing apply returns a rollback window; confirm it from a fresh connection."},
-		[]string{"eregion bootstrap plan --role main --node main --database-url-file /root/eregion-db.url --json", "eregion bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --database-url-file /root/eregion-db.url --apply --json"})
+		[]string{"eregion node bootstrap plan --role main --node main --database-url-file /root/eregion-db.url --json", "eregion node bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --database-url-file /root/eregion-db.url --apply --json"})
+	parentMeta.Audience = []string{"node"}
 	parentMeta.Platforms = []string{"linux"}
 	parentMeta.Environment = []string{"EREGION_DATABASE_URL"}
 	parentMeta.ErrorCodes = append(parentMeta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired, contract.Forbidden, contract.NotFound)
@@ -56,7 +57,7 @@ func (a *app) bootstrapActionSpec(action string, mutating bool, parent CommandMe
 	meta.Mutating = mutating
 	if mutating {
 		meta.DryRun, meta.Confirmation, meta.NeedsRestart = true, "plan-bound", "required"
-		meta.Examples = []string{"eregion bootstrap apply --role main --node main --database-url-file /root/eregion-db.url --apply --confirm TOKEN --json"}
+		meta.Examples = []string{"eregion node bootstrap apply --role main --node main --database-url-file /root/eregion-db.url --apply --confirm TOKEN --json"}
 	}
 	return spec{use: action, meta: meta, flags: bootstrapFlags, run: func(cmd *cobra.Command, _ []string) (result, error) {
 		if action == "apply" {
@@ -99,11 +100,11 @@ func (a *app) bootstrapLocalApply(cmd *cobra.Command) (result, error) {
 	}
 	apply, _ := cmd.Flags().GetBool("apply")
 	if !apply {
-		return result{}, contract.NewFault(contract.ConfirmationRequired, "host mutation requires --apply", "Run bootstrap plan (or apply --dry-run), review the diff, then supply --apply and --confirm with its plan token.")
+		return result{}, contract.NewFault(contract.ConfirmationRequired, "host mutation requires --apply", "Run node bootstrap plan (or apply --dry-run), review the diff, then supply --apply and --confirm with its plan token.")
 	}
 	confirm, _ := cmd.Flags().GetString("confirm")
 	if confirm == "" {
-		return result{}, contract.NewFault(contract.ConfirmationRequired, "--confirm is required for bootstrap apply", "Run bootstrap plan, review the plan and diff, then pass its confirmation token.")
+		return result{}, contract.NewFault(contract.ConfirmationRequired, "--confirm is required for bootstrap apply", "Run node bootstrap plan, review the plan and diff, then pass its confirmation token.")
 	}
 	runner.Reporter = bootstrapReporter(a, cmd)
 	report, err := runner.Apply(cmd.Context(), confirm, false)
@@ -114,8 +115,8 @@ func (a *app) bootstrapConfirmSpec(parent CommandMeta) spec {
 	meta := parent
 	meta.Summary = "Confirm an access-changing bootstrap before its rollback deadline"
 	meta.Mutating = true
-	meta.DryRunReason = "Confirmation is the commit of an already applied change; inspect bootstrap status before confirming."
-	meta.Examples = []string{"eregion bootstrap confirm op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json", "eregion bootstrap confirm op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ssh-address root@host:22 --ssh-identity /root/key --ssh-known-hosts /root/known_hosts --json"}
+	meta.DryRunReason = "Confirmation is the commit of an already applied change; inspect node bootstrap status before confirming."
+	meta.Examples = []string{"eregion node bootstrap confirm op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json", "eregion node bootstrap confirm op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --ssh-address root@host:22 --ssh-identity /root/key --ssh-known-hosts /root/known_hosts --json"}
 	return spec{
 		use:  "confirm <operation_id>",
 		meta: meta,
@@ -150,8 +151,8 @@ func (a *app) bootstrapRemoteSpec(parent CommandMeta) spec {
 	meta.DryRun = true
 	meta.NeedsRestart = "required"
 	meta.Examples = []string{
-		"eregion bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --node main --database-url-file /root/eregion-db.url --dry-run --json",
-		"eregion bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --node main --database-url-file /root/eregion-db.url --apply --json",
+		"eregion node bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --node main --database-url-file /root/eregion-db.url --dry-run --json",
+		"eregion node bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --node main --database-url-file /root/eregion-db.url --apply --json",
 	}
 	return spec{
 		use:   "remote",
@@ -459,7 +460,7 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 }
 
 func remoteCommand(dir, action string, args []string, extra []string) string {
-	parts := []string{shellPath(filepath.Join(dir, "eregion")), "bootstrap", action}
+	parts := []string{shellPath(filepath.Join(dir, "eregion")), "node", "bootstrap", action}
 	for _, value := range args {
 		parts = append(parts, shellPath(value))
 	}
@@ -487,7 +488,7 @@ func decodeRemoteEnvelope[T any](raw []byte, action string) (T, error) {
 	}
 	if !envelope.OK {
 		if envelope.Error == nil {
-			return zero, contract.NewFault(contract.Unavailable, "the remote bootstrap failed without a structured error", "Inspect the remote journal and run bootstrap status again.")
+			return zero, contract.NewFault(contract.Unavailable, "the remote bootstrap failed without a structured error", "Inspect the remote journal and run node bootstrap status again.")
 		}
 		fault := *envelope.Error
 		if fault.Hint == "" {

@@ -25,6 +25,7 @@ type result struct {
 
 type spec struct {
 	use      string
+	hidden   bool
 	meta     CommandMeta
 	args     cobra.PositionalArgs
 	flags    func(*cobra.Command)
@@ -77,7 +78,7 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.bootstrapSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.contextSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.workspaceSpecs(), a.logsSpecs()} {
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.contextSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.workspaceSpecs(), a.logsSpecs()} {
 		for _, s := range specs {
 			a.attach(a.root, s)
 		}
@@ -95,7 +96,7 @@ func newApp() *app {
 }
 
 func (a *app) command(s spec) *cobra.Command {
-	cmd := &cobra.Command{Use: s.use, Short: s.meta.Summary, Long: s.meta.Summary, Example: strings.Join(s.meta.Examples, "\n")}
+	cmd := &cobra.Command{Use: s.use, Short: s.meta.Summary, Long: s.meta.Summary, Example: strings.Join(s.meta.Examples, "\n"), Hidden: s.hidden}
 	args := s.args
 	if args == nil {
 		args = cobra.NoArgs
@@ -223,6 +224,9 @@ func (a *app) help(cmd *cobra.Command) result {
 	if cmd.HasSubCommands() {
 		text += "\nCommands:\n"
 		for _, child := range cmd.Commands() {
+			if child.Hidden {
+				continue
+			}
 			text += fmt.Sprintf("  %-12s %s\n", child.Name(), child.Short)
 		}
 	}

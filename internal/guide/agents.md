@@ -29,10 +29,11 @@ path, usage, flags, examples and safety metadata: `mutating`, `destructive`,
 
 Use `eregion help <command...> --json` or
 `eregion commands --path <command> --json` for one command. The catalog is
-authoritative: a command that is not listed does not exist in this build. The
-target command tree in `docs/MASTER.md` grows a row at a time, so this guide
-describes the implemented surface rather than promising commands that are not
-here yet.
+authoritative: a command that is not listed does not exist in this build.
+`eregion node …` commands are server-side plumbing: they are hidden from the
+operator catalog and are not an operator workflow. The target command tree in
+`docs/MASTER.md` grows a row at a time, so this guide describes the implemented
+surface rather than promising commands that are not here yet.
 
 ## Confirmation
 
@@ -66,15 +67,15 @@ build. Keep the operation ID and observe it.
 
 ```sh
 eregion operations follow <operation_id> --json
+eregion operations follow <operation_id> --output ndjson
 eregion operations get <operation_id> --json
-eregion operations events <operation_id> --after <cursor> --json
 ```
 
 `follow --json` waits for a final snapshot. Its exit code does not by itself
-mean success: read `data.state` and any error code. Use `events` with the
-returned cursor to read a bounded page; sequences, not timestamps, order events.
-Cancellation is explicit (`operations cancel`); detaching or a timeout does not
-cancel accepted work.
+mean success: read `data.state` and any error code. `follow --output ndjson`
+replays the bounded event history and then streams new events; sequences, not
+timestamps, order events. Cancellation is explicit (`operations cancel`);
+detaching or a timeout does not cancel accepted work.
 
 ## Exit codes
 
@@ -157,7 +158,7 @@ environment's current secret revisions.
 
 ### Operations and upgrades
 
-Use `eregion operations get|events|follow|cancel` for durable work.
+Use `eregion operations get|follow|cancel` for durable work.
 `eregion upgrade --dry-run --json` plans a local CLI upgrade; it never upgrades a
 node. Node upgrades belong to the host-convergence flow, not to an agent guess.
 

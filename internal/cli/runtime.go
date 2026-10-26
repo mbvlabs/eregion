@@ -39,6 +39,7 @@ func operationMeta(summary, example string) CommandMeta {
 
 func serverMeta(summary, example, reason string) CommandMeta {
 	meta := operationMeta(summary, example)
+	meta.Audience = []string{"node"}
 	meta.Platforms, meta.Remote, meta.Mutating = []string{"linux"}, false, true
 	meta.DryRunReason = reason
 	meta.Environment = []string{"EREGION_DATABASE_URL"}
@@ -67,20 +68,39 @@ var nodeTransportEnvironment = []string{
 	"EREGION_NODE_WG_SUBNET",
 }
 
-func (a *app) runtimeSpecs() []spec {
-	followMeta := operationMeta("Follow an operation's durable state and events", "eregion operations follow op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output ndjson")
-	followMeta.Output = "events"
-	cancelMeta := operationMeta("Request cancellation at a safe boundary", "eregion operations cancel op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json")
-	cancelMeta.Mutating = true
-	cancelMeta.DryRunReason = "Cancellation is an idempotent request, not a deployment plan; inspect state with operations get."
-	migrateMeta := serverMeta("Apply explicit PostgreSQL and River migrations", "eregion system migrate --dry-run --json", "")
+// nodeSpecs is the hidden node-mode group. Its commands run on the server, not
+// on the operator machine, and never appear in `commands --json`'s operator
+// listing. Operator commands reach `node rpc` over SSH inside WireGuard; the
+// service, migration and bootstrap entry points are invoked by systemd units or
+// by the operator's first-contact path.
+func (a *app) nodeSpecs() []spec {
+	nodeMeta := readMeta("Run node-mode control-plane and host commands on the server",
+		[]string{"Run the server half of eregion. Operator commands invoke these over SSH inside WireGuard; systemd invokes the service and migration entry points."},
+		[]string{"sudo eregion node migrate --json", "eregion node bootstrap plan --role main --node main --json"})
+	nodeMeta.Audience = []string{"node"}
+	nodeMeta.Platforms = []string{"linux"}
+	nodeMeta.Remote = false
+	nodeMeta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_CONTEXT_FILE"}
+	nodeMeta.ErrorCodes = append(nodeMeta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired, contract.Forbidden, contract.NotFound)
+	children := append(a.nodeServiceSpecs(), a.bootstrapSpecs()...)
+	return []spec{{
+		use:      "node",
+		hidden:   true,
+		meta:     nodeMeta,
+		run:      func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
+		children: children,
+	}}
+}
+
+func (a *app) nodeServiceSpecs() []spec {
+	migrateMeta := serverMeta("Apply explicit PostgreSQL and River migrations", "eregion node migrate --dry-run --json", "")
 	migrateMeta.DryRun = true
-	serveMeta := serverMeta("Run the authenticated control-plane API", "eregion serve --listen 127.0.0.1:8080", "A running API/worker service has no static mutation preview; use system migrate --dry-run to inspect schema changes.")
+	serveMeta := serverMeta("Run the authenticated control-plane API", "eregion node serve --listen 127.0.0.1:8080", "A running API/worker service has no static mutation preview; use node migrate --dry-run to inspect schema changes.")
 	serveMeta.Environment = append(serveMeta.Environment, "EREGION_AUTH_FILE")
 	serveMeta.Environment = append(serveMeta.Environment, nodeTransportEnvironment...)
 	serveMeta.Environment = append(serveMeta.Environment, extensionEnvironment...)
 	serveMeta.Environment = append(serveMeta.Environment, serveExtensionEnvironment...)
-	workerMeta := serverMeta("Run River workers without an API listener", "eregion worker --concurrency 2", "Background execution cannot be previewed; this command starts workers for accepted operations.")
+	workerMeta := serverMeta("Run River workers without an API listener", "eregion node worker --concurrency 2", "Background execution cannot be previewed; this command starts workers for accepted operations.")
 	workerMeta.Environment = append(workerMeta.Environment, nodeTransportEnvironment...)
 	workerMeta.Environment = append(workerMeta.Environment, extensionEnvironment...)
 	return []spec{
@@ -95,11 +115,19 @@ func (a *app) runtimeSpecs() []spec {
 		{use: "worker", meta: workerMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Int("concurrency", 2, "Diagnostic workers in this process (1–16)")
 		}, run: a.worker},
-		{use: "system", meta: readMeta("Inspect local control-plane maintenance commands", []string{"Discover explicit database maintenance commands."}, []string{"eregion help system --json"}), run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil }, children: []spec{
-			{use: "migrate", meta: migrateMeta, flags: func(cmd *cobra.Command) {
-				cmd.Flags().Bool("dry-run", false, "Inspect pending schema versions without applying DDL")
-			}, run: a.migrate},
-		}},
+		{use: "migrate", meta: migrateMeta, flags: func(cmd *cobra.Command) {
+			cmd.Flags().Bool("dry-run", false, "Inspect pending schema versions without applying DDL")
+		}, run: a.migrate},
+	}
+}
+
+func (a *app) runtimeSpecs() []spec {
+	followMeta := operationMeta("Follow an operation's durable state and events", "eregion operations follow op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output ndjson")
+	followMeta.Output = "events"
+	cancelMeta := operationMeta("Request cancellation at a safe boundary", "eregion operations cancel op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json")
+	cancelMeta.Mutating = true
+	cancelMeta.DryRunReason = "Cancellation is an idempotent request, not a deployment plan; inspect state with operations get."
+	return []spec{
 		{use: "operations", meta: readMeta("Inspect durable operations", []string{"Discover authenticated operation observation and cancellation commands."}, []string{"eregion help operations --json"}), flags: func(cmd *cobra.Command) {
 		}, run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil }, children: []spec{
 			a.operationsListSpec(),
@@ -110,19 +138,6 @@ func (a *app) runtimeSpecs() []spec {
 					return result{}, err
 				}
 				raw, err := client.Get(cmd.Context(), contract.OperationID(args[0]))
-				return apiResult(raw), err
-			}},
-			{use: "events <operation_id>", meta: operationMeta("Read a bounded page of durable operation events", "eregion operations events op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --after 0 --json"), args: oneID, flags: func(cmd *cobra.Command) {
-				cmd.Flags().Uint64("after", 0, "Exclusive event sequence cursor")
-				cmd.Flags().Int("limit", 100, "Maximum events (1–200)")
-			}, run: func(cmd *cobra.Command, args []string) (result, error) {
-				client, err := a.client(cmd)
-				if err != nil {
-					return result{}, err
-				}
-				after, _ := cmd.Flags().GetUint64("after")
-				limit, _ := cmd.Flags().GetInt("limit")
-				raw, err := client.Events(cmd.Context(), contract.Cursor{OperationID: contract.OperationID(args[0]), After: after}, limit)
 				return apiResult(raw), err
 			}},
 			{use: "cancel <operation_id>", meta: cancelMeta, args: oneID, run: func(cmd *cobra.Command, args []string) (result, error) {

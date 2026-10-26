@@ -15,7 +15,7 @@ sketches as the design reference; `docs/workspace.md` describes current views.
   conventions, and the release model come from `../vaire`. Inspect the relevant
   source, not just their READMEs. Do not copy vaire's database-specific
   architecture wholesale.
-- No milestone tree, parallel roadmap or new handoff/spec document by default.
+- No milestone tree, parallel plan or new handoff/spec document by default.
   Update the existing three core docs. Old plans are available in Git history;
   they are not active instructions. Root `scratchpad.md` is an ignored historical
   session log, not current requirements or authorization.

@@ -29,16 +29,16 @@ application service. The worker-to-node step transport is a separate protocol
 boundary.
 
 API and worker are supervised separately by `eregion-api.service` and
-`eregion-worker.service`; `serve` can also run workers in-process. Domain intent
-and queue insertion are atomic. Long remote effects do not hold a SQL
-transaction open. Workers recheck placement and reconcile step acknowledgements.
-An SSH disconnect never owns the lifetime of accepted work.
+`eregion-worker.service`; `eregion node serve` can also run workers in-process.
+Domain intent and queue insertion are atomic. Long remote effects do not hold a
+SQL transaction open. Workers recheck placement and reconcile step
+acknowledgements. An SSH disconnect never owns the lifetime of accepted work.
 
 ## Code map
 
 | Location | Responsibility |
 | --- | --- |
-| `cmd/eregion` | One executable entry point, including `node-agent` and hidden `node rpc`. |
+| `cmd/eregion` | One executable entry point: the operator surface, hidden `node` mode (`rpc`, `serve`, `worker`, `migrate`, `bootstrap`) and hidden `node-agent`. |
 | `internal/cli/tree.go`, `meta.go`, `run.go`, `deploy.go` | Command catalog, safety metadata, output selection, dispatch and the deploy/rollback/build/release pipeline commands. |
 | `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup (preflight, answers/pending, plan/confirm, apply, guarded handoff), first contact, DNS, private access and token-free age handoff/import. |
 | `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host and local RPC, Docker workload/log reads, SSH/WireGuard route. |
@@ -88,8 +88,8 @@ bin/eregion help app create --json
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
 | `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
 | `ui` | Full-screen workspace over the same inventory and node-mode action service. The graph still uses the telemetry read adapter for metrics. |
-| `operations list/get/events/follow/cancel` | Actor-scoped operation history filtered by app, environment, state, build and limit, plus snapshot/event observation and explicit cancellation. |
-| `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
+| `operations list/get/follow/cancel` | Actor-scoped operation history filtered by app, environment, state, build and limit, plus snapshot/follow observation and explicit cancellation. |
+| `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
 All of MASTER section 5's app, environment, deployment and observation surface
@@ -100,7 +100,11 @@ work list row 8. `resources …` and the backup code are deleted (MASTER D19), t
 Docker Compose telemetry stack install is deleted (D5), and `dns …`, `access …`,
 `platform …`, `metrics …` and `operations test` are no longer registered
 (D6, D19, D22, D26). Their internal packages remain for the after-v1 phases
-where the work list says they return.
+where the work list says they return. `bootstrap …`, `serve`, `worker` and
+`system migrate` are not operator commands; they live under the hidden Linux-only
+`node` group (`node rpc`, `node unlock-ssh`, `node serve`, `node worker`,
+`node migrate`, `node bootstrap …`) and `commands --json` lists only the section
+5 tree plus `help`.
 
 ## Release and local upgrade
 
@@ -209,9 +213,9 @@ transaction-pooling proxies have not been qualified.
 
 ```sh
 # On the intended control host, with its DSN securely supplied:
-eregion system migrate --dry-run --json
+eregion node migrate --dry-run --json
 # Only after explicitly authorizing this database's migration:
-eregion system migrate --json
+eregion node migrate --json
 ```
 
 Migrations serialize with a dedicated PostgreSQL session advisory lock. Domain

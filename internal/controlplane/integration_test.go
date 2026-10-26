@@ -487,7 +487,7 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	_ = reserved.Close()
 	endpoint := "http://" + address
 	nodeDir := t.TempDir()
-	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile, "EREGION_API_URL="+endpoint, "EREGION_API_TOKEN="+credential, "EREGION_NODE_STATE_DIR="+nodeDir)
+	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile, "EREGION_NODE_STATE_DIR="+nodeDir)
 	start := func(args ...string) (*exec.Cmd, <-chan error) {
 		command := exec.Command(binary, args...)
 		command.Env = environment
@@ -500,10 +500,9 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 		t.Cleanup(func() { _ = command.Process.Kill() })
 		return command, done
 	}
-	server, serverDone := start("serve", "--workers=false", "--listen", address, "--json")
+	server, serverDone := start("node", "serve", "--workers=false", "--listen", address, "--json")
 	await(t, 10*time.Second, func() bool {
 		request, _ := http.NewRequest(http.MethodGet, endpoint+"/readyz", nil)
-		request.Header.Set("Authorization", "Bearer "+credential)
 		client := &http.Client{Timeout: time.Second}
 		response, err := client.Do(request)
 		if err != nil {
@@ -524,7 +523,7 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if err := json.Unmarshal(raw, &accepted); err != nil || accepted.State != contract.Queued {
 		t.Fatalf("API did not durably queue: %s %v", raw, err)
 	}
-	worker, workerDone := start("worker", "--concurrency", "2", "--json")
+	worker, workerDone := start("node", "worker", "--concurrency", "2", "--json")
 	service := testRuntime(t, pool, 0, nodeDir).Service
 	await(t, 10*time.Second, func() bool {
 		op, err := service.Get(context.Background(), testActor, accepted.ID)
@@ -533,11 +532,11 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if got := effectCount(t, nodeDir, accepted.ID, 5); got != 5 {
 		t.Fatalf("executable lifecycle effects: %d", got)
 	}
-	command := exec.Command(binary, "operations", "events", string(accepted.ID), "--limit", "2", "--json")
+	command := exec.Command(binary, "version", "--json")
 	command.Env = environment
 	raw, err = command.Output()
 	if err != nil || !json.Valid(raw) {
-		t.Fatalf("CLI could not reconnect to events: %s %v", raw, err)
+		t.Fatalf("built CLI did not run: %s %v", raw, err)
 	}
 	for _, process := range []struct {
 		cmd  *exec.Cmd

@@ -104,7 +104,7 @@ func LoadIntent(layout Layout) (Config, error) {
 func LoadNodeConfig(layout Layout, databaseURL string) (Config, error) {
 	cfg, err := LoadIntent(layout)
 	if errors.Is(err, ErrNoIntent) {
-		return Config{}, contract.NewFault(contract.PreconditionFailed, "the node has no recorded host intent", "Run server init (or bootstrap apply) on this node once to record its desired host state.")
+		return Config{}, contract.NewFault(contract.PreconditionFailed, "the node has no recorded host intent", "Run server init (or node bootstrap apply) on this node once to record its desired host state.")
 	}
 	if err != nil {
 		return Config{}, err

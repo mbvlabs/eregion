@@ -268,7 +268,7 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 		}},
 		{title: "Break-glass", fields: []handoffField{
 			{"When", "Only when WireGuard or the node is unreachable."},
-			{"How", "Use the provider console as root and run `eregion node unlock-ssh` (on builds before that command lands: `/usr/local/bin/eregion node-agent access revert`). It reopens public SSH for its fixed window."},
+			{"How", "Use the provider console as root and run `eregion node unlock-ssh`. It reopens public SSH for its fixed window."},
 			{"Public SSH", "Closed after server init; sshd accepts the admin user over WireGuard only."},
 			{"Recovery", "The transfer bundle above rebuilds the context on another machine. Without it, use the provider console and this record."},
 		}},

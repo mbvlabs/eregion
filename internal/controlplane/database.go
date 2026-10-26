@@ -233,7 +233,7 @@ func Ready(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	if plan.Current != plan.Required || plan.RiverCurrent != plan.RiverRequired {
-		return contract.NewFault(contract.PreconditionFailed, "database migrations are pending", "Run eregion system migrate before starting API or workers.")
+		return contract.NewFault(contract.PreconditionFailed, "database migrations are pending", "Run eregion node migrate before starting API or workers.")
 	}
 	return nil
 }

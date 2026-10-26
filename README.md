@@ -32,9 +32,13 @@ bin/eregion commands --json
 bin/eregion help server init --json
 ```
 
-Discovery and help need no database or credentials. The application commands are
-`app`, `env`, `process`, `config`, `domain`, `deploy`, `rollback`, `restart`,
-`build` and `release list`; the target tree is in MASTER.
+Discovery and help need no database or credentials. The operator surface is
+MASTER section 5: `server init`, `plan`, `apply`, `login`, `context`, `secrets
+export`, `app`, `env`, `process`, `config`, `domain`, `deploy`, `rollback`,
+`restart`, `build`, `release list`, `logs`, `operations`, `token`, `protect`,
+`ssh`, `upgrade`, `doctor`, `ui`, `commands`, `guide`, `skill` and `version`.
+Node-mode entry points (`eregion node …`) are hidden server plumbing, not part of
+`commands --json`.
 
 Servers run Debian 13 or Ubuntu 26.04 (amd64/arm64) with Docker, Buildpacks, a
 local registry and Caddy, and keep their state in an external PostgreSQL 17+

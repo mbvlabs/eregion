@@ -89,6 +89,13 @@ func (r registry) validate(root *cobra.Command) error {
 		if slices.Contains(meta.Audience, "node") && (len(meta.Platforms) != 1 || meta.Platforms[0] != "linux") {
 			add("node commands require Linux-only platforms")
 		}
+		nodePath := root.Name() + " node"
+		if slices.Contains(meta.Audience, "node") && cmd.CommandPath() != nodePath && !strings.HasPrefix(cmd.CommandPath(), nodePath+" ") {
+			add("node audience is only valid under " + nodePath)
+		}
+		if (cmd.CommandPath() == nodePath || strings.HasPrefix(cmd.CommandPath(), nodePath+" ")) && !slices.Contains(meta.Audience, "node") {
+			add("commands under " + nodePath + " require node audience")
+		}
 		if !slices.Contains([]string{"never", "possible", "required"}, meta.NeedsRestart) {
 			add("needs_restart must be never, possible, or required")
 		}
@@ -163,10 +170,25 @@ func (r registry) validate(root *cobra.Command) error {
 func (r registry) catalog(root *cobra.Command) []Command {
 	commands := make([]Command, 0, len(r))
 	for _, cmd := range walk(root) {
+		if commandHidden(cmd) {
+			continue
+		}
 		commands = append(commands, r.describe(cmd))
 	}
 	sort.Slice(commands, func(i, j int) bool { return commands[i].Path < commands[j].Path })
 	return commands
+}
+
+// commandHidden reports whether a command or one of its parents is hidden.
+// Node-mode commands are attached to a hidden `node` parent so discovery lists
+// only the operator surface while the node paths stay executable.
+func commandHidden(cmd *cobra.Command) bool {
+	for current := cmd; current != nil && current.Parent() != nil; current = current.Parent() {
+		if current.Hidden {
+			return true
+		}
+	}
+	return false
 }
 
 func (r registry) describe(cmd *cobra.Command) Command {

@@ -10,7 +10,7 @@ import (
 )
 
 func TestBootstrapAndContextAreAttached(t *testing.T) {
-	for _, path := range [][]string{{"bootstrap"}, {"bootstrap", "plan"}, {"bootstrap", "apply"}, {"bootstrap", "confirm"}, {"bootstrap", "remote"}, {"context"}} {
+	for _, path := range [][]string{{"node"}, {"node", "bootstrap"}, {"node", "bootstrap", "plan"}, {"node", "bootstrap", "apply"}, {"node", "bootstrap", "confirm"}, {"node", "bootstrap", "remote"}, {"context"}} {
 		code, stdout, stderr := invoke(t, append([]string{"commands", "--path", strings.Join(path, " ")}, "--json")...)
 		if code != 0 {
 			t.Fatalf("%v: code=%d stdout=%q stderr=%q", path, code, stdout, stderr)

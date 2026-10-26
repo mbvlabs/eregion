@@ -182,7 +182,7 @@ func (s *Service) Events(ctx context.Context, actor contract.Actor, cursor contr
 	if cursor.After > op.LastSequence {
 		return page, contract.NewFault(contract.PreconditionFailed, "event cursor is ahead of the operation", "Refresh the operation and resume from a previously observed cursor.")
 	}
-	// No pruning in M0.2. A missing retained event is an explicit gap, not silent loss.
+	// No event pruning. A missing retained event is an explicit gap, not silent loss.
 	rows, err := s.pool.Query(ctx, `SELECT sequence,event FROM eregion_operation_events WHERE operation_id=$1 AND sequence>$2 AND sequence<=$3 ORDER BY sequence LIMIT $4`, cursor.OperationID, int64(cursor.After), int64(op.LastSequence), limit)
 	if err != nil {
 		if ctx.Err() != nil {

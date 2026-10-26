@@ -107,7 +107,7 @@ func platformInventoryFilters(cmd *cobra.Command) url.Values {
 func platformOperationResult(raw json.RawMessage, dryRun bool) result {
 	var operation contract.Operation
 	if !dryRun && json.Unmarshal(raw, &operation) == nil && operation.Validate() == nil {
-		plain := fmt.Sprintf("Accepted %s on %s\noperation: %s\nstate: %s\nnext: eregion operations events %s --json", operation.Kind, operation.Target, operation.ID, operation.State, operation.ID)
+		plain := fmt.Sprintf("Accepted %s on %s\noperation: %s\nstate: %s\nnext: eregion operations follow %s --output ndjson", operation.Kind, operation.Target, operation.ID, operation.State, operation.ID)
 		return result{data: raw, plain: plain}
 	}
 	var preview platform.Preview

@@ -75,7 +75,7 @@ func TestRemoteBootstrapPlanOverPinnedSSH(t *testing.T) {
 		t.Fatalf("build eregion: %v\n%s", err, raw)
 	}
 	command := exec.CommandContext(ctx, cliBinary,
-		"bootstrap", "remote",
+		"node", "bootstrap", "remote",
 		"--ssh-address", fixture.Address,
 		"--ssh-user", "eregion",
 		"--ssh-identity", fixture.IdentityFile,
@@ -115,7 +115,7 @@ func TestRemoteBootstrapPlanOverPinnedSSH(t *testing.T) {
 	// A second invocation is a resume, not a new generation. The bundle path,
 	// config hash, generation, and operation ID must all be stable.
 	second := exec.CommandContext(ctx, cliBinary,
-		"bootstrap", "remote",
+		"node", "bootstrap", "remote",
 		"--ssh-address", fixture.Address,
 		"--ssh-user", "eregion",
 		"--ssh-identity", fixture.IdentityFile,

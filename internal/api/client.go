@@ -32,7 +32,7 @@ func NewClient(endpoint, token string) (*Client, error) {
 		return nil, contract.NewFault(contract.ValidationFailed, "API transport must be encrypted", "Use HTTPS; plain HTTP is allowed only for literal loopback development hosts.")
 	}
 	if !tokenPattern.MatchString(token) {
-		return nil, contract.NewFault(contract.InputRequired, "a valid EREGION_API_TOKEN is required", "Provide a random 32–256 character API token through the environment, not command arguments.")
+		return nil, contract.NewFault(contract.InputRequired, "a valid API token is required", "Provide a scoped token directly; tokens are never read from command arguments or an operator environment.")
 	}
 	return &Client{base: strings.TrimSuffix(u.String(), "/"), token: token, http: &http.Client{
 		Timeout:       15 * time.Second,
