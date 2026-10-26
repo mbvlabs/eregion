@@ -23,8 +23,7 @@ import (
 )
 
 // NodeTransports resolves the authenticated transport that reaches one node.
-// It is the single place a worker, and any extension that dispatches node work
-// (telemetry, resources), learns how to reach a node:
+// It is the single place a worker learns how to reach a node:
 //
 //	tr, err := nodes.TransportFor(ctx, "builder-1")
 //	response, err := tr.Call(ctx, request, onEvent)
@@ -138,7 +137,7 @@ func (r *NodeResolver) TransportFor(ctx context.Context, nodeName string) (node.
 	switch rec.Enrollment {
 	case platform.EnrollmentPending, platform.EnrollmentFailed:
 		return nil, placementViolation(ReasonNotEnrolled, rec.Name, fmt.Sprintf("node %q is not enrolled (%s)", rec.Name, rec.Enrollment),
-			"Finish enrollment with platform nodes enroll or platform nodes retry.", nil)
+			"Finish node enrollment.", nil)
 	case platform.EnrollmentEnrolled:
 		if rec.Transport == "ssh" {
 			return r.cached(rec, false)

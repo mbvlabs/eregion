@@ -49,7 +49,7 @@ type followSelection struct {
 func followSelectionFromArgs(args []string, valueFlags []string) followSelection {
 	var words []string
 	var selected string
-	var outputSet, jsonEnabled, testFollow bool
+	var outputSet, jsonEnabled bool
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -75,8 +75,6 @@ func followSelectionFromArgs(args []string, valueFlags []string) followSelection
 				case value == "false":
 					jsonEnabled = false
 				}
-			case "follow":
-				testFollow = !hasValue || value == "true"
 			default:
 				if !hasValue {
 					for _, flag := range valueFlags {
@@ -95,13 +93,8 @@ func followSelectionFromArgs(args []string, valueFlags []string) followSelection
 		words = append(words, arg)
 	}
 	selection := followSelection{JSON: jsonEnabled}
-	if len(words) >= 2 && words[0] == "operations" {
-		switch words[1] {
-		case "follow":
-			selection.Active = true
-		case "test":
-			selection.Active = testFollow
-		}
+	if len(words) >= 2 && words[0] == "operations" && words[1] == "follow" {
+		selection.Active = true
 	}
 	// logs tail is a streaming read like operations follow: it opts into NDJSON
 	// without changing the rules for any other command.
@@ -114,7 +107,7 @@ func followSelectionFromArgs(args []string, valueFlags []string) followSelection
 	return selection
 }
 
-// followFlags are shared by operations follow and operations test --follow.
+// followFlags configures an operation follow command.
 func followFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("interactive", false, "Start the interactive terminal viewer (requires a terminal; ignored by machine output)")
 	cmd.Flags().Bool("ascii", false, "Use ASCII glyphs in the interactive viewer")

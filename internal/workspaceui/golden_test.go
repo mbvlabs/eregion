@@ -21,9 +21,8 @@ func TestWorkspaceGoldenRenders(t *testing.T) {
 		ascii  bool
 	}{
 		{name: "fleet-wide", width: 120, height: 24, raw: nodesJSON},
-		{name: "resources-narrow", width: 44, height: 16, tab: '6', raw: resourcesJSON},
 		{name: "releases-standard", width: 80, height: 24, tab: '4', raw: releasesJSON},
-		{name: "palette-standard", width: 100, height: 34, raw: nodesJSON, keys: ":backup"},
+		{name: "palette-standard", width: 100, height: 34, raw: nodesJSON, keys: ":deploy"},
 		{name: "fleet-ascii", width: 90, height: 20, raw: nodesJSON, ascii: true},
 	}
 	for _, test := range cases {

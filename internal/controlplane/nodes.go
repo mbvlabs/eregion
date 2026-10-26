@@ -192,13 +192,13 @@ func nodePlacement(n platform.Node, role, capability string) error {
 	switch n.EnrollmentState {
 	case platform.EnrollmentPending, platform.EnrollmentFailed:
 		return placementViolation(ReasonNotEnrolled, n.Name, fmt.Sprintf("node %q is not enrolled (%s)", n.Name, n.EnrollmentState),
-			"Finish enrollment with platform nodes enroll or platform nodes retry, then submit the work again.", nil)
+			"Finish node enrollment, then submit the work again.", nil)
 	}
 	if n.EnrollmentState == platform.EnrollmentEnrolled && n.LastCheckState == ReasonIdentityMismatch {
 		// The last authenticated check found a different identity key on this
 		// host. It is quarantined until a check verifies the pinned identity again.
 		return placementViolation(ReasonIdentityMismatch, n.Name, fmt.Sprintf("node %q failed its last identity check and is quarantined", n.Name),
-			"Investigate the host; the node receives work again only after platform nodes check verifies its pinned identity.", nil)
+			"Investigate the host; the node receives work again only after a node check verifies its pinned identity.", nil)
 	}
 	if !contains(n.Roles, role) {
 		if role == platform.RoleBuilder && contains(n.Roles, platform.RoleApplication) {
@@ -210,7 +210,7 @@ func nodePlacement(n platform.Node, role, capability string) error {
 	}
 	if capability != "" && !contains(n.Capabilities, capability) {
 		return placementViolation(ReasonCapabilityMissing, n.Name, fmt.Sprintf("node %q lacks the %s capability", n.Name, capability),
-			"Install or enable "+capability+" on the node, then run platform nodes check.", map[string]any{"required_capability": capability})
+			"Install or enable "+capability+" on the node, then re-run the node check.", map[string]any{"required_capability": capability})
 	}
 	return nil
 }

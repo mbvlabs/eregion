@@ -54,40 +54,12 @@ func CommandActions() []CommandAction {
 			CLI: "eregion platform deployments rollback <app> <environment> --confirm <plan-token> --idempotency-key <key> --json", CommandPath: "eregion platform deployments rollback", Destructive: true,
 		},
 		{
-			ID: "node.check", Name: "Check node runtime", Keys: "n", Form: "node-check",
-			CLI: "eregion platform nodes check <node> --idempotency-key <key> --json", CommandPath: "eregion platform nodes check",
-		},
-		{
-			ID: "resource.destroy", Name: "Destroy application resource", Keys: "x", Form: "resource-destroy",
-			CLI:         "eregion platform submit --kind platform.resource.destroy --target node/<host> --input-file action.json --idempotency-key <key> --json",
-			CommandPath: "eregion platform submit", Destructive: true,
-		},
-		{
-			ID: "backup.create", Name: "Create resource backup", Keys: "b", Form: "backup-create",
-			CLI:         "eregion platform submit --kind platform.backup.create --target node/<host> --input-file action.json --idempotency-key <key> --json",
-			CommandPath: "eregion platform submit",
-		},
-		{
-			ID: "backup.verify", Name: "Verify backup archive", Keys: "v", Form: "backup-verify",
-			CLI:         "eregion platform submit --kind platform.backup.verify --target node/<host> --input-file action.json --idempotency-key <key> --json",
-			CommandPath: "eregion platform submit",
-		},
-		{
-			ID: "backup.restore", Name: "Restore verified backup", Keys: "R", Form: "backup-restore",
-			CLI:         "eregion platform submit --kind platform.backup.restore --target node/<host> --input-file action.json --idempotency-key <key> --json",
-			CommandPath: "eregion platform submit", Destructive: true,
-		},
-		{
 			ID: "operations.get", Name: "Read an operation snapshot", Keys: "", Form: "",
 			CLI: "eregion operations get <operation_id> --json", CommandPath: "eregion operations get",
 		},
 		{
 			ID: "operations.follow", Name: "Follow an operation", Keys: "f", Form: "",
 			CLI: "eregion operations follow <operation_id> --interactive", CommandPath: "eregion operations follow",
-		},
-		{
-			ID: "platform.fleet", Name: "Read the fleet snapshot", Keys: "r", Form: "",
-			CLI: "eregion platform fleet --json", CommandPath: "eregion platform fleet",
 		},
 	}
 }
@@ -171,16 +143,6 @@ func (m *Model) openForm(id string) {
 		form = m.newDeployForm()
 	case "rollback":
 		form = m.newRollbackForm()
-	case "node-check":
-		form = m.newNodeCheckForm()
-	case "resource-destroy":
-		form = m.newResourceDestroyForm()
-	case "backup-create":
-		form = m.newBackupCreateForm()
-	case "backup-verify":
-		form = m.newBackupVerifyForm()
-	case "backup-restore":
-		form = m.newBackupRestoreForm()
 	default:
 		m.notice = "This action has no guided form."
 		return

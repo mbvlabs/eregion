@@ -48,5 +48,3 @@ needs a Linux operator binary matching the server architecture.
 - [Telemetry](docs/telemetry.md), [TUI design](docs/tui-design.md),
   [terminal presentation](docs/workspace.md)
 - [Upgrades](docs/upgrades.md), [security notes](docs/security-review.md)
-- [Resources](docs/resources.md): retained code that leaves the operator surface
-  before v1 (MASTER D19)

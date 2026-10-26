@@ -250,26 +250,6 @@ func TestFollowDetachDoesNotCancel(t *testing.T) {
 	}
 }
 
-func TestTestFollowSubmitsThenFollows(t *testing.T) {
-	newOperationAPI(t, contract.Succeeded)
-	code, stdout, stderr := invoke(t, "operations", "test", "--idempotency-key", "ci:follow-1", "--follow", "--json", "--poll-interval", "1ms")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q", code, stderr)
-	}
-	envelope := decodeOne(t, stdout)
-	raw, _ := json.Marshal(envelope.Data)
-	if !strings.Contains(string(raw), `"state":"succeeded"`) || !strings.Contains(string(raw), string(followTestID)) {
-		t.Fatalf("test --follow did not return the followed operation: %s", raw)
-	}
-}
-
-func TestTestFollowRejectsDryRun(t *testing.T) {
-	code, stdout, stderr := invoke(t, "operations", "test", "--dry-run", "--follow")
-	if code != 2 || stdout != "" || !strings.Contains(stderr, "--follow cannot be combined with --dry-run") {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-}
-
 func TestNDJSONIsRejectedForOrdinaryCommands(t *testing.T) {
 	code, stdout, stderr := invoke(t, "operations", "get", string(followTestID), "--output", "ndjson")
 	if code != 2 || stdout != "" || !strings.Contains(stderr, "invalid output mode") {
@@ -313,8 +293,6 @@ func TestFollowSelectionRecognizesOnlyFollowCommands(t *testing.T) {
 	}{
 		{[]string{"operations", "follow", "op_x", "--output", "ndjson"}, true, true},
 		{[]string{"--output=ndjson", "operations", "follow", "op_x"}, true, true},
-		{[]string{"operations", "test", "--follow", "--output", "ndjson"}, true, true},
-		{[]string{"operations", "test", "--output", "ndjson"}, false, false},
 		{[]string{"operations", "get", "op_x", "--output", "ndjson"}, false, false},
 		{[]string{"operations", "follow", "op_x", "--output", "json"}, true, false},
 	} {

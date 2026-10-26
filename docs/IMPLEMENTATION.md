@@ -43,7 +43,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `internal/host`, `internal/access` | Bootstrap steps and host journal; admin/firewall/WireGuard/SSH lockdown scripts. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
-| `internal/resources`, `internal/integrations`, `internal/telemetry` | Existing optional resource/backup, DNS/access and telemetry mechanisms. |
+| `internal/integrations`, `internal/telemetry` | Internal DNS/private-access actions (no operator CLI before v1) and the telemetry read adapters used by `logs` and the workspace graph. |
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
 | `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement only. Nodes are not upgraded by this path. |
 
@@ -68,15 +68,18 @@ bin/eregion help platform environments create --json
 | `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. |
 | `domain add/remove <app> <environment> <hostname>`, `domain list` | Main-node desired host bindings + Caddy reload. Not observed TLS/route status. |
 | `secret set/list/archive/export` | Metadata/write-only storage and explicit file export; no plaintext `get`. |
-| `operations test/get/events/follow/cancel` | Generic durable operation diagnostics and observation. |
-| `platform nodes …`, `platform inventory/submit/fleet` | Existing low-level placement, enrollment, inventory and action tools. |
-| `resources …`, `dns …`, `access …`, `logs …`, `metrics …`, `ui` | Optional subsystem surfaces; see focused references. |
+| `platform inventory`, `logs search/tail`, `ui` | Read-only inventory, telemetry reads and the full-screen workspace. |
+| `operations get/events/follow/cancel` | Durable operation observation and explicit cancellation. |
 | `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
 The target tree is MASTER section 5. Its commands (`app create`, `env update`,
 `deploy`, `doctor`, `ssh`, …) do not exist yet; renaming is not a substitute for
-implementing the flow. `resources …` leaves the surface entirely (MASTER D19).
+implementing the flow. `resources …` and the backup code are deleted (MASTER
+D19), the Docker Compose telemetry stack install is deleted (D5), and `dns …`,
+`access …`, `platform nodes …`, `platform fleet`, `platform submit`, `metrics …`
+and `operations test` are no longer registered (D6, D22, D26). Their internal
+packages remain for the after-v1 phases where the work list says they return.
 
 ## Release and local upgrade
 
@@ -157,9 +160,9 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
 - SQL `ON DELETE CASCADE` is not a safe application deletion implementation:
   release/history references, secret namespaces, containers, Caddy and file-backed
   state need deliberate handling. There are no app/env delete actions today.
-- Resources/backups use protected host files, manifests and operation history;
-  there are no resource/backup catalog tables in the control-plane migrations.
-  DNS records live at the provider; a domain binding is not a DNS record.
+- The deleted resources/backup subsystem had no catalog tables in the
+  control-plane migrations. DNS records live at the provider; a domain binding
+  is not a DNS record.
 - Roles/rows do not prove tools, credentials, services or routes are installed.
 
 ## Migration and external database policy
@@ -185,6 +188,33 @@ versions commit transactionally; River versions commit separately. Services do
 not auto-migrate; readiness fails until both are current. A newer schema, gap or
 changed applied checksum fails closed. Never edit an applied SQL file, forge
 history or reset a database to make an upgrade pass. Add the next migration.
+
+## External control-state recovery
+
+The control database is the PostgreSQL provider's recovery responsibility (D4,
+D9); eregion has no backup product or `resources backups restore`. A
+maintenance-window recovery must:
+
+1. Stop every API/worker/writer. Preserve the old DB, sanitized schema/version
+   facts and current configuration. No two independent restored writers.
+2. Take/verify a protected custom dump with PostgreSQL tools and a credential
+   source that does not expose passwords in process arguments or logs.
+3. Restore to a **new** database, never over the live source. Check table
+   contents, operation history, migrations/checksums and River versions with the
+   same binary.
+4. Restore/verify the matching vault keyring, node identities/transport
+   credentials and relevant host state. A DB dump alone is not complete
+   recovery.
+5. Repoint the protected service DSN deliberately, start one API/worker pair,
+   check readiness and reconcile in-flight effects without inventing success.
+6. Account for operations accepted after the dump. Retain old DB and backups
+   until the restored setup and a new backup are proven. Reverting DSNs after
+   new writes is not lossless rollback; reconcile divergence first.
+
+`TestIntegrationControlPlaneRecoveryDrill` exercises a narrower
+dump/restore/readiness subset against generated test databases. It is not
+evidence of live writer quiescence, DSN cutover, keyring recovery, HA or
+recovery-time goals.
 
 ## Bootstrap and local state
 
@@ -293,7 +323,9 @@ even after a failed apply. See [network](network.md) before changing this path.
   actor-scoped state, bounded cursor pages and explicit cancellation.
 - `/v1/platform?collection=…`: bounded inventory with app/environment/node/state
   filters. Base collections: summary, nodes, apps, environments, revisions,
-  deployability, releases, deployments and changes; extensions add their own.
+  deployability, releases, deployments and changes; the internal DNS/access
+  extensions add their own. The removed resources/backups and telemetry
+  collections are not registered.
 - `/v1/secrets…`: separate authenticated credential API; values are encrypted
   directly, never placed in ordinary action input.
 - `/v1/webhooks/github`: bounded HMAC-verified push with one server-wide secret

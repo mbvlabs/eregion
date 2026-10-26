@@ -56,7 +56,7 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.
 			return contract.NewFault(contract.NotFound, "node not found", "Enroll the node first; there is no enrollment to retry.")
 		}
 		if existing.Transport != "ssh" {
-			return contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Run platform nodes enroll with the node's address and pinned host key.")
+			return contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Enroll the node with its address and pinned host key.")
 		}
 		_, err := tx.Exec(ctx, `UPDATE eregion_platform_nodes
             SET enrollment_state=CASE WHEN enrollment_state='enrolled' THEN 'enrolled' ELSE 'pending' END,
@@ -232,7 +232,7 @@ func (w *platformWorker) runNodeEnroll(ctx context.Context, id contract.Operatio
 		return w.settle(ctx, id, attempt, err)
 	}
 	if rec.Transport != "ssh" || rec.HostKey == "" {
-		return w.settleEnroll(ctx, id, attempt, rec.Name, contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Run platform nodes enroll with the node's address and pinned host key."))
+		return w.settleEnroll(ctx, id, attempt, rec.Name, contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Enroll the node with its address and pinned host key."))
 	}
 	tr, closer, err := w.service.resolver.Direct(rec)
 	if err != nil {

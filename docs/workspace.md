@@ -18,19 +18,19 @@ Opening the workspace is not required for future guided app/env commands.
 
 ## Current workspace
 
-Tabs: `1` Fleet, `2` Apps, `3` Envs, `4` Releases, `5` Deployments,
-`6` Resources, `7` Backups. Keys: arrows/`j/k`, `g/G`, `/` filter, `enter`
-details, `r` refresh, `:` discovery, `?` help, `q`/Ctrl-C detach. The operation
-view's space key pauses the local viewport, not execution.
+Tabs: `1` Fleet, `2` Apps, `3` Envs, `4` Releases, `5` Deployments. Keys:
+arrows/`j/k`, `g/G`, `/` filter, `enter` details, `r` refresh, `:` discovery,
+`?` help, `q`/Ctrl-C detach. The operation view's space key pauses the local
+viewport, not execution.
 
-Existing forms cover app/env creation, image release, deploy/rollback, node
-check and resource/backup actions. They preview through the action API and show
-their current `platform …`/resource command equivalents. The mapping is owned
-by `internal/workspaceui/discovery.go` and catalog tests. These forms do not
-provide complete source/settings/secrets/domain setup or guarded app/env deletion.
-Do not confuse an app form with deploycrate's complete application workflow.
-The Resources and Backups tabs and their forms go with the surface cleanup
-(MASTER D19, work list row 9); forms follow the section 5 command tree.
+Existing forms cover app/env creation, image release and deploy/rollback. They
+preview through the action API and show their exact noninteractive
+`platform …` command equivalent. The mapping is owned by
+`internal/workspaceui/discovery.go` and catalog tests. These forms do not
+provide complete source/settings/secrets/domain setup or guarded app/env
+deletion. Do not confuse an app form with deploycrate's complete application
+workflow. The former Resources and Backups tabs, node-check action and their
+forms are deleted with the surface cleanup (MASTER D19, work list row 9).
 
 ## Honest observations
 

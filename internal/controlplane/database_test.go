@@ -3,9 +3,7 @@ package controlplane
 import (
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
 
@@ -22,23 +20,6 @@ func TestMigration005MatchesVaultSchema(t *testing.T) {
 	}
 	if requiredVersion() != len(migrations) {
 		t.Fatalf("required schema version = %d, want %d", requiredVersion(), len(migrations))
-	}
-}
-
-func TestDatabaseNameAndBackupKey(t *testing.T) {
-	if got := databaseName("postgres://user:secret@127.0.0.1:5432/eregion?sslmode=disable"); got != "eregion" {
-		t.Fatalf("database name = %q", got)
-	}
-	if got := databaseName("::not a url"); got != "" {
-		t.Fatalf("invalid DSN produced %q", got)
-	}
-	slot := time.Date(2026, 10, 20, 3, 0, 0, 0, time.FixedZone("x", 3600))
-	key := scheduledBackupKey("appdb", slot)
-	if key != scheduledBackupKey("appdb", slot.UTC()) || key != "scheduled-backup:appdb:1792461600" {
-		t.Fatalf("key = %s", key)
-	}
-	if err := contract.ValidateIdempotencyKey(key); err != nil {
-		t.Fatal(err)
 	}
 }
 

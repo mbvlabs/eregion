@@ -1,3 +1,7 @@
+// Package telemetry exposes a small read interface for logs and metrics. The
+// Docker Compose stack installer is deleted (D5); only the read adapters remain
+// for `logs` and the workspace graph. It deliberately does not own operation
+// history: durable deployment history stays in PostgreSQL.
 package telemetry
 
 import (

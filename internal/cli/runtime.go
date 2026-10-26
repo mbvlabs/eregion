@@ -23,7 +23,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/node"
-	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/transport"
@@ -69,11 +68,9 @@ var nodeTransportEnvironment = []string{
 }
 
 func (a *app) runtimeSpecs() []spec {
-	submitMeta := operationMeta("Submit a harmless durable diagnostic operation", "eregion operations test --idempotency-key ci:diagnostic-1 --json")
-	submitMeta.Mutating, submitMeta.DryRun = true, true
 	followMeta := operationMeta("Follow an operation's durable state and events", "eregion operations follow op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output ndjson")
 	followMeta.Output = "events"
-	cancelMeta := operationMeta("Request cancellation at a diagnostic safe boundary", "eregion operations cancel op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json")
+	cancelMeta := operationMeta("Request cancellation at a safe boundary", "eregion operations cancel op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json")
 	cancelMeta.Mutating = true
 	cancelMeta.DryRunReason = "Cancellation is an idempotent request, not a deployment plan; inspect state with operations get."
 	migrateMeta := serverMeta("Apply explicit PostgreSQL and River migrations", "eregion system migrate --dry-run --json", "")
@@ -105,18 +102,9 @@ func (a *app) runtimeSpecs() []spec {
 				cmd.Flags().Bool("dry-run", false, "Inspect pending schema versions without applying DDL")
 			}, run: a.migrate},
 		}},
-		{use: "operations", meta: readMeta("Inspect durable diagnostic operations", []string{"Discover authenticated operation submission and observation commands."}, []string{"eregion help operations --json"}), flags: func(cmd *cobra.Command) {
+		{use: "operations", meta: readMeta("Inspect durable operations", []string{"Discover authenticated operation observation and cancellation commands."}, []string{"eregion help operations --json"}), flags: func(cmd *cobra.Command) {
 			cmd.PersistentFlags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 		}, run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil }, children: []spec{
-			{use: "test", meta: submitMeta, flags: func(cmd *cobra.Command) {
-				cmd.Flags().String("idempotency-key", "", "Stable submission key; required unless --dry-run")
-				cmd.Flags().Int("steps", 3, "Diagnostic steps (1–20); writes only node-local markers")
-				cmd.Flags().Int("step-delay-ms", 100, "Delay per step (0–1000 ms)")
-				cmd.Flags().Int("fail-until-attempt", 0, "Intentionally fail attempts up to this number (0–3)")
-				cmd.Flags().Bool("dry-run", false, "Validate with the API without inserting an operation or job")
-				cmd.Flags().Bool("follow", false, "Follow the submitted operation after it is accepted")
-				followFlags(cmd)
-			}, run: a.submitTest},
 			{use: "follow <operation_id>", meta: followMeta, args: oneID, flags: followFlags, run: a.follow},
 			{use: "get <operation_id>", meta: operationMeta("Read the authoritative operation snapshot", "eregion operations get op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json"), args: oneID, run: func(cmd *cobra.Command, args []string) (result, error) {
 				client, err := a.client(cmd)
@@ -169,52 +157,6 @@ func apiResult(raw json.RawMessage) result {
 
 func (a *app) client(cmd *cobra.Command) (*api.Client, error) {
 	return a.contextClient(cmd)
-}
-
-func (a *app) submitTest(cmd *cobra.Command, _ []string) (result, error) {
-	steps, _ := cmd.Flags().GetInt("steps")
-	delay, _ := cmd.Flags().GetInt("step-delay-ms")
-	fail, _ := cmd.Flags().GetInt("fail-until-attempt")
-	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	follow, _ := cmd.Flags().GetBool("follow")
-	key, _ := cmd.Flags().GetString("idempotency-key")
-	if dryRun && follow {
-		return result{}, contract.NewFault(contract.Usage, "--follow cannot be combined with --dry-run", "Submit without --dry-run to follow a durable operation.")
-	}
-	if follow {
-		if err := validateFollow(cmd); err != nil {
-			return result{}, err
-		}
-	}
-	if !dryRun && key == "" {
-		return result{}, contract.NewFault(contract.InputRequired, "--idempotency-key is required", "Choose a stable key and reuse it if submission times out.")
-	}
-	input := operations.TestInput{Steps: steps, StepDelayMS: delay, FailUntilAttempt: fail}
-	raw, _ := json.Marshal(input)
-	if _, err := operations.NormalizeTestInput(raw); err != nil {
-		return result{}, err
-	}
-	if !dryRun {
-		if err := contract.ValidateIdempotencyKey(key); err != nil {
-			return result{}, err
-		}
-	}
-	client, err := a.client(cmd)
-	if err != nil {
-		return result{}, err
-	}
-	response, err := client.Test(cmd.Context(), input, key, dryRun)
-	if err != nil {
-		return result{}, err
-	}
-	if follow {
-		var operation contract.Operation
-		if json.Unmarshal(response, &operation) != nil || operation.Validate() != nil {
-			return result{}, contract.NewFault(contract.Unavailable, "API returned unreadable operation data", "Check binary compatibility; do not assume an unrecognized result means work was not accepted.")
-		}
-		return a.followOperation(cmd, client, operation.ID)
-	}
-	return apiResult(response), nil
 }
 
 func (a *app) database(ctx context.Context) (*pgxpool.Pool, error) {
@@ -325,12 +267,12 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		}
 	}
 	logger := a.logger(cmd)
-	// One resolver serves both extension dispatch (telemetry) and the worker.
-	// Sharing it keeps one transport cache and one WireGuard key lock per node.
+	// One resolver serves extension dispatch and the worker. Sharing it keeps
+	// one transport cache and one WireGuard key lock per node.
 	nodes := controlplane.NewNodeResolver(pool, a.fleetResolverConfig(logger), func() node.Transport { return nodeTransport })
 	// Extensions register before New so the registry is complete before any
 	// action can be normalized, submitted, or executed.
-	parts, secretResolver, err := a.startExtensions(pool, concurrency > 0, nodes)
+	parts, secretResolver, err := a.startExtensions(pool)
 	if err != nil {
 		closeTransport()
 		pool.Close()

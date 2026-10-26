@@ -1264,7 +1264,7 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 		return s.failReconciledPlatform(ctx, op, "the node action ended before it recorded a result; it is idempotent, so submit it again", contract.Unavailable)
 	case platform.KindNodeEnroll:
 		// Enrollment is durable only once the worker recorded it. A job that ended
-		// first leaves the node pending (or failed) for platform nodes retry; the
+		// first leaves the node pending (or failed) for an enrollment retry; the
 		// operation never claims verification it did not see.
 		var state string
 		var enrollOp *string
@@ -1272,7 +1272,7 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 		if state == string(platform.EnrollmentEnrolled) && enrollOp != nil && *enrollOp == string(op.ID) {
 			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
 		}
-		return s.failReconciledPlatform(ctx, op, "enrollment ended before the node was verified; retry with platform nodes retry", contract.Unavailable)
+		return s.failReconciledPlatform(ctx, op, "enrollment ended before the node was verified; retry node enrollment", contract.Unavailable)
 	case platform.KindDomainAdd, platform.KindDomainRemove:
 		// The table already holds the change; the routes file is derived from it.
 		if err := s.syncRoutes(ctx); err != nil {

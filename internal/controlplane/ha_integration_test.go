@@ -157,7 +157,7 @@ func TestIntegrationDatabaseOutageRecoversWithoutDuplicates(t *testing.T) {
 	keyFile := writeKeyFile(t)
 	nodeDir := t.TempDir()
 	ctx := context.Background()
-	cp := startControlPlane(t, proxy.dsn(dsn), keyFile, nodeDir, 2, false)
+	cp := startControlPlane(t, proxy.dsn(dsn), keyFile, nodeDir, 2)
 
 	const steps = 8
 	op, err := cp.run.Service.Submit(ctx, submission("database-outage", fmt.Sprintf(`{"steps":%d,"step_delay_ms":150}`, steps)))
@@ -391,8 +391,8 @@ func TestIntegrationCompetingSubmissionsAcrossControlPlanes(t *testing.T) {
 	keyFile := writeKeyFile(t)
 	nodeDir := t.TempDir()
 	ctx := context.Background()
-	first := startControlPlane(t, dsn, keyFile, nodeDir, 1, false)
-	second := startControlPlane(t, dsn, keyFile, nodeDir, 1, false)
+	first := startControlPlane(t, dsn, keyFile, nodeDir, 1)
+	second := startControlPlane(t, dsn, keyFile, nodeDir, 1)
 
 	const steps = 4
 	var wait sync.WaitGroup

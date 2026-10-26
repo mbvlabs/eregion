@@ -76,11 +76,6 @@ func logsServerBody(message string) string {
 		time.Now().UTC().Format(time.RFC3339Nano), encoded)
 }
 
-func metricsServerBody() string {
-	return fmt.Sprintf(`{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"host":"app-1"},"values":[[%d,"1"],[%d,"4"],[%d,"2"]]}]}}`,
-		time.Now().Add(-2*time.Minute).Unix(), time.Now().Add(-time.Minute).Unix(), time.Now().Unix())
-}
-
 func TestLogsSearchJSONAndPlain(t *testing.T) {
 	state, server := newTelemetryServer(t)
 	state.token = "read-token-value"
@@ -239,34 +234,6 @@ func TestLogsTailNoDataIsNotAFailure(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "No log entries matched") {
 		t.Fatalf("no-data state was not explicit: %q", stdout)
-	}
-}
-
-func TestMetricsQueryJSONAndGraph(t *testing.T) {
-	state, server := newTelemetryServer(t)
-	state.metrics = metricsServerBody()
-	telemetryTestEnvironment(t, server, "")
-
-	code, stdout, stderr := invoke(t, "metrics", "query", "--source", "app-1", "--expression", "up", "--unit", "count", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q", code, stderr)
-	}
-	envelope := decodeOne(t, stdout)
-	raw, _ := json.Marshal(envelope.Data)
-	var metrics telemetry.MetricResult
-	if err := json.Unmarshal(raw, &metrics); err != nil {
-		t.Fatal(err)
-	}
-	if metrics.State != telemetry.StateOK || metrics.Unit != "count" || len(metrics.Series) != 1 || len(metrics.Series[0].Samples) != 3 {
-		t.Fatalf("unexpected metric result: %s", raw)
-	}
-
-	code, stdout, stderr = invoke(t, "metrics", "query", "--source", "app-1", "--expression", "up", "--unit", "count", "--graph")
-	if code != 0 || stderr != "" {
-		t.Fatalf("graph code=%d stderr=%q", code, stderr)
-	}
-	if !strings.Contains(stdout, "series {host=app-1}") || !strings.ContainsAny(stdout, "▁▂▃▄▅▆▇█") {
-		t.Fatalf("sparkline was not rendered:\n%s", stdout)
 	}
 }
 

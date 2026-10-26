@@ -128,7 +128,7 @@ func TestIntegrationWebhookDeliverySurvivesOperationRetention(t *testing.T) {
 	keyFile := writeKeyFile(t)
 	nodeDir := t.TempDir()
 	ctx := context.Background()
-	cp := startControlPlane(t, dsn, keyFile, nodeDir, 2, false)
+	cp := startControlPlane(t, dsn, keyFile, nodeDir, 2)
 	store := NewWebhookDeliveryStore(pool)
 	handler, err := api.NewWebhookHandler(api.WebhookConfig{
 		Secret:     []byte(integrationWebhookSecret),

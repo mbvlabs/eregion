@@ -54,8 +54,7 @@ func (reconcileArgs) Kind() string { return "operation_reconcile" }
 type Runtime struct {
 	Service *Service
 	Jobs    *river.Client[pgx.Tx]
-	// Nodes resolves the transport of any node. Extensions that dispatch node
-	// work (telemetry, resources) take it instead of a single transport.
+	// Nodes resolves the transport of any node for worker dispatch.
 	Nodes NodeTransports
 }
 
@@ -100,10 +99,10 @@ type WorkerConfig struct {
 	// uses EREGION_NODE_NAME, then "local" for compatibility. A fresh main
 	// node bootstrap writes "main".
 	LocalNodeName string
-	// Resolver is an already-built per-node transport resolver. A process that
-	// also registers extensions (telemetry) builds one resolver and shares it, so
-	// there is exactly one cache and one WireGuard key lock per node. Nil builds
-	// the resolver from Nodes and Transport.
+	// Resolver is an already-built per-node transport resolver. The process
+	// builds one resolver and shares it with extension dispatch, so there is
+	// exactly one cache and one WireGuard key lock per node. Nil builds the
+	// resolver from Nodes and Transport.
 	Resolver *NodeResolver
 }
 
@@ -148,7 +147,6 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &platformWorker{service: service})
 	river.AddWorker(workers, &reconcileWorker{service: service})
-	river.AddWorker(workers, &backupScheduleWorker{service: service, logger: logger})
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
@@ -163,11 +161,6 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		riverConfig.PeriodicJobs = []*river.PeriodicJob{
 			river.NewPeriodicJob(river.PeriodicInterval(5*time.Second), func() (river.JobArgs, *river.InsertOpts) {
 				return reconcileArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 3}
-			}, &river.PeriodicJobOpts{RunOnStart: true}),
-			// Backup policies are evaluated by every worker; the deterministic
-			// idempotency key makes concurrent evaluation submit each slot once.
-			river.NewPeriodicJob(river.PeriodicInterval(backupScheduleInterval), func() (river.JobArgs, *river.InsertOpts) {
-				return backupScheduleArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 3, UniqueOpts: river.UniqueOpts{ByPeriod: backupScheduleInterval / 2}}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
 		}
 	}

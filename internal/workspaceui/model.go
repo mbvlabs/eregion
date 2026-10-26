@@ -29,8 +29,6 @@ const (
 	Envs
 	Releases
 	Deployments
-	Resources
-	Backups
 	tabCount
 )
 
@@ -46,10 +44,6 @@ func (t Tab) String() string {
 		return "Releases"
 	case Deployments:
 		return "Deployments"
-	case Resources:
-		return "Resources"
-	case Backups:
-		return "Backups"
 	default:
 		return "Unknown"
 	}
@@ -68,10 +62,6 @@ func (t Tab) Collection() string {
 		return "releases"
 	case Deployments:
 		return "deployments"
-	case Resources:
-		return "resources"
-	case Backups:
-		return "backups"
 	default:
 		return ""
 	}
@@ -90,12 +80,8 @@ func ParseTab(value string) (Tab, error) {
 		return Releases, nil
 	case "deployments", "deployment", "deploys":
 		return Deployments, nil
-	case "resources", "resource":
-		return Resources, nil
-	case "backups", "backup":
-		return Backups, nil
 	default:
-		return Fleet, contract.NewFault(contract.Usage, "unknown workspace tab", "Use fleet, apps, envs, releases, deployments, resources, or backups.")
+		return Fleet, contract.NewFault(contract.Usage, "unknown workspace tab", "Use fleet, apps, envs, releases, or deployments.")
 	}
 }
 
@@ -614,12 +600,6 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 	case "5":
 		command := m.setTab(Deployments)
 		return m, command
-	case "6":
-		command := m.setTab(Resources)
-		return m, command
-	case "7":
-		command := m.setTab(Backups)
-		return m, command
 	case "tab":
 		command := m.setTab((m.tab + 1) % tabCount)
 		return m, command
@@ -676,16 +656,6 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 		m.openForm("deploy")
 	case "o":
 		m.openForm("rollback")
-	case "n":
-		m.openForm("node-check")
-	case "x":
-		m.openForm("resource-destroy")
-	case "b":
-		m.openForm("backup-create")
-	case "v":
-		m.openForm("backup-verify")
-	case "R":
-		m.openForm("backup-restore")
 	case "?":
 		m.showHelp = true
 	}
@@ -743,16 +713,6 @@ func (m Model) handleDetailKey(pressed string) (tea.Model, tea.Cmd) {
 		m.openForm("deploy")
 	case "o":
 		m.openForm("rollback")
-	case "n":
-		m.openForm("node-check")
-	case "x":
-		m.openForm("resource-destroy")
-	case "b":
-		m.openForm("backup-create")
-	case "v":
-		m.openForm("backup-verify")
-	case "R":
-		m.openForm("backup-restore")
 	case "?":
 		m.showHelp = true
 	}
@@ -918,12 +878,12 @@ type keyMap struct {
 func defaultKeys() keyMap {
 	return keyMap{
 		Nav:       key.NewBinding(key.WithKeys("j", "k", "g", "G"), key.WithHelp("j/k g/G", "move")),
-		Tabs:      key.NewBinding(key.WithKeys("tab", "1-7"), key.WithHelp("tab/1-7", "workspace")),
+		Tabs:      key.NewBinding(key.WithKeys("tab", "1-5"), key.WithHelp("tab/1-5", "workspace")),
 		Filter:    key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
 		Discovery: key.NewBinding(key.WithKeys(":"), key.WithHelp(":", "commands")),
 		Details:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "details")),
 		Refresh:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
-		Actions:   key.NewBinding(key.WithKeys("a", "e", "i", "d", "o", "n", "x", "b", "v", "R"), key.WithHelp("a e i d o n x b v R", "guided actions")),
+		Actions:   key.NewBinding(key.WithKeys("a", "e", "i", "d", "o"), key.WithHelp("a e i d o", "guided actions")),
 		Help:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Detach:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "detach")),
 		Form:      key.NewBinding(key.WithKeys("enter", "tab", "esc"), key.WithHelp("enter/tab", "field")),

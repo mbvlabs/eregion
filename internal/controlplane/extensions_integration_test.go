@@ -19,20 +19,10 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
-	"github.com/mbvlabs/eregion/internal/resources"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
 
 var operatorActor = contract.Actor{Kind: "operator", Subject: "extensions-operator"}
-
-// absentRunner is a Docker stand-in for a host with no containers: every command
-// completes with a non-zero exit, which the resources service reads as absent.
-type absentRunner struct{ node string }
-
-func (r absentRunner) NodeIdentity(context.Context) (string, error) { return r.node, nil }
-func (absentRunner) Run(context.Context, resources.Command) (resources.CommandResult, error) {
-	return resources.CommandResult{ExitCode: 1, Stderr: []byte("Error: No such object")}, nil
-}
 
 // controlPlane is one full control plane: its own pool, extension wiring, vault
 // resolver, River workers, and HTTP API (operations, secrets) on one database.
@@ -54,25 +44,14 @@ func (c *controlPlane) client(t *testing.T) *api.Client {
 	return client
 }
 
-func startControlPlane(t *testing.T, dsn, keyFile, nodeDir string, workers int, withResources bool) *controlPlane {
+func startControlPlane(t *testing.T, dsn, keyFile, nodeDir string, workers int) *controlPlane {
 	t.Helper()
 	ctx := context.Background()
 	pool, err := Open(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	config := ExtensionConfig{Pool: pool, DatabaseURL: dsn}
-	if withResources {
-		config.Resources = &resources.Config{
-			Host: "node-a", StateDir: filepath.Join(nodeDir, "resources"), BackupDir: filepath.Join(nodeDir, "backups"),
-			Runner: absentRunner{node: "node-a"}, PollInterval: time.Millisecond,
-			// The generated test database name is longer than a resource
-			// database may be, so the protected name is explicit here; the
-			// DSN derivation has its own unit test.
-			ControlPlaneDatabase: "cpdb",
-		}
-	}
-	if _, err := RegisterExtensions(config); err != nil {
+	if _, err := RegisterExtensions(ExtensionConfig{Pool: pool}); err != nil {
 		t.Fatal(err)
 	}
 	vaultService, err := NewVaultService(pool, keyFile)
@@ -137,7 +116,7 @@ func TestIntegrationTwoControlPlanesSurviveTheSubmitter(t *testing.T) {
 	nodeDir := t.TempDir() // Both control planes share one node state directory.
 	ctx := context.Background()
 
-	first := startControlPlane(t, dsn, keyFile, nodeDir, 1, false)
+	first := startControlPlane(t, dsn, keyFile, nodeDir, 1)
 	raw, err := first.client(t).Test(ctx, operations.TestInput{Steps: 3, StepDelayMS: 400}, "two-control-planes", false)
 	if err != nil {
 		t.Fatal(err)
@@ -153,7 +132,7 @@ func TestIntegrationTwoControlPlanesSurviveTheSubmitter(t *testing.T) {
 	})
 
 	// The second control plane comes up only now, so the first certainly holds the job.
-	second := startControlPlane(t, dsn, keyFile, nodeDir, 1, false)
+	second := startControlPlane(t, dsn, keyFile, nodeDir, 1)
 	first.stop() // Kill: listener closed, workers cancelled mid-step, pool gone.
 
 	// The surviving control plane's API answers for the dead one's operation.
@@ -196,7 +175,7 @@ func TestIntegrationExtensionsThroughRealWiring(t *testing.T) {
 	keyFile := writeKeyFile(t)
 	nodeDir := t.TempDir()
 	ctx := context.Background()
-	cp := startControlPlane(t, dsn, keyFile, nodeDir, 2, true)
+	cp := startControlPlane(t, dsn, keyFile, nodeDir, 2)
 	s := cp.run.Service
 
 	for _, table := range []string{"eregion_secrets", "eregion_secret_revisions", "eregion_access_grants", "eregion_integration_audit"} {
@@ -208,17 +187,6 @@ func TestIntegrationExtensionsThroughRealWiring(t *testing.T) {
 	if audit, err := integrationsAudit(pool); err != nil || audit != 0 {
 		t.Fatalf("audit table is not queryable and empty: %d %v", audit, err)
 	}
-
-	// A resource action executes through the registered extension.
-	spec := resources.Spec{Name: "appdb", Engine: resources.EnginePostgreSQL, Version: "17", Host: "node-a", Database: "app", Username: "app"}
-	health := platformSubmit(t, s, resources.KindResourceHealth, "node/node-a", "resource-health", resources.ResourceHealthInput{Spec: spec})
-	platformAwait(t, s, health, contract.Succeeded)
-
-	// The control-plane database itself is excluded from resource actions.
-	protected := spec
-	protected.Name, protected.Database = "cpdb", "cpdb"
-	op := platformSubmit(t, s, resources.KindBackupCreate, "node/node-a", "protected-backup", resources.BackupCreateInput{Spec: protected})
-	platformAwait(t, s, op, contract.Failed)
 
 	// A secret set through the mounted route is resolved at deploy time.
 	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "app", map[string]any{"name": "shop"}), contract.Succeeded)
@@ -251,36 +219,6 @@ func TestIntegrationExtensionsThroughRealWiring(t *testing.T) {
 	var leaked int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operation_events e JOIN eregion_operations o ON o.id=e.operation_id WHERE e.event::text LIKE '%'||$1||'%' OR o.input::text LIKE '%'||$1||'%'`, plaintext).Scan(&leaked); err != nil || leaked != 0 {
 		t.Fatalf("plaintext reached durable operation state: %d %v", leaked, err)
-	}
-
-	// A declared backup policy is submitted once per slot, however many
-	// control planes evaluate it.
-	backups := platformSubmit(t, s, resources.KindBackupCreate, "node/node-a", "policy-declaration", resources.BackupCreateInput{
-		Spec: spec, Policy: &resources.Policy{Schedule: resources.Schedule{EverySeconds: 3600}, Retention: resources.Retention{KeepLast: 3}},
-	})
-	platformAwait(t, s, backups, contract.Failed) // The fake host has no database to dump; the declaration is what matters.
-	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET created_at = created_at - interval '2 hours' WHERE id=$1`, backups.ID); err != nil {
-		t.Fatal(err)
-	}
-	var evaluations sync.WaitGroup
-	now := time.Now().UTC()
-	for range 4 {
-		evaluations.Add(1)
-		go func() {
-			defer evaluations.Done()
-			if _, err := s.ScheduleBackups(ctx, now, nil); err != nil {
-				t.Errorf("schedule: %v", err)
-			}
-		}()
-	}
-	evaluations.Wait()
-	var scheduled int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE kind=$1 AND actor_subject=$2`, resources.KindBackupCreate, scheduledBackupActor.Subject).Scan(&scheduled); err != nil || scheduled != 1 {
-		t.Fatalf("expected exactly one scheduled backup, got %d (%v)", scheduled, err)
-	}
-	again, err := s.ScheduleBackups(ctx, now, nil)
-	if err != nil || len(again) != 0 {
-		t.Fatalf("a restart re-submitted a slot: %d %v", len(again), err)
 	}
 }
 

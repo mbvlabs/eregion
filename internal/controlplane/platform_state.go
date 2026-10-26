@@ -161,7 +161,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return platformWriteError(err, "node registration conflicts")
 		}
 		if tag.RowsAffected() == 0 {
-			return contract.NewFault(contract.Conflict, "node is enrolling or enrolled; declared facts cannot overwrite verified ones", "Use platform nodes enroll or platform nodes retry to change an enrolled node.")
+			return contract.NewFault(contract.Conflict, "node is enrolling or enrolled; declared facts cannot overwrite verified ones", "An enrolled node's verified facts cannot be replaced by declared facts.")
 		}
 	case *platform.EnvironmentCreateInput:
 		app, err := appByNameTx(ctx, tx, input.App)

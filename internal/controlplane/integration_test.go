@@ -512,29 +512,28 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 		_ = response.Body.Close()
 		return response.StatusCode == 200
 	})
-	command := exec.Command(binary, "operations", "test", "--steps", "5", "--step-delay-ms", "25", "--idempotency-key", "cli:durable-1", "--json")
-	command.Env = environment
-	raw, err = command.Output()
+	client, err := api.NewClient(endpoint, credential)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var accepted struct {
-		OK   bool               `json:"ok"`
-		Data contract.Operation `json:"data"`
+	raw, err = client.Test(context.Background(), operations.TestInput{Steps: 5, StepDelayMS: 25}, "cli:durable-1", false)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := json.Unmarshal(raw, &accepted); err != nil || !accepted.OK || accepted.Data.State != contract.Queued {
-		t.Fatalf("CLI did not durably queue: %s %v", raw, err)
+	var accepted contract.Operation
+	if err := json.Unmarshal(raw, &accepted); err != nil || accepted.State != contract.Queued {
+		t.Fatalf("API did not durably queue: %s %v", raw, err)
 	}
 	worker, workerDone := start("worker", "--concurrency", "2", "--json")
 	service := testRuntime(t, pool, 0, nodeDir).Service
 	await(t, 10*time.Second, func() bool {
-		op, err := service.Get(context.Background(), testActor, accepted.Data.ID)
+		op, err := service.Get(context.Background(), testActor, accepted.ID)
 		return err == nil && op.State == contract.Succeeded
 	})
-	if got := effectCount(t, nodeDir, accepted.Data.ID, 5); got != 5 {
+	if got := effectCount(t, nodeDir, accepted.ID, 5); got != 5 {
 		t.Fatalf("executable lifecycle effects: %d", got)
 	}
-	command = exec.Command(binary, "operations", "events", string(accepted.Data.ID), "--limit", "2", "--json")
+	command := exec.Command(binary, "operations", "events", string(accepted.ID), "--limit", "2", "--json")
 	command.Env = environment
 	raw, err = command.Output()
 	if err != nil || !json.Valid(raw) {

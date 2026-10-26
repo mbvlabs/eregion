@@ -1,6 +1,6 @@
 eregion · 127.0.0.1:8080 · Fleet
 fresh · 2 rows
-[1 Fleet]  2 Apps  3 Envs  4 Releases  5 Deployments  6 Resources  7 Backups
+[1 Fleet]  2 Apps  3 Envs  4 Releases  5 Deployments
 SERVER                                                           ROLE                 HEALTH         OBSERVED        
 > main                                                             application, builder ready          10s ago         
   builder-2                                                        builder              unreachable    never observed  
@@ -21,4 +21,4 @@ focus: main · role application, builder · health ready · observed 10s ago · 
 
 
 fresh
-j/k g/G move | tab/1-7 workspace | / filter | : commands | enter details | r refresh …
+j/k g/G move | tab/1-5 workspace | / filter | : commands | enter details | r refresh | a e i d o guided actions | ? h...

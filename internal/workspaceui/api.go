@@ -1,5 +1,5 @@
 // Package workspaceui implements the keyboard-driven fleet, application,
-// environment, resource, and backup workspaces. It only reads platform
+// environment, release, and deployment workspaces. It only reads platform
 // inventory and submits registered platform actions through the public API
 // contract; it never opens SSH, touches a database, starts a queue, or cancels
 // an operation when the interface is detached.
@@ -20,7 +20,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
-	"github.com/mbvlabs/eregion/internal/resources"
 )
 
 // API is the subset of the authenticated API client the workspace uses. The
@@ -47,9 +46,6 @@ type Action struct {
 	ConfirmPhrase string
 }
 
-// Noninteractive is the generic platform submit equivalent shown for every
-// action. The wrapper uses the same kind, target, input, and idempotency key as
-// the interactive path; it never adds a second submission mechanism.
 // PlanToken binds a typed confirmation to the exact kind, target, and input
 // that the dry run previewed. It mirrors the CLI's plan-bound rollback token so
 // a changed input cannot reuse an earlier approval.
@@ -67,24 +63,56 @@ func (a Action) PlanToken() string {
 	return hex.EncodeToString(digest.Sum(nil))
 }
 
+// Noninteractive is the exact platform command equivalent shown for every
+// action. It uses the same kind, target, input, and idempotency key as the
+// interactive path; it never adds a second submission mechanism.
 func (a Action) Noninteractive() string {
-	input := string(a.Input)
-	if input == "" {
-		input = "{}"
+	suffix := " --idempotency-key " + a.IdempotencyKey + " --json"
+	switch a.Kind {
+	case platform.KindAppCreate:
+		var input platform.AppCreateInput
+		if json.Unmarshal(a.Input, &input) != nil {
+			return ""
+		}
+		return "eregion platform apps create " + input.Name + suffix
+	case platform.KindEnvironmentCreate:
+		var input platform.EnvironmentCreateInput
+		if json.Unmarshal(a.Input, &input) != nil {
+			return ""
+		}
+		command := "eregion platform environments create " + input.App + " " + input.Name +
+			" --node " + input.Node +
+			fmt.Sprintf(" --container-port %d --host-port %d", input.ContainerPort, input.HostPort)
+		if input.Health.Path != "" {
+			command += " --health-path " + input.Health.Path
+		}
+		return command + suffix
+	case platform.KindReleaseCreate:
+		var input platform.ReleaseCreateInput
+		if json.Unmarshal(a.Input, &input) != nil {
+			return ""
+		}
+		return "eregion platform releases create " + input.App + " " + input.Environment +
+			" --image " + input.Source.Image + suffix
+	case platform.KindDeploy:
+		var input platform.DeployInput
+		if json.Unmarshal(a.Input, &input) != nil {
+			return ""
+		}
+		return "eregion platform deployments deploy " + input.App + " " + input.Environment +
+			" --release-id " + string(input.ReleaseID) + suffix
+	case platform.KindRollback:
+		var input platform.RollbackInput
+		if json.Unmarshal(a.Input, &input) != nil {
+			return ""
+		}
+		command := "eregion platform deployments rollback " + input.App + " " + input.Environment
+		if input.ToReleaseID != "" {
+			command += " --to-release-id " + string(input.ToReleaseID)
+		}
+		return command + " --confirm " + a.PlanToken() + suffix
 	}
-	var command strings.Builder
-	command.WriteString("umask 077 && printf '%s' " + shellQuote(input) + " > action.json\n")
-	command.WriteString("eregion platform submit")
-	command.WriteString(" --kind " + a.Kind)
-	command.WriteString(" --target " + a.Target)
-	command.WriteString(" --input-file action.json")
-	command.WriteString(" --idempotency-key " + a.IdempotencyKey)
-	command.WriteString(" --json")
-	return command.String()
-}
-
-func shellQuote(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+	return ""
 }
 
 // Preview is the secret-free dry-run plan returned before a real submission.
@@ -179,10 +207,6 @@ func decodeInventory(tab Tab, raw json.RawMessage, clean func(string) string) ([
 		return decodeReleases(items, clean)
 	case Deployments:
 		return decodeDeployments(items, clean)
-	case Resources:
-		return decodeResources(items, clean)
-	case Backups:
-		return decodeBackups(items, clean)
 	default:
 		return decodeGeneric(items, clean)
 	}
@@ -424,119 +448,12 @@ func decodeDeployments(raw json.RawMessage, clean func(string) string) ([]Item, 
 	return items, nil
 }
 
-func decodeResources(raw json.RawMessage, clean func(string) string) ([]Item, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	var observations []resources.ResourceInventoryItem
-	if err := json.Unmarshal(raw, &observations); err != nil {
-		return nil, invalidAPI("resource inventory is not a resource list")
-	}
-	items := make([]Item, 0, len(observations))
-	for _, observation := range observations {
-		spec := observation.Spec
-		name, host := clean(spec.Name), clean(spec.Host)
-		status := clean(string(observation.State))
-		if observation.Health != nil && observation.Health.Status != "" {
-			status = clean(string(observation.Health.Status))
-		}
-		details := []Detail{
-			{Label: "name", Value: name},
-			{Label: "engine", Value: clean(string(spec.Engine))},
-			{Label: "version", Value: clean(spec.Version)},
-			{Label: "host", Value: host},
-			{Label: "database", Value: clean(spec.Database)},
-			{Label: "username", Value: clean(spec.Username)},
-			{Label: "protection", Value: clean(string(spec.Protection))},
-			{Label: "state", Value: clean(string(observation.State))},
-		}
-		if observation.Endpoint != nil {
-			details = append(details,
-				Detail{Label: "endpoint", Value: clean(fmt.Sprintf("%s:%d", observation.Endpoint.Address, observation.Endpoint.Port))},
-				Detail{Label: "sslmode", Value: clean(observation.Endpoint.SSLMode)},
-			)
-		}
-		if observation.Credential != nil {
-			details = append(details, Detail{Label: "credential file", Value: clean(observation.Credential.PasswordFile)})
-		}
-		if observation.Health != nil {
-			details = append(details,
-				Detail{Label: "health", Value: clean(string(observation.Health.Status))},
-				Detail{Label: "health detail", Value: clean(observation.Health.Detail)},
-				Detail{Label: "health checked", Value: observation.Health.CheckedAt.Format("2006-01-02 15:04:05Z07:00")},
-			)
-		}
-		details = append(details, Detail{Label: "telemetry", Value: "source-dependent; no metric is invented"})
-		search := joinSearch(name, host, string(spec.Engine), spec.Database, string(observation.State), status)
-		items = append(items, Item{
-			Key: name + "@" + host, Title: name, Subtitle: host, Status: status, Details: details, SearchText: search,
-			Data: map[string]string{
-				"name": name, "host": host, "engine": clean(string(spec.Engine)), "status": status,
-				"database": clean(spec.Database), "version": clean(spec.Version),
-			},
-			Payload: marshalPayload(spec),
-		})
-	}
-	return items, nil
-}
-
-func decodeBackups(raw json.RawMessage, clean func(string) string) ([]Item, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	var artifacts []resources.BackupArtifact
-	if err := json.Unmarshal(raw, &artifacts); err != nil {
-		return nil, invalidAPI("backup inventory is not a backup list")
-	}
-	items := make([]Item, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		archive := clean(artifact.Archive)
-		title := clean(artifact.Resource) + " " + pathBase(archive)
-		status := "unverified"
-		if artifact.Verified {
-			status = "verified"
-		}
-		details := []Detail{
-			{Label: "archive", Value: archive},
-			{Label: "manifest", Value: clean(artifact.Manifest)},
-			{Label: "resource", Value: clean(artifact.Resource)},
-			{Label: "host", Value: clean(artifact.Host)},
-			{Label: "database", Value: clean(artifact.Database)},
-			{Label: "effect", Value: clean(artifact.EffectID)},
-			{Label: "size", Value: fmt.Sprintf("%d bytes", artifact.SizeBytes)},
-			{Label: "sha256", Value: clean(artifact.SHA256)},
-			{Label: "reason", Value: clean(artifact.Reason)},
-			{Label: "created", Value: artifact.CreatedAt.Format("2006-01-02 15:04:05Z07:00")},
-		}
-		if artifact.VerifiedAt != nil {
-			details = append(details, Detail{Label: "verified", Value: artifact.VerifiedAt.Format("2006-01-02 15:04:05Z07:00")})
-		}
-		search := joinSearch(title, artifact.Resource, artifact.Host, artifact.Database, artifact.Archive, artifact.SHA256, status)
-		items = append(items, Item{
-			Key: artifact.Archive, Title: title, Subtitle: clean(artifact.Host), Status: status, Details: details, SearchText: search,
-			Data: map[string]string{
-				"archive": archive, "resource": clean(artifact.Resource), "host": clean(artifact.Host),
-				"database": clean(artifact.Database), "sha256": clean(artifact.SHA256), "status": status,
-			},
-			Payload: marshalPayload(artifact),
-		})
-	}
-	return items, nil
-}
-
 func marshalPayload(value any) json.RawMessage {
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return nil
 	}
 	return raw
-}
-
-func pathBase(value string) string {
-	if index := strings.LastIndexAny(value, `/\`); index >= 0 && index+1 < len(value) {
-		return value[index+1:]
-	}
-	return value
 }
 
 func envDetails(values map[string]string, clean func(string) string) []Detail {

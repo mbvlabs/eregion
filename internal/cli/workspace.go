@@ -27,8 +27,8 @@ func (a *app) workspaceSpecs() []spec {
 	meta.Mutating = true
 	meta.DryRunReason = "The workspace previews every action with the platform dry-run API before explicit submission; the command itself only starts the interface."
 	meta.WhenToUse = []string{
-		"Explore fleet, app, environment, release, deployment, resource, and backup inventory with freshness and focused details.",
-		"Preview and submit an app, environment, image release, deploy, rollback, node check, resource destruction, or backup action; every action shows its noninteractive platform submit equivalent.",
+		"Explore fleet, app, environment, release, and deployment inventory with freshness and focused details.",
+		"Preview and submit an app, environment, image release, deploy, or rollback action; every action shows its exact noninteractive platform command equivalent.",
 		"Use ':' for command discovery, '/' to filter, and the documented destructive confirmation before submission.",
 		"Requires --interactive and a real terminal on stdin and stdout. Machine output never starts the interface.",
 	}
@@ -43,7 +43,7 @@ func (a *app) workspaceSpecs() []spec {
 		use:  "ui",
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
-			cmd.Flags().String("tab", "fleet", "Initial workspace: fleet, apps, envs, releases, deployments, resources, or backups")
+			cmd.Flags().String("tab", "fleet", "Initial workspace: fleet, apps, envs, releases, or deployments")
 			cmd.Flags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 			cmd.Flags().Bool("ascii", false, "Use ASCII glyphs instead of Unicode")
 			cmd.Flags().Bool("no-color", false, "Disable colour (NO_COLOR is also honoured)")
@@ -58,7 +58,7 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	jsonMode, _ := cmd.Flags().GetBool("json")
 	outputMode, _ := cmd.Flags().GetString("output")
 	if jsonMode || outputMode != "plain" {
-		return result{}, contract.NewFault(contract.InvalidOutputMode, "the interactive workspace cannot produce machine output", "Use plain output and run eregion ui, or use the platform submit commands with --json.")
+		return result{}, contract.NewFault(contract.InvalidOutputMode, "the interactive workspace cannot produce machine output", "Use plain output and run eregion ui, or use the platform commands with --json.")
 	}
 	streams := followConfig(cmd)
 	if streams == nil || !isTerminal(streams.in) || !isTerminal(streams.out) {
@@ -178,10 +178,10 @@ func (w workspaceLiveAPI) Events(ctx context.Context, cursor contract.Cursor, li
 	return w.client.Events(ctx, cursor, limit)
 }
 
-// workspaceMetricsSource adapts the same telemetry read configuration used by
-// `logs` and `metrics` to the workspace graph boundary. No telemetry
-// configuration is the explicit nil source, so the UI renders "no telemetry
-// node" instead of an empty graph.
+// workspaceMetricsSource adapts the telemetry read configuration used by
+// `logs` to the workspace graph boundary. No telemetry configuration is the
+// explicit nil source, so the UI renders "no telemetry node" instead of an
+// empty graph.
 func (a *app) workspaceMetricsSource(cmd *cobra.Command) (workspaceui.MetricsSource, error) {
 	if strings.TrimSpace(flagOrEnvironment(cmd, "telemetry-url", "EREGION_TELEMETRY_URL")) == "" &&
 		strings.TrimSpace(flagOrEnvironment(cmd, "logs-url", "EREGION_TELEMETRY_LOGS_URL")) == "" &&

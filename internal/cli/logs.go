@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/url"
 	"os"
@@ -91,28 +90,6 @@ func (a *app) logsSpecs() []spec {
 						cmd.Flags().Bool("ndjson", false, "Emit NDJSON records even without --output json")
 					},
 					run: a.logsTail,
-				},
-			},
-		},
-		{
-			use:  "metrics",
-			meta: telemetryReadMeta("Query telemetry metrics with an explicit unit and optional terminal graph", "eregion metrics query --source app-1 --expression 'up' --unit count --graph --json", "eregion metrics query --source app-1 --expression 'up' --unit count --json"),
-			run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
-			children: []spec{
-				{
-					use:  "query",
-					meta: telemetryReadMeta("Read one bounded metric range and optionally render a plain-text sparkline", "eregion metrics query --source app-1 --expression 'rate(http_requests_total[5m])' --unit requests/second --graph --json", "eregion metrics query --source app-1 --expression 'up' --unit count --json"),
-					args: platformReadArgs,
-					flags: func(cmd *cobra.Command) {
-						addTelemetrySourceFlags(cmd)
-						addTelemetryWindowFlags(cmd, time.Hour)
-						cmd.Flags().String("source", "", "Logical producer named in the result; the backend is never inferred")
-						cmd.Flags().String("expression", "", "PromQL/MetricsQL expression")
-						cmd.Flags().String("unit", "", "Explicit unit, such as percent, bytes, or requests/second")
-						cmd.Flags().Duration("step", 0, "Sample step; defaults to a bounded window-derived value")
-						cmd.Flags().Bool("graph", false, "Render a plain-text sparkline per series")
-					},
-					run: a.metricsQuery,
 				},
 			},
 		},
@@ -263,38 +240,6 @@ func (a *app) finishTail(cmd *cobra.Command, out io.Writer, streamJSON bool, las
 	return result{data: summary, streamed: true}, err
 }
 
-func (a *app) metricsQuery(cmd *cobra.Command, _ []string) (result, error) {
-	window, err := telemetryWindow(cmd, time.Hour)
-	if err != nil {
-		return result{}, err
-	}
-	source, _ := cmd.Flags().GetString("source")
-	expression, _ := cmd.Flags().GetString("expression")
-	unit, _ := cmd.Flags().GetString("unit")
-	step, _ := cmd.Flags().GetDuration("step")
-	graph, _ := cmd.Flags().GetBool("graph")
-	if strings.TrimSpace(source) == "" {
-		return result{}, contract.NewFault(contract.InputRequired, "--source is required", "Name the logical producer; the backend never infers it.")
-	}
-	if strings.TrimSpace(expression) == "" {
-		return result{}, contract.NewFault(contract.InputRequired, "--expression is required", "Provide a PromQL/MetricsQL expression.")
-	}
-	if strings.TrimSpace(unit) == "" {
-		return result{}, contract.NewFault(contract.InputRequired, "--unit is required", "Provide an explicit unit such as percent or bytes.")
-	}
-	dataSource, err := a.telemetryDataSource(cmd)
-	if err != nil {
-		return result{}, err
-	}
-	metrics, err := dataSource.Metrics(cmd.Context(), telemetry.MetricQuery{
-		Window: window, Source: source, Expression: expression, Unit: unit, Step: step,
-	})
-	if err != nil {
-		return result{}, err
-	}
-	return result{data: metrics, plain: a.formatMetrics(metrics, graph)}, nil
-}
-
 func telemetryWindow(cmd *cobra.Command, fallback time.Duration) (telemetry.Window, error) {
 	since, _ := cmd.Flags().GetDuration("since")
 	startText, _ := cmd.Flags().GetString("start")
@@ -430,49 +375,6 @@ func (a *app) formatLogLine(entry telemetry.LogEntry, clean func(string) string)
 	return strings.Join(parts, " ")
 }
 
-func (a *app) formatMetrics(metrics telemetry.MetricResult, graph bool) string {
-	clean := a.followCleaner()
-	var b strings.Builder
-	fmt.Fprintf(&b, "state: %s  source: %s  unit: %s\n", metrics.State, clean(metrics.Source), clean(metrics.Unit))
-	fmt.Fprintf(&b, "window: %s .. %s\n", metrics.Window.Start.UTC().Format(time.RFC3339), metrics.Window.End.UTC().Format(time.RFC3339))
-	if !metrics.ObservedAt.IsZero() {
-		fmt.Fprintf(&b, "observed: %s\n", metrics.ObservedAt.UTC().Format(time.RFC3339))
-	}
-	if message := stateMessage(metrics.State, metrics.Message); message != "" {
-		b.WriteString(clean(message) + "\n")
-	}
-	for _, series := range metrics.Series {
-		fmt.Fprintf(&b, "series %s samples=%d", formatLabels(series.Labels, clean), len(series.Samples))
-		if len(series.Samples) > 0 {
-			last := series.Samples[len(series.Samples)-1]
-			fmt.Fprintf(&b, " last=%g at=%s", last.Value, last.Timestamp.UTC().Format(time.RFC3339))
-		}
-		b.WriteString("\n")
-		if graph {
-			if line := sparkline(series.Samples); line != "" {
-				b.WriteString("  " + line + "\n")
-			}
-		}
-	}
-	return b.String()
-}
-
-func formatLabels(labels map[string]string, clean func(string) string) string {
-	if len(labels) == 0 {
-		return "{}"
-	}
-	keys := make([]string, 0, len(labels))
-	for key := range labels {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, key := range keys {
-		parts = append(parts, clean(key)+"="+clean(labels[key]))
-	}
-	return "{" + strings.Join(parts, ",") + "}"
-}
-
 func stateMessage(state telemetry.State, message string) string {
 	switch state {
 	case telemetry.StateAbsent:
@@ -531,45 +433,4 @@ func writeJSONRecord(out io.Writer, record ndjsonLogRecord) error {
 		err = fmt.Errorf("short write")
 	}
 	return err
-}
-
-func sparkline(samples []telemetry.MetricSample) string {
-	blocks := []rune("▁▂▃▄▅▆▇█")
-	values := make([]float64, 0, len(samples))
-	for _, sample := range samples {
-		if math.IsNaN(sample.Value) || math.IsInf(sample.Value, 0) {
-			continue
-		}
-		values = append(values, sample.Value)
-	}
-	if len(values) == 0 {
-		return ""
-	}
-	if len(values) > 80 {
-		values = values[len(values)-80:]
-	}
-	min, max := values[0], values[0]
-	for _, value := range values[1:] {
-		if value < min {
-			min = value
-		}
-		if value > max {
-			max = value
-		}
-	}
-	var b strings.Builder
-	for _, value := range values {
-		index := len(blocks) / 2
-		if max > min {
-			index = int(math.Round((value - min) / (max - min) * float64(len(blocks)-1)))
-		}
-		if index < 0 {
-			index = 0
-		}
-		if index >= len(blocks) {
-			index = len(blocks) - 1
-		}
-		b.WriteRune(blocks[index])
-	}
-	return b.String()
 }

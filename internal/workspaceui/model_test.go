@@ -11,6 +11,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
@@ -166,10 +167,6 @@ func mustDecode(t *testing.T, tab Tab, raw string) []Item {
 
 func render(m Model) string { return m.render() }
 
-const resourcesJSON = `{"collection":"resources","items":[{"spec":{"name":"db","engine":"postgresql","version":"17","host":"app-01","address":"127.0.0.1","port":5432,"database":"api","username":"api"},"state":"ready","endpoint":{"node":"app-01","address":"127.0.0.1","port":5432,"database":"api","username":"api","sslmode":"disable"},"credential":{"username":"api","database":"api","password_file":"/run/secrets/db","mode":"0600"},"health":{"status":"healthy","detail":"select 1","checked_at":"2026-10-20T09:59:55Z"}}]}`
-
-const backupsJSON = `{"collection":"backups","items":[{"archive":"/var/backups/app/db-20261020.dump","manifest":"/var/backups/app/db-20261020.json","resource":"db","host":"app-01","database":"api","effect_id":"op:backup:1","size_bytes":4096,"sha256":"abc123","created_at":"2026-10-20T09:00:00Z","reason":"manual","verified":true,"verified_at":"2026-10-20T09:01:00Z"}]}`
-
 const releasesJSON = `{"collection":"releases","items":[{"id":"` + testReleaseID + `","app":"api","environment":"production","image":"ghcr.io/acme/api:2026-10-20","image_id":"sha256:abc","source":{"type":"image","image":"ghcr.io/acme/api:2026-10-20"},"status":"ready","created_at":"2026-10-20T09:00:00Z"}]}`
 
 const deploymentsJSON = `{"collection":"deployments","items":[{"id":"dep_00000000000000000000000000000001","operation_id":"` + testOperationID + `","app":"api","environment":"production","action":"deploy","release_id":"` + testReleaseID + `","previous_release_id":"rel_00000000000000000000000000000002","state":"succeeded","message":"Serving release ` + testReleaseID + ` passed health verification.","created_at":"2026-10-20T09:00:00Z","updated_at":"2026-10-20T09:05:00Z"}]}`
@@ -177,7 +174,7 @@ const deploymentsJSON = `{"collection":"deployments","items":[{"id":"dep_0000000
 func TestParseTabCoversEveryWorkspace(t *testing.T) {
 	values := map[string]Tab{
 		"fleet": Fleet, "apps": Apps, "envs": Envs, "releases": Releases,
-		"deployments": Deployments, "resources": Resources, "backups": Backups,
+		"deployments": Deployments,
 	}
 	for value, want := range values {
 		got, err := ParseTab(value)
@@ -238,145 +235,19 @@ func TestReleasesAndDeploymentsTabs(t *testing.T) {
 	}
 }
 
-func TestResourceAndBackupViews(t *testing.T) {
-	m, api, _ := testArgs(t)
-	api.inventory = func(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
-		switch collection {
-		case "resources":
-			return json.RawMessage(resourcesJSON), nil
-		case "backups":
-			return json.RawMessage(backupsJSON), nil
-		default:
-			return json.RawMessage(`{"collection":"` + collection + `","items":[]}`), nil
-		}
-	}
-	next, command := stepCmd(t, m, press('6'))
-	m = applyCommand(t, next, command)
-	view := render(m)
-	for _, want := range []string{"db", "app-01", "healthy"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q in resources:\n%s", want, view)
-		}
-	}
-	next, command = stepCmd(t, m, press('7'))
-	m = applyCommand(t, next, command)
-	view = render(m)
-	for _, want := range []string{"db-20261020.dump", "app-01", "verified"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q in backups:\n%s", want, view)
-		}
-	}
-	m = step(t, m, special(tea.KeyEnter))
-	view = render(m)
-	for _, want := range []string{"/var/backups/app/db-20261020.dump", "abc123", "verified"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q in backup details:\n%s", want, view)
-		}
-	}
-}
-
-func TestResourceDestroyConfirmationIsBoundToPreview(t *testing.T) {
-	m, api, _ := testArgs(t)
-	api.inventory = func(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
-		return json.RawMessage(resourcesJSON), nil
-	}
-	next, command := stepCmd(t, m, press('6'))
-	m = applyCommand(t, next, command)
-	m = load(t, m, resourcesJSON)
-	m = step(t, m, press('x'))
-	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
-		if !dryRun || kind != "platform.resource.destroy" || target != "node/app-01" {
-			t.Fatalf("wrong destroy plan: %s %s dry=%t", kind, target, dryRun)
-		}
-		if !strings.Contains(string(input), `"confirmation":"db"`) || strings.Contains(string(input), `"remove_volume":true`) {
-			t.Fatalf("destroy input is not bound: %s", input)
-		}
-		return json.RawMessage(previewJSON(kind, target)), nil
-	}
-	next, command = stepCmd(t, m, special(tea.KeyEnter))
-	m = applyCommand(t, next, command)
-	view := render(m)
-	previewInput := append(json.RawMessage(nil), api.submits[len(api.submits)-1].input...)
-	for _, want := range []string{"Type db to confirm", "plan binding:", "DRY-RUN PREVIEW"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q in destructive preview:\n%s", want, view)
-		}
-	}
-	before := len(api.submits)
-	m = step(t, m, special(tea.KeyEnter))
-	if len(api.submits) != before {
-		t.Fatal("destroy submitted without the typed confirmation")
-	}
-	m = typeText(m, "db")
-	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, key string, dryRun bool) (json.RawMessage, error) {
-		if dryRun || kind != "platform.resource.destroy" || target != "node/app-01" || key != "ui:test-key" {
-			t.Fatalf("unexpected destroy submission: %s %s %q dry=%t", kind, target, key, dryRun)
-		}
-		if string(input) != string(previewInput) {
-			t.Fatalf("submitted input differs from the previewed plan:\n%s\n%s", input, previewInput)
-		}
-		return operationFor(kind, target), nil
-	}
-	next, command = stepCmd(t, m, press('s'))
-	m = applyCommand(t, next, command)
-	if !strings.Contains(render(m), "ACCEPTED") {
-		t.Fatalf("destroy was not submitted:\n%s", render(m))
-	}
-}
-
-func TestBackupRestoreUsesResourceSpecAndConfirmation(t *testing.T) {
-	m, api, _ := testArgs(t)
-	api.inventory = func(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
-		switch collection {
-		case "resources":
-			return json.RawMessage(resourcesJSON), nil
-		case "backups":
-			return json.RawMessage(backupsJSON), nil
-		default:
-			return json.RawMessage(`{"collection":"` + collection + `","items":[]}`), nil
-		}
-	}
-	next, command := stepCmd(t, m, press('6'))
-	m = applyCommand(t, next, command)
-	m = load(t, m, resourcesJSON)
-	next, command = stepCmd(t, m, press('7'))
-	m = applyCommand(t, next, command)
-	m = load(t, m, backupsJSON)
-	m = step(t, m, press('R'))
-	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
-		if !dryRun || kind != "platform.backup.restore" || target != "node/app-01" {
-			t.Fatalf("wrong restore plan: %s %s dry=%t", kind, target, dryRun)
-		}
-		for _, want := range []string{`"name":"db"`, `"archive":"/var/backups/app/db-20261020.dump"`, `"confirmation":"db"`} {
-			if !strings.Contains(string(input), want) {
-				t.Fatalf("restore input missing %s: %s", want, input)
-			}
-		}
-		return json.RawMessage(previewJSON(kind, target)), nil
-	}
-	next, command = stepCmd(t, m, special(tea.KeyEnter))
-	m = applyCommand(t, next, command)
-	view := render(m)
-	for _, want := range []string{"Type db to confirm", "plan binding:"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q in restore preview:\n%s", want, view)
-		}
-	}
-}
-
 func TestCommandPaletteListsExactCLIEquivalents(t *testing.T) {
 	m, _, _ := testArgs(t)
 	m.width, m.height = 120, 60
 	m = step(t, m, press(':'))
 	view := render(m)
-	for _, want := range []string{"COMMAND DISCOVERY", "Create application", "backup", "eregion platform apps create", "eregion platform submit --kind platform.resource.destroy", "exact noninteractive CLI equivalent"} {
+	for _, want := range []string{"COMMAND DISCOVERY", "Create application", "Deploy release", "eregion platform apps create", "eregion platform deployments deploy", "exact noninteractive CLI equivalent"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("missing %q in palette:\n%s", want, view)
 		}
 	}
-	m = typeText(m, "backup")
+	m = typeText(m, "deploy")
 	view = render(m)
-	if !strings.Contains(view, "backup") || strings.Contains(view, "Create application") {
+	if !strings.Contains(view, "Deploy release") || strings.Contains(view, "Create application") {
 		t.Fatalf("palette filter did not narrow actions:\n%s", view)
 	}
 	m = step(t, m, special(tea.KeyEsc))
@@ -572,7 +443,7 @@ func TestAppFormPreviewSubmitAndStableKey(t *testing.T) {
 		t.Fatalf("wrong action: %+v", api.submits[0])
 	}
 	view := render(m)
-	for _, want := range []string{"DRY-RUN PREVIEW", "nothing has been submitted", "eregion platform submit", "ui:test-key", "s submit"} {
+	for _, want := range []string{"DRY-RUN PREVIEW", "nothing has been submitted", "eregion platform apps create", "ui:test-key", "s submit"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("missing %q in preview:\n%s", want, view)
 		}
@@ -731,21 +602,6 @@ func TestDeployRequiresBoundConfirmation(t *testing.T) {
 	}
 }
 
-func TestResourceInventoryUnavailableIsHonest(t *testing.T) {
-	m, api, _ := testArgs(t)
-	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
-		return nil, contract.NewFault(contract.ValidationFailed, "unknown collection", "register a provider")
-	}
-	next, command := stepCmd(t, m, press('6'))
-	m = applyCommand(t, next, command)
-	view := render(m)
-	for _, want := range []string{"Resources inventory is not available", "No rows are invented", "r to retry"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q:\n%s", want, view)
-		}
-	}
-}
-
 func TestHostileTextIsSanitizedAndSecretRedacted(t *testing.T) {
 	registry := &secrets.Registry{}
 	registry.Add("super-secret-token")
@@ -864,5 +720,31 @@ func TestNoColorAsciiAndNarrowRender(t *testing.T) {
 	}
 	if !strings.Contains(view, "Fleet") || !strings.Contains(view, "? help") {
 		t.Fatalf("compact view missing essentials:\n%s", view)
+	}
+}
+
+func TestNoninteractiveEquivalentUsesTheDirectPlatformCommand(t *testing.T) {
+	rollback := Action{Kind: platform.KindRollback, Input: json.RawMessage(`{"app":"api","environment":"production"}`), IdempotencyKey: "ui:key"}
+	tests := []struct {
+		action Action
+		want   string
+	}{
+		{
+			action: Action{Kind: platform.KindAppCreate, Input: json.RawMessage(`{"name":"api"}`), IdempotencyKey: "ui:key"},
+			want:   "eregion platform apps create api --idempotency-key ui:key --json",
+		},
+		{
+			action: Action{Kind: platform.KindDeploy, Input: json.RawMessage(`{"app":"api","environment":"production","release_id":"` + testReleaseID + `"}`), IdempotencyKey: "ui:key"},
+			want:   "eregion platform deployments deploy api production --release-id " + testReleaseID + " --idempotency-key ui:key --json",
+		},
+		{
+			action: rollback,
+			want:   "eregion platform deployments rollback api production --confirm " + rollback.PlanToken() + " --idempotency-key ui:key --json",
+		},
+	}
+	for _, test := range tests {
+		if got := test.action.Noninteractive(); got != test.want {
+			t.Fatalf("noninteractive equivalent = %q, want %q", got, test.want)
+		}
 	}
 }

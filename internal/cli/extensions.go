@@ -16,7 +16,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/operations"
-	"github.com/mbvlabs/eregion/internal/resources"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -26,9 +25,6 @@ import (
 // execute what any other accepted.
 var extensionEnvironment = []string{
 	"EREGION_VAULT_KEY_FILE",
-	"EREGION_RESOURCES_HOST",
-	"EREGION_RESOURCES_STATE_DIR",
-	"EREGION_RESOURCES_BACKUP_DIR",
 	"EREGION_ACCESS_ADMINS",
 	"EREGION_DNS_ADMINS",
 	"EREGION_CLOUDFLARE_ZONES",
@@ -55,7 +51,7 @@ type extensionRuntime struct {
 // with an instruction instead of silently deploying without them. A process
 // without workers (executes false) registers the actions for validation but never
 // touches Docker, so an API-only host needs no container runtime.
-func (a *app) startExtensions(pool *pgxpool.Pool, executes bool, nodes controlplane.NodeTransports) (extensionRuntime, *vault.EnvironmentResolver, error) {
+func (a *app) startExtensions(pool *pgxpool.Pool) (extensionRuntime, *vault.EnvironmentResolver, error) {
 	var parts extensionRuntime
 	if path := os.Getenv("EREGION_VAULT_KEY_FILE"); path != "" {
 		service, err := controlplane.NewVaultService(pool, path)
@@ -64,14 +60,7 @@ func (a *app) startExtensions(pool *pgxpool.Pool, executes bool, nodes controlpl
 		}
 		parts.Vault = service
 	}
-	config := controlplane.ExtensionConfig{Pool: pool, DatabaseURL: os.Getenv("EREGION_DATABASE_URL"), NodeTransports: nodes}
-	if host := os.Getenv("EREGION_RESOURCES_HOST"); host != "" && executes {
-		state := os.Getenv("EREGION_RESOURCES_STATE_DIR")
-		if state == "" {
-			return parts, nil, contract.NewFault(contract.InputRequired, "EREGION_RESOURCES_STATE_DIR is required with EREGION_RESOURCES_HOST", "Set a private directory for resource credentials and restore journals.")
-		}
-		config.Resources = &resources.Config{Host: host, StateDir: state, BackupDir: os.Getenv("EREGION_RESOURCES_BACKUP_DIR")}
-	}
+	config := controlplane.ExtensionConfig{Pool: pool}
 	config.AccessAdmins = splitList(os.Getenv("EREGION_ACCESS_ADMINS"))
 	config.DNSAdmins = splitList(os.Getenv("EREGION_DNS_ADMINS"))
 	zones, err := parseCloudflareZones(os.Getenv("EREGION_CLOUDFLARE_ZONES"), os.Getenv("EREGION_CLOUDFLARE_TOKEN_FILE"))

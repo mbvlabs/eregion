@@ -50,47 +50,17 @@ and public response reported separately; serialized atomic writes;
 reconciliation on start and retry; Caddy backends switched between candidate and
 serving containers on dynamic loopback ports.
 
-## Cloudflare subsystem
+## Cloudflare and private access (off the surface)
 
-Off the v1 surface: Cloudflare DNS automation comes after v1 (MASTER D26); the
-alpha uses manual DNS with resolver checks.
+Cloudflare DNS automation comes after v1 (MASTER D26); the alpha uses manual DNS
+with resolver checks. The `dns plan/reconcile/list` commands and the
+`resources`/`backups` inventory are not registered. `internal/integrations`
+keeps the DNS action and its explicit `zoneID=zoneName` configuration for the
+after-v1 phase; it never installs a Caddy route or binds an environment domain.
 
-`dns plan/reconcile/list` are separate actions/inventory. They do not install a
-Caddy route or bind an environment domain. Configure workers/API with:
-
-| Variable | Purpose |
-| --- | --- |
-| `EREGION_CLOUDFLARE_ZONES` | Comma-separated explicit `zoneID=zoneName` pairs; no guessing. |
-| `EREGION_CLOUDFLARE_TOKEN_FILE` | Absolute root-owned 0600 regular non-symlink token file. |
-| `EREGION_DNS_ADMINS` | Actor-subject allowlist for reconciliation; falls back to access admins if empty. |
-
-Use a token restricted to the intended zone with Zone Read and DNS Edit, never a
-Global API Key. Actions carry a file reference, not the secret value. Desired
-records support A/AAAA/CNAME/TXT (max 200), zone-contained names, TTL 1 or
-60–86400, and no proxied TXT. No wildcard/unmanaged adoption. Only ownership
-comments starting `eregion:managed` may be mutated. Conflicting unmanaged or
-duplicate managed records fail closed; empty desired sets cannot delete all.
-
-Authorization/audit precede mutation; audit failure stops it. A post-mutation
-audit error does not imply nothing happened. Reconcile re-reads provider state
-on retry. Plan normalizes input; it does **not** fetch a live Cloudflare diff.
-Fake-provider tests are not real-account/DNS-propagation evidence.
-
-## Private-access subsystem
-
-Off the v1 surface: private-network access modes come after v1 (MASTER D22).
-
-`access devices` groups observed grants; it is not device/VPN enrollment.
-`access grants grant/list/revoke` manages exact subject/device/route grants with
-expiry and durable audit in PostgreSQL. Route matching is exact, not prefix or
-wildcard. Creation is keyed to operation identity; revoke is idempotent.
-
-`EREGION_ACCESS_ADMINS` enables the explicit administrator allowlist. Missing
-store/audit/controller fails closed. The optional `/private/` handler uses a
-verified identity and server-resolved route; missing/expired/revoked grant denies
-access, and audit failure also denies. Proxy rewriting strips bearer credentials,
-cookies, proxy auth and caller-supplied forwarding headers.
-
+Private-network access modes come after v1 (MASTER D22); the `access …` commands
+are not registered. The internal grant controller remains for the optional
+`/private/` proxy. Missing store/audit/controller fails closed; the proxy uses a
+verified identity and server-resolved exact route, and audit failure denies.
 These HTTP grants are not vaire-style operator authentication, WireGuard device
 provisioning, deploycrate resource-network grants, or Cloudflare Zero Trust.
-Do not claim any of those from this grant model.

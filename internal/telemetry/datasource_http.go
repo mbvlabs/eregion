@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -381,6 +382,29 @@ func (d *HTTPDataSource) freshness(window Window, observed time.Time) State {
 		return StateStale
 	}
 	return StateOK
+}
+
+// readSecretFile reads a bounded owner-only credential file. The token content
+// never enters a query, error, or result.
+func readSecretFile(path string, max int64) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "read-token file is unavailable", "Create the referenced root-owned 0600 file before querying telemetry.")
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > max {
+		return nil, contract.NewFault(contract.PreconditionFailed, "read-token file is not a safe regular file", "Use a regular 0600 file no larger than the documented bound; symlinks are rejected.")
+	}
+	if info.Mode().Perm()&0077 != 0 {
+		return nil, contract.NewFault(contract.PreconditionFailed, "read-token file is readable by group or others", "Set mode 0600 on the read-token file.")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "read-token file could not be read", "Check ownership and permissions.")
+	}
+	if int64(len(raw)) > max {
+		return nil, contract.NewFault(contract.PreconditionFailed, "read-token file exceeds its bound", "Use a bounded bearer token file.")
+	}
+	return raw, nil
 }
 
 func (d *HTTPDataSource) get(ctx context.Context, endpoint, tokenFile, directToken string) (*http.Response, error) {

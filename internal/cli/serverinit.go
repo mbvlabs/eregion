@@ -371,7 +371,7 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	}
 	var fields []huh.Field
 	if !r.cmd.Flags().Changed("node") {
-		fields = append(fields, huh.NewInput().Title("Main node name").Description("This server becomes the main node: control plane, API, workers and builds. Extra nodes are added later with eregion platform nodes enroll.").Value(&ans.Node).Validate(nonEmpty))
+		fields = append(fields, huh.NewInput().Title("Main node name").Description("This server becomes the main node: control plane, API, workers and builds. Extra nodes are added later.").Value(&ans.Node).Validate(nonEmpty))
 	}
 	if !r.cmd.Flags().Changed("context-name") {
 		ans.Context = ""
@@ -741,7 +741,7 @@ func (r *serverInit) finish(s serverInitSummary) {
 		{"context", s.Context + " (current)"},
 	}, []string{
 		ui.Dim("next:"),
-		"  " + ui.Code("eregion platform fleet"),
+		"  " + ui.Code("eregion commands --json"),
 		"  " + ui.Code("eregion ui"),
 	}))
 }

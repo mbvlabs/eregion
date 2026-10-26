@@ -1,17 +1,17 @@
 COMMAND DISCOVERY
 Every action lists its exact noninteractive CLI equivalent. Enter opens the guided form; esc closes.
-/backup
+/deploy
 
-> Create resource backup       b   backup.create
-    cli: eregion platform submit --kind platform.backup.create --target node/<host> --input-file
-    action.json --idempotency-key <key> --json
-  Verify backup archive        v   backup.verify
-    cli: eregion platform submit --kind platform.backup.verify --target node/<host> --input-file
-    action.json --idempotency-key <key> --json
-  Restore verified backup      R   backup.restore · destructive
-    cli: eregion platform submit --kind platform.backup.restore --target node/<host> --input-file
-    action.json --idempotency-key <key> --json
+> Preview a deployment         -   deployment.plan
+    cli: eregion platform deployments plan <app> <environment> --release-id <release> --json
+  Deploy release               d   deployment.deploy · destructive
+    cli: eregion platform deployments deploy <app> <environment> --release-id <release>
+    --idempotency-key <key> --json
+  Roll back environment        o   deployment.rollback · destructive
+    cli: eregion platform deployments rollback <app> <environment> --confirm <plan-token>
+    --idempotency-key <key> --json
 j/k move · type filter · enter open · esc close
+
 
 
 

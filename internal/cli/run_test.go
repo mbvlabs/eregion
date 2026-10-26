@@ -144,7 +144,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 			t.Fatalf("missing inherited/help flags: %+v", command)
 		}
 	}
-	for _, path := range []string{"eregion operations follow", "eregion platform submit", "eregion platform fleet", "eregion ui", "eregion secret list", "eregion upgrade"} {
+	for _, path := range []string{"eregion operations follow", "eregion platform inventory", "eregion ui", "eregion secret list", "eregion upgrade"} {
 		if !seen[path] {
 			t.Fatalf("missing implemented product command: %s", path)
 		}

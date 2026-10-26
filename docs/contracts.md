@@ -60,8 +60,8 @@ after a timeout; a lost response is an unknown outcome, not proof nothing ran.
 Keys contain 1–128 ASCII letters/digits or `._:-`.
 
 Current platform create/deploy helpers require an explicit key. Domain commands
-generate one if omitted; resources derive one from intent if omitted. For safe
-manual retry after an ambiguous response, supply and retain an explicit key.
+generate one if omitted. For safe manual retry after an ambiguous response,
+supply and retain an explicit key.
 Dry-run validates through the service without operation/job insertion. It does
 not prove current host readiness, provider diff or future execution success.
 
@@ -136,9 +136,9 @@ different protections. Current mechanisms vary:
 
 - Bootstrap/credential-add use intent/revision/expiry-bound confirmation checks.
 - CLI rollback uses a deterministic kind/target/input digest checked **client-side**;
-  this is not an unforgeable server approval. Generic authenticated action
-  submission can bypass that CLI check.
-- Resources and upgrades have their own confirmation/precondition mechanisms.
+  this is not an unforgeable server approval. An authenticated client can submit
+  the same registered action directly.
+- Upgrades have their own confirmation/precondition mechanisms.
 - Current `server init --yes` bypasses its interactive apply question; it must
   never be reused as the human factor for future token issuance.
 

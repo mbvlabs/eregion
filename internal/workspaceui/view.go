@@ -121,10 +121,6 @@ func (m Model) stateLabel() string {
 			label = "authentication required"
 		case contract.Forbidden:
 			label = "not authorized"
-		case contract.ValidationFailed:
-			if m.tab == Resources || m.tab == Backups {
-				label = "inventory not available"
-			}
 		}
 		style := m.riskStyle()
 		if len(tab.items) > 0 {
@@ -340,11 +336,6 @@ func (m Model) renderUnreachable(width, height int) string {
 	case contract.Unauthenticated:
 		title = "Authentication required"
 		detail = "Set EREGION_API_TOKEN for the selected API before opening the workspace."
-	case contract.ValidationFailed:
-		if m.tab == Resources || m.tab == Backups {
-			title = m.tab.String() + " inventory is not available"
-			detail = "No rows are invented. The " + m.tab.Collection() + " collection is not registered."
-		}
 	}
 	lines := []string{
 		m.riskStyle().Render(title),
@@ -378,12 +369,6 @@ func (m Model) renderEmpty(width, height int) string {
 		case Deployments:
 			title = "No deployments reported"
 			hint = "Press d to deploy a ready release, or o to plan a rollback."
-		case Resources:
-			title = "No resources reported"
-			hint = "No resources inventory rows were returned by this control plane."
-		case Backups:
-			title = "No backups reported"
-			hint = "No backups inventory rows were returned by this control plane."
 		}
 	}
 	lines := append(wrapText(title, width), "", m.dim().Render(truncate(hint, width)))
@@ -428,9 +413,6 @@ func (m Model) renderDetail(width, height int) string {
 		if len(lines) >= height-2 {
 			break
 		}
-	}
-	if m.tab == Resources || m.tab == Backups {
-		lines = append(lines, "", m.dim().Render("Telemetry: no telemetry node is configured; no graph is shown."))
 	}
 	lines = append(lines, m.dim().Render("j/k scroll · r refresh · esc back · q detach"))
 	return fitLines(strings.Join(lines, "\n"), width, height)
@@ -541,15 +523,14 @@ func (m Model) renderHelp(width, height int) string {
 		helpModel.View(m.keys),
 		"",
 		m.boldStyle().Render("Workspaces"),
-		m.dim().Render("1 fleet · 2 apps · 3 envs · 4 releases · 5 deployments · 6 resources · 7 backups · tab cycles"),
+		m.dim().Render("1 fleet · 2 apps · 3 envs · 4 releases · 5 deployments · tab cycles"),
 		m.boldStyle().Render("Guided forms"),
-		m.dim().Render("a application · e environment · i image release · d deploy · o rollback · n node check"),
-		m.dim().Render("x destroy resource · b backup · v verify backup · R restore backup"),
+		m.dim().Render("a application · e environment · i image release · d deploy · o rollback"),
 		m.dim().Render("enter next field · tab next · s submit after preview · e edit preview · esc cancel"),
 		m.boldStyle().Render("Discovery"),
 		m.dim().Render(": command palette shows every action with its exact noninteractive CLI equivalent."),
 		m.boldStyle().Render("Safety"),
-		m.dim().Render("Deploys, rollbacks, resource destruction, and restores require typing the target name; submission is bound to the previewed plan. A detached UI never cancels an operation."),
+		m.dim().Render("Deploys and rollbacks require typing the target name; submission is bound to the previewed plan. A detached UI never cancels an operation."),
 		m.dim().Render("No telemetry node is configured by default, so no graph is drawn. Operations do not need telemetry."),
 	}
 	return fitLines(strings.Join(lines, "\n"), width, height)

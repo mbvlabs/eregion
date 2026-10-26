@@ -5,8 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -151,8 +149,7 @@ func TestPlatformCommandMetadata(t *testing.T) {
 		}
 	}
 	for _, path := range [][]string{
-		{"platform", "submit"}, {"platform", "inventory"}, {"platform", "fleet"},
-		{"platform", "nodes", "enroll"}, {"platform", "nodes", "retry"}, {"platform", "nodes", "reconcile"}, {"platform", "nodes", "register"}, {"platform", "nodes", "list"}, {"platform", "nodes", "status"}, {"platform", "nodes", "check"},
+		{"platform", "inventory"},
 		{"platform", "apps", "create"}, {"platform", "apps", "list"}, {"platform", "apps", "status"},
 		{"platform", "environments", "create"}, {"platform", "deployments", "retry"}, {"platform", "deployments", "rollback"},
 	} {
@@ -199,39 +196,7 @@ func TestPlatformAppsCreateAndDryRun(t *testing.T) {
 	}
 }
 
-func TestPlatformGenericSubmitUsesProtectedInputFile(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-	directory := t.TempDir()
-	path := filepath.Join(directory, "input.json")
-	if err := os.WriteFile(path, []byte(`{"name":"main","roles":["application"],"capabilities":["docker"]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	code, stdout, stderr := invokePlatform(t, "platform", "submit", "--kind", "platform.node.register", "--target", "platform", "--input-file", path, "--idempotency-key", "ci:enroll-main", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q stdout=%s", code, stderr, stdout)
-	}
-	decodePlatformEnvelope(t, stdout)
-	if len(state.calls) != 1 || state.calls[0].kind != "platform.node.register" || state.calls[0].target != "platform" {
-		t.Fatalf("unexpected call: %+v", state.calls)
-	}
-	var input platform.NodeRegisterInput
-	if err := json.Unmarshal(state.calls[0].input, &input); err != nil || input.Name != "main" {
-		t.Fatalf("input was not canonicalized: %s %v", state.calls[0].input, err)
-	}
-
-	if err := os.WriteFile(path, []byte(`{"name":"main","roles":["application"],"capabilities":["docker"]} trailing`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	code, stdout, stderr = invokePlatform(t, "platform", "submit", "--kind", "platform.node.register", "--target", "platform", "--input-file", path, "--idempotency-key", "ci:enroll-main", "--json")
-	assertPlatformJSONFault(t, code, stdout, stderr, contract.ValidationFailed, "trailing data")
-	if len(state.calls) != 1 {
-		t.Fatal("invalid input reached the API")
-	}
-}
-
-func TestPlatformInventoryAndFleetUseReadAPI(t *testing.T) {
+func TestPlatformInventoryUsesReadAPI(t *testing.T) {
 	state, server := newPlatformServer(t)
 	platformTestEnvironment(t, server)
 
@@ -251,100 +216,7 @@ func TestPlatformInventoryAndFleetUseReadAPI(t *testing.T) {
 		t.Fatalf("unexpected inventory query: %+v", call)
 	}
 
-	code, stdout, stderr = invokePlatform(t, "platform", "fleet")
-	if code != 0 || stderr != "" {
-		t.Fatalf("fleet code=%d stderr=%q", code, stderr)
-	}
-	if strings.ContainsRune(stdout, '\x1b') {
-		t.Fatal("fleet output contains terminal escapes")
-	}
-	for _, want := range []string{"Fleet snapshot (read-only)", "NODES", "main", "APPS", "api", "ENVIRONMENTS", "production"} {
-		if !strings.Contains(stdout, want) {
-			t.Fatalf("fleet output missing %q:\n%s", want, stdout)
-		}
-	}
-	for _, call := range state.calls[1:] {
-		if call.method != http.MethodGet {
-			t.Fatalf("fleet used a mutating request: %+v", call)
-		}
-	}
 }
-
-func TestPlatformNodeRegister(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-	code, stdout, stderr := invokePlatform(t, "platform", "nodes", "register", "main",
-		"--role", "application", "--role", "builder",
-		"--capability", "docker", "--capability", "buildpacks",
-		"--address", "10.77.0.1:22", "--idempotency-key", "ci:enroll-main", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q stdout=%s", code, stderr, stdout)
-	}
-	decodePlatformEnvelope(t, stdout)
-	if len(state.calls) != 1 {
-		t.Fatalf("calls=%+v", state.calls)
-	}
-	var input platform.NodeRegisterInput
-	if err := json.Unmarshal(state.calls[0].input, &input); err != nil {
-		t.Fatal(err)
-	}
-	if input.Name != "main" || input.Address != "10.77.0.1:22" || len(input.Roles) != 2 || len(input.Capabilities) != 2 {
-		t.Fatalf("unexpected enroll input: %+v", input)
-	}
-}
-
-func TestPlatformNodeEnrollNeedsAPinnedHostKey(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-	code, stdout, stderr := invokePlatform(t, "platform", "nodes", "enroll", "builder-1", "--role", "builder",
-		"--address", "203.0.113.10:22", "--idempotency-key", "ci:enroll-b1", "--json")
-	if code == 0 || !strings.Contains(stdout+stderr, "host-key") {
-		t.Fatalf("enroll without a pinned host key must fail: code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if len(state.calls) != 0 {
-		t.Fatalf("an enrollment without a host key reached the API: %+v", state.calls)
-	}
-}
-
-func TestPlatformNodeEnrollSubmitsTheEnrollAction(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-	key := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
-	code, stdout, stderr := invokePlatform(t, "platform", "nodes", "enroll", "builder-1", "--role", "builder",
-		"--address", "203.0.113.10:22", "--host-key", key, "--build-concurrency", "2", "--idempotency-key", "ci:enroll-b1", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q stdout=%s", code, stderr, stdout)
-	}
-	if len(state.calls) != 1 || state.calls[0].kind != platform.KindNodeEnroll {
-		t.Fatalf("calls=%+v", state.calls)
-	}
-	var input platform.NodeEnrollInput
-	if err := json.Unmarshal(state.calls[0].input, &input); err != nil {
-		t.Fatal(err)
-	}
-	if input.HostKey != key || input.BuildConcurrency != 2 || len(input.Roles) != 1 || input.Address != "203.0.113.10:22" {
-		t.Fatalf("unexpected enroll input: %+v", input)
-	}
-}
-
-func TestPlatformNodesPlainShowsEnrollmentAndFreshness(t *testing.T) {
-	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
-	checked := now.Add(-3 * time.Minute)
-	old := now.Add(-2 * time.Hour)
-	raw, _ := json.Marshal(map[string]any{"items": []platform.Node{
-		{Name: "app-1", Roles: []string{"application"}, EnrollmentState: platform.EnrollmentEnrolled, Status: platform.NodeReady, IdentityFingerprint: "SHA256:abc", LastCheckAt: &checked, LastCheckState: "ok",
-			WireGuard: &platform.NodeWireGuard{State: platform.WireGuardApplied, Address: "10.77.0.2"}},
-		{Name: "old", Roles: []string{"builder"}, EnrollmentState: platform.EnrollmentFailed, Status: platform.NodeUnreachable, LastCheckAt: &old, LastCheckState: "identity_mismatch"},
-		{Name: "new", Roles: []string{"edge"}, EnrollmentState: platform.EnrollmentPending, Status: platform.NodeRegistered},
-	}})
-	plain := platformNodesPlain(raw, now)
-	for _, want := range []string{"app-1", "enrolled", "SHA256:abc", "applied 10.77.0.2", "ok 3m0s ago", "failed", "identity_mismatch 2h0m0s ago (stale)", "never checked"} {
-		if !strings.Contains(plain, want) {
-			t.Fatalf("node table missing %q:\n%s", want, plain)
-		}
-	}
-}
-
 func TestPlatformRollbackNeedsMatchingPlanConfirmation(t *testing.T) {
 	state, server := newPlatformServer(t)
 	platformTestEnvironment(t, server)
