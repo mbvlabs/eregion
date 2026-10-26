@@ -43,7 +43,7 @@ func (a *app) workspaceSpecs() []spec {
 		use:  "ui",
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
-			cmd.Flags().Bool("interactive", false, "Open the workspace in this terminal; required")
+			cmd.Flags().Bool("interactive", false, "Accepted for compatibility; a terminal always opens the workspace")
 			cmd.Flags().String("tab", "fleet", "Initial workspace: fleet, apps, envs, releases, deployments, resources, or backups")
 			cmd.Flags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 			cmd.Flags().Bool("ascii", false, "Use ASCII glyphs instead of Unicode")
@@ -56,18 +56,14 @@ func (a *app) workspaceSpecs() []spec {
 }
 
 func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
-	interactive, _ := cmd.Flags().GetBool("interactive")
-	if !interactive {
-		return result{}, contract.NewFault(contract.Usage, "the workspace must be requested explicitly", "Run eregion ui --interactive on a terminal. Noninteractive clients use the platform submit commands.")
-	}
 	jsonMode, _ := cmd.Flags().GetBool("json")
 	outputMode, _ := cmd.Flags().GetString("output")
 	if jsonMode || outputMode != "plain" {
-		return result{}, contract.NewFault(contract.InvalidOutputMode, "the interactive workspace cannot produce machine output", "Use plain output and run eregion ui --interactive, or use the platform submit commands with --json.")
+		return result{}, contract.NewFault(contract.InvalidOutputMode, "the interactive workspace cannot produce machine output", "Use plain output and run eregion ui, or use the platform submit commands with --json.")
 	}
 	streams := followConfig(cmd)
 	if streams == nil || !isTerminal(streams.in) || !isTerminal(streams.out) {
-		return result{}, contract.NewFault(contract.Usage, "the interactive workspace requires a terminal", "Run eregion ui --interactive from a TTY; prompts and full-screen input are never used on a pipe.")
+		return result{}, contract.NewFault(contract.Usage, "the interactive workspace requires a terminal", "Run eregion ui from a TTY; prompts and full-screen input are never used on a pipe.")
 	}
 	tabName, _ := cmd.Flags().GetString("tab")
 	tab, err := workspaceui.ParseTab(tabName)

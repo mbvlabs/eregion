@@ -84,6 +84,7 @@ type serverInit struct {
 	interactive bool
 	live        *ui.Live
 	answers     serverInitAnswers
+	hostKey     string
 }
 
 func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error) {
@@ -194,7 +195,8 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	// that reaches the loopback API through the pinned SSH route.
 	task = r.start("handoff", "Saving context "+ans.Context)
 	apiURL := "http://" + cfg.APIListen
-	if err := r.saveContext(ctx, remote, cfg, apiURL, address, knownHosts); err != nil {
+	token, err := r.saveContext(ctx, remote, cfg, apiURL, address, knownHosts)
+	if err != nil {
 		task.end(ui.EndFail, "")
 		return summary, err
 	}
@@ -211,6 +213,16 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 		r.note("uploaded bundle cleanup failed: " + err.Error())
 	}
 	summary.API = apiURL + " via ssh " + summary.Server
+	if r.interactive {
+		h := &secretsHandoff{node: ans.Node, groups: []handoffGroup{
+			{"Main node " + ans.Node, []handoffField{{"Server", summary.Server}, {"Platform", summary.Platform}, {"SSH host key", r.hostKey}}},
+			{"Control plane API", []handoffField{{"URL", apiURL + " (on the server; reached through SSH)"}, {"Operator token", token}, {"Context", ans.Context}}},
+			{"Control-plane database", []handoffField{{"URL", r.answers.DatabaseURL}}},
+		}}
+		if err := h.show(os.Stderr); err != nil {
+			return summary, err
+		}
+	}
 	r.finish(summary)
 	return summary, nil
 }
@@ -331,6 +343,9 @@ func parseTarget(v string) (user, hostPart, port string, err error) {
 // --host-key-fingerprint, --accept-new-host-key, or a yes in a terminal.
 func (r *serverInit) trustHostKey(ctx context.Context, knownHosts, address string) error {
 	if hostKeyPinned(knownHosts, address) {
+		if key, err := probeHostKey(ctx, address); err == nil {
+			r.hostKey = key.Type() + " " + ssh.FingerprintSHA256(key)
+		}
 		return nil
 	}
 	task := r.start("hostkey", "Reading the host key of "+address)
@@ -340,6 +355,7 @@ func (r *serverInit) trustHostKey(ctx context.Context, knownHosts, address strin
 		return contract.NewFault(contract.Unavailable, "the server does not answer on SSH", err.Error())
 	}
 	fp := ssh.FingerprintSHA256(key)
+	r.hostKey = key.Type() + " " + fp
 	task.end(ui.EndOK, key.Type()+" "+fp)
 	want, _ := r.cmd.Flags().GetString("host-key-fingerprint")
 	accept, _ := r.cmd.Flags().GetBool("accept-new-host-key")
@@ -492,6 +508,11 @@ func (p *applyProgress) line(line string) {
 	}
 	step, message, _ := strings.Cut(rest, ": ")
 	message = p.r.a.secrets.Redact(message)
+	// Sub-step IDs such as host-eregion-api.service-apply belong to the
+	// running plan step; only a plan step starts a new line.
+	if _, planned := p.steps[step]; !planned && p.task != nil {
+		step = p.current
+	}
 	if step != p.current {
 		if p.task != nil {
 			p.task.end(ui.EndOK, "")
@@ -516,24 +537,24 @@ func (p *applyProgress) close(state string) {
 	}
 }
 
-func (r *serverInit) saveContext(ctx context.Context, remote *host.Remote, cfg host.Config, apiURL, address, knownHosts string) error {
+func (r *serverInit) saveContext(ctx context.Context, remote *host.Remote, cfg host.Config, apiURL, address, knownHosts string) (string, error) {
 	operatorOut := cfg.OperatorTokenOut
 	if operatorOut == "" {
 		operatorOut = host.DefaultLayout().StateDir + "/operator.handoff"
 	}
 	token, err := consumeRemoteToken(ctx, remote, operatorOut)
 	if err != nil {
-		return err
+		return "", err
 	}
 	r.a.secrets.Add(token)
 	store, err := host.LoadContextStore("")
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err := store.Login(r.answers.Context, apiURL, token, host.KnownScopes()); err != nil {
-		return err
+		return "", err
 	}
-	return store.SetSSH(r.answers.Context, &host.ContextSSH{Address: address, User: r.answers.User, Identity: r.answers.Identity, KnownHosts: knownHosts})
+	return token, store.SetSSH(r.answers.Context, &host.ContextSSH{Address: address, User: r.answers.User, Identity: r.answers.Identity, KnownHosts: knownHosts})
 }
 
 func (r *serverInit) finish(s serverInitSummary) {
