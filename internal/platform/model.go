@@ -435,6 +435,7 @@ type InventoryQuery struct {
 	Environment string
 	Node        string
 	State       string
+	Build       string
 	Limit       int
 }
 

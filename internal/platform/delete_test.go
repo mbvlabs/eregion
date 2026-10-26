@@ -11,16 +11,16 @@ func TestDeleteConfirmationValidatesCurrentTargetName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := DeleteConfirmationToken(app); got != "api" {
-		t.Fatalf("app token = %q", got)
+	if got, err := ConfirmationToken(app); err != nil || got != "api" {
+		t.Fatalf("app token = %q, %v", got, err)
 	}
-	if err := ValidateDeleteConfirmation(app, "api"); err != nil {
+	if err := ValidateTargetConfirmation(app, "api"); err != nil {
 		t.Fatalf("matching app token: %v", err)
 	}
-	if err := ValidateDeleteConfirmation(app, ""); contract.Classify(err).Code != contract.ConfirmationRequired {
+	if err := ValidateTargetConfirmation(app, ""); contract.Classify(err).Code != contract.ConfirmationRequired {
 		t.Fatalf("empty token code = %v", contract.Classify(err).Code)
 	}
-	if err := ValidateDeleteConfirmation(app, "other"); contract.Classify(err).Code != contract.PreconditionFailed {
+	if err := ValidateTargetConfirmation(app, "other"); contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("wrong app token code = %v", contract.Classify(err).Code)
 	}
 
@@ -28,13 +28,13 @@ func TestDeleteConfirmationValidatesCurrentTargetName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := DeleteConfirmationToken(env); got != "api/production" {
-		t.Fatalf("environment token = %q", got)
+	if got, err := ConfirmationToken(env); err != nil || got != "api/production" {
+		t.Fatalf("environment token = %q, %v", got, err)
 	}
-	if err := ValidateDeleteConfirmation(env, "api/production"); err != nil {
+	if err := ValidateTargetConfirmation(env, "api/production"); err != nil {
 		t.Fatalf("matching environment token: %v", err)
 	}
-	if err := ValidateDeleteConfirmation(env, "api"); contract.Classify(err).Code != contract.PreconditionFailed {
+	if err := ValidateTargetConfirmation(env, "api"); contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("app token accepted for an environment: %v", err)
 	}
 }

@@ -150,7 +150,7 @@ func (a *app) setSecret(cmd *cobra.Command, _ []string) (result, error) {
 		plain += namespace.Name + " is already in the environment revision.\n"
 		return result{data: data, plain: plain}, nil
 	}
-	op, err := a.submitAccepted(cmd, platform.KindEnvironmentSecretAttach, target, attachInput)
+	op, err := a.submitAccepted(cmd, platform.KindEnvironmentSecretAttach, target, attachInput, "")
 	if err != nil {
 		fault := contract.Classify(err)
 		return result{}, contract.NewFault(fault.Code,

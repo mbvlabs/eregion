@@ -39,7 +39,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | Location | Responsibility |
 | --- | --- |
 | `cmd/eregion` | One executable entry point, including `node-agent` and hidden `node rpc`. |
-| `internal/cli/tree.go`, `meta.go`, `run.go` | Command catalog, safety metadata, output selection and dispatch. |
+| `internal/cli/tree.go`, `meta.go`, `run.go`, `deploy.go` | Command catalog, safety metadata, output selection, dispatch and the deploy/rollback/build/release pipeline commands. |
 | `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup (preflight, answers/pending, plan/confirm, apply, guarded handoff), first contact, DNS, private access and token-free age handoff/import. |
 | `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host and local RPC, Docker workload/log reads, SSH/WireGuard route. |
 | `internal/cli/observe.go`, `internal/cli/logs.go`, `internal/cli/delete.go`, `internal/cli/operations.go` | Extended app/environment status, container logs over the operator channel, target-confirmed deletion and operation-history filters. |
@@ -79,33 +79,28 @@ bin/eregion help app create --json
 | `env create/update/list/status/delete` | `create` accepts an environment with its first revision and queues its first deploy unless `--no-deploy`; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` (D13). |
 | `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. No deploy is queued. |
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
-| `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. Transitional until the deploy row replaces it. |
-| `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. Transitional until the deploy row replaces it. |
+| `deploy <app> <env> [--ref REF \| --release ID]` | Node-mode `platform.deploy`. In a terminal it prints source, ref/commit, revision and processes, then follows the operation with the shared viewer (build log lines and stages). `--detach` returns after acceptance. |
+| `rollback <app> <env> [--to ID]` | Node-mode `platform.rollback`; requires `--confirm <app>/<env>`, validated by the node and control plane against the current target (D12). There is no plan-token scheme for rollback. |
+| `build list/logs/stop/retry`, `release list`, `restart <app> <env>` | Build lifecycle over `platform_builds`; `build logs` reads (and with `--follow` streams) the build operation's events. `build get` is served by the `builds` inventory filter. `restart` reapplies the serving release through the blue/green path. |
 | `domain add/remove <app> <environment> <hostname> [--primary]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `remove` takes `--confirm <hostname>` and refuses the primary. |
 | `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused. `secrets export` rebuilds the server-init handoff (including the vault keyring) and honours `--secrets-out`. |
 | `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
 | `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
-| `platform inventory`, `ui` | Read-only inventory and the full-screen workspace. The workspace graph still uses the telemetry read adapter for metrics. |
-| `operations list/get/events/follow/cancel` | Actor-scoped operation history filtered by app, environment, state and limit, plus snapshot/event observation and explicit cancellation. |
+| `ui` | Full-screen workspace over the same inventory and node-mode action service. The graph still uses the telemetry read adapter for metrics. |
+| `operations list/get/events/follow/cancel` | Actor-scoped operation history filtered by app, environment, state, build and limit, plus snapshot/event observation and explicit cancellation. |
 | `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
-`app create|status|delete`, `env create|update|status|delete`, `process`,
-`config`, `domain`, `logs` and `operations list` are the current application
-surface. `platform releases …` and `platform deployments …` are the remaining
-transitional names. The rest of MASTER section 5 (`deploy`, `rollback`, `build`,
-`release`, `restart`, tokens) does not exist yet; renaming is not a substitute
-for implementing the flow.
-
-The telemetry-backed `logs search`/`logs tail` commands are deleted; the
-workspace metrics graph keeps the telemetry data source. `platform apps …` and
-`platform environments …` are deleted (pre-v1, no aliases). `resources …` and
-the backup code are deleted (MASTER D19), the Docker
-Compose telemetry stack install is deleted (D5), and `dns …`, `access …`,
-`platform nodes …`, `platform fleet`, `platform submit`, `metrics …` and
-`operations test` are no longer registered (D6, D22, D26). Their internal
-packages remain for the after-v1 phases where the work list says they return.
+All of MASTER section 5's app, environment, deployment and observation surface
+exists. The `platform` command group is deleted: `app`, `env`, `process`,
+`config`, `domain`, `deploy`, `rollback`, `restart`, `build`, `release`, `logs`
+and `operations` are the operator commands. Token/protect commands remain for
+work list row 8. `resources …` and the backup code are deleted (MASTER D19), the
+Docker Compose telemetry stack install is deleted (D5), and `dns …`, `access …`,
+`platform …`, `metrics …` and `operations test` are no longer registered
+(D6, D19, D22, D26). Their internal packages remain for the after-v1 phases
+where the work list says they return.
 
 ## Release and local upgrade
 
@@ -403,7 +398,10 @@ All use `POST /v1/operations`, the shared registry and one River job:
 Names: lowercase letters/digits/hyphens, start with a letter, max 40 characters.
 Unknown input fields fail, including nested revision fields. Refer to
 `internal/platform/actions.go` rather than copying JSON types into a second
-client/service implementation.
+client/service implementation. `platform.rollback` is the destructive action:
+`eregion rollback` sends `--confirm <app>/<env>` and `eregion node rpc` validates
+that exact target before submission; a deployment ref, an operation ID or `--yes`
+alone never satisfies it.
 
 Environment revisions are numbered per environment and immutable. The revision
 is the desired state; an accepted action is not an applied route or a running
@@ -488,8 +486,9 @@ changing this path.
   health.
 - `/v1/operations`: submit/preview; `/{id}`, `/{id}/events`, `/{id}/cancel`:
   actor-scoped state, bounded cursor pages and explicit cancellation.
-- `/v1/platform?collection=…`: bounded inventory with app/environment/node/state
-  filters. Base collections: summary, nodes, apps, environments, revisions,
+- `/v1/platform?collection=…`: bounded inventory with app/environment/node/state/
+  build filters. `build=<build ID>` returns that exact build for `build logs`.
+  Base collections: summary, nodes, apps, environments, revisions,
   deployability, domains, releases, builds, deployments and changes; the
   internal DNS/access extensions add their own. The removed resources/backups and
   telemetry collections are not registered.

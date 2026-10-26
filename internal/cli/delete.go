@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -91,7 +92,10 @@ type deleteResult struct {
 func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target, app, environment, confirm string) (result, error) {
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	detach, _ := cmd.Flags().GetBool("detach")
-	token := platform.DeleteConfirmationToken(target)
+	token, err := platform.ConfirmationToken(target)
+	if err != nil {
+		return result{}, err
+	}
 	var input any
 	if environment == "" {
 		input = platform.AppDeleteInput{App: app, Confirm: confirm}
@@ -115,11 +119,10 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 		fmt.Fprintf(&plain, "confirmation_token: %s\n", token)
 		return result{data: data, plain: plain.String()}, nil
 	}
-	if confirm == "" {
-		return result{}, contract.NewFault(contract.ConfirmationRequired, "deletion needs --confirm "+token,
-			"Run with --dry-run to inspect the plan, then pass --confirm "+token+".")
+	if err := platform.ValidateTargetConfirmation(target, confirm); err != nil {
+		return result{}, err
 	}
-	op, err := a.submitAccepted(cmd, kind, target.String(), input)
+	op, err := a.submitAccepted(cmd, kind, target.String(), input, confirm)
 	if err != nil {
 		return result{}, err
 	}
@@ -137,8 +140,9 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 }
 
 // followAccepted attaches the existing plain operation presenter after a
-// mutation in a terminal. Ctrl-C detaches; it never cancels the operation.
-func (a *app) followAccepted(cmd *cobra.Command, client Backend, op contract.Operation) (result, error) {
+// mutation in a terminal. Ctrl-C detaches; it never cancels the operation. A
+// caller may append command-specific outcome lines after the finish line.
+func (a *app) followAccepted(cmd *cobra.Command, client Backend, op contract.Operation, outcome ...func(context.Context, Backend, contract.Operation) []string) (result, error) {
 	config := followConfig(cmd)
 	if config == nil {
 		return result{}, nil
@@ -151,6 +155,13 @@ func (a *app) followAccepted(cmd *cobra.Command, client Backend, op contract.Ope
 	err = followError(summary, err)
 	if finishErr := presenter.Finish(summary, err, resumeCommand+" "+string(op.ID), time.Now()); finishErr != nil && err == nil {
 		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
+	}
+	if len(outcome) > 0 && outcome[0] != nil && !summary.Detached && summary.State.Terminal() {
+		for _, line := range outcome[0](context.WithoutCancel(cmd.Context()), client, op) {
+			if _, writeErr := fmt.Fprintln(config.out, clean(line)); writeErr != nil && err == nil {
+				err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
+			}
+		}
 	}
 	return result{data: newFollowResult(summary), streamed: true}, err
 }

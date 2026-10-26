@@ -169,7 +169,7 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 }
 
 func submitDomain(cmd *cobra.Command, client Backend, kind, target string, input json.RawMessage, key string, dryRun bool) (result, error) {
-	raw, err := client.SubmitAction(cmd.Context(), kind, target, input, key, dryRun)
+	raw, err := client.SubmitAction(cmd.Context(), kind, target, input, key, "", dryRun)
 	if err != nil {
 		return result{}, err
 	}

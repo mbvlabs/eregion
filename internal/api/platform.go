@@ -75,7 +75,7 @@ func (s *Server) platformInventory(r *http.Request) (any, int, error) {
 func parseInventoryQuery(raw string) (platform.InventoryQuery, error) {
 	values, err := url.ParseQuery(raw)
 	if err != nil {
-		return platform.InventoryQuery{}, contract.NewFault(contract.ValidationFailed, "invalid inventory query", "Use collection, app, environment, node, state, and limit parameters.")
+		return platform.InventoryQuery{}, contract.NewFault(contract.ValidationFailed, "invalid inventory query", "Use collection, app, environment, node, state, build, and limit parameters.")
 	}
 	query := platform.InventoryQuery{Limit: 50}
 	for name, entries := range values {
@@ -94,6 +94,11 @@ func parseInventoryQuery(raw string) (platform.InventoryQuery, error) {
 			query.Node = value
 		case "state":
 			query.State = value
+		case "build":
+			if err := platform.BuildID(value).Validate(); err != nil {
+				return query, contract.NewFault(contract.ValidationFailed, "invalid build filter", "Use a build ID from build list or a deploy operation.")
+			}
+			query.Build = value
 		case "limit":
 			limit, err := strconv.Atoi(value)
 			if err != nil || limit < 1 || limit > 200 {
@@ -101,7 +106,7 @@ func parseInventoryQuery(raw string) (platform.InventoryQuery, error) {
 			}
 			query.Limit = limit
 		default:
-			return query, contract.NewFault(contract.ValidationFailed, "unknown inventory parameter", "Use only collection, app, environment, node, state, and limit.")
+			return query, contract.NewFault(contract.ValidationFailed, "unknown inventory parameter", "Use only collection, app, environment, node, state, build, and limit.")
 		}
 	}
 	if query.Collection == "" {

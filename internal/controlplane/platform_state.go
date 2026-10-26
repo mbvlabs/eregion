@@ -544,7 +544,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if _, err := appByNameTx(ctx, tx, input.App); err != nil {
 			return err
 		}
-		if err := platform.ValidateDeleteConfirmation(input.Target(), input.Confirm); err != nil {
+		if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
 			return err
 		}
 		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, input.App, ""); err != nil {
@@ -555,7 +555,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return err
 		}
-		if err := platform.ValidateDeleteConfirmation(input.Target(), input.Confirm); err != nil {
+		if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
 			return err
 		}
 		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, env.App, env.Name); err != nil {
@@ -1417,6 +1417,10 @@ func (s *Service) inventoryBuilds(ctx context.Context, query platform.InventoryQ
 	if query.State != "" {
 		args = append(args, query.State)
 		statement += fmt.Sprintf(" AND b.state=$%d", len(args))
+	}
+	if query.Build != "" {
+		args = append(args, query.Build)
+		statement += fmt.Sprintf(" AND b.id=$%d", len(args))
 	}
 	args = append(args, query.Limit)
 	statement += fmt.Sprintf(" ORDER BY b.created_at DESC LIMIT $%d", len(args))

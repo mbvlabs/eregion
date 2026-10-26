@@ -66,11 +66,11 @@ func TestMachineErrors(t *testing.T) {
 		args []string
 		code contract.Code
 	}{
-		{[]string{"deploy", "--json"}, contract.Usage},
+		{[]string{"deploy", "--json"}, contract.InputRequired},
 		{[]string{"version", "extra", "--json"}, contract.Usage},
 		{[]string{"version", "--unknown", "--json"}, contract.Usage},
 		{[]string{"--unknown", "version", "--json"}, contract.Usage},
-		{[]string{"commands", "--path", "deploy", "--json"}, contract.Usage},
+		{[]string{"commands", "--path", "not-a-command", "--json"}, contract.Usage},
 		{[]string{"help", "version", "extra", "--json"}, contract.Usage},
 		{[]string{"completion", "bash", "--json"}, contract.Usage},
 		{[]string{"commands", "--path=", "--json"}, contract.InputRequired},
@@ -149,7 +149,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 			t.Fatalf("missing inherited/help flags: %+v", command)
 		}
 	}
-	for _, path := range []string{"eregion operations follow", "eregion platform inventory", "eregion ui", "eregion secret list", "eregion upgrade", "eregion app create", "eregion env status", "eregion process scale", "eregion config set"} {
+	for _, path := range []string{"eregion operations follow", "eregion ui", "eregion secret list", "eregion upgrade", "eregion app create", "eregion env status", "eregion process scale", "eregion config set", "eregion deploy", "eregion rollback", "eregion build logs", "eregion release list"} {
 		if !seen[path] {
 			t.Fatalf("missing implemented product command: %s", path)
 		}

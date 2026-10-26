@@ -32,10 +32,9 @@ bin/eregion commands --json
 bin/eregion help server init --json
 ```
 
-Discovery and help need no database or credentials. The current application
-commands are `app`, `env`, `process`, `config` and `domain`; `platform releases …`
-and `platform deployments …` are the remaining transitional names. The target
-tree is in MASTER.
+Discovery and help need no database or credentials. The application commands are
+`app`, `env`, `process`, `config`, `domain`, `deploy`, `rollback`, `restart`,
+`build` and `release list`; the target tree is in MASTER.
 
 Servers run Debian 13 or Ubuntu 26.04 (amd64/arm64) with Docker, Buildpacks, a
 local registry and Caddy, and keep their state in an external PostgreSQL 17+

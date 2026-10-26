@@ -359,13 +359,13 @@ func (m Model) renderEmpty(width, height int) string {
 			hint = "Register placement facts through the platform API; this view never invents a node."
 		case Apps:
 			title = "No applications yet"
-			hint = "Press a to create an application."
+			hint = "Create apps with eregion app create; this view is read-only."
 		case Envs:
 			title = "No environments yet"
-			hint = "Press e to create an environment after an application exists."
+			hint = "Create environments with eregion env create; this view is read-only."
 		case Releases:
 			title = "No releases reported"
-			hint = "Press i to create an image release for an environment."
+			hint = "Releases are recorded by deploys and builds; press d to deploy an environment."
 		case Deployments:
 			title = "No deployments reported"
 			hint = "Press d to deploy a ready release, or o to plan a rollback."
@@ -525,7 +525,7 @@ func (m Model) renderHelp(width, height int) string {
 		m.boldStyle().Render("Workspaces"),
 		m.dim().Render("1 fleet · 2 apps · 3 envs · 4 releases · 5 deployments · tab cycles"),
 		m.boldStyle().Render("Guided forms"),
-		m.dim().Render("a application · e environment · i image release · d deploy · o rollback"),
+		m.dim().Render("d deploy · o rollback"),
 		m.dim().Render("enter next field · tab next · s submit after preview · e edit preview · esc cancel"),
 		m.boldStyle().Render("Discovery"),
 		m.dim().Render(": command palette shows every action with its exact noninteractive CLI equivalent."),
@@ -622,7 +622,7 @@ func (m Model) renderPreview(form *formState, width int) string {
 		}
 	}
 	if form.confirmPhrase != "" {
-		lines = append(lines, "", m.warnStyle().Render("Type "+form.confirmPhrase+" to confirm this deploy."))
+		lines = append(lines, "", m.warnStyle().Render("Type "+form.confirmPhrase+" to confirm this action."))
 		value := form.confirm.Value()
 		if value == "" {
 			value = "_"

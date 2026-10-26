@@ -77,17 +77,6 @@ func (m Model) formContext() (app, environment, node string) {
 	return app, environment, node
 }
 
-func (m Model) newReleaseForm() *formState {
-	app, environment, _ := m.formContext()
-	form := newForm(platform.KindReleaseCreate, "Create image release", "", "", m.opts.Key(), []*formField{
-		field("app", app, "api", true),
-		field("environment", environment, "production", true),
-		field("image", "", "ghcr.io/acme/api:2026-10-20", true),
-	})
-	form.input.Focus()
-	return form
-}
-
 func (m Model) newDeployForm() *formState {
 	app, environment, _ := m.formContext()
 	release := ""
@@ -112,7 +101,7 @@ func (m Model) newRollbackForm() *formState {
 		m.notice = "Select an environment before planning a rollback."
 		return nil
 	}
-	form := newForm(platform.KindRollback, "Roll back environment", "env/"+app+"/"+environment, environment, m.opts.Key(), []*formField{
+	form := newForm(platform.KindRollback, "Roll back environment", "env/"+app+"/"+environment, app+"/"+environment, m.opts.Key(), []*formField{
 		field("app", app, "api", true),
 		field("environment", environment, "production", true),
 		field("to release", "", "empty restores the last applied release", false),
@@ -196,7 +185,7 @@ func (m Model) handlePreviewKey(message tea.KeyPressMsg, pressed string) (tea.Mo
 	if form.confirmPhrase != "" && pressed != "esc" {
 		if pressed == "enter" || (pressed == "s" && form.confirm.Value() == form.confirmPhrase) {
 			if form.confirm.Value() != form.confirmPhrase {
-				form.errText = "type " + form.confirmPhrase + " to confirm this deploy"
+				form.errText = "type " + form.confirmPhrase + " to confirm this action"
 				return m, nil
 			}
 			return m.startSubmit()
@@ -220,7 +209,7 @@ func (m Model) handlePreviewKey(message tea.KeyPressMsg, pressed string) (tea.Mo
 	case "s":
 		if form.confirmPhrase != "" {
 			if strings.TrimSpace(form.confirm.Value()) != form.confirmPhrase {
-				form.errText = "type " + form.confirmPhrase + " to confirm this deploy"
+				form.errText = "type " + form.confirmPhrase + " to confirm this action"
 				form.confirm.Focus()
 				return m, nil
 			}
@@ -266,7 +255,7 @@ func (m Model) previewCommand(action Action, revision int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		raw, err := api.SubmitAction(ctx, action.Kind, action.Target, action.Input, "", true)
+		raw, err := api.SubmitAction(ctx, action.Kind, action.Target, action.Input, "", "", true)
 		if err != nil {
 			return previewMsg{revision: revision, at: now(), err: err}
 		}
@@ -304,7 +293,7 @@ func (m Model) submitCommand(action Action, revision int) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
-		raw, err := api.SubmitAction(ctx, action.Kind, action.Target, action.Input, action.IdempotencyKey, false)
+		raw, err := api.SubmitAction(ctx, action.Kind, action.Target, action.Input, action.IdempotencyKey, action.Confirm, false)
 		if err != nil {
 			return submitMsg{revision: revision, at: now(), err: err}
 		}
@@ -331,28 +320,6 @@ func (form *formState) action() (Action, int, error) {
 		return -1
 	}
 	switch form.kind {
-	case platform.KindReleaseCreate:
-		app, environment, image := value("app"), value("environment"), value("image")
-		if app == "" || environment == "" || image == "" {
-			for _, label := range []string{"app", "environment", "image"} {
-				if value(label) == "" {
-					return Action{}, fieldIndex(label), requiredValue(label, "", fieldIndex(label))
-				}
-			}
-		}
-		if err := platform.ValidateName(app); err != nil {
-			return Action{}, fieldIndex("app"), err
-		}
-		if err := platform.ValidateName(environment); err != nil {
-			return Action{}, fieldIndex("environment"), err
-		}
-		if err := platform.ValidateImage(image); err != nil {
-			return Action{}, fieldIndex("image"), err
-		}
-		raw, _ := json.Marshal(platform.ReleaseCreateInput{
-			App: app, Environment: environment, Source: platform.Source{Type: "image", Image: image},
-		})
-		return Action{Kind: form.kind, Target: "env/" + app + "/" + environment, Input: raw, IdempotencyKey: form.key, Title: form.title}, -1, nil
 	case platform.KindDeploy:
 		app, environment, release := value("app"), value("environment"), value("release")
 		if app == "" || environment == "" || release == "" {
@@ -402,7 +369,7 @@ func (form *formState) action() (Action, int, error) {
 		raw, _ := json.Marshal(input)
 		return Action{
 			Kind: form.kind, Target: "env/" + app + "/" + environment, Input: raw, IdempotencyKey: form.key,
-			Title: form.title, ConfirmPhrase: environment,
+			Title: form.title, ConfirmPhrase: app + "/" + environment, Confirm: app + "/" + environment,
 		}, -1, nil
 	}
 	return Action{}, -1, contract.NewFault(contract.Internal, "unsupported guided form", "Use a documented form; this is a binary defect.")

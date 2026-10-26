@@ -1,8 +1,8 @@
 // Package workspaceui implements the keyboard-driven fleet, application,
 // environment, release, and deployment workspaces. It only reads platform
-// inventory and submits registered platform actions through the public API
-// contract; it never opens SSH, touches a database, starts a queue, or cancels
-// an operation when the interface is detached.
+// inventory and submits registered platform actions through the same node-mode
+// backend as the CLI; it never opens SSH, touches a database, starts a queue,
+// or cancels an operation when the interface is detached.
 package workspaceui
 
 import (
@@ -22,11 +22,11 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// API is the subset of the authenticated API client the workspace uses. The
-// live CLI adapts *api.Client to this interface; tests use a pure fake.
+// API is the subset of the node-mode application backend the workspace uses.
+// The live CLI adapts it to this interface; tests use a pure fake.
 type API interface {
 	PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error)
-	SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool) (json.RawMessage, error)
+	SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool) (json.RawMessage, error)
 	Get(ctx context.Context, id contract.OperationID) (json.RawMessage, error)
 	Events(ctx context.Context, cursor contract.Cursor, limit int) (json.RawMessage, error)
 }
@@ -44,6 +44,9 @@ type Action struct {
 	// ConfirmPhrase is nonempty when the action must be confirmed by typing an
 	// exact phrase before submission (deploy replaces the serving container).
 	ConfirmPhrase string
+	// Confirm is the D12 target-name token sent to the node for a destructive
+	// action. It is empty for actions that do not take one.
+	Confirm string
 }
 
 // PlanToken binds a typed confirmation to the exact kind, target, and input
@@ -69,30 +72,29 @@ func (a Action) PlanToken() string {
 func (a Action) Noninteractive() string {
 	suffix := " --idempotency-key " + a.IdempotencyKey + " --json"
 	switch a.Kind {
-	case platform.KindReleaseCreate:
-		var input platform.ReleaseCreateInput
-		if json.Unmarshal(a.Input, &input) != nil {
-			return ""
-		}
-		return "eregion platform releases create " + input.App + " " + input.Environment +
-			" --image " + input.Source.Image + suffix
 	case platform.KindDeploy:
 		var input platform.DeployInput
 		if json.Unmarshal(a.Input, &input) != nil {
 			return ""
 		}
-		return "eregion platform deployments deploy " + input.App + " " + input.Environment +
-			" --release-id " + string(input.ReleaseID) + suffix
+		command := "eregion deploy " + input.App + " " + input.Environment
+		if input.ReleaseID != "" {
+			command += " --release " + string(input.ReleaseID)
+		}
+		if input.Ref != "" {
+			command += " --ref " + input.Ref
+		}
+		return command + suffix
 	case platform.KindRollback:
 		var input platform.RollbackInput
 		if json.Unmarshal(a.Input, &input) != nil {
 			return ""
 		}
-		command := "eregion platform deployments rollback " + input.App + " " + input.Environment
+		command := "eregion rollback " + input.App + " " + input.Environment
 		if input.ToReleaseID != "" {
-			command += " --to-release-id " + string(input.ToReleaseID)
+			command += " --to " + string(input.ToReleaseID)
 		}
-		return command + " --confirm " + a.PlanToken() + suffix
+		return command + " --confirm " + input.App + "/" + input.Environment + suffix
 	}
 	return ""
 }

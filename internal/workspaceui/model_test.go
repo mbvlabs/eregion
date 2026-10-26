@@ -17,7 +17,7 @@ import (
 
 type fakeAPI struct {
 	inventory func(context.Context, string, url.Values) (json.RawMessage, error)
-	submit    func(context.Context, string, string, json.RawMessage, string, bool) (json.RawMessage, error)
+	submit    func(context.Context, string, string, json.RawMessage, string, string, bool) (json.RawMessage, error)
 	get       func(context.Context, contract.OperationID) (json.RawMessage, error)
 	events    func(context.Context, contract.Cursor, int) (json.RawMessage, error)
 
@@ -26,11 +26,12 @@ type fakeAPI struct {
 }
 
 type fakeSubmit struct {
-	kind   string
-	target string
-	input  json.RawMessage
-	key    string
-	dryRun bool
+	kind    string
+	target  string
+	input   json.RawMessage
+	key     string
+	confirm string
+	dryRun  bool
 }
 
 func (f *fakeAPI) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {
@@ -41,12 +42,12 @@ func (f *fakeAPI) PlatformInventory(ctx context.Context, collection string, filt
 	return f.inventory(ctx, collection, filters)
 }
 
-func (f *fakeAPI) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, key string, dryRun bool) (json.RawMessage, error) {
-	f.submits = append(f.submits, fakeSubmit{kind: kind, target: target, input: append(json.RawMessage(nil), input...), key: key, dryRun: dryRun})
+func (f *fakeAPI) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, key, confirm string, dryRun bool) (json.RawMessage, error) {
+	f.submits = append(f.submits, fakeSubmit{kind: kind, target: target, input: append(json.RawMessage(nil), input...), key: key, confirm: confirm, dryRun: dryRun})
 	if f.submit == nil {
 		return nil, contract.NewFault(contract.Unavailable, "no fake submit", "test")
 	}
-	return f.submit(ctx, kind, target, input, key, dryRun)
+	return f.submit(ctx, kind, target, input, key, confirm, dryRun)
 }
 
 func (f *fakeAPI) Get(ctx context.Context, id contract.OperationID) (json.RawMessage, error) {
@@ -240,14 +241,14 @@ func TestCommandPaletteListsExactCLIEquivalents(t *testing.T) {
 	m.width, m.height = 120, 60
 	m = step(t, m, press(':'))
 	view := render(m)
-	for _, want := range []string{"COMMAND DISCOVERY", "Create image release", "Deploy release", "eregion platform releases create", "eregion platform deployments deploy", "exact noninteractive CLI equivalent"} {
+	for _, want := range []string{"COMMAND DISCOVERY", "Deploy an environment", "Roll back environment", "eregion deploy", "eregion rollback", "exact noninteractive CLI equivalent"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("missing %q in palette:\n%s", want, view)
 		}
 	}
-	m = typeText(m, "deploy")
+	m = typeText(m, "rollback")
 	view = render(m)
-	if !strings.Contains(view, "Deploy release") || strings.Contains(view, "Create image release") {
+	if !strings.Contains(view, "Roll back environment") || strings.Contains(view, "Deploy an environment") {
 		t.Fatalf("palette filter did not narrow actions:\n%s", view)
 	}
 	m = step(t, m, special(tea.KeyEsc))
@@ -389,7 +390,7 @@ func TestFleetFreshnessUnreachableAndEmptyStates(t *testing.T) {
 	}
 	next, command = stepCmd(t, m, press('2'))
 	m = applyCommand(t, next, command)
-	if view = render(m); !strings.Contains(view, "No applications yet") || !strings.Contains(view, "Press a") {
+	if view = render(m); !strings.Contains(view, "No applications yet") || !strings.Contains(view, "eregion app create") {
 		t.Fatalf("missing empty state:\n%s", view)
 	}
 }
@@ -420,72 +421,6 @@ func TestFilterSearchAndDetails(t *testing.T) {
 	}
 }
 
-func TestReleaseFormPreviewSubmitAndStableKey(t *testing.T) {
-	m, api, _ := testArgs(t)
-	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
-		return json.RawMessage(appsJSON), nil
-	}
-	next, command := stepCmd(t, m, press('2'))
-	m = applyCommand(t, next, command)
-	m = load(t, m, appsJSON)
-	m = step(t, m, press('i'))
-	m = step(t, m, special(tea.KeyEnter)) // app (prefilled) -> environment
-	m = typeText(m, "production")
-	m = step(t, m, special(tea.KeyEnter)) // environment -> image
-	m = typeText(m, "ghcr.io/acme/api:2026-10-20")
-	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, key string, dryRun bool) (json.RawMessage, error) {
-		if !dryRun || kind != "platform.release.create" || target != "env/api/production" {
-			t.Fatalf("wrong release preview: %s %s dry=%t", kind, target, dryRun)
-		}
-		if !strings.Contains(string(input), `"type":"image"`) {
-			t.Fatalf("release form advertised another source: %s", input)
-		}
-		return json.RawMessage(previewJSON(kind, target)), nil
-	}
-	next, command = stepCmd(t, m, special(tea.KeyEnter))
-	m = applyCommand(t, next, command)
-	if len(api.submits) != 1 || !api.submits[0].dryRun || api.submits[0].key != "" {
-		t.Fatalf("unexpected dry-run: %+v", api.submits)
-	}
-	view := render(m)
-	for _, want := range []string{"DRY-RUN PREVIEW", "nothing has been submitted", "eregion platform releases create", "ui:test-key", "s submit"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q in preview:\n%s", want, view)
-		}
-	}
-
-	// A timed-out submission is ambiguous; the same key must be reused.
-	api.submit = func(_ context.Context, _, _ string, _ json.RawMessage, _ string, _ bool) (json.RawMessage, error) {
-		return nil, contract.NewFault(contract.Unavailable, "submission did not complete", "reuse the key")
-	}
-	next, command = stepCmd(t, m, press('s'))
-	m = applyCommand(t, next, command)
-	if len(api.submits) != 2 || api.submits[1].dryRun || api.submits[1].key != "ui:test-key" {
-		t.Fatalf("submission did not reuse the key: %+v", api.submits)
-	}
-	if view = render(m); !strings.Contains(view, "Retry with the same key") {
-		t.Fatalf("missing retry guidance:\n%s", view)
-	}
-
-	api.submit = func(_ context.Context, kind, target string, _ json.RawMessage, _ string, _ bool) (json.RawMessage, error) {
-		return operationFor(kind, target), nil
-	}
-	next, command = stepCmd(t, m, press('s'))
-	m = applyCommand(t, next, command)
-	if len(api.submits) != 3 || api.submits[2].key != "ui:test-key" {
-		t.Fatalf("retry used a different key: %+v", api.submits)
-	}
-	view = render(m)
-	for _, want := range []string{"ACCEPTED", testOperationID, "operations follow " + testOperationID, "Detaching never cancels"} {
-		if !strings.Contains(view, want) {
-			t.Fatalf("missing %q after submit:\n%s", want, view)
-		}
-	}
-	if len(m.summary.Operations) != 1 || m.summary.Operations[0] != testOperationID {
-		t.Fatalf("summary did not record the operation: %+v", m.summary)
-	}
-}
-
 func TestDeployRequiresBoundConfirmation(t *testing.T) {
 	m, api, _ := testArgs(t)
 	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
@@ -497,7 +432,7 @@ func TestDeployRequiresBoundConfirmation(t *testing.T) {
 	m = step(t, m, press('d'))
 	m = step(t, m, special(tea.KeyEnter)) // app -> env
 	m = step(t, m, special(tea.KeyEnter)) // env -> release (prefilled from inventory)
-	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
+	api.submit = func(_ context.Context, kind, target string, input json.RawMessage, _ string, _ string, dryRun bool) (json.RawMessage, error) {
 		if !dryRun {
 			t.Fatal("deploy submitted without a preview")
 		}
@@ -524,7 +459,7 @@ func TestDeployRequiresBoundConfirmation(t *testing.T) {
 		t.Fatalf("missing confirmation error:\n%s", render(m))
 	}
 	m = typeText(m, "production")
-	api.submit = func(_ context.Context, kind, target string, _ json.RawMessage, key string, dryRun bool) (json.RawMessage, error) {
+	api.submit = func(_ context.Context, kind, target string, _ json.RawMessage, key string, _ string, dryRun bool) (json.RawMessage, error) {
 		if dryRun || kind != "platform.deploy" || target != "env/api/production" || key != "ui:test-key" {
 			t.Fatalf("unexpected deploy submission: %s %s %q dry=%t", kind, target, key, dryRun)
 		}
@@ -594,25 +529,24 @@ func TestGenericResourceSecretFieldsAreRedacted(t *testing.T) {
 func TestOperationFollowAndDetachDoesNotCancel(t *testing.T) {
 	m, api, _ := testArgs(t)
 	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
-		return json.RawMessage(appsJSON), nil
+		return json.RawMessage(envsJSON), nil
 	}
-	next, command := stepCmd(t, m, press('2'))
+	next, command := stepCmd(t, m, press('3'))
 	m = applyCommand(t, next, command)
-	m = load(t, m, appsJSON)
-	m = step(t, m, press('i'))
-	m = step(t, m, special(tea.KeyEnter)) // app (prefilled) -> environment
-	m = typeText(m, "production")
-	m = step(t, m, special(tea.KeyEnter)) // environment -> image
-	m = typeText(m, "ghcr.io/acme/api:2026-10-20")
+	m = load(t, m, envsJSON)
+	m = step(t, m, press('d'))
+	m = step(t, m, special(tea.KeyEnter)) // app -> env
+	m = step(t, m, special(tea.KeyEnter)) // env -> release (prefilled from inventory)
 	next, command = stepCmd(t, m, special(tea.KeyEnter))
 	m = next
-	api.submit = func(_ context.Context, kind, target string, _ json.RawMessage, _ string, dryRun bool) (json.RawMessage, error) {
+	api.submit = func(_ context.Context, kind, target string, _ json.RawMessage, _ string, _ string, dryRun bool) (json.RawMessage, error) {
 		if dryRun {
 			return json.RawMessage(previewJSON(kind, target)), nil
 		}
 		return operationFor(kind, target), nil
 	}
 	m = applyCommand(t, m, command)
+	m = typeText(m, "production")
 	next, command = stepCmd(t, m, press('s'))
 	m = applyCommand(t, next, command)
 
@@ -675,11 +609,11 @@ func TestNoninteractiveEquivalentUsesTheDirectPlatformCommand(t *testing.T) {
 	}{
 		{
 			action: Action{Kind: platform.KindDeploy, Input: json.RawMessage(`{"app":"api","environment":"production","release_id":"` + testReleaseID + `"}`), IdempotencyKey: "ui:key"},
-			want:   "eregion platform deployments deploy api production --release-id " + testReleaseID + " --idempotency-key ui:key --json",
+			want:   "eregion deploy api production --release " + testReleaseID + " --idempotency-key ui:key --json",
 		},
 		{
 			action: rollback,
-			want:   "eregion platform deployments rollback api production --confirm " + rollback.PlanToken() + " --idempotency-key ui:key --json",
+			want:   "eregion rollback api production --confirm api/production --idempotency-key ui:key --json",
 		},
 	}
 	for _, test := range tests {

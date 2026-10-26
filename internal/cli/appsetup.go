@@ -1060,7 +1060,7 @@ func (a *app) previewAction(cmd *cobra.Command, kind, target string, input any) 
 	if err != nil {
 		return platform.Preview{}, err
 	}
-	data, err := client.SubmitAction(cmd.Context(), kind, target, raw, "", true)
+	data, err := client.SubmitAction(cmd.Context(), kind, target, raw, "", "", true)
 	if err != nil {
 		return platform.Preview{}, err
 	}
@@ -1071,9 +1071,10 @@ func (a *app) previewAction(cmd *cobra.Command, kind, target string, input any) 
 	return preview, nil
 }
 
-// submitAccepted submits one action and returns the durable operation it was
-// accepted as. The idempotency key is stable when the operator supplied one.
-func (a *app) submitAccepted(cmd *cobra.Command, kind, target string, input any) (contract.Operation, error) {
+// submitAccepted submits one action with a D12 target confirmation when the
+// action requires one, returning the durable operation it was accepted as. The
+// idempotency key is stable when the operator supplied one.
+func (a *app) submitAccepted(cmd *cobra.Command, kind, target string, input any, confirm string) (contract.Operation, error) {
 	raw, err := json.Marshal(input)
 	if err != nil {
 		return contract.Operation{}, contract.NewFault(contract.Internal, "could not encode platform input", "Report the command and binary version.")
@@ -1089,7 +1090,7 @@ func (a *app) submitAccepted(cmd *cobra.Command, kind, target string, input any)
 	if err != nil {
 		return contract.Operation{}, err
 	}
-	data, err := client.SubmitAction(cmd.Context(), kind, target, raw, key, false)
+	data, err := client.SubmitAction(cmd.Context(), kind, target, raw, key, confirm, false)
 	if err != nil {
 		return contract.Operation{}, err
 	}

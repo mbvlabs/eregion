@@ -149,8 +149,8 @@ func (w workspaceLiveAPI) PlatformInventory(ctx context.Context, collection stri
 	return w.client.PlatformInventory(ctx, collection, filters)
 }
 
-func (w workspaceLiveAPI) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool) (json.RawMessage, error) {
-	return w.client.SubmitAction(ctx, kind, target, input, idempotencyKey, dryRun)
+func (w workspaceLiveAPI) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool) (json.RawMessage, error) {
+	return w.client.SubmitAction(ctx, kind, target, input, idempotencyKey, confirm, dryRun)
 }
 
 func (w workspaceLiveAPI) Get(ctx context.Context, id contract.OperationID) (json.RawMessage, error) {

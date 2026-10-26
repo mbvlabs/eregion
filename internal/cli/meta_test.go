@@ -38,7 +38,7 @@ func TestMetadataGate(t *testing.T) {
 			m.DestructiveFlags = []string{"erase"}
 		}, "also be mutating"},
 		{"handler", func(_ *app, c *cobra.Command, _ *CommandMeta) { c.RunE = nil }, "handler"},
-		{"next", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Next = []string{"eregion deploy"} }, "implemented command"},
+		{"next", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Next = []string{"eregion not-a-command"} }, "implemented command"},
 		{"dry-run-type", func(_ *app, c *cobra.Command, m *CommandMeta) {
 			c.Flags().String("dry-run", "", "bad")
 			m.DryRun = true

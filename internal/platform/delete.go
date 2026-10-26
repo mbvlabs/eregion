@@ -1,10 +1,7 @@
 package platform
 
 import (
-	"crypto/subtle"
 	"encoding/json"
-
-	"github.com/mbvlabs/eregion/internal/contract"
 )
 
 // Application and environment deletion are durable, target-confirmed actions.
@@ -55,7 +52,7 @@ func normalizeAppDelete(target Target, raw json.RawMessage) (ActionInput, error)
 		return nil, err
 	}
 	if input.Confirm != "" {
-		if err := ValidateDeleteConfirmation(input.Target(), input.Confirm); err != nil {
+		if err := ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
 			return nil, err
 		}
 	}
@@ -81,44 +78,11 @@ func normalizeEnvironmentDelete(target Target, raw json.RawMessage) (ActionInput
 		return nil, err
 	}
 	if input.Confirm != "" {
-		if err := ValidateDeleteConfirmation(input.Target(), input.Confirm); err != nil {
+		if err := ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
 			return nil, err
 		}
 	}
 	return &input, nil
-}
-
-// DeleteConfirmationToken is the exact token an operator must pass for this
-// target: <app> for an application, <app>/<env> for an environment.
-func DeleteConfirmationToken(target Target) string {
-	switch target.Kind {
-	case TargetApp:
-		return target.App
-	case TargetEnvironment:
-		return target.App + "/" + target.Environment
-	default:
-		return ""
-	}
-}
-
-// ValidateDeleteConfirmation compares the supplied token with the target names
-// loaded from current state. It is deliberately constant-time and returns the
-// contract fault a caller can report without guessing.
-func ValidateDeleteConfirmation(target Target, confirm string) error {
-	want := DeleteConfirmationToken(target)
-	if confirm == "" {
-		return contract.NewFault(contract.ConfirmationRequired, "deletion needs a confirmation token",
-			"Run with --dry-run to inspect the plan, then pass --confirm "+want+".")
-	}
-	if want == "" {
-		return contract.NewFault(contract.ValidationFailed, "deletion target is not an app or environment",
-			"Use app delete <app> or env delete <app> <environment>.")
-	}
-	if subtle.ConstantTimeCompare([]byte(confirm), []byte(want)) != 1 {
-		return contract.NewFault(contract.PreconditionFailed, "confirmation token does not match the current target",
-			"Pass --confirm "+want+" for this exact application or environment.")
-	}
-	return nil
 }
 
 // DeletionSteps returns the ordered effects a deletion performs. Workload and

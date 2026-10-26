@@ -26,23 +26,17 @@ type CommandAction struct {
 func CommandActions() []CommandAction {
 	return []CommandAction{
 		{
-			ID: "release.create", Name: "Create image release", Keys: "i", Form: "release",
-			CLI:         "eregion platform releases create <app> <environment> --image <image> --idempotency-key <key> --json",
-			CommandPath: "eregion platform releases create",
-		},
-		{
-			ID: "deployment.plan", Name: "Preview a deployment", Keys: "", Form: "",
-			CLI:         "eregion platform deployments plan <app> <environment> --release-id <release> --json",
-			CommandPath: "eregion platform deployments plan",
-		},
-		{
-			ID: "deployment.deploy", Name: "Deploy release", Keys: "d", Form: "deploy",
-			CLI:         "eregion platform deployments deploy <app> <environment> --release-id <release> --idempotency-key <key> --json",
-			CommandPath: "eregion platform deployments deploy", Destructive: true,
+			ID: "deployment.deploy", Name: "Deploy an environment", Keys: "d", Form: "deploy",
+			CLI:         "eregion deploy <app> <environment> --release <release> --idempotency-key <key> --json",
+			CommandPath: "eregion deploy", Destructive: true,
 		},
 		{
 			ID: "deployment.rollback", Name: "Roll back environment", Keys: "o", Form: "rollback",
-			CLI: "eregion platform deployments rollback <app> <environment> --confirm <plan-token> --idempotency-key <key> --json", CommandPath: "eregion platform deployments rollback", Destructive: true,
+			CLI: "eregion rollback <app> <environment> --confirm <app>/<environment> --idempotency-key <key> --json", CommandPath: "eregion rollback", Destructive: true,
+		},
+		{
+			ID: "deployment.restart", Name: "Restart an environment", Keys: "", Form: "",
+			CLI: "eregion restart <app> <environment> --idempotency-key <key> --json", CommandPath: "eregion restart",
 		},
 		{
 			ID: "operations.get", Name: "Read an operation snapshot", Keys: "", Form: "",
@@ -124,8 +118,6 @@ func (m *Model) openForm(id string) {
 	}
 	var form *formState
 	switch id {
-	case "release":
-		form = m.newReleaseForm()
 	case "deploy":
 		form = m.newDeployForm()
 	case "rollback":

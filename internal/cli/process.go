@@ -101,7 +101,7 @@ func (a *app) processScale(cmd *cobra.Command, args []string) (result, error) {
 		plain += updatePreviewText(preview)
 		return result{data: data, plain: plain}, nil
 	}
-	op, err := a.submitAccepted(cmd, platform.KindProcessScale, target, input)
+	op, err := a.submitAccepted(cmd, platform.KindProcessScale, target, input, "")
 	if err != nil {
 		return result{}, err
 	}

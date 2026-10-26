@@ -145,7 +145,7 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, err
 	}
 	summary.SecretNames = secretNames
-	op, err := a.submitAccepted(cmd, platform.KindAppCreate, platform.PlatformTarget().String(), input)
+	op, err := a.submitAccepted(cmd, platform.KindAppCreate, platform.PlatformTarget().String(), input, "")
 	if err != nil {
 		return result{}, err
 	}
@@ -157,7 +157,7 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 		domainOp, err := a.submitAccepted(cmd, platform.KindDomainAdd, target.String(), platform.DomainInput{
 			App: ans.App, Environment: ans.Environment, Domain: ans.Domain,
-		})
+		}, "")
 		if err != nil {
 			fault := contract.Classify(err)
 			return result{}, contract.NewFault(fault.Code,

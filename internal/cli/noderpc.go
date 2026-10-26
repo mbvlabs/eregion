@@ -46,7 +46,7 @@ type Backend interface {
 	Events(context.Context, contract.Cursor, int) (json.RawMessage, error)
 	Cancel(context.Context, contract.OperationID) (json.RawMessage, error)
 	Ready(context.Context) error
-	SubmitAction(context.Context, string, string, json.RawMessage, string, bool) (json.RawMessage, error)
+	SubmitAction(context.Context, string, string, json.RawMessage, string, string, bool) (json.RawMessage, error)
 	PlatformInventory(context.Context, string, url.Values) (json.RawMessage, error)
 	Workloads(context.Context, string, string) (platform.Workloads, error)
 	Logs(context.Context, platform.LogQuery, func(platform.LogLine) error) (platform.LogResult, error)
@@ -235,8 +235,8 @@ func (n *nodeClient) Ready(ctx context.Context) error {
 	return err
 }
 
-func (n *nodeClient) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool) (json.RawMessage, error) {
-	return n.call(ctx, methodSubmit, rpcSubmitParams{Kind: kind, Target: target, Input: input}, rpcCallOptions{DryRun: dryRun, IdempotencyKey: idempotencyKey})
+func (n *nodeClient) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool) (json.RawMessage, error) {
+	return n.call(ctx, methodSubmit, rpcSubmitParams{Kind: kind, Target: target, Input: input}, rpcCallOptions{DryRun: dryRun, IdempotencyKey: idempotencyKey, Confirm: confirm})
 }
 
 func (n *nodeClient) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {
@@ -1069,6 +1069,11 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		var params rpcSubmitParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
 			return nil, err
+		}
+		if !request.DryRun {
+			if err := platform.ValidateConfirmation(params.Kind, params.Target, request.Confirm); err != nil {
+				return nil, err
+			}
 		}
 		return app.PreviewOrSubmit(ctx, actor, params.Kind, params.Target, params.Input, request.IdempotencyKey, request.DryRun)
 	case methodGet:

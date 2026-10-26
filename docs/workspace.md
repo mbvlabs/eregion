@@ -23,14 +23,14 @@ arrows/`j/k`, `g/G`, `/` filter, `enter` details, `r` refresh, `:` discovery,
 `?` help, `q`/Ctrl-C detach. The operation view's space key pauses the local
 viewport, not execution.
 
-Existing workspace forms cover image release and deploy/rollback. They preview
-through the action API and show their exact noninteractive `platform …` command
-equivalent. The mapping is owned by `internal/workspaceui/discovery.go` and
-catalog tests. App and environment setup is not a workspace form: use the guided
+Existing workspace forms cover deploy and rollback. They preview through the
+node-mode action service and show their exact noninteractive command equivalent.
+The mapping is owned by `internal/workspaceui/discovery.go` and catalog tests.
+App and environment setup is not a workspace form: use the guided
 `eregion app create` and `eregion env create` commands. These views do not
-provide app/env deletion. The former app/env forms, Resources and Backups tabs,
-node-check action and their forms are deleted with the surface cleanup (MASTER
-D19, work list rows 4 and 9).
+provide app/env deletion. The former app/env and image-release forms, Resources
+and Backups tabs, node-check action and their forms are deleted with the surface
+cleanup (MASTER D19, work list rows 4, 5 and 9).
 
 ## Honest observations
 

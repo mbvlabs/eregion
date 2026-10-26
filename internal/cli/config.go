@@ -114,7 +114,7 @@ func (a *app) configSet(cmd *cobra.Command, args []string) (result, error) {
 		plain += updatePreviewText(preview)
 		return result{data: data, plain: plain}, nil
 	}
-	op, err := a.submitAccepted(cmd, platform.KindConfigSet, target, input)
+	op, err := a.submitAccepted(cmd, platform.KindConfigSet, target, input, "")
 	if err != nil {
 		return result{}, err
 	}
@@ -143,7 +143,7 @@ func (a *app) configUnset(cmd *cobra.Command, args []string) (result, error) {
 		plain += updatePreviewText(preview)
 		return result{data: data, plain: plain}, nil
 	}
-	op, err := a.submitAccepted(cmd, platform.KindConfigUnset, target, input)
+	op, err := a.submitAccepted(cmd, platform.KindConfigUnset, target, input, "")
 	if err != nil {
 		return result{}, err
 	}

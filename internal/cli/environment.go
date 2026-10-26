@@ -201,7 +201,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, err
 	}
 	summary.SecretNames = secretNames
-	op, err := a.submitAccepted(cmd, platform.KindEnvironmentCreate, target.String(), input)
+	op, err := a.submitAccepted(cmd, platform.KindEnvironmentCreate, target.String(), input, "")
 	if err != nil {
 		return result{}, err
 	}
@@ -213,7 +213,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 		domainOp, err := a.submitAccepted(cmd, platform.KindDomainAdd, envTarget.String(), platform.DomainInput{
 			App: ans.App, Environment: ans.Environment, Domain: ans.Domain,
-		})
+		}, "")
 		if err != nil {
 			fault := contract.Classify(err)
 			return result{}, contract.NewFault(fault.Code,
@@ -386,7 +386,7 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 			plain: "Rotated the push-to-deploy secret for " + appName + "/" + environment + "; the new value is active immediately.\n" + webhook.URL + "\n",
 		}, nil
 	}
-	op, err := a.submitAccepted(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch)
+	op, err := a.submitAccepted(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch, "")
 	if err != nil {
 		return result{}, err
 	}
