@@ -206,3 +206,9 @@ func MultiSelect(title, description string, options, selected []string) ([]strin
 	}
 	return out, nil
 }
+
+// Answered is the scrollback line of a question answered in a form.
+func Answered(title, answer string) string { return answeredLine(title, answer) }
+
+// SecretAnswer is what stands for a secret answer in the scrollback.
+const SecretAnswer = secretMask

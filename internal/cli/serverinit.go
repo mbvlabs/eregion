@@ -295,7 +295,8 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	if len(fields) > 0 {
 		groups = append(groups, huh.NewGroup(fields...))
 	}
-	if ans.DatabaseURL == "" {
+	askURL := ans.DatabaseURL == ""
+	if askURL {
 		groups = append(groups, huh.NewGroup(
 			huh.NewInput().Title("External PostgreSQL URL").
 				Description("postgres://user:password@host:5432/db").
@@ -306,6 +307,13 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 		if err := ui.RunForm(groups...); err != nil {
 			return err
 		}
+	}
+	// huh clears a finished form; keep each answer in the scrollback.
+	if !r.cmd.Flags().Changed("node") {
+		r.live.Println(ui.Answered("Main node name", ans.Node))
+	}
+	if askURL {
+		r.live.Println(ui.Answered("External PostgreSQL URL", ui.SecretAnswer))
 	}
 	if ans.Context == "" {
 		ans.Context = ans.Node
@@ -443,11 +451,7 @@ func (r *serverInit) confirm(server string) error {
 // access-changing apply is confirmed from a fresh connection right away:
 // reaching the host again is the proof the new access path works.
 func (r *serverInit) apply(ctx context.Context, session *remoteSession, plan host.Plan) (host.ApplyReport, error) {
-	steps := map[string]string{}
-	for _, step := range plan.Steps {
-		steps[step.ID] = step.Description
-	}
-	progress := &applyProgress{r: r, steps: steps}
+	progress := newApplyProgress(r, plan.Steps)
 	report, err := remoteApply(ctx, session, plan.Confirmation.Token, progress)
 	var fault *contract.Fault
 	if err != nil && errors.As(err, &fault) && fault.Code == contract.ConfirmationRequired {
@@ -475,14 +479,24 @@ func (r *serverInit) apply(ctx context.Context, session *remoteSession, plan hos
 }
 
 // applyProgress reads "bootstrap <step>: <message>" lines from the remote
-// stderr: a new step ends the previous one.
+// stderr and walks the plan in order: every plan step gets a line, also the
+// ones that finish without output or were already done.
 type applyProgress struct {
-	r       *serverInit
-	steps   map[string]string
-	mu      sync.Mutex
-	buf     []byte
-	current string
-	task    *initTask
+	r     *serverInit
+	plan  []host.PlanEntry
+	mu    sync.Mutex
+	buf   []byte
+	next  int // index of the first plan step without a line yet
+	task  *initTask
+	index map[string]int
+}
+
+func newApplyProgress(r *serverInit, plan []host.PlanEntry) *applyProgress {
+	index := make(map[string]int, len(plan))
+	for i, step := range plan {
+		index[step.ID] = i
+	}
+	return &applyProgress{r: r, plan: plan, index: index}
 }
 
 func (p *applyProgress) Write(b []byte) (int, error) {
@@ -509,32 +523,52 @@ func (p *applyProgress) line(line string) {
 	step, message, _ := strings.Cut(rest, ": ")
 	message = p.r.a.secrets.Redact(message)
 	// Sub-step IDs such as host-eregion-api.service-apply belong to the
-	// running plan step; only a plan step starts a new line.
-	if _, planned := p.steps[step]; !planned && p.task != nil {
-		step = p.current
+	// running plan step.
+	if i, planned := p.index[step]; planned && i >= p.next {
+		p.endTask(ui.EndOK)
+		p.flush(i)
+		p.task = p.r.start("step-"+step, p.plan[i].Description)
+		p.next = i + 1
 	}
-	if step != p.current {
-		if p.task != nil {
-			p.task.end(ui.EndOK, "")
-		}
-		title := p.steps[step]
-		if title == "" {
-			title = step
-		}
-		p.current, p.task = step, p.r.start("step-"+step, title)
-	}
-	if message != "" && message != step {
+	if p.task != nil && message != "" && message != step {
 		p.task.detail(message)
+	}
+}
+
+// flush prints a line for each plan step before upto that never reported.
+func (p *applyProgress) flush(upto int) {
+	for ; p.next < upto; p.next++ {
+		step := p.plan[p.next]
+		if step.Complete {
+			p.r.line(ui.EndSkip, step.Description, "already done")
+		} else {
+			p.r.line(ui.EndOK, step.Description, "")
+		}
+	}
+}
+
+func (p *applyProgress) endTask(state string) {
+	if p.task != nil {
+		p.task.end(state, "")
+		p.task = nil
 	}
 }
 
 func (p *applyProgress) close(state string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.task != nil {
-		p.task.end(state, "")
-		p.task = nil
+	p.endTask(state)
+	if state == ui.EndOK {
+		p.flush(len(p.plan))
 	}
+}
+
+func (r *serverInit) line(state, title, detail string) {
+	if r.live != nil {
+		r.live.Line(state, title, detail)
+		return
+	}
+	fmt.Fprintf(r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", title, state, detail)
 }
 
 func (r *serverInit) saveContext(ctx context.Context, remote *host.Remote, cfg host.Config, apiURL, address, knownHosts string) (string, error) {
