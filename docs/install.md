@@ -118,7 +118,8 @@ An unpinned host key or a node-protocol mismatch fails closed.
 - PostgreSQL **17 or newer**, on a dedicated database. Do not point migrations
   at an unrelated application database.
 - Use TLS: `sslmode=verify-full` for any non-loopback host. `sslmode=disable`
-  is accepted only for a literal loopback development host, not `localhost`.
+  is accepted only for a literal loopback address or a tailnet host (`100.64.0.0/10`,
+  `fd7a:115c:a1e0::/48`, or a `*.ts.net` MagicDNS name), not `localhost`.
 - The migration role needs permission to create the eregion and River schema
   objects. Grant that deliberately; a runtime role with fewer privileges needs
   migrations applied by an authorized operator first.

@@ -315,7 +315,9 @@ clean Debian/Ubuntu VM; see G8 in [release criteria](release-criteria.md).
   `GET /readyz` to succeed. A database outage after the services start is visible
   as an unready API; bootstrap does not report success from process liveness
   alone.
-- Database TLS is mandatory except for a literal loopback development host.
+- Database TLS is mandatory except for a literal loopback address or a tailnet host
+  (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, or a `*.ts.net` MagicDNS name), where
+  WireGuard already encrypts the path.
   `sslmode=verify-full` is the tested external configuration; host overrides in
   the URL are rejected.
 

@@ -48,12 +48,16 @@ func TestDatabaseTransportPolicy(t *testing.T) {
 		"postgres://localhost/db?sslmode=disable", "postgres://remote.example/db?sslmode=require",
 		"postgres://remote.example/db?sslmode=disable", "postgres://remote.example/db?sslmode=verify-full&host=127.0.0.1",
 		"postgres://remote.example/db?sslmode=verify-full&sslmode=disable",
+		"postgres://100.128.0.1/db?sslmode=disable", "postgres://evilts.net/db?sslmode=disable",
+		"postgres://thelab.ts.net.example.com/db?sslmode=disable", "postgres://thelab.tailnet.ts.net/db?sslmode=require",
 	} {
 		if _, err := ParseDatabaseConfig(dsn); err == nil {
 			t.Fatalf("unsafe DSN accepted: %s", dsn)
 		}
 	}
-	for _, dsn := range []string{"postgres://127.0.0.1/test?sslmode=disable", "postgres://[::1]/test?sslmode=disable", "postgres://database.example/test?sslmode=verify-full"} {
+	for _, dsn := range []string{"postgres://127.0.0.1/test?sslmode=disable", "postgres://[::1]/test?sslmode=disable", "postgres://database.example/test?sslmode=verify-full",
+		"postgres://100.83.227.89:5433/test?sslmode=disable", "postgres://[fd7a:115c:a1e0::1]/test?sslmode=disable",
+		"postgres://thelab.tailbbed89.ts.net:5433/test?sslmode=disable", "postgres://THELAB.TAILBBED89.TS.NET./test?sslmode=disable"} {
 		config, err := ParseDatabaseConfig(dsn)
 		if err != nil || config.MaxConns != 12 {
 			t.Fatalf("valid config rejected: %v", err)

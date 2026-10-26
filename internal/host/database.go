@@ -3,7 +3,6 @@ package host
 import (
 	"context"
 	"fmt"
-	"net"
 	"net/url"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -93,8 +92,8 @@ func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (Datab
 	if err != nil {
 		return DatabaseState{}, err
 	}
-	if !state.TLS && !parsed.loopback {
-		return DatabaseState{}, contract.NewFault(contract.PreconditionFailed, "the external database connection is not encrypted", "Use sslmode=verify-full with a trusted CA; plaintext is allowed only for a literal loopback development database.")
+	if !state.TLS && !parsed.plaintextAllowed {
+		return DatabaseState{}, contract.NewFault(contract.PreconditionFailed, "the external database connection is not encrypted", "Use sslmode=verify-full with a trusted CA; plaintext is allowed only for loopback and tailnet databases.")
 	}
 	plan, err := controlplane.PlanMigrations(ctx, pool)
 	if err != nil {
@@ -106,8 +105,8 @@ func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (Datab
 }
 
 type databaseURL struct {
-	password string
-	loopback bool
+	password         string
+	plaintextAllowed bool
 }
 
 func parseDatabaseURL(dsn string) (databaseURL, error) {
@@ -119,8 +118,6 @@ func parseDatabaseURL(dsn string) (databaseURL, error) {
 	if parsed.User != nil {
 		out.password, _ = parsed.User.Password()
 	}
-	if ip := net.ParseIP(parsed.Hostname()); ip != nil && ip.IsLoopback() {
-		out.loopback = true
-	}
+	out.plaintextAllowed = controlplane.PlaintextDatabaseHostAllowed(parsed.Hostname())
 	return out, nil
 }

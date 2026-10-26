@@ -9,8 +9,9 @@ import (
 	"encoding/hex"
 	"io"
 	"log/slog"
-	"net"
+	"net/netip"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -89,10 +90,8 @@ func ParseDatabaseConfig(dsn string) (*pgxpool.Config, error) {
 	}
 	q := u.Query()
 	mode := q.Get("sslmode")
-	ip := net.ParseIP(u.Hostname())
-	loopback := ip != nil && ip.IsLoopback()
-	if len(q["sslmode"]) != 1 || (mode != "verify-full" && !(loopback && mode == "disable")) || q.Has("host") || q.Has("port") || q.Has("service") {
-		return nil, contract.NewFault(contract.ValidationFailed, "database TLS policy is unsafe or ambiguous", "Use sslmode=verify-full; sslmode=disable is allowed only for literal loopback development hosts. Host overrides are not supported.")
+	if len(q["sslmode"]) != 1 || (mode != "verify-full" && !(PlaintextDatabaseHostAllowed(u.Hostname()) && mode == "disable")) || q.Has("host") || q.Has("port") || q.Has("service") {
+		return nil, contract.NewFault(contract.ValidationFailed, "database TLS policy is unsafe or ambiguous", "Use sslmode=verify-full; sslmode=disable is allowed only for loopback and tailnet hosts. Host overrides are not supported.")
 	}
 	config, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -294,4 +293,28 @@ func unavailable(causes ...error) *contract.Fault {
 		fault.Cause = causes[0]
 	}
 	return fault
+}
+
+var tailnetPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
+}
+
+// PlaintextDatabaseHostAllowed reports whether a database host may be reached
+// with sslmode=disable: a literal loopback address, or a tailnet address or
+// MagicDNS name, where WireGuard already encrypts the path.
+func PlaintextDatabaseHostAllowed(host string) bool {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		addr = addr.Unmap()
+		if addr.IsLoopback() {
+			return true
+		}
+		for _, prefix := range tailnetPrefixes {
+			if prefix.Contains(addr) {
+				return true
+			}
+		}
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(strings.TrimSuffix(host, ".")), ".ts.net")
 }
