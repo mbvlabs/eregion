@@ -64,6 +64,7 @@ func TestSSHTransportRunsAndReportsStatus(t *testing.T) {
 	if _, err := os.Stat(markerPath(server.config.StateDir, exec)); err != nil {
 		t.Fatalf("the node did not write the effect: %v", err)
 	}
+	server.waitTaskExit(t, exec)
 }
 
 func TestSSHTransportRefusesAnUnpinnedHostKey(t *testing.T) {
@@ -184,6 +185,7 @@ func TestSSHTransportDuplicateRequestsProduceOneEffect(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("duplicate requests produced %d effects", count)
 	}
+	server.waitTaskExit(t, exec)
 }
 
 func TestSSHTransportCancellationDoesNotKillTheNodeTask(t *testing.T) {
@@ -350,6 +352,7 @@ func TestSSHTransportRedactsSecretsInTheStderrTail(t *testing.T) {
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("the stderr tail leaked a secret: %v", err)
 	}
+	server.waitTaskExit(t, exec)
 }
 
 func TestSSHTransportBoundsTheStderrTail(t *testing.T) {
@@ -365,6 +368,7 @@ func TestSSHTransportBoundsTheStderrTail(t *testing.T) {
 	if len(err.Error()) > StderrTailBytes+512 {
 		t.Fatalf("the stderr tail is not bounded: %d bytes", len(err.Error()))
 	}
+	server.waitTaskExit(t, exec)
 }
 
 // TestSSHTransportReportsADeadNodeTaskPromptly proves that a node task that
@@ -404,6 +408,7 @@ func TestSSHTransportReportsADeadNodeTaskPromptly(t *testing.T) {
 	if count := countEffects(t, server.config.StateDir, exec); count != 1 {
 		t.Fatalf("the recovery applied %d effects", count)
 	}
+	server.waitTaskExit(t, exec)
 }
 
 // TestSSHTransportReportsANodeTaskThatNeverStarted proves that a node task

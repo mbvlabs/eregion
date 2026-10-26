@@ -3,12 +3,14 @@ package noded
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -71,6 +73,26 @@ func executionFromID(t *testing.T, id string) engine.Execution {
 	}
 }
 
+// waitForTaskExit waits for the detached task process recorded in the journal
+// to exit. The task writes its log and compacts the journal after the effect
+// marker appears, so returning earlier races the test's TempDir cleanup.
+func waitForTaskExit(t *testing.T, stateDir string, execution engine.Execution) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		journal, err := engine.LoadJournal(engine.JournalPath(stateDir))
+		if err == nil {
+			if task, ok := journal.Tasks[execution.EffectKey()]; ok && task.Owner.PID > 0 {
+				if errors.Is(syscall.Kill(task.Owner.PID, 0), syscall.ESRCH) {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("the detached node task did not exit before cleanup")
+}
+
 // TestSpawnTaskWritesTheRequestBeforeTheProcessExits proves that the request
 // reaches the detached task even when the serving process exits as soon as
 // the channel closes. The request is larger than the request pipe, so a write
@@ -96,13 +118,14 @@ func TestSpawnTaskWritesTheRequestBeforeTheProcessExits(t *testing.T) {
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		if _, err := os.Stat(marker); err == nil {
-			return
+			break
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the detached task never received the request")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	waitForTaskExit(t, config.StateDir, execution)
 }
 
 // TestNodeTaskSpawnHelper starts one detached node task and exits at once,
