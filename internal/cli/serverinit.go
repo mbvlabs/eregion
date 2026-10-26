@@ -154,6 +154,8 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 
 	cfg := host.DefaultConfig(host.RoleMain, ans.Node)
 	cfg.DatabaseURL = r.answers.DatabaseURL
+	// The token is written on the server, read once over SSH, then removed.
+	cfg.OperatorTokenOut = host.DefaultLayout().StateDir + "/operator.handoff"
 	if err := cfg.Validate(); err != nil {
 		return summary, err
 	}
