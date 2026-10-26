@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -27,8 +26,13 @@ func (a *app) domainSpecs() []spec {
 	add := platformMutationMeta("Route a public hostname to an environment", "eregion domain add hello production hello.example.com")
 	add.WhenToUse = []string{"Give an environment a public HTTPS URL. Create the DNS record it shows; Caddy gets the certificate once it resolves."}
 	add.Next = []string{"eregion domain list"}
-	remove := platformDestructiveMeta("Remove a public hostname's route", "eregion domain remove hello production hello.example.com --confirm <token>")
+	remove := platformDestructiveMeta("Remove a public hostname's route", "eregion domain remove hello production hello.example.com --confirm hello.example.com")
+	remove.Confirmation = "target"
 	remove.Next = []string{"eregion domain list"}
+	remove.Examples = []string{
+		"eregion domain remove hello production hello.example.com --dry-run --json",
+		"eregion domain remove hello production hello.example.com --confirm hello.example.com --json",
+	}
 	changeFlags := func(cmd *cobra.Command) {
 		cmd.Flags().Bool("dry-run", false, "Validate with the API and return a plan without accepting an operation")
 		cmd.Flags().String("idempotency-key", "", "Stable submission key; one is generated when empty")
@@ -53,7 +57,7 @@ func (a *app) domainSpecs() []spec {
 			}},
 			{use: "remove <app> <environment> <hostname>", meta: remove, args: cobra.ExactArgs(3), flags: func(cmd *cobra.Command) {
 				changeFlags(cmd)
-				cmd.Flags().String("confirm", "", "Confirmation token from --dry-run")
+				cmd.Flags().String("confirm", "", "Target-naming confirmation token: the hostname being removed")
 			}, run: func(cmd *cobra.Command, args []string) (result, error) {
 				return a.domainRemove(cmd, args)
 			}},
@@ -74,7 +78,8 @@ func (a *app) domainAdd(cmd *cobra.Command, args []string) (result, error) {
 }
 
 func (a *app) domainRemove(cmd *cobra.Command, args []string) (result, error) {
-	input := platform.DomainInput{App: args[0], Environment: args[1], Domain: args[2]}
+	confirm, _ := cmd.Flags().GetString("confirm")
+	input := platform.DomainInput{App: args[0], Environment: args[1], Domain: args[2], Confirm: confirm}
 	return a.domainChange(cmd, platform.KindDomainRemove, input)
 }
 
@@ -95,13 +100,8 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	rawInput := normalized.Canonical
 	if kind == platform.KindDomainRemove && !dryRun {
-		confirm, _ := cmd.Flags().GetString("confirm")
-		token := platformConfirmationToken(kind, target.String(), rawInput)
-		if confirm == "" {
-			return result{}, contract.NewFault(contract.ConfirmationRequired, "--confirm is required to remove a domain", "Run the command with --dry-run and pass the returned confirmation token.")
-		}
-		if subtle.ConstantTimeCompare([]byte(confirm), []byte(token)) != 1 {
-			return result{}, contract.NewFault(contract.PreconditionFailed, "confirmation token does not match this plan", "Run with --dry-run and pass the confirmation token for the exact target and input.")
+		if err := platform.ValidateDomainConfirmation(input.Domain, input.Confirm); err != nil {
+			return result{}, err
 		}
 	}
 	if dryRun {
@@ -110,8 +110,7 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 			return result{}, err
 		}
 		if kind == platform.KindDomainRemove {
-			token := platformConfirmationToken(kind, target.String(), rawInput)
-			preview.data, preview.plain = platformWithConfirmation(preview.data.(json.RawMessage), token)
+			preview.data, preview.plain = platformWithConfirmation(preview.data.(json.RawMessage), input.Domain)
 		} else {
 			records := domainRecords(input.Domain, input.Addresses)
 			preview.plain += "\n" + domainRecordText(input)

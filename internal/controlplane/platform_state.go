@@ -312,6 +312,9 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			if err != nil {
 				return unavailable()
 			}
+			if err := platform.ValidateDomainConfirmation(input.Domain, input.Confirm); err != nil {
+				return err
+			}
 			if primary {
 				return contract.NewFault(contract.PreconditionFailed, "the primary domain cannot be removed",
 					"Add another domain with --primary first, then remove this one.")

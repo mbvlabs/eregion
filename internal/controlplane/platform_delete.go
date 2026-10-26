@@ -4,10 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -143,7 +141,13 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 	}, nil); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if err := w.service.writeRoutesExcluding(ctx, map[platform.EnvironmentID]bool{env.ID: true}); err != nil {
+	// Remove the row-6 domain state first, then let the one serialized route
+	// writer render from the remaining bindings and reload Caddy. There is no
+	// second route file writer for deletion.
+	if err := w.service.deleteDomainRows(ctx, []platform.EnvironmentID{env.ID}); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.syncRoutes(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
@@ -166,10 +170,10 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 		return w.settle(ctx, id, attempt, err)
 	}
 	byNode := map[string]bool{}
-	excluded := map[platform.EnvironmentID]bool{}
+	environmentIDs := make([]platform.EnvironmentID, 0, len(environments))
 	for _, env := range environments {
 		byNode[env.Node] = true
-		excluded[env.ID] = true
+		environmentIDs = append(environmentIDs, env.ID)
 	}
 	nodes := make([]string, 0, len(byNode))
 	for name := range byNode {
@@ -188,7 +192,10 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 			return w.settle(ctx, id, attempt, err)
 		}
 	}
-	if err := w.service.writeRoutesExcluding(ctx, excluded); err != nil {
+	if err := w.service.deleteDomainRows(ctx, environmentIDs); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.syncRoutes(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
@@ -259,56 +266,19 @@ func deleteApplicationRowsTx(ctx context.Context, tx pgx.Tx, app platform.App) e
 	return nil
 }
 
-// writeRoutesExcluding rewrites the Caddy routes file without the named
-// environments, leaving every other app's upstreams untouched, then loads it.
-// It is used before deletion rows are removed so a failed reload leaves the
-// records available for a retry.
-func (s *Service) writeRoutesExcluding(ctx context.Context, excluded map[platform.EnvironmentID]bool) error {
-	rows, err := s.pool.Query(ctx, `SELECT d.name,e.id,coalesce(dep.instances,'[]'::jsonb)
-        FROM eregion_platform_domains d
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        LEFT JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id
-        ORDER BY d.name`)
-	if err != nil {
+// deleteDomainRows removes the row-6 domain state for the environments being
+// deleted. The caller then uses the one serialized route writer (syncRoutes),
+// so deletion does not introduce a second Caddy write path.
+func (s *Service) deleteDomainRows(ctx context.Context, environmentIDs []platform.EnvironmentID) error {
+	if len(environmentIDs) == 0 {
+		return nil
+	}
+	ids := make([]string, len(environmentIDs))
+	for index, id := range environmentIDs {
+		ids[index] = string(id)
+	}
+	if _, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_domains WHERE environment_id = ANY($1)`, ids); err != nil {
 		return unavailable()
-	}
-	routes := []platform.Route{}
-	for rows.Next() {
-		var route platform.Route
-		var environmentID platform.EnvironmentID
-		var rawInstances []byte
-		if err := rows.Scan(&route.Domain, &environmentID, &rawInstances); err != nil {
-			rows.Close()
-			return unavailable()
-		}
-		if excluded[environmentID] {
-			continue
-		}
-		if len(rawInstances) > 0 {
-			var instances []platform.DeploymentInstance
-			if err := json.Unmarshal(rawInstances, &instances); err != nil {
-				rows.Close()
-				return unavailable()
-			}
-			route.Upstreams = platform.WebUpstreams(instances)
-		}
-		routes = append(routes, route)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return unavailable()
-	}
-	previous, err := readCaddyRoutes()
-	if err != nil {
-		return err
-	}
-	if err := writeCaddyRoutes(platform.RenderRoutes(routes)); err != nil {
-		return err
-	}
-	if err := loadCaddyfile(ctx); err != nil {
-		_ = writeCaddyRoutes(previous)
-		_ = loadCaddyfile(context.WithoutCancel(ctx))
-		return err
 	}
 	return nil
 }
@@ -415,14 +385,4 @@ func (s *Service) applicationEnvironments(ctx context.Context, app string) (plat
 		return record, nil, unavailable()
 	}
 	return record, environments, nil
-}
-
-// readCaddyRoutes and writeCaddyRoutes are the small file boundary used by the
-// exclusion rewrite; routes.go keeps the normal reconcile path.
-func readCaddyRoutes() ([]byte, error) {
-	return os.ReadFile(platform.CaddyRoutesPath)
-}
-
-func writeCaddyRoutes(raw []byte) error {
-	return os.WriteFile(platform.CaddyRoutesPath, raw, 0o644) //nolint:gosec // G306: Caddy reads it.
 }

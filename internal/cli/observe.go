@@ -40,11 +40,13 @@ func (a *app) appStatusView(cmd *cobra.Command, app string) (result, error) {
 	}
 	releases := a.readStatusReleases(cmd, app, "")
 	workloads, workloadErr := a.readStatusWorkloads(cmd, app, "")
+	domains, domainsErr := a.readStatusDomains(cmd, app, "")
 	operationsList, operationsErr := a.readStatusOperations(cmd, app, "", 10)
 	observation := platform.AppObservation{App: record, Environments: []platform.EnvironmentObservation{}, Operations: operationsList, OperationsError: operationsErr}
 	for _, environment := range environments {
-		item := platform.BuildEnvironmentObservation(environment, findRelease(releases, environment.ServingRelease), workloads.Containers, nil)
+		item := platform.BuildEnvironmentObservation(environment, findRelease(releases, environment.ServingRelease), workloads.Containers, domains, nil)
 		item.WorkloadError = workloadErr
+		item.DomainsError = domainsErr
 		if workloadErr != "" {
 			markWorkloadUnknown(&item)
 		}
@@ -78,9 +80,11 @@ func (a *app) envStatusView(cmd *cobra.Command, app, environment string) (result
 	}
 	releases := a.readStatusReleases(cmd, app, environment)
 	workloads, workloadErr := a.readStatusWorkloads(cmd, app, environment)
+	domains, domainsErr := a.readStatusDomains(cmd, app, environment)
 	operationsList, operationsErr := a.readStatusOperations(cmd, app, environment, 10)
-	observation := platform.BuildEnvironmentObservation(env, findRelease(releases, env.ServingRelease), workloads.Containers, operationsList)
+	observation := platform.BuildEnvironmentObservation(env, findRelease(releases, env.ServingRelease), workloads.Containers, domains, operationsList)
 	observation.WorkloadError = workloadErr
+	observation.DomainsError = domainsErr
 	observation.OperationsError = operationsErr
 	if workloadErr != "" {
 		markWorkloadUnknown(&observation)
@@ -127,6 +131,22 @@ func (a *app) readStatusWorkloads(cmd *cobra.Command, app, environment string) (
 		return platform.Workloads{}, contract.Classify(err).Message
 	}
 	return workloads, ""
+}
+
+func (a *app) readStatusDomains(cmd *cobra.Command, app, environment string) ([]platform.DomainBinding, string) {
+	filters := urlValues("app", app, "limit", "200")
+	if environment != "" {
+		filters["environment"] = []string{environment}
+	}
+	raw, err := a.platformReadInventoryWith(cmd, "domains", filters)
+	if err != nil {
+		return nil, contract.Classify(err).Message
+	}
+	domains, err := decodeInventoryItems[platform.DomainBinding](raw)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return domains, ""
 }
 
 func (a *app) readStatusOperations(cmd *cobra.Command, app, environment string, limit int) ([]contract.Operation, string) {
@@ -225,7 +245,9 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 	} else {
 		out.WriteString(writeTable([]string{"PROCESS", "KIND", "REPLICA", "STATE", "CONTAINER", "HOST PORT", "SERVING"}, rows))
 	}
-	if len(observation.Domains) > 0 {
+	if observation.DomainsError != "" {
+		fmt.Fprintf(&out, "Domains: unavailable (%s)\n", observation.DomainsError)
+	} else if len(observation.Domains) > 0 {
 		out.WriteString("Domains\n")
 		domainRows := make([][]string, 0, len(observation.Domains))
 		for _, domain := range observation.Domains {
@@ -233,9 +255,19 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 			if domain.Primary {
 				primary = "yes"
 			}
-			domainRows = append(domainRows, []string{domain.Domain, primary, domain.DNS, domain.Route, domain.TLS, domain.Public})
+			ready := "no"
+			if domain.Ready {
+				ready = "yes"
+			}
+			domainRows = append(domainRows, []string{
+				domain.Domain, primary, string(domain.RouteState), string(domain.DNSState),
+				string(domain.CertificateState), string(domain.PublicState), ready,
+			})
+			if message := domainBindingError(domain.DomainBinding); message != "" {
+				domainRows = append(domainRows, []string{"", "", "", "", "", "", message})
+			}
 		}
-		out.WriteString(writeTable([]string{"DOMAIN", "PRIMARY", "DNS", "ROUTE", "TLS", "PUBLIC"}, domainRows))
+		out.WriteString(writeTable([]string{"DOMAIN", "PRIMARY", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY"}, domainRows))
 	}
 	if observation.OperationsError != "" {
 		fmt.Fprintf(&out, "Last operations: unavailable (%s)\n", observation.OperationsError)

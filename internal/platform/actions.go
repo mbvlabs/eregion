@@ -1318,6 +1318,10 @@ type DomainInput struct {
 	Domain      string   `json:"domain"`
 	Primary     bool     `json:"primary,omitempty"`
 	Addresses   []string `json:"addresses,omitempty"`
+	// Confirm names the hostname being removed (MASTER D12). It is required
+	// for platform.domain.remove and validated by the node against the current
+	// binding; it is empty for add and for a dry run.
+	Confirm string `json:"confirm,omitempty"`
 }
 
 func (in *DomainInput) Target() Target {
@@ -1340,6 +1344,12 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 	input.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Domain), "."))
 	if err := ValidateDomain(input.Domain); err != nil {
 		return nil, invalid("domain", err.Error())
+	}
+	if input.Confirm != "" {
+		input.Confirm = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Confirm), "."))
+		if input.Confirm != input.Domain {
+			return nil, invalid("confirm", "The confirmation token must name the hostname shown by --dry-run.")
+		}
 	}
 	addresses := make([]string, 0, len(input.Addresses))
 	seen := map[string]bool{}

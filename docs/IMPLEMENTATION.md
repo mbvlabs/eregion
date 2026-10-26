@@ -79,7 +79,7 @@ bin/eregion help app create --json
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
 | `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. Transitional until the deploy row replaces it. |
 | `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. Transitional until the deploy row replaces it. |
-| `domain add/remove <app> <environment> <hostname> [--primary]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `remove` is plan-bound and refuses the primary. |
+| `domain add/remove <app> <environment> <hostname> [--primary]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `remove` takes `--confirm <hostname>` and refuses the primary. |
 | `secret set/list/archive/export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. |
 | `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
 | `platform inventory`, `ui` | Read-only inventory and the full-screen workspace. The workspace graph still uses the telemetry read adapter for metrics. |
@@ -183,14 +183,15 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
   read credential) now records the build and deployment. Auto-deploy/push and
   the per-environment webhook remain work list row 8.
 - Deletion is deliberate, not SQL cascade alone. `platform.environment.delete`
-  and `platform.app.delete` first remove containers selected by ownership labels
-  and rewrite the Caddy routes without the target, then delete domains,
-  deployments, releases, builds, revisions, change rows, vault secret namespaces
-  and the environment/app rows in that order. A failed container or Caddy step
-  leaves platform rows available for retry. Operations and operation events are
-  never deleted; operation `--app`/`--environment` history still shows the
-  deletion after the platform record is gone. The node validates the
-  target-naming `--confirm` token against the records it loads.
+  and `platform.app.delete` first remove containers selected by ownership labels,
+  delete the row-6 domain state for the target environments, then rewrite the
+  routes through the one serialized writer (`syncRoutes`, one advisory lock) and
+  reload Caddy. Only then are deployments, releases, builds, revisions, change
+  rows, vault secret namespaces and the environment/app rows deleted. A failed
+  container or Caddy step leaves the platform rows available for retry. Operations
+  and operation events are never deleted; operation `--app`/`--environment`
+  history still shows the deletion after the platform record is gone. The node
+  validates the target-naming `--confirm` token against the records it loads.
 - The deleted resources/backup subsystem had no catalog tables in the
   control-plane migrations. DNS records live at the provider; a domain binding
   is not a DNS record.
@@ -390,7 +391,7 @@ All use `POST /v1/operations`, the shared registry and one River job:
 | `platform.deploy` | `env/<app>/<env>` | Optional `release_id` and `ref`. Without a release it resolves the current revision's bound source to an exact commit, builds, records the release digest and deploys it with the current revision. With a release it redeploys that release with the current revision. |
 | `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, then uses that deployment's revision and exact secret revisions. |
 | `platform.restart` | `env/<app>/<env>` | Reapplies the serving release with the current revision through the same blue/green path, so a scaled formation takes effect. |
-| `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary` and `addresses` (the main node's public A/AAAA targets). Removing the primary is refused. |
+| `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary` and `addresses` (the main node's public A/AAAA targets). Removal also requires `confirm` equal to the current hostname; removing the primary is refused. |
 | `platform.environment.delete` | `env/<app>/<env>` | `confirm` equal to `<app>/<environment>`; the worker removes labeled containers and routes before platform rows. |
 | `platform.app.delete` | `app/<app>` | `confirm` equal to `<app>`; every environment is deleted and the app record last. |
 
@@ -451,11 +452,13 @@ Explicit retry creates new work; it does not rewrite a terminal failed record.
 Docker observation (`platform.workloads`). Each desired process replica is shown
 with its container state and dynamic host port; a container from another
 deployment is shown but not marked serving. Docker read failure leaves the
-durable status visible and marks replica state `unknown`. Domain bindings show
-DNS, route, TLS and public response as `unknown` until the domain work observes
-them. `logs` uses `platform.logs` to stream the serving deployment's containers
-as RPC events, filtered by `--process`; it does not read telemetry. The workspace
-metrics graph still uses the telemetry data source.
+durable status visible and marks replica state `unknown`. Domains come from the
+`domains` inventory collection with the recorded route, DNS, certificate and
+public-response state plus the ready flag; a failed domain read is reported
+separately instead of inventing `unknown` per domain. `logs` uses
+`platform.logs` to stream the serving deployment's containers as RPC events,
+filtered by `--process`; it does not read telemetry. The workspace metrics graph
+still uses the telemetry data source.
 
 Domains are changed in the submission transaction, then the worker reads all
 bindings, writes one Caddy site per domain with the serving deployment's web

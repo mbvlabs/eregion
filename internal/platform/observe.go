@@ -63,16 +63,12 @@ type ProcessObservation struct {
 	Replicas        []ReplicaObservation `json:"replicas"`
 }
 
-// DomainStatus keeps desired and observed state separate. DNS, route, TLS and
-// the public response stay unknown until the domain worker observes them; the
-// binding itself is still shown.
-type DomainStatus struct {
-	Domain  string `json:"domain"`
-	Primary bool   `json:"primary"`
-	DNS     string `json:"dns"`
-	Route   string `json:"route"`
-	TLS     string `json:"tls"`
-	Public  string `json:"public"`
+// DomainObservation is one row from the `domains` inventory collection plus
+// the ready flag derived from the same four observations. It keeps the binding,
+// route, DNS, certificate and public response separate.
+type DomainObservation struct {
+	DomainBinding
+	Ready bool `json:"ready"`
 }
 
 // EnvironmentObservation is the status read model. It carries the environment
@@ -83,9 +79,10 @@ type EnvironmentObservation struct {
 	ServingRelease  *Release             `json:"serving_release,omitempty"`
 	Processes       []ProcessObservation `json:"processes"`
 	OtherContainers []ReplicaObservation `json:"other_containers,omitempty"`
-	Domains         []DomainStatus       `json:"domains"`
+	Domains         []DomainObservation  `json:"domains"`
 	Operations      []contract.Operation `json:"operations,omitempty"`
 	WorkloadError   string               `json:"workload_error,omitempty"`
+	DomainsError    string               `json:"domains_error,omitempty"`
 	OperationsError string               `json:"operations_error,omitempty"`
 }
 
@@ -98,11 +95,12 @@ type AppObservation struct {
 	OperationsError string                   `json:"operations_error,omitempty"`
 }
 
-// BuildEnvironmentObservation joins durable desired state with a Docker read.
-func BuildEnvironmentObservation(env Environment, serving *Release, workloads []ContainerObservation, operations []contract.Operation) EnvironmentObservation {
+// BuildEnvironmentObservation joins durable desired state with a Docker read
+// and the row-6 domain inventory.
+func BuildEnvironmentObservation(env Environment, serving *Release, workloads []ContainerObservation, domains []DomainBinding, operations []contract.Operation) EnvironmentObservation {
 	observation := EnvironmentObservation{
 		Environment: env, ServingRelease: serving, Operations: operations,
-		Domains: DomainStatuses(env), Processes: []ProcessObservation{}, OtherContainers: []ReplicaObservation{},
+		Domains: EnvironmentDomains(env, domains), Processes: []ProcessObservation{}, OtherContainers: []ReplicaObservation{},
 	}
 	desired := make(map[string]ProcessSpec, len(env.Processes))
 	for _, process := range env.Processes {
@@ -197,18 +195,18 @@ func containerReplica(env Environment, container ContainerObservation) ReplicaOb
 	}
 }
 
-// DomainStatuses returns the desired bindings with observation fields marked
-// unknown. A later domain observation can replace the unknowns without changing
-// where the binding comes from.
-func DomainStatuses(env Environment) []DomainStatus {
-	domains := append([]string(nil), env.Domains...)
-	sort.Strings(domains)
-	out := make([]DomainStatus, 0, len(domains))
-	for _, domain := range domains {
-		out = append(out, DomainStatus{
-			Domain: domain, Primary: domain == env.PrimaryDomain,
-			DNS: ObservationUnknown, Route: ObservationUnknown, TLS: ObservationUnknown, Public: ObservationUnknown,
-		})
+// EnvironmentDomains selects the inventory rows for one environment and marks
+// each with the same ready rule the domain list uses.
+func EnvironmentDomains(env Environment, domains []DomainBinding) []DomainObservation {
+	out := make([]DomainObservation, 0, len(domains))
+	for _, binding := range domains {
+		if binding.App != "" && binding.App != env.App {
+			continue
+		}
+		if binding.Environment != "" && binding.Environment != env.Name {
+			continue
+		}
+		out = append(out, DomainObservation{DomainBinding: binding, Ready: binding.Ready()})
 	}
 	return out
 }
