@@ -17,9 +17,8 @@ var (
 // and versioned artifacts live below it. Release scripts bake the same value
 // into manifests, and a mismatch fails verification.
 //
-// It is a documented placeholder until the release domain and bucket are
-// configured; publish workflows refuse a variable that differs from it.
-const ReleaseBaseURL = "https://releases.eregion.example"
+// Publish workflows refuse a RELEASE_BASE_URL variable that differs from it.
+const ReleaseBaseURL = "https://eregion.mbvlabs.com"
 
 type Info struct {
 	Version string `json:"version"`

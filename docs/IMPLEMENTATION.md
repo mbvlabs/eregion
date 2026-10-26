@@ -109,7 +109,7 @@ where the work list says they return. `bootstrap …`, `serve`, `worker` and
 ## Release and local upgrade
 
 `internal/buildinfo` carries `Version`, `Commit`, `Channel` and the public
-`ReleaseBaseURL` (currently a documented placeholder). `internal/release`
+`ReleaseBaseURL` (`https://eregion.mbvlabs.com`). `internal/release`
 resolves a channel or version manifest, verifies its sigstore bundle against
 the pinned publish workflow identity, validates the manifest against the
 channel, and caches the platform binary only after its signed SHA256 matches.

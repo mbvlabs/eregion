@@ -96,22 +96,19 @@ final release, and never replaces a final with an alpha, beta or rc. Immutable
 artifacts are never overwritten: an existing `/releases/<version>/` prefix
 fails the run.
 
-## Configuration placeholders
+## Release configuration
 
-`internal/buildinfo.ReleaseBaseURL` is a documented placeholder
-(`https://releases.eregion.example`) until the public release origin exists.
-Both publish workflows refuse to run unless the `EREGION_RELEASE_BASE_URL`
-repository variable exactly equals it. Before the first publish, set:
+Same setup as vaire. `internal/buildinfo.ReleaseBaseURL` is
+`https://eregion.mbvlabs.com`; both publish workflows refuse to run unless the
+`RELEASE_BASE_URL` repository variable equals it exactly. Configure:
 
-- repository variable `EREGION_RELEASE_BASE_URL` to the bucket's public HTTPS
-  origin, and change `ReleaseBaseURL` in the same commit;
-- repository variable `EREGION_RELEASE_BUCKET` to the R2 bucket name (for
-  example the placeholder `eregion-releases`);
+- repository variable `RELEASE_BASE_URL` = `https://eregion.mbvlabs.com`;
+- repository variable `RELEASE_BUCKET` = the R2 bucket served at that origin;
 - environment `edge` and environment `stable` with secrets
-  `EREGION_R2_ENDPOINT`, `EREGION_R2_ACCESS_KEY_ID` and
-  `EREGION_R2_SECRET_ACCESS_KEY`.
+  `R2_ENDPOINT`, `R2_ACCESS_KEY_ID` and
+  `R2_SECRET_ACCESS_KEY`.
 
-No endpoint, account ID, bucket credential or base URL is recorded in this
+No endpoint, account ID or bucket credential is recorded in this
 repository. The stable environment must exist before the first tag. Tags and
 the `1.x` branch are created only when the user authorizes them.
 

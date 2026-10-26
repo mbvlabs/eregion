@@ -26,19 +26,19 @@ jobs:
           cache: true
       - name: Validate release configuration
         env:
-          EREGION_RELEASE_BUCKET: ${{ vars.EREGION_RELEASE_BUCKET }}
-          EREGION_RELEASE_BASE_URL: ${{ vars.EREGION_RELEASE_BASE_URL }}
-          EREGION_R2_ENDPOINT: ${{ secrets.EREGION_R2_ENDPOINT }}
-          EREGION_R2_ACCESS_KEY_ID: ${{ secrets.EREGION_R2_ACCESS_KEY_ID }}
-          EREGION_R2_SECRET_ACCESS_KEY: ${{ secrets.EREGION_R2_SECRET_ACCESS_KEY }}
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          RELEASE_BASE_URL: ${{ vars.RELEASE_BASE_URL }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
-          test -n "${EREGION_RELEASE_BUCKET}" || { echo "EREGION_RELEASE_BUCKET is not configured" >&2; exit 1; }
-          test -n "${EREGION_RELEASE_BASE_URL}" || { echo "EREGION_RELEASE_BASE_URL is not configured" >&2; exit 1; }
-          test -n "${EREGION_R2_ENDPOINT}" || { echo "EREGION_R2_ENDPOINT is not configured" >&2; exit 1; }
-          test -n "${EREGION_R2_ACCESS_KEY_ID}" || { echo "EREGION_R2_ACCESS_KEY_ID is not configured" >&2; exit 1; }
-          test -n "${EREGION_R2_SECRET_ACCESS_KEY}" || { echo "EREGION_R2_SECRET_ACCESS_KEY is not configured" >&2; exit 1; }
-          grep -Fq "const ReleaseBaseURL = \"${EREGION_RELEASE_BASE_URL}\"" internal/buildinfo/buildinfo.go || {
-            echo "EREGION_RELEASE_BASE_URL must equal buildinfo.ReleaseBaseURL" >&2
+          test -n "${RELEASE_BUCKET}" || { echo "RELEASE_BUCKET is not configured" >&2; exit 1; }
+          test -n "${RELEASE_BASE_URL}" || { echo "RELEASE_BASE_URL is not configured" >&2; exit 1; }
+          test -n "${R2_ENDPOINT}" || { echo "R2_ENDPOINT is not configured" >&2; exit 1; }
+          test -n "${R2_ACCESS_KEY_ID}" || { echo "R2_ACCESS_KEY_ID is not configured" >&2; exit 1; }
+          test -n "${R2_SECRET_ACCESS_KEY}" || { echo "R2_SECRET_ACCESS_KEY is not configured" >&2; exit 1; }
+          grep -Fq "const ReleaseBaseURL = \"${RELEASE_BASE_URL}\"" internal/buildinfo/buildinfo.go || {
+            echo "RELEASE_BASE_URL must equal buildinfo.ReleaseBaseURL" >&2
             exit 1
           }
       - name: Verify tagged source
@@ -57,56 +57,56 @@ jobs:
           go build ./...
       - name: Build the major line release
         env:
-          EREGION_RELEASE_BASE_URL: ${{ vars.EREGION_RELEASE_BASE_URL }}
+          RELEASE_BASE_URL: ${{ vars.RELEASE_BASE_URL }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          scripts/build-release.sh "${version}" "stable-${version%%.*}.x" "${EREGION_RELEASE_BASE_URL}"
+          scripts/build-release.sh "${version}" "stable-${version%%.*}.x" "${RELEASE_BASE_URL}"
       - name: Sign and verify the line release
         run: |
           version="${GITHUB_REF_NAME#v}"
           scripts/sign-release.sh "dist/release-stable-${version%%.*}.x"
       - name: Upload the immutable artifacts
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.EREGION_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.EREGION_R2_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
-          EREGION_RELEASE_BUCKET: ${{ vars.EREGION_RELEASE_BUCKET }}
-          EREGION_R2_ENDPOINT: ${{ secrets.EREGION_R2_ENDPOINT }}
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           line="stable-${version%%.*}.x"
           existing="$(aws s3api list-objects-v2 \
-            --bucket "${EREGION_RELEASE_BUCKET}" --prefix "releases/${version}/" --max-keys 1 \
-            --query KeyCount --output text --endpoint-url "${EREGION_R2_ENDPOINT}")"
+            --bucket "${RELEASE_BUCKET}" --prefix "releases/${version}/" --max-keys 1 \
+            --query KeyCount --output text --endpoint-url "${R2_ENDPOINT}")"
           test "${existing}" = 0 || {
             echo "Release ${version} already exists and will not be overwritten" >&2
             exit 1
           }
-          scripts/upload-release.sh "dist/release-stable-${version%%.*}.x" "${line}" "${EREGION_RELEASE_BUCKET}" "${EREGION_R2_ENDPOINT}" artifacts
+          scripts/upload-release.sh "dist/release-stable-${version%%.*}.x" "${line}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" artifacts
       - name: Promote the major line only forward
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.EREGION_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.EREGION_R2_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
-          EREGION_RELEASE_BUCKET: ${{ vars.EREGION_RELEASE_BUCKET }}
-          EREGION_R2_ENDPOINT: ${{ secrets.EREGION_R2_ENDPOINT }}
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           line="${version%%.*}.x"
-          promote="$(go run ./internal/release/cmd/promote --bucket "${EREGION_RELEASE_BUCKET}" --key "${line}/manifest.json" --endpoint "${EREGION_R2_ENDPOINT}" "${version}")"
+          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key "${line}/manifest.json" --endpoint "${R2_ENDPOINT}" "${version}")"
           if [ "${promote}" = yes ]; then
-            scripts/upload-release.sh "dist/release-stable-${line}" "stable-${line}" "${EREGION_RELEASE_BUCKET}" "${EREGION_R2_ENDPOINT}" channel
+            scripts/upload-release.sh "dist/release-stable-${line}" "stable-${line}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
           fi
       - name: Move the root channel when this is the highest version
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.EREGION_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.EREGION_R2_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
-          EREGION_RELEASE_BUCKET: ${{ vars.EREGION_RELEASE_BUCKET }}
-          EREGION_R2_ENDPOINT: ${{ secrets.EREGION_R2_ENDPOINT }}
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          promote="$(go run ./internal/release/cmd/promote --bucket "${EREGION_RELEASE_BUCKET}" --key manifest.json --endpoint "${EREGION_R2_ENDPOINT}" "${version}")"
+          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key manifest.json --endpoint "${R2_ENDPOINT}" "${version}")"
           if [ "${promote}" != yes ]; then
             echo "the root channel stays unchanged: ${version} does not move it"
             exit 0
@@ -114,4 +114,4 @@ jobs:
           release_root="dist/release-stable-${version%%.*}.x"
           cp "${release_root}/${version%%.*}.x/manifest.json" "${release_root}/manifest.json"
           cp "${release_root}/${version%%.*}.x/manifest.json.sigstore.json" "${release_root}/manifest.json.sigstore.json"
-          scripts/upload-release.sh "${release_root}" stable "${EREGION_RELEASE_BUCKET}" "${EREGION_R2_ENDPOINT}" channel
+          scripts/upload-release.sh "${release_root}" stable "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
