@@ -22,8 +22,11 @@ WireGuard and reads NDJSON back. Contexts carry the WireGuard identity and SSH
 key, not a bearer token. The HTTP API remains for the narrow CI/webhook path and
 the public `/readyz` endpoint; the operator CLI does not configure or use it.
 Before the first service call the CLI compares the node build with its own and
-refuses with `node_version_mismatch` unless the node was auto-upgraded. The
-worker-to-node step transport is a separate protocol boundary.
+refuses with `node_version_mismatch` unless the node was auto-upgraded.
+Read-only RPC methods `platform.workloads` and `platform.logs` read Docker
+directly and do not need the control database; `operations.list` uses the shared
+application service. The worker-to-node step transport is a separate protocol
+boundary.
 
 API and worker are supervised separately by `eregion-api.service` and
 `eregion-worker.service`; `serve` can also run workers in-process. Domain intent
@@ -38,7 +41,8 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `cmd/eregion` | One executable entry point, including `node-agent` and hidden `node rpc`. |
 | `internal/cli/tree.go`, `meta.go`, `run.go` | Command catalog, safety metadata, output selection and dispatch. |
 | `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup (preflight, answers/pending, plan/confirm, apply, guarded handoff), first contact, DNS, private access and token-free age handoff/import. |
-| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host RPC and SSH/WireGuard route. |
+| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host RPC, Docker workload/log reads, SSH/WireGuard route. |
+| `internal/cli/observe.go`, `internal/cli/logs.go`, `internal/cli/delete.go`, `internal/cli/operations.go` | Extended app/environment status, container logs over the operator channel, target-confirmed deletion and operation-history filters. |
 | `internal/cli/host.go`, `internal/cli/serverstatus.go`, `internal/cli/nodeunlock.go` | `plan`, `apply`, `doctor`, `ssh`, `server status` and hidden `node unlock-ssh`. |
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
 | `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, webhook and private proxy adapters. |
@@ -48,7 +52,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps (incl. vault keyring and node_exporter), local pending-init state, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
-| `internal/integrations`, `internal/telemetry` | Internal DNS/private-access actions (no operator CLI before v1) and the telemetry read adapters used by `logs` and the workspace graph. |
+| `internal/integrations`, `internal/telemetry` | Internal DNS/private-access actions (no operator CLI before v1) and the telemetry read adapters used by the workspace metrics graph. |
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
 | `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement plus the verified linux/<node arch> binary used by `apply --auto-upgrade-nodes`. |
 
@@ -69,26 +73,31 @@ bin/eregion help app create --json
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). |
 | `context list/show/use/remove`, `context credential add` | Saved contexts, target-confirmed removal with its key files, and local server-auth-file editing. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. |
-| `app create/list/status` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, then adds the domain as a separate `platform.domain.add` action. List/status read inventory. No delete yet. |
-| `env create/update/list/status` | `create` accepts an environment with its first revision; `update` merges source, placement, runtime and process changes into a new immutable revision. List/status include revision, processes and deployability. No delete yet. |
+| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, then adds the domain as a separate `platform.domain.add` action. `status` reads inventory plus Docker container state, domain observations and recent operations. `delete` takes `--confirm <app>` and follows the operation in a terminal unless `--detach` is given. |
+| `env create/update/list/status/delete` | `create` accepts an environment with its first revision; `update` merges source, placement, runtime and process changes into a new immutable revision. `status` includes the serving release, per-process replicas with container state, domains, deployability and recent operations. `delete` takes `--confirm <app>/<environment>`; deleting the last environment deletes the app. |
 | `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. No deploy is queued. |
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
 | `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. Transitional until the deploy row replaces it. |
 | `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. Transitional until the deploy row replaces it. |
 | `domain add/remove <app> <environment> <hostname> [--primary]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `remove` is plan-bound and refuses the primary. |
 | `secret set/list/archive/export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. |
-| `platform inventory`, `logs search/tail`, `ui` | Read-only inventory, telemetry reads and the full-screen workspace. |
-| `operations get/events/follow/cancel` | Durable operation observation and explicit cancellation. |
+| `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
+| `platform inventory`, `ui` | Read-only inventory and the full-screen workspace. The workspace graph still uses the telemetry read adapter for metrics. |
+| `operations list/get/events/follow/cancel` | Actor-scoped operation history filtered by app, environment, state and limit, plus snapshot/event observation and explicit cancellation. |
 | `bootstrap …`, `system migrate`, `serve`, `worker`, `node-agent …` | Current low-level host/service entry points. Not the desired everyday operator workflow. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
-`app create`, `env create`, `process`, `config` and `domain` are the current
-application surface. `platform releases …` and `platform deployments …` are the
-remaining transitional names. The rest of MASTER section 5 (`deploy`, `rollback`,
-`build`, `release`, `app/env delete`, `logs`, `restart`, tokens)
-does not exist yet; renaming is not a substitute for implementing the flow.
-`platform apps …` and `platform environments …` are deleted (pre-v1, no
-aliases). `resources …` and the backup code are deleted (MASTER D19), the Docker
+`app create|status|delete`, `env create|update|status|delete`, `process`,
+`config`, `domain`, `logs` and `operations list` are the current application
+surface. `platform releases …` and `platform deployments …` are the remaining
+transitional names. The rest of MASTER section 5 (`deploy`, `rollback`, `build`,
+`release`, `restart`, tokens) does not exist yet; renaming is not a substitute
+for implementing the flow.
+
+The telemetry-backed `logs search`/`logs tail` commands are deleted; the
+workspace metrics graph keeps the telemetry data source. `platform apps …` and
+`platform environments …` are deleted (pre-v1, no aliases). `resources …` and
+the backup code are deleted (MASTER D19), the Docker
 Compose telemetry stack install is deleted (D5), and `dns …`, `access …`,
 `platform nodes …`, `platform fleet`, `platform submit`, `metrics …` and
 `operations test` are no longer registered (D6, D22, D26). Their internal
@@ -173,9 +182,15 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
 - Deploying from the revision's bound source (including a private HTTPS git
   read credential) now records the build and deployment. Auto-deploy/push and
   the per-environment webhook remain work list row 8.
-- SQL `ON DELETE CASCADE` is not a safe application deletion implementation:
-  release/history references, secret namespaces, containers, Caddy and file-backed
-  state need deliberate handling. There are no app/env delete actions today.
+- Deletion is deliberate, not SQL cascade alone. `platform.environment.delete`
+  and `platform.app.delete` first remove containers selected by ownership labels
+  and rewrite the Caddy routes without the target, then delete domains,
+  deployments, releases, builds, revisions, change rows, vault secret namespaces
+  and the environment/app rows in that order. A failed container or Caddy step
+  leaves platform rows available for retry. Operations and operation events are
+  never deleted; operation `--app`/`--environment` history still shows the
+  deletion after the platform record is gone. The node validates the
+  target-naming `--confirm` token against the records it loads.
 - The deleted resources/backup subsystem had no catalog tables in the
   control-plane migrations. DNS records live at the provider; a domain binding
   is not a DNS record.
@@ -376,6 +391,8 @@ All use `POST /v1/operations`, the shared registry and one River job:
 | `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, then uses that deployment's revision and exact secret revisions. |
 | `platform.restart` | `env/<app>/<env>` | Reapplies the serving release with the current revision through the same blue/green path, so a scaled formation takes effect. |
 | `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary` and `addresses` (the main node's public A/AAAA targets). Removing the primary is refused. |
+| `platform.environment.delete` | `env/<app>/<env>` | `confirm` equal to `<app>/<environment>`; the worker removes labeled containers and routes before platform rows. |
+| `platform.app.delete` | `app/<app>` | `confirm` equal to `<app>`; every environment is deleted and the app record last. |
 
 Names: lowercase letters/digits/hyphens, start with a letter, max 40 characters.
 Unknown input fields fail, including nested revision fields. Refer to
@@ -425,6 +442,16 @@ the candidates and leaves the previous release serving; a failure after the
 switch restores the previous upstreams. Rollback and restart use the same path
 with the recorded revision/secret snapshot and the current revision respectively.
 Explicit retry creates new work; it does not rewrite a terminal failed record.
+
+`app status` and `env status` join durable inventory with a read-only node RPC
+Docker observation (`platform.workloads`). Each desired process replica is shown
+with its container state and dynamic host port; a container from another
+deployment is shown but not marked serving. Docker read failure leaves the
+durable status visible and marks replica state `unknown`. Domain bindings show
+DNS, route, TLS and public response as `unknown` until the domain work observes
+them. `logs` uses `platform.logs` to stream the serving deployment's containers
+as RPC events, filtered by `--process`; it does not read telemetry. The workspace
+metrics graph still uses the telemetry data source.
 
 Domains are changed in the submission transaction, then the worker reads all
 bindings, writes one Caddy site per domain with the serving deployment's web

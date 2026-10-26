@@ -26,6 +26,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/operations"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/upgrade"
@@ -44,6 +45,9 @@ type Backend interface {
 	Ready(context.Context) error
 	SubmitAction(context.Context, string, string, json.RawMessage, string, bool) (json.RawMessage, error)
 	PlatformInventory(context.Context, string, url.Values) (json.RawMessage, error)
+	Workloads(context.Context, string, string) (platform.Workloads, error)
+	Logs(context.Context, platform.LogQuery, func(platform.LogLine) error) (platform.LogResult, error)
+	ListOperations(context.Context, operations.ListQuery) (operations.ListPage, error)
 	SetSecret(context.Context, vault.Namespace, []byte, uint64) (vault.Metadata, error)
 	ArchiveSecret(context.Context, vault.Namespace, uint64) (vault.Metadata, error)
 	GetSecretMetadata(context.Context, vault.Namespace) (vault.Metadata, error)
@@ -647,6 +651,23 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 		data, err := dispatchHostMethod(ctx, request, stdout, registry)
 		return writeRPCResult(stdout, data, err)
 	}
+	// Docker observations and log streaming do not need the control database.
+	if request.Method == methodWorkloads {
+		var params rpcWorkloadParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return writeRPCResult(stdout, nil, err)
+		}
+		data, err := observeNodeWorkloads(ctx, params)
+		return writeRPCResult(stdout, data, err)
+	}
+	if request.Method == methodLogs {
+		var params rpcLogParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return writeRPCResult(stdout, nil, err)
+		}
+		data, err := streamNodeLogs(ctx, params, stdout, registry)
+		return writeRPCResult(stdout, data, err)
+	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	app, closeRuntime, err := openNodeApp(ctx, logger, registry)
@@ -787,6 +808,13 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, contract.NewFault(contract.InputRequired, "inventory collection is required", "Use summary, nodes, apps, environments, releases, deployments, or changes.")
 		}
 		return app.Inventory(ctx, actor, query)
+	case methodOperationsList:
+		var params rpcOperationsListParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		query := operations.ListQuery{App: params.App, Environment: params.Environment, State: params.State, Limit: params.Limit}
+		return app.ListOperations(ctx, actor, query)
 	case methodSecretSet:
 		var params rpcSecretParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {

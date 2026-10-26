@@ -81,7 +81,7 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.settle(ctx, op.ID, attempt, err)
 	}
 
-	releaseLock, err := w.service.lockTarget(ctx, normalized.Target.String())
+	releaseLock, err := w.service.lockPlatformTargets(ctx, normalized)
 	if err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -117,6 +117,8 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runDeployment(ctx, op.ID, attempt, normalized)
 	case platform.KindDomainAdd, platform.KindDomainRemove:
 		return w.runDomain(ctx, op.ID, attempt, normalized)
+	case platform.KindAppDelete, platform.KindEnvironmentDelete:
+		return w.runDelete(ctx, op.ID, attempt, normalized)
 	default:
 		return w.settle(ctx, op.ID, attempt, contract.NewFault(contract.Internal, "platform action has no worker path", "This is a binary/registration mismatch; do not resubmit accepted work."))
 	}
@@ -767,6 +769,40 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 			return s.failReconciledPlatform(ctx, op, err.Error(), contract.Unavailable)
 		}
 		return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+	case platform.KindAppDelete:
+		var raw []byte
+		if err := s.pool.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {
+			return unavailable()
+		}
+		normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
+		if err != nil {
+			return err
+		}
+		input := normalized.Input.(*platform.AppDeleteInput)
+		if _, _, err := s.applicationEnvironments(ctx, input.App); err != nil {
+			if contract.Classify(err).Code == contract.NotFound {
+				return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+			}
+			return err
+		}
+		return s.failReconciledPlatform(ctx, op, "application deletion ended before the platform rows were removed", contract.Unavailable)
+	case platform.KindEnvironmentDelete:
+		var raw []byte
+		if err := s.pool.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {
+			return unavailable()
+		}
+		normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
+		if err != nil {
+			return err
+		}
+		input := normalized.Input.(*platform.EnvironmentDeleteInput)
+		if _, err := s.environment(ctx, input.App, input.Environment); err != nil {
+			if contract.Classify(err).Code == contract.NotFound {
+				return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+			}
+			return err
+		}
+		return s.failReconciledPlatform(ctx, op, "environment deletion ended before the platform rows were removed", contract.Unavailable)
 	case platform.KindAppCreate, platform.KindEnvironmentCreate, platform.KindEnvironmentUpdate,
 		platform.KindProcessScale, platform.KindConfigSet, platform.KindConfigUnset,
 		platform.KindEnvironmentSecretAttach, platform.KindNodeRegister:

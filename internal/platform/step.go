@@ -56,6 +56,7 @@ func StepFamilies() []Family {
 		{Match: healthStepPattern.MatchString, Build: buildHealthStep},
 		{Match: packStepPattern.MatchString, Build: buildPackStep},
 		{Match: buildStopStepPattern.MatchString, Build: buildBuildStopStep},
+		{Match: deleteStepPattern.MatchString, Build: buildDeleteStep},
 	}
 }
 

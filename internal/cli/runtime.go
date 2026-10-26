@@ -104,6 +104,7 @@ func (a *app) runtimeSpecs() []spec {
 		}},
 		{use: "operations", meta: readMeta("Inspect durable operations", []string{"Discover authenticated operation observation and cancellation commands."}, []string{"eregion help operations --json"}), flags: func(cmd *cobra.Command) {
 		}, run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil }, children: []spec{
+			a.operationsListSpec(),
 			{use: "follow <operation_id>", meta: followMeta, args: oneID, flags: followFlags, run: a.follow},
 			{use: "get <operation_id>", meta: operationMeta("Read the authoritative operation snapshot", "eregion operations get op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json"), args: oneID, run: func(cmd *cobra.Command, args []string) (result, error) {
 				client, err := a.client(cmd)

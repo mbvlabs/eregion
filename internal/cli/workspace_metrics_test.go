@@ -10,6 +10,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func clearTelemetryEnvironment(t *testing.T) {
+	t.Helper()
+	for _, name := range telemetryEnvironment {
+		t.Setenv(name, "")
+	}
+}
+
 type fakeMetricsSource struct {
 	logs    telemetry.LogResult
 	metrics telemetry.MetricResult

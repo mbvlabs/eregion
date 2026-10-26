@@ -85,6 +85,7 @@ func (a *app) envSpecs() []spec {
 					return a.envStatus(cmd, args[0], args[1])
 				},
 			},
+			a.envDeleteSpec(),
 		},
 	}}
 }
@@ -503,9 +504,5 @@ func (a *app) envList(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 func (a *app) envStatus(cmd *cobra.Command, app, environment string) (result, error) {
-	env, raw, err := a.readEnvironment(cmd, app, environment)
-	if err != nil {
-		return result{}, err
-	}
-	return result{data: raw, plain: writeEnvironmentStatus(env)}, nil
+	return a.envStatusView(cmd, app, environment)
 }

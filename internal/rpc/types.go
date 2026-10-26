@@ -72,10 +72,23 @@ type Event struct {
 	Event  EventBody `json:"event"`
 }
 
-// EventBody is a transport-neutral progress message.
+// EventBody is a transport-neutral progress message. Log carries one
+// container-log line when Kind is "log"; Message remains the redacted plain
+// text for ordinary progress events.
 type EventBody struct {
-	Kind    string `json:"kind,omitempty"`
-	Message string `json:"message,omitempty"`
+	Kind    string   `json:"kind,omitempty"`
+	Message string   `json:"message,omitempty"`
+	Log     *LogLine `json:"log,omitempty"`
+}
+
+// LogLine is one container-log line streamed by the node before the final RPC
+// result. It never carries a configured secret value.
+type LogLine struct {
+	Process   string `json:"process,omitempty"`
+	Replica   string `json:"replica,omitempty"`
+	Container string `json:"container,omitempty"`
+	Stream    string `json:"stream,omitempty"`
+	Message   string `json:"message"`
 }
 
 // Result is the final NDJSON line. It is written exactly once.

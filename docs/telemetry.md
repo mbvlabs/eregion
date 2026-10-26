@@ -18,19 +18,17 @@ gateways and its narrow `telemetry-*` node steps) is deleted: "never Compose"
 or inventory collection is registered, and no extension receives a node
 transport for telemetry.
 
-What remains is the read side used by `logs search`/`logs tail` and the
-workspace graph:
+What remains is the read side used by the workspace metrics graph:
 
 - `internal/telemetry/datasource.go` defines the bounded query/result types and
   the honest `ok`/`no_data`/`stale`/`absent`/`error` states.
 - `internal/telemetry/datasource_http.go` reads an already-configured private
   metrics/logs backend over HTTP. It has no install, render or Compose path.
-- `internal/cli/logs.go` is the only operator command that reads logs. A later
-  node_exporter/Grafana design can reuse these adapters; `metrics …` is not an
-  operator command in the alpha.
+- `internal/cli/workspace.go` uses the adapter for workspace metrics. `logs`
+  reads container logs over the operator channel and does not use this backend.
 
-Reads currently access configured backend URLs, not PostgreSQL and not a
-finished private node-command abstraction.
+Reads currently access configured backend URLs for workspace metrics, not
+PostgreSQL and not a finished private node-command abstraction.
 
 URL configuration: `EREGION_TELEMETRY_URL`, `_LOGS_URL`, `_METRICS_URL` (with
 matching CLI flags). Protected read credentials: `EREGION_TELEMETRY_LOGS_TOKEN_FILE`
@@ -38,11 +36,11 @@ and `_METRICS_TOKEN_FILE`; read tokens differ from ingest credentials. Environme
 token values also remain in the current adapter. Align access through the chosen
 private operator channel rather than making private backend ports public.
 
-Search queries return JSON envelopes; tail supports NDJSON log records and a
-final result (`--json` also selects its streaming form). Results identify source,
-unit/window/timestamp and distinguish absent, no-data, stale and unavailable.
-None may be rendered as fabricated zero/healthy data. Inspect current help for
-exact filters and output behavior.
+Metric queries return bounded series with source, unit/window/timestamp and
+distinguish absent, no-data, stale and unavailable. None may be rendered as
+fabricated zero/healthy data. Container logs are no longer a telemetry read:
+`logs` streams the serving deployment's Docker containers over node RPC and
+prefixes each line with process/replica.
 
 Source/unit tests do not qualify a real telemetry VM, live ingestion, Grafana
 alert evaluation, external vendor TLS/auth or retention. Record such runs in

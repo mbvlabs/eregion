@@ -259,6 +259,8 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindRestart, Summary: "Reapply the serving release with the current revision", Normalize: normalizeRestart})
 	r.registerBuiltin(Definition{Kind: KindDomainAdd, Summary: "Route a public hostname to an environment through Caddy", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindDomainRemove, Summary: "Remove a public hostname's route", Normalize: normalizeDomain})
+	r.registerBuiltin(Definition{Kind: KindAppDelete, Summary: "Delete an application and every environment it owns", Normalize: normalizeAppDelete})
+	r.registerBuiltin(Definition{Kind: KindEnvironmentDelete, Summary: "Delete an environment after workload cleanup", Normalize: normalizeEnvironmentDelete})
 }
 
 func normalizeAppCreate(target Target, raw json.RawMessage) (ActionInput, error) {

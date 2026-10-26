@@ -131,6 +131,22 @@ func ParseInventoryQueryValues(filters map[string][]string) (platform.InventoryQ
 	return parseInventoryQuery(url.Values(filters).Encode())
 }
 
+// operationListService is implemented by a control-plane service that can read
+// bounded operation history. It is optional so existing test doubles keep
+// compiling and a missing implementation fails closed.
+type operationListService interface {
+	ListOperations(context.Context, contract.Actor, operations.ListQuery) (operations.ListPage, error)
+}
+
+// ListOperations reads actor-scoped operation history.
+func (s AppService) ListOperations(ctx context.Context, actor contract.Actor, query operations.ListQuery) (operations.ListPage, error) {
+	service, ok := s.Operations.(operationListService)
+	if !ok {
+		return operations.ListPage{}, contract.NewFault(contract.Unavailable, "operation history is not configured", "Use a control-plane service with durable operation state.")
+	}
+	return service.ListOperations(ctx, actor, query)
+}
+
 // Inventory reads one bounded inventory collection.
 func (s AppService) Inventory(ctx context.Context, actor contract.Actor, query platform.InventoryQuery) (platform.Inventory, error) {
 	service, ok := s.Operations.(platformInventoryService)

@@ -131,6 +131,10 @@ func platformAcceptedMessage(kind string) string {
 		return "Node reconciliation accepted durably."
 	case platform.KindDomainAdd, platform.KindDomainRemove:
 		return "Domain change accepted durably; the worker rewrites the Caddy routes."
+	case platform.KindEnvironmentDelete:
+		return "Environment deletion accepted durably; containers and routes are removed before platform state."
+	case platform.KindAppDelete:
+		return "Application deletion accepted durably; every environment's containers and routes are removed before platform state."
 	default:
 		return "Platform action accepted durably."
 	}
@@ -522,6 +526,27 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		if err := s.prepareDeploymentTx(ctx, tx, id, env, release.ID, platform.ActionRestart, env.RevisionID, env.ServingDeploymentID, nil); err != nil {
+			return err
+		}
+	case *platform.AppDeleteInput:
+		if _, err := appByNameTx(ctx, tx, input.App); err != nil {
+			return err
+		}
+		if err := platform.ValidateDeleteConfirmation(input.Target(), input.Confirm); err != nil {
+			return err
+		}
+		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, input.App, ""); err != nil {
+			return err
+		}
+	case *platform.EnvironmentDeleteInput:
+		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
+		if err != nil {
+			return err
+		}
+		if err := platform.ValidateDeleteConfirmation(input.Target(), input.Confirm); err != nil {
+			return err
+		}
+		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, env.App, env.Name); err != nil {
 			return err
 		}
 	case *platform.NodeCheckInput:
@@ -1769,6 +1794,8 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	case *platform.NodeReconcileInput:
 		preview.Steps = []string{"converge role directories", "generate node WireGuard key", "render peer configuration", "apply peers"}
 		preview.Summary = "Converge host configuration and WireGuard peers on node " + input.Node + "; rerunning changes nothing when the node already matches."
+	case *platform.AppDeleteInput, *platform.EnvironmentDeleteInput:
+		return s.deletionPreview(ctx, normalized)
 	default:
 		if preview.Summary == "" {
 			preview.Summary = "Execute registered platform action " + normalized.Kind + "."

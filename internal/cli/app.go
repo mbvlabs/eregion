@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -73,6 +72,7 @@ func (a *app) appSpecs() []spec {
 					return a.appStatus(cmd, args[0])
 				},
 			},
+			a.appDeleteSpec(),
 		},
 	}}
 }
@@ -210,48 +210,7 @@ func (a *app) appList(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 func (a *app) appStatus(cmd *cobra.Command, app string) (result, error) {
-	if err := platform.ValidateName(app); err != nil {
-		return result{}, err
-	}
-	appRaw, err := a.platformReadInventoryWith(cmd, "apps", urlValues("app", app, "limit", "1"))
-	if err != nil {
-		return result{}, err
-	}
-	appItem, err := platformSelectItem(appRaw, app)
-	if err != nil {
-		return result{}, err
-	}
-	var record platform.App
-	if json.Unmarshal(appItem, &record) != nil || record.Name != app {
-		return result{}, invalidNodeData("application")
-	}
-	envRaw, err := a.platformReadInventoryWith(cmd, "environments", urlValues("app", app, "limit", "200"))
-	if err != nil {
-		return result{}, err
-	}
-	environments, err := decodeInventoryItems[platform.Environment](envRaw)
-	if err != nil {
-		return result{}, err
-	}
-	data, err := json.Marshal(map[string]json.RawMessage{"app": appItem, "environments": envRaw})
-	if err != nil {
-		return result{}, contract.NewFault(contract.Internal, "could not encode the application view", "Report the command and binary version.")
-	}
-	var plain strings.Builder
-	fmt.Fprintf(&plain, "App %s (%s)\n", record.Name, record.ID)
-	if len(environments) == 0 {
-		plain.WriteString("No environments. Add one with eregion env create.\n")
-		return result{data: data, plain: plain.String()}, nil
-	}
-	rows := make([][]string, 0, len(environments))
-	for _, environment := range environments {
-		rows = append(rows, []string{
-			environment.Name, environment.Node, revisionLabel(environment), processesLabel(environment),
-			boolLabel(environment.Deployability.Deployable), strings.Join(environment.Deployability.Missing, ","),
-		})
-	}
-	plain.WriteString(writeTable([]string{"ENVIRONMENT", "NODE", "REVISION", "PROCESSES", "DEPLOYABLE", "MISSING"}, rows))
-	return result{data: data, plain: plain.String()}, nil
+	return a.appStatusView(cmd, app)
 }
 
 func revisionLabel(environment platform.Environment) string {
