@@ -179,11 +179,12 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	// Pin the host key seen through the tunnel when it matches the record.
 	if !hostKeyPinned(knownHosts, route.Address) {
-		key, err := probeOverWireGuard(cmd.Context(), route)
+		want := get("Main node", "SSH host key")
+		keyType, _, _ := strings.Cut(want, " ")
+		key, err := probeOverWireGuard(cmd.Context(), route, keyType)
 		if err != nil {
 			return result{}, contract.NewFault(contract.Unavailable, "the node does not answer over WireGuard", err.Error())
 		}
-		want := get("Main node", "SSH host key")
 		if got := key.Type() + " " + ssh.FingerprintSHA256(key); got != want {
 			return result{}, contract.NewFault(contract.PreconditionFailed, "the node's host key "+got+" does not match the record", "Do not continue until the server is checked.")
 		}
@@ -216,8 +217,9 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	return result{data: data, plain: "logged in to " + name}, nil
 }
 
-// probeOverWireGuard reads the node's SSH host key through the tunnel.
-func probeOverWireGuard(ctx context.Context, route *host.ContextSSH) (ssh.PublicKey, error) {
+// probeOverWireGuard reads the node's SSH host key of keyType through the
+// tunnel; the node offers several types and the record names one.
+func probeOverWireGuard(ctx context.Context, route *host.ContextSSH, keyType string) (ssh.PublicKey, error) {
 	dial, err := wireGuardDial(route.WireGuard)
 	if err != nil {
 		return nil, err
@@ -231,7 +233,8 @@ func probeOverWireGuard(ctx context.Context, route *host.ContextSSH) (ssh.Public
 	defer conn.Close()
 	var key ssh.PublicKey
 	_, _, _, _ = ssh.NewClientConn(conn, route.Address, &ssh.ClientConfig{
-		User: "probe",
+		User:              "probe",
+		HostKeyAlgorithms: hostKeyAlgorithms(keyType),
 		HostKeyCallback: func(_ string, _ net.Addr, k ssh.PublicKey) error {
 			key = k
 			return fmt.Errorf("probed")
@@ -241,4 +244,13 @@ func probeOverWireGuard(ctx context.Context, route *host.ContextSSH) (ssh.Public
 		return nil, fmt.Errorf("no host key from %s", route.Address)
 	}
 	return key, nil
+}
+
+// hostKeyAlgorithms are the algorithms that make the server present a key of
+// keyType (an ssh-rsa key is signed with rsa-sha2-*).
+func hostKeyAlgorithms(keyType string) []string {
+	if keyType == ssh.KeyAlgoRSA {
+		return []string{ssh.KeyAlgoRSASHA512, ssh.KeyAlgoRSASHA256, ssh.KeyAlgoRSA}
+	}
+	return []string{keyType}
 }
