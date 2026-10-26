@@ -30,7 +30,7 @@ func (a *app) serverSpecs() []spec {
 		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --yes --accept-new-host-key --json"})
 	parent.Platforms = []string{"linux"}
 	meta := parent
-	meta.Summary = "Set up a fresh server as an eregion control plane"
+	meta.Summary = "Set up a fresh server as the main node (control plane)"
 	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass --host, --yes and a host key decision; every question has a flag."}
 	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
 	meta.InputFlags = []string{"host", "identity", "node", "database-url-file", "context-name", "host-key-fingerprint", "accept-new-host-key", "yes"}
@@ -47,7 +47,7 @@ func (a *app) serverSpecs() []spec {
 				f := cmd.Flags()
 				f.String("host", "", "Server to set up: user@host or user@host:port")
 				f.String("identity", "", "SSH private key; default: ssh-agent and ~/.ssh keys")
-				f.String("node", "", "Node name (default main)")
+				f.String("node", "", "Main node name (default main)")
 				f.String("database-url-file", "", "External PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
 				f.String("context-name", "", "Local context name (default: the node name)")
 				f.String("host-key-fingerprint", "", "Expected SHA256 host key fingerprint")
@@ -274,7 +274,7 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	}
 	var fields []huh.Field
 	if !r.cmd.Flags().Changed("node") {
-		fields = append(fields, huh.NewInput().Title("Node name").Description("How this server is named in eregion.").Value(&ans.Node).Validate(nonEmpty))
+		fields = append(fields, huh.NewInput().Title("Main node name").Description("This server becomes the main node: control plane, API, workers and builds. Extra nodes are added later with eregion platform nodes enroll.").Value(&ans.Node).Validate(nonEmpty))
 	}
 	if !r.cmd.Flags().Changed("context-name") {
 		ans.Context = ""
@@ -298,7 +298,7 @@ func (r *serverInit) interview(ans *serverInitAnswers) error {
 	if ans.Context == "" {
 		ans.Context = ans.Node
 	}
-	r.live.Println(ui.Note("node " + ans.Node + " · external PostgreSQL · context " + ans.Context))
+	r.live.Println(ui.Note("main node " + ans.Node + " · external PostgreSQL · context " + ans.Context))
 	return nil
 }
 
@@ -403,7 +403,7 @@ func (r *serverInit) showPlan(plan host.Plan) {
 		fmt.Fprintln(r.cmd.ErrOrStderr(), "plan:\n"+body)
 		return
 	}
-	r.live.Println(ui.PanelFit("Plan for "+plan.Node+" on "+plan.Platform.String(), body, r.live.Width()))
+	r.live.Println(ui.PanelFit("Plan for main node "+plan.Node+" on "+plan.Platform.String(), body, r.live.Width()))
 }
 
 func (r *serverInit) confirm(server string) error {
@@ -413,7 +413,7 @@ func (r *serverInit) confirm(server string) error {
 	if !r.interactive {
 		return contract.NewFault(contract.ConfirmationRequired, "server init needs confirmation", "Review the plan with --dry-run, then pass --yes.")
 	}
-	ok, err := ui.YesNoDefault("Set up "+server+" now?", "Installs packages, services and the eregion control plane.", true)
+	ok, err := ui.YesNoDefault("Set up "+server+" as the main node now?", "Installs packages, services and the eregion control plane.", true)
 	if err != nil {
 		return err
 	}
@@ -541,7 +541,7 @@ func (r *serverInit) finish(s serverInitSummary) {
 		return
 	}
 	r.live.Println("")
-	r.live.Println(ui.Card("Server "+s.Node+" is ready", [][2]string{
+	r.live.Println(ui.Card("Main node "+s.Node+" is ready", [][2]string{
 		{"server", s.Server},
 		{"platform", s.Platform},
 		{"database", "external PostgreSQL"},
