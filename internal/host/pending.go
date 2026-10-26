@@ -65,8 +65,12 @@ func PendingRoot() (string, error) {
 	return filepath.Join(filepath.Dir(contexts), "pending"), nil
 }
 
-// PendingDir is pending/<server>.
+// PendingDir is pending/<server>. The name is validated here so every caller
+// joins only a plain server name, never a path.
 func PendingDir(name string) (string, error) {
+	if !contextNamePattern.MatchString(name) {
+		return "", invalidPendingName()
+	}
 	root, err := PendingRoot()
 	if err != nil {
 		return "", err

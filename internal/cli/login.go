@@ -17,7 +17,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/transport"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/term"
 )
 
 // loginSpecs is `eregion login`, as vaire login: decrypt the transfer bundle
@@ -87,7 +86,7 @@ func (h handoffRecord) field(prefix, label string) string {
 func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	path, _ := cmd.Flags().GetString("file")
 	passFile, _ := cmd.Flags().GetString("passphrase-file")
-	interactive := term.IsTerminal(int(os.Stdin.Fd())) //nolint:gosec // G115: file descriptors fit in int.
+	interactive := humanAtTerminal(cmd)
 	var armored []byte
 	var err error
 	if path != "" {
@@ -130,8 +129,12 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	name := get("Main node", "Context")
 	sshKey := get("Operator", "SSH private key")
 	wgKey := get("Operator", "WireGuard private key")
+	wireGuardAddress := get("Main node", "WireGuard address")
+	adminUser := get("Operator", "Admin user")
 	required := map[string]string{
 		"context": name, "SSH private key": sshKey, "WireGuard private key": wgKey,
+		"WireGuard address":    wireGuardAddress,
+		"admin user":           adminUser,
 		"WireGuard endpoint":   get("Main node", "WireGuard endpoint"),
 		"WireGuard public key": get("Main node", "WireGuard public key"),
 		"SSH host key":         get("Main node", "SSH host key"),
@@ -167,11 +170,11 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	route := &host.ContextSSH{
-		Address: get("Main node", "WireGuard address") + ":22", User: get("Operator", "Admin user"),
+		Address: net.JoinHostPort(wireGuardAddress, "22"), User: adminUser,
 		Identity: sshPath, KnownHosts: knownHosts,
 		WireGuard: &host.ContextWireGuard{
 			PrivateKeyFile: wgPath, Address: get("Operator", "WireGuard address"),
-			NodeAddress: get("Main node", "WireGuard address"), NodePublicKey: get("Main node", "WireGuard public key"),
+			NodeAddress: wireGuardAddress, NodePublicKey: get("Main node", "WireGuard public key"),
 			Endpoint: get("Main node", "WireGuard endpoint"),
 		},
 	}

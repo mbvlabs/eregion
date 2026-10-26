@@ -35,17 +35,27 @@ func publicIPv4(ctx context.Context, target string) (string, error) {
 // askDNS shows the A record and, in a terminal, waits for 'confirmed', so the
 // record propagates while the host is set up (vaire D10).
 func (r *serverInit) askDNS() error {
+	if r.dnsShown {
+		return nil
+	}
+	ready := boolFlag(r.cmd, "dns-ready") || dryRun(r.cmd)
 	name := r.answers.hostname()
 	body := strings.Join(append(hostRecordLines(hostDNSRecords(name, r.publicIPv4, "")),
 		"",
 		"Create it at your DNS provider, DNS only (no proxy).",
 		"eregion checks it after setting up the host; Caddy then gets the certificate."), "\n")
 	if r.live == nil {
-		r.note("create the DNS record: A " + name + " " + r.publicIPv4)
+		if ready {
+			r.note("treating the DNS record as created: A " + name + " " + r.publicIPv4)
+		} else {
+			r.note("create the DNS record: A " + name + " " + r.publicIPv4)
+		}
+		r.dnsShown = true
 		return nil
 	}
 	r.live.Println(ui.PanelFit("Create this DNS record", body, r.live.Width()))
-	if ready, _ := r.cmd.Flags().GetBool("dns-ready"); ready || dryRun(r.cmd) {
+	r.dnsShown = true
+	if ready {
 		return nil
 	}
 	return ui.TypeWord("Type 'confirmed' once the A record exists", "", "confirmed")

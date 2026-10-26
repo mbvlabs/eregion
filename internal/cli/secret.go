@@ -43,6 +43,7 @@ func (a *app) secretSpecs() []spec {
 
 	exportMeta := secretMeta("Write one secret value to an explicitly protected destination file", "eregion secret export --app api --environment production --name DATABASE_URL --dest /run/secrets/database-url --json")
 	exportMeta.Mutating = true
+	exportMeta.Prompts = true
 	exportMeta.InputFlags = []string{"dest"}
 	exportMeta.DryRunReason = "Export writes only to the explicitly named destination; values are never printed, so there is no preview output."
 

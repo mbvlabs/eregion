@@ -43,7 +43,7 @@ const (
 func (a *app) serverSpecs() []spec {
 	parent := readMeta("Set up and manage eregion servers",
 		[]string{"Set up a fresh Debian 13 or Ubuntu 26.04 server as an eregion main node. The operator CLI runs on Linux or macOS; the node receives a matching linux binary."},
-		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --hostname app.example.com --database-url-file /root/eregion-db.url --accept-new-host-key --secrets-out ./prod-secrets.txt --confirm prod --json"})
+		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --hostname app.example.com --database-url-file /root/eregion-db.url --context-name prod --accept-new-host-key --secrets-out ./prod-secrets.txt --confirm prod --json"})
 	parent.Platforms = []string{"linux", "darwin"}
 	meta := parent
 	meta.Summary = "Set up a fresh server as the main node (control plane)"
@@ -62,7 +62,7 @@ func (a *app) serverSpecs() []spec {
 			meta: meta,
 			flags: func(cmd *cobra.Command) {
 				f := cmd.Flags()
-				f.String("host", "", "Server to set up: user@host or user@host:port, as root")
+				f.String("host", "", "Server to set up: user@host, as root (SSH port 22)")
 				f.String("identity", "", "SSH private key for first contact; default: ssh-agent and ~/.ssh keys")
 				f.Bool("password-stdin", false, "Read the root SSH password from the first line of standard input")
 				f.String("node", "", "Main node name (default main)")
@@ -135,6 +135,7 @@ type serverInit struct {
 	remote       *host.Remote
 	auth         []ssh.AuthMethod
 	dryRun       bool
+	dnsShown     bool
 	session      *remoteSession
 	hostPlan     host.Plan
 	operationID  string
@@ -216,7 +217,7 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 			return summary, err
 		}
 		summary.DryRun, summary.Platform = true, r.platform.String()
-		for _, step := range r.hostPlan.Steps {
+		for _, step := range r.planRows(r.hostPlan) {
 			summary.Steps = append(summary.Steps, step.Description)
 		}
 		return summary, nil
@@ -250,6 +251,13 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 			return err
 		}
 		if err := r.mark(phaseContact); err != nil {
+			return err
+		}
+	}
+	// A resume skips first contact, so show the DNS record here unless this run
+	// already did. --dns-ready treats it as created and never waits.
+	if !r.dnsShown {
+		if err := r.askDNS(); err != nil {
 			return err
 		}
 	}
@@ -290,6 +298,7 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		r.showResumePlan()
 	}
 	if err := r.confirm(); err != nil {
+		r.removeSession(ctx)
 		return err
 	}
 	if !r.pending.Done(phaseHost) {
@@ -515,7 +524,7 @@ func (r *serverInit) collect() error {
 		if !r.interactive {
 			return contract.NewFault(contract.InputRequired, "--host is required without a terminal", "Pass --host root@203.0.113.10.")
 		}
-		v, err := ui.Input("Server to set up", "user@host or user@host:port, as root", "")
+		v, err := ui.Input("Server to set up", "user@host, as root (SSH port 22)", "")
 		if err != nil {
 			return err
 		}
@@ -607,6 +616,9 @@ func (r *serverInit) validate() error {
 	ans := r.answers
 	if ans.Host == "" || ans.User == "" {
 		return contract.NewFault(contract.InputRequired, "the server must be user@host", "Pass --host root@203.0.113.10.")
+	}
+	if ans.Port != "" && ans.Port != "22" {
+		return contract.NewFault(contract.ValidationFailed, "server init needs SSH on port 22, not "+ans.Port, "Connect on port 22 (a provider NAT or firewall rule is fine), or move sshd to 22, then run server init again. The WireGuard route and sshd drop-in use port 22.")
 	}
 	if ans.PasswordStdin && ans.Identity != "" {
 		return contract.NewFault(contract.Usage, "--password-stdin and --identity cannot be combined", "Use one first-contact credential.")
@@ -852,12 +864,15 @@ func (r *serverInit) prepareHost(ctx context.Context) error {
 	}
 	plan, err := remotePlan(ctx, session)
 	if err != nil {
+		r.session = session
+		r.removeSession(ctx)
 		task.end(ui.EndFail, "")
 		return err
 	}
 	r.session, r.hostPlan = session, plan
 	task.end(ui.EndOK, fmt.Sprintf("%d steps", len(plan.Steps)))
 	if plan.ApplyBlocked != "" {
+		r.removeSession(ctx)
 		return contract.NewFault(contract.PreconditionFailed, "the server cannot be set up: "+plan.ApplyBlocked, "Fix the reported precondition and run eregion server init again.")
 	}
 	return nil
@@ -918,12 +933,23 @@ func (r *serverInit) applyHost(ctx context.Context) error {
 	if err != nil {
 		return withResumeHint(err, r.answers.Context)
 	}
-	if err := r.session.Remove(ctx); err != nil {
+	r.removeSession(ctx)
+	r.operationID = report.OperationID
+	return r.mark(phaseHost)
+}
+
+// removeSession drops the uploaded planning/apply bundle. A failed apply keeps
+// it for resume; every path that never applies must remove it.
+func (r *serverInit) removeSession(ctx context.Context) {
+	if r.session == nil {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if err := r.session.Remove(cleanupCtx); err != nil {
 		r.note("uploaded bundle cleanup failed: " + err.Error())
 	}
 	r.session = nil
-	r.operationID = report.OperationID
-	return r.mark(phaseHost)
 }
 
 // ensureRootConnection reopens first contact for a resume that already ran the
@@ -1078,6 +1104,12 @@ func (r *serverInit) savePending() error {
 	}
 	p.Node, p.Hostname = r.answers.Node, r.answers.Hostname
 	p.DatabaseURLFile, p.AdminUser = r.answers.DatabaseURLFile, r.answers.AdminUser
+	if r.hostKey != "" {
+		p.HostKey = r.hostKey
+		if _, fingerprint, ok := strings.Cut(r.hostKey, " "); ok {
+			p.HostKeyFingerprint = fingerprint
+		}
+	}
 	if r.publicIPv4 != "" {
 		p.PublicIPv4 = r.publicIPv4
 	}
@@ -1109,6 +1141,9 @@ func (r *serverInit) discard() (serverInitSummary, error) {
 			return serverInitSummary{}, fault
 		}
 		name = names[0]
+	}
+	if err := host.ValidateContextName(name); err != nil {
+		return serverInitSummary{}, err
 	}
 	if !host.PendingExists(name) {
 		fault := contract.NewFault(contract.PreconditionFailed, "there is no unfinished init for "+name, "Start one with eregion server init.")
@@ -1264,6 +1299,7 @@ func (r *serverInit) preview(ctx context.Context) error {
 	if err := r.prepareHost(ctx); err != nil {
 		return err
 	}
+	defer r.removeSession(ctx)
 	r.showPlan(r.hostPlan)
 	return nil
 }
@@ -1281,7 +1317,7 @@ func (r *serverInit) showPlan(plan host.Plan) {
 		b.WriteString("database      external PostgreSQL from EREGION_DATABASE_URL\n")
 	}
 	b.WriteString("\n")
-	for _, step := range plan.Steps {
+	for _, step := range r.planRows(plan) {
 		mark := ui.Dim("○")
 		if step.Complete {
 			mark = ui.Dim(ui.SymOK)

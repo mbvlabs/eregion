@@ -247,22 +247,22 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 			task.end(ui.EndFail, "")
 			return nil, contract.NewFault(contract.Unavailable, "hardening the server failed", lastLine(stderr.String(), err))
 		}
-		got, err := access.PublicKey(out.String())
-		if err != nil {
-			task.end(ui.EndFail, "")
-			return nil, contract.NewFault(contract.Unavailable, err.Error(), "")
+		got, keyErr := access.PublicKey(out.String())
+		if keyErr == nil {
+			nodeKey = got
+			r.pending.NodePublicKey = nodeKey
 		}
-		nodeKey = got
-		// Record the node key before the lockdown so an interruption between
-		// setup and confirmation can still build the WireGuard route.
-		r.pending.NodePublicKey = nodeKey
-		if err := r.savePending(); err != nil {
+		// setup.sh installs the sshd drop-in last, so root SSH is already gone
+		// when it returns. Record the phase before any remaining step can fail;
+		// a resume then reconnects as the admin user over WireGuard.
+		r.pending.Mark(phaseAccessSetup)
+		if err := r.pending.Save(); err != nil {
 			task.end(ui.EndFail, "")
 			return nil, err
 		}
-		if err := r.mark(phaseAccessSetup); err != nil {
+		if keyErr != nil {
 			task.end(ui.EndFail, "")
-			return nil, err
+			return nil, contract.NewFault(contract.Unavailable, keyErr.Error(), "")
 		}
 		task.end(ui.EndOK, "admin user "+r.answers.AdminUser+", wg0 "+access.NodeAddress+", ufw, sshd")
 	}
@@ -307,6 +307,26 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 	}
 	task.end(ui.EndOK, "SSH answers only on WireGuard")
 	return route, nil
+}
+
+// planRows adds the access changes to the host steps. The admin user, wg0,
+// firewall and SSH lockdown switchover are applied by setup.sh, not by a host
+// bootstrap step, so the plan names them explicitly. node_exporter is already
+// a host step; add it only when a plan does not carry it.
+func (r *serverInit) planRows(plan host.Plan) []host.PlanEntry {
+	rows := append([]host.PlanEntry(nil), plan.Steps...)
+	rows = append(rows,
+		host.PlanEntry{ID: "access-admin", Description: "Create the admin user " + r.answers.AdminUser + " with the operator SSH key, sudo password and passwordless node RPC"},
+		host.PlanEntry{ID: "access-wireguard", Description: "Bring up wg0 at " + access.NodeAddress + " with the operator peer"},
+		host.PlanEntry{ID: "access-firewall", Description: "Enable ufw: deny incoming, allow WireGuard, HTTP, HTTPS and SSH on wg0"},
+		host.PlanEntry{ID: "access-lockdown", Description: "Switch SSH to " + r.answers.AdminUser + " over WireGuard and close public SSH (reverted unless confirmed)"},
+	)
+	for _, row := range rows {
+		if strings.Contains(strings.ToLower(row.Description), "node_exporter") {
+			return rows
+		}
+	}
+	return append(rows, host.PlanEntry{ID: "access-node-exporter", Description: "Install node_exporter on the WireGuard address"})
 }
 
 func runWithRetry(ctx context.Context, route *host.ContextSSH, command string, within time.Duration) error {

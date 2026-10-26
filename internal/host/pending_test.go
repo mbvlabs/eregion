@@ -33,6 +33,7 @@ func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
 		Server: "prod", Host: "203.0.113.10", User: "root", Port: 22, Node: "main",
 		Context: "prod", Hostname: "app.example.com", AdminUser: "admin",
 		DatabaseURLFile: "/root/eregion-db.url", Phases: map[string]string{},
+		HostKey: "ssh-ed25519 SHA256:host", HostKeyFingerprint: "SHA256:host",
 	}
 	pending.Mark("first_contact")
 	if err := pending.Save(); err != nil {
@@ -48,6 +49,9 @@ func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
 	if loaded.Server != "prod" || loaded.Hostname != "app.example.com" || !loaded.Done("first_contact") {
 		t.Fatalf("loaded: %+v", loaded)
 	}
+	if loaded.HostKey != pending.HostKey || loaded.HostKeyFingerprint != pending.HostKeyFingerprint {
+		t.Fatalf("host key was not saved: %+v", loaded)
+	}
 	if err := SavePendingFile("prod", VaultKeyringName, []byte("{}\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -59,5 +63,20 @@ func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
 	}
 	if PendingExists("prod") {
 		t.Fatal("discard left the init behind")
+	}
+}
+
+func TestPendingNamesCannotEscapeThePendingRoot(t *testing.T) {
+	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	for _, name := range []string{"../escape", "a/b", "Prod", ""} {
+		if _, err := PendingDir(name); err == nil {
+			t.Errorf("PendingDir(%q) accepted a path", name)
+		}
+		if err := RemovePending(name); err == nil {
+			t.Errorf("RemovePending(%q) accepted a path", name)
+		}
+		if _, err := LoadPending(name); err == nil {
+			t.Errorf("LoadPending(%q) accepted a path", name)
+		}
 	}
 }

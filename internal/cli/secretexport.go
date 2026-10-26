@@ -21,7 +21,7 @@ func (a *app) secretsSpecs() []spec {
 		"Reproduce the server init handoff record: the operator keys, hostname, control-plane database URL and vault keyring, sealed with a new age passphrase. Requires a code from the authenticator app at a terminal.",
 	}
 	exportMeta.Mutating = false
-	exportMeta.Prompts = false
+	exportMeta.Prompts = true
 	exportMeta.InputFlags = []string{"secrets-out"}
 	exportMeta.Examples = []string{"eregion secrets export", "eregion secrets export --secrets-out ./prod-secrets.txt"}
 	return []spec{{
