@@ -123,8 +123,8 @@ func SupportMatrix() []SupportEntry {
 		id       string
 		versions []string
 	}{
-		{"debian", []string{"12", "13"}},
-		{"ubuntu", []string{"22.04", "24.04"}},
+		{"debian", []string{"13"}},
+		{"ubuntu", []string{"26.04"}},
 	} {
 		for _, version := range distro.versions {
 			for _, arch := range []string{"amd64", "arm64"} {

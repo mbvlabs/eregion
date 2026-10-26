@@ -12,6 +12,8 @@ type packagesStep struct {
 	cfg  Config
 	exec Exec
 	role RoleConfig
+	// distro is the os-release ID; package names differ between distributions.
+	distro string
 }
 
 func (s *packagesStep) ID() string { return "host-packages-v1" }
@@ -38,7 +40,12 @@ func (s *packagesStep) packages() []string {
 	if s.role.Telemetry {
 		// The telemetry role needs a Compose-capable host. Bootstrap does not
 		// install a telemetry stack, collector, or storage.
-		packages = append(packages, "docker-compose")
+		// Ubuntu ships Compose v2 as docker-compose-v2; Debian as docker-compose.
+		if s.distro == "ubuntu" {
+			packages = append(packages, "docker-compose-v2")
+		} else {
+			packages = append(packages, "docker-compose")
+		}
 	}
 	return packages
 }

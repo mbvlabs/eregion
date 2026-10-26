@@ -31,7 +31,7 @@ func (s *platformStep) Check(_ context.Context, _ engine.Runtime) (engine.CheckR
 		return engine.CheckResult{}, fmt.Errorf("%w: %v", engine.ErrPermanent, err)
 	}
 	if !platform.Supported() {
-		return engine.CheckResult{}, fmt.Errorf("%w: %s is not in the verified matrix (Debian 12/13, Ubuntu 22.04/24.04; amd64/arm64)", engine.ErrPermanent, platform)
+		return engine.CheckResult{}, fmt.Errorf("%w: %s is not in the verified matrix (Debian 13, Ubuntu 26.04; amd64/arm64)", engine.ErrPermanent, platform)
 	}
 	return complete("supported: " + platform.String())
 }

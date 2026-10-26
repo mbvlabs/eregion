@@ -54,7 +54,7 @@ func fixture(t *testing.T, role Role) Config {
 	cfg.Layout.User, cfg.Layout.NodeUser = account.Username, account.Username
 	cfg.Layout.Group, cfg.Layout.NodeGroup = group.Name, group.Name
 	cfg.PlatformPath, cfg.Arch = filepath.Join(root, "os-release"), "amd64"
-	put(t, cfg.PlatformPath, "ID=debian\nVERSION_ID=12\n", 0o600)
+	put(t, cfg.PlatformPath, "ID=debian\nVERSION_ID=13\n", 0o600)
 	cfg.BinaryPath, cfg.NodeBinaryPath = filepath.Join(root, "source-cli"), filepath.Join(root, "source-node")
 	put(t, cfg.BinaryPath, "fixture CLI executable", 0o700)
 	put(t, cfg.NodeBinaryPath, "fixture node executable", 0o700)
@@ -64,8 +64,8 @@ func fixture(t *testing.T, role Role) Config {
 }
 
 func TestSupportAndRoleMatrix(t *testing.T) {
-	if len(SupportMatrix()) != 8 {
-		t.Fatal("matrix must have eight release/architecture pairs")
+	if len(SupportMatrix()) != 4 {
+		t.Fatal("matrix must have four release/architecture pairs")
 	}
 	for _, entry := range SupportMatrix() {
 		raw := fmt.Sprintf("ID=%s\nVERSION_ID=\"%s\"\n", entry.ID, entry.VersionID)
@@ -74,7 +74,7 @@ func TestSupportAndRoleMatrix(t *testing.T) {
 			t.Fatalf("%+v: %v", entry, err)
 		}
 	}
-	for _, p := range []Platform{{ID: "debian", VersionID: "11", Arch: "amd64"}, {ID: "ubuntu", VersionID: "26.04", Arch: "arm64"}, {ID: "debian", VersionID: "12", Arch: "386"}} {
+	for _, p := range []Platform{{ID: "debian", VersionID: "11", Arch: "amd64"}, {ID: "ubuntu", VersionID: "24.04", Arch: "arm64"}, {ID: "debian", VersionID: "12", Arch: "amd64"}, {ID: "debian", VersionID: "13", Arch: "386"}} {
 		if p.Supported() {
 			t.Fatalf("unexpected support: %+v", p)
 		}

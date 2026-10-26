@@ -3,7 +3,7 @@
 # The image is a throwaway node: an unprivileged account, an OpenSSH server, and
 # the node binary. iproute2 and wireguard-tools let a test put the node behind
 # kernel WireGuard. It is never a deployment image and holds no credential.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-server iproute2 wireguard-tools \

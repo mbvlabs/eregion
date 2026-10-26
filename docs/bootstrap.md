@@ -15,8 +15,8 @@ fails before PostgreSQL is reachable can be resumed without the platform store.
 
 | Distribution | Releases | Architectures |
 | --- | --- | --- |
-| Debian | 12, 13 | amd64, arm64 |
-| Ubuntu | 22.04, 24.04 | amd64, arm64 |
+| Debian | 13 | amd64, arm64 |
+| Ubuntu | 26.04 | amd64, arm64 |
 
 `internal/host/platform.go` is the single source of truth. Any other release or
 architecture is rejected before a package, account, service, or file mutation.

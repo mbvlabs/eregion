@@ -176,7 +176,9 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 	if err != nil {
 		return nil, err
 	}
-	steps := []Step{&platformStep{cfg: r.Config}, &packagesStep{cfg: r.Config, exec: r.Exec, role: role}, &usersStep{cfg: r.Config, exec: r.Exec, role: role}, &directoriesStep{cfg: r.Config, role: role}}
+	// An undetectable platform fails the platform step first; distro is then empty.
+	platform, _ := DetectPlatform(r.Config.PlatformPath, r.Config.Arch)
+	steps := []Step{&platformStep{cfg: r.Config}, &packagesStep{cfg: r.Config, exec: r.Exec, role: role, distro: platform.ID}, &usersStep{cfg: r.Config, exec: r.Exec, role: role}, &directoriesStep{cfg: r.Config, role: role}}
 	if role.Runtime {
 		steps = append(steps, &dockerStep{exec: r.Exec})
 	}
@@ -220,7 +222,7 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 		if platformErr != nil {
 			entry.Error = safeError(platformErr)
 		} else {
-			entry.Error = fmt.Sprintf("%s is not in the verified matrix (Debian 12/13, Ubuntu 22.04/24.04; amd64/arm64)", platform)
+			entry.Error = fmt.Sprintf("%s is not in the verified matrix (Debian 13, Ubuntu 26.04; amd64/arm64)", platform)
 		}
 		plan.Steps = []PlanEntry{entry}
 		return plan, nil

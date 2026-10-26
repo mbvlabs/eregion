@@ -51,12 +51,12 @@ func TestEnrollRoleCombinations(t *testing.T) {
 }
 
 func TestSupportedReleaseMatrix(t *testing.T) {
-	for _, ok := range [][2]string{{"debian", "12"}, {"debian", "13"}, {"ubuntu", "22.04"}, {"ubuntu", "24.04"}, {"Ubuntu", "24.04"}} {
+	for _, ok := range [][2]string{{"debian", "13"}, {"ubuntu", "26.04"}, {"Ubuntu", "26.04"}} {
 		if !SupportedRelease(ok[0], ok[1]) {
 			t.Errorf("%v must be supported", ok)
 		}
 	}
-	for _, bad := range [][2]string{{"debian", "11"}, {"debian", "12.5"}, {"ubuntu", "20.04"}, {"ubuntu", "26.04"}, {"alpine", "3.20"}, {"", ""}, {"fedora", "42"}} {
+	for _, bad := range [][2]string{{"debian", "11"}, {"debian", "12"}, {"debian", "13.1"}, {"ubuntu", "22.04"}, {"ubuntu", "24.04"}, {"alpine", "3.20"}, {"", ""}, {"fedora", "42"}} {
 		if SupportedRelease(bad[0], bad[1]) {
 			t.Errorf("%v must not be supported", bad)
 		}

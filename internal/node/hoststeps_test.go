@@ -115,11 +115,11 @@ func TestProbeReportsWhatTheHostProved(t *testing.T) {
 		}
 		return path
 	}
-	debian := write("PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nID=debian\nVERSION_ID=\"12\"\n")
+	debian := write("PRETTY_NAME=\"Debian GNU/Linux 13 (trixie)\"\nID=debian\nVERSION_ID=\"13\"\n")
 	full := fakeCommander(map[string]string{"docker": "27.3.1\n", "pack": "0.36.0+git\n", "wg": "wireguard-tools v1.0\n", "id": "eregion\n"})
 
 	probe := Probe(context.Background(), debian, "amd64", full)
-	if !probe.Supported || probe.OS.ID != "debian" || probe.OS.VersionID != "12" {
+	if !probe.Supported || probe.OS.ID != "debian" || probe.OS.VersionID != "13" {
 		t.Fatalf("%+v", probe)
 	}
 	if got := strings.Join(probe.Capabilities, ","); got != "buildpacks,docker" {
@@ -139,7 +139,7 @@ func TestProbeReportsWhatTheHostProved(t *testing.T) {
 		"debian 11":   {"ID=debian\nVERSION_ID=\"11\"\n", "amd64"},
 		"ubuntu 20":   {"ID=ubuntu\nVERSION_ID=\"20.04\"\n", "amd64"},
 		"alpine":      {"ID=alpine\nVERSION_ID=3.20.1\n", "amd64"},
-		"32-bit arch": {"ID=ubuntu\nVERSION_ID=\"24.04\"\n", "386"},
+		"32-bit arch": {"ID=ubuntu\nVERSION_ID=\"26.04\"\n", "386"},
 	}
 	for name, tc := range unsupported {
 		result := Probe(context.Background(), write(tc.release), tc.arch, full)

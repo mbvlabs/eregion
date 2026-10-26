@@ -296,13 +296,13 @@ func RequiredCapabilities(roles []string) []string {
 }
 
 // SupportedRelease reports whether a Linux distribution release is in the
-// supported matrix: Debian 12/13 and Ubuntu 22.04/24.04.
+// supported matrix: Debian 13 and Ubuntu 26.04.
 func SupportedRelease(id, versionID string) bool {
 	switch strings.ToLower(strings.TrimSpace(id)) {
 	case "debian":
-		return versionID == "12" || versionID == "13"
+		return versionID == "13"
 	case "ubuntu":
-		return versionID == "22.04" || versionID == "24.04"
+		return versionID == "26.04"
 	}
 	return false
 }

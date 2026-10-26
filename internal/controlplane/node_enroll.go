@@ -210,7 +210,7 @@ func (w *platformWorker) verifyNode(ctx context.Context, tr node.Transport, id c
 	}
 	if !host.probe.Supported {
 		return host, contract.NewFault(contract.PreconditionFailed, "unsupported node: "+host.probe.Unsupported,
-			"Supported: Debian 12/13 and Ubuntu 22.04/24.04 on amd64 or arm64.")
+			"Supported: Debian 13 and Ubuntu 26.04 on amd64 or arm64.")
 	}
 	var missing []string
 	for _, capability := range platform.RequiredCapabilities(rec.Roles) {

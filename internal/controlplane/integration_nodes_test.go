@@ -19,7 +19,7 @@ import (
 )
 
 // The enrollment integration tests run real control-plane workers against the
-// disposable SSH nodes of internal/sshfixture. Each fixture is a Debian 12
+// disposable SSH nodes of internal/sshfixture. Each fixture is a Debian 13
 // container running the real eregion-node binary behind a real sshd; the host
 // tools the probe looks for (docker, pack) are small stand-ins installed per
 // node, so a node's capabilities are exactly what the test gives it.
@@ -166,7 +166,7 @@ func TestIntegrationNodesApplicationAndBuilderEnrollAndReceiveOnlyTheirWork(t *t
 	if strings.Join(app.Capabilities, ",") != "docker" || strings.Join(builder.Capabilities, ",") != "buildpacks,docker" {
 		t.Fatalf("capabilities must be what the probe found: %v %v", app.Capabilities, builder.Capabilities)
 	}
-	if app.OS != "debian 12" || app.Arch == "" || builder.BuildConcurrency != 2 {
+	if app.OS != "debian 13" || app.Arch == "" || builder.BuildConcurrency != 2 {
 		t.Fatalf("probe facts were not recorded: %+v %+v", app, builder)
 	}
 	if !strings.HasPrefix(app.IdentityFingerprint, "SHA256:") || app.IdentityFingerprint == builder.IdentityFingerprint || app.EnrolledAt == nil || app.LastCheckAt == nil || app.LastCheckState != "ok" {

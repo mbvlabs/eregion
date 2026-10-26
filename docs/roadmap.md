@@ -186,7 +186,7 @@ simulated-host tests with stubbed systemd/Docker/apt were removed.
 no clean Debian/Ubuntu VM install was run here.
 
 **Delivered:** `eregion bootstrap` (local and pinned-SSH remote), resumable
-node-local journal, Debian 12/13 and Ubuntu 22.04/24.04 checks, role-specific
+node-local journal, Debian 13 and Ubuntu 26.04 checks, role-specific
 packages/services (main/application/builder/telemetry), database preflight and
 advisory-locked forward-only migrations, API/worker units, authenticated
 readiness, contexts and private credential files, plan-bound scoped automation
@@ -212,7 +212,7 @@ detached commit-confirm watchdog. See [bootstrap](bootstrap.md).
 **Gate (local):** passed for placement and identity. Nodes enroll over pinned SSH,
 prove a node-generated identity, expose probed capabilities, reconcile WireGuard
 peers, and cannot receive work outside their declared role/capability constraints.
-**Gate (distro matrix):** unproven. Enrollment is exercised against the Debian 12
+**Gate (distro matrix):** unproven. Enrollment is exercised against the Debian 13
 fixture, not every supported Debian/Ubuntu release and architecture.
 
 **Delivered:** enrollment over pinned SSH, identity attestation and first-use
@@ -407,7 +407,7 @@ silently approved by the sketches:
   ownership fencing are recorded in the [M0.3 plan](m0.3-plan.md), [SSH plan](m0.3-ssh-plan.md),
   and [WireGuard plan](m0.3-wireguard-plan.md). Cross-node distributed conflict
   scopes remain open ([next increments](ssh-wireguard-next.md)).
-- **M1 (resolved):** Debian 12/13 and Ubuntu 22.04/24.04, amd64/arm64; external
+- **M1 (resolved):** Debian 13 and Ubuntu 26.04, amd64/arm64; external
   PostgreSQL is the only store; non-loopback API requires TLS; migrations use an
   advisory lock and forward-only checksums; bootstrap owns migration execution.
   The fresh-VM matrix itself is still unproven.
@@ -432,7 +432,7 @@ restore, read telemetry, reconcile DNS, revoke access, receive signed webhooks,
 and upgrade/roll back the binary. The remaining work is evidence and hardening,
 not placeholder commands:
 
-1. Run the fresh-host VM matrix (Debian 12/13 and Ubuntu 22.04/24.04, amd64/arm64)
+1. Run the fresh-host VM matrix (Debian 13 and Ubuntu 26.04, amd64/arm64)
    for main, application, builder, and telemetry roles. Record G8 evidence.
 2. Exercise a real Cloudflare zone/token, private-access tunnel, and telemetry VM
    with live OTLP + Grafana. Record G9 and the M5 real-infrastructure gate.

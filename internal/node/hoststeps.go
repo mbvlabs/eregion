@@ -205,7 +205,7 @@ func Probe(ctx context.Context, osReleasePath, arch string, run Commander) Probe
 	}
 	switch {
 	case !platform.SupportedRelease(result.OS.ID, result.OS.VersionID):
-		result.Unsupported = fmt.Sprintf("unsupported distribution %q %q: supported are Debian 12/13 and Ubuntu 22.04/24.04", result.OS.ID, result.OS.VersionID)
+		result.Unsupported = fmt.Sprintf("unsupported distribution %q %q: supported are Debian 13 and Ubuntu 26.04", result.OS.ID, result.OS.VersionID)
 	case !platform.SupportedArch(arch):
 		result.Unsupported = fmt.Sprintf("unsupported architecture %q: supported are amd64 and arm64", arch)
 	default:

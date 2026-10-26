@@ -1,6 +1,6 @@
 # Nodes: enrollment, placement, and private connectivity (M2)
 
-**Status:** implemented and tested against disposable Debian 12 SSH nodes
+**Status:** implemented and tested against disposable Debian 13 SSH nodes
 (including a real kernel WireGuard tunnel) · 2026-10-20
 
 This document is the operator and integrator reference for additional
@@ -24,7 +24,7 @@ key the node generated for itself and proves possession of.
 
 ## Setting up a node
 
-Supported hosts: **Debian 12/13 and Ubuntu 22.04/24.04**, amd64 or arm64. The
+Supported hosts: **Debian 13 and Ubuntu 26.04**, amd64 or arm64. The
 probe refuses anything else (`unsupported node`).
 
 The operator does this once per host (a bootstrap script or image can do it; the
@@ -276,8 +276,8 @@ durable surface for them.
 
 ## Not tested, and honest limits
 
-- **Real multi-distro VMs.** Every test node is the Debian 12 fixture container.
-  Debian 13 and Ubuntu 22.04/24.04 are accepted by the release matrix
+- **Real multi-distro VMs.** Every test node is the Debian 13 fixture container.
+  Ubuntu 26.04 is accepted by the release matrix
   (`platform.SupportedRelease`, unit-tested on os-release text) but no such host
   was enrolled. arm64 is accepted by the probe, untested.
 - **Real Docker and `pack` on enrolled nodes.** The fixture's `docker` and `pack`

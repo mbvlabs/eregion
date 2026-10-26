@@ -194,10 +194,10 @@ exercise at least:
 
 | Host | Role | Evidence to record |
 | --- | --- | --- |
-| Debian 12 `amd64` | `main` | bootstrap plan/diff/apply, `version`, `/readyz`, first deploy and rollback |
-| Ubuntu 24.04 `amd64` | `main` | same as above |
-| Debian 12 `arm64` | `application` | node install, SSH pin, node check, operation on the node |
-| Ubuntu 24.04 `arm64` | `builder` | node install, Docker/Buildpacks availability, a directory/git build |
+| Debian 13 `amd64` | `main` | bootstrap plan/diff/apply, `version`, `/readyz`, first deploy and rollback |
+| Ubuntu 26.04 `amd64` | `main` | same as above |
+| Debian 13 `arm64` | `application` | node install, SSH pin, node check, operation on the node |
+| Ubuntu 26.04 `arm64` | `builder` | node install, Docker/Buildpacks availability, a directory/git build |
 
 A fresh-VM run must start without a developer checkout, without `just`, and
 without ambient environment variables. Until that exists, do not claim
