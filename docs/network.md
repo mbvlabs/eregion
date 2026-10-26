@@ -3,39 +3,63 @@
 Mechanism reference; [MASTER](MASTER.md) owns scope and status. Three different
 things must not be conflated: **domain binding**, **Caddy route**, **DNS record**.
 
-## Current environment domains
+## Environment domains
 
 ```sh
 eregion domain add hello production hello.example.com --dry-run --json
-eregion domain add hello production hello.example.com --idempotency-key ops:hello-domain-1 --json
+eregion domain add hello production hello.example.com --primary --json
 eregion domain list --app hello --environment production --json
-eregion domain remove hello production hello.example.com --idempotency-key ops:hello-domain-remove-1 --json
+eregion domain remove hello production hello.example.com --dry-run --json
+eregion domain remove hello production hello.example.com --confirm <token> --json
 ```
 
-These are current command examples, not proof a full setup works. App and env
-must already exist, migrations through 010 must be applied, and Caddy must have
-been installed by setup with a public main hostname. Only local/main-node
-environments can receive these domain bindings.
+App and env must already exist, migrations through 013 must be applied, and Caddy
+must have been installed by setup with a public main hostname. Only local/main-node
+environments can receive these domain bindings. `domain add` is idempotent for the
+same binding; `--primary` promotes it and demotes the current primary. Every
+environment has at most one primary (partial unique index). Removing the primary is
+refused: promote another hostname first.
 
-Current path:
+The binding, route, DNS record, certificate and public response are separate:
 
-1. Submission transaction inserts/deletes `eregion_platform_domains`, one unique
-   hostname per environment binding, along with operation/job acceptance.
-2. Worker `internal/controlplane/routes.go` joins all desired domain rows to env
-   stable ports and renders `internal/platform/routes.go` site blocks:
-   `hostname { reverse_proxy 127.0.0.1:<host_port> }`.
-3. Worker writes `/etc/caddy/eregion.d/routes.caddy`; Caddy loads the importing
-   `/etc/caddy/Caddyfile` through loopback admin port 2019.
-4. On reload rejection the prior file is restored. The DB intent is not reverted.
-   On acceptance the operation completes; the CLI may show/check the A record.
+| Fact | Where it lives | Meaning |
+| --- | --- | --- |
+| Binding | `eregion_platform_domains` row | Desired hostname, environment and primary flag. Accepted intent only. |
+| Route | `desired_revision`/`applied_revision`, `route_state`, `route_error` | Caddy accepted and loaded a routes file containing that domain. A pending/failed row does not delete the binding. |
+| DNS | `expected_addresses`, `dns_state` (`pending`/`ok`/`wrong`/`proxied`), `dns_addresses`, `dns_error` | 1.1.1.1 and 8.8.8.8 answers over UDP compared with the main node's public address. Proxied or wrong never becomes ready. |
+| Certificate | `certificate_state` (`pending`/`valid`/`failed`), `certificate_not_after`, `certificate_error` | TLS handshake to the hostname through local Caddy with SNI, chain and name verified against system roots. |
+| Public response | `public_state` (`pending`/`ok`/`failed`), `public_status`, `public_error` | HTTP response through local Caddy with the real hostname, using the environment revision's health path. |
 
-**Limits that upcoming implementation must address:** the table stores no applied
-revision, last error, TLS state or observation time. List reads desired bindings,
-not observed Caddy state. The worker's file write is not atomic or globally
-serialized; domain work is not a journaled node step and has no general startup/
-periodic route reconciliation. A reload failure can leave DB/file/proxy disagreeing.
-The domain command's success message does not prove DNS, TLS or a healthy public
-app. Dry-run validation is not a provider/backend probe.
+`domain add` prints the exact A/AAAA record from the current context's WireGuard
+endpoint (the main node's public address) and records it as `expected_addresses`.
+The node does not infer a public address from its interfaces. `domain list` shows
+route, DNS, certificate, public and overall readiness separately.
+
+Route path:
+
+1. The submission transaction inserts/deletes `eregion_platform_domains` and
+   records the operation/job, together.
+2. The worker takes one PostgreSQL advisory lock for the routes file, joins all
+   desired domain rows to each environment's serving deployment web replicas, and
+   renders `/etc/caddy/eregion.d/routes.caddy` (`hostname { reverse_proxy … }`).
+   A deployment switch uses the same lock and writer with candidate upstreams.
+3. The new fragment is adapted with Caddy's `/adapt` endpoint before it replaces
+   the file. The file is written to a sibling temp file, fsynced and renamed; the
+   importing `/etc/caddy/Caddyfile` is then loaded through loopback admin port
+   2019.
+4. A rejected load restores the prior routes file and reloads it. The database
+   binding is never reverted; the route revision and last error record the failed
+   attempt, so `domain list` distinguishes desired from applied.
+5. A maintenance job re-renders on worker start and every 30 seconds. A failed
+   reload therefore retries without another domain command. Concurrent domain
+   changes keep every unrelated route because each write renders the complete
+   current table under the lock.
+
+A second periodic job observes DNS, certificate and public response separately
+(every five minutes and on worker start). Observations never change the binding or
+the route; a later run overwrites them. The command's success message proves an
+accepted operation, not DNS, TLS or a healthy app; only `domain list` readiness
+aggregates all four observations.
 
 The main hostname's Caddy site exposes **only** `/readyz` and
 `/v1/webhooks/github`, forwarding to loopback. The per-environment CI deploy
@@ -44,11 +68,10 @@ wired yet. Never expose the whole admin API
 as a workaround. Caddy's admin endpoint must stay local; access to it is
 administrative authority.
 
-The target (MASTER section 6.5, D17): a primary hostname plus aliases per
-environment; desired, applied and observed route state with DNS, certificate
-and public response reported separately; serialized atomic writes;
-reconciliation on start and retry; Caddy backends switched between candidate and
-serving containers on dynamic loopback ports.
+This is MASTER section 6.5/D3/D17's route path: a primary hostname plus aliases,
+desired/applied/observed state, serialized atomic writes, startup and retry
+reconciliation, and Caddy backends switched between candidate and serving
+containers on dynamic loopback ports.
 
 ## Cloudflare and private access (off the surface)
 

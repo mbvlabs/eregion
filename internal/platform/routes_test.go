@@ -1,6 +1,8 @@
 package platform
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -20,6 +22,44 @@ func TestRenderRoutesBalancesWebReplicas(t *testing.T) {
 	}
 	if strings.Index(rendered, "a.example.com") > strings.Index(rendered, "b.example.com") {
 		t.Fatalf("routes are not sorted:\n%s", rendered)
+	}
+}
+
+func TestRenderRoutesIncludesPrimaryAndAliases(t *testing.T) {
+	routes := []Route{
+		{Domain: "alias.example.com", Upstreams: []string{"127.0.0.1:40001"}},
+		{Domain: "primary.example.com", Primary: true, Upstreams: []string{"127.0.0.1:40001"}},
+	}
+	rendered := string(RenderRoutes(routes))
+	for _, domain := range []string{"primary.example.com", "alias.example.com"} {
+		if !strings.Contains(rendered, domain+" {") {
+			t.Fatalf("route %s is missing:\n%s", domain, rendered)
+		}
+	}
+}
+
+func TestWriteFileAtomicReplacesContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "routes.caddy")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteFileAtomic(path, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "new" {
+		t.Fatalf("content=%q", content)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "routes.caddy" {
+		t.Fatalf("temporary file was not cleaned up: %v", entries)
 	}
 }
 

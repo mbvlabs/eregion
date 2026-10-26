@@ -135,10 +135,12 @@ files.
 
 ### Domains
 
-`eregion domain add <app> <environment> <hostname>` saves the binding and shows
-the exact DNS record. It is desired state: the route, certificate and public
-response are separate observations. Use `eregion domain list --json` to see
-bindings and `eregion domain remove` to remove one.
+`eregion domain add <app> <environment> <hostname> [--primary]` saves the binding
+and shows the exact A/AAAA record. It is desired state: the route, DNS,
+certificate and public response are separate observations, and only an all-ok
+`ready` is proof. Use `eregion domain list --json` to see each state and
+`eregion domain remove` (plan-bound `--confirm`) to remove an alias. Promote
+another hostname with `--primary` before removing the primary.
 
 ### Secrets
 

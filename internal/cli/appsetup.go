@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -908,11 +909,12 @@ func domainDNSRecord(domain string) (hostDNSRecord, bool) {
 	if domain == "" {
 		return hostDNSRecord{}, false
 	}
-	value := currentPublicIPv4()
-	if ip := net.ParseIP(value); ip == nil || ip.To4() == nil {
-		return hostDNSRecord{}, false
+	for _, value := range mainNodeAddresses(context.Background()) {
+		if ip := net.ParseIP(value); ip != nil && ip.To4() != nil {
+			return hostDNSRecord{Type: "A", Name: domain, Value: value}, true
+		}
 	}
-	return hostDNSRecord{Type: "A", Name: domain, Value: value}, true
+	return hostDNSRecord{}, false
 }
 
 // setupPlan is the secret-free plan shown before a guided submit and by

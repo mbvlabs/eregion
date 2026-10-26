@@ -43,7 +43,7 @@ An SSH disconnect never owns the lifetime of accepted work.
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
 | `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, webhook and private proxy adapters. |
 | `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
-| `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps and Caddy route renderer. |
+| `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps, Caddy route renderer and the domain DNS/TLS/HTTP observation helpers. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
 | `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps (incl. vault keyring and node_exporter), local pending-init state, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
@@ -75,7 +75,7 @@ bin/eregion help app create --json
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
 | `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. Transitional until the deploy row replaces it. |
 | `platform deployments plan/deploy/list/retry/rollback` | Durable deployment actions; rollback takes a dry-run confirmation. Transitional until the deploy row replaces it. |
-| `domain add/remove <app> <environment> <hostname>`, `domain list` | Main-node desired host bindings + Caddy reload. Not observed TLS/route status. |
+| `domain add/remove <app> <environment> <hostname> [--primary]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `remove` is plan-bound and refuses the primary. |
 | `secret set/list/archive/export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. |
 | `platform inventory`, `logs search/tail`, `ui` | Read-only inventory, telemetry reads and the full-screen workspace. |
 | `operations get/events/follow/cancel` | Durable operation observation and explicit cancellation. |
@@ -114,7 +114,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 012
+## Database: embedded schema 013
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -134,6 +134,7 @@ node protocol version and database migration version are independent.
 | `010_platform_domains.sql` | Globally unique domain name -> environment FK; creation timestamp only. |
 | `011_environment_revisions.sql` | Immutable numbered environment revisions, current-revision pointer, deployment revision/secret snapshots and domain primary flag. Backfills one baseline revision per existing environment. |
 | `012_platform_deploy.sql` | First-class builds with exact commit and lifecycle; release build/commit links; deployment runtime instances, previous deployment and `restart` action; environment serving-deployment pointer. Backfills the serving deployment for existing successful environments. |
+| `013_domain_state.sql` | Per-domain desired/applied route revision, last route error and timestamps; recorded expected addresses and DNS state/answers; certificate state and expiry; public response state/status; observation timestamps. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -151,7 +152,7 @@ Tables below have the literal `eregion_` prefix:
 | `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, build link, exact commit, pending/ready/failed status and error. |
 | `platform_deployments` | Deployment ID and unique operation FK; action (`deploy`, `rollback`, `restart`), release, previous release/deployment, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), recorded process instances/ports, state and errors. |
 | `platform_changes` | App/env history, sequence, operation/actor, desired/applied JSON and summary. |
-| `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment, creation timestamp. Still no backend, TLS, observation or failure columns. |
+| `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment. `desired_revision`/`applied_revision` and `route_state`/`route_error` record the Caddy write; `expected_addresses` plus `dns_state`/`dns_addresses` record public-resolver observation; `certificate_state`/`certificate_not_after` and `public_state`/`public_status` keep the other observations separate. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
 | `webhook_deliveries` | Hashed delivery ID, exact-body hash, actor/kind/target, pending/submitted state and operation ID. |
@@ -374,7 +375,7 @@ All use `POST /v1/operations`, the shared registry and one River job:
 | `platform.deploy` | `env/<app>/<env>` | Optional `release_id` and `ref`. Without a release it resolves the current revision's bound source to an exact commit, builds, records the release digest and deploys it with the current revision. With a release it redeploys that release with the current revision. |
 | `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, then uses that deployment's revision and exact secret revisions. |
 | `platform.restart` | `env/<app>/<env>` | Reapplies the serving release with the current revision through the same blue/green path, so a scaled formation takes effect. |
-| `platform.domain.add/remove` | `env/<app>/<env>` | `domain` (app/env resolved from target) |
+| `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary` and `addresses` (the main node's public A/AAAA targets). Removing the primary is refused. |
 
 Names: lowercase letters/digits/hyphens, start with a letter, max 40 characters.
 Unknown input fields fail, including nested revision fields. Refer to
@@ -427,13 +428,19 @@ Explicit retry creates new work; it does not rewrite a terminal failed record.
 
 Domains are changed in the submission transaction, then the worker reads all
 bindings, writes one Caddy site per domain with the serving deployment's web
-replica upstreams and reloads Caddy. A deployment switch writes the same file
-with candidate upstreams and verifies the primary domain through local Caddy
-before removing the previous containers. A rejected reload restores the prior
-**file**, not the domain rows. Writes are currently not atomic/serialized
-globally; there is no general route reconciler. Inventory/list exposes desired
-bindings even after a failed apply. See [network](network.md) before changing
-this path.
+replica upstreams and reloads Caddy. Route writers take one PostgreSQL advisory
+lock, adapt the new fragment through Caddy's `/adapt` endpoint, replace the file
+with a fsync+rename, then load it; a rejected load restores the prior **file**,
+not the domain rows. A deployment switch writes the same file with candidate
+upstreams and verifies the primary domain through local Caddy before removing
+the previous containers. A periodic maintenance job re-renders on worker start
+and every 30 seconds after a failure; it updates `route_state` per domain. A
+second periodic job observes DNS through 1.1.1.1 and 8.8.8.8 over UDP, then the
+certificate chain/expiry and public response through local Caddy with the real
+SNI. Proxied or wrong DNS stays unready. `domain add` records the main node's
+public addresses so observation has an expected value. Inventory `domains` and
+`domain list` expose each state separately. See [network](network.md) before
+changing this path.
 
 ## API and extension seams
 
@@ -444,8 +451,8 @@ this path.
   actor-scoped state, bounded cursor pages and explicit cancellation.
 - `/v1/platform?collection=…`: bounded inventory with app/environment/node/state
   filters. Base collections: summary, nodes, apps, environments, revisions,
-  deployability, releases, builds, deployments and changes; the internal
-  DNS/access extensions add their own. The removed resources/backups and
+  deployability, domains, releases, builds, deployments and changes; the
+  internal DNS/access extensions add their own. The removed resources/backups and
   telemetry collections are not registered.
 - `/v1/secrets…`: separate authenticated credential API; values are encrypted
   directly, never placed in ordinary action input.

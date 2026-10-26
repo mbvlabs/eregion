@@ -2,6 +2,8 @@ package platform
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -23,7 +25,10 @@ const (
 // Route is one public hostname and the loopback upstreams it proxies to. Caddy
 // loads balances a web process across every replica upstream.
 type Route struct {
-	Domain    string
+	Domain string
+	// Primary marks the environment's primary hostname. Every binding,
+	// including aliases, gets its own Caddy site.
+	Primary   bool
 	Upstreams []string
 }
 
@@ -62,6 +67,42 @@ func RenderRoutes(routes []Route) []byte {
 		fmt.Fprintf(&b, "\n%s {\n\treverse_proxy %s\n}\n", r.Domain, strings.Join(upstreams, " "))
 	}
 	return []byte(b.String())
+}
+
+// WriteFileAtomic replaces path with data without exposing a partially written
+// file: write a sibling temp file, fsync it, rename it over path, then fsync the
+// directory. Caddy only ever sees the previous or the complete new routes file.
+func WriteFileAtomic(path string, data []byte, mode os.FileMode) error {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := temp.Chmod(mode); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if directory, err := os.Open(dir); err == nil {
+		_ = directory.Sync()
+		_ = directory.Close()
+	}
+	return nil
 }
 
 func validUpstreams(upstreams []string) []string {

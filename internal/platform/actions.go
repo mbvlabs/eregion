@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -1298,10 +1299,14 @@ func validGitRef(ref string) bool {
 }
 
 // DomainInput names a public hostname and the environment it routes to.
+// Addresses are the main node's public addresses, recorded so DNS observation
+// can compare without a second source of truth.
 type DomainInput struct {
-	App         string `json:"app,omitempty"`
-	Environment string `json:"environment,omitempty"`
-	Domain      string `json:"domain"`
+	App         string   `json:"app,omitempty"`
+	Environment string   `json:"environment,omitempty"`
+	Domain      string   `json:"domain"`
+	Primary     bool     `json:"primary,omitempty"`
+	Addresses   []string `json:"addresses,omitempty"`
 }
 
 func (in *DomainInput) Target() Target {
@@ -1325,6 +1330,25 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 	if err := ValidateDomain(input.Domain); err != nil {
 		return nil, invalid("domain", err.Error())
 	}
+	addresses := make([]string, 0, len(input.Addresses))
+	seen := map[string]bool{}
+	for _, value := range input.Addresses {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		addr, err := netip.ParseAddr(value)
+		if err != nil {
+			return nil, invalid("addresses", "Use only literal IP addresses for the main node's DNS record.")
+		}
+		value = addr.Unmap().String()
+		if !seen[value] {
+			seen[value] = true
+			addresses = append(addresses, value)
+		}
+	}
+	sort.Strings(addresses)
+	input.Addresses = addresses
 	return &input, nil
 }
 

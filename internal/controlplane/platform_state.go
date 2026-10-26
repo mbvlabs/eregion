@@ -291,12 +291,20 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		if normalized.Kind == platform.KindDomainRemove {
-			tag, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2`, input.Domain, env.ID)
+			var primary bool
+			err := tx.QueryRow(ctx, `SELECT is_primary FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2`, input.Domain, env.ID).Scan(&primary)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return contract.NewFault(contract.NotFound, input.Domain+" is not routed to "+input.App+"/"+input.Environment, "List routes with eregion domain list.")
+			}
 			if err != nil {
 				return unavailable()
 			}
-			if tag.RowsAffected() == 0 {
-				return contract.NewFault(contract.NotFound, input.Domain+" is not routed to "+input.App+"/"+input.Environment, "List routes with eregion domain list.")
+			if primary {
+				return contract.NewFault(contract.PreconditionFailed, "the primary domain cannot be removed",
+					"Add another domain with --primary first, then remove this one.")
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2`, input.Domain, env.ID); err != nil {
+				return unavailable()
 			}
 			return nil
 		}
@@ -307,10 +315,47 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if node.Transport != "local" {
 			return contract.NewFault(contract.PreconditionFailed, "domains route only to environments on the main node for now", "Create the environment on the main node.")
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary)
-            VALUES($1,$2,NOT EXISTS(SELECT 1 FROM eregion_platform_domains WHERE environment_id=$2 AND is_primary))`,
-			input.Domain, env.ID); err != nil {
-			return platformWriteError(err, input.Domain+" is already routed")
+		var existingEnvironment string
+		err = tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE name=$1`, input.Domain).Scan(&existingEnvironment)
+		switch {
+		case err == nil && existingEnvironment != string(env.ID):
+			return contract.NewFault(contract.Conflict, input.Domain+" is already routed to another environment", "Remove it from that environment first, or use another hostname.")
+		case err == nil:
+			// Re-adding the same binding is idempotent; --primary promotes it and
+			// refreshes the recorded main-node addresses for DNS observation.
+			if len(input.Addresses) > 0 {
+				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET expected_addresses=$2 WHERE name=$1`, input.Domain, input.Addresses); err != nil {
+					return unavailable()
+				}
+			}
+			if input.Primary {
+				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary AND name<>$2`, env.ID, input.Domain); err != nil {
+					return unavailable()
+				}
+				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=true, desired_revision=desired_revision+1 WHERE name=$1`, input.Domain); err != nil {
+					return unavailable()
+				}
+			}
+		case errors.Is(err, pgx.ErrNoRows):
+			primary := input.Primary
+			if !primary {
+				var hasPrimary bool
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_domains WHERE environment_id=$1 AND is_primary)`, env.ID).Scan(&hasPrimary); err != nil {
+					return unavailable()
+				}
+				primary = !hasPrimary
+			}
+			if primary {
+				if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary`, env.ID); err != nil {
+					return unavailable()
+				}
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary,expected_addresses)
+                VALUES($1,$2,$3,$4)`, input.Domain, env.ID, primary, input.Addresses); err != nil {
+				return platformWriteError(err, input.Domain+" is already routed")
+			}
+		default:
+			return unavailable()
 		}
 	case *platform.ReleaseCreateInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
@@ -946,6 +991,12 @@ func (s *Service) Inventory(ctx context.Context, actor contract.Actor, query pla
 			return inventory, err
 		}
 		inventory.Items = items
+	case "domains":
+		items, err := s.inventoryDomains(ctx, query)
+		if err != nil {
+			return inventory, err
+		}
+		inventory.Items = items
 	case "changes":
 		items, err := s.inventoryChanges(ctx, query)
 		if err != nil {
@@ -964,7 +1015,7 @@ func (s *Service) Inventory(ctx context.Context, actor contract.Actor, query pla
 			inventory.Items = items
 			return inventory, nil
 		}
-		return inventory, contract.NewFault(contract.ValidationFailed, "unknown inventory collection", "Use summary, nodes, apps, environments, revisions, deployability, releases, builds, deployments, or changes.")
+		return inventory, contract.NewFault(contract.ValidationFailed, "unknown inventory collection", "Use summary, nodes, apps, environments, revisions, deployability, domains, releases, builds, deployments, or changes.")
 	}
 	return inventory, nil
 }
@@ -1164,6 +1215,57 @@ func (s *Service) inventoryEnvironments(ctx context.Context, query platform.Inve
 			return nil, unavailable()
 		}
 		items = append(items, env)
+	}
+	return items, rows.Err()
+}
+
+func (s *Service) inventoryDomains(ctx context.Context, query platform.InventoryQuery) ([]platform.DomainBinding, error) {
+	items := []platform.DomainBinding{}
+	statement := `SELECT d.name,a.name,e.name,d.is_primary,d.desired_revision,d.applied_revision,
+        d.route_state,d.route_error,d.route_applied_at,d.route_observed_at,
+        d.expected_addresses,d.dns_state,d.dns_addresses,d.dns_error,d.dns_observed_at,
+        d.certificate_state,d.certificate_not_after,d.certificate_error,d.certificate_observed_at,
+        d.public_state,coalesce(d.public_status,0),d.public_error,d.public_observed_at,d.observed_at,
+        coalesce(dep.instances,'[]'::jsonb)
+        FROM eregion_platform_domains d
+        JOIN eregion_platform_environments e ON e.id=d.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        LEFT JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id
+        WHERE ($1='' OR a.name=$1) AND ($2='' OR e.name=$2)
+        ORDER BY a.name,e.name,d.is_primary DESC,d.name LIMIT $3`
+	rows, err := s.pool.Query(ctx, statement, query.App, query.Environment, query.Limit)
+	if err != nil {
+		return nil, unavailable()
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var item platform.DomainBinding
+		var rawInstances []byte
+		if err := rows.Scan(&item.Domain, &item.App, &item.Environment, &item.Primary,
+			&item.DesiredRevision, &item.AppliedRevision, &item.RouteState, &item.RouteError,
+			&item.RouteAppliedAt, &item.RouteObservedAt, &item.ExpectedAddresses,
+			&item.DNSState, &item.DNSAddresses, &item.DNSError, &item.DNSObservedAt,
+			&item.CertificateState, &item.CertificateNotAfter, &item.CertificateError, &item.CertificateObservedAt,
+			&item.PublicState, &item.PublicStatus, &item.PublicError, &item.PublicObservedAt, &item.ObservedAt,
+			&rawInstances); err != nil {
+			return nil, unavailable()
+		}
+		if item.ExpectedAddresses == nil {
+			item.ExpectedAddresses = []string{}
+		}
+		if item.DNSAddresses == nil {
+			item.DNSAddresses = []string{}
+		}
+		if len(rawInstances) > 0 {
+			var instances []platform.DeploymentInstance
+			if err := json.Unmarshal(rawInstances, &instances); err == nil {
+				item.Upstreams = platform.WebUpstreams(instances)
+			}
+		}
+		if item.Upstreams == nil {
+			item.Upstreams = []string{}
+		}
+		items = append(items, item)
 	}
 	return items, rows.Err()
 }

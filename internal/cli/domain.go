@@ -3,12 +3,14 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
+	"net/url"
 	"strings"
-	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
@@ -17,49 +19,108 @@ import (
 )
 
 // domainSpecs is `eregion domain`: public hostnames that Caddy on the main
-// node routes to an environment, each with its own ACME certificate.
+// node routes to an environment, each with its own ACME certificate. The
+// binding, route, DNS record, certificate and public response are reported
+// separately.
 func (a *app) domainSpecs() []spec {
 	parent := platformMeta("Route public hostnames to environments through Caddy", "eregion domain list --json")
 	add := platformMutationMeta("Route a public hostname to an environment", "eregion domain add hello production hello.example.com")
 	add.WhenToUse = []string{"Give an environment a public HTTPS URL. Create the DNS record it shows; Caddy gets the certificate once it resolves."}
-	remove := platformMutationMeta("Remove a public hostname's route", "eregion domain remove hello production hello.example.com")
-	submission := func(cmd *cobra.Command) {
+	add.Next = []string{"eregion domain list"}
+	remove := platformDestructiveMeta("Remove a public hostname's route", "eregion domain remove hello production hello.example.com --confirm <token>")
+	remove.Next = []string{"eregion domain list"}
+	changeFlags := func(cmd *cobra.Command) {
 		cmd.Flags().Bool("dry-run", false, "Validate with the API and return a plan without accepting an operation")
 		cmd.Flags().String("idempotency-key", "", "Stable submission key; one is generated when empty")
+		cmd.Flags().Bool("detach", false, "Return after acceptance instead of following the operation")
+		followFlags(cmd)
+	}
+	listFlags := func(cmd *cobra.Command) {
+		cmd.Flags().String("app", "", "Filter by app name")
+		cmd.Flags().String("environment", "", "Filter by environment name")
+		cmd.Flags().Int("limit", 100, "Maximum items (1–200)")
 	}
 	return []spec{{
 		use:  "domain",
 		meta: parent,
 		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{
-			{use: "add <app> <environment> <hostname>", meta: add, args: cobra.ExactArgs(3), flags: submission,
-				run: func(cmd *cobra.Command, args []string) (result, error) {
-					return a.domainChange(cmd, platform.KindDomainAdd, args)
-				}},
-			{use: "remove <app> <environment> <hostname>", meta: remove, args: cobra.ExactArgs(3), flags: submission,
-				run: func(cmd *cobra.Command, args []string) (result, error) {
-					return a.domainChange(cmd, platform.KindDomainRemove, args)
-				}},
-			{use: "list", meta: platformMeta("List public hostnames and the environments they route to", "eregion domain list --json"), args: platformReadArgs,
-				flags: addInventoryFlags,
+			{use: "add <app> <environment> <hostname>", meta: add, args: cobra.ExactArgs(3), flags: func(cmd *cobra.Command) {
+				changeFlags(cmd)
+				cmd.Flags().Bool("primary", false, "Make this the environment's primary hostname, demoting the current one")
+			}, run: func(cmd *cobra.Command, args []string) (result, error) {
+				return a.domainAdd(cmd, args)
+			}},
+			{use: "remove <app> <environment> <hostname>", meta: remove, args: cobra.ExactArgs(3), flags: func(cmd *cobra.Command) {
+				changeFlags(cmd)
+				cmd.Flags().String("confirm", "", "Confirmation token from --dry-run")
+			}, run: func(cmd *cobra.Command, args []string) (result, error) {
+				return a.domainRemove(cmd, args)
+			}},
+			{use: "list", meta: platformMeta("List public hostnames with route, DNS, certificate and public-response state", "eregion domain list --app hello --environment production --json"), args: platformReadArgs,
+				flags: listFlags,
 				run:   a.domainList},
 		},
 	}}
 }
 
-func (a *app) domainChange(cmd *cobra.Command, kind string, args []string) (result, error) {
-	target, err := platform.NewEnvironmentTarget(args[0], args[1])
+func (a *app) domainAdd(cmd *cobra.Command, args []string) (result, error) {
+	primary, _ := cmd.Flags().GetBool("primary")
+	input := platform.DomainInput{
+		App: args[0], Environment: args[1], Domain: args[2],
+		Primary: primary, Addresses: mainNodeAddresses(cmd.Context()),
+	}
+	return a.domainChange(cmd, platform.KindDomainAdd, input)
+}
+
+func (a *app) domainRemove(cmd *cobra.Command, args []string) (result, error) {
+	input := platform.DomainInput{App: args[0], Environment: args[1], Domain: args[2]}
+	return a.domainChange(cmd, platform.KindDomainRemove, input)
+}
+
+func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.DomainInput) (result, error) {
+	target, err := platform.NewEnvironmentTarget(input.App, input.Environment)
 	if err != nil {
 		return result{}, err
 	}
-	input := platform.DomainInput{App: args[0], Environment: args[1], Domain: args[2]}
 	normalized, err := platform.Default().Normalize(kind, target.String(), mustJSON(input))
 	if err != nil {
 		return result{}, err
 	}
-	domain := normalized.Input.(*platform.DomainInput).Domain
-	if dry, _ := cmd.Flags().GetBool("dry-run"); dry {
-		return a.submitPlatformRawMode(cmd, kind, target.String(), normalized.Canonical, "", true)
+	input = *normalized.Input.(*platform.DomainInput)
+	client, err := a.client(cmd)
+	if err != nil {
+		return result{}, err
+	}
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	rawInput := normalized.Canonical
+	if kind == platform.KindDomainRemove && !dryRun {
+		confirm, _ := cmd.Flags().GetString("confirm")
+		token := platformConfirmationToken(kind, target.String(), rawInput)
+		if confirm == "" {
+			return result{}, contract.NewFault(contract.ConfirmationRequired, "--confirm is required to remove a domain", "Run the command with --dry-run and pass the returned confirmation token.")
+		}
+		if subtle.ConstantTimeCompare([]byte(confirm), []byte(token)) != 1 {
+			return result{}, contract.NewFault(contract.PreconditionFailed, "confirmation token does not match this plan", "Run with --dry-run and pass the confirmation token for the exact target and input.")
+		}
+	}
+	if dryRun {
+		preview, err := submitDomain(cmd, client, kind, target.String(), rawInput, "", true)
+		if err != nil {
+			return result{}, err
+		}
+		if kind == platform.KindDomainRemove {
+			token := platformConfirmationToken(kind, target.String(), rawInput)
+			preview.data, preview.plain = platformWithConfirmation(preview.data.(json.RawMessage), token)
+		} else {
+			records := domainRecords(input.Domain, input.Addresses)
+			preview.plain += "\n" + domainRecordText(input)
+			var value any
+			_ = json.Unmarshal(preview.data.(json.RawMessage), &value)
+			encoded, _ := json.Marshal(map[string]any{"preview": value, "dns_records": records})
+			preview.data = encoded
+		}
+		return preview, nil
 	}
 	key, _ := cmd.Flags().GetString("idempotency-key")
 	if key == "" {
@@ -68,125 +129,295 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, args []string) (resu
 	if err := contract.ValidateIdempotencyKey(key); err != nil {
 		return result{}, err
 	}
-	client, err := a.client(cmd)
-	if err != nil {
-		return result{}, err
-	}
-	raw, err := client.SubmitAction(cmd.Context(), kind, target.String(), normalized.Canonical, key, false)
+	submission, err := submitDomain(cmd, client, kind, target.String(), rawInput, key, false)
 	if err != nil {
 		return result{}, err
 	}
 	var op contract.Operation
-	if err := json.Unmarshal(raw, &op); err != nil {
-		return result{}, contract.NewFault(contract.Internal, "unexpected API answer", err.Error())
+	if err := json.Unmarshal(submission.data.(json.RawMessage), &op); err != nil || op.ID == "" {
+		return result{}, contract.NewFault(contract.Internal, "unexpected operation answer", "Check binary compatibility before assuming the change was rejected.")
 	}
-	op, err = a.waitOperation(cmd.Context(), op.ID, time.Minute)
+
+	detach, _ := cmd.Flags().GetBool("detach")
+	if detach {
+		data := domainChangeData{
+			Domain: input.Domain, App: input.App, Environment: input.Environment,
+			Primary: input.Primary, OperationID: op.ID,
+			DNSRecords: domainRecords(input.Domain, input.Addresses),
+		}
+		plain := "Accepted " + kind + " for " + input.Domain + "\noperation: " + string(op.ID) + "\nnext: eregion operations follow " + string(op.ID)
+		if kind == platform.KindDomainAdd {
+			plain += "\n" + domainRecordText(input)
+		}
+		return result{data: data, plain: plain}, nil
+	}
+	config := followConfig(cmd)
+	follow := config != nil && config.mode == "plain" && isTerminal(config.in) && isTerminal(config.out)
+	if follow {
+		// Show the record before the worker starts so it can be created while
+		// the operation runs.
+		fmt.Fprintln(config.out, domainRecordText(input))
+		_, followErr := a.followOperation(cmd, client, op.ID)
+		if followErr != nil {
+			return result{streamed: true}, followErr
+		}
+		fmt.Fprintln(config.out, a.domainStateText(cmd, input))
+		return result{streamed: true}, nil
+	}
+
+	data, plain := a.domainChangeResult(cmd, kind, input, op)
+	return result{data: data, plain: plain}, nil
+}
+
+func submitDomain(cmd *cobra.Command, client Backend, kind, target string, input json.RawMessage, key string, dryRun bool) (result, error) {
+	raw, err := client.SubmitAction(cmd.Context(), kind, target, input, key, dryRun)
 	if err != nil {
 		return result{}, err
 	}
-	if op.State != contract.Succeeded {
-		return result{}, contract.NewFault(contract.Unavailable, "the domain change "+string(op.State)+" ("+string(op.ErrorCode)+")", "Inspect it with eregion operations events "+string(op.ID)+".")
+	return platformOperationResult(raw, dryRun), nil
+}
+
+type domainRecord struct {
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type domainChangeData struct {
+	Domain       string               `json:"domain"`
+	App          string               `json:"app"`
+	Environment  string               `json:"environment"`
+	Primary      bool                 `json:"primary"`
+	OperationID  contract.OperationID `json:"operation_id,omitempty"`
+	DNSRecords   []domainRecord       `json:"dns_records"`
+	DNSState     platform.DNSState    `json:"dns_state,omitempty"`
+	DNSAddresses []string             `json:"dns_addresses,omitempty"`
+	DNSError     string               `json:"dns_error,omitempty"`
+	RouteState   platform.RouteState  `json:"route_state,omitempty"`
+	RouteError   string               `json:"route_error,omitempty"`
+	Certificate  string               `json:"certificate_state,omitempty"`
+	PublicState  platform.PublicState `json:"public_state,omitempty"`
+	PublicError  string               `json:"public_error,omitempty"`
+	Ready        bool                 `json:"ready"`
+}
+
+func (a *app) domainChangeResult(cmd *cobra.Command, kind string, input platform.DomainInput, op contract.Operation) (domainChangeData, string) {
+	data := domainChangeData{
+		Domain: input.Domain, App: input.App, Environment: input.Environment, Primary: input.Primary,
+		OperationID: op.ID, DNSRecords: domainRecords(input.Domain, input.Addresses),
 	}
-	data := map[string]any{"domain": domain, "app": args[0], "environment": args[1], "operation_id": op.ID}
 	if kind == platform.KindDomainRemove {
-		return result{data: data, plain: "Removed the route for " + domain + "."}, nil
+		return data, "Accepted removal of " + input.Domain + "; the worker rewrites the Caddy routes.\noperation: " + string(op.ID)
 	}
-	plain := []string{"Routed https://" + domain + " to " + args[0] + "/" + args[1] + "."}
-	if ip := currentPublicIPv4(); ip != "" {
-		data["dns_record"] = map[string]string{"type": "A", "name": domain, "value": ip}
-		check := checkDNS(cmd.Context(), domain, ip, "")
-		data["dns_resolves"] = check.Matches
-		plain = append(plain, "", "DNS record:", "  A  "+domain+"  "+ip)
-		switch {
-		case check.Matches:
-			plain = append(plain, "It resolves; Caddy gets the certificate now.")
-		case check.Proxied:
-			plain = append(plain, "It is proxied by Cloudflare; set it to DNS only so Caddy can get the certificate.")
-		default:
-			plain = append(plain, "It does not resolve to "+ip+" yet; Caddy gets the certificate once it does.")
+	if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
+		data.RouteState, data.RouteError = binding.RouteState, binding.RouteError
+		data.Certificate = string(binding.CertificateState)
+		data.PublicState, data.PublicError = binding.PublicState, binding.PublicError
+		data.Primary = binding.Primary
+	}
+	observation := platform.LookupPublicDNS(cmd.Context(), input.Domain)
+	data.DNSAddresses, data.DNSError = observation.Addresses, observation.Error
+	data.DNSState = platform.ClassifyDNS(input.Addresses, observation.Addresses)
+	data.Ready = data.RouteState == platform.RouteApplied && data.DNSState == platform.DNSOK &&
+		data.Certificate == string(platform.CertificateValid) && data.PublicState == platform.PublicOK
+	return data, domainChangeText(data)
+}
+
+func (a *app) domainStateText(cmd *cobra.Command, input platform.DomainInput) string {
+	data, _ := a.domainChangeResult(cmd, platform.KindDomainAdd, input, contract.Operation{})
+	return domainStateLines(data)
+}
+
+func (a *app) domainBinding(cmd *cobra.Command, app, environment, domain string) (*platform.DomainBinding, error) {
+	raw, err := a.platformReadInventoryWith(cmd, "domains", url.Values{"app": {app}, "environment": {environment}})
+	if err != nil {
+		return nil, err
+	}
+	var page struct {
+		Items []platform.DomainBinding `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "the node returned invalid domain state", "Check binary compatibility before assuming the route is absent.")
+	}
+	for index := range page.Items {
+		if page.Items[index].Domain == domain {
+			return &page.Items[index], nil
 		}
 	}
-	return result{data: data, plain: strings.Join(plain, "\n")}, nil
+	return nil, contract.NewFault(contract.NotFound, domain+" is not in the domain inventory", "Refresh with eregion domain list.")
 }
 
 func (a *app) domainList(cmd *cobra.Command, _ []string) (result, error) {
-	raw, err := a.platformReadInventory(cmd, "environments")
+	filters := url.Values{}
+	for _, name := range []string{"app", "environment"} {
+		value, _ := cmd.Flags().GetString(name)
+		if value != "" {
+			filters.Set(name, value)
+		}
+	}
+	limit, _ := cmd.Flags().GetInt("limit")
+	filters.Set("limit", fmt.Sprint(limit))
+	raw, err := a.platformReadInventoryWith(cmd, "domains", filters)
 	if err != nil {
 		return result{}, err
 	}
-	var inv struct {
-		Items []platform.Environment `json:"items"`
+	var page struct {
+		Items []platform.DomainBinding `json:"items"`
 	}
-	if err := json.Unmarshal(raw, &inv); err != nil {
-		return result{}, contract.NewFault(contract.Internal, "unexpected inventory answer", err.Error())
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return result{}, contract.NewFault(contract.Unavailable, "the node returned invalid domain state", "Check binary compatibility before assuming domains are absent.")
 	}
-	type row struct {
-		Domain      string `json:"domain"`
-		App         string `json:"app"`
-		Environment string `json:"environment"`
-		Upstream    string `json:"upstream"`
+	if len(page.Items) == 0 {
+		return result{data: []platform.DomainBinding{}, plain: "No domains. Add one with eregion domain add <app> <environment> <hostname>."}, nil
 	}
-	rows := []row{}
 	var table strings.Builder
-	for _, env := range inv.Items {
-		for _, d := range env.Domains {
-			r := row{d, env.App, env.Name, fmt.Sprintf("127.0.0.1:%d", env.HostPort)}
-			rows = append(rows, r)
-			fmt.Fprintf(&table, "%-40s %-16s %-16s %s\n", r.Domain, r.App, r.Environment, r.Upstream)
+	fmt.Fprintf(&table, "%-36s %-3s %-14s %-14s %-9s %-8s %-11s %-8s %s\n",
+		"DOMAIN", "PRI", "APP", "ENVIRONMENT", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY")
+	for _, item := range page.Items {
+		ready := "no"
+		if item.Ready() {
+			ready = "yes"
+		}
+		fmt.Fprintf(&table, "%-36s %-3s %-14s %-14s %-9s %-8s %-11s %-8s %s\n",
+			item.Domain, primaryMark(item.Primary), item.App, item.Environment,
+			item.RouteState, item.DNSState, item.CertificateState, item.PublicState, ready)
+		if err := domainBindingError(item); err != "" {
+			fmt.Fprintf(&table, "  %s\n", err)
 		}
 	}
-	if len(rows) == 0 {
-		return result{data: rows, plain: "No domains. Add one with eregion domain add <app> <environment> <hostname>."}, nil
-	}
-	return result{data: rows, plain: fmt.Sprintf("%-40s %-16s %-16s %s\n", "DOMAIN", "APP", "ENVIRONMENT", "UPSTREAM") + table.String()}, nil
+	return result{data: page.Items, plain: table.String()}, nil
 }
 
-// waitOperation polls an operation until it ends or within passes.
-func (a *app) waitOperation(ctx context.Context, id contract.OperationID, within time.Duration) (contract.Operation, error) {
-	client, err := a.client(nil)
-	if err != nil {
-		return contract.Operation{}, err
+func domainBindingError(item platform.DomainBinding) string {
+	parts := []string{}
+	for _, part := range []struct{ name, value string }{
+		{"route", item.RouteError}, {"dns", item.DNSError},
+		{"certificate", item.CertificateError}, {"public", item.PublicError},
+	} {
+		if part.value != "" {
+			parts = append(parts, part.name+": "+part.value)
+		}
 	}
-	deadline := time.Now().Add(within)
-	for {
-		raw, err := client.Get(ctx, id)
+	return strings.Join(parts, "; ")
+}
+
+func domainChangeText(data domainChangeData) string {
+	lines := []string{"Accepted the domain binding " + data.Domain + " for " + data.App + "/" + data.Environment + "."}
+	if data.OperationID != "" {
+		lines = append(lines, "operation: "+string(data.OperationID))
+	}
+	lines = append(lines, domainRecordLines(data)...)
+	lines = append(lines, domainStateLines(data))
+	return strings.Join(lines, "\n")
+}
+
+func domainRecordText(input platform.DomainInput) string {
+	return strings.Join(domainRecordLines(domainChangeData{Domain: input.Domain, DNSRecords: domainRecords(input.Domain, input.Addresses)}), "\n")
+}
+
+func domainRecordLines(data domainChangeData) []string {
+	lines := []string{}
+	if len(data.DNSRecords) == 0 {
+		return []string{"No DNS record address is known; add an A/AAAA record pointing at the main node."}
+	}
+	lines = append(lines, "", "DNS record:")
+	for _, record := range data.DNSRecords {
+		lines = append(lines, fmt.Sprintf("  %-4s  %-36s  %s", record.Type, record.Name, record.Value))
+	}
+	return lines
+}
+
+func domainStateLines(data domainChangeData) string {
+	route := string(data.RouteState)
+	if route == "" {
+		route = string(platform.RoutePending)
+	}
+	certificate := data.Certificate
+	if certificate == "" {
+		certificate = string(platform.CertificatePending)
+	}
+	public := string(data.PublicState)
+	if public == "" {
+		public = string(platform.PublicPending)
+	}
+	dns := string(data.DNSState)
+	if dns == "" {
+		dns = string(platform.DNSPending)
+	}
+	lines := []string{
+		fmt.Sprintf("Route: %s", route),
+		fmt.Sprintf("DNS: %s", dns),
+		fmt.Sprintf("Certificate: %s", certificate),
+		fmt.Sprintf("Public: %s", public),
+	}
+	if !data.Ready {
+		lines = append(lines, "Ready: no (DNS, route, certificate and public response must all succeed)")
+	} else {
+		lines = append(lines, "Ready: yes")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func domainRecords(domain string, addresses []string) []domainRecord {
+	records := make([]domainRecord, 0, len(addresses))
+	for _, address := range addresses {
+		addr, err := netip.ParseAddr(address)
 		if err != nil {
-			return contract.Operation{}, err
+			continue
 		}
-		var op contract.Operation
-		if err := json.Unmarshal(raw, &op); err != nil {
-			return contract.Operation{}, contract.NewFault(contract.Internal, "unexpected API answer", err.Error())
-		}
-		if op.State.Terminal() {
-			return op, nil
-		}
-		if time.Now().After(deadline) {
-			return op, contract.NewFault(contract.Unavailable, "operation "+string(id)+" is still "+string(op.State), "Follow it with eregion operations events "+string(id)+".")
-		}
-		select {
-		case <-ctx.Done():
-			return op, ctx.Err()
-		case <-time.After(time.Second):
+		if addr.Unmap().Is4() {
+			records = append(records, domainRecord{Type: "A", Name: domain, Value: addr.Unmap().String()})
+		} else {
+			records = append(records, domainRecord{Type: "AAAA", Name: domain, Value: addr.String()})
 		}
 	}
+	return records
 }
 
-// currentPublicIPv4 is the main node's public address from the current
-// context's WireGuard endpoint.
-func currentPublicIPv4() string {
+func primaryMark(primary bool) string {
+	if primary {
+		return "yes"
+	}
+	return ""
+}
+
+// mainNodeAddresses is the address the domain's DNS record points at: the
+// current context's WireGuard endpoint (the main node's public address), or
+// the SSH target when the context predates WireGuard.
+func mainNodeAddresses(ctx context.Context) []string {
 	store, err := host.LoadContextStore("")
-	if err != nil || store.Current == "" {
-		return ""
-	}
-	ctx, err := store.Get("")
-	if err != nil || ctx.SSH == nil || ctx.SSH.WireGuard == nil {
-		return ""
-	}
-	h, _, err := net.SplitHostPort(ctx.SSH.WireGuard.Endpoint)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return h
+	current, err := store.Get("")
+	if err != nil || current.SSH == nil {
+		return nil
+	}
+	target := current.SSH.Address
+	if current.SSH.WireGuard != nil && current.SSH.WireGuard.Endpoint != "" {
+		target = current.SSH.WireGuard.Endpoint
+	}
+	hostText := target
+	if hostPart, _, err := net.SplitHostPort(target); err == nil {
+		hostText = hostPart
+	}
+	if addr, err := netip.ParseAddr(hostText); err == nil {
+		return []string{addr.Unmap().String()}
+	}
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", hostText)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(ips))
+	seen := map[string]bool{}
+	for _, ip := range ips {
+		value := ip.Unmap().String()
+		if !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func randomHex(n int) string {

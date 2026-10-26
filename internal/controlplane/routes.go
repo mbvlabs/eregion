@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,13 +27,18 @@ func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID,
 		return w.settle(ctx, id, attempt, err)
 	}
 	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		kind, summary := "domain.added", "Routed "+input.Domain+" to "+input.App+"/"+input.Environment
+		kind, summary := "domain.added", "Saved the binding for "+input.Domain+" on "+input.App+"/"+input.Environment+"; route and observations are reported separately."
 		if normalized.Kind == platform.KindDomainRemove {
-			kind, summary = "domain.removed", "Removed the route for "+input.Domain
+			kind, summary = "domain.removed", "Removed the binding and route for "+input.Domain
 		}
 		return insertPlatformChange(ctx, tx, op, kind, input.App, input.Environment, summary, map[string]any{"domain": input.Domain}, nil)
 	})
 }
+
+// caddyRoutesLockKey serializes every writer of the one routes file, including
+// domain changes and deployment upstream switches. It is a PostgreSQL advisory
+// lock, not a per-process mutex, so API and worker processes cooperate.
+const caddyRoutesLockKey int64 = 0x6361646479726f75 // "caddyrou"
 
 // syncRoutes rewrites the Caddy routes file from the domains table and each
 // environment's serving deployment, then loads the Caddyfile through Caddy's
@@ -48,7 +54,22 @@ func (s *Service) switchRoutesForDeployment(ctx context.Context, env platform.En
 }
 
 func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.EnvironmentID, overrideUpstreams []string) error {
-	rows, err := s.pool.Query(ctx, `SELECT d.name,e.id,coalesce(dep.instances,'[]'::jsonb)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return unavailable()
+	}
+	defer rollback(tx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, caddyRoutesLockKey); err != nil {
+		return unavailable()
+	}
+	if overrideEnvironment != "" {
+		// A deployment switch changes this environment's desired upstreams, so
+		// its domains get a new route revision before the write is attempted.
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET desired_revision=desired_revision+1 WHERE environment_id=$1`, overrideEnvironment); err != nil {
+			return unavailable()
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT d.name,e.id,d.is_primary,coalesce(dep.instances,'[]'::jsonb)
         FROM eregion_platform_domains d
         JOIN eregion_platform_environments e ON e.id=d.environment_id
         LEFT JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id
@@ -57,11 +78,12 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 		return unavailable()
 	}
 	var routes []platform.Route
+	var routed, unrouted []string
 	for rows.Next() {
 		var route platform.Route
 		var environmentID platform.EnvironmentID
 		var rawInstances []byte
-		if err := rows.Scan(&route.Domain, &environmentID, &rawInstances); err != nil {
+		if err := rows.Scan(&route.Domain, &environmentID, &route.Primary, &rawInstances); err != nil {
 			rows.Close()
 			return unavailable()
 		}
@@ -75,24 +97,108 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 			}
 			route.Upstreams = platform.WebUpstreams(instances)
 		}
+		if len(route.Upstreams) == 0 {
+			unrouted = append(unrouted, route.Domain)
+		} else {
+			routed = append(routed, route.Domain)
+		}
 		routes = append(routes, route)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return unavailable()
 	}
+	content := platform.RenderRoutes(routes)
+	now := time.Now().UTC()
 	previous, err := os.ReadFile(platform.CaddyRoutesPath)
 	if err != nil {
-		return contract.NewFault(contract.PreconditionFailed, "Caddy is not set up on the main node ("+err.Error()+")", "Run eregion server init with a public hostname.")
+		fault := contract.NewFault(contract.PreconditionFailed, "Caddy is not set up on the main node ("+err.Error()+")", "Run eregion server init with a public hostname.")
+		return s.finishRouteWrite(ctx, tx, routed, unrouted, fault, now)
 	}
-	if err := os.WriteFile(platform.CaddyRoutesPath, platform.RenderRoutes(routes), 0o644); err != nil { //nolint:gosec // G306: Caddy reads it.
-		return contract.NewFault(contract.PreconditionFailed, "could not write the Caddy routes", err.Error())
+	if len(routed) > 0 {
+		if err := validateCaddyRoutes(ctx, content); err != nil {
+			return s.finishRouteWrite(ctx, tx, routed, unrouted, err, now)
+		}
 	}
-	if err := loadCaddyfile(ctx); err != nil {
-		_ = os.WriteFile(platform.CaddyRoutesPath, previous, 0o644) //nolint:gosec // G306: Caddy reads it.
-		_ = loadCaddyfile(context.WithoutCancel(ctx))
+	if !bytes.Equal(previous, content) {
+		if err := platform.WriteFileAtomic(platform.CaddyRoutesPath, content, 0o644); err != nil {
+			fault := contract.NewFault(contract.PreconditionFailed, "could not write the Caddy routes", err.Error())
+			return s.finishRouteWrite(ctx, tx, routed, unrouted, fault, now)
+		}
+		if err := loadCaddyfile(ctx); err != nil {
+			restoreErr := platform.WriteFileAtomic(platform.CaddyRoutesPath, previous, 0o644)
+			_ = loadCaddyfile(context.WithoutCancel(ctx))
+			if restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("restore previous routes: %w", restoreErr))
+			}
+			return s.finishRouteWrite(ctx, tx, routed, unrouted, err, now)
+		}
+	}
+	return s.finishRouteWrite(ctx, tx, routed, unrouted, nil, now)
+}
+
+// finishRouteWrite records the applied or failed route attempt and commits the
+// lock transaction. The file and the rows never claim more than the reload did.
+func (s *Service) finishRouteWrite(ctx context.Context, tx pgx.Tx, routed, unrouted []string, routeErr error, now time.Time) error {
+	if len(routed) > 0 {
+		if routeErr == nil {
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains
+                SET route_state='applied',route_error='',applied_revision=desired_revision,
+                    route_applied_at=coalesce(route_applied_at,$2),route_observed_at=$2,observed_at=$2
+                WHERE name=ANY($1)`, routed, now.UTC()); err != nil {
+				return unavailable()
+			}
+		} else if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains
+            SET route_state='failed',route_error=$2,route_observed_at=$3,observed_at=$3
+            WHERE name=ANY($1)`, routed, boundedRouteError(routeErr.Error()), now.UTC()); err != nil {
+			return unavailable()
+		}
+	}
+	if len(unrouted) > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains
+            SET route_state='pending',route_error=$2,route_observed_at=$3,observed_at=$3
+            WHERE name=ANY($1)`, unrouted, "no serving web upstream yet", now.UTC()); err != nil {
+			return unavailable()
+		}
+	}
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		if routeErr != nil {
+			return errors.Join(routeErr, commitErr)
+		}
+		return commitErr
+	}
+	return routeErr
+}
+
+func boundedRouteError(message string) string {
+	message = strings.TrimSpace(message)
+	if len(message) > 1000 {
+		message = message[:1000]
+	}
+	return message
+}
+
+// validateCaddyRoutes adapts the new routes fragment before it replaces the
+// file. Caddy's /adapt endpoint reports syntax errors without touching the
+// running configuration.
+func validateCaddyRoutes(ctx context.Context, content []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, platform.CaddyAdmin+"/adapt", bytes.NewReader(content))
+	if err != nil {
 		return err
 	}
+	req.Header.Set("Content-Type", "text/caddyfile")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return contract.NewFault(contract.Unavailable, "Caddy's admin endpoint does not answer", err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return contract.NewFault(contract.PreconditionFailed, fmt.Sprintf("Caddy rejected the routes (%d)", resp.StatusCode), strings.TrimSpace(string(body)))
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	return nil
 }
 

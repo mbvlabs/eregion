@@ -51,6 +51,14 @@ type reconcileArgs struct{}
 
 func (reconcileArgs) Kind() string { return "operation_reconcile" }
 
+type domainRouteArgs struct{}
+
+func (domainRouteArgs) Kind() string { return "platform_domain_routes" }
+
+type domainObserveArgs struct{}
+
+func (domainObserveArgs) Kind() string { return "platform_domain_observe" }
+
 type Runtime struct {
 	Service *Service
 	Jobs    *river.Client[pgx.Tx]
@@ -147,6 +155,8 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &platformWorker{service: service})
 	river.AddWorker(workers, &reconcileWorker{service: service})
+	river.AddWorker(workers, &domainRouteWorker{service: service})
+	river.AddWorker(workers, &domainObserveWorker{service: service})
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
@@ -161,6 +171,18 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		riverConfig.PeriodicJobs = []*river.PeriodicJob{
 			river.NewPeriodicJob(river.PeriodicInterval(5*time.Second), func() (river.JobArgs, *river.InsertOpts) {
 				return reconcileArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 3}
+			}, &river.PeriodicJobOpts{RunOnStart: true}),
+			// Reconcile the routes file on worker start and after any failed
+			// reload. The advisory lock keeps this independent of a domain
+			// change that is already writing the same file.
+			river.NewPeriodicJob(river.PeriodicInterval(30*time.Second), func() (river.JobArgs, *river.InsertOpts) {
+				return domainRouteArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
+			}, &river.PeriodicJobOpts{RunOnStart: true}),
+			// Observe DNS, certificate and public response separately. A
+			// transient probe failure is not a failed binding; the next run
+			// overwrites the observation.
+			river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
+				return domainObserveArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
 		}
 	}
@@ -469,6 +491,28 @@ type reconcileWorker struct {
 
 func (w *reconcileWorker) Work(ctx context.Context, _ *river.Job[reconcileArgs]) error {
 	return w.service.Reconcile(ctx)
+}
+
+type domainRouteWorker struct {
+	river.WorkerDefaults[domainRouteArgs]
+	service *Service
+}
+
+func (w *domainRouteWorker) Work(ctx context.Context, _ *river.Job[domainRouteArgs]) error {
+	// Periodic reconciliation retries on its own; returning the error would
+	// only make River attach a retry to the same schedule.
+	logDomainMaintenance("route reconciliation", w.service.reconcileDomainRoutes(ctx))
+	return nil
+}
+
+type domainObserveWorker struct {
+	river.WorkerDefaults[domainObserveArgs]
+	service *Service
+}
+
+func (w *domainObserveWorker) Work(ctx context.Context, _ *river.Job[domainObserveArgs]) error {
+	logDomainMaintenance("observation", w.service.observeDomains(ctx))
+	return nil
 }
 
 // Reconcile covers exhausted attempts lost to a process crash, not just errors
