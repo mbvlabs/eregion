@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/workspaceui"
 	"github.com/spf13/cobra"
@@ -44,7 +44,6 @@ func (a *app) workspaceSpecs() []spec {
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("tab", "fleet", "Initial workspace: fleet, apps, envs, releases, or deployments")
-			cmd.Flags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 			cmd.Flags().Bool("ascii", false, "Use ASCII glyphs instead of Unicode")
 			cmd.Flags().Bool("no-color", false, "Disable colour (NO_COLOR is also honoured)")
 			cmd.Flags().Bool("reduced-motion", false, "Replace spinners with a static loading label (EREGION_REDUCED_MOTION=1 is also honoured)")
@@ -126,48 +125,32 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	}, nil
 }
 
-func workspaceHost(cmd *cobra.Command) string {
-	endpoint, _ := cmd.Flags().GetString("api-url")
-	if endpoint == "" {
-		endpoint = os.Getenv("EREGION_API_URL")
-	}
-	if endpoint == "" {
-		endpoint = "http://127.0.0.1:8080"
-	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil || parsed.Host == "" {
+func workspaceHost(_ *cobra.Command) string {
+	store, err := host.LoadContextStore("")
+	if err != nil {
 		return ""
 	}
-	return parsed.Host
-}
-
-// workspacePlatformClient is the platform surface documented in the platform
-// contract. Asserting it at runtime keeps the workspace command compilable
-// against older API clients while refusing to invent a second HTTP path.
-type workspacePlatformClient interface {
-	PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error)
-	SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool) (json.RawMessage, error)
+	context, err := store.Get("")
+	if err != nil || context.SSH == nil {
+		return ""
+	}
+	return context.SSH.User + "@" + context.SSH.Address
 }
 
 type workspaceLiveAPI struct {
-	client   *api.Client
-	platform workspacePlatformClient
+	client Backend
 }
 
-func newWorkspaceAPI(client *api.Client) (workspaceui.API, error) {
-	platform, ok := any(client).(workspacePlatformClient)
-	if !ok {
-		return nil, contract.NewFault(contract.Internal, "this API client has no platform surface", "Upgrade the binary; the interactive workspace never bypasses api.Client.")
-	}
-	return workspaceLiveAPI{client: client, platform: platform}, nil
+func newWorkspaceAPI(client Backend) (workspaceui.API, error) {
+	return workspaceLiveAPI{client: client}, nil
 }
 
 func (w workspaceLiveAPI) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {
-	return w.platform.PlatformInventory(ctx, collection, filters)
+	return w.client.PlatformInventory(ctx, collection, filters)
 }
 
 func (w workspaceLiveAPI) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool) (json.RawMessage, error) {
-	return w.platform.SubmitAction(ctx, kind, target, input, idempotencyKey, dryRun)
+	return w.client.SubmitAction(ctx, kind, target, input, idempotencyKey, dryRun)
 }
 
 func (w workspaceLiveAPI) Get(ctx context.Context, id contract.OperationID) (json.RawMessage, error) {

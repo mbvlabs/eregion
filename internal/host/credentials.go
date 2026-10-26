@@ -13,7 +13,6 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/engine"
 )
 
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32,256}$`)
@@ -32,100 +31,17 @@ func knownScope(scope string) bool {
 // KnownScopes returns a copy of the server's accepted API scopes.
 func KnownScopes() []string { return append([]string(nil), scopes...) }
 
-// Credentials is the secret handoff for one bootstrap. Empty tokens mean this
-// is a read-only plan and the credential has not been generated yet.
-type Credentials struct {
-	Operator          string
-	Automation        string
-	AutomationSubject string
-	AutomationScopes  []string
-}
+// Credentials is the bootstrap credential handoff. Setup mints no API token;
+// CI/webhook tokens are added later with an explicit create command.
+type Credentials struct{}
 
-// LoadCredentials reads or creates the two bootstrap credentials under the
-// bootstrap state directory. Plan (apply=false) never creates a credential.
-func LoadCredentials(cfg Config, apply bool) (Credentials, error) {
-	role, err := cfg.RoleConfig()
-	if err != nil {
+// LoadCredentials validates the role before bootstrap runs. It creates no
+// credential.
+func LoadCredentials(cfg Config, _ bool) (Credentials, error) {
+	if _, err := cfg.RoleConfig(); err != nil {
 		return Credentials{}, err
 	}
-	if !role.ControlPlane {
-		return Credentials{}, nil
-	}
-	credentials := Credentials{}
-	credentials.Operator, err = loadToken(filepath.Join(cfg.Layout.StateDir, "secrets", "operator.token"), cfg.OperatorTokenFile, apply)
-	if err != nil {
-		return Credentials{}, err
-	}
-	if len(cfg.AutomationScopes) > 0 {
-		credentials.AutomationSubject = cfg.AutomationSubject
-		credentials.AutomationScopes = append([]string(nil), cfg.AutomationScopes...)
-		credentials.Automation, err = loadToken(filepath.Join(cfg.Layout.StateDir, "secrets", "automation.token"), "", apply)
-		if err != nil {
-			return Credentials{}, err
-		}
-	}
-	return credentials, nil
-}
-
-func loadToken(statePath, inputPath string, create bool) (string, error) {
-	raw, mode, exists, err := fileState(statePath)
-	if err != nil {
-		return "", err
-	}
-	if exists {
-		if mode != 0o600 {
-			return "", fmt.Errorf("the bootstrap credential at %s must be mode 0600", statePath)
-		}
-		token := strings.TrimSpace(string(raw))
-		if !tokenPattern.MatchString(token) {
-			return "", fmt.Errorf("the bootstrap credential at %s is invalid; restore it or remove the bootstrap state deliberately", statePath)
-		}
-		if inputPath != "" {
-			provided, err := readTokenFile(inputPath)
-			if err != nil {
-				return "", err
-			}
-			if provided != token {
-				return "", fmt.Errorf("the supplied credential differs from the existing bootstrap credential; refusing to rotate it implicitly")
-			}
-		}
-		return token, nil
-	}
-	if inputPath != "" {
-		token, err := readTokenFile(inputPath)
-		if err != nil {
-			return "", err
-		}
-		if create {
-			if err := writeReplacingSecret(statePath, []byte(token+"\n"), "", ""); err != nil {
-				return "", err
-			}
-		}
-		return token, nil
-	}
-	if !create {
-		return "", nil
-	}
-	token, err := generateToken()
-	if err != nil {
-		return "", err
-	}
-	if err := writeReplacingSecret(statePath, []byte(token+"\n"), "", ""); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-func readTokenFile(path string) (string, error) {
-	raw, err := readPrivateFile(path, 1024)
-	if err != nil {
-		return "", fmt.Errorf("read the credential file %s: %w", path, err)
-	}
-	token := strings.TrimSpace(string(raw))
-	if !tokenPattern.MatchString(token) {
-		return "", fmt.Errorf("the credential file %s does not contain a valid API token", path)
-	}
-	return token, nil
+	return Credentials{}, nil
 }
 
 func generateToken() (string, error) {
@@ -149,20 +65,10 @@ func principal(actor contract.Actor, token string, scopes []string) api.Principa
 	return api.Principal{Actor: actor, TokenSHA256: tokenHash(token), Scopes: copied}
 }
 
-// AuthPrincipals builds the deterministic auth file contents.
-func (c Credentials) AuthPrincipals(node string) ([]api.Principal, error) {
-	if c.Operator == "" {
-		return nil, fmt.Errorf("the operator credential has not been generated")
-	}
-	operator := principal(contract.Actor{Kind: "operator", Subject: "operator@" + node}, c.Operator, scopes)
-	principals := []api.Principal{operator}
-	if c.Automation != "" {
-		subject := c.AutomationSubject
-		if subject == "" {
-			subject = "automation@" + node
-		}
-		principals = append(principals, principal(contract.Actor{Kind: "ci", Subject: subject}, c.Automation, c.AutomationScopes))
-	}
+// AuthPrincipals builds the deterministic auth file contents. Setup writes an
+// empty list; the auth file is only the CI/webhook token path.
+func (c Credentials) AuthPrincipals(string) ([]api.Principal, error) {
+	principals := []api.Principal{}
 	if _, err := api.NewAuth(principals); err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "the generated API credentials are invalid", err.Error())
 	}
@@ -183,16 +89,7 @@ func (c Credentials) AuthFile(node string) ([]byte, error) {
 }
 
 // TokenHashes is the only credential representation allowed in step inputs.
-func (c Credentials) TokenHashes() map[string]string {
-	hashes := map[string]string{}
-	if c.Operator != "" {
-		hashes["operator"] = engine.HashSecret(c.Operator)
-	}
-	if c.Automation != "" {
-		hashes["automation"] = engine.HashSecret(c.Automation)
-	}
-	return hashes
-}
+func (c Credentials) TokenHashes() map[string]string { return map[string]string{} }
 
 // CredentialFingerprint is safe to show. It is a digest, not the credential.
 func CredentialFingerprint(token string) string {
@@ -202,12 +99,7 @@ func CredentialFingerprint(token string) string {
 	return tokenHash(token)[:12]
 }
 
-func exportToken(path, token, owner, group string) (bool, error) {
-	if token == "" {
-		return false, fmt.Errorf("cannot export an empty credential")
-	}
-	return writeSecretOnce(path, []byte(token+"\n"), owner, group)
-}
+func tokenFingerprint(token string) string { return CredentialFingerprint(token) }
 
 // ReadAuthFile reads the existing principal list for an additive credential
 // command. It enforces the same owner-only mode as api.LoadAuth.
@@ -227,7 +119,7 @@ func ReadAuthFile(path string) ([]api.Principal, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if len(principals) == 0 {
-		return nil, fmt.Errorf("%s contains no credentials", path)
+		return principals, nil
 	}
 	if _, err := api.NewAuth(principals); err != nil {
 		return nil, err
@@ -246,9 +138,6 @@ func WriteAuthFile(path string, principals []api.Principal, owner, group string)
 	}
 	return writeFile(path, append(raw, '\n'), 0o600, owner, group)
 }
-
-// ReadTokenFile is the CLI adapter for explicit token inputs.
-func ReadTokenFile(path string) (string, error) { return readTokenFile(path) }
 
 // ValidToken reports whether a handed-off value has the API token shape. It
 // does not prove the token is authorized; the first authenticated request does.
@@ -271,7 +160,7 @@ func ensureState(cfg Config) error {
 // secretsForRedaction returns every secret bootstrap holds in memory. Callers
 // register them before producing any output.
 func secretsForRedaction(cfg Config, credentials Credentials) []string {
-	values := []string{cfg.DatabaseURL, credentials.Operator, credentials.Automation}
+	values := []string{cfg.DatabaseURL}
 	if strings.Contains(cfg.DatabaseURL, ":") {
 		// The URL password is often quoted or embedded in an error; register
 		// the individual password too.

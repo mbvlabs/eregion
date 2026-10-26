@@ -85,8 +85,8 @@ type ApplyEntry struct {
 
 // Status is the node-local bootstrap state plus the persisted step journal. It
 // deliberately does not evaluate drift: status works without the database URL,
-// operator-token output, binary, or other apply-only inputs. Run `bootstrap
-// plan` when those inputs are available to observe drift.
+// binary, or other apply-only inputs. Run `bootstrap plan` when those inputs
+// are available to observe drift.
 type Status struct {
 	Bootstrapped bool `json:"bootstrapped"`
 	Complete     bool `json:"complete"`
@@ -203,7 +203,7 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 	steps = append(steps, &binaryStep{cfg: r.Config, role: role})
 	if role.ControlPlane {
 		steps = append(steps, newAPIService(r.Config, r.Exec), newWorkerService(r.Config, r.Exec))
-		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe, token: credentials.Operator})
+		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe})
 	}
 	if role.NodeAgent {
 		steps = append(steps, &nodeConfigStep{cfg: r.Config})

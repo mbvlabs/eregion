@@ -12,16 +12,16 @@ import (
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
-// Probe checks the local API liveness and authenticated readiness endpoints.
+// Probe checks the local API liveness and public readiness endpoints.
 type Probe interface {
-	Health(context.Context, Config, string) error
+	Health(context.Context, Config) error
 }
 
 type httpProbe struct {
 	Client *http.Client
 }
 
-func (p httpProbe) Health(ctx context.Context, cfg Config, token string) error {
+func (p httpProbe) Health(ctx context.Context, cfg Config) error {
 	client := p.Client
 	if client == nil {
 		client = &http.Client{
@@ -47,14 +47,10 @@ func (p httpProbe) Health(ctx context.Context, cfg Config, token string) error {
 	if err := doProbe(client, health); err != nil {
 		return fmt.Errorf("API liveness check failed: %w", err)
 	}
-	if token == "" {
-		return fmt.Errorf("the operator credential is not available for the readiness check")
-	}
 	ready, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/readyz", nil)
 	if err != nil {
 		return err
 	}
-	ready.Header.Set("Authorization", "Bearer "+token)
 	if err := doProbe(client, ready); err != nil {
 		return fmt.Errorf("API readiness check failed: %w", err)
 	}
@@ -99,12 +95,11 @@ type readinessStep struct {
 	cfg   Config
 	exec  Exec
 	probe Probe
-	token string
 }
 
 func (s *readinessStep) ID() string { return "host-readiness-v1" }
 func (s *readinessStep) Describe() string {
-	return "Verify the API liveness and authenticated database readiness endpoints"
+	return "Verify the API liveness and public database readiness endpoints"
 }
 func (s *readinessStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -112,8 +107,7 @@ func (s *readinessStep) Inputs() ([]byte, error) {
 	return canonicalInput(struct {
 		Listen string `json:"listen"`
 		TLS    bool   `json:"tls"`
-		Token  string `json:"token_hash"`
-	}{s.cfg.APIListen, s.cfg.APITLSCert != "", engine.HashSecret(s.token)})
+	}{s.cfg.APIListen, s.cfg.APITLSCert != ""})
 }
 
 func (s *readinessStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
@@ -125,18 +119,15 @@ if systemctl is-active --quiet eregion-worker.service; then echo worker:ok; else
 	if strings.Contains(output, ":missing") {
 		return incomplete("control-plane services are not both active: " + output)
 	}
-	if s.token == "" {
-		return incomplete("services are active; the authenticated readiness check waits for the operator credential")
-	}
 	if s.probe == nil {
 		return engine.CheckResult{}, fmt.Errorf("no readiness probe is configured")
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
-	if err := s.probe.Health(probeCtx, s.cfg, s.token); err != nil {
+	if err := s.probe.Health(probeCtx, s.cfg); err != nil {
 		return incomplete("services are active but not ready: " + err.Error())
 	}
-	return complete("API liveness and authenticated /readyz succeeded")
+	return complete("API liveness and public /readyz succeeded")
 }
 
 func (s *readinessStep) Apply(ctx context.Context, _ engine.Runtime, _ engine.Reporter) (engine.ApplyResult, error) {
@@ -147,10 +138,10 @@ func (s *readinessStep) Apply(ctx context.Context, _ engine.Runtime, _ engine.Re
 	var last error
 	for time.Now().Before(deadline) {
 		probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
-		last = s.probe.Health(probeCtx, s.cfg, s.token)
+		last = s.probe.Health(probeCtx, s.cfg)
 		cancel()
 		if last == nil {
-			return engine.ApplyResult{Notes: []string{"API liveness and authenticated /readyz succeeded"}, Result: map[string]any{"ready": true}}, nil
+			return engine.ApplyResult{Notes: []string{"API liveness and public /readyz succeeded"}, Result: map[string]any{"ready": true}}, nil
 		}
 		select {
 		case <-ctx.Done():
@@ -162,7 +153,7 @@ func (s *readinessStep) Apply(ctx context.Context, _ engine.Runtime, _ engine.Re
 }
 
 func (s *readinessStep) Diff(context.Context, engine.Runtime) ([]string, error) {
-	return []string{"+ require both services active", "+ require GET /healthz and authenticated GET /readyz to succeed"}, nil
+	return []string{"+ require both services active", "+ require GET /healthz and public GET /readyz to succeed"}, nil
 }
 
 func (s *readinessStep) Plan(ctx context.Context, runtime engine.Runtime) (PlanEntry, error) {

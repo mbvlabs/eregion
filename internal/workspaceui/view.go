@@ -335,7 +335,7 @@ func (m Model) renderUnreachable(width, height int) string {
 	switch tab.errCode {
 	case contract.Unauthenticated:
 		title = "Authentication required"
-		detail = "Set EREGION_API_TOKEN for the selected API before opening the workspace."
+		detail = "Select a saved context with eregion context use before opening the workspace."
 	}
 	lines := []string{
 		m.riskStyle().Render(title),

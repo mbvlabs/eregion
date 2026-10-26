@@ -51,11 +51,12 @@ release. Re-check against the build being shipped.
    and provider firewall behavior need actual switchover/timeout/reboot testing.
    Lockdown uses firewall policy; do not assert sshd binds only wg0 without
    checking the actual config. Root/Docker administrative authority is explicit.
-2. **Handoff/login.** Current handoff includes an operator token and external DSN;
-   local identity/password files persist. Import validates/writes files and
-   changes context before its final readiness check. Existing pin handling,
-   overwrite/conflict safety, secret lifetime and JSON/no-TTY prompting need
-   regression review. Encrypted transport bundles are still credentials.
+2. **Handoff/login.** Current handoff includes the operator's SSH/WireGuard keys
+   and the external DSN, not an API token; local identity/password files
+   persist. Import validates/writes files and changes context before its final
+   node-RPC readiness check. Existing pin handling, overwrite/conflict safety,
+   secret lifetime and JSON/no-TTY prompting need regression review. Encrypted
+   transport bundles are still credentials.
 3. **Destructive approval.** CLI rollback's public intent digest is not a server
    authorization token; raw authenticated action submission can bypass that CLI
    check. Define server-side exact-target/revision checks for new deletion paths.

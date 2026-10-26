@@ -6,7 +6,7 @@
 # reloaded last, so root keeps working until every other change is in place.
 set -euo pipefail
 
-: "${ADMIN_USER:?}" "${AUTHORIZED_KEYS:?}" "${SUDO_PASSWORD:?}" "${SUDOERS:?}"
+: "${ADMIN_USER:?}" "${AUTHORIZED_KEYS:?}" "${SUDO_PASSWORD:?}" "${SUDOERS:?}" "${NODE_SUDOERS:?}"
 : "${WG_ADDRESS:?}" "${WG_PORT:?}" "${OPERATOR_PUBLIC_KEY:?}" "${OPERATOR_ADDRESS:?}"
 : "${SSH_PORT:?}" "${SSHD_DROPIN:?}" "${STATE_DIR:?}"
 : "${SWAP_MB:=1024}"
@@ -50,11 +50,19 @@ install -d -m 0700 -o "${ADMIN_USER}" -g "${ADMIN_USER}" "${home}/.ssh"
 printf '%s' "${AUTHORIZED_KEYS}" > "${home}/.ssh/authorized_keys"
 chown "${ADMIN_USER}:${ADMIN_USER}" "${home}/.ssh/authorized_keys"
 chmod 0600 "${home}/.ssh/authorized_keys"
-sudoers_tmp="$(mktemp /etc/sudoers.d/.eregion.XXXXXX)"
-printf '%s' "${SUDOERS}" > "${sudoers_tmp}"
-chmod 0440 "${sudoers_tmp}"
-visudo -cf "${sudoers_tmp}" >/dev/null
-mv -f "${sudoers_tmp}" /etc/sudoers.d/eregion
+install_sudoers() {
+  local path="$1" content="$2"
+  local tmp
+  tmp="$(mktemp "/etc/sudoers.d/.eregion.XXXXXX")"
+  printf '%s' "${content}" > "${tmp}"
+  chmod 0440 "${tmp}"
+  visudo -cf "${tmp}" >/dev/null
+  mv -f "${tmp}" "${path}"
+}
+# Node RPC is the only ordinary operator command the admin may run without a
+# password. Access lockdown stays available for setup and break-glass only.
+install_sudoers /etc/sudoers.d/eregion-node "${NODE_SUDOERS}"
+install_sudoers /etc/sudoers.d/eregion "${SUDOERS}"
 
 # WireGuard: the node key stays on the node; the operator is the one peer.
 install -d -m 0700 /etc/wireguard

@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/term"
-	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/tui"
 	"github.com/mbvlabs/eregion/internal/viewer"
@@ -127,7 +127,7 @@ func (a *app) follow(cmd *cobra.Command, args []string) (result, error) {
 
 // followOperation runs the shared follow loop through the selected presenter.
 // It never submits, cancels, or executes work.
-func (a *app) followOperation(cmd *cobra.Command, client *api.Client, id contract.OperationID) (result, error) {
+func (a *app) followOperation(cmd *cobra.Command, client Backend, id contract.OperationID) (result, error) {
 	if err := validateFollow(cmd); err != nil {
 		return result{}, err
 	}
@@ -204,13 +204,13 @@ func (a *app) followCleaner() viewer.Cleaner {
 	}
 }
 
-func (a *app) followJSON(cmd *cobra.Command, client *api.Client, id contract.OperationID, opts viewer.FollowOptions) (result, error) {
+func (a *app) followJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions) (result, error) {
 	summary, err := viewer.Follow(cmd.Context(), client, id, opts, nil)
 	err = followError(summary, err)
 	return result{data: newFollowResult(summary)}, err
 }
 
-func (a *app) followPlain(cmd *cobra.Command, client *api.Client, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
+func (a *app) followPlain(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
 	presenter := viewer.NewPlain(config.out, config.err, clean)
 	summary, err := viewer.Follow(cmd.Context(), client, id, opts, presenter.Observe)
 	err = followError(summary, err)
@@ -220,7 +220,7 @@ func (a *app) followPlain(cmd *cobra.Command, client *api.Client, id contract.Op
 	return result{data: newFollowResult(summary), streamed: true}, err
 }
 
-func (a *app) followNDJSON(cmd *cobra.Command, client *api.Client, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
+func (a *app) followNDJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
 	stream := output.NewStream(config.out, a.secrets)
 	var last uint64
 	emit := func(observation viewer.Observation) error {
@@ -251,7 +251,7 @@ func (a *app) followNDJSON(cmd *cobra.Command, client *api.Client, id contract.O
 	return result{data: newFollowResult(summary), streamed: true}, err
 }
 
-func (a *app) followInteractive(cmd *cobra.Command, client *api.Client, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
+func (a *app) followInteractive(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
 	ascii, _ := cmd.Flags().GetBool("ascii")
 	reduced, _ := cmd.Flags().GetBool("reduced-motion")
 	if strings.EqualFold(os.Getenv("TERM"), "dumb") {
@@ -317,14 +317,15 @@ func followError(summary viewer.Summary, err error) error {
 }
 
 func apiEndpoint(cmd *cobra.Command) string {
-	endpoint, _ := cmd.Flags().GetString("api-url")
-	if endpoint == "" {
-		endpoint = os.Getenv("EREGION_API_URL")
+	store, err := host.LoadContextStore("")
+	if err != nil {
+		return ""
 	}
-	if endpoint == "" {
-		endpoint = "http://127.0.0.1:8080"
+	context, err := store.Get("")
+	if err != nil {
+		return ""
 	}
-	return endpoint
+	return "ssh " + context.SSH.User + "@" + context.SSH.Address
 }
 
 type terminalFile interface {

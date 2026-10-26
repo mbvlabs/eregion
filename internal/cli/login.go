@@ -127,12 +127,11 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	rec := parseHandoffRecord(string(plain))
 	get := func(section, label string) string { return rec.field(section, label) }
-	name := get("Control plane API", "Context")
-	token := get("Control plane API", "Operator token")
+	name := get("Main node", "Context")
 	sshKey := get("Operator", "SSH private key")
 	wgKey := get("Operator", "WireGuard private key")
 	required := map[string]string{
-		"context": name, "operator token": token, "SSH private key": sshKey, "WireGuard private key": wgKey,
+		"context": name, "SSH private key": sshKey, "WireGuard private key": wgKey,
 		"WireGuard endpoint":   get("Main node", "WireGuard endpoint"),
 		"WireGuard public key": get("Main node", "WireGuard public key"),
 		"SSH host key":         get("Main node", "SSH host key"),
@@ -142,10 +141,9 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 			return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has no "+label, "Use the bundle from eregion server init's secrets handoff.")
 		}
 	}
-	for _, v := range []string{token, sshKey, wgKey, get("Operator", "Sudo password")} {
+	for _, v := range []string{sshKey, wgKey, get("Operator", "Sudo password")} {
 		a.secrets.Add(v)
 	}
-	apiURL := strings.TrimSpace(strings.SplitN(get("Control plane API", "URL"), " ", 2)[0])
 
 	dir, err := identityDir(name)
 	if err != nil {
@@ -196,10 +194,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	if _, err := store.Login(name, apiURL, token, host.KnownScopes()); err != nil {
-		return result{}, err
-	}
-	if err := store.SetSSH(name, route); err != nil {
+	if _, err := store.SaveContext(host.Context{Name: name, SSH: route}); err != nil {
 		return result{}, err
 	}
 	client, err := a.contextClient(cmd)
@@ -209,7 +204,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	data := map[string]string{"context": name, "api": apiURL, "route": route.User + "@" + route.Address + " over WireGuard"}
+	data := map[string]string{"context": name, "route": route.User + "@" + route.Address + " over WireGuard"}
 	if interactive {
 		fmt.Fprintln(cmd.ErrOrStderr(), ui.Card("Logged in to "+name, [][2]string{{"context", name + " (current)"}, {"route", data["route"]}}, nil))
 		return result{data: data, streamed: true}, nil

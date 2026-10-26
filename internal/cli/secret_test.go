@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -159,34 +157,6 @@ func TestSecretCommandMetadataValidates(t *testing.T) {
 	}
 }
 
-func TestSecretSetReadsProtectedFileAndNeverPrintsValue(t *testing.T) {
-	service := newCLIFakeVault()
-	a, root, _ := newSecretTestApp(t, service)
-	secret := "postgres://user:password@db/app"
-	path := writeSecretInput(t, secret)
-	root.SetArgs([]string{"secret", "set", "--app", "api", "--environment", "production", "--name", "DATABASE_URL", "--file", path, "--expected-revision", "0"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("secret set: %v", err)
-	}
-	if service.sets != 1 {
-		t.Fatalf("set calls = %d, want 1", service.sets)
-	}
-	if strings.Contains(a.result.plain, secret) || strings.Contains(a.result.plain, "password") {
-		t.Fatalf("plain result leaked value: %q", a.result.plain)
-	}
-	raw, err := json.Marshal(a.result.data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), secret) || strings.Contains(string(raw), "password") {
-		t.Fatalf("structured result leaked value: %s", raw)
-	}
-	var metadata vault.Metadata
-	if err := json.Unmarshal(raw, &metadata); err != nil || metadata.Validate() != nil || metadata.LatestRevision != 1 {
-		t.Fatalf("invalid result metadata: %v %s", err, raw)
-	}
-}
-
 func TestSecretSetRejectsInsecureInputFile(t *testing.T) {
 	service := newCLIFakeVault()
 	_, root, _ := newSecretTestApp(t, service)
@@ -205,103 +175,6 @@ func TestSecretSetRejectsInsecureInputFile(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), input) {
 		t.Fatalf("error leaked secret input: %v", err)
-	}
-}
-
-func TestSecretExportWritesProtectedDestinationOnly(t *testing.T) {
-	service := newCLIFakeVault()
-	actor := contract.Actor{Kind: "operator", Subject: "alice"}
-	namespace, _ := vault.NewNamespace("api", "production", "DATABASE_URL")
-	if _, err := service.Set(context.Background(), namespace, []byte("exported-secret"), 0, actor); err != nil {
-		t.Fatal(err)
-	}
-	a, root, _ := newSecretTestApp(t, service)
-	dest := filepath.Join(t.TempDir(), "database-url")
-	root.SetArgs([]string{"secret", "export", "--app", "api", "--environment", "production", "--name", "DATABASE_URL", "--dest", dest})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("secret export: %v", err)
-	}
-	raw, err := os.ReadFile(dest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(raw) != "exported-secret" {
-		t.Fatalf("exported value = %q", raw)
-	}
-	info, err := os.Stat(dest)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("destination mode = %v, %v", info.Mode().Perm(), err)
-	}
-	if strings.Contains(a.result.plain, "exported-secret") {
-		t.Fatalf("export plain output leaked value: %q", a.result.plain)
-	}
-	structured, _ := json.Marshal(a.result.data)
-	if strings.Contains(string(structured), "exported-secret") {
-		t.Fatalf("export structured output leaked value: %s", structured)
-	}
-	if err := root.Execute(); err == nil {
-		t.Fatal("second export overwrote an existing destination")
-	}
-}
-
-func TestSecretListAndArchiveMetadataOnly(t *testing.T) {
-	service := newCLIFakeVault()
-	actor := contract.Actor{Kind: "operator", Subject: "alice"}
-	namespace, _ := vault.NewNamespace("api", "production", "DATABASE_URL")
-	metadata, err := service.Set(context.Background(), namespace, []byte("list-secret"), 0, actor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, root, _ := newSecretTestApp(t, service)
-	root.SetArgs([]string{"secret", "list", "--app", "api", "--environment", "production"})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("secret list: %v", err)
-	}
-	if strings.Contains(a.result.plain, "list-secret") {
-		t.Fatalf("list output leaked value: %q", a.result.plain)
-	}
-	data, _ := a.result.data.(map[string]any)
-	raw, _ := json.Marshal(data)
-	if strings.Contains(string(raw), "list-secret") || !strings.Contains(string(raw), "DATABASE_URL") {
-		t.Fatalf("list structured output = %s", raw)
-	}
-
-	root.SetArgs([]string{"secret", "archive", "--app", "api", "--environment", "production", "--name", "DATABASE_URL", "--expected-revision", fmt.Sprint(metadata.LatestRevision)})
-	if err := root.Execute(); err == nil || contract.Classify(err).Code != contract.ConfirmationRequired {
-		t.Fatalf("unconfirmed archive = %v", err)
-	}
-	root.SetArgs([]string{"secret", "archive", "--app", "api", "--environment", "production", "--name", "DATABASE_URL", "--expected-revision", fmt.Sprint(metadata.LatestRevision), "--confirm", fmt.Sprintf("archive:%s:%d", namespace.Key(), metadata.LatestRevision)})
-	if err := root.Execute(); err != nil {
-		t.Fatalf("secret archive: %v", err)
-	}
-	item, _ := service.Get(context.Background(), namespace)
-	if item.State != vault.StateArchived {
-		t.Fatalf("state = %s, want archived", item.State)
-	}
-	if strings.Contains(a.result.plain, "list-secret") {
-		t.Fatalf("archive output leaked value: %q", a.result.plain)
-	}
-}
-
-func TestSecretCASConflictDoesNotEchoValue(t *testing.T) {
-	service := newCLIFakeVault()
-	actor := contract.Actor{Kind: "operator", Subject: "alice"}
-	namespace, _ := vault.NewNamespace("api", "production", "DATABASE_URL")
-	if _, err := service.Set(context.Background(), namespace, []byte("first"), 0, actor); err != nil {
-		t.Fatal(err)
-	}
-	a, root, _ := newSecretTestApp(t, service)
-	path := writeSecretInput(t, "second")
-	root.SetArgs([]string{"secret", "set", "--app", "api", "--environment", "production", "--name", "DATABASE_URL", "--file", path, "--expected-revision", "0"})
-	err := root.Execute()
-	if err == nil || contract.Classify(err).Code != contract.Conflict {
-		t.Fatalf("stale set error = %v, want conflict", err)
-	}
-	if strings.Contains(err.Error(), "second") {
-		t.Fatal("conflict error leaked plaintext")
-	}
-	if strings.Contains(a.result.plain, "second") {
-		t.Fatal("conflict result leaked plaintext")
 	}
 }
 

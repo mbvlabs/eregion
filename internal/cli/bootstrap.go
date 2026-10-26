@@ -28,9 +28,9 @@ import (
 func (a *app) bootstrapSpecs() []spec {
 	parentMeta := readMeta("Bootstrap a supported Debian/Ubuntu host",
 		[]string{"Plan and converge one fresh host with a node-local journal that never depends on PostgreSQL. Access-changing apply returns a rollback window; confirm it from a fresh connection."},
-		[]string{"eregion bootstrap plan --role main --node main --database-url-file /root/eregion-db.url --operator-token-out /root/eregion-operator.token --json", "eregion bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --database-url-file /root/eregion-db.url --apply --json"})
+		[]string{"eregion bootstrap plan --role main --node main --database-url-file /root/eregion-db.url --json", "eregion bootstrap remote --ssh-address root@203.0.113.10:22 --ssh-identity /root/eregion-bootstrap --ssh-known-hosts /root/known_hosts --role main --database-url-file /root/eregion-db.url --apply --json"})
 	parentMeta.Platforms = []string{"linux"}
-	parentMeta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_API_TOKEN"}
+	parentMeta.Environment = []string{"EREGION_DATABASE_URL"}
 	parentMeta.ErrorCodes = append(parentMeta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired, contract.Forbidden, contract.NotFound)
 	parentMeta.Prompts = false
 
@@ -56,7 +56,7 @@ func (a *app) bootstrapActionSpec(action string, mutating bool, parent CommandMe
 	meta.Mutating = mutating
 	if mutating {
 		meta.DryRun, meta.Confirmation, meta.NeedsRestart = true, "plan-bound", "required"
-		meta.Examples = []string{"eregion bootstrap apply --role main --node main --database-url-file /root/eregion-db.url --operator-token-out /root/eregion-operator.token --apply --confirm TOKEN --json"}
+		meta.Examples = []string{"eregion bootstrap apply --role main --node main --database-url-file /root/eregion-db.url --apply --confirm TOKEN --json"}
 	}
 	return spec{use: action, meta: meta, flags: bootstrapFlags, run: func(cmd *cobra.Command, _ []string) (result, error) {
 		if action == "apply" {
@@ -167,9 +167,6 @@ func remoteFlags(cmd *cobra.Command) {
 	f.String("ssh-user", "root", "SSH account used for first contact")
 	f.String("ssh-identity", "", "Owner-only unencrypted SSH private key")
 	f.String("ssh-known-hosts", "", "known_hosts file containing the pinned host key")
-	f.String("context-name", "", "Save the handed-off operator token under this context name (default: node)")
-	f.String("context-url", "", "API origin saved in the context; defaults to the listener or loopback")
-	f.String("token-file-out", "", "Optional owner-only local file for the handed-off operator token")
 }
 
 func bootstrapFlags(cmd *cobra.Command) {
@@ -188,11 +185,6 @@ func bootstrapInputFlags(cmd *cobra.Command) {
 	f.String("role", "main", "Placement: main, application, builder, or telemetry")
 	f.String("node", "local", "Node name; local and main are accepted names for the in-process local identity")
 	f.String("database-url-file", "", "Owner-only external PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
-	f.String("operator-token-file", "", "Optional existing owner-only operator token input")
-	f.String("operator-token-out", "", "Required absolute operator token output for main; mode 0600")
-	f.String("automation-subject", "", "Optional CI credential subject")
-	f.StringSlice("automation-scope", nil, "Explicit CI scopes")
-	f.String("automation-token-out", "", "Absolute CI token output; mode 0600")
 	f.String("binary", "", "eregion binary to install on the host; defaults to this executable")
 	f.String("api-listen", "127.0.0.1:8080", "API listener; non-loopback apply is access-changing")
 	f.String("api-tls-cert", "", "TLS certificate source")
@@ -216,9 +208,6 @@ func (a *app) bootstrapConfig(cmd *cobra.Command) (host.Config, error) {
 		cfg.DatabaseURL = strings.TrimSpace(string(raw))
 	}
 	a.secrets.Add(cfg.DatabaseURL)
-	cfg.OperatorTokenFile, cfg.OperatorTokenOut = get("operator-token-file"), get("operator-token-out")
-	cfg.AutomationSubject, cfg.AutomationTokenOut = get("automation-subject"), get("automation-token-out")
-	cfg.AutomationScopes, _ = f.GetStringSlice("automation-scope")
 	cfg.BinaryPath = get("binary")
 	cfg.APIListen, cfg.APITLSCert, cfg.APITLSKey = get("api-listen"), get("api-tls-cert"), get("api-tls-key")
 	cfg.NodeAuthorizedKeysFile = get("node-authorized-keys-file")
@@ -240,8 +229,7 @@ func bootstrapReporter(a *app, cmd *cobra.Command) engine.Reporter {
 
 // bootstrapRemote is the resumable first-contact path. It uploads the exact
 // local binary, runs the node-local plan and apply over separate SSH
-// connections, streams step progress from the remote stderr, and reads the
-// generated operator token once over the SSH channel.
+// connections, and streams step progress from the remote stderr.
 func (a *app) bootstrapRemote(cmd *cobra.Command, _ []string) (result, error) {
 	cfg, err := a.bootstrapConfig(cmd)
 	if err != nil {
@@ -272,25 +260,12 @@ func (a *app) bootstrapRemote(cmd *cobra.Command, _ []string) (result, error) {
 	if remoteErr != nil {
 		var fault *contract.Fault
 		if errors.As(remoteErr, &fault) && fault.Code == contract.ConfirmationRequired {
-			// The credential already exists on the host and the new access path
-			// may be live; hand it off before asking for confirmation. Keep the
-			// bundle: confirm needs the same binary path and generation.
-			if role, roleErr := cfg.RoleConfig(); roleErr == nil && role.ControlPlane {
-				if saveErr := a.saveRemoteCredential(cmd, remote, cfg); saveErr != nil {
-					return result{}, saveErr
-				}
-			}
 			if fault.Hint != "" {
 				fault.Hint += " "
 			}
 			fault.Hint += "Add the same --ssh-address, --ssh-identity, and --ssh-known-hosts flags to confirm from a fresh connection."
 		}
 		return result{}, remoteErr
-	}
-	if role, roleErr := cfg.RoleConfig(); roleErr == nil && role.ControlPlane {
-		if err := a.saveRemoteCredential(cmd, remote, cfg); err != nil {
-			return hostResult(report), err
-		}
 	}
 	if err := session.Remove(cmd.Context()); err != nil {
 		fmt.Fprintf(cmd.ErrOrStderr(), "bootstrap remote: uploaded bundle cleanup failed: %v\n", err)
@@ -465,14 +440,6 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 		files = append(files, host.RemoteFile{Name: "database-url", Data: []byte(cfg.DatabaseURL + "\n"), Mode: 0o600})
 		args = append(args, "--database-url-file", filepath.Join(dir, "database-url"))
 	}
-	if cfg.OperatorTokenFile != "" {
-		tokenRaw, err := host.ReadPrivateInput(cfg.OperatorTokenFile)
-		if err != nil {
-			return nil, nil, err
-		}
-		files = append(files, host.RemoteFile{Name: "operator-token", Data: tokenRaw, Mode: 0o600})
-		args = append(args, "--operator-token-file", filepath.Join(dir, "operator-token"))
-	}
 	uploadPair := func(name, source string) error {
 		raw, err := os.ReadFile(source) //nolint:gosec // G304: operator-provided bootstrap input.
 		if err != nil {
@@ -499,20 +466,6 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 	args = append(args, "--commit-confirm-seconds", fmt.Sprint(cfg.CommitConfirmSeconds))
 	if cfg.Hostname != "" {
 		args = append(args, "--hostname", cfg.Hostname)
-	}
-	operatorOut := cfg.OperatorTokenOut
-	if operatorOut == "" {
-		operatorOut = filepath.Join(host.DefaultLayout().StateDir, "operator.handoff")
-	}
-	args = append(args, "--operator-token-out", operatorOut)
-	if cfg.AutomationSubject != "" {
-		args = append(args, "--automation-subject", cfg.AutomationSubject)
-	}
-	if len(cfg.AutomationScopes) > 0 {
-		args = append(args, "--automation-scope", strings.Join(cfg.AutomationScopes, ","))
-	}
-	if cfg.AutomationTokenOut != "" {
-		args = append(args, "--automation-token-out", cfg.AutomationTokenOut)
 	}
 	return files, args, nil
 }
@@ -563,82 +516,6 @@ func decodeRemoteEnvelope[T any](raw []byte, action string) (T, error) {
 		return zero, contract.NewFault(contract.Unavailable, "the remote bootstrap returned unexpected data", "Check binary compatibility; do not assume the host was unchanged.")
 	}
 	return value, nil
-}
-
-// remoteCredentialReader is the narrow SSH surface credential handoff needs.
-// It is an interface so the consume-once behavior is testable without Docker.
-type remoteCredentialReader interface {
-	Output(context.Context, string) ([]byte, error)
-	Remove(context.Context, string) error
-}
-
-// consumeRemoteToken reads the one-time host credential and removes it in the
-// same step. The value is never included in an error or log message. A read
-// failure keeps the file for the operator; a successful read always consumes
-// it, even when the content is malformed, so a second copy does not linger.
-func consumeRemoteToken(ctx context.Context, remote remoteCredentialReader, path string) (string, error) {
-	raw, err := remote.Output(ctx, "cat "+shellPath(path))
-	if err != nil {
-		return "", contract.NewFault(contract.Unavailable, "the operator credential could not be read over SSH", "The token was generated on the host at "+path+"; read it from a fresh connection. Do not print it in an untrusted terminal.")
-	}
-	token := strings.TrimSpace(string(raw))
-	removeErr := remote.Remove(ctx, path)
-	if !host.ValidToken(token) {
-		return "", contract.NewFault(contract.Unavailable, "the handed-off operator credential is invalid", "Inspect the remote credential file; do not reuse an invalid token.")
-	}
-	if removeErr != nil {
-		return "", contract.NewFault(contract.Unavailable, "the handed-off operator credential could not be removed from the host", "Remove "+path+" over a fresh connection before continuing; the token is not printed.")
-	}
-	return token, nil
-}
-
-func (a *app) saveRemoteCredential(cmd *cobra.Command, remote remoteCredentialReader, cfg host.Config) error {
-	operatorOut := cfg.OperatorTokenOut
-	if operatorOut == "" {
-		operatorOut = filepath.Join(host.DefaultLayout().StateDir, "operator.handoff")
-	}
-	token, err := consumeRemoteToken(cmd.Context(), remote, operatorOut)
-	if err != nil {
-		return err
-	}
-	a.secrets.Add(token)
-	endpoint := remoteContextURL(cmd, cfg)
-	name, _ := cmd.Flags().GetString("context-name")
-	if name == "" {
-		name = cfg.Node
-	}
-	store, err := host.LoadContextStore("")
-	if err != nil {
-		return err
-	}
-	if _, err := store.Login(name, endpoint, token, host.KnownScopes()); err != nil {
-		return err
-	}
-	if path, _ := cmd.Flags().GetString("token-file-out"); path != "" {
-		if _, err := store.Export(name, path, false); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func remoteContextURL(cmd *cobra.Command, cfg host.Config) string {
-	if explicit, _ := cmd.Flags().GetString("context-url"); explicit != "" {
-		return strings.TrimRight(explicit, "/")
-	}
-	listenHost, port, err := net.SplitHostPort(cfg.APIListen)
-	if err != nil {
-		return "http://127.0.0.1:8080"
-	}
-	ip := net.ParseIP(listenHost)
-	scheme := "http"
-	if cfg.APITLSCert != "" {
-		scheme = "https"
-	}
-	if ip == nil || ip.IsLoopback() || ip.IsUnspecified() {
-		listenHost = "127.0.0.1"
-	}
-	return scheme + "://" + net.JoinHostPort(listenHost, port)
 }
 
 func (a *app) bootstrapRemoteConfirm(cmd *cobra.Command, id string) (result, error) {

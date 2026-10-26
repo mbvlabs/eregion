@@ -18,12 +18,12 @@ import (
 )
 
 // platformMeta is the common metadata for platform client commands. Platform
-// commands are portable clients of the authenticated API; they never open the
-// database, enqueue a River job themselves, or run SSH.
+// commands run on the node through the saved context; they never open the
+// database or enqueue a River job themselves.
 func platformMeta(summary, example string) CommandMeta {
 	meta := operationMeta(summary, example)
-	meta.WhenToUse = []string{summary + ". Reads the authenticated platform API; mutations are durable operations with explicit idempotency."}
-	meta.Environment = []string{"EREGION_API_URL", "EREGION_API_TOKEN"}
+	meta.WhenToUse = []string{summary + ". Runs on the node through SSH inside WireGuard; mutations are durable operations with explicit idempotency."}
+	meta.Environment = []string{"EREGION_CONTEXT_FILE"}
 	return meta
 }
 
@@ -87,7 +87,6 @@ func (a *app) platformSpecs() []spec {
 			use:  "platform",
 			meta: platformMeta("Inspect and change the application platform through the authenticated API", "eregion platform inventory --collection summary --json"),
 			flags: func(cmd *cobra.Command) {
-				cmd.PersistentFlags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 			},
 			run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 			children: []spec{

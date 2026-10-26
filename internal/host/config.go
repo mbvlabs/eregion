@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -100,13 +99,6 @@ type Config struct {
 	// loaded from a private file or EREGION_DATABASE_URL, never a flag.
 	DatabaseURL string `json:"-"`
 
-	OperatorTokenFile string `json:"-"`
-	OperatorTokenOut  string `json:"operator_token_out,omitempty"`
-
-	AutomationSubject  string   `json:"automation_subject,omitempty"`
-	AutomationScopes   []string `json:"automation_scopes,omitempty"`
-	AutomationTokenOut string   `json:"automation_token_out,omitempty"`
-
 	APIListen         string `json:"api_listen"`
 	APITLSCert        string `json:"api_tls_cert,omitempty"`
 	APITLSKey         string `json:"api_tls_key,omitempty"`
@@ -181,12 +173,6 @@ func (c Config) Validate() error {
 		if strings.TrimSpace(c.DatabaseURL) == "" {
 			return contract.NewFault(contract.InputRequired, "the external database URL is required for the main role", "Set EREGION_DATABASE_URL or --database-url-file to a private file; the URL is never accepted as a command argument.")
 		}
-		if strings.TrimSpace(c.OperatorTokenOut) == "" {
-			return contract.NewFault(contract.InputRequired, "--operator-token-out is required for the main role", "Choose a protected file so the first operator credential is not lost when bootstrap completes.")
-		}
-		if !filepath.IsAbs(c.OperatorTokenOut) {
-			return contract.NewFault(contract.ValidationFailed, "--operator-token-out must be an absolute path", "Use a path under a private directory, for example /root/eregion-operator.token.")
-		}
 		if err := validateListen(c.APIListen, "API"); err != nil {
 			return err
 		}
@@ -210,25 +196,6 @@ func (c Config) Validate() error {
 		if c.CommitConfirmSeconds != 0 && (c.CommitConfirmSeconds < 30 || c.CommitConfirmSeconds > 900) {
 			return contract.NewFault(contract.ValidationFailed, "commit-confirm window out of range", "Use --commit-confirm-seconds 30–900.")
 		}
-		if c.AutomationTokenOut != "" && len(c.AutomationScopes) == 0 {
-			return contract.NewFault(contract.ValidationFailed, "an automation token needs at least one scope", "Use --automation-scope operations:submit and other explicit scopes.")
-		}
-		if len(c.AutomationScopes) > 0 && c.AutomationTokenOut == "" {
-			return contract.NewFault(contract.InputRequired, "an automation token needs an output file", "Supply --automation-token-out so the generated credential can be handed off securely.")
-		}
-		if len(c.AutomationScopes) > 0 {
-			if strings.TrimSpace(c.AutomationSubject) == "" {
-				return contract.NewFault(contract.ValidationFailed, "an automation credential needs a subject", "Use --automation-subject with the CI identity.")
-			}
-			for _, scope := range c.AutomationScopes {
-				if !knownScope(scope) {
-					return contract.NewFault(contract.ValidationFailed, "unknown automation scope", "Use operations:submit, operations:read, operations:cancel, or system:read.")
-				}
-			}
-			if !filepath.IsAbs(c.AutomationTokenOut) {
-				return contract.NewFault(contract.ValidationFailed, "--automation-token-out must be an absolute path", "Use a path under a private directory.")
-			}
-		}
 	}
 	if role.Registry {
 		if err := validateListen(c.RegistryListen, "registry"); err != nil {
@@ -248,11 +215,6 @@ func (c Config) Validate() error {
 	if role.ControlPlane {
 		if _, err := c.EffectiveBinaryPath(); err != nil {
 			return contract.NewFault(contract.ValidationFailed, "cannot locate the eregion binary", "Supply --binary explicitly.")
-		}
-	}
-	for name, path := range map[string]string{"operator token output": c.OperatorTokenOut, "automation token output": c.AutomationTokenOut} {
-		if path != "" && !filepath.IsAbs(path) {
-			return contract.NewFault(contract.ValidationFailed, "the "+name+" must be absolute", "Use an absolute path under a private directory.")
 		}
 	}
 	if c.NodeAuthorizedKeysFile != "" && !filepath.IsAbs(c.NodeAuthorizedKeysFile) {
@@ -316,30 +278,22 @@ func (c Config) AccessRisks() []string {
 // hashes in individual steps.
 func (c Config) CanonicalInputs() ([]byte, error) {
 	type canonical struct {
-		Node               string   `json:"node"`
-		Role               Role     `json:"role"`
-		Layout             Layout   `json:"layout"`
-		PlatformPath       string   `json:"platform_path"`
-		Arch               string   `json:"arch"`
-		OperatorTokenOut   string   `json:"operator_token_out"`
-		AutomationSubject  string   `json:"automation_subject"`
-		AutomationScopes   []string `json:"automation_scopes"`
-		AutomationTokenOut string   `json:"automation_token_out"`
-		APIListen          string   `json:"api_listen"`
-		APITLSCert         string   `json:"api_tls_cert"`
-		APITLSKey          string   `json:"api_tls_key"`
-		WorkerConcurrency  int      `json:"worker_concurrency"`
-		RegistryListen     string   `json:"registry_listen"`
-		CommitConfirm      int      `json:"commit_confirm_seconds"`
-		BinaryPath         string   `json:"binary_path"`
-		NodeAuthorizedKeys string   `json:"node_authorized_keys"`
+		Node               string `json:"node"`
+		Role               Role   `json:"role"`
+		Layout             Layout `json:"layout"`
+		PlatformPath       string `json:"platform_path"`
+		Arch               string `json:"arch"`
+		APIListen          string `json:"api_listen"`
+		APITLSCert         string `json:"api_tls_cert"`
+		APITLSKey          string `json:"api_tls_key"`
+		WorkerConcurrency  int    `json:"worker_concurrency"`
+		RegistryListen     string `json:"registry_listen"`
+		CommitConfirm      int    `json:"commit_confirm_seconds"`
+		BinaryPath         string `json:"binary_path"`
+		NodeAuthorizedKeys string `json:"node_authorized_keys"`
 	}
-	scopes := append([]string(nil), c.AutomationScopes...)
-	sort.Strings(scopes)
 	value := canonical{
 		Node: c.Node, Role: c.Role, Layout: c.Layout, PlatformPath: c.PlatformPath, Arch: c.Arch,
-		OperatorTokenOut: c.OperatorTokenOut, AutomationSubject: c.AutomationSubject,
-		AutomationScopes: scopes, AutomationTokenOut: c.AutomationTokenOut,
 		APIListen: c.APIListen, APITLSCert: c.APITLSCert, APITLSKey: c.APITLSKey,
 		WorkerConcurrency: c.WorkerConcurrency, RegistryListen: c.RegistryListen,
 		CommitConfirm:      c.CommitConfirmSeconds,
@@ -365,7 +319,7 @@ func (c Config) ConfigHash() (string, error) {
 			binaryPath = executable
 		}
 	}
-	for _, path := range []string{binaryPath, c.APITLSCert, c.APITLSKey, c.NodeAuthorizedKeysFile, c.OperatorTokenFile} {
+	for _, path := range []string{binaryPath, c.APITLSCert, c.APITLSKey, c.NodeAuthorizedKeysFile} {
 		if path == "" {
 			continue
 		}

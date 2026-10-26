@@ -9,18 +9,21 @@ work status belong in [MASTER](MASTER.md); run evidence belongs in
 
 ```text
 operator CLI
-  -> saved context: embedded WireGuard -> pinned SSH -> forwarded loopback HTTP
-  -> authenticated API -> shared operations service
+  -> saved context: embedded userspace WireGuard -> pinned SSH -> sudo -n eregion node rpc
+  -> NDJSON request/events/result -> shared application services (api.AppService)
   -> external PostgreSQL: domain intent + operation + River job, one transaction
   -> River worker -> local or pinned-SSH node transport -> Check/Apply effects
   -> durable events/state -> CLI plain/JSON/NDJSON/terminal presentations
 ```
 
-The current operator adapter tunnels HTTP; it does **not** invoke an operator
-`eregion node <command>` RPC. It still sends a bearer token. Direct HTTP client
-configuration also remains possible through flags/environment. Worker-to-node
-step dispatch is a different transport boundary; its protocol handshake does
-not establish full operator/node binary version lockstep.
+Every operator command uses node-mode dispatch: the CLI writes one
+`eregion-rpc/v1` request to `eregion node rpc` on stdin over SSH inside
+WireGuard and reads NDJSON back. Contexts carry the WireGuard identity and SSH
+key, not a bearer token. The HTTP API remains for the narrow CI/webhook path and
+the public `/readyz` endpoint; the operator CLI does not configure or use it.
+Before the first service call the CLI compares the node build with its own and
+refuses with `node_version_mismatch` unless the node was auto-upgraded. The
+worker-to-node step transport is a separate protocol boundary.
 
 API and worker are supervised separately by `eregion-api.service` and
 `eregion-worker.service`; `serve` can also run workers in-process. Domain intent
@@ -32,11 +35,12 @@ An SSH disconnect never owns the lifetime of accepted work.
 
 | Location | Responsibility |
 | --- | --- |
-| `cmd/eregion` | One executable entry point, including `node-agent`. |
+| `cmd/eregion` | One executable entry point, including `node-agent` and hidden `node rpc`. |
 | `internal/cli/tree.go`, `meta.go`, `run.go` | Command catalog, safety metadata, output selection and dispatch. |
-| `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup, first contact, DNS, private access and age handoff/import. |
-| `internal/cli/context.go`, `internal/host/contextstore.go` | Context resolution, current API-token storage, SSH/WireGuard route. |
-| `internal/api` | HTTP client, authentication/grants, operation/inventory routes, vault, webhook and private proxy adapters. |
+| `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup, first contact, DNS, private access and token-free age handoff/import. |
+| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep and SSH/WireGuard route. |
+| `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
+| `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, webhook and private proxy adapters. |
 | `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
 | `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps and Caddy route renderer. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
@@ -60,8 +64,8 @@ bin/eregion help platform environments create --json
 | Current commands | Meaning/limit |
 | --- | --- |
 | `server init` | Guided root first contact; Linux operator, matching server arch, IPv4-oriented DNS/access setup. |
-| `login --file … --passphrase-file …` | Import an age transfer bundle; still requires its operator API token. |
-| `context list/show/use/login/export`, `context credential add` | Saved contexts and local server-auth-file editing. `use` takes `--name`; no remove command. |
+| `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). |
+| `context list/show/use`, `context credential add` | Saved contexts and local server-auth-file editing. `use` takes `--name`; no remove command. |
 | `platform apps create/list/status` | App record only; no guided full setup, update or delete. |
 | `platform environments create/list/status` | Separate env record with node, port, bind, health and `--env`; no update/delete or secret-reference convenience flags. |
 | `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. |
@@ -220,9 +224,13 @@ recovery-time goals.
 
 `server init` collects host/identity, node/context name, hostname and external DSN;
 pins the host key; checks root/OS/arch; uploads the running binary; previews and
-applies bootstrap; consumes an initial token; sets up admin/WireGuard; tests the
-private channel; arms and confirms lockdown from a fresh connection; saves its
-context and offers the interactive handoff. `login` imports that handoff.
+applies bootstrap; sets up admin/WireGuard; tests the private channel; arms and
+confirms lockdown from a fresh connection; saves its token-free context and
+offers the interactive handoff. `login` imports that handoff. Bootstrap installs
+the binary once at `/usr/local/bin/eregion` (the systemd units use that path) and
+installs `/etc/sudoers.d/eregion-node` with only
+`NOPASSWD: /usr/local/bin/eregion node rpc`; the separate access rule covers
+setup/break-glass lockdown.
 
 Current bootstrap accepts an identity, ssh-agent/default keys and interactive
 encrypted-key passphrases. There is no answers TOML, password-stdin, robust local
@@ -239,15 +247,16 @@ It stops before host apply; it is not an entirely side-effect-free local command
 | Current path | Ownership/purpose |
 | --- | --- |
 | `/etc/eregion/control-plane.env` | Service environment incl. DSN, auth/state and transport paths; bootstrap preserves operator-added lines. |
-| `/etc/eregion/auth.json` | Owner-only API token hashes, actors, scopes and grants. |
+| `/etc/eregion/auth.json` | Owner-only CI/webhook token hashes, actors, scopes and grants. Setup mints no operator token. |
 | `/etc/eregion/node.json` | Node name/state directory and optional operator-installed helper configuration. |
 | `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles and commit-confirm snapshots. |
 | `/var/lib/eregion/node/` | Node journal, per-effect records/locks, detached-task logs and identity. |
 | `/var/lib/eregion/access/` | Operator-access snapshot and lockdown state; separate from bootstrap commit-confirm. |
 | `/etc/caddy/Caddyfile` | Bootstrap-owned main hostname config, importing routes. |
 | `/etc/caddy/eregion.d/routes.caddy` | Worker-owned generated app host routes. |
-| OS config dir + `/eregion/contexts.json` | Owner-only context store; overridden by `EREGION_CONTEXT_FILE`. |
+| OS config dir + `/eregion/contexts.json` | Owner-only context store (SSH/WireGuard route and `auto_upgrade_nodes`); overridden by `EREGION_CONTEXT_FILE`. No API token. |
 | Context store's parent + `/servers/<context>/` | Operator SSH key, WireGuard key and sudo password files. |
+| `/etc/sudoers.d/eregion-node` | Admin's passwordless `/usr/local/bin/eregion node rpc` rule, validated by `visudo`. |
 
 Node effect identity is `operation:step`, stable across attempts. Execution
 identity is `operation:attempt:step`. Check durable status before dispatch;
@@ -341,8 +350,10 @@ Caddy currently exposes only `/readyz` and `/v1/webhooks/github` on the main
 hostname. There is **no public deploy trigger path** yet. Do not expose all of
 `/v1` as a shortcut. Main-node application hostnames are separate Caddy sites.
 
-`api.Client.SubmitAction` / `PlatformInventory` reuse these adapters. New guided
-commands must share the action/services, not enqueue directly. Extensions register
+The operator `Backend` (`internal/cli`) and HTTP handlers share the
+`api.AppService` functions for action submission/preview, inventory and vault
+operations. New guided commands must use node RPC and share those services, not
+enqueue directly or build a second HTTP path. Extensions register
 strict normalizers/executors and inventory providers before runtime startup through
 `controlplane.RegisterExtensions`; no extension gets a second queue. Registry
 availability alone is not readiness: missing host/key/provider configuration

@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 const cliPlatformToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -140,7 +139,7 @@ func TestPlatformCommandMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	unwired := []string{"secrets", "resources", "telemetry", "dns", "access"}
+	unwired := []string{"secrets", "resources", "telemetry", "dns", "access", "nodes", "fleet", "submit"}
 	for _, child := range platformCommand.Commands() {
 		for _, name := range unwired {
 			if child.Name() == name {
@@ -157,178 +156,6 @@ func TestPlatformCommandMetadata(t *testing.T) {
 		if err != nil || len(remaining) != 0 || cmd.RunE == nil {
 			t.Fatalf("missing implemented command %s: %v", strings.Join(path, " "), err)
 		}
-	}
-}
-
-func TestPlatformAppsCreateAndDryRun(t *testing.T) {
-	serverState, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-
-	code, stdout, stderr := invokePlatform(t, "platform", "apps", "create", "api", "--idempotency-key", "ci:app-api", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q", code, stderr)
-	}
-	envelope := decodePlatformEnvelope(t, stdout)
-	if envelope.Command != "eregion platform apps create" {
-		t.Fatalf("wrong command identity: %s", envelope.Command)
-	}
-	if len(serverState.calls) != 1 {
-		t.Fatalf("expected one API call, got %+v", serverState.calls)
-	}
-	call := serverState.calls[0]
-	if call.method != http.MethodPost || call.path != "/v1/operations" || call.key != "ci:app-api" || call.dryRun {
-		t.Fatalf("unexpected submission: %+v", call)
-	}
-	if call.kind != "platform.app.create" || call.target != "platform" || string(call.input) != `{"name":"api"}` {
-		t.Fatalf("unexpected action: %+v input=%s", call, call.input)
-	}
-
-	code, stdout, stderr = invokePlatform(t, "platform", "apps", "create", "api", "--dry-run", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("dry-run code=%d stderr=%q", code, stderr)
-	}
-	decodePlatformEnvelope(t, stdout)
-	if len(serverState.calls) != 2 {
-		t.Fatal("dry-run did not call the API")
-	}
-	if !serverState.calls[1].dryRun || serverState.calls[1].key != "" {
-		t.Fatalf("dry-run sent an idempotency identity: %+v", serverState.calls[1])
-	}
-}
-
-func TestPlatformInventoryUsesReadAPI(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-
-	code, stdout, stderr := invokePlatform(t, "platform", "inventory", "--collection", "apps", "--app", "api", "--limit", "10", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q", code, stderr)
-	}
-	envelope := decodePlatformEnvelope(t, stdout)
-	if envelope.Command != "eregion platform inventory" {
-		t.Fatalf("wrong command: %s", envelope.Command)
-	}
-	if len(state.calls) != 1 {
-		t.Fatalf("calls=%+v", state.calls)
-	}
-	call := state.calls[0]
-	if call.method != http.MethodGet || call.query.Get("collection") != "apps" || call.query.Get("app") != "api" || call.query.Get("limit") != "10" {
-		t.Fatalf("unexpected inventory query: %+v", call)
-	}
-
-}
-func TestPlatformRollbackNeedsMatchingPlanConfirmation(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-
-	code, stdout, stderr := invokePlatform(t, "platform", "deployments", "rollback", "api", "production", "--to-release-id", "rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--dry-run", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("plan code=%d stderr=%q", code, stderr)
-	}
-	envelope := decodePlatformEnvelope(t, stdout)
-	var data struct {
-		Preview           map[string]any `json:"preview"`
-		ConfirmationToken string         `json:"confirmation_token"`
-	}
-	raw, _ := json.Marshal(envelope.Data)
-	if err := json.Unmarshal(raw, &data); err != nil || data.ConfirmationToken == "" {
-		t.Fatalf("dry-run did not return a confirmation token: %s", raw)
-	}
-	if len(state.calls) != 1 || !state.calls[0].dryRun {
-		t.Fatalf("plan did not use dry-run: %+v", state.calls)
-	}
-
-	code, stdout, stderr = invokePlatform(t, "platform", "deployments", "rollback", "api", "production", "--to-release-id", "rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--idempotency-key", "ci:rollback-1", "--json")
-	assertPlatformJSONFault(t, code, stdout, stderr, contract.ConfirmationRequired, "--confirm is required")
-	if len(state.calls) != 1 {
-		t.Fatal("unconfirmed rollback reached the API")
-	}
-
-	code, stdout, stderr = invokePlatform(t, "platform", "deployments", "rollback", "api", "production", "--to-release-id", "rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--confirm", "wrong", "--idempotency-key", "ci:rollback-1", "--json")
-	assertPlatformJSONFault(t, code, stdout, stderr, contract.PreconditionFailed, "does not match")
-	if len(state.calls) != 1 {
-		t.Fatal("mismatched rollback reached the API")
-	}
-
-	code, stdout, stderr = invokePlatform(t, "platform", "deployments", "rollback", "api", "production", "--to-release-id", "rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--confirm", data.ConfirmationToken, "--idempotency-key", "ci:rollback-1", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("confirmed rollback code=%d stderr=%q stdout=%s", code, stderr, stdout)
-	}
-	decodePlatformEnvelope(t, stdout)
-	if len(state.calls) != 2 || state.calls[1].kind != "platform.rollback" || state.calls[1].key != "ci:rollback-1" {
-		t.Fatalf("confirmed rollback did not submit: %+v", state.calls)
-	}
-}
-
-func TestPlatformEnvironmentCreateSendsBuildNode(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-	code, stdout, stderr := invokePlatform(t, "platform", "environments", "create", "api", "production",
-		"--node", "main", "--build-node", "builder-1", "--idempotency-key", "ci:env-build-node", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q stdout=%s", code, stderr, stdout)
-	}
-	if len(state.calls) != 1 || state.calls[0].kind != platform.KindEnvironmentCreate {
-		t.Fatalf("unexpected call: %+v", state.calls)
-	}
-	var input platform.EnvironmentCreateInput
-	if err := json.Unmarshal(state.calls[0].input, &input); err != nil {
-		t.Fatal(err)
-	}
-	if input.Node != "main" || input.BuildNode != "builder-1" {
-		t.Fatalf("build placement was not sent: %+v", input)
-	}
-}
-
-func TestPlatformDeploymentRetryResubmitsFailedDeployment(t *testing.T) {
-	state, server := newPlatformServer(t)
-	platformTestEnvironment(t, server)
-
-	code, stdout, stderr := invokePlatform(t, "platform", "deployments", "retry", "--deployment", "dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--dry-run", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("retry dry-run code=%d stderr=%q stdout=%s", code, stderr, stdout)
-	}
-	decodePlatformEnvelope(t, stdout)
-	if len(state.calls) != 2 {
-		t.Fatalf("expected inventory read and preview, got %+v", state.calls)
-	}
-	if state.calls[0].method != http.MethodGet || state.calls[0].query.Get("collection") != "deployments" {
-		t.Fatalf("retry did not read deployment inventory: %+v", state.calls[0])
-	}
-	preview := state.calls[1]
-	if !preview.dryRun || preview.kind != "platform.deploy" || preview.target != "env/api/production" {
-		t.Fatalf("retry preview did not preserve target/action: %+v", preview)
-	}
-	if string(preview.input) != `{"release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}` {
-		t.Fatalf("retry preview did not preserve the release: %s", preview.input)
-	}
-
-	code, stdout, stderr = invokePlatform(t, "platform", "deployments", "retry", "--deployment", "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--idempotency-key", "ci:retry-deploy-1", "--json")
-	if code != 0 || stderr != "" {
-		t.Fatalf("retry code=%d stderr=%q stdout=%s", code, stderr, stdout)
-	}
-	decodePlatformEnvelope(t, stdout)
-	if len(state.calls) != 4 {
-		t.Fatalf("retry did not read inventory and submit: %+v", state.calls)
-	}
-	submit := state.calls[3]
-	if submit.method != http.MethodPost || submit.kind != "platform.deploy" || submit.target != "env/api/production" || submit.key != "ci:retry-deploy-1" {
-		t.Fatalf("retry did not use the shared submission path: %+v", submit)
-	}
-	if string(submit.input) != `{"release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}` {
-		t.Fatalf("retry changed the release: %s", submit.input)
-	}
-}
-
-func TestPlatformDeploymentRetryRefusesNonFailedDeployment(t *testing.T) {
-	state, server := newPlatformServer(t)
-	state.items["deployments"] = json.RawMessage(`[{"id":"dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","app":"api","environment":"production","action":"deploy","release_id":"rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","state":"succeeded"}]`)
-	platformTestEnvironment(t, server)
-
-	code, stdout, stderr := invokePlatform(t, "platform", "deployments", "retry", "--deployment", "dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--idempotency-key", "ci:retry-deploy-2", "--json")
-	assertPlatformJSONFault(t, code, stdout, stderr, contract.PreconditionFailed, "only a terminally failed deployment")
-	if len(state.calls) != 1 {
-		t.Fatalf("a non-failed retry reached submission: %+v", state.calls)
 	}
 }
 

@@ -27,9 +27,9 @@ type handoffGroup struct {
 	fields []handoffField
 }
 
-// secretsHandoff is the record server init hands to the operator: eregion
-// keeps the operator token only in the local context, so this is the copy
-// that survives losing this machine.
+// secretsHandoff is the record server init hands to the operator: eregion keeps
+// only the operator's SSH and WireGuard keys in the local context, so this is
+// the copy that survives losing this machine.
 type secretsHandoff struct {
 	node       string
 	groups     []handoffGroup
@@ -80,7 +80,7 @@ func (h *secretsHandoff) show(w io.Writer) error {
 	resume := ui.Suspend()
 	defer resume()
 	_, _ = fmt.Fprintln(w, "\n"+ui.Header("Secrets handoff", 72))
-	_, _ = fmt.Fprintln(w, "The main node's record: the operator's keys, the operator token, the database URL and the server's identity.")
+	_, _ = fmt.Fprintln(w, "The main node's record: the operator's keys, the database URL and the server's identity.")
 	_, _ = fmt.Fprintln(w, "eregion doesn't show it again. Store it in your password manager.")
 	_, _ = fmt.Fprintln(w)
 	_, _ = fmt.Fprintln(w, ui.Dim("Bundle passphrase")+"  "+h.passphrase)
@@ -117,7 +117,7 @@ func (h *secretsHandoff) show(w io.Writer) error {
 	}
 	if err := ui.TypeWord("Type 'stored' once the record is in your password manager", "", "stored"); err != nil {
 		if errors.Is(err, ui.ErrAborted) {
-			return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the context is saved; the token is in the local context store.")
+			return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the context is saved locally.")
 		}
 		return err
 	}

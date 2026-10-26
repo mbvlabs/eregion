@@ -24,7 +24,6 @@ func TestStatusReadsStateAndJournalWithoutApplyInputs(t *testing.T) {
 	cfg := fixture(t, RoleMain)
 	// Status must not require these apply-only inputs.
 	cfg.DatabaseURL = ""
-	cfg.OperatorTokenOut = ""
 	cfg.BinaryPath = ""
 
 	state := State{
@@ -69,7 +68,7 @@ func TestStatusReadsStateAndJournalWithoutApplyInputs(t *testing.T) {
 
 func TestStatusWithoutStateIsNotAnError(t *testing.T) {
 	cfg := fixture(t, RoleMain)
-	cfg.DatabaseURL, cfg.OperatorTokenOut, cfg.BinaryPath = "", "", ""
+	cfg.DatabaseURL, cfg.BinaryPath = "", ""
 	runner, err := NewStatusRunner(cfg, nil)
 	if err != nil {
 		t.Fatal(err)

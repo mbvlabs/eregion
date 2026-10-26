@@ -212,7 +212,7 @@ func dispatchVault(r *http.Request, service VaultService, authorize VaultAuthori
 		if err := access.Authorize(VaultKindSecretList, secretTarget(namespace)); err != nil {
 			return 0, nil, err
 		}
-		metadata, err := service.Get(r.Context(), namespace)
+		metadata, err := GetSecretMetadata(r.Context(), service, namespace)
 		return http.StatusOK, metadata, err
 	}
 	if parts[3] != "export" || r.Method != http.MethodGet {
@@ -221,7 +221,7 @@ func dispatchVault(r *http.Request, service VaultService, authorize VaultAuthori
 	if err := access.Authorize(VaultKindSecretExport, secretTarget(namespace)); err != nil {
 		return 0, nil, err
 	}
-	metadata, value, err := service.Export(r.Context(), namespace)
+	metadata, value, err := ExportSecretValue(r.Context(), service, namespace)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -264,10 +264,7 @@ func setSecret(r *http.Request, service VaultService, access VaultAccess) (int, 
 			value[i] = 0
 		}
 	}()
-	if err := vault.ValidateValue(value); err != nil {
-		return 0, nil, err
-	}
-	metadata, err := service.Set(r.Context(), namespace, value, *request.ExpectedRevision, access.Actor)
+	metadata, err := SetSecretValue(r.Context(), service, access.Actor, namespace, value, *request.ExpectedRevision)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -296,7 +293,7 @@ func archiveSecret(r *http.Request, service VaultService, access VaultAccess) (i
 	if err := access.Authorize(VaultKindSecretArchive, secretTarget(namespace)); err != nil {
 		return 0, nil, err
 	}
-	metadata, err := service.Archive(r.Context(), namespace, *request.ExpectedRevision, access.Actor)
+	metadata, err := ArchiveSecretValue(r.Context(), service, access.Actor, namespace, *request.ExpectedRevision)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -329,7 +326,7 @@ func listSecrets(r *http.Request, service VaultService, access VaultAccess) (int
 	if err := access.Authorize(VaultKindSecretList, secretEnvTarget(app, environment)); err != nil {
 		return 0, nil, err
 	}
-	metadata, err := service.List(r.Context(), app, environment, limit)
+	metadata, err := ListSecretMetadata(r.Context(), service, app, environment, limit)
 	if err != nil {
 		return 0, nil, err
 	}

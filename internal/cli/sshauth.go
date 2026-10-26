@@ -141,20 +141,6 @@ func pinHostKey(path, address string, key ssh.PublicKey) error {
 	return err
 }
 
-// contextTunnel connects to a context's host over SSH; the API client then
-// dials the loopback API through it.
-func contextTunnel(ctx context.Context, route *host.ContextSSH) (*ssh.Client, error) {
-	remote, err := routeRemote(route, false)
-	if err != nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "the context's SSH route is not usable", err.Error())
-	}
-	client, err := remote.Dial(ctx)
-	if err != nil {
-		return nil, contract.NewFault(contract.Unavailable, "could not reach the server over SSH", err.Error())
-	}
-	return client, nil
-}
-
 func hostKeyPinned(path, address string) bool {
 	if _, err := os.Stat(path); err != nil {
 		return false

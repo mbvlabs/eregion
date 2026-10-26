@@ -161,7 +161,10 @@ func TestEventQueryAndPanicRecovery(t *testing.T) {
 }
 
 func TestAuthConfiguration(t *testing.T) {
-	for _, principals := range [][]Principal{nil, {principal("invented")}, {principal("operations:read"), principal("operations:submit")}} {
+	if _, err := NewAuth(nil); err != nil {
+		t.Fatalf("an empty auth file must start the API: %v", err)
+	}
+	for _, principals := range [][]Principal{{principal("invented")}, {principal("operations:read"), principal("operations:submit")}} {
 		if _, err := NewAuth(principals); err == nil {
 			t.Fatal("invalid auth configuration accepted")
 		}

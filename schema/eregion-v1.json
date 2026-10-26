@@ -9,7 +9,7 @@
   ],
   "$defs": {
     "code": {
-      "enum": ["usage_error", "invalid_output_mode", "input_required", "validation_failed", "not_found", "unauthenticated", "forbidden", "precondition_failed", "confirmation_required", "conflict", "unavailable", "cancelled", "internal_error"]
+      "enum": ["usage_error", "invalid_output_mode", "input_required", "validation_failed", "not_found", "unauthenticated", "forbidden", "precondition_failed", "confirmation_required", "conflict", "node_version_mismatch", "unavailable", "cancelled", "internal_error"]
     },
     "fault": {
       "type": "object",

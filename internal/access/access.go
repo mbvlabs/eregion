@@ -85,6 +85,7 @@ func (s Setup) Env() map[string]string {
 		"AUTHORIZED_KEYS":     strings.TrimSpace(s.OperatorSSHKey) + "\n",
 		"SUDO_PASSWORD":       s.SudoPassword,
 		"SUDOERS":             "# managed by eregion\n" + s.AdminUser + " ALL=(root) NOPASSWD: /usr/local/bin/eregion node-agent access *\n",
+		"NODE_SUDOERS":        "# managed by eregion\n" + s.AdminUser + " ALL=(root) NOPASSWD: /usr/local/bin/eregion node rpc\n",
 		"WG_ADDRESS":          NodeAddress + "/" + strconv.Itoa(Prefix),
 		"WG_PORT":             strconv.Itoa(ListenPort),
 		"OPERATOR_PUBLIC_KEY": s.OperatorPublicKey,

@@ -28,8 +28,8 @@ metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
 ```
 
 MASTER adds vaire's codes to this table as their flows land: `missing_tool`
-(preflight), `node_version_mismatch` (lockstep), `remote_unreachable` and
-`partial_failure`.
+(preflight), `remote_unreachable` and `partial_failure`. `node_version_mismatch`
+is implemented for node RPC lockstep.
 
 Readers ignore unknown optional object fields and handle unknown enum members
 explicitly, never as success. Breaking changes to existing field meaning/type,
@@ -42,7 +42,7 @@ Binary, node-protocol and database versions are separate from envelope version.
 | 2 | `usage_error`, `invalid_output_mode`, `input_required`, `validation_failed` |
 | 3 | `not_found` |
 | 4 | `unauthenticated`, `forbidden` |
-| 5 | `precondition_failed`, `confirmation_required`, `conflict` |
+| 5 | `precondition_failed`, `confirmation_required`, `conflict`, `node_version_mismatch` |
 | 6 | `unavailable`, including request deadlines |
 | 70 | `internal_error`, including output failure |
 | 130 | `cancelled` for interrupted client/viewer |
@@ -128,6 +128,20 @@ states, separate from operation state. Stale means **last known**, not stopped.
 ```
 
 An incomplete stream without its final record is not a complete request result.
+
+## Node RPC
+
+Operator commands run `eregion node rpc` over SSH inside WireGuard. The request
+schema is `eregion-rpc/v1`; it is one JSON object of at most 1 MiB on stdin with
+`schema`, `request_id`, `method`, `params`, optional transient `secrets`,
+`dry_run`, `confirm`, `idempotency_key`, `operator`, and the client build.
+Responses are NDJSON: optional event lines, then exactly one `result` line with
+`schema`, `type: "result"`, `ok`, and either `data` or an `eregion/v1` fault.
+`secrets` values are never logged or persisted. Before the first non-exempt
+method the operator checks `version`; a different build fails with
+`node_version_mismatch` unless `--auto-upgrade-nodes` or the context's
+`auto_upgrade_nodes` permits pushing the operator's matching Linux binary.
+`version` and `upgrade.install` are exempt from the node-side build check.
 
 ## Confirmation is not authorization
 

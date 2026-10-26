@@ -14,14 +14,14 @@ import (
 
 func secretMeta(summary, example string) CommandMeta {
 	meta := readMeta(summary,
-		[]string{summary + ". Requires an authenticated API credential; the actor comes from authentication, never the payload."},
+		[]string{summary + ". Runs on the node through the active context; the operator is the SSH-authenticated admin, never the payload."},
 		[]string{example}, "eregion secret list --app <app> --environment <env> --json")
 	meta.Remote = true
-	meta.Environment = []string{"EREGION_API_URL", "EREGION_API_TOKEN"}
+	meta.Environment = []string{"EREGION_CONTEXT_FILE"}
 	meta.ErrorCodes = []contract.Code{
 		contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed,
 		contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.Conflict,
-		contract.PreconditionFailed, contract.Unavailable, contract.Internal, contract.Cancelled,
+		contract.PreconditionFailed, contract.NodeVersionMismatch, contract.Unavailable, contract.Internal, contract.Cancelled,
 	}
 	return meta
 }
@@ -50,7 +50,6 @@ func (a *app) secretSpecs() []spec {
 		use:  "secret",
 		meta: parentMeta,
 		flags: func(cmd *cobra.Command) {
-			cmd.PersistentFlags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 		},
 		run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{

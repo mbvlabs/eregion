@@ -68,6 +68,7 @@ func newApp() *app {
 	a.root.CompletionOptions.DisableDefaultCmd = true
 	a.root.PersistentFlags().String("output", "plain", "Output mode: plain or json; follow commands also accept ndjson")
 	a.root.PersistentFlags().Bool("json", false, "Shorthand for --output json")
+	a.root.PersistentFlags().Bool("auto-upgrade-nodes", false, "Install this CLI's build on a node whose build differs before the command runs")
 	a.root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		var required *pflag.ValueRequiredError
 		if errors.As(err, &required) {

@@ -23,6 +23,7 @@ const (
 	PreconditionFailed   Code = "precondition_failed"
 	ConfirmationRequired Code = "confirmation_required"
 	Conflict             Code = "conflict"
+	NodeVersionMismatch  Code = "node_version_mismatch"
 	Unavailable          Code = "unavailable"
 	Cancelled            Code = "cancelled"
 	Internal             Code = "internal_error"
@@ -31,7 +32,7 @@ const (
 var exits = map[Code]int{
 	Usage: 2, InvalidOutputMode: 2, InputRequired: 2, ValidationFailed: 2,
 	NotFound: 3, Unauthenticated: 4, Forbidden: 4,
-	PreconditionFailed: 5, ConfirmationRequired: 5, Conflict: 5,
+	PreconditionFailed: 5, ConfirmationRequired: 5, Conflict: 5, NodeVersionMismatch: 5,
 	Unavailable: 6, Internal: 70, Cancelled: 130,
 }
 

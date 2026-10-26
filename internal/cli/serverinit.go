@@ -189,8 +189,6 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	cfg := host.DefaultConfig(host.RoleMain, ans.Node)
 	cfg.DatabaseURL = r.answers.DatabaseURL
 	cfg.Hostname = ans.hostname()
-	// The token is written on the server, read once over SSH, then removed.
-	cfg.OperatorTokenOut = host.DefaultLayout().StateDir + "/operator.handoff"
 	if err := cfg.Validate(); err != nil {
 		return summary, err
 	}
@@ -226,14 +224,6 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	summary.OperationID = report.OperationID
 	r.checkDNS(ctx)
 
-	// The operator token is read once over root SSH, before root login closes.
-	task = r.start("token", "Reading the operator token")
-	token, err := r.readToken(ctx, remote, cfg)
-	if err != nil {
-		task.end(ui.EndFail, "")
-		return summary, err
-	}
-	task.end(ui.EndOK, "")
 	if err := session.Remove(ctx); err != nil {
 		r.note("uploaded bundle cleanup failed: " + err.Error())
 	}
@@ -251,8 +241,7 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	}
 
 	task = r.start("handoff", "Saving context "+ans.Context)
-	apiURL := "http://" + cfg.APIListen
-	if err := r.saveContext(token, apiURL, route); err != nil {
+	if err := r.saveContext(route); err != nil {
 		task.end(ui.EndFail, "")
 		return summary, err
 	}
@@ -264,8 +253,8 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 		task.end(ui.EndFail, "")
 		return summary, err
 	}
-	task.end(ui.EndOK, "API answers through SSH over WireGuard")
-	summary.API = apiURL + " via " + access.AdminUser + "@" + access.NodeAddress + " over WireGuard"
+	task.end(ui.EndOK, "Node RPC answers through SSH over WireGuard")
+	summary.API = "ssh " + access.AdminUser + "@" + access.NodeAddress + " over WireGuard"
 	r.waitForCertificate(ctx)
 	if r.interactive {
 		h := &secretsHandoff{node: ans.Node, groups: []handoffGroup{
@@ -277,6 +266,7 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 				{"WireGuard endpoint", route.WireGuard.Endpoint},
 				{"WireGuard address", route.WireGuard.NodeAddress},
 				{"WireGuard public key", route.WireGuard.NodePublicKey},
+				{"Context", ans.Context},
 			}},
 			{"Operator", []handoffField{
 				{"Admin user", access.AdminUser},
@@ -285,7 +275,6 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 				{"WireGuard private key", id.wg.Encode()},
 				{"SSH private key", "\n" + strings.TrimSpace(id.sshKeyPEM)},
 			}},
-			{"Control plane API", []handoffField{{"URL", apiURL + " (on the server)"}, {"Operator token", token}, {"Context", ans.Context}}},
 			{"Control-plane database", []handoffField{{"URL", r.answers.DatabaseURL}}},
 			{"Break-glass", []handoffField{{"Public SSH closed", "From the provider console, as root: eregion node-agent access revert"}}},
 		}}
@@ -707,24 +696,13 @@ func (r *serverInit) line(state, title, detail string) {
 	fmt.Fprintf(r.cmd.ErrOrStderr(), "server init: %s: %s %s\n", title, state, detail)
 }
 
-func (r *serverInit) readToken(ctx context.Context, remote *host.Remote, cfg host.Config) (string, error) {
-	token, err := consumeRemoteToken(ctx, remote, cfg.OperatorTokenOut)
-	if err != nil {
-		return "", err
-	}
-	r.a.secrets.Add(token)
-	return token, nil
-}
-
-func (r *serverInit) saveContext(token, apiURL string, route *host.ContextSSH) error {
+func (r *serverInit) saveContext(route *host.ContextSSH) error {
 	store, err := host.LoadContextStore("")
 	if err != nil {
 		return err
 	}
-	if _, err := store.Login(r.answers.Context, apiURL, token, host.KnownScopes()); err != nil {
-		return err
-	}
-	return store.SetSSH(r.answers.Context, route)
+	_, err = store.SaveContext(host.Context{Name: r.answers.Context, SSH: route})
+	return err
 }
 
 func (r *serverInit) finish(s serverInitSummary) {

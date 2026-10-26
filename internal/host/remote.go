@@ -164,8 +164,8 @@ func (r *Remote) Run(ctx context.Context, command string, stdin io.Reader, stdou
 	}
 }
 
-// Output runs one command and returns its standard output. It is used for
-// short, non-secret reads such as the handed-off operator token.
+// Output runs one command and returns its standard output for short,
+// non-secret reads.
 func (r *Remote) Output(ctx context.Context, command string) ([]byte, error) {
 	var out, stderr bytes.Buffer
 	if err := r.Run(ctx, command, nil, &out, &stderr); err != nil {

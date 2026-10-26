@@ -30,10 +30,10 @@ import (
 )
 
 func operationMeta(summary, example string) CommandMeta {
-	meta := readMeta(summary, []string{summary + ". Requires a scoped API credential; operations belong to the authenticated actor."}, []string{example})
+	meta := readMeta(summary, []string{summary + ". Runs on the node through the active context over SSH inside WireGuard; operations belong to the named operator."}, []string{example})
 	meta.Remote = true
-	meta.Environment = []string{"EREGION_API_URL", "EREGION_API_TOKEN"}
-	meta.ErrorCodes = []contract.Code{contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.Conflict, contract.PreconditionFailed, contract.Unavailable, contract.Internal, contract.Cancelled}
+	meta.Environment = []string{"EREGION_CONTEXT_FILE"}
+	meta.ErrorCodes = []contract.Code{contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.Conflict, contract.PreconditionFailed, contract.NodeVersionMismatch, contract.Unavailable, contract.Internal, contract.Cancelled}
 	return meta
 }
 
@@ -103,7 +103,6 @@ func (a *app) runtimeSpecs() []spec {
 			}, run: a.migrate},
 		}},
 		{use: "operations", meta: readMeta("Inspect durable operations", []string{"Discover authenticated operation observation and cancellation commands."}, []string{"eregion help operations --json"}), flags: func(cmd *cobra.Command) {
-			cmd.PersistentFlags().String("api-url", "", "API origin URL (defaults to EREGION_API_URL or loopback)")
 		}, run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil }, children: []spec{
 			{use: "follow <operation_id>", meta: followMeta, args: oneID, flags: followFlags, run: a.follow},
 			{use: "get <operation_id>", meta: operationMeta("Read the authoritative operation snapshot", "eregion operations get op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json"), args: oneID, run: func(cmd *cobra.Command, args []string) (result, error) {
@@ -155,7 +154,7 @@ func apiResult(raw json.RawMessage) result {
 	return result{data: raw, plain: pretty.String()}
 }
 
-func (a *app) client(cmd *cobra.Command) (*api.Client, error) {
+func (a *app) client(cmd *cobra.Command) (Backend, error) {
 	return a.contextClient(cmd)
 }
 
@@ -204,7 +203,7 @@ type safeLogWriter struct {
 
 func registerEnvironmentSecrets(registry *secrets.Registry) {
 	dsn := os.Getenv("EREGION_DATABASE_URL")
-	registry.Add(os.Getenv("EREGION_API_TOKEN"), os.Getenv("PGPASSWORD"), dsn)
+	registry.Add(os.Getenv("PGPASSWORD"), dsn)
 	if parsed, err := url.Parse(dsn); err == nil {
 		if parsed.User != nil {
 			password, _ := parsed.User.Password()

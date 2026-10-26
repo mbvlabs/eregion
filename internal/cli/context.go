@@ -1,10 +1,7 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/api"
@@ -18,70 +15,33 @@ func hostResult(data any) result {
 	return result{data: data, plain: string(raw)}
 }
 
-// contextClient is the integration hook for a.client in runtime.go. Precedence
-// is explicit: --api-url, then EREGION_API_URL, then the active saved context.
-// A saved credential is never sent to a different explicit origin.
-func (a *app) contextClient(cmd *cobra.Command) (*api.Client, error) {
-	flagEndpoint := ""
-	if cmd != nil && cmd.Flags().Lookup("api-url") != nil {
-		flagEndpoint, _ = cmd.Flags().GetString("api-url")
-	}
-	envEndpoint := os.Getenv("EREGION_API_URL")
-	token := os.Getenv("EREGION_API_TOKEN")
-	endpoint := flagEndpoint
-	explicitOrigin := endpoint != ""
-	if endpoint == "" {
-		endpoint = envEndpoint
-		explicitOrigin = endpoint != ""
-	}
-	if endpoint != "" && token != "" {
-		a.secrets.Add(token)
-		return api.NewClient(endpoint, token)
-	}
+// contextClient resolves the active saved context into the node RPC backend.
+// There is no direct HTTP or token path: every operator command reaches the
+// node through SSH inside WireGuard.
+func (a *app) contextClient(cmd *cobra.Command) (Backend, error) {
 	store, err := host.LoadContextStore("")
 	if err != nil {
 		return nil, err
 	}
-	var route *host.ContextSSH
-	if store.Current != "" {
-		current, err := store.Get("")
-		if err != nil {
-			return nil, err
-		}
-		if endpoint == "" {
-			endpoint = current.APIURL
-			route = current.SSH
-		}
-		if token == "" {
-			if sameOrigin(endpoint, current.APIURL) {
-				token = current.Token
-			} else if explicitOrigin {
-				return nil, contract.NewFault(contract.InputRequired, "the explicit API origin differs from the active context", "Supply EREGION_API_TOKEN for that origin or select the matching context with eregion context use.")
-			}
-		}
-	}
-	if endpoint == "" {
-		endpoint = "http://127.0.0.1:8080"
-	}
-	a.secrets.Add(token)
-	client, err := api.NewClient(endpoint, token)
-	if err != nil || route == nil {
-		return client, err
-	}
-	ctx := context.Background()
-	if cmd != nil && cmd.Context() != nil {
-		ctx = cmd.Context()
-	}
-	tunnel, err := contextTunnel(ctx, route)
+	current, err := store.Get("")
 	if err != nil {
 		return nil, err
 	}
-	client.UseDialer(tunnel.DialContext)
-	return client, nil
-}
-
-func sameOrigin(left, right string) bool {
-	return strings.EqualFold(strings.TrimRight(strings.TrimSpace(left), "/"), strings.TrimRight(strings.TrimSpace(right), "/"))
+	if current.SSH == nil {
+		return nil, contract.NewFault(contract.PreconditionFailed, "context "+current.Name+" has no SSH route", "Import a server init handoff with eregion login, or re-run server init.")
+	}
+	remote, err := routeRemote(current.SSH, false)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "the context's SSH route is not usable", err.Error())
+	}
+	autoUpgrade := current.AutoUpgradeNodes
+	if cmd != nil {
+		autoUpgrade = autoUpgrade || boolFlag(cmd, "auto-upgrade-nodes")
+	}
+	return &nodeClient{
+		remote: remote, route: current.SSH,
+		operator: current.SSH.User, autoUpgrade: autoUpgrade, stderr: cmd.ErrOrStderr(),
+	}, nil
 }
 
 func (a *app) contextSpecs() []spec {
@@ -91,7 +51,7 @@ func (a *app) contextSpecs() []spec {
 		if mutating {
 			m.DryRunReason = "Local credential-store edits have no remote effect; inspect context show/list before changing them."
 		}
-		m.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_API_TOKEN", "EREGION_API_URL"}
+		m.Environment = []string{"EREGION_CONTEXT_FILE"}
 		m.ErrorCodes = append(m.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.NotFound)
 		return m
 	}
@@ -105,44 +65,14 @@ func (a *app) contextSpecs() []spec {
 		},
 		run: func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{
-			{use: "login", meta: meta("Save and select an API context", "eregion context login --name production --api-url https://api.example.com --token-file /private/operator.token", true),
-				flags: func(cmd *cobra.Command) {
-					cmd.Flags().String("name", "default", "Context name")
-					cmd.Flags().String("api-url", "", "API origin URL; HTTPS except literal loopback")
-					cmd.Flags().String("token-file", "", "Owner-only token input; otherwise EREGION_API_TOKEN")
-					cmd.Flags().StringSlice("scope", nil, "Informational API scopes (not a server-side grant)")
-				}, run: func(cmd *cobra.Command, _ []string) (result, error) {
-					name, _ := cmd.Flags().GetString("name")
-					endpoint, _ := cmd.Flags().GetString("api-url")
-					path, _ := cmd.Flags().GetString("token-file")
-					scopes, _ := cmd.Flags().GetStringSlice("scope")
-					token := os.Getenv("EREGION_API_TOKEN")
-					if path != "" {
-						var err error
-						token, err = host.ReadTokenFile(path)
-						if err != nil {
-							return result{}, err
-						}
-					}
-					a.secrets.Add(token)
-					if endpoint == "" {
-						endpoint = os.Getenv("EREGION_API_URL")
-					}
-					store, err := load(cmd)
-					if err != nil {
-						return result{}, err
-					}
-					view, err := store.Login(name, endpoint, token, scopes)
-					return hostResult(view), err
-				}},
-			{use: "list", meta: meta("List contexts without tokens", "eregion context list --json", false), run: func(cmd *cobra.Command, _ []string) (result, error) {
+			{use: "list", meta: meta("List saved contexts", "eregion context list --json", false), run: func(cmd *cobra.Command, _ []string) (result, error) {
 				store, err := load(cmd)
 				if err != nil {
 					return result{}, err
 				}
 				return hostResult(store.List()), nil
 			}},
-			{use: "show", meta: meta("Show a context without its token", "eregion context show --name production --json", false), flags: contextNameFlag, run: func(cmd *cobra.Command, _ []string) (result, error) {
+			{use: "show", meta: meta("Show one saved context", "eregion context show --name production --json", false), flags: contextNameFlag, run: func(cmd *cobra.Command, _ []string) (result, error) {
 				store, err := load(cmd)
 				if err != nil {
 					return result{}, err
@@ -159,21 +89,6 @@ func (a *app) contextSpecs() []spec {
 				name, _ := cmd.Flags().GetString("name")
 				view, err := store.Use(name)
 				return hostResult(view), err
-			}},
-			{use: "export", meta: meta("Export a token only to an explicit private file", "eregion context export --out /private/ci.token", true), flags: func(cmd *cobra.Command) {
-				contextNameFlag(cmd)
-				cmd.Flags().String("out", "", "Absolute owner-only token output file (never stdout)")
-				cmd.Flags().Bool("replace", false, "Replace a different existing private token")
-			}, run: func(cmd *cobra.Command, _ []string) (result, error) {
-				store, err := load(cmd)
-				if err != nil {
-					return result{}, err
-				}
-				name, _ := cmd.Flags().GetString("name")
-				path, _ := cmd.Flags().GetString("out")
-				replace, _ := cmd.Flags().GetBool("replace")
-				report, err := store.Export(name, path, replace)
-				return hostResult(report), err
 			}},
 			a.contextCredentialSpec(meta),
 		}}}

@@ -12,7 +12,7 @@ import (
 // (q or Ctrl+C) or the context ends. Detaching never cancels an operation.
 func Run(ctx context.Context, opts Options) (Summary, error) {
 	if opts.API == nil {
-		return Summary{}, contract.NewFault(contract.InputRequired, "an API client is required", "Configure EREGION_API_URL and EREGION_API_TOKEN before opening the workspace.")
+		return Summary{}, contract.NewFault(contract.InputRequired, "an API client is required", "Select a saved context before opening the workspace.")
 	}
 	opts = opts.normalized()
 	program := tea.NewProgram(New(opts),

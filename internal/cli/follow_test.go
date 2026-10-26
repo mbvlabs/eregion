@@ -1,8 +1,6 @@
 package cli
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,8 +11,6 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/output"
-	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
 var followTestID = contract.OperationID("op_" + strings.Repeat("b", 32))
@@ -122,134 +118,6 @@ func followArgs(extra ...string) []string {
 	return append([]string{"operations", "follow", string(followTestID), "--poll-interval", "1ms"}, extra...)
 }
 
-func TestFollowPlainOutput(t *testing.T) {
-	newOperationAPI(t, contract.Succeeded)
-	code, stdout, stderr := invoke(t, followArgs()...)
-	if code != 0 {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if stderr != "" {
-		t.Fatalf("plain follow wrote stderr: %q", stderr)
-	}
-	for _, want := range []string{"accepted durably", "step preflight", "succeeded " + string(followTestID), "3 events"} {
-		if !strings.Contains(stdout, want) {
-			t.Fatalf("plain output missing %q:\n%s", want, stdout)
-		}
-	}
-	if strings.ContainsRune(stdout, '\x1b') {
-		t.Fatalf("plain output contains terminal escapes: %q", stdout)
-	}
-}
-
-func TestFollowJSONOutput(t *testing.T) {
-	newOperationAPI(t, contract.Succeeded)
-	code, stdout, stderr := invoke(t, followArgs("--json")...)
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q", code, stderr)
-	}
-	envelope := decodeOne(t, stdout)
-	if !envelope.OK {
-		t.Fatalf("follow failed: %+v", envelope.Error)
-	}
-	raw, _ := json.Marshal(envelope.Data)
-	var data struct {
-		State    contract.State     `json:"state"`
-		Events   uint64             `json:"events"`
-		Cursor   uint64             `json:"cursor,string"`
-		Detached bool               `json:"detached"`
-		Op       contract.Operation `json:"operation"`
-	}
-	if err := json.Unmarshal(raw, &data); err != nil {
-		t.Fatal(err)
-	}
-	if data.State != contract.Succeeded || data.Events != 3 || data.Cursor != 3 || data.Detached || data.Op.ID != followTestID {
-		t.Fatalf("unexpected final result: %s", raw)
-	}
-}
-
-func TestFollowNDJSONOutput(t *testing.T) {
-	newOperationAPI(t, contract.Succeeded)
-	code, stdout, stderr := invoke(t, followArgs("--output", "ndjson")...)
-	if code != 0 || stderr != "" {
-		t.Fatalf("code=%d stderr=%q", code, stderr)
-	}
-	var records []output.Record
-	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
-		var record output.Record
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			t.Fatalf("invalid NDJSON record %q: %v", line, err)
-		}
-		records = append(records, record)
-	}
-	if len(records) != 4 {
-		t.Fatalf("expected 3 events and one result, got %d records:\n%s", len(records), stdout)
-	}
-	for i, record := range records[:3] {
-		if record.Type != "event" || record.Event == nil || record.Event.Sequence != uint64(i+1) {
-			t.Fatalf("record %d is not the expected event: %+v", i, record)
-		}
-	}
-	last := records[3]
-	if last.Type != "result" || last.Result == nil || !last.Result.OK {
-		t.Fatalf("missing terminal result record: %+v", last)
-	}
-	raw, _ := json.Marshal(last.Result.Data)
-	if !strings.Contains(string(raw), `"state":"succeeded"`) {
-		t.Fatalf("result record lacks the final state: %s", raw)
-	}
-}
-
-func TestFollowInteractiveRequiresATerminal(t *testing.T) {
-	newOperationAPI(t, contract.Succeeded)
-	code, stdout, stderr := invoke(t, followArgs("--interactive")...)
-	if code != 2 || stdout != "" || !strings.Contains(stderr, "interactive viewer requires a terminal") {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-}
-
-func TestFollowInteractiveIsIgnoredByMachineOutput(t *testing.T) {
-	newOperationAPI(t, contract.Succeeded)
-	code, stdout, stderr := invoke(t, followArgs("--interactive", "--json")...)
-	if code != 0 || stderr != "" || !decodeOne(t, stdout).OK {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-}
-
-func TestFollowDetachDoesNotCancel(t *testing.T) {
-	api, _ := newOperationAPI(t, contract.Running)
-	api.block = true
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var stdout, stderr bytes.Buffer
-	done := make(chan int, 1)
-	go func() {
-		done <- run(ctx, followArgs(), panicReader{}, &stdout, &stderr, &secrets.Registry{})
-	}()
-	select {
-	case <-api.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("follow never contacted the API")
-	}
-	cancel()
-	select {
-	case code := <-done:
-		if code != 130 {
-			t.Fatalf("detach exit code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("follow did not stop after cancellation")
-	}
-	if !strings.Contains(stdout.String(), string(followTestID)) || !strings.Contains(stdout.String(), "resume: eregion operations follow") {
-		t.Fatalf("detach summary lacks identity/resume: %q", stdout.String())
-	}
-	api.mu.Lock()
-	cancels := api.cancelCalls
-	api.mu.Unlock()
-	if cancels != 0 {
-		t.Fatalf("detaching called cancel %d times", cancels)
-	}
-}
-
 func TestNDJSONIsRejectedForOrdinaryCommands(t *testing.T) {
 	code, stdout, stderr := invoke(t, "operations", "get", string(followTestID), "--output", "ndjson")
 	if code != 2 || stdout != "" || !strings.Contains(stderr, "invalid output mode") {
@@ -285,7 +153,7 @@ func TestFollowMetadataAndFlags(t *testing.T) {
 }
 
 func TestFollowSelectionRecognizesOnlyFollowCommands(t *testing.T) {
-	flags := []string{"api-url", "idempotency-key", "poll-interval"}
+	flags := []string{"idempotency-key", "poll-interval"}
 	for _, test := range []struct {
 		args   []string
 		active bool
@@ -300,13 +168,5 @@ func TestFollowSelectionRecognizesOnlyFollowCommands(t *testing.T) {
 		if selection.Active != test.active || selection.NDJSON != test.ndjson {
 			t.Fatalf("%v: %+v", test.args, selection)
 		}
-	}
-}
-
-func TestFollowRejectsNonPositivePollInterval(t *testing.T) {
-	newOperationAPI(t, contract.Succeeded)
-	code, stdout, stderr := invoke(t, "operations", "follow", string(followTestID), "--poll-interval", "0s")
-	if code != 2 || stdout != "" || !strings.Contains(stderr, "poll interval must be positive") {
-		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }

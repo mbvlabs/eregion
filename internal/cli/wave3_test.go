@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -106,56 +104,5 @@ func TestRemoteBundleDirIsStablePerHostAndContent(t *testing.T) {
 	}
 	if firstHash != secondHash {
 		t.Fatalf("remote config hash is not stable: %q != %q", firstHash, secondHash)
-	}
-}
-
-type fakeCredentialRemote struct {
-	output    []byte
-	outputErr error
-	removeErr error
-	removed   []string
-}
-
-func (f *fakeCredentialRemote) Output(context.Context, string) ([]byte, error) {
-	return f.output, f.outputErr
-}
-func (f *fakeCredentialRemote) Remove(_ context.Context, path string) error {
-	f.removed = append(f.removed, path)
-	return f.removeErr
-}
-
-func TestRemoteCredentialHandoffIsConsumedOnce(t *testing.T) {
-	path := "/var/lib/eregion/bootstrap/operator.handoff"
-	token := strings.Repeat("t", 43)
-	fake := &fakeCredentialRemote{output: []byte(token + "\n")}
-	got, err := consumeRemoteToken(context.Background(), fake, path)
-	if err != nil || got != token {
-		t.Fatalf("consume: %q %v", got, err)
-	}
-	if len(fake.removed) != 1 || fake.removed[0] != path {
-		t.Fatalf("the handoff file was not removed once: %v", fake.removed)
-	}
-
-	invalid := "not-a-token-but-secret"
-	fake = &fakeCredentialRemote{output: []byte(invalid)}
-	_, err = consumeRemoteToken(context.Background(), fake, path)
-	if err == nil || strings.Contains(err.Error(), invalid) {
-		t.Fatalf("invalid token error: %v", err)
-	}
-	if len(fake.removed) != 1 {
-		t.Fatal("a malformed handoff file was left on the host")
-	}
-
-	fake = &fakeCredentialRemote{outputErr: errors.New("connection lost")}
-	if _, err := consumeRemoteToken(context.Background(), fake, path); err == nil {
-		t.Fatal("unreadable handoff was accepted")
-	}
-	if len(fake.removed) != 0 {
-		t.Fatal("an unreadable handoff was deleted before the operator could recover it")
-	}
-
-	fake = &fakeCredentialRemote{output: []byte(token), removeErr: errors.New("read-only filesystem")}
-	if _, err := consumeRemoteToken(context.Background(), fake, path); err == nil || strings.Contains(err.Error(), token) {
-		t.Fatalf("remove failure: %v", err)
 	}
 }

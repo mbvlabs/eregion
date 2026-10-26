@@ -54,8 +54,8 @@ func LoadAuth(path string) (*Auth, error) {
 }
 
 func NewAuth(principals []Principal) (*Auth, error) {
-	if len(principals) == 0 || len(principals) > 128 {
-		return nil, contract.NewFault(contract.ValidationFailed, "invalid number of API credentials", "Configure 1–128 scoped credentials.")
+	if len(principals) > 128 {
+		return nil, contract.NewFault(contract.ValidationFailed, "invalid number of API credentials", "Configure at most 128 scoped credentials.")
 	}
 	auth := &Auth{principals: make(map[[32]byte]Principal)}
 	for _, principal := range principals {

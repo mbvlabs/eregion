@@ -10,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -34,7 +33,7 @@ func (s *Server) submitPlatformAction(r *http.Request, raw []byte) (any, int, er
 	if err := decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF {
 		return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid operation request", "Provide kind, target, input, and optional dry_run; identity comes from authentication.")
 	}
-	normalized, err := platform.Default().Normalize(request.Kind, request.Target, request.Input)
+	normalized, err := NormalizeAction(request.Kind, request.Target, request.Input)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -45,25 +44,15 @@ func (s *Server) submitPlatformAction(r *http.Request, raw []byte) (any, int, er
 	if err != nil {
 		return nil, 0, err
 	}
+	if len(r.Header.Values("Idempotency-Key")) > 1 {
+		return nil, 0, contract.NewFault(contract.InputRequired, "exactly one Idempotency-Key header is required", "Reuse one stable key for retries of this submission.")
+	}
+	data, err := NewAppService(s.service, nil, nil).SubmitNormalized(r.Context(), actor, normalized, r.Header.Get("Idempotency-Key"), request.DryRun)
+	status := http.StatusAccepted
 	if request.DryRun {
-		if previewer, ok := s.service.(platformPreviewService); ok {
-			preview, err := previewer.Preview(r.Context(), actor, normalized)
-			return preview, http.StatusOK, err
-		}
-		return platform.Preview{
-			Kind: normalized.Kind, Target: normalized.Target.String(), DryRun: true,
-			Input: normalized.Input.Preview(), Summary: normalized.Summary,
-			Warnings: []string{"A detailed deployment plan requires a control-plane service."},
-		}, http.StatusOK, nil
+		status = http.StatusOK
 	}
-	if len(r.Header.Values("Idempotency-Key")) != 1 || r.Header.Get("Idempotency-Key") == "" {
-		return nil, 0, contract.NewFault(contract.InputRequired, "Idempotency-Key header is required", "Reuse one stable key for retries of this submission.")
-	}
-	op, err := s.service.Submit(r.Context(), operations.Submission{
-		Kind: normalized.Kind, Target: normalized.Target.String(), Actor: actor,
-		IdempotencyKey: r.Header.Get("Idempotency-Key"), Input: normalized.Canonical,
-	})
-	return op, http.StatusAccepted, err
+	return data, status, err
 }
 
 func (s *Server) platformInventory(r *http.Request) (any, int, error) {
@@ -78,10 +67,7 @@ func (s *Server) platformInventory(r *http.Request) (any, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	service, ok := s.service.(platformInventoryService)
-	if !ok {
-		return nil, 0, contract.NewFault(contract.Unavailable, "platform inventory is not configured", "Use a control-plane service with durable platform state.")
-	}
+	service := NewAppService(s.service, nil, nil)
 	inventory, err := service.Inventory(r.Context(), actor, query)
 	return inventory, http.StatusOK, err
 }

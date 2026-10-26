@@ -17,7 +17,10 @@ import (
 // except for follow commands whose presenter writes its own terminal protocol.
 func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer) int {
 	// The node agent speaks the node protocol on stdin/stdout, so it bypasses
-	// the result envelope entirely.
+	// the result envelope entirely. Node RPC speaks its own NDJSON protocol.
+	if len(args) == 2 && args[0] == "node" && args[1] == "rpc" {
+		return serveNodeRPC(ctx, in, out, stderr)
+	}
 	if len(args) > 0 && args[0] == "node-agent" {
 		return nodeagent.Run(args[1:], in, out, stderr)
 	}

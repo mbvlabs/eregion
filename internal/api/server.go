@@ -118,19 +118,16 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 		if request.Kind != operations.TestKind || request.Target != operations.TestTarget {
 			return nil, 0, contract.NewFault(contract.ValidationFailed, "unsupported operation kind or target", "Use diagnostic.test on control-plane.")
 		}
-		input, err := operations.NormalizeTestInput(request.Input)
-		if err != nil {
-			return nil, 0, err
+		if len(r.Header.Values("Idempotency-Key")) > 1 {
+			return nil, 0, contract.NewFault(contract.InputRequired, "exactly one Idempotency-Key header is required", "Reuse one stable key for retries of this submission.")
 		}
+		key := r.Header.Get("Idempotency-Key")
+		data, err := NewAppService(s.service, nil, s.ready).SubmitDiagnostic(r.Context(), actor, request.Input, key, request.DryRun)
+		status := http.StatusAccepted
 		if request.DryRun {
-			return operations.TestPreview{Kind: request.Kind, Target: request.Target, Input: input, DryRun: true}, http.StatusOK, nil
+			status = http.StatusOK
 		}
-		if len(r.Header.Values("Idempotency-Key")) != 1 || r.Header.Get("Idempotency-Key") == "" {
-			return nil, 0, contract.NewFault(contract.InputRequired, "Idempotency-Key header is required", "Reuse one stable key for retries of this submission.")
-		}
-		canonical, _ := json.Marshal(input)
-		op, err := s.service.Submit(r.Context(), operations.Submission{Kind: request.Kind, Target: request.Target, Actor: actor, IdempotencyKey: r.Header.Get("Idempotency-Key"), Input: canonical})
-		return op, http.StatusAccepted, err
+		return data, status, err
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/platform" {
 		return s.platformInventory(r)
@@ -141,8 +138,9 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 		if err := id.Validate(); err != nil {
 			return nil, 0, err
 		}
+		app := NewAppService(s.service, nil, s.ready)
 		if r.Method == http.MethodGet && len(parts) == 3 {
-			op, err := s.service.Get(r.Context(), actor, id)
+			op, err := app.GetOperation(r.Context(), actor, id)
 			if err != nil {
 				return op, http.StatusOK, err
 			}
@@ -152,7 +150,7 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 			return op, http.StatusOK, nil
 		}
 		if r.Method == http.MethodGet && len(parts) == 4 && parts[3] == "events" {
-			existing, err := s.service.Get(r.Context(), actor, id)
+			existing, err := app.GetOperation(r.Context(), actor, id)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -184,11 +182,11 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 			if limit < 1 || limit > 200 {
 				return nil, 0, contract.NewFault(contract.ValidationFailed, "event limit out of range", "Use an event limit from 1 to 200.")
 			}
-			page, err := s.service.Events(r.Context(), actor, contract.Cursor{OperationID: id, After: after}, limit)
+			page, err := app.OperationEvents(r.Context(), actor, contract.Cursor{OperationID: id, After: after}, limit)
 			return page, http.StatusOK, err
 		}
 		if r.Method == http.MethodPost && len(parts) == 4 && parts[3] == "cancel" {
-			existing, err := s.service.Get(r.Context(), actor, id)
+			existing, err := app.GetOperation(r.Context(), actor, id)
 			if err != nil {
 				return nil, 0, err
 			}

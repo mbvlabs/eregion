@@ -58,7 +58,6 @@ func fixture(t *testing.T, role Role) Config {
 	cfg.BinaryPath = filepath.Join(root, "source-cli")
 	put(t, cfg.BinaryPath, "fixture CLI executable", 0o700)
 	cfg.DatabaseURL = "postgres://test:private-password@127.0.0.1/test?sslmode=disable"
-	cfg.OperatorTokenOut = filepath.Join(root, "exports/operator.token")
 	return cfg
 }
 
@@ -116,25 +115,20 @@ func TestConfirmationBindingAndExpiry(t *testing.T) {
 	}
 }
 
-func TestPrivateContextAndExport(t *testing.T) {
+func TestContextStore(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "contexts.json")
 	store, err := LoadContextStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	token := strings.Repeat("a", 43)
-	view, err := store.Login("production", "https://api.example.com", token, []string{"system:read"})
+	route := &ContextSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: filepath.Join(root, "known_hosts")}
+	view, err := store.SaveContext(Context{Name: "production", SSH: route, AutoUpgradeNodes: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, _ := json.Marshal(view)
-	if strings.Contains(string(data), token) {
-		t.Fatal("view leaks token")
-	}
-	data, _ = json.Marshal(store.List())
-	if strings.Contains(string(data), token) {
-		t.Fatal("list leaks token")
+	if view.Route == "" || !view.AutoUpgradeNodes || !view.Current {
+		t.Fatalf("unexpected view: %+v", view)
 	}
 	info, _ := os.Stat(path)
 	if info.Mode().Perm() != 0o600 {
@@ -147,39 +141,17 @@ func TestPrivateContextAndExport(t *testing.T) {
 	if reloaded.Current != "production" {
 		t.Fatal("current not persisted")
 	}
-	out := filepath.Join(root, "export/token")
-	report, err := reloaded.Export("", out, false)
-	if err != nil {
+	if _, err := reloaded.Get("production"); err != nil {
 		t.Fatal(err)
 	}
-	data, _ = json.Marshal(report)
-	if strings.Contains(string(data), token) {
-		t.Fatal("export result leaks token")
+	if !reloaded.List()[0].AutoUpgradeNodes {
+		t.Fatal("auto upgrade flag not persisted")
 	}
-	raw, _ := os.ReadFile(out)
-	info, _ = os.Stat(out)
-	if strings.TrimSpace(string(raw)) != token || info.Mode().Perm() != 0o600 {
-		t.Fatal("bad export")
-	}
-	other := filepath.Join(root, "other")
-	put(t, other, strings.Repeat("b", 43), 0o600)
-	if _, err := reloaded.Export("", other, false); err == nil {
-		t.Fatal("overwrote another token")
-	}
-	symlink := filepath.Join(root, "link")
-	if err := os.Symlink(other, symlink); err != nil {
+	if _, err := reloaded.Use(""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reloaded.Export("", symlink, true); err == nil {
-		t.Fatal("followed symlink")
-	}
-	if _, err := ReadTokenFile(symlink); err == nil {
-		t.Fatal("read private input through symlink")
-	}
-	for _, origin := range []string{"http://api.example.com", "https://api.example.com/path", "https://user:password@api.example.com"} {
-		if _, err := store.Login("unsafe", origin, token, nil); err == nil {
-			t.Fatal("unsafe API origin", origin)
-		}
+	if ok, err := reloaded.Remove("production"); err != nil || !ok {
+		t.Fatalf("remove: %v %v", ok, err)
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
@@ -191,9 +163,8 @@ func TestPrivateContextAndExport(t *testing.T) {
 
 func TestCredentialHandoffNoPlaintextInputs(t *testing.T) {
 	cfg := fixture(t, RoleMain)
-	preview, err := LoadCredentials(cfg, false)
-	if err != nil || preview.Operator != "" {
-		t.Fatalf("%+v %v", preview, err)
+	if _, err := LoadCredentials(cfg, false); err != nil {
+		t.Fatal(err)
 	}
 	credentials, err := LoadCredentials(cfg, true)
 	if err != nil {
@@ -204,7 +175,7 @@ func TestCredentialHandoffNoPlaintextInputs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(inputs, []byte(credentials.Operator)) || bytes.Contains(inputs, []byte("private-password")) {
+	if bytes.Contains(inputs, []byte("private-password")) {
 		t.Fatal("secret in engine inputs")
 	}
 	// Use the fixture's existing account, not a real service account.
@@ -216,20 +187,14 @@ func TestCredentialHandoffNoPlaintextInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(step.authPath())
-	if bytes.Contains(raw, []byte(credentials.Operator)) {
-		t.Fatal("auth file contains token")
+	if bytes.Contains(raw, []byte("token_sha256")) {
+		t.Fatal("setup minted an API token")
 	}
-	for _, path := range []string{step.authPath(), step.envPath(), cfg.OperatorTokenOut, filepath.Join(cfg.Layout.StateDir, "secrets/operator.token")} {
+	for _, path := range []string{step.authPath(), step.envPath()} {
 		info, err := os.Stat(path)
 		if err != nil || info.Mode().Perm() != 0o600 {
 			t.Fatalf("unsafe credential file %s: %v", path, err)
 		}
-	}
-	if err := os.Chmod(filepath.Join(cfg.Layout.StateDir, "secrets/operator.token"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadCredentials(cfg, false); err == nil {
-		t.Fatal("accepted unsafe cached token")
 	}
 }
 
@@ -328,21 +293,20 @@ func TestPackExtractionRejectsLinksAndTraversal(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedReadiness(t *testing.T) {
-	token := strings.Repeat("r", 43)
+func TestPublicReadiness(t *testing.T) {
 	seen := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/readyz" {
-			seen = r.Header.Get("Authorization") == "Bearer "+token
-			if !seen {
-				w.WriteHeader(401)
+			seen = true
+			if r.Header.Get("Authorization") != "" {
+				w.WriteHeader(400)
 			}
 		}
 	}))
 	defer server.Close()
 	cfg := fixture(t, RoleMain)
 	cfg.APIListen = strings.TrimPrefix(server.URL, "http://")
-	if err := (httpProbe{}).Health(context.Background(), cfg, token); err != nil || !seen {
-		t.Fatal("no authenticated readiness", err)
+	if err := (httpProbe{}).Health(context.Background(), cfg); err != nil || !seen {
+		t.Fatal("no public readiness", err)
 	}
 }

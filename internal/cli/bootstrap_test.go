@@ -5,12 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/api"
@@ -19,7 +16,7 @@ import (
 )
 
 func TestBootstrapAndContextAreAttached(t *testing.T) {
-	for _, path := range [][]string{{"bootstrap"}, {"bootstrap", "plan"}, {"bootstrap", "apply"}, {"bootstrap", "confirm"}, {"bootstrap", "remote"}, {"context"}, {"context", "login"}, {"context", "credential", "add"}} {
+	for _, path := range [][]string{{"bootstrap"}, {"bootstrap", "plan"}, {"bootstrap", "apply"}, {"bootstrap", "confirm"}, {"bootstrap", "remote"}, {"context"}, {"context", "credential", "add"}} {
 		code, stdout, stderr := invoke(t, append([]string{"commands", "--path", strings.Join(path, " ")}, "--json")...)
 		if code != 0 {
 			t.Fatalf("%v: code=%d stdout=%q stderr=%q", path, code, stdout, stderr)
@@ -31,76 +28,11 @@ func TestBootstrapAndContextAreAttached(t *testing.T) {
 	}
 }
 
-func TestContextClientPrecedence(t *testing.T) {
-	dir := t.TempDir()
-	contextPath := filepath.Join(dir, "contexts.json")
-	store, err := host.LoadContextStore(contextPath)
-	if err != nil {
-		t.Fatal(err)
+func TestContextClientRequiresSavedContext(t *testing.T) {
+	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	if code, _, _ := invoke(t, "operations", "get", string(followTestID), "--json"); code != 3 {
+		t.Fatalf("missing context: code=%d", code)
 	}
-	var savedHits, envHits atomic.Int32
-	saved := operationServer(t, &savedHits)
-	explicit := operationServer(t, &envHits)
-	savedToken := strings.Repeat("s", 32)
-	envToken := strings.Repeat("e", 32)
-	if _, err := store.Login("saved", saved.URL, savedToken, nil); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("EREGION_CONTEXT_FILE", contextPath)
-	t.Setenv("EREGION_API_URL", "")
-	t.Setenv("EREGION_API_TOKEN", "")
-	if code, stdout, stderr := invoke(t, "operations", "get", string(followTestID), "--json"); code != 0 {
-		t.Fatalf("saved context: code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if savedHits.Load() != 1 || envHits.Load() != 0 {
-		t.Fatalf("saved context was not selected: saved=%d env=%d", savedHits.Load(), envHits.Load())
-	}
-
-	t.Setenv("EREGION_API_URL", explicit.URL)
-	t.Setenv("EREGION_API_TOKEN", envToken)
-	if code, stdout, stderr := invoke(t, "operations", "get", string(followTestID), "--json"); code != 0 {
-		t.Fatalf("environment: code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if envHits.Load() != 1 || savedHits.Load() != 1 {
-		t.Fatalf("environment did not win: saved=%d env=%d", savedHits.Load(), envHits.Load())
-	}
-
-	// An explicit origin without a token must not receive the saved token.
-	t.Setenv("EREGION_API_TOKEN", "")
-	if code, _, _ := invoke(t, "operations", "get", string(followTestID), "--api-url", explicit.URL, "--json"); code != 2 {
-		t.Fatalf("saved credential leaked to another origin: code=%d", code)
-	}
-	if envHits.Load() != 1 {
-		t.Fatal("request reached the explicit origin without a credential")
-	}
-
-	// The same origin may reuse the saved token.
-	if code, stdout, stderr := invoke(t, "operations", "get", string(followTestID), "--api-url", saved.URL, "--json"); code != 0 {
-		t.Fatalf("same origin: code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if savedHits.Load() != 2 {
-		t.Fatalf("saved token not reused for the same origin: %d", savedHits.Load())
-	}
-
-	// A flag wins over the environment.
-	t.Setenv("EREGION_API_URL", explicit.URL)
-	t.Setenv("EREGION_API_TOKEN", envToken)
-	if code, stdout, stderr := invoke(t, "operations", "get", string(followTestID), "--api-url", saved.URL, "--json"); code != 0 {
-		t.Fatalf("flag: code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if savedHits.Load() != 3 {
-		t.Fatalf("flag did not win: %d", savedHits.Load())
-	}
-}
-
-func operationServer(t *testing.T, hits *atomic.Int32) *httptest.Server {
-	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
-		writeTestEnvelope(w, followTestOperation(contract.Succeeded))
-	}))
-	t.Cleanup(server.Close)
-	return server
 }
 
 func TestContextCredentialAddIsScopedAndBound(t *testing.T) {
@@ -131,7 +63,7 @@ func TestContextCredentialAddIsScopedAndBound(t *testing.T) {
 		t.Fatalf("bad credential plan: %s %v", data, err)
 	}
 	if strings.Contains(string(data), tokenOut) && strings.Contains(string(data), operator) {
-		t.Fatal("credential plan leaked the operator token")
+		t.Fatal("credential plan leaked the generated token")
 	}
 	if code, _, _ := invoke(t, "context", "credential", "add", "--auth-file", authPath, "--subject", "ci-deploy", "--scope", "operations:read", "--token-out", tokenOut, "--json"); code != 5 {
 		t.Fatalf("unconfirmed credential add: code=%d", code)
@@ -226,7 +158,6 @@ func TestRemoteBundleNeverPassesSecretsInArguments(t *testing.T) {
 	cfg := host.DefaultConfig(host.RoleMain, "main")
 	cfg.BinaryPath = binary
 	cfg.DatabaseURL = "postgres://u:private-password@127.0.0.1/test?sslmode=disable"
-	cfg.OperatorTokenOut = "/var/lib/eregion/bootstrap/operator.handoff"
 	files, args, err := remoteBundle(cfg, "/var/lib/eregion/bootstrap/remote/test")
 	if err != nil {
 		t.Fatal(err)
