@@ -12,15 +12,20 @@ import (
 )
 
 const (
-	KindAppCreate         = "platform.app.create"
-	KindNodeRegister      = "platform.node.register"
-	KindNodeCheck         = "platform.node.check"
-	KindEnvironmentCreate = "platform.environment.create"
-	KindReleaseCreate     = "platform.release.create"
-	KindDeploy            = "platform.deploy"
-	KindRollback          = "platform.rollback"
-	KindDomainAdd         = "platform.domain.add"
-	KindDomainRemove      = "platform.domain.remove"
+	KindAppCreate               = "platform.app.create"
+	KindNodeRegister            = "platform.node.register"
+	KindNodeCheck               = "platform.node.check"
+	KindEnvironmentCreate       = "platform.environment.create"
+	KindEnvironmentUpdate       = "platform.environment.update"
+	KindProcessScale            = "platform.process.scale"
+	KindConfigSet               = "platform.config.set"
+	KindConfigUnset             = "platform.config.unset"
+	KindEnvironmentSecretAttach = "platform.environment.secret.attach"
+	KindReleaseCreate           = "platform.release.create"
+	KindDeploy                  = "platform.deploy"
+	KindRollback                = "platform.rollback"
+	KindDomainAdd               = "platform.domain.add"
+	KindDomainRemove            = "platform.domain.remove"
 )
 
 // MaxInputBytes bounds one action input. The API enforces the same value at the

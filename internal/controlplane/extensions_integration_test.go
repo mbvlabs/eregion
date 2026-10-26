@@ -239,13 +239,13 @@ func TestIntegrationExtensionsThroughRealWiring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	values, err := s.resolveEnvironmentSecrets(ctx, env)
+	values, _, err := s.resolveEnvironmentSecrets(ctx, env)
 	if err != nil || values["DB_PASSWORD"] != plaintext {
 		t.Fatalf("deploy-time resolution failed: %v %v", values, err)
 	}
 	// A reference into another environment is refused, not resolved.
 	env.SecretRefs = map[string]string{"DB_PASSWORD": "vault:shop/staging/DB_PASSWORD@1"}
-	if _, err := s.resolveEnvironmentSecrets(ctx, env); err == nil {
+	if _, _, err := s.resolveEnvironmentSecrets(ctx, env); err == nil {
 		t.Fatal("cross-environment secret reference resolved")
 	}
 	var leaked int

@@ -16,6 +16,7 @@ import (
 
 type AppID string
 type EnvironmentID string
+type RevisionID string
 type ReleaseID string
 type DeploymentID string
 type ChangeID string
@@ -23,6 +24,7 @@ type ChangeID string
 var (
 	appIDPattern         = regexp.MustCompile(`^app_[0-9a-f]{32}$`)
 	environmentIDPattern = regexp.MustCompile(`^env_[0-9a-f]{32}$`)
+	revisionIDPattern    = regexp.MustCompile(`^erv_[0-9a-f]{32}$`)
 	releaseIDPattern     = regexp.MustCompile(`^rel_[0-9a-f]{32}$`)
 	deploymentIDPattern  = regexp.MustCompile(`^dep_[0-9a-f]{32}$`)
 	changeIDPattern      = regexp.MustCompile(`^chg_[0-9a-f]{32}$`)
@@ -51,6 +53,11 @@ func NewEnvironmentID() (EnvironmentID, error) {
 	return EnvironmentID(value), err
 }
 
+func NewEnvironmentRevisionID() (RevisionID, error) {
+	value, err := newID("erv_")
+	return RevisionID(value), err
+}
+
 func NewReleaseID() (ReleaseID, error) {
 	value, err := newID("rel_")
 	return ReleaseID(value), err
@@ -76,6 +83,13 @@ func (id AppID) Validate() error {
 func (id EnvironmentID) Validate() error {
 	if !environmentIDPattern.MatchString(string(id)) {
 		return contract.NewFault(contract.ValidationFailed, "invalid environment ID", "Use the environment ID returned by inventory.")
+	}
+	return nil
+}
+
+func (id RevisionID) Validate() error {
+	if !revisionIDPattern.MatchString(string(id)) {
+		return contract.NewFault(contract.ValidationFailed, "invalid environment revision ID", "Use the revision ID returned by inventory.")
 	}
 	return nil
 }

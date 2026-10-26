@@ -75,6 +75,144 @@ type HealthConfig struct {
 	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 
+// SourceBinding is the durable source declaration in an environment revision.
+// A git binding is an HTTPS repository with an optional read-credential secret
+// NAME; the value lives in the vault and is never part of the revision.
+type SourceBinding struct {
+	Kind                 string            `json:"kind"`
+	URL                  string            `json:"url,omitempty"`
+	Ref                  string            `json:"ref,omitempty"`
+	CredentialSecretName string            `json:"credential_secret_name,omitempty"`
+	ContextPath          string            `json:"context_path,omitempty"`
+	Builder              string            `json:"builder,omitempty"`
+	BuildEnv             map[string]string `json:"build_env,omitempty"`
+	Image                string            `json:"image,omitempty"`
+}
+
+// RuntimeSpec is the environment runtime declaration. Node is mirrored on the
+// environment row so placement remains queryable without reading the revision.
+type RuntimeSpec struct {
+	Node                 string       `json:"node,omitempty"`
+	HealthType           string       `json:"health_type,omitempty"`
+	HealthPath           string       `json:"health_path,omitempty"`
+	HealthTimeoutSeconds int          `json:"health_timeout_seconds,omitempty"`
+	ReleaseCommand       *CommandSpec `json:"release_command,omitempty"`
+}
+
+// ProcessSpec is one process formation entry. Web and service processes own a
+// container port; a worker has no published port.
+type ProcessSpec struct {
+	Name          string   `json:"name"`
+	Kind          string   `json:"kind"`
+	Command       string   `json:"command,omitempty"`
+	Args          []string `json:"args,omitempty"`
+	Replicas      int      `json:"replicas,omitempty"`
+	ContainerPort int      `json:"container_port,omitempty"`
+}
+
+// RevisionState is the complete desired state carried by one environment
+// revision. SecretNames are vault names only; values are resolved per deploy.
+type RevisionState struct {
+	Source            SourceBinding     `json:"source"`
+	AutoDeploy        bool              `json:"auto_deploy"`
+	WebhookSecretName string            `json:"webhook_secret_name,omitempty"`
+	Runtime           RuntimeSpec       `json:"runtime"`
+	Processes         []ProcessSpec     `json:"processes"`
+	Config            map[string]string `json:"config"`
+	SecretNames       []string          `json:"secret_names"`
+	// DeployIntent records that the operator asked for a first deploy. Building
+	// from a revision is implemented by the deploy work list row, not here.
+	DeployIntent bool `json:"deploy_intent,omitempty"`
+}
+
+// EnvironmentRevision is one immutable, numbered environment desired state.
+type EnvironmentRevision struct {
+	ID          RevisionID           `json:"id"`
+	App         string               `json:"app,omitempty"`
+	Environment string               `json:"environment,omitempty"`
+	Number      int                  `json:"number"`
+	OperationID contract.OperationID `json:"operation_id,omitempty"`
+	Actor       contract.Actor       `json:"actor"`
+	Operation   string               `json:"operation"`
+	Summary     string               `json:"summary"`
+	RevisionState
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Deployability is the report MASTER section 4 requires before a deploy can
+// run. DNS stays unknown until the domain work list row observes it.
+type Deployability struct {
+	Deployable bool     `json:"deployable"`
+	Missing    []string `json:"missing"`
+	DNS        string   `json:"dns"`
+}
+
+// DeployabilityState supplies the non-revision observations.
+type DeployabilityState struct {
+	ArtifactReady bool
+	PrimaryDomain string
+	DNS           string
+}
+
+type EnvironmentDeployabilityReport struct {
+	App               string        `json:"app"`
+	Environment       string        `json:"environment"`
+	CurrentRevisionID RevisionID    `json:"current_revision_id,omitempty"`
+	Deployability     Deployability `json:"deployability"`
+}
+
+// EvaluateDeployability is pure: it reads only the revision and observations.
+func EvaluateDeployability(revision *EnvironmentRevision, state DeployabilityState) Deployability {
+	dns := state.DNS
+	if dns == "" {
+		dns = "unknown"
+	}
+	missing := make([]string, 0, 6)
+	if revision == nil || !sourceReady(revision.Source) {
+		missing = append(missing, "source")
+	}
+	if !state.ArtifactReady {
+		missing = append(missing, "artifact")
+	}
+	if revision == nil || !runtimeReady(revision.Runtime) {
+		missing = append(missing, "runtime")
+	}
+	if revision == nil || !webProcessReady(revision.Processes) {
+		missing = append(missing, "web_process")
+	}
+	if state.PrimaryDomain == "" {
+		missing = append(missing, "domain")
+	}
+	if dns == "missing" {
+		missing = append(missing, "dns")
+	}
+	return Deployability{Deployable: len(missing) == 0, Missing: missing, DNS: dns}
+}
+
+func sourceReady(source SourceBinding) bool {
+	switch source.Kind {
+	case "git":
+		return source.URL != ""
+	case "image":
+		return source.Image != ""
+	default:
+		return false
+	}
+}
+
+func runtimeReady(runtime RuntimeSpec) bool {
+	return runtime.Node != "" && runtime.HealthPath != ""
+}
+
+func webProcessReady(processes []ProcessSpec) bool {
+	for _, process := range processes {
+		if process.Kind == "web" && process.Replicas > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 type HealthState string
 
 const (
@@ -107,9 +245,15 @@ type Environment struct {
 	HealthDetail    string            `json:"health_detail,omitempty"`
 	HealthCheckedAt *time.Time        `json:"health_checked_at,omitempty"`
 	// Domains are the public hostnames Caddy routes to HostPort.
-	Domains   []string  `json:"domains"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Domains       []string             `json:"domains"`
+	PrimaryDomain string               `json:"primary_domain,omitempty"`
+	ArtifactReady bool                 `json:"artifact_ready"`
+	RevisionID    RevisionID           `json:"current_revision_id,omitempty"`
+	Revision      *EnvironmentRevision `json:"revision,omitempty"`
+	Processes     []ProcessSpec        `json:"processes"`
+	Deployability Deployability        `json:"deployability"`
+	CreatedAt     time.Time            `json:"created_at"`
+	UpdatedAt     time.Time            `json:"updated_at"`
 }
 
 // BuildNodeName is where a build source for this environment runs. An empty
@@ -187,20 +331,30 @@ const (
 	DeploymentCancelled DeploymentState = "cancelled"
 )
 
+// SecretRevisionRef is the non-secret identity of one resolved vault revision.
+type SecretRevisionRef struct {
+	Revision  uint64    `json:"revision"`
+	Hash      string    `json:"hash"`
+	KeyID     string    `json:"key_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type Deployment struct {
-	ID                DeploymentID         `json:"id"`
-	OperationID       contract.OperationID `json:"operation_id"`
-	App               string               `json:"app"`
-	Environment       string               `json:"environment"`
-	Action            DeploymentAction     `json:"action"`
-	ReleaseID         ReleaseID            `json:"release_id"`
-	PreviousReleaseID ReleaseID            `json:"previous_release_id,omitempty"`
-	State             DeploymentState      `json:"state"`
-	ErrorCode         contract.Code        `json:"error_code,omitempty"`
-	Message           string               `json:"message,omitempty"`
-	CreatedAt         time.Time            `json:"created_at"`
-	UpdatedAt         time.Time            `json:"updated_at"`
-	CompletedAt       *time.Time           `json:"completed_at,omitempty"`
+	ID                DeploymentID                 `json:"id"`
+	OperationID       contract.OperationID         `json:"operation_id"`
+	App               string                       `json:"app"`
+	Environment       string                       `json:"environment"`
+	Action            DeploymentAction             `json:"action"`
+	ReleaseID         ReleaseID                    `json:"release_id"`
+	PreviousReleaseID ReleaseID                    `json:"previous_release_id,omitempty"`
+	RevisionID        RevisionID                   `json:"revision_id,omitempty"`
+	SecretRevisions   map[string]SecretRevisionRef `json:"secret_revisions,omitempty"`
+	State             DeploymentState              `json:"state"`
+	ErrorCode         contract.Code                `json:"error_code,omitempty"`
+	Message           string                       `json:"message,omitempty"`
+	CreatedAt         time.Time                    `json:"created_at"`
+	UpdatedAt         time.Time                    `json:"updated_at"`
+	CompletedAt       *time.Time                   `json:"completed_at,omitempty"`
 }
 
 type Change struct {

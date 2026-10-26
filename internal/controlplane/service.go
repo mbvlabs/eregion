@@ -14,6 +14,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/vault"
 )
 
 type Service struct {
@@ -52,6 +53,12 @@ type SecretResolver interface {
 // refused. A resolver that implements it is always preferred over Resolve.
 type EnvironmentSecretResolver interface {
 	ResolveEnvironment(ctx context.Context, app, environment string, refs map[string]string) (map[string]string, error)
+}
+
+// EnvironmentSecretSnapshotResolver resolves revision secret names (or the
+// transitional pinned refs) and returns the exact non-secret revision identities.
+type EnvironmentSecretSnapshotResolver interface {
+	ResolveEnvironmentSnapshot(ctx context.Context, app, environment string, names []string, refs map[string]string) (map[string]string, map[string]vault.RevisionRef, error)
 }
 
 func (s *Service) buildSourceRoots() []string {

@@ -15,6 +15,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/riverqueue/river"
 )
 
@@ -92,7 +93,9 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runExtension(ctx, op.ID, attempt, normalized, executor)
 	}
 	switch normalized.Kind {
-	case platform.KindAppCreate, platform.KindNodeRegister, platform.KindEnvironmentCreate:
+	case platform.KindAppCreate, platform.KindNodeRegister, platform.KindEnvironmentCreate,
+		platform.KindEnvironmentUpdate, platform.KindProcessScale, platform.KindConfigSet,
+		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach:
 		return w.runRecordAction(ctx, op.ID, attempt, normalized)
 	case platform.KindNodeCheck:
 		return w.runNodeCheck(ctx, op.ID, attempt, normalized)
@@ -197,22 +200,65 @@ func (s *Service) lockTarget(ctx context.Context, target string) (func(), error)
 
 func (w *platformWorker) runRecordAction(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
 	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		if normalized.Kind == platform.KindEnvironmentCreate {
-			input := normalized.Input.(*platform.EnvironmentCreateInput)
-			return insertPlatformChange(ctx, tx, op, "environment.created", input.App, input.Name,
-				"Created environment "+input.Name+" on node "+input.Node,
-				map[string]any{"node": input.Node, "bind": input.Bind, "container_port": input.ContainerPort},
-				map[string]any{"host_port": nil, "serving_release_id": nil})
-		}
-		if normalized.Kind == platform.KindAppCreate {
-			input := normalized.Input.(*platform.AppCreateInput)
-			return insertPlatformChange(ctx, tx, op, "app.created", input.Name, "",
-				"Created application "+input.Name, map[string]any{"app": input.Name}, nil)
+		switch input := normalized.Input.(type) {
+		case *platform.AppCreateInput:
+			if err := insertPlatformChange(ctx, tx, op, "app.created", input.Name, "",
+				"Created application "+input.Name, map[string]any{"app": input.Name}, nil); err != nil {
+				return err
+			}
+			if input.Environment == nil {
+				return nil
+			}
+			if input.Deploy {
+				if err := appendEvent(ctx, tx, op, contract.Event{
+					Kind: "warning", Stage: "environment", Message: "A first deploy was requested and is recorded on the revision as intent; deploy-from-revision is not implemented yet.",
+				}); err != nil {
+					return err
+				}
+			}
+			return recordRevisionChange(ctx, tx, op, "environment.created", input.Name, input.Environment.Name,
+				"Created environment "+input.Environment.Name+" and its first desired-state revision.")
+		case *platform.EnvironmentCreateInput:
+			return recordRevisionChange(ctx, tx, op, "environment.created", input.App, input.Name,
+				"Created environment "+input.Name+" on node "+input.Node+" with its first desired-state revision.")
+		case *platform.EnvironmentUpdateInput:
+			return recordRevisionChange(ctx, tx, op, "environment.updated", input.App, input.Environment,
+				"Updated environment "+input.Environment+" desired state as a new revision.")
+		case *platform.ProcessScaleInput:
+			return recordRevisionChange(ctx, tx, op, "process.scaled", input.App, input.Environment,
+				"Scaled process "+input.Process+" in a new revision.")
+		case *platform.ConfigSetInput:
+			return recordRevisionChange(ctx, tx, op, "config.set", input.App, input.Environment,
+				"Set plain configuration in a new revision; no deploy was queued.")
+		case *platform.ConfigUnsetInput:
+			return recordRevisionChange(ctx, tx, op, "config.unset", input.App, input.Environment,
+				"Removed plain configuration in a new revision; no deploy was queued.")
+		case *platform.EnvironmentSecretAttachInput:
+			return recordRevisionChange(ctx, tx, op, "environment.secret.attached", input.App, input.Environment,
+				"Attached vault secret name "+input.Name+" to the environment revision.")
 		}
 		// Node registration records declared facts only. It is not enrollment or
 		// verification; node.check performs an authenticated transport check.
 		return nil
 	})
+}
+
+func recordRevisionChange(ctx context.Context, tx pgx.Tx, op *contract.Operation, kind, app, environment, summary string) error {
+	var revisionID string
+	if err := tx.QueryRow(ctx, `SELECT coalesce(e.current_revision_id,'')
+        FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE a.name=$1 AND e.name=$2`, app, environment).Scan(&revisionID); err != nil {
+		return err
+	}
+	var number int
+	if revisionID != "" {
+		_ = tx.QueryRow(ctx, `SELECT number FROM eregion_platform_environment_revisions WHERE id=$1`, revisionID).Scan(&number)
+	}
+	desired := map[string]any{"revision_id": revisionID}
+	if number > 0 {
+		desired["revision_number"] = number
+	}
+	return insertPlatformChange(ctx, tx, op, kind, app, environment, summary, desired, nil)
 }
 
 func (w *platformWorker) runNodeCheck(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
@@ -395,9 +441,21 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	secrets, err := w.service.resolveEnvironmentSecrets(ctx, env)
+	secrets, secretRevisions, err := w.service.resolveEnvironmentSecrets(ctx, env)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.recordDeploymentSecretSnapshot(ctx, id, env.RevisionID, secretRevisions); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	secretKeys := sortedPlatformKeys(secrets)
+	containerEnv := env.Env
+	releaseCommand := release.Command
+	if env.Revision != nil {
+		containerEnv = env.Revision.Config
+		if env.Revision.Runtime.ReleaseCommand != nil {
+			releaseCommand = env.Revision.Runtime.ReleaseCommand
+		}
 	}
 	candidateName := platform.CandidateContainerName(env.ID, id)
 	servingName := env.ID.Container("serving")
@@ -421,21 +479,19 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	}, nil); err != nil {
 		return finish(err)
 	}
-	if release.Command != nil {
+	if releaseCommand != nil {
 		commandArgs := []string{"docker", "run", "--rm", "--name", candidateName + "-cmd", "--pull", "never"}
-		envKeys := sortedPlatformKeys(env.Env)
-		for _, key := range envKeys {
+		for _, key := range sortedPlatformKeys(containerEnv) {
 			commandArgs = append(commandArgs, "-e", key)
 		}
-		for _, key := range sortedPlatformKeys(env.SecretRefs) {
+		for _, key := range secretKeys {
 			commandArgs = append(commandArgs, "-e", key)
 		}
 		commandArgs = append(commandArgs, release.ImageID)
-		commandArgs = append(commandArgs, release.Command.Argv...)
-		secretKeys := sortedPlatformKeys(env.SecretRefs)
+		commandArgs = append(commandArgs, releaseCommand.Argv...)
 		if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentCommandStep, platform.ArgvPayload{
 			Step: deploymentCommandStep, Argv: commandArgs,
-			Env: env.Env, SecretEnvKeys: secretKeys, TimeoutSeconds: release.Command.TimeoutSeconds,
+			Env: containerEnv, SecretEnvKeys: secretKeys, TimeoutSeconds: releaseCommand.TimeoutSeconds,
 		}, secrets); err != nil {
 			return finish(err)
 		}
@@ -447,7 +503,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	candidatePayload := platform.ContainerPayload{
 		Step: deploymentCandidateStep, Name: candidateName, Image: release.ImageID,
 		ContainerPort: env.ContainerPort, HostPort: env.CandidatePort, Bind: env.Bind,
-		Env: env.Env, SecretEnvKeys: sortedPlatformKeys(env.SecretRefs), Restart: "no",
+		Env: containerEnv, SecretEnvKeys: secretKeys, Restart: "no",
 		Labels: map[string]string{
 			"io.eregion.app": env.App, "io.eregion.environment": env.Name,
 			"io.eregion.release": string(release.ID), "io.eregion.role": "candidate",
@@ -473,7 +529,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	servingPayload := platform.ContainerPayload{
 		Step: deploymentSwitchStep, Name: servingName, Image: release.ImageID,
 		ContainerPort: env.ContainerPort, HostPort: env.HostPort, Bind: env.Bind,
-		Env: env.Env, SecretEnvKeys: sortedPlatformKeys(env.SecretRefs), Restart: "unless-stopped",
+		Env: containerEnv, SecretEnvKeys: secretKeys, Restart: "unless-stopped",
 		Labels: map[string]string{
 			"io.eregion.app": env.App, "io.eregion.environment": env.Name,
 			"io.eregion.release": string(release.ID), "io.eregion.role": "serving",
@@ -508,7 +564,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			restore := platform.ContainerPayload{
 				Step: deploymentRestoreStep, Name: servingName, Image: previous.ImageID,
 				ContainerPort: env.ContainerPort, HostPort: env.HostPort, Bind: env.Bind,
-				Env: env.Env, SecretEnvKeys: sortedPlatformKeys(env.SecretRefs), Restart: "unless-stopped",
+				Env: containerEnv, SecretEnvKeys: secretKeys, Restart: "unless-stopped",
 				Labels: map[string]string{
 					"io.eregion.app": env.App, "io.eregion.environment": env.Name,
 					"io.eregion.release": string(previous.ID), "io.eregion.role": "serving",
@@ -712,40 +768,67 @@ func sortedPlatformKeys(values map[string]string) []string {
 	return keys
 }
 
-func (s *Service) resolveEnvironmentSecrets(ctx context.Context, env platform.Environment) (map[string]string, error) {
-	if len(env.SecretRefs) == 0 {
-		return nil, nil
+func (s *Service) resolveEnvironmentSecrets(ctx context.Context, env platform.Environment) (map[string]string, map[string]platform.SecretRevisionRef, error) {
+	names := []string{}
+	if env.Revision != nil {
+		names = env.Revision.SecretNames
+	}
+	if len(names) == 0 && len(env.SecretRefs) == 0 {
+		return map[string]string{}, map[string]platform.SecretRevisionRef{}, nil
 	}
 	if s.secrets == nil {
-		return nil, contract.NewFault(contract.PreconditionFailed, "secret injection is not configured", "Set EREGION_VAULT_KEY_FILE on every control-plane worker and pin the secret references before deploying.")
+		return nil, nil, contract.NewFault(contract.PreconditionFailed, "secret injection is not configured", "Set EREGION_VAULT_KEY_FILE on every control-plane worker and declare secret names before deploying.")
 	}
 	var values map[string]string
+	var resolved map[string]vault.RevisionRef
 	var err error
-	if scoped, ok := s.secrets.(EnvironmentSecretResolver); ok {
+	if snapshot, ok := s.secrets.(EnvironmentSecretSnapshotResolver); ok {
+		values, resolved, err = snapshot.ResolveEnvironmentSnapshot(ctx, env.App, env.Name, names, env.SecretRefs)
+	} else if len(names) > 0 {
+		return nil, nil, contract.NewFault(contract.PreconditionFailed, "secret name resolution is not configured", "Use a worker whose secret resolver supports environment revision secret names.")
+	} else if scoped, ok := s.secrets.(EnvironmentSecretResolver); ok {
 		values, err = scoped.ResolveEnvironment(ctx, env.App, env.Name, env.SecretRefs)
 	} else {
 		values, err = s.secrets.Resolve(ctx, env.SecretRefs)
 	}
 	if err != nil {
-		return nil, contract.NewFault(contract.Unavailable, "environment secrets could not be resolved", "Check the vault agent and reference revisions, then retry the deployment.")
+		return nil, nil, contract.NewFault(contract.Unavailable, "environment secrets could not be resolved", "Check the vault agent and secret names, then retry the deployment.")
 	}
-	out := make(map[string]string, len(env.SecretRefs))
-	for key := range env.SecretRefs {
-		value := values[key]
+	out := make(map[string]string, len(values))
+	for key, value := range values {
 		if value == "" {
-			return nil, contract.NewFault(contract.PreconditionFailed, "a referenced environment secret is missing", "Resolve every configured secret reference before deploying.")
+			return nil, nil, contract.NewFault(contract.PreconditionFailed, "a declared environment secret is missing", "Resolve every configured secret name before deploying.")
 		}
 		out[key] = value
 	}
-	return out, nil
+	refs := make(map[string]platform.SecretRevisionRef, len(resolved))
+	for name, ref := range resolved {
+		refs[name] = platform.SecretRevisionRef{
+			Revision: ref.Revision, Hash: ref.Hash, KeyID: ref.KeyID, CreatedAt: ref.CreatedAt,
+		}
+	}
+	return out, refs, nil
+}
+
+// recordDeploymentSecretSnapshot freezes the exact revisions the first attempt
+// resolved. A retry keeps that snapshot even if the vault has since rotated.
+func (s *Service) recordDeploymentSecretSnapshot(ctx context.Context, id contract.OperationID, revisionID platform.RevisionID, refs map[string]platform.SecretRevisionRef) error {
+	raw, err := json.Marshal(refs)
+	if err != nil {
+		return unavailable(err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_deployments
+        SET revision_id=coalesce(revision_id,$2),
+            secret_revisions=CASE WHEN secret_revisions='{}'::jsonb THEN $3 ELSE secret_revisions END,
+            updated_at=clock_timestamp()
+        WHERE operation_id=$1`, id, nullableRevisionID(revisionID), raw); err != nil {
+		return unavailable()
+	}
+	return nil
 }
 
 func (s *Service) deploymentPlan(ctx context.Context, operationID contract.OperationID) (platform.Deployment, platform.Environment, platform.Release, platform.Release, error) {
-	var dep platform.Deployment
-	err := s.pool.QueryRow(ctx, `SELECT `+deploymentColumns+` FROM eregion_platform_deployments d
-        JOIN eregion_platform_apps a ON a.id=d.app_id
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        WHERE d.operation_id=$1`, operationID).Scan(&dep.ID, &dep.OperationID, &dep.App, &dep.Environment, &dep.Action, &dep.ReleaseID, &dep.PreviousReleaseID, &dep.State, &dep.ErrorCode, &dep.Message, &dep.CreatedAt, &dep.UpdatedAt, &dep.CompletedAt)
+	dep, err := scanDeploymentRow(s.pool.QueryRow(ctx, deploymentSelect+` WHERE d.operation_id=$1`, operationID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return dep, platform.Environment{}, platform.Release{}, platform.Release{}, contract.NewFault(contract.NotFound, "deployment record is missing", "Do not retry an operation that has no durable deployment row.")
 	}
@@ -755,6 +838,29 @@ func (s *Service) deploymentPlan(ctx context.Context, operationID contract.Opera
 	env, err := s.environment(ctx, dep.App, dep.Environment)
 	if err != nil {
 		return dep, env, platform.Release{}, platform.Release{}, err
+	}
+	// A deployment pins the revision accepted with it. Later environment
+	// changes must not silently alter a retry or a queued deployment.
+	if dep.RevisionID != "" && (env.Revision == nil || env.Revision.ID != dep.RevisionID) {
+		revision, err := s.revisionByID(ctx, dep.RevisionID)
+		if err != nil {
+			return dep, env, platform.Release{}, platform.Release{}, err
+		}
+		env.RevisionID, env.Revision = revision.ID, &revision
+		env.Processes = revision.Processes
+		env.Env = revision.Config
+		if revision.Runtime.Node != "" {
+			env.Node = revision.Runtime.Node
+		}
+		if revision.Runtime.HealthPath != "" {
+			env.Health = platform.HealthConfig{Type: revision.Runtime.HealthType, Path: revision.Runtime.HealthPath, TimeoutSeconds: revision.Runtime.HealthTimeoutSeconds}
+		}
+		for _, process := range revision.Processes {
+			if process.Kind == "web" && process.ContainerPort > 0 {
+				env.ContainerPort = process.ContainerPort
+				break
+			}
+		}
 	}
 	// Capture the actual predecessor after acquiring the distributed target
 	// lock, not the potentially stale serving value seen at submission. Once
@@ -791,8 +897,6 @@ func (s *Service) deploymentPlan(ctx context.Context, operationID contract.Opera
 	}
 	return dep, env, release, previous, nil
 }
-
-const deploymentColumns = `d.id,d.operation_id,a.name,e.name,d.action,d.release_id,coalesce(d.previous_release_id,''),d.state,d.error_code,d.message,d.created_at,d.updated_at,d.completed_at`
 
 func (s *Service) releaseForOperation(ctx context.Context, operationID contract.OperationID) (platform.Release, error) {
 	var releaseID platform.ReleaseID
@@ -1175,7 +1279,9 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 			return s.failReconciledPlatform(ctx, op, err.Error(), contract.Unavailable)
 		}
 		return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
-	case platform.KindAppCreate, platform.KindEnvironmentCreate, platform.KindNodeRegister:
+	case platform.KindAppCreate, platform.KindEnvironmentCreate, platform.KindEnvironmentUpdate,
+		platform.KindProcessScale, platform.KindConfigSet, platform.KindConfigUnset,
+		platform.KindEnvironmentSecretAttach, platform.KindNodeRegister:
 		exists, err := s.recordActionExists(ctx, op)
 		if err != nil {
 			return err
@@ -1215,6 +1321,16 @@ func (s *Service) recordActionExists(ctx context.Context, op contract.Operation)
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_apps WHERE name=$1)`, input.Name).Scan(&exists)
 	case *platform.EnvironmentCreateInput:
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND e.name=$2)`, input.App, input.Name).Scan(&exists)
+	case *platform.EnvironmentUpdateInput:
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
+	case *platform.ProcessScaleInput:
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
+	case *platform.ConfigSetInput:
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
+	case *platform.ConfigUnsetInput:
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
+	case *platform.EnvironmentSecretAttachInput:
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
 	case *platform.NodeRegisterInput:
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_nodes WHERE name=$1)`, input.Name).Scan(&exists)
 	default:

@@ -95,7 +95,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 010
+## Database: embedded schema 011
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -113,6 +113,7 @@ node protocol version and database migration version are independent.
 | `008_webhook_deliveries.sql` | Delivery/body hashes and reserved/submitted operation identity, independent of operation retention. |
 | `009_platform_build_node.sql` | Optional environment build-node FK. Does not implement image transfer. |
 | `010_platform_domains.sql` | Globally unique domain name -> environment FK; creation timestamp only. |
+| `011_environment_revisions.sql` | Immutable numbered environment revisions, current-revision pointer, deployment revision/secret snapshots and domain primary flag. Backfills one baseline revision per existing environment. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -124,31 +125,40 @@ Tables below have the literal `eregion_` prefix:
 | `operation_steps` | `(operation_id, step)`; inputs hash, execution identity, attempt, state, timestamps and result/error. |
 | `platform_nodes` | Name; roles/capabilities, status, SSH address/user/**host key**, attested identity, probes, build concurrency/user and WireGuard public state. Private keys stay in files. |
 | `platform_apps` | Opaque app ID and unique name. No stored setup wizard/source configuration. |
-| `platform_environments` | App FK + name; runtime/build node, stable/candidate/container ports, bind, health settings/observation, config, pinned secret refs, desired/applied/serving release IDs. |
+| `platform_environments` | App FK + name; runtime/build node, stable/candidate/container ports, bind, health settings/observation, config, pinned secret refs, desired/applied/serving release IDs and `current_revision_id`. The mutable config/health/container fields mirror the current revision for the existing single-container deploy worker; they go away with the per-process deploy row. `secret_refs` remains the transitional pinned form, used only when the current revision names no secrets. |
+| `platform_environment_revisions` | Immutable `erv_…` ID and per-environment number; operation/actor/operation/summary change record; source binding, auto-deploy flag, webhook secret NAME, runtime JSON, processes JSON, plain config and secret NAMEs, plus the first-deploy intent flag. An UPDATE trigger refuses edits; deleting the environment still cascades. |
 | `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, pending/ready/failed status and error. |
-| `platform_deployments` | Deployment ID and unique operation FK; action, release, previous release, state and errors. |
+| `platform_deployments` | Deployment ID and unique operation FK; action, release, previous release, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), state and errors. |
 | `platform_changes` | App/env history, sequence, operation/actor, desired/applied JSON and summary. |
-| `platform_domains` | Domain name PK, environment FK, creation timestamp. No desired/applied revision, backend, TLS, observation or failure columns. |
+| `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment, creation timestamp. Still no backend, TLS, observation or failure columns. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
 | `webhook_deliveries` | Hashed delivery ID, exact-body hash, actor/kind/target, pending/submitted state and operation ID. |
 
-Boundaries the MASTER app-model work (work list row 4) must change or handle:
+Boundaries around the MASTER app-model work (work list rows 4–5):
 
 - Runtime and candidate ports are globally unique in the current schema, not
   scoped per node. Defaults allocate 20000–29999 and 30000–39999 respectively.
-- Source/build configuration belongs to **releases**, not a durable environment
-  source binding; MASTER section 4 moves it into environment revisions.
-- Environments hold pinned `secret_refs` (`vault:…@N`); MASTER D18 replaces them
-  with secret names resolved per deploy.
-- One container per environment on a stable port; MASTER D17/D21 need
-  per-process containers on dynamic loopback ports.
+  The environment revision is now the source of truth, but the deploy worker
+  still reads these mirrored legacy columns.
+- Source/build configuration exists both on releases (for the current release
+  action) and on environment revisions. Deploying from the revision's bound
+  source, including private git credentials and auto-deploy, is work list row 5.
+- Environments still hold pinned `secret_refs` for compatibility with the
+  current deploy worker. New revisions use secret NAMEs and resolve their
+  current revisions per deploy (D18); the fallback and the legacy column go away
+  with row 5 once all deployment paths use revisions.
+- One container per environment on a stable port; the revision already declares
+  the per-process formation and replicas, but MASTER D17/D21 per-process
+  containers on dynamic loopback ports are implemented by row 5.
+- The first-deploy flag on a revision records intent only; no build or
+  deployment is queued until deploy-from-revision lands.
 - SQL `ON DELETE CASCADE` is not a safe application deletion implementation:
   release/history references, secret namespaces, containers, Caddy and file-backed
   state need deliberate handling. There are no app/env delete actions today.
 - Resources/backups use protected host files, manifests and operation history;
-  there are no resource/backup catalog tables in these ten migrations. DNS records
-  live at the provider; a domain binding is not a DNS record.
+  there are no resource/backup catalog tables in the control-plane migrations.
+  DNS records live at the provider; a domain binding is not a DNS record.
 - Roles/rows do not prove tools, credentials, services or routes are installed.
 
 ## Migration and external database policy
@@ -221,16 +231,36 @@ All use `POST /v1/operations`, the shared registry and one River job:
 
 | Kind | Target | Main input |
 | --- | --- | --- |
-| `platform.app.create` | `platform` | `name` |
-| `platform.environment.create` | `app/<app>` | `name`, `node`, optional `build_node`, ports/bind/health, `env`, `secret_refs` |
+| `platform.app.create` | `platform` | `name`; optional `environment` (first environment + first revision) and `deploy` intent. |
+| `platform.environment.create` | `app/<app>` | `name`, `node`, optional `build_node`, legacy ports/bind/health, `env`, `secret_refs`; revision `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`. |
+| `platform.environment.update` | `env/<app>/<env>` | Partial patch: `node`, `build_node`, `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`; produces a new full revision. |
+| `platform.process.scale` | `env/<app>/<env>` | `process`, `replicas`; produces a new revision. |
+| `platform.config.set/unset` | `env/<app>/<env>` | `config` map or `keys` list; produces a new revision and never queues a deploy. |
+| `platform.environment.secret.attach` | `env/<app>/<env>` | `name` only; the vault write is separate and no value enters the revision. |
 | `platform.release.create` | `env/<app>/<env>` | `source`, optional `build`, `command`, `pull` |
-| `platform.deploy` | `env/<app>/<env>` | `release_id` |
+| `platform.deploy` | `env/<app>/<env>` | `release_id`; pins the current environment revision and resolved secret revisions. |
 | `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, not simply current applied release. |
 | `platform.domain.add/remove` | `env/<app>/<env>` | `domain` (app/env resolved from target) |
 
 Names: lowercase letters/digits/hyphens, start with a letter, max 40 characters.
-Unknown input fields fail. Refer to `internal/platform/actions.go` rather than
-copying JSON types into a second client/service implementation.
+Unknown input fields fail, including nested revision fields. Refer to
+`internal/platform/actions.go` rather than copying JSON types into a second
+client/service implementation.
+
+Environment revisions are numbered per environment and immutable. The revision
+is the desired state; an accepted action is not an applied route or a running
+process. Deployability is the pure `platform.EvaluateDeployability` report over
+the current revision plus artifact/domain observations, with DNS reported as
+`unknown` until the domain row observes it. Inventory collections `revisions`
+and `deployability` expose it, and each environment record carries its current
+revision, processes and deployability.
+
+Deploy-time secret resolution prefers the current revision's secret names,
+resolving each name's active latest revision and freezing the exact non-secret
+revision identities on the deployment. The transitional pinned `secret_refs`
+path is used only when the revision names no secrets. A first deploy requested by
+`platform.app.create` is recorded on the revision as intent; deploy-from-revision
+is work list row 5.
 
 Image releases inspect/pull the image. Buildpacks builds require builder role
 and capability, allowed source roots for directories, and allowlisted HTTPS git
@@ -261,8 +291,8 @@ even after a failed apply. See [network](network.md) before changing this path.
 - `/v1/operations`: submit/preview; `/{id}`, `/{id}/events`, `/{id}/cancel`:
   actor-scoped state, bounded cursor pages and explicit cancellation.
 - `/v1/platform?collection=…`: bounded inventory with app/environment/node/state
-  filters. Base collections: summary, nodes, apps, environments, releases,
-  deployments and changes; extensions add their own.
+  filters. Base collections: summary, nodes, apps, environments, revisions,
+  deployability, releases, deployments and changes; extensions add their own.
 - `/v1/secrets…`: separate authenticated credential API; values are encrypted
   directly, never placed in ordinary action input.
 - `/v1/webhooks/github`: bounded HMAC-verified push with one server-wide secret
