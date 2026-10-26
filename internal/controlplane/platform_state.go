@@ -105,7 +105,7 @@ func platformAcceptedMessage(kind string) string {
 	case platform.KindAppCreate:
 		return "Application record accepted durably."
 	case platform.KindEnvironmentCreate:
-		return "Environment record accepted durably; placement will be checked by the worker."
+		return "Environment record accepted durably."
 	case platform.KindEnvironmentUpdate, platform.KindProcessScale, platform.KindConfigSet,
 		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach:
 		return "Environment desired state accepted durably as a new revision; no deploy was queued."
@@ -187,8 +187,17 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		summary := "Created environment " + input.Name + " with its first desired-state revision."
-		if _, err := s.insertEnvironmentTx(ctx, tx, app, &input.EnvironmentSpec, id, actor, "environment.created", summary, false); err != nil {
+		if input.Deploy {
+			summary += " The first deploy was queued from that revision."
+		}
+		envID, err := s.insertEnvironmentTx(ctx, tx, app, &input.EnvironmentSpec, id, actor, "environment.created", summary, input.Deploy)
+		if err != nil {
 			return err
+		}
+		if input.Deploy {
+			if err := s.queueFirstDeployTx(ctx, tx, envID, actor); err != nil {
+				return err
+			}
 		}
 	case *platform.EnvironmentUpdateInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
@@ -1730,26 +1739,79 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Summary = fmt.Sprintf("Roll back %s/%s to %s using the same health-first path.", env.App, env.Name, release.Image)
 		addReleaseWarnings(&preview, release, env)
 	case *platform.AppCreateInput:
+		if err := s.checkPreviewAppAvailable(ctx, input.Name); err != nil {
+			return preview, err
+		}
 		if input.Environment == nil {
 			preview.Summary = "Create application " + input.Name + " without an environment."
 			break
 		}
+		if err := s.checkPreviewPlacement(ctx, input.Environment.Node, input.Environment.BuildNode); err != nil {
+			return preview, err
+		}
+		if err := checkPreviewDeploySource(input.Environment, input.Deploy); err != nil {
+			return preview, err
+		}
 		preview.Steps = []string{"record application", "record first environment and revision", "allocate ports"}
 		preview.Summary = "Create application " + input.Name + " with environment " + input.Environment.Name + " on node " + input.Environment.Node + "."
+		if input.Environment.BuildNode != "" && input.Environment.BuildNode != input.Environment.Node && input.Environment.Source.Kind == "git" {
+			preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
+		}
 		if input.Deploy {
 			preview.Steps = append(preview.Steps, "queue the first deploy from the new revision")
 			preview.Summary += " A first deploy is queued from the new revision."
 		}
 	case *platform.EnvironmentCreateInput:
+		if err := s.checkPreviewApp(ctx, input.App); err != nil {
+			return preview, err
+		}
+		if err := s.checkPreviewEnvironmentAvailable(ctx, input.App, input.Name); err != nil {
+			return preview, err
+		}
+		if err := s.checkPreviewPlacement(ctx, input.Node, input.BuildNode); err != nil {
+			return preview, err
+		}
+		if err := checkPreviewDeploySource(&input.EnvironmentSpec, input.Deploy); err != nil {
+			return preview, err
+		}
 		preview.Steps = []string{"record environment", "record first desired-state revision", "allocate stable and candidate ports"}
 		preview.Summary = "Create environment " + input.Name + " on node " + input.Node + "."
 		if input.BuildNode != "" {
 			preview.Summary += " Builds run on builder node " + input.BuildNode + "."
-			if input.BuildNode != input.Node {
+			if input.BuildNode != input.Node && input.Source.Kind == "git" {
 				preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
 			}
 		}
+		if input.Deploy {
+			preview.Steps = append(preview.Steps, "queue the first deploy from the new revision")
+			preview.Summary += " A first deploy is queued from the new revision."
+		}
 	case *platform.EnvironmentUpdateInput:
+		env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
+		if err != nil {
+			return preview, err
+		}
+		nodeName := env.Node
+		if input.Node != nil {
+			nodeName = *input.Node
+		}
+		if input.Runtime != nil && input.Runtime.Node != "" {
+			nodeName = input.Runtime.Node
+		}
+		buildNode := env.BuildNode
+		if input.BuildNode != nil {
+			buildNode = *input.BuildNode
+		}
+		if nodeName != env.Node {
+			if err := s.checkPreviewNode(ctx, nodeName, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+				return preview, err
+			}
+		}
+		if input.BuildNode != nil && buildNode != "" {
+			if err := s.checkPreviewNode(ctx, buildNode, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
+				return preview, err
+			}
+		}
 		preview.Steps = []string{"load current revision", "merge the patch", "append a new revision"}
 		preview.Summary = "Update environment " + input.Environment + " desired state as a new immutable revision; no deploy is queued."
 	case *platform.ProcessScaleInput:
@@ -1759,6 +1821,9 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Steps = []string{"load current revision", "change plain configuration", "append a new revision"}
 		preview.Summary = "Change plain environment configuration as a new revision; no deploy is queued."
 	case *platform.EnvironmentSecretAttachInput:
+		if _, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment); err != nil {
+			return preview, err
+		}
 		preview.Steps = []string{"load current revision", "attach the secret name", "append a new revision"}
 		preview.Summary = "Attach vault secret name " + input.Name + " to the environment revision; no value enters the operation."
 	case *platform.ReleaseCreateInput:
@@ -1802,6 +1867,79 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		}
 	}
 	return preview, nil
+}
+
+// checkPreviewPlacement applies the same node placement facts a create
+// submission checks, so a dry run refuses before the CLI writes vault values.
+// Transport identity is still rechecked by the worker at dispatch.
+func (s *Service) checkPreviewPlacement(ctx context.Context, nodeName, buildNode string) error {
+	if err := s.checkPreviewNode(ctx, nodeName, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+		return err
+	}
+	if buildNode != "" {
+		if err := s.checkPreviewNode(ctx, buildNode, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) checkPreviewNode(ctx context.Context, nodeName, role, capability string) error {
+	node, err := s.node(ctx, nodeName)
+	if err != nil {
+		return err
+	}
+	return s.checkPlacement(node, role, capability)
+}
+
+func (s *Service) checkPreviewAppAvailable(ctx context.Context, name string) error {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_apps WHERE name=$1)`, name).Scan(&exists); err != nil {
+		return unavailable()
+	}
+	if exists {
+		return contract.NewFault(contract.Conflict, "app "+name+" already exists", "Choose another app name, or inspect the existing app.")
+	}
+	return nil
+}
+
+func (s *Service) checkPreviewApp(ctx context.Context, name string) error {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_apps WHERE name=$1)`, name).Scan(&exists); err != nil {
+		return unavailable()
+	}
+	if !exists {
+		return contract.NewFault(contract.NotFound, "app "+name+" was not found", "Create the app first, or choose an existing app.")
+	}
+	return nil
+}
+
+func (s *Service) checkPreviewEnvironmentAvailable(ctx context.Context, app, environment string) error {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM eregion_platform_environments e
+		JOIN eregion_platform_apps a ON a.id=e.app_id
+		WHERE a.name=$1 AND e.name=$2)`, app, environment).Scan(&exists); err != nil {
+		return unavailable()
+	}
+	if exists {
+		return contract.NewFault(contract.Conflict, "environment "+app+"/"+environment+" already exists", "Change it with eregion env update, or choose another name.")
+	}
+	return nil
+}
+
+// checkPreviewDeploySource mirrors the deterministic refusals of a first
+// deploy from a new revision, before the CLI writes any vault value.
+func checkPreviewDeploySource(spec *platform.EnvironmentSpec, deploy bool) error {
+	if !deploy || spec.Source.Kind != "git" {
+		return nil
+	}
+	if spec.BuildNode != "" && spec.BuildNode != spec.Node {
+		return contract.NewFault(contract.PreconditionFailed,
+			"build_node is distinct from the application node; moving the built image requires a shared registry",
+			"Use build_node equal to the environment node, or create with --no-deploy and deploy an image release.")
+	}
+	return nil
 }
 
 func deploymentSteps() []string {

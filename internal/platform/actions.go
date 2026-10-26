@@ -72,6 +72,9 @@ type EnvironmentSpec struct {
 
 type EnvironmentCreateInput struct {
 	App string `json:"app,omitempty"`
+	// Deploy queues the first deploy from the new revision in the same
+	// submission transaction. It records the same intent as app create.
+	Deploy bool `json:"deploy,omitempty"`
 	EnvironmentSpec
 }
 
@@ -278,6 +281,9 @@ func normalizeAppCreate(target Target, raw json.RawMessage) (ActionInput, error)
 		if err := normalizeEnvironmentSpec(input.Environment); err != nil {
 			return nil, err
 		}
+		if input.Deploy && input.Environment.Source.Kind == "" {
+			return nil, invalid("deploy", "A first deploy needs a source binding.")
+		}
 	} else if input.Deploy {
 		return nil, invalid("deploy", "A first deploy needs an environment specification.")
 	}
@@ -457,6 +463,9 @@ func normalizeEnvironmentCreate(target Target, raw json.RawMessage) (ActionInput
 	input.App = target.App
 	if err := normalizeEnvironmentSpec(&input.EnvironmentSpec); err != nil {
 		return nil, err
+	}
+	if input.Deploy && input.Source.Kind == "" {
+		return nil, invalid("deploy", "A first deploy needs a source binding.")
 	}
 	return &input, nil
 }

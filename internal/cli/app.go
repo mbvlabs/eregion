@@ -112,7 +112,7 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	}
 	dry := dryRun(cmd)
 	if interactive && !dry {
-		ok, err := ui.YesNoDefault("Create app "+ans.App+" now?", "The app, its first environment and first revision are accepted in one submission.", true)
+		ok, err := ui.YesNoDefault("Create app "+ans.App+" now?", "The app, its first environment and first revision are accepted in one submission; a requested first deploy is queued from it.", true)
 		if err != nil {
 			return result{}, setupPromptError("app create", err)
 		}
@@ -128,6 +128,9 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	}
 	if record, ok := domainDNSRecord(ans.Domain); ok {
 		summary.DNSRecord = &record
+	}
+	if ans.Deploy && ans.Domain == "" {
+		summary.Warnings = append(summary.Warnings, "The first deploy has no domain; public verification will fail until a domain is added.")
 	}
 	if dry {
 		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
@@ -170,6 +173,9 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 			{"node", ans.Node},
 			{"source", describeSource(spec.Source)},
 			{"operation", string(op.ID)},
+		}
+		if ans.Deploy {
+			rows = append(rows, [2]string{"first deploy", "queued from the revision"})
 		}
 		if ans.Domain != "" {
 			rows = append(rows, [2]string{"domain", ans.Domain})

@@ -127,6 +127,33 @@ func TestAppCreateImageSourceUsesTheDefaultWebProcess(t *testing.T) {
 	}
 }
 
+func TestEnvCreateDeployFlagMapping(t *testing.T) {
+	build := func(args ...string) *setupAnswers {
+		t.Helper()
+		cmd := &cobra.Command{Use: "create"}
+		cmd.Flags().String("app", "", "app")
+		cmd.Flags().String("name", "", "environment")
+		cmd.Flags().Bool("no-deploy", false, "no deploy")
+		addSetupFlags(cmd, true)
+		if err := cmd.ParseFlags(args); err != nil {
+			t.Fatal(err)
+		}
+		a := &app{secrets: &secrets.Registry{}}
+		ans, err := a.readSetup(cmd, setupEnvironment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ans
+	}
+	base := []string{"--app", "api", "--name", "staging", "--node", "main", "--image", "ghcr.io/acme/api:1"}
+	if ans := build(base...); !ans.Deploy {
+		t.Fatal("env create did not request the first deploy by default")
+	}
+	if ans := build(append(base, "--no-deploy")...); ans.Deploy {
+		t.Fatal("--no-deploy did not clear the env create deploy intent")
+	}
+}
+
 func TestEnvUpdateFlagsMergeOverTheCurrentRevision(t *testing.T) {
 	cmd := &cobra.Command{Use: "update"}
 	addEnvironmentUpdateFlags(cmd)

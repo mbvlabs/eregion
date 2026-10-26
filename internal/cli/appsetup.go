@@ -208,6 +208,21 @@ func askReplicas(title, def string) (int, error) {
 	}
 }
 
+// askIntRange asks for one integer within an inclusive range, prefilled with def.
+func askIntRange(title, description, def string, min, max int) (int, error) {
+	for {
+		value, err := ui.Input(title, description, def)
+		if err != nil {
+			return 0, err
+		}
+		if number, convErr := strconv.Atoi(value); convErr == nil && number >= min && number <= max {
+			return number, nil
+		}
+		fmt.Fprintln(os.Stderr, ui.Warn(fmt.Sprintf("Use a number from %d to %d.", min, max)))
+		def = value
+	}
+}
+
 // readSetup reads the flags, asks only for what is still missing in a terminal
 // and returns one validated declaration. Every question has a flag equivalent.
 func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, error) {
@@ -467,19 +482,17 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 	}
 
-	if mode == setupApp {
-		switch {
-		case boolFlag(cmd, "no-deploy"):
-			ans.Deploy = false
-		case interactive && !flagChanged(cmd, "no-deploy"):
-			deploy, err := ui.YesNoDefault("Request the first deploy?", "The intent is recorded with the revision; a running deployment needs the deploy work list row.", true)
-			if err != nil {
-				return nil, err
-			}
-			ans.Deploy = deploy
-		default:
-			ans.Deploy = true
+	switch {
+	case boolFlag(cmd, "no-deploy"):
+		ans.Deploy = false
+	case interactive && !flagChanged(cmd, "no-deploy"):
+		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from the new revision; --no-deploy skips it.", true)
+		if err != nil {
+			return nil, err
 		}
+		ans.Deploy = deploy
+	default:
+		ans.Deploy = true
 	}
 
 	if _, err := ans.environmentSpec(); err != nil {
@@ -538,17 +551,29 @@ func (a *app) readSetupCredential(cmd *cobra.Command, ans *setupAnswers, interac
 }
 
 func readExtraProcesses(ans *setupAnswers) error {
+	extras, err := readAdditionalProcesses(ans.Processes)
+	if err != nil {
+		return err
+	}
+	ans.Processes = append(ans.Processes, extras...)
+	return nil
+}
+
+// readAdditionalProcesses asks for new worker/service processes and returns
+// only the additions. The caller keeps the existing formation.
+func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.ProcessSpec, error) {
 	seen := map[string]bool{}
-	for _, process := range ans.Processes {
+	for _, process := range existing {
 		seen[process.Name] = true
 	}
+	extras := []platform.ProcessSpec{}
 	for {
 		name, err := ui.Input("Add a process", "A worker or service name; empty to finish", "")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if name == "" {
-			return nil
+			return extras, nil
 		}
 		if !setupProcessNamePattern.MatchString(name) {
 			fmt.Fprintln(os.Stderr, ui.Warn("Use a lowercase process name of 1–63 letters, digits, underscores, or hyphens."))
@@ -563,11 +588,11 @@ func readExtraProcesses(ans *setupAnswers) error {
 			{"Service (private port only)", "service"},
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		line, err := ui.Input("Command", "Executable and arguments, split on spaces; no shell", "")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if strings.TrimSpace(line) == "" {
 			fmt.Fprintln(os.Stderr, ui.Warn("A worker or service process needs a command."))
@@ -577,15 +602,15 @@ func readExtraProcesses(ans *setupAnswers) error {
 		if kind == "service" {
 			port, err = askPort("Service container port", "Reachable privately on the node", "9000")
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 		replicas, err := askReplicas("Replicas", "1")
 		if err != nil {
-			return err
+			return nil, err
 		}
 		command, args := splitCommandLine(line)
-		ans.Processes = append(ans.Processes, platform.ProcessSpec{
+		extras = append(extras, platform.ProcessSpec{
 			Name: name, Kind: kind, Command: command, Args: args, Replicas: replicas, ContainerPort: port,
 		})
 		seen[name] = true
@@ -972,7 +997,10 @@ func setupPlan(ans *setupAnswers, preview platform.Preview) string {
 		fmt.Fprintln(&out, "domain: none; add one later with eregion domain add")
 	}
 	if ans.Deploy {
-		fmt.Fprintln(&out, "first deploy: requested (recorded as intent with the revision)")
+		fmt.Fprintln(&out, "first deploy: queued from the revision")
+		if ans.Domain == "" {
+			fmt.Fprintln(&out, "warning: the first deploy has no domain; public verification will fail until a domain is added")
+		}
 	} else {
 		fmt.Fprintln(&out, "first deploy: not requested")
 	}
@@ -1347,7 +1375,7 @@ func (r setupResult) plainText() string {
 	}
 	fmt.Fprintf(&out, "operation: %s\n", r.OperationID)
 	if r.Deploy {
-		out.WriteString("first deploy: requested (recorded as intent; not a running deployment)\n")
+		out.WriteString("first deploy: queued from the revision\n")
 	}
 	if r.Domain != "" {
 		fmt.Fprintf(&out, "domain: %s\n", r.Domain)

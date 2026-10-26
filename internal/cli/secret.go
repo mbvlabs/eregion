@@ -119,6 +119,22 @@ func (a *app) setSecret(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	attached := env.Revision != nil && slices.Contains(env.Revision.SecretNames, namespace.Name)
+	target := ""
+	attachInput := platform.EnvironmentSecretAttachInput{
+		App: namespace.App, Environment: namespace.Environment, Name: namespace.Name,
+	}
+	if !attached {
+		envTarget, err := platform.NewEnvironmentTarget(namespace.App, namespace.Environment)
+		if err != nil {
+			return result{}, err
+		}
+		target = envTarget.String()
+		// Validate the attach action before the vault write, so a rejected
+		// submission cannot leave an unreferenced secret revision behind.
+		if _, err := a.previewAction(cmd, platform.KindEnvironmentSecretAttach, target, attachInput); err != nil {
+			return result{}, err
+		}
+	}
 	client, err := a.client(cmd)
 	if err != nil {
 		return result{}, err
@@ -133,13 +149,7 @@ func (a *app) setSecret(cmd *cobra.Command, _ []string) (result, error) {
 		plain += namespace.Name + " is already in the environment revision.\n"
 		return result{data: data, plain: plain}, nil
 	}
-	target, err := platform.NewEnvironmentTarget(namespace.App, namespace.Environment)
-	if err != nil {
-		return result{}, err
-	}
-	op, err := a.submitAccepted(cmd, platform.KindEnvironmentSecretAttach, target.String(), platform.EnvironmentSecretAttachInput{
-		App: namespace.App, Environment: namespace.Environment, Name: namespace.Name,
-	})
+	op, err := a.submitAccepted(cmd, platform.KindEnvironmentSecretAttach, target, attachInput)
 	if err != nil {
 		fault := contract.Classify(err)
 		return result{}, contract.NewFault(fault.Code,

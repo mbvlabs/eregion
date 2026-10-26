@@ -7,6 +7,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
@@ -17,12 +18,12 @@ func (a *app) envSpecs() []spec {
 	parent.WhenToUse = []string{"Manage the unit of deployment: its source binding, runtime, processes and domains."}
 
 	create := operationMeta("Create an environment with its first desired-state revision", "eregion env create --app api --name production --node main --git-url https://github.com/acme/api --json")
-	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup. JSON and no-TTY take every value from flags and never prompt."}
+	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup. The first deploy is queued from the new revision unless --no-deploy. JSON and no-TTY take every value from flags and never prompt."}
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
 		"app", "name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
 		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
-		"health-path", "process", "config", "secret", "domain",
+		"health-path", "process", "config", "secret", "domain", "no-deploy",
 	}
 	create.Examples = []string{
 		"eregion env create",
@@ -31,9 +32,15 @@ func (a *app) envSpecs() []spec {
 	create.Next = []string{"eregion env status <app> <environment> --json", "eregion domain add <app> <environment> <hostname>"}
 
 	update := operationMeta("Change an environment as a new desired-state revision", "eregion env update api production --git-ref release-2026-10 --json")
-	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. Plain config uses config set; secret names use secret set. No deploy is queued."}
-	update.Mutating, update.DryRun = true, true
+	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued."}
+	update.Mutating, update.DryRun, update.Prompts = true, true, true
+	update.InputFlags = []string{
+		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name",
+		"image", "builder", "context-path", "health-type", "health-path", "health-timeout",
+		"release-command", "process",
+	}
 	update.Examples = []string{
+		"eregion env update api production",
 		"eregion env update api production --health-path /readyz --json",
 		"eregion env update api production --process 'web=web:8080:2:' --json",
 	}
@@ -57,6 +64,7 @@ func (a *app) envSpecs() []spec {
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().String("app", "", "Existing application name")
 					cmd.Flags().String("name", "", "Environment name")
+					cmd.Flags().Bool("no-deploy", false, "Do not queue the first deploy")
 					addSetupFlags(cmd, true)
 				},
 				run: a.envCreate,
@@ -140,7 +148,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if exists {
 		return result{}, contract.NewFault(contract.Conflict, "environment "+ans.App+"/"+ans.Environment+" already exists", "Change it with eregion env update, or choose another name.")
 	}
-	input := platform.EnvironmentCreateInput{App: ans.App, EnvironmentSpec: spec}
+	input := platform.EnvironmentCreateInput{App: ans.App, EnvironmentSpec: spec, Deploy: ans.Deploy}
 	target, err := platform.NewAppTarget(ans.App)
 	if err != nil {
 		return result{}, err
@@ -156,7 +164,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	}
 	dry := dryRun(cmd)
 	if interactive && !dry {
-		ok, err := ui.YesNoDefault("Create environment "+ans.App+"/"+ans.Environment+" now?", "The environment and its first revision are accepted in one submission.", true)
+		ok, err := ui.YesNoDefault("Create environment "+ans.App+"/"+ans.Environment+" now?", "The environment and its first revision are accepted in one submission; a requested first deploy is queued from it.", true)
 		if err != nil {
 			return result{}, setupPromptError("env create", err)
 		}
@@ -167,11 +175,14 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	summary := setupResult{
 		App: ans.App, Environment: ans.Environment, Node: ans.Node,
 		Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
-		CredentialSecretName: ans.CredentialName, Domain: ans.Domain,
+		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, Deploy: ans.Deploy,
 		Warnings: preview.Warnings, created: "environment",
 	}
 	if record, ok := domainDNSRecord(ans.Domain); ok {
 		summary.DNSRecord = &record
+	}
+	if ans.Deploy && ans.Domain == "" {
+		summary.Warnings = append(summary.Warnings, "The first deploy has no domain; public verification will fail until a domain is added.")
 	}
 	if dry {
 		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
@@ -214,6 +225,9 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 			{"source", describeSource(spec.Source)},
 			{"operation", string(op.ID)},
 		}
+		if ans.Deploy {
+			rows = append(rows, [2]string{"first deploy", "queued from the revision"})
+		}
 		if ans.Domain != "" {
 			rows = append(rows, [2]string{"domain", ans.Domain})
 			dns := "point " + ans.Domain + " at the main node's public IPv4 address"
@@ -243,15 +257,53 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 	}
 	patch, credential, credentialName, changed, err := a.buildEnvironmentUpdate(cmd, current)
 	if err != nil {
+		clearBytes(credential)
 		return result{}, err
 	}
-	defer clearBytes(credential)
+	guided := false
+	var diff []string
+	if len(changed) == 0 && humanInteractive(cmd) {
+		edit, err := a.envUpdateGuided(current)
+		if err != nil {
+			clearBytes(credential)
+			return result{}, setupPromptError("env update", err)
+		}
+		patch, credential, credentialName = edit.Patch, edit.Credential, edit.CredentialName
+		changed, diff = edit.Changed, edit.Diff
+		guided = true
+	}
+	defer func() { clearBytes(credential) }()
 	if len(changed) == 0 {
+		if guided {
+			fmt.Fprintln(os.Stderr, ui.Note("No changes; nothing was submitted."))
+			return result{streamed: true}, nil
+		}
 		return result{}, contract.NewFault(contract.InputRequired, "nothing to update", "Pass at least one of --node, --build-node, a source flag, --health-path, --release-command or --process.")
 	}
 	preview, err := a.previewAction(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch)
 	if err != nil {
 		return result{}, err
+	}
+	if guided {
+		body := strings.Join(diff, "\n")
+		if body == "" {
+			body = "changed: " + strings.Join(changed, ", ")
+		}
+		for _, warning := range preview.Warnings {
+			body += "\nwarning: " + warning
+		}
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, ui.PanelFit("Changes to "+appName+"/"+environment, output.SafeText(body), 80))
+		if dryRun(cmd) {
+			return result{streamed: true}, nil
+		}
+		ok, err := ui.YesNoDefault("Update "+appName+"/"+environment+" now?", "The change is a new immutable revision; no deploy is queued.", true)
+		if err != nil {
+			return result{}, setupPromptError("env update", err)
+		}
+		if !ok {
+			return result{}, contract.NewFault(contract.Cancelled, "environment update was not confirmed", "Nothing was submitted and no secret value was written.")
+		}
 	}
 	resultData := struct {
 		App                  string                          `json:"app"`
@@ -284,6 +336,18 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, err
 	}
 	resultData.OperationID = op.ID
+	if guided {
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, ui.Card("Environment "+appName+"/"+environment+" updated", [][2]string{
+			{"changed", strings.Join(changed, ", ")},
+			{"operation", string(op.ID)},
+		}, []string{
+			ui.Dim("no deploy was queued; the next deploy applies the revision"),
+			ui.Dim("next:"),
+			"  " + ui.Code("eregion env status "+appName+" "+environment+" --json"),
+		}))
+		return result{streamed: true}, nil
+	}
 	plain := fmt.Sprintf("Updated %s/%s desired state.\noperation: %s\nchanged: %s\nnext: eregion env status %s %s --json\n",
 		appName, environment, op.ID, strings.Join(changed, ", "), appName, environment)
 	return result{data: resultData, plain: plain}, nil
@@ -364,7 +428,11 @@ func (a *app) buildEnvironmentUpdate(cmd *cobra.Command, current platform.Enviro
 			runtime.HealthTimeoutSeconds = flagInt(cmd, "health-timeout")
 		}
 		if flagChanged(cmd, "release-command") {
-			runtime.ReleaseCommand = commandSpecFromLine(flagString(cmd, "release-command"))
+			command := commandSpecFromLine(flagString(cmd, "release-command"))
+			if command != nil && base.Runtime.ReleaseCommand != nil {
+				command.TimeoutSeconds = base.Runtime.ReleaseCommand.TimeoutSeconds
+			}
+			runtime.ReleaseCommand = command
 		}
 		patch.Runtime = &runtime
 		changed = append(changed, "runtime")

@@ -132,6 +132,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 		guided := map[string]bool{
 			"eregion server init": true, "eregion login": true, "eregion upgrade": true,
 			"eregion skill install": true, "eregion app create": true, "eregion env create": true,
+			"eregion env update": true,
 		}
 		prompts := command.Prompts && !guided[command.Path]
 		if prompts || (command.Output != "result" && !events) {

@@ -47,6 +47,28 @@ func TestEnvironmentPreviewMentionsDistinctBuildNode(t *testing.T) {
 	}
 }
 
+func TestEnvironmentCreateDeployNeedsASource(t *testing.T) {
+	registry := NewRegistry()
+	normalize := func(input map[string]any) (Normalized, error) {
+		raw, _ := json.Marshal(input)
+		return registry.Normalize(KindEnvironmentCreate, "app/api", raw)
+	}
+	if _, err := normalize(map[string]any{"name": "production", "node": "app-1", "deploy": true}); err == nil {
+		t.Fatal("deploy without a source must be refused")
+	}
+	good, err := normalize(map[string]any{
+		"name": "production", "node": "app-1", "deploy": true,
+		"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := good.Input.(*EnvironmentCreateInput)
+	if !input.Deploy {
+		t.Fatal("deploy intent was lost")
+	}
+}
+
 func TestDeployNormalizesSourceAndReleaseForms(t *testing.T) {
 	registry := NewRegistry()
 	normalize := func(kind, target string, input map[string]any) (Normalized, error) {

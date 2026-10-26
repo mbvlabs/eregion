@@ -73,8 +73,8 @@ bin/eregion help app create --json
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). |
 | `context list/show/use/remove`, `context credential add` | Saved contexts, target-confirmed removal with its key files, and local server-auth-file editing. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. |
-| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, then adds the domain as a separate `platform.domain.add` action. `status` reads inventory plus Docker container state, domain observations and recent operations. `delete` takes `--confirm <app>` and follows the operation in a terminal unless `--detach` is given. |
-| `env create/update/list/status/delete` | `create` accepts an environment with its first revision; `update` merges source, placement, runtime and process changes into a new immutable revision. `status` includes the serving release, per-process replicas with container state, domains, deployability and recent operations. `delete` takes `--confirm <app>/<environment>`; deleting the last environment deletes the app. |
+| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create`, queues its first deploy unless `--no-deploy`, then adds the domain as a separate `platform.domain.add` action. List/status read inventory. No delete yet. `status` shows the serving release, processes, per-domain state and recent operations; `delete` takes `--confirm <app>` (D13). |
+| `env create/update/list/status/delete` | `create` accepts an environment with its first revision and queues its first deploy unless `--no-deploy`; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags, `update` walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. No delete yet. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` (D13). |
 | `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. No deploy is queued. |
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
 | `platform releases create/list` | Exactly one of `--image`, `--directory`, `--git-url`. Directory is on the server. Transitional until the deploy row replaces it. |
@@ -379,7 +379,7 @@ All use `POST /v1/operations`, the shared registry and one River job:
 | Kind | Target | Main input |
 | --- | --- | --- |
 | `platform.app.create` | `platform` | `name`; optional `environment` (first environment + first revision) and `deploy` to queue the first deploy from that revision. |
-| `platform.environment.create` | `app/<app>` | `name`, `node`, optional `build_node`, legacy ports/bind/health, `env`, `secret_refs`; revision `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`. |
+| `platform.environment.create` | `app/<app>` | `name`, `node`, optional `build_node`, legacy ports/bind/health, `env`, `secret_refs`; revision `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`; optional `deploy` to queue the first deploy from that revision. |
 | `platform.environment.update` | `env/<app>/<env>` | Partial patch: `node`, `build_node`, `source`, `auto_deploy`, `webhook_secret_name`, `runtime`, `processes`, `config`, `secret_names`; produces a new full revision. |
 | `platform.process.scale` | `env/<app>/<env>` | `process`, `replicas`; produces a new revision. |
 | `platform.config.set/unset` | `env/<app>/<env>` | `config` map or `keys` list; produces a new revision and never queues a deploy. |
@@ -410,9 +410,12 @@ revision, processes and deployability.
 The CLI `app create` and `env create` preview the canonical action on the node,
 write the read credential and secret values through `vault.set`, then submit.
 Only names enter the revision; a domain is a separate `platform.domain.add`
-submission. `env update` reads the current revision and sends a merged patch.
-`secret set` writes the value and submits `platform.environment.secret.attach`
-only when the current revision does not already name it.
+submission. The preview checks the target node placement, so a refused create
+does not leave vault values behind. `env update` reads the current revision and
+sends a merged patch; its terminal interview shows the diff before confirmation.
+`secret set` previews the attach action, writes the value, then submits
+`platform.environment.secret.attach` only when the current revision does not
+already name it.
 
 Deploy-time secret resolution prefers the current revision's secret names,
 resolving each name's active latest revision and freezing the exact non-secret
@@ -420,8 +423,9 @@ revision identities on the deployment. A private git read credential is resolved
 by NAME at build execution and passed only to the askpass child environment; the
 value never enters the revision, operation input, events or logs. The
 transitional pinned `secret_refs` path is used only when the revision names no
-secrets. `platform.app.create` with deploy intent queues the first
-deploy-from-revision operation in the same submission transaction.
+secrets. `platform.app.create` and `platform.environment.create` with deploy
+intent queue the first deploy-from-revision operation in the same submission
+transaction.
 
 Image releases inspect/pull the image. Buildpacks builds require builder role
 and capability, allowed source roots for directories, and allowlisted HTTPS git

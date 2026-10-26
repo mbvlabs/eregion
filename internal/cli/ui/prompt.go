@@ -142,7 +142,13 @@ func TypeWord(title, description, word string) error {
 
 // Choose asks the operator to pick one of options (label, value pairs).
 func Choose(title, description string, options [][2]string) (string, error) {
-	var value string
+	return ChooseDefault(title, description, options, "")
+}
+
+// ChooseDefault is Choose with def preselected. def must be one of the option
+// values; an unknown value leaves the first option selected.
+func ChooseDefault(title, description string, options [][2]string, def string) (string, error) {
+	value := def
 	opts := make([]huh.Option[string], 0, len(options))
 	for _, o := range options {
 		opts = append(opts, huh.NewOption(o[0], o[1]))
