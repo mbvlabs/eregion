@@ -194,14 +194,16 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		}
 		steps = append(steps, &databaseStep{cfg: r.Config, database: r.Database})
 		steps = append(steps, &credentialsStep{cfg: r.Config, credentials: credentials})
+		// Before the services: the worker's unit makes the routes dir writable,
+		// which must exist when it starts.
+		if r.Config.Hostname != "" {
+			steps = append(steps, &ingressStep{cfg: r.Config, exec: r.Exec})
+		}
 	}
 	steps = append(steps, &binaryStep{cfg: r.Config, role: role})
 	if role.ControlPlane {
 		steps = append(steps, newAPIService(r.Config, r.Exec), newWorkerService(r.Config, r.Exec))
 		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe, token: credentials.Operator})
-		if r.Config.Hostname != "" {
-			steps = append(steps, &ingressStep{cfg: r.Config, exec: r.Exec})
-		}
 	}
 	if role.NodeAgent {
 		steps = append(steps, &nodeConfigStep{cfg: r.Config})

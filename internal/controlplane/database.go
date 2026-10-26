@@ -52,6 +52,9 @@ var migration008 string
 //go:embed migrations/009_platform_build_node.sql
 var migration009 string
 
+//go:embed migrations/010_platform_domains.sql
+var migration010 string
+
 type migration struct {
 	version int
 	name    string
@@ -71,6 +74,7 @@ var migrations = []migration{
 	{version: 7, name: "007_nodes.sql", sql: migration007},
 	{version: 8, name: "008_webhook_deliveries.sql", sql: migration008},
 	{version: 9, name: "009_platform_build_node.sql", sql: migration009},
+	{version: 10, name: "010_platform_domains.sql", sql: migration010},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.

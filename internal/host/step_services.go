@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 type serviceStep struct {
@@ -222,12 +223,12 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=%s
+ReadWritePaths=%s -%s
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-`, cfg.Layout.User, cfg.Layout.Group, filepath.Join(cfg.Layout.ConfigDir, "control-plane.env"), filepath.Join(cfg.Layout.BinDir, "eregion"), cfg.WorkerConcurrency, cfg.Layout.DataDir))
+`, cfg.Layout.User, cfg.Layout.Group, filepath.Join(cfg.Layout.ConfigDir, "control-plane.env"), filepath.Join(cfg.Layout.BinDir, "eregion"), cfg.WorkerConcurrency, cfg.Layout.DataDir, platform.CaddyRoutesDir))
 }
 
 func newAPIService(cfg Config, exec Exec) *serviceStep {

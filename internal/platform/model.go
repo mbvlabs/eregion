@@ -106,8 +106,10 @@ type Environment struct {
 	HealthState     HealthState       `json:"health_state"`
 	HealthDetail    string            `json:"health_detail,omitempty"`
 	HealthCheckedAt *time.Time        `json:"health_checked_at,omitempty"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
+	// Domains are the public hostnames Caddy routes to HostPort.
+	Domains   []string  `json:"domains"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // BuildNodeName is where a build source for this environment runs. An empty

@@ -2,15 +2,16 @@ package host
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 // CaddyfilePath is the distribution package's config, owned by eregion.
-const CaddyfilePath = "/etc/caddy/Caddyfile"
+const CaddyfilePath = platform.CaddyfilePath
 
 // PublicAPIPaths are the only API paths Caddy exposes on the main node's
 // hostname: readiness and the GitHub webhook, which verifies its own HMAC
@@ -19,22 +20,7 @@ const CaddyfilePath = "/etc/caddy/Caddyfile"
 var PublicAPIPaths = []string{"/readyz", "/v1/webhooks/github"}
 
 // ValidateHostname checks a DNS name such as main.example.com.
-func ValidateHostname(name string) error {
-	if len(name) > 253 || !strings.Contains(name, ".") {
-		return errors.New("use a fully qualified name such as main.example.com")
-	}
-	for _, label := range strings.Split(name, ".") {
-		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return errors.New("each label must be 1–63 letters, digits or hyphens")
-		}
-		for _, r := range label {
-			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
-				return errors.New("use lowercase letters, digits, hyphens and dots")
-			}
-		}
-	}
-	return nil
-}
+func ValidateHostname(name string) error { return platform.ValidateDomain(name) }
 
 // ingressStep installs Caddy on the main node: an ACME certificate for the
 // hostname and a reverse proxy for the public API paths only.
@@ -51,6 +37,8 @@ func (s *ingressStep) CancelBoundary() engine.Boundary { return engine.BoundaryA
 
 func (s *ingressStep) caddyfile() []byte {
 	return []byte(fmt.Sprintf(`# managed by eregion
+import %s/*.caddy
+
 %s {
 	@api path %s
 	handle @api {
@@ -60,7 +48,7 @@ func (s *ingressStep) caddyfile() []byte {
 		respond 404
 	}
 }
-`, s.cfg.Hostname, strings.Join(PublicAPIPaths, " "), s.cfg.APIListen))
+`, platform.CaddyRoutesDir, s.cfg.Hostname, strings.Join(PublicAPIPaths, " "), s.cfg.APIListen))
 }
 
 func (s *ingressStep) Inputs() ([]byte, error) {
@@ -78,6 +66,9 @@ func (s *ingressStep) Check(ctx context.Context, _ engine.Runtime) (engine.Check
 	if !ok {
 		return incomplete("Caddy is not installed or its Caddyfile differs")
 	}
+	if _, err := os.Stat(platform.CaddyRoutesPath); err != nil {
+		return incomplete("the routes file " + platform.CaddyRoutesPath + " is missing")
+	}
 	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, `if systemctl is-active caddy.service >/dev/null 2>&1; then echo active:ok; else echo active:missing; fi`)
 	if err != nil {
 		return engine.CheckResult{}, err
@@ -91,6 +82,13 @@ func (s *ingressStep) Check(ctx context.Context, _ engine.Runtime) (engine.Check
 func (s *ingressStep) Apply(ctx context.Context, _ engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
 	install := "set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\nif ! dpkg-query -W -f='${db:Status-Abbrev}' caddy 2>/dev/null | grep -q '^ii'; then apt-get update -qq; apt-get install -y --no-install-recommends caddy; fi"
 	if err := s.exec.Run(ctx, s.ID(), install, nil, report); err != nil {
+		return engine.ApplyResult{}, err
+	}
+	// The worker owns the routes file; it rewrites it on every domain change.
+	routes := fmt.Sprintf(`set -euo pipefail
+install -d -m 0755 -o %[1]s -g %[2]s %[3]s
+[ -f %[4]s ] || install -m 0644 -o %[1]s -g %[2]s /dev/null %[4]s`, shellQuote(s.cfg.Layout.User), shellQuote(s.cfg.Layout.Group), platform.CaddyRoutesDir, platform.CaddyRoutesPath)
+	if err := s.exec.Run(ctx, s.ID(), routes, nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	if err := writePublicFile(CaddyfilePath, s.caddyfile(), "root", "root"); err != nil {

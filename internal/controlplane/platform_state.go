@@ -117,6 +117,8 @@ func platformAcceptedMessage(kind string) string {
 		return "Node enrollment accepted durably; the host key is pinned, but nothing is trusted until the node proves its identity."
 	case platform.KindNodeReconcile:
 		return "Node reconciliation accepted durably."
+	case platform.KindDomainAdd, platform.KindDomainRemove:
+		return "Domain change accepted durably; the worker rewrites the Caddy routes."
 	default:
 		return "Platform action accepted durably."
 	}
@@ -190,6 +192,31 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			envID, app.ID, input.Name, input.Node, buildNode, hostPort, candidatePort, input.ContainerPort, input.Bind,
 			input.Health.Type, input.Health.Path, input.Health.TimeoutSeconds, env, refs); err != nil {
 			return platformWriteError(err, "environment name or port already exists")
+		}
+	case *platform.DomainInput:
+		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
+		if err != nil {
+			return err
+		}
+		if normalized.Kind == platform.KindDomainRemove {
+			tag, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2`, input.Domain, env.ID)
+			if err != nil {
+				return unavailable()
+			}
+			if tag.RowsAffected() == 0 {
+				return contract.NewFault(contract.NotFound, input.Domain+" is not routed to "+input.App+"/"+input.Environment, "List routes with eregion domain list.")
+			}
+			return nil
+		}
+		node, err := nodeByNameTx(ctx, tx, env.Node)
+		if err != nil {
+			return err
+		}
+		if node.Transport != "local" {
+			return contract.NewFault(contract.PreconditionFailed, "domains route only to environments on the main node for now", "Create the environment on the main node.")
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id) VALUES($1,$2)`, input.Domain, env.ID); err != nil {
+			return platformWriteError(err, input.Domain+" is already routed")
 		}
 	case *platform.ReleaseCreateInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
@@ -589,7 +616,9 @@ func (s *Service) inventoryApps(ctx context.Context, query platform.InventoryQue
 const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.build_node,''),e.host_port,e.candidate_port,e.container_port,
     e.bind_address,e.health_type,e.health_path,e.health_timeout_seconds,e.env,e.secret_refs,e.secret_revision,
     coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,''),coalesce(e.serving_release_id,''),
-    e.health_state,e.health_detail,e.health_checked_at,e.created_at,e.updated_at
+    e.health_state,e.health_detail,e.health_checked_at,
+    coalesce((SELECT array_agg(d.name ORDER BY d.name) FROM eregion_platform_domains d WHERE d.environment_id=e.id),'{}'),
+    e.created_at,e.updated_at
     FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id`
 
 func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
@@ -598,7 +627,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var desired, applied, serving string
 	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
-		&desired, &applied, &serving, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.CreatedAt, &env.UpdatedAt)
+		&desired, &applied, &serving, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains, &env.CreatedAt, &env.UpdatedAt)
 	if err != nil {
 		return env, err
 	}

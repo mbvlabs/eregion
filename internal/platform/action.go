@@ -19,6 +19,8 @@ const (
 	KindReleaseCreate     = "platform.release.create"
 	KindDeploy            = "platform.deploy"
 	KindRollback          = "platform.rollback"
+	KindDomainAdd         = "platform.domain.add"
+	KindDomainRemove      = "platform.domain.remove"
 )
 
 // MaxInputBytes bounds one action input. The API enforces the same value at the

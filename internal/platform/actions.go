@@ -2,6 +2,7 @@ package platform
 
 import (
 	"encoding/json"
+	"errors"
 	"net"
 	"path/filepath"
 	"strings"
@@ -118,6 +119,8 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindReleaseCreate, Summary: "Record or build a release", Normalize: normalizeReleaseCreate})
 	r.registerBuiltin(Definition{Kind: KindDeploy, Summary: "Deploy a release with health-first switching", Normalize: normalizeDeploy})
 	r.registerBuiltin(Definition{Kind: KindRollback, Summary: "Deploy a previous release", Normalize: normalizeRollback})
+	r.registerBuiltin(Definition{Kind: KindDomainAdd, Summary: "Route a public hostname to an environment through Caddy", Normalize: normalizeDomain})
+	r.registerBuiltin(Definition{Kind: KindDomainRemove, Summary: "Remove a public hostname's route", Normalize: normalizeDomain})
 }
 
 func normalizeAppCreate(target Target, raw json.RawMessage) (ActionInput, error) {
@@ -484,4 +487,53 @@ func validGitRef(ref string) bool {
 		}
 	}
 	return true
+}
+
+// DomainInput names a public hostname and the environment it routes to.
+type DomainInput struct {
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+	Domain      string `json:"domain"`
+}
+
+func (in *DomainInput) Target() Target {
+	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
+}
+func (in *DomainInput) Preview() any { return in }
+
+func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetEnvironment {
+		return nil, invalid("target", "domain actions require target env/<app>/<env>.")
+	}
+	var input DomainInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if (input.App != "" && input.App != target.App) || (input.Environment != "" && input.Environment != target.Environment) {
+		return nil, invalid("environment", "The app and environment fields must match the target, or be omitted.")
+	}
+	input.App, input.Environment = target.App, target.Environment
+	input.Domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Domain), "."))
+	if err := ValidateDomain(input.Domain); err != nil {
+		return nil, invalid("domain", err.Error())
+	}
+	return &input, nil
+}
+
+// ValidateDomain checks a public DNS name such as app.example.com.
+func ValidateDomain(name string) error {
+	if len(name) > 253 || !strings.Contains(name, ".") {
+		return errors.New("use a fully qualified name such as app.example.com")
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return errors.New("each label must be 1–63 letters, digits or hyphens")
+		}
+		for _, r := range label {
+			if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+				return errors.New("use lowercase letters, digits, hyphens and dots")
+			}
+		}
+	}
+	return nil
 }

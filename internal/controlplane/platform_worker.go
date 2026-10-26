@@ -104,6 +104,8 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runRelease(ctx, op.ID, attempt, normalized)
 	case platform.KindDeploy, platform.KindRollback:
 		return w.runDeployment(ctx, op.ID, attempt, normalized)
+	case platform.KindDomainAdd, platform.KindDomainRemove:
+		return w.runDomain(ctx, op.ID, attempt, normalized)
 	default:
 		return w.settle(ctx, op.ID, attempt, contract.NewFault(contract.Internal, "platform action has no worker path", "This is a binary/registration mismatch; do not resubmit accepted work."))
 	}
@@ -1167,6 +1169,12 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
 		}
 		return s.failReconciledPlatform(ctx, op, "enrollment ended before the node was verified; retry with platform nodes retry", contract.Unavailable)
+	case platform.KindDomainAdd, platform.KindDomainRemove:
+		// The table already holds the change; the routes file is derived from it.
+		if err := s.syncRoutes(ctx); err != nil {
+			return s.failReconciledPlatform(ctx, op, err.Error(), contract.Unavailable)
+		}
+		return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
 	case platform.KindAppCreate, platform.KindEnvironmentCreate, platform.KindNodeRegister:
 		exists, err := s.recordActionExists(ctx, op)
 		if err != nil {
