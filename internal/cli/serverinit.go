@@ -570,11 +570,11 @@ func (r *serverInit) collect() error {
 		if env := strings.TrimSpace(os.Getenv("EREGION_DATABASE_URL")); env != "" {
 			ans.DatabaseURL = env
 		} else if r.interactive {
-			v, err := ui.Input("External PostgreSQL URL file", "An owner-only file holding postgres://user:password@host:5432/db", "")
+			v, err := ui.Secret("External PostgreSQL URL (postgres://user:password@host:5432/db)")
 			if err != nil {
 				return err
 			}
-			ans.DatabaseURLFile = v
+			ans.DatabaseURL = v
 		} else {
 			return contract.NewFault(contract.InputRequired, "the control plane needs an external PostgreSQL URL", "Pass --database-url-file with an owner-only file.")
 		}
@@ -1013,7 +1013,8 @@ func (r *serverInit) readVaultKeyring(ctx context.Context) error {
 }
 
 // loadDatabaseURL reads the DSN again on a resume. It is never stored in the
-// pending state, only the protected file path is.
+// pending state, only the protected file path is; a URL typed at the prompt
+// is asked for again.
 func (r *serverInit) loadDatabaseURL() error {
 	if r.answers.DatabaseURLFile != "" {
 		raw, err := host.ReadPrivateInput(expandHome(r.answers.DatabaseURLFile))
@@ -1024,6 +1025,13 @@ func (r *serverInit) loadDatabaseURL() error {
 		return nil
 	}
 	r.answers.DatabaseURL = strings.TrimSpace(os.Getenv("EREGION_DATABASE_URL"))
+	if r.answers.DatabaseURL == "" && r.interactive {
+		v, err := ui.Secret("External PostgreSQL URL (postgres://user:password@host:5432/db)")
+		if err != nil {
+			return err
+		}
+		r.answers.DatabaseURL = v
+	}
 	return nil
 }
 
@@ -1313,8 +1321,10 @@ func (r *serverInit) showPlan(plan host.Plan) {
 	fmt.Fprintf(&b, "node binary   %s\n", r.binaryPath)
 	if r.answers.DatabaseURLFile != "" {
 		fmt.Fprintf(&b, "database      external PostgreSQL from %s\n", r.answers.DatabaseURLFile)
-	} else {
+	} else if os.Getenv("EREGION_DATABASE_URL") != "" {
 		b.WriteString("database      external PostgreSQL from EREGION_DATABASE_URL\n")
+	} else {
+		b.WriteString("database      external PostgreSQL entered at the prompt\n")
 	}
 	b.WriteString("\n")
 	for _, step := range r.planRows(plan) {
