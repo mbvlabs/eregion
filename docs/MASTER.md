@@ -158,6 +158,7 @@ eregion app create|list|status|delete
 eregion env create|update|list|status|delete
 eregion process list|scale                             # per environment
 eregion deploy <app> <env> [--ref REF | --release ID] | rollback <app> <env> [--to ID]
+eregion image push <local-image> --app <app> [--tag <tag>]   # local image into the node registry
 eregion build list|logs|stop|retry  ·  release list
 eregion domain add|list|remove [--primary]
 eregion config set|unset|list                          # plain variables

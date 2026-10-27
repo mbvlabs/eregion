@@ -398,7 +398,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		if release.BuildID != "" || (release.Source.Type != "image" && release.Source.Type != "") {
 			release, err = w.buildRelease(ctx, id, attempt, env, release, tr, buildSecrets)
 		} else {
-			release, err = w.verifyReleaseImage(ctx, id, attempt, release, tr, false)
+			// An image source may live only in the node's loopback registry.
+			// Pull it by its recorded reference before inspecting the image ID.
+			release, err = w.verifyReleaseImage(ctx, id, attempt, release, tr, release.Source.Type == "image")
 		}
 		if err != nil {
 			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)

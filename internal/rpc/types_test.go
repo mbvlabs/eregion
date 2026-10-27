@@ -3,6 +3,7 @@ package rpc
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 
@@ -18,26 +19,62 @@ func TestRequestRoundTripAndBound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := DecodeRequest(bytes.NewReader(append(raw, '\n')))
+	decoded, rest, err := DecodeRequest(bytes.NewReader(append(raw, '\n')))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if decoded.Method != request.Method || decoded.Operator != request.Operator || !ValidMethod(decoded.Method) || !requestIDPattern.MatchString(decoded.RequestID) {
 		t.Fatalf("unexpected request: %+v", decoded)
 	}
+	if rest != nil {
+		t.Fatal("non-streamed request returned a payload reader")
+	}
 
 	tooLarge := `{"schema":"` + Schema + `","method":"version","params":{"x":"` + strings.Repeat("a", MaxRequestBytes) + `"}}`
-	if _, err := DecodeRequest(strings.NewReader(tooLarge)); err == nil {
+	if _, _, err := DecodeRequest(strings.NewReader(tooLarge)); err == nil {
 		t.Fatal("oversized request accepted")
 	}
-	if _, err := DecodeRequest(strings.NewReader(string(raw) + string(raw))); err == nil {
+	if _, _, err := DecodeRequest(strings.NewReader(string(raw) + string(raw))); err == nil {
 		t.Fatal("two requests accepted")
 	}
-	if _, err := DecodeRequest(strings.NewReader(`{"schema":"other","method":"version"}`)); err == nil {
+	if _, _, err := DecodeRequest(strings.NewReader(`{"schema":"other","method":"version"}`)); err == nil {
 		t.Fatal("wrong schema accepted")
 	}
-	if _, err := DecodeRequest(strings.NewReader(`{"schema":"` + Schema + `","method":"not a method"}`)); err == nil {
+	if _, _, err := DecodeRequest(strings.NewReader(`{"schema":"` + Schema + `","method":"not a method"}`)); err == nil {
 		t.Fatal("malformed method accepted")
+	}
+}
+
+func TestStreamedRequestKeepsThePayload(t *testing.T) {
+	payload := strings.Repeat("image-bytes", 1024)
+	line := `{"schema":"` + Schema + `","method":"image.push","stream":true}` + "\n"
+	request, rest, err := DecodeRequest(strings.NewReader(line + payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !request.Stream || request.Method != "image.push" || rest == nil {
+		t.Fatalf("unexpected streamed request: %+v", request)
+	}
+	got, err := io.ReadAll(rest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != payload {
+		t.Fatalf("payload = %q", got)
+	}
+}
+
+func TestNonStreamedRequestAllowsOnlyWhitespaceAfterTheLine(t *testing.T) {
+	line := `{"schema":"` + Schema + `","method":"version"}` + "\n"
+	request, rest, err := DecodeRequest(strings.NewReader(line + " \n\t\r"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Stream || rest != nil {
+		t.Fatalf("unexpected request: %+v", request)
+	}
+	if _, _, err := DecodeRequest(strings.NewReader(line + "payload")); err == nil {
+		t.Fatal("non-streamed trailing payload accepted")
 	}
 }
 

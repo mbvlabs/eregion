@@ -496,6 +496,15 @@ transient node secret map, never in the build payload. A directory/git build on
 a distinct build node is refused before `pack`: registry push/pull and dedicated
 credentials do not exist. Installing a registry alone does not move images.
 
+`eregion image push <local-image> --app <app> [--tag <tag>]` moves a local image
+into that registry without port forwarding: the request line is followed on the
+same stdin by a `docker save` tar, the node's `image.push` method pipes it to
+`docker load` with an 8 GiB cap, tags and pushes
+`<RegistryListen>/<app>:<tag>`, and returns the pushed
+`<RegistryListen>/<app>@sha256:…` reference with sparse progress events. An image
+revision deploy pulls that recorded reference on the node before inspecting its
+immutable image ID.
+
 Deploy sequence: deployability gate -> preflight -> build from the revision when
 the release is pending -> release command -> candidate containers for every
 process replica on dynamic loopback ports -> health for every web replica ->

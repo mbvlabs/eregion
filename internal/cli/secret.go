@@ -307,6 +307,10 @@ func readProtectedSecretFile(path string) ([]byte, error) {
 		clearSecretBytes(value)
 		return nil, contract.NewFault(contract.PreconditionFailed, "secret input file could not be read within its bound", "Check the file size and permissions.")
 	}
+	// A value file written by an editor, echo or openssl ends with one line
+	// break that is not part of the value; injected into the environment it
+	// would break a password or key.
+	value = trimOneLineBreak(value)
 	if err := vault.ValidateValue(value); err != nil {
 		clearSecretBytes(value)
 		return nil, err
@@ -363,4 +367,15 @@ func clearSecretBytes(value []byte) {
 	for i := range value {
 		value[i] = 0
 	}
+}
+
+// trimOneLineBreak drops a single trailing \n or \r\n.
+func trimOneLineBreak(value []byte) []byte {
+	if n := len(value); n > 0 && value[n-1] == '\n' {
+		value = value[:n-1]
+		if n := len(value); n > 0 && value[n-1] == '\r' {
+			value = value[:n-1]
+		}
+	}
+	return value
 }

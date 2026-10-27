@@ -2,6 +2,7 @@
 package rpc
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
@@ -37,6 +38,9 @@ type Request struct {
 	ClientVersion  string            `json:"client_version"`
 	ClientCommit   string            `json:"client_commit"`
 	ClientChannel  string            `json:"client_channel,omitempty"`
+	// Stream reports that stdin continues after the request line with the
+	// method's payload.
+	Stream bool `json:"stream,omitempty"`
 }
 
 // Loggable returns the request with secret values dropped. Only the secret
@@ -57,6 +61,7 @@ func (r Request) Loggable() map[string]any {
 		"client_version":  r.ClientVersion,
 		"client_commit":   r.ClientCommit,
 		"client_channel":  r.ClientChannel,
+		"stream":          r.Stream,
 		"secret_names":    names,
 	}
 	if len(r.Params) > 0 {
@@ -125,41 +130,76 @@ var requestIDPattern = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{26}$`)
 // methodPattern is <group>.<verb>; words may contain inner hyphens.
 var methodPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(-[a-z0-9]+)*(\.[a-z][a-z0-9]*(-[a-z0-9]+)*)*$`)
 
-// DecodeRequest reads exactly one JSON object from r, then EOF, within
-// MaxRequestBytes. A request without request_id gets a new one.
-func DecodeRequest(r io.Reader) (Request, error) {
-	raw, err := io.ReadAll(io.LimitReader(r, MaxRequestBytes+1))
+// DecodeRequest reads exactly one JSON request line from r, within
+// MaxRequestBytes, and returns a reader for whatever follows it. A request
+// without a newline ends at EOF. A streamed request keeps the remaining stdin
+// available as its payload; any other request must be followed only by
+// whitespace. A request without request_id gets a new one.
+func DecodeRequest(r io.Reader) (Request, io.Reader, error) {
+	buffered := bufio.NewReaderSize(r, 64*1024)
+	line, err := readRequestLine(buffered)
 	if err != nil {
-		return Request{}, usage("could not read the request", err.Error())
+		return Request{}, nil, err
 	}
-	if len(raw) > MaxRequestBytes {
-		return Request{}, usage("request is larger than 1 MiB", "Send one JSON object of at most 1 MiB.")
-	}
-	dec := json.NewDecoder(bytes.NewReader(raw))
+	rest := io.MultiReader(buffered, r)
+	dec := json.NewDecoder(bytes.NewReader(line))
 	var req Request
 	if err := dec.Decode(&req); err != nil {
-		return Request{}, usage("request is not valid JSON", err.Error())
+		return Request{}, nil, usage("request is not valid JSON", err.Error())
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return Request{}, usage("request must be exactly one JSON object", "Send one JSON object, then close stdin.")
+		return Request{}, nil, usage("request must be exactly one JSON object", "Send one JSON object, then close stdin.")
 	}
 	if req.Schema != Schema {
-		return Request{}, usage("request schema must be "+Schema, "Set \"schema\": \""+Schema+"\".")
+		return Request{}, nil, usage("request schema must be "+Schema, "Set \"schema\": \""+Schema+"\".")
 	}
 	if !methodPattern.MatchString(req.Method) {
-		return Request{}, usage("request method is missing or malformed", "Set \"method\", for example \"version\".")
+		return Request{}, nil, usage("request method is missing or malformed", "Set \"method\", for example \"version\".")
 	}
 	if req.RequestID == "" {
 		req.RequestID = NewRequestID()
 	}
 	req.RequestID = strings.ToUpper(strings.TrimSpace(req.RequestID))
 	if !requestIDPattern.MatchString(req.RequestID) {
-		return Request{}, usage("request_id must be a ULID", "Omit request_id and the node assigns one.")
+		return Request{}, nil, usage("request_id must be a ULID", "Omit request_id and the node assigns one.")
 	}
 	if len(req.Params) > 0 && !bytes.HasPrefix(bytes.TrimSpace(req.Params), []byte("{")) && string(bytes.TrimSpace(req.Params)) != "null" {
-		return Request{}, usage("params must be a JSON object", "")
+		return Request{}, nil, usage("params must be a JSON object", "")
 	}
-	return req, nil
+	if req.Stream {
+		return req, rest, nil
+	}
+	tail, err := io.ReadAll(io.LimitReader(rest, MaxRequestBytes+1))
+	if err != nil {
+		return Request{}, nil, usage("could not read the request", err.Error())
+	}
+	if len(bytes.TrimSpace(tail)) > 0 {
+		return Request{}, nil, usage("request must be exactly one JSON object", "Send one JSON object, then close stdin; set \"stream\": true only for a method with a payload.")
+	}
+	return req, nil, nil
+}
+
+// readRequestLine consumes one newline-terminated line without reading the
+// payload that follows it into a second buffer.
+func readRequestLine(r *bufio.Reader) ([]byte, error) {
+	var line []byte
+	for {
+		part, err := r.ReadSlice('\n')
+		line = append(line, part...)
+		if len(line) > MaxRequestBytes {
+			return nil, usage("request is larger than 1 MiB", "Send one JSON object of at most 1 MiB.")
+		}
+		switch {
+		case err == nil:
+			return bytes.TrimRight(line, "\r\n"), nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF):
+			return bytes.TrimRight(line, "\r\n"), nil
+		default:
+			return nil, usage("could not read the request", err.Error())
+		}
+	}
 }
 
 // ValidMethod reports whether name is a well-formed method name.

@@ -89,3 +89,11 @@ func TestCLIProtectedFileHelpersRejectUnsafePaths(t *testing.T) {
 		t.Fatalf("destination content = %q, %v", raw, err)
 	}
 }
+
+func TestSecretFilesDropOneTrailingLineBreak(t *testing.T) {
+	for in, want := range map[string]string{"abc\n": "abc", "abc\r\n": "abc", "abc": "abc", "abc\n\n": "abc\n"} {
+		if got := string(trimOneLineBreak([]byte(in))); got != want {
+			t.Errorf("trimOneLineBreak(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -53,7 +53,7 @@ func (a *app) nodeClientFor(cmd *cobra.Command, name string) (*nodeClient, error
 	}
 	remote.KeepAlive()
 	client := &nodeClient{
-		remote: remote, route: current.SSH,
+		remote: remote, route: current.SSH, contextName: current.Name,
 		operator: current.SSH.User, autoUpgrade: autoUpgrade, stderr: cmd.ErrOrStderr(),
 		wait: humanPlainAt(cmd),
 	}

@@ -98,6 +98,7 @@ const (
 	methodTokenRevoke    = "token.revoke"
 	methodHandoffExport  = "handoff.export"
 	methodNodeInfo       = "node.info"
+	methodImagePush      = "image.push"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -210,12 +211,20 @@ type rpcCallOptions struct {
 	IdempotencyKey string
 	// OnEvent receives progress lines from methods that stream their work.
 	OnEvent func(rpc.EventBody)
+	// Payload is sent after the request line when Stream is set.
+	Payload io.Reader
+	Stream  bool
+	// Progress keeps the loading line visible while events update its detail.
+	Progress bool
+	// Label overrides the loading line's text.
+	Label string
 }
 
 type nodeClient struct {
 	remote      *host.Remote
 	route       *host.ContextSSH
 	operator    string
+	contextName string
 	autoUpgrade bool
 	stderr      io.Writer
 	// wait enables the human loading line on stderr while a remote call runs.
@@ -601,6 +610,8 @@ func waitLabel(method string, params any) string {
 		return "Minting token…"
 	case rpcTokenRevokeParams:
 		return "Revoking token…"
+	case rpcImagePushParams:
+		return "Pushing image…"
 	}
 	switch method {
 	case methodReady:
@@ -632,9 +643,22 @@ func waitLabel(method string, params any) string {
 }
 
 func (n *nodeClient) call(ctx context.Context, method string, params any, opts rpcCallOptions) (json.RawMessage, error) {
-	if n.wait && opts.OnEvent == nil && !waitSuppressed(ctx) {
-		stop := ui.Wait(os.Stderr, waitLabel(method, params))
+	if n.wait && (opts.OnEvent == nil || opts.Progress) && !waitSuppressed(ctx) {
+		label := opts.Label
+		if label == "" {
+			label = waitLabel(method, params)
+		}
+		status, stop := ui.Start(os.Stderr).Wait(label)
 		defer stop()
+		inner := opts.OnEvent
+		opts.OnEvent = func(event rpc.EventBody) {
+			if message := strings.TrimSpace(event.Message); message != "" {
+				status.Detail(message)
+			}
+			if inner != nil {
+				inner(event)
+			}
+		}
 	}
 	if method != methodVersion && method != methodUpgradeInstall {
 		if err := n.ensureVersion(ctx); err != nil {
@@ -788,12 +812,17 @@ func (n *nodeClient) callRaw(ctx context.Context, method string, params any, opt
 		Schema: rpc.Schema, RequestID: rpc.NewRequestID(), Method: method, Params: rawParams,
 		Secrets: opts.Secrets, DryRun: opts.DryRun, Confirm: opts.Confirm, IdempotencyKey: opts.IdempotencyKey,
 		Operator: n.operator, ClientVersion: buildinfo.Version, ClientCommit: buildinfo.Commit,
+		Stream: opts.Stream,
 	}
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
 	}
 	payload = append(payload, '\n')
+	var stdin io.Reader = bytes.NewReader(payload)
+	if opts.Payload != nil {
+		stdin = io.MultiReader(bytes.NewReader(payload), opts.Payload)
+	}
 	pr, pw := io.Pipe()
 	stderr := &rpcTail{max: 8 * 1024}
 	var errOut io.Writer = stderr
@@ -802,7 +831,7 @@ func (n *nodeClient) callRaw(ctx context.Context, method string, params any, opt
 	}
 	runErr := make(chan error, 1)
 	go func() {
-		err := n.remote.Run(ctx, nodeRPCCommand(n.operator), bytes.NewReader(payload), pw, errOut)
+		err := n.remote.Run(ctx, nodeRPCCommand(n.operator), stdin, pw, errOut)
 		_ = pw.CloseWithError(io.EOF)
 		runErr <- err
 	}()
@@ -916,9 +945,12 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	if runtime.GOOS != "linux" {
 		return writeRPCResult(stdout, nil, contract.NewFault(contract.PreconditionFailed, "eregion node rpc runs on Linux nodes", "Run it on the node over SSH."))
 	}
-	request, err := rpc.DecodeRequest(stdin)
+	request, payload, err := rpc.DecodeRequest(stdin)
 	if err != nil {
 		return writeRPCResult(stdout, nil, err)
+	}
+	if request.Stream && request.Method != methodImagePush {
+		return writeRPCResult(stdout, nil, contract.NewFault(contract.Usage, "method does not accept a streamed payload", "Omit \"stream\" unless the method documents a payload."))
 	}
 	for _, value := range request.Secrets {
 		registry.Add(value)
@@ -967,7 +999,7 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	}
 	// The human factor, token store and handoff exist without the control
 	// database: a recovery export must work while PostgreSQL is unreachable.
-	if data, handled, err := dispatchLocalMethod(ctx, request); handled {
+	if data, handled, err := dispatchLocalMethod(ctx, request, payload, stdout); handled {
 		registerRPCMethodSecrets(registry, request.Method, data)
 		return writeRPCResult(stdout, data, err)
 	}
@@ -1009,7 +1041,7 @@ func registerRPCMethodSecrets(registry *secrets.Registry, method string, data an
 
 // dispatchLocalMethod handles node-local requests that need no control-plane
 // pool. The boolean reports whether the method was handled.
-func dispatchLocalMethod(ctx context.Context, request rpc.Request) (any, bool, error) {
+func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Reader, out io.Writer) (any, bool, error) {
 	switch request.Method {
 	case methodProtectInit:
 		var params rpcProtectInitParams
@@ -1097,6 +1129,16 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request) (any, bool, e
 			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before using CI or push-to-deploy URLs.")
 		}
 		return rpcNodeInfoResult{Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary()}, true, nil
+	case methodImagePush:
+		var params rpcImagePushParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, true, err
+		}
+		if !request.Stream {
+			return nil, true, contract.NewFault(contract.InputRequired, "image.push requires a streamed image payload", "Set \"stream\": true and send a docker save tar on stdin after the request line.")
+		}
+		result, err := pushNodeImage(ctx, params, payload, out)
+		return result, true, err
 	case methodHandoffExport:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
 			return nil, true, err
