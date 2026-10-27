@@ -9,12 +9,10 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/access"
@@ -138,76 +136,6 @@ func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts
 			NodePublicKey:  nodePublicKey,
 			Endpoint:       net.JoinHostPort(publicHost, strconv.Itoa(access.ListenPort)),
 		},
-	}
-}
-
-// wireGuardDialers holds one tunnel per operator key for the whole process.
-// The node has one peer per key: a second tunnel with the same key steals the
-// peer, and the first one's keepalives steal it back, which drops the SSH
-// connections running over either.
-var (
-	wireGuardMu      sync.Mutex
-	wireGuardDialers = map[string]*transport.WireGuardDialer{}
-)
-
-// wireGuardDial is the dial function for a context's WireGuard route. Every
-// route with the same key and node shares one tunnel.
-func wireGuardDial(wg *host.ContextWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
-	key, err := transport.ReadWireGuardKey(wg.PrivateKeyFile)
-	if err != nil {
-		return nil, err
-	}
-	id := key.PublicKey().String() + "|" + wg.NodePublicKey + "|" + wg.Endpoint + "|" + wg.Address + "|" + wg.NodeAddress
-	wireGuardMu.Lock()
-	defer wireGuardMu.Unlock()
-	if dialer, ok := wireGuardDialers[id]; ok {
-		return dialer.DialContext, nil
-	}
-	peer, err := transport.ParseWireGuardPublicKey(wg.NodePublicKey)
-	if err != nil {
-		return nil, err
-	}
-	self, err := netip.ParseAddr(wg.Address)
-	if err != nil {
-		return nil, err
-	}
-	nodeAddr, err := netip.ParseAddr(wg.NodeAddress)
-	if err != nil {
-		return nil, err
-	}
-	dialer, err := transport.NewWireGuardDialer(transport.WireGuardConfig{PrivateKey: key, Address: self, NodeAddress: nodeAddr, PeerPublicKey: peer, Endpoint: wg.Endpoint})
-	if err != nil {
-		return nil, err
-	}
-	// A different tunnel for the same key (a rebuilt node) replaces the old one.
-	for other, d := range wireGuardDialers {
-		if strings.HasPrefix(other, key.PublicKey().String()+"|") {
-			_ = d.Close()
-			delete(wireGuardDialers, other)
-		}
-	}
-	wireGuardDialers[id] = dialer
-	return dialer.DialContext, nil
-}
-
-// closeWireGuardRoute closes the process's tunnel for a removed context so
-// nothing keeps the node peer alive after its key files are gone.
-func closeWireGuardRoute(route *host.ContextSSH) {
-	if route == nil || route.WireGuard == nil {
-		return
-	}
-	key, err := transport.ReadWireGuardKey(route.WireGuard.PrivateKeyFile)
-	if err != nil {
-		return
-	}
-	prefix := key.PublicKey().String() + "|"
-	wireGuardMu.Lock()
-	defer wireGuardMu.Unlock()
-	for id, dialer := range wireGuardDialers {
-		if strings.HasPrefix(id, prefix) {
-			_ = dialer.Close()
-			delete(wireGuardDialers, id)
-		}
 	}
 }
 

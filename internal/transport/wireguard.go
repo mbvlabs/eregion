@@ -450,6 +450,24 @@ func (d *WireGuardDialer) Up() bool {
 	return d.current != nil
 }
 
+// LastHandshake reports the tunnel's most recent completed handshake, or the
+// zero time when none completed or the tunnel is down. It reads the same UAPI
+// state the liveness watch uses; the private key never leaves that value.
+func (d *WireGuardDialer) LastHandshake() time.Time {
+	d.mu.Lock()
+	current := d.current
+	d.mu.Unlock()
+	if current == nil {
+		return time.Time{}
+	}
+	sec := current.uapiValue("last_handshake_time_sec")
+	nsec := current.uapiValue("last_handshake_time_nsec")
+	if sec == 0 && nsec == 0 {
+		return time.Time{}
+	}
+	return time.Unix(int64(sec), int64(nsec)) //nolint:gosec // G115: UAPI counters are small.
+}
+
 // up returns the established tunnel, bringing it up when it is down.
 func (d *WireGuardDialer) up(ctx context.Context) (*tunnel, error) {
 	for {

@@ -197,7 +197,18 @@ func (t *SSHTransport) Call(ctx context.Context, request node.Request, onEvent f
 
 // connect opens the connection and verifies the pinned host key.
 func (t *SSHTransport) connect(ctx context.Context) (*ssh.Client, error) {
-	raw, err := t.dialer.DialContext(ctx, "tcp", t.config.Address)
+	// A shared-tunnel dial may include a WireGuard re-handshake, which takes
+	// longer than an SSH connection; a dialer that knows its budget sets it.
+	// The SSH handshake keeps the normal timeout.
+	dialCtx := ctx
+	if b, ok := t.dialer.(interface{ DialBudget() time.Duration }); ok {
+		if budget := b.DialBudget(); budget > 0 {
+			var cancel context.CancelFunc
+			dialCtx, cancel = context.WithTimeout(ctx, budget)
+			defer cancel()
+		}
+	}
+	raw, err := t.dialer.DialContext(dialCtx, "tcp", t.config.Address)
 	if err != nil {
 		return nil, fmt.Errorf("dial the node %s: %w", t.config.Address, err)
 	}

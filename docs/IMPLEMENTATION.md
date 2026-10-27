@@ -30,6 +30,17 @@ SSH-authenticated operator's authority, so they may open any operation on the
 node; the public HTTP API stays actor- and grant-scoped. The worker-to-node step
 transport is a separate protocol boundary.
 
+Operator WireGuard is shared per tunnel configuration: the first command that
+needs the node spawns the hidden `eregion tunnel serve` daemon, which owns the
+only userspace WireGuard device for that operator key and proxies TCP dials
+over a unix socket in the private tunnel directory under the operator's
+eregion config (`0700`, socket and lock `0600`). Every operator-side dial,
+including server init, login's host-key probe, node RPC and the node_exporter
+check, goes through that daemon; it exits after ten idle minutes and
+`eregion tunnel status`/`tunnel stop [--force]` inspect or restart it.
+`EREGION_TUNNEL=inprocess` keeps the old in-process tunnel as a fallback, and
+non-unix builds use the in-process tunnel because the daemon is unix-only.
+
 API and worker are supervised separately by `eregion-api.service` and
 `eregion-worker.service`; `eregion node serve` can also run workers in-process.
 Domain intent and queue insertion are atomic. Long remote effects do not hold a
