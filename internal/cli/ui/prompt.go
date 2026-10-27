@@ -87,6 +87,32 @@ func Input(title, description, def string) (string, error) {
 	return strings.TrimSpace(value), nil
 }
 
+// Lines asks for several lines at once, such as a pasted .env block. def is
+// pre-filled.
+func Lines(title, description, def string) (string, error) {
+	value := def
+	text := huh.NewText().Title(title).Value(&value).Lines(8)
+	if description != "" {
+		text = text.Description(description)
+	}
+	answer := func() string {
+		n := 0
+		for _, line := range strings.Split(value, "\n") {
+			if strings.TrimSpace(line) != "" {
+				n++
+			}
+		}
+		if n == 1 {
+			return "1 line"
+		}
+		return fmt.Sprintf("%d lines", n)
+	}
+	if err := run(title, answer, text); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
 // Secret asks for a value without echoing it.
 func Secret(title string) (string, error) {
 	var value string

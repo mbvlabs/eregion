@@ -247,3 +247,11 @@ func TestParseAssignmentsAndProcessSpecs(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvLinesReadsAPastedBlock(t *testing.T) {
+	got := envLines("# app\nexport PORT=8080\n\nSITE_NAME=\"Andurel\"\nEMPTY=\n")
+	want := []string{"PORT=8080", "SITE_NAME=Andurel", "EMPTY="}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("envLines = %q, want %q", got, want)
+	}
+}

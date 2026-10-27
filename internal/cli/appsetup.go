@@ -613,32 +613,52 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 }
 
 func readConfigPairs(ans *setupAnswers) error {
+	text := ""
 	for {
-		line, err := ui.Input("Config KEY=VALUE", "Plain value; empty to finish", "")
+		value, err := ui.Lines("Config", "One KEY=VALUE per line; paste a .env block. Blank lines and # comments are skipped. Ctrl+J for a new line, Enter to finish", text)
 		if err != nil {
 			return err
 		}
-		if line == "" {
-			return nil
-		}
-		values, err := parseAssignments([]string{line}, "config")
+		values, err := parseAssignments(envLines(value), "config")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, ui.Warn(err.Error()))
+			text = value
 			continue
 		}
-		for key, value := range values {
-			if _, exists := ans.Config[key]; exists {
-				fmt.Fprintln(os.Stderr, ui.Warn("Set each configuration key once."))
-				continue
-			}
-			ans.Config[key] = value
+		for key, item := range values {
+			ans.Config[key] = item
 		}
+		return nil
 	}
+}
+
+// envLines turns a pasted .env block into KEY=VALUE entries: blank lines and
+// comments are dropped, an export prefix and matching quotes are removed.
+func envLines(text string) []string {
+	var out []string
+	for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		if key, value, ok := strings.Cut(line, "="); ok && len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
+				line = key + "=" + value[1:len(value)-1]
+			}
+		}
+		out = append(out, line)
+	}
+	return out
 }
 
 func (a *app) readSetupSecrets(ans *setupAnswers) error {
 	for {
-		name, err := ui.Input("Secret name", "Environment-variable form, e.g. DATABASE_URL; empty to finish", "")
+		title := "Secret name"
+		if n := len(ans.SecretValues); n > 0 {
+			title = fmt.Sprintf("Another secret name (%d added)", n)
+		}
+		name, err := ui.Input(title, "Environment-variable form, e.g. DATABASE_URL; empty to finish", "")
 		if err != nil {
 			return err
 		}
