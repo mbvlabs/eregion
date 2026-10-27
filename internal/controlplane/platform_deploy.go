@@ -593,7 +593,12 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if err := w.service.recordServing(ctx, env, release, dep, instances); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if err := w.service.syncRoutes(ctx); err != nil {
+	resync := w.service.syncRoutes
+	if w.service.routeSwitch != nil {
+		// Tests replace Caddy; the switch seam renders the same upstreams.
+		resync = func(ctx context.Context) error { return w.service.routeSwitch(ctx, env, candidateUpstreams) }
+	}
+	if err := resync(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	// The previous release is no longer routed. Removing its containers is
