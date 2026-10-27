@@ -25,7 +25,7 @@ import (
 func (a *app) loginSpecs() []spec {
 	meta := readMeta("Log in to a main node with its transfer bundle",
 		[]string{"Paste the transfer bundle from server init's secrets handoff (or the whole copied handoff), then its passphrase."},
-		[]string{"eregion login", "eregion login --file main-secrets.txt --passphrase-file pass.txt --json"})
+		[]string{"eregion login", "eregion login --file main-secrets.md --passphrase-file pass.txt --json"})
 	meta.Mutating, meta.Prompts, meta.Remote = true, true, true
 	meta.DryRunReason = "Login only writes the local context store and identity files."
 	meta.InputFlags = []string{"file", "passphrase-file"}
@@ -55,18 +55,28 @@ func parseHandoffRecord(text string) handoffRecord {
 			record[section] = map[string]string{}
 			continue
 		}
-		label, value, ok := strings.Cut(line, ":")
-		if section == "" || !ok || strings.HasPrefix(line, " ") {
+		item, ok := strings.CutPrefix(line, "- ")
+		if section == "" || !ok {
+			continue
+		}
+		label, value, ok := strings.Cut(item, ":")
+		if !ok {
 			continue
 		}
 		value = strings.TrimSpace(value)
 		if value == "" {
-			var block []string
-			for i+1 < len(lines) && strings.TrimSpace(lines[i+1]) != "" && !strings.HasPrefix(lines[i+1], "## ") {
-				i++
-				block = append(block, strings.TrimRight(lines[i], " \t"))
+			// A multi-line value is the fenced block that follows.
+			j := i + 1
+			for j < len(lines) && strings.TrimSpace(lines[j]) == "" {
+				j++
 			}
-			value = strings.Join(block, "\n")
+			if j < len(lines) && strings.TrimSpace(lines[j]) == "```" {
+				var block []string
+				for j++; j < len(lines) && strings.TrimSpace(lines[j]) != "```"; j++ {
+					block = append(block, strings.TrimRight(lines[j], " \t"))
+				}
+				value, i = strings.Join(block, "\n"), j
+			}
 		}
 		record[section][strings.TrimSpace(label)] = value
 	}

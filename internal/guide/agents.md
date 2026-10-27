@@ -124,7 +124,7 @@ database URL is a protected file, never an argument.
 ```sh
 eregion server init --host root@203.0.113.10 --hostname app.example.com \
   --database-url-file /protected/database-url --context-name prod \
-  --accept-new-host-key --secrets-out /protected/prod-secrets.txt \
+  --accept-new-host-key --secrets-out /protected/prod-secrets.md \
   --confirm prod --json
 ```
 

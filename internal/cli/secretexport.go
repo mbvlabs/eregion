@@ -16,14 +16,14 @@ import (
 // secretsSpecs registers the operator handoff re-export. It is separate from
 // secretSpecs because it reproduces the server-init record, not a vault value.
 func (a *app) secretsSpecs() []spec {
-	exportMeta := operationMeta("Re-export the server handoff behind the human factor", "eregion secrets export --secrets-out ./prod-secrets.txt")
+	exportMeta := operationMeta("Re-export the server handoff behind the human factor", "eregion secrets export --secrets-out ./prod-secrets.md")
 	exportMeta.WhenToUse = []string{
 		"Reproduce the server init handoff record: the operator keys, hostname, control-plane database URL and vault keyring, sealed with a new age passphrase. Requires a code from the authenticator app at a terminal.",
 	}
 	exportMeta.Mutating = false
 	exportMeta.Prompts = true
 	exportMeta.InputFlags = []string{"secrets-out"}
-	exportMeta.Examples = []string{"eregion secrets export", "eregion secrets export --secrets-out ./prod-secrets.txt"}
+	exportMeta.Examples = []string{"eregion secrets export", "eregion secrets export --secrets-out ./prod-secrets.md"}
 	return []spec{{
 		use:  "secrets",
 		meta: readMeta("Export the server handoff behind the human factor", []string{"Reproduce the protected server record after init."}, []string{"eregion secrets export"}),

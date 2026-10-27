@@ -63,31 +63,34 @@ func newSecretsHandoff(node string, groups []handoffGroup) (*secretsHandoff, err
 	return h, nil
 }
 
-// record is every value, then the transfer bundle and its passphrase.
+// record is every value, then the transfer bundle and its passphrase, as
+// Markdown.
 func (h *secretsHandoff) record() string {
-	return h.body() + "\n## Transfer bundle\n" +
-		"On another machine run eregion login and paste this block.\n" +
-		"Passphrase: " + h.passphrase + "\n" + string(h.bundle)
+	return h.body() + "\n## Transfer bundle\n\n" +
+		"On another machine run eregion login and paste this block.\n\n" +
+		"- Passphrase: " + h.passphrase + "\n\n```\n" + strings.TrimRight(string(h.bundle), "\n") + "\n```\n"
 }
 
+// body is the Markdown record parseHandoffRecord reads: a section per group,
+// a list item per value, and fenced blocks for multi-line values.
 func (h *secretsHandoff) body() string {
 	var b strings.Builder
-	b.WriteString("eregion secrets handoff for server " + h.node + "\n")
+	b.WriteString("# eregion secrets handoff for server " + h.node + "\n")
 	for _, g := range h.groups {
-		b.WriteString("\n## " + g.title + "\n")
+		b.WriteString("\n## " + g.title + "\n\n")
 		for _, f := range g.fields {
-			v := strings.TrimRight(f.value, "\n")
+			v := strings.Trim(f.value, "\r\n")
 			if v == "" {
 				continue
 			}
 			if strings.Contains(v, "\n") {
-				b.WriteString(f.label + ":\n" + strings.TrimLeft(v, "\r\n") + "\n")
+				b.WriteString("- " + f.label + ":\n\n```\n" + v + "\n```\n\n")
 				continue
 			}
-			b.WriteString(f.label + ": " + v + "\n")
+			b.WriteString("- " + f.label + ": " + v + "\n")
 		}
 	}
-	return b.String()
+	return strings.ReplaceAll(b.String(), "```\n\n\n", "```\n\n")
 }
 
 // writeRecord writes the whole record (secrets, bundle and passphrase) to an
@@ -103,7 +106,7 @@ func (h *secretsHandoff) writeRecord(path string, overwrite bool) error {
 	}
 	if !overwrite {
 		if _, err := os.Lstat(path); err == nil {
-			fault := contract.NewFault(contract.PreconditionFailed, path+" already exists", "Move it away or choose another --secrets-out path.")
+			fault := contract.NewFault(contract.PreconditionFailed, path+" already exists", "Move it away or choose another path.")
 			fault.Details = map[string]any{"reason": "secrets_out_exists", "path": path}
 			return fault
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -117,8 +120,8 @@ func (h *secretsHandoff) writeRecord(path string, overwrite bool) error {
 	return nil
 }
 
-// show is the handoff gate: copy or show the record, then type 'stored'. It
-// never writes a file by itself.
+// show is the handoff gate: copy, save or show the record, then type
+// 'stored'. Nothing is written unless the operator saves it.
 func (h *secretsHandoff) show(w io.Writer) error {
 	resume := ui.Suspend()
 	defer resume()
@@ -133,15 +136,26 @@ func (h *secretsHandoff) show(w io.Writer) error {
 	_, _ = fmt.Fprintln(w, ui.Note("To log in from another machine: eregion login, paste the transfer bundle, then this passphrase."))
 	_, _ = fmt.Fprintln(w)
 	for {
-		choice, err := ui.Choose("Secrets handoff", "", [][2]string{
-			{"Copy everything to the clipboard", "copy"},
-			{"Show everything on screen", "print"},
-			{"Done", "done"},
-		})
+		options := [][2]string{{"Copy everything to the clipboard", "copy"}}
+		if h.path == "" {
+			options = append(options, [2]string{"Save everything to a file", "save"})
+		}
+		options = append(options, [2]string{"Show everything on screen", "print"}, [2]string{"Done", "done"})
+		choice, err := ui.Choose("Secrets handoff", "", options)
 		if err != nil {
 			return err
 		}
 		switch choice {
+		case "save":
+			path, err := ui.Input("Save everything to", "A new owner-only Markdown file", "./"+h.node+"-secrets.md")
+			if err != nil {
+				return err
+			}
+			if err := h.writeRecord(path, false); err != nil {
+				_, _ = fmt.Fprintln(w, ui.Note(err.Error()))
+				continue
+			}
+			_, _ = fmt.Fprintln(w, ui.Note("Saved everything to "+h.path+" (readable only by you). Keep the passphrase apart from the file."))
 		case "done":
 			if err := ui.TypeWord("Type 'stored' once the record is in your password manager", "", "stored"); err != nil {
 				if errors.Is(err, ui.ErrAborted) {

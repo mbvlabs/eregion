@@ -43,7 +43,7 @@ const (
 func (a *app) serverSpecs() []spec {
 	parent := readMeta("Set up and manage eregion servers",
 		[]string{"Set up a fresh Debian 13 or Ubuntu 26.04 server as an eregion main node. The operator CLI runs on Linux or macOS; the node receives a matching linux binary."},
-		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --hostname app.example.com --database-url-file /root/eregion-db.url --context-name prod --accept-new-host-key --secrets-out ./prod-secrets.txt --confirm prod --json"})
+		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --hostname app.example.com --database-url-file /root/eregion-db.url --context-name prod --accept-new-host-key --secrets-out ./prod-secrets.md --confirm prod --json"})
 	parent.Platforms = []string{"linux", "darwin"}
 	meta := parent
 	meta.Summary = "Set up a fresh server as the main node (control plane)"

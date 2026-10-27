@@ -53,7 +53,7 @@ func TestHandoffGroupsCarryEverythingLoginNeeds(t *testing.T) {
 
 func TestSecretsOutIsOwnerOnlyAndNeverOverwritten(t *testing.T) {
 	h := &secretsHandoff{node: "prod", groups: []handoffGroup{{title: "Operator", fields: []handoffField{{"Sudo password", "sudo-pass"}}}}, passphrase: "word-word"}
-	path := filepath.Join(t.TempDir(), "prod-secrets.txt")
+	path := filepath.Join(t.TempDir(), "prod-secrets.md")
 	if err := h.writeRecord(path, false); err != nil {
 		t.Fatal(err)
 	}
