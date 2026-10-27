@@ -305,6 +305,9 @@ func TestWireGuardLostTunnelAfterDispatchRecoversThroughStatus(t *testing.T) {
 	}
 	// The node task outlived the tunnel.
 	awaitCondition(t, 10*time.Second, "the detached effect", func() bool { return countEffects(t, wg.server.config.StateDir, exec) == 1 })
+	// The effect is written before the task records completion and releases
+	// its lock; status is only final once the task has exited.
+	wg.server.waitTaskExit(t, exec)
 
 	relay.SetBlackhole(false)
 	// The retry path asks for status first, then retries the run: neither
