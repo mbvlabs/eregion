@@ -3,6 +3,7 @@ package cli
 import (
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/spf13/cobra"
 )
@@ -52,6 +53,7 @@ func (a *app) operationsList(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	var plain strings.Builder
+	plain.WriteString(ui.Header("Operations", 72) + "\n")
 	if len(page.Items) == 0 {
 		plain.WriteString("No operations matched.\n")
 	} else {

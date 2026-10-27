@@ -596,7 +596,7 @@ func (a *app) envList(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	plain := "No environments.\n"
+	plain := ui.Header("Environments", 72) + "\nNo environments.\n"
 	if len(environments) > 0 {
 		rows := make([][]string, 0, len(environments))
 		for _, environment := range environments {
@@ -609,7 +609,7 @@ func (a *app) envList(cmd *cobra.Command, _ []string) (result, error) {
 				boolLabel(environment.Deployability.Deployable), strings.Join(environment.Deployability.Missing, ","), serving,
 			})
 		}
-		plain = writeTable([]string{"APP", "ENVIRONMENT", "NODE", "REVISION", "DEPLOYABLE", "MISSING", "SERVING RELEASE"}, rows)
+		plain = ui.Header("Environments", 72) + "\n" + writeTable([]string{"APP", "ENVIRONMENT", "NODE", "REVISION", "DEPLOYABLE", "MISSING", "SERVING RELEASE"}, rows)
 	}
 	return result{data: raw, plain: plain}, nil
 }

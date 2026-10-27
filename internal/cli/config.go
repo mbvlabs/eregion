@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/spf13/cobra"
@@ -165,14 +166,14 @@ func (a *app) configList(cmd *cobra.Command, app, environment string) (result, e
 		config = env.Env
 	}
 	keys := sortedKeys(config)
-	plain := fmt.Sprintf("No plain configuration for %s/%s.\n", app, environment)
+	title := ui.Header("Config for "+app+"/"+environment, 72)
+	plain := title + "\nNo plain configuration for " + app + "/" + environment + ".\n"
 	if len(keys) > 0 {
-		var out strings.Builder
-		fmt.Fprintf(&out, "Config for %s/%s\n", app, environment)
+		rows := make([][]string, 0, len(keys))
 		for _, key := range keys {
-			fmt.Fprintf(&out, "  %s=%s\n", key, config[key])
+			rows = append(rows, []string{key, config[key]})
 		}
-		plain = out.String()
+		plain = title + "\n" + writeTable([]string{"KEY", "VALUE"}, rows)
 	}
 	return result{data: map[string]any{
 		"app": app, "environment": environment, "config": config, "keys": keys,

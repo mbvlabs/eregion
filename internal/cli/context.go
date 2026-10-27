@@ -55,6 +55,7 @@ func (a *app) nodeClientFor(cmd *cobra.Command, name string) (*nodeClient, error
 	client := &nodeClient{
 		remote: remote, route: current.SSH,
 		operator: current.SSH.User, autoUpgrade: autoUpgrade, stderr: cmd.ErrOrStderr(),
+		wait: humanPlainAt(cmd),
 	}
 	if a.nodeClients == nil {
 		a.nodeClients = map[string]*nodeClient{}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/tokens"
@@ -122,12 +123,18 @@ func (a *app) tokenList(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	var b strings.Builder
-	b.WriteString("Deploy tokens\n")
+	b.WriteString(ui.Header("Deploy tokens", 72) + "\n")
 	if len(list) == 0 {
 		b.WriteString("  none\n")
-	}
-	for _, item := range list {
-		b.WriteString("  " + tokenMetadataPlain(item) + "\n")
+	} else {
+		rows := make([][]string, 0, len(list))
+		for _, item := range list {
+			rows = append(rows, []string{
+				item.Name, item.App, item.Environment, strings.Join(item.Scopes, ","),
+				tokens.FormatExpiry(item.ExpiresAt), item.Fingerprint,
+			})
+		}
+		b.WriteString(writeTable([]string{"NAME", "APP", "ENVIRONMENT", "SCOPES", "EXPIRES", "FINGERPRINT"}, rows))
 	}
 	return result{data: map[string]any{"tokens": list}, plain: b.String()}, nil
 }

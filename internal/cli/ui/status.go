@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -24,6 +25,8 @@ type Status struct {
 
 // Wait shows label in the status line until the returned func is called.
 // A wait already showing is kept, and the returned func then does nothing.
+// A running task area or an open prompt already owns the terminal, so Wait
+// then leaves the screen alone.
 func (l *Live) Wait(label string) (*Status, func()) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -31,6 +34,9 @@ func (l *Live) Wait(label string) (*Status, func()) {
 		return l.status, func() {}
 	}
 	now := time.Now()
+	if l.paused > 0 || len(l.tasks) > 0 {
+		return &Status{l: l, label: label, started: now, phaseStarted: now}, func() {}
+	}
 	st := &Status{l: l, label: label, started: now, phaseStarted: now}
 	l.status = st
 	l.lastOut = now
@@ -48,6 +54,17 @@ func (l *Live) Wait(label string) (*Status, func()) {
 		}
 		l.draw()
 	}
+}
+
+// Wait shows label on the terminal while a command waits for the node. It is
+// a no-op when f is not a terminal; the returned func may be called more than
+// once.
+func Wait(f *os.File, label string) func() {
+	if !Enabled(f) {
+		return func() {}
+	}
+	_, stop := Start(f).Wait(label)
+	return stop
 }
 
 // Phase names the current phase; an empty phase falls back to the label.

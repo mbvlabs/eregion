@@ -192,9 +192,9 @@ func (a *app) appList(cmd *cobra.Command, _ []string) (result, error) {
 	for _, item := range items {
 		rows = append(rows, []string{item.Name, string(item.ID), item.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")})
 	}
-	plain := "No applications. Create one with eregion app create.\n"
+	plain := ui.Header("Applications", 72) + "\nNo applications. Create one with eregion app create.\n"
 	if len(rows) > 0 {
-		plain = writeTable([]string{"NAME", "ID", "UPDATED"}, rows)
+		plain = ui.Header("Applications", 72) + "\n" + writeTable([]string{"NAME", "ID", "UPDATED"}, rows)
 	}
 	return result{data: raw, plain: plain}, nil
 }

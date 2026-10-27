@@ -2,12 +2,16 @@
 package output
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
+	"github.com/charmbracelet/colorprofile"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
@@ -103,7 +107,47 @@ func (w Writer) Write(envelope contract.Envelope, plain string) error {
 		}
 		return writeAll(w.Err, []byte(SafeText(w.Secrets.Redact(text))))
 	}
-	return writeAll(w.Out, []byte(SafeText(w.Secrets.Redact(strings.TrimRight(plain, "\n")+"\n"))))
+	text := w.Secrets.Redact(strings.TrimRight(plain, "\n") + "\n")
+	return writeAll(w.Out, []byte(safePlain(w.Out, text)))
+}
+
+// safePlain keeps human styling only where the destination supports it: the
+// colour profile is resolved against the real writer, so a pipe, redirected
+// file, dumb terminal or NO_COLOR gets plain text. SafeStyled then guards the
+// remaining control characters while preserving the palette's SGR sequences.
+func safePlain(out io.Writer, text string) string {
+	var styled bytes.Buffer
+	writer := colorprofile.Writer{Forward: &styled, Profile: colorprofile.Detect(out, os.Environ())}
+	_, _ = writer.Write([]byte(text))
+	return SafeStyled(styled.String())
+}
+
+// SafeStyled is SafeText for plain text that already carries the ui palette's
+// SGR colour sequences: a numeric SGR sequence is kept, every other control
+// character (including OSC, cursor movement and C1 controls) is made visible.
+func SafeStyled(text string) string {
+	var out strings.Builder
+	for i := 0; i < len(text); {
+		if text[i] == '\x1b' && i+1 < len(text) && text[i+1] == '[' {
+			end := i + 2
+			for end < len(text) && (text[end] >= '0' && text[end] <= '9' || text[end] == ';' || text[end] == ':') {
+				end++
+			}
+			if end < len(text) && text[end] == 'm' {
+				out.WriteString(text[i : end+1])
+				i = end + 1
+				continue
+			}
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r != '\n' && r != '\t' && (unicode.IsControl(r) || unicode.In(r, unicode.Cf)) {
+			fmt.Fprintf(&out, "\\u%04x", r)
+		} else {
+			out.WriteRune(r)
+		}
+		i += size
+	}
+	return out.String()
 }
 
 // outputTail is a failed script's last output lines, as a host step fault

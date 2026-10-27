@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/spf13/cobra"
@@ -39,7 +40,7 @@ func (a *app) processSpecs() []spec {
 					if err != nil {
 						return result{}, err
 					}
-					plain := fmt.Sprintf("Processes for %s/%s\n", args[0], args[1])
+					plain := ui.Header("Processes for "+args[0]+"/"+args[1], 72) + "\n"
 					plain += writeProcessTable(env.Processes)
 					return result{data: map[string]any{
 						"app": args[0], "environment": args[1], "processes": env.Processes,

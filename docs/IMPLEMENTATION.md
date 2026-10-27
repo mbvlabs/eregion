@@ -1,6 +1,6 @@
 # Implementation reference
 
-Checked against source on 2026-10-26. This describes **current code**, not the
+Checked against source on 2026-10-27. This describes **current code**, not the
 target command tree or a real-host certification. Product decisions and all
 work status belong in [MASTER](MASTER.md); run evidence belongs in
 [MANUAL-TESTING](MANUAL-TESTING.md).
@@ -118,6 +118,27 @@ where the work list says they return. `bootstrap …`, `serve`, `worker` and
 `node` group (`node rpc`, `node unlock-ssh`, `node serve`, `node worker`,
 `node migrate`, `node bootstrap …`) and `commands --json` lists only the section
 5 tree plus `help`.
+
+## Human presentation and waiting
+
+Human plain output and JSON stay separate schemas. When stderr is the process's
+terminal and the invocation is ordinary plain output, `nodeClient.call` draws a
+single `ui.Live` status line with a spinner and present-tense label
+(`Reading app andurel…`, `Submitting…`) while a remote RPC waits; the line is
+cleared when the answer arrives. The wait is not drawn for JSON/NDJSON, a
+redirected or captured stderr, a prompt, or a call that streams events
+(`apply`, `logs`, follows, and the live tasks in `server init`). Nested waits
+keep the outer label, and the existing `NO_COLOR`/colour-profile handling
+applies through `ui.Writer` and the plain-output writer.
+
+Read command plain output (`env/app status`, app/env/domain/config/secret/
+process/release/build/token/operations lists, `server status`, `doctor`) uses
+the shared `internal/cli/ui` palette: a section header, tables whose headers are
+dim and whose state words carry success/caution/failure colour, and aligned
+key/value fields. The styled text is built once and the output writer resolves
+the destination's colour profile before `SafeText`, so a pipe, file, dumb
+terminal or `NO_COLOR` gets the same information without ANSI. JSON output is
+unchanged.
 
 ## Release and local upgrade
 

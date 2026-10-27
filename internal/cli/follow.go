@@ -29,6 +29,19 @@ type followIO struct {
 
 type followIOKey struct{}
 
+// streamContextKey marks remote calls made by an event-following loop. The
+// viewer polls repeatedly, so a loading line would mix into its stream.
+type streamContextKey struct{}
+
+func withoutWait(ctx context.Context) context.Context {
+	return context.WithValue(ctx, streamContextKey{}, true)
+}
+
+func waitSuppressed(ctx context.Context) bool {
+	suppressed, _ := ctx.Value(streamContextKey{}).(bool)
+	return suppressed
+}
+
 func followConfig(cmd *cobra.Command) *followIO {
 	if cmd == nil || cmd.Context() == nil {
 		return nil
@@ -205,14 +218,14 @@ func (a *app) followCleaner() viewer.Cleaner {
 }
 
 func (a *app) followJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions) (result, error) {
-	summary, err := viewer.Follow(cmd.Context(), client, id, opts, nil)
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, nil)
 	err = followError(summary, err)
 	return result{data: newFollowResult(summary)}, err
 }
 
 func (a *app) followPlain(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
 	presenter := viewer.NewPlain(config.out, config.err, clean)
-	summary, err := viewer.Follow(cmd.Context(), client, id, opts, presenter.Observe)
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, presenter.Observe)
 	err = followError(summary, err)
 	if finishErr := presenter.Finish(summary, err, resumeCommand+" "+string(id), time.Now()); finishErr != nil && err == nil {
 		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
@@ -239,7 +252,7 @@ func (a *app) followNDJSON(cmd *cobra.Command, client Backend, id contract.Opera
 		}
 		return nil
 	}
-	summary, err := viewer.Follow(cmd.Context(), client, id, opts, emit)
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, emit)
 	err = followError(summary, err)
 	envelope := contract.Success(cmd.CommandPath(), newFollowResult(summary), nil)
 	if err != nil {
@@ -262,7 +275,7 @@ func (a *app) followInteractive(cmd *cobra.Command, client Backend, id contract.
 	}
 	initial := viewer.New(id, viewer.Options{Clean: clean})
 	producer := func(ctx context.Context, emit func(viewer.Observation) error) (viewer.Summary, error) {
-		return viewer.Follow(ctx, client, id, opts, emit)
+		return viewer.Follow(withoutWait(ctx), client, id, opts, emit)
 	}
 	summary, err := tui.Run(cmd.Context(), initial, tui.Options{
 		Host:          clean(apiEndpoint(cmd)),

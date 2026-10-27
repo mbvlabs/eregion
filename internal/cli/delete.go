@@ -149,7 +149,7 @@ func (a *app) followAccepted(cmd *cobra.Command, client Backend, op contract.Ope
 	}
 	clean := a.followCleaner()
 	presenter := viewer.NewPlain(config.out, config.err, clean)
-	summary, err := viewer.Follow(cmd.Context(), client, op.ID, viewer.FollowOptions{
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, op.ID, viewer.FollowOptions{
 		PollInterval: viewer.DefaultPollInterval, Clean: clean,
 	}, presenter.Observe)
 	err = followError(summary, err)

@@ -52,3 +52,26 @@ func TestErrorBlockNarrowDropsFrame(t *testing.T) {
 		t.Fatalf("narrow render kept the frame:\n%s", out)
 	}
 }
+
+func TestTableAlignsStateColumns(t *testing.T) {
+	out := ansi.Strip(Table([]string{"NAME", "STATE"}, [][]string{
+		{"web", "active"},
+		{"worker", "failed"},
+	}))
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 3 || !strings.HasPrefix(lines[0], "NAME") {
+		t.Fatalf("table = %q", out)
+	}
+	if strings.Index(lines[1], "active") != strings.Index(lines[2], "failed") {
+		t.Fatalf("state column is not aligned:\n%s", out)
+	}
+}
+
+func TestStateOnlyColoursMeaningWords(t *testing.T) {
+	if got := State("failed"); !strings.Contains(got, "\x1b[") {
+		t.Fatalf("failed state is not coloured: %q", got)
+	}
+	if got := State("andurel"); got != "andurel" {
+		t.Fatalf("ordinary value changed: %q", got)
+	}
+}

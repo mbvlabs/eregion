@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -53,20 +54,20 @@ func (a *app) appStatusView(cmd *cobra.Command, app string) (result, error) {
 		observation.Environments = append(observation.Environments, item)
 	}
 	var plain strings.Builder
-	fmt.Fprintf(&plain, "App %s (%s)\n", record.Name, record.ID)
+	plain.WriteString(ui.Header(fmt.Sprintf("App %s (%s)", record.Name, record.ID), 72) + "\n")
 	if len(observation.Environments) == 0 {
 		plain.WriteString("No environments. Add one with eregion env create.\n")
 		return result{data: observation, plain: plain.String()}, nil
 	}
 	if workloadErr != "" {
-		fmt.Fprintf(&plain, "warning: container state is unknown: %s\n", workloadErr)
+		fmt.Fprintf(&plain, "%s\n", ui.Warn("container state is unknown: "+workloadErr))
 	}
 	for _, item := range observation.Environments {
 		plain.WriteString("\n")
 		plain.WriteString(writeEnvironmentObservation(item))
 	}
 	if len(observation.Operations) > 0 {
-		plain.WriteString("\nLast operations for the app\n")
+		plain.WriteString("\n" + ui.Section("Last operations for the app") + "\n")
 		plain.WriteString(writeOperationTable(observation.Operations))
 	}
 	return result{data: observation, plain: plain.String()}, nil
@@ -176,13 +177,16 @@ func findRelease(releases []platform.Release, id platform.ReleaseID) *platform.R
 func writeEnvironmentObservation(observation platform.EnvironmentObservation) string {
 	env := observation.Environment
 	var out strings.Builder
-	fmt.Fprintf(&out, "Environment %s/%s (%s)\n", env.App, env.Name, env.ID)
-	fmt.Fprintf(&out, "  node: %s\n", env.Node)
+	fmt.Fprintf(&out, "%s\n", ui.Header(fmt.Sprintf("Environment %s/%s (%s)", env.App, env.Name, env.ID), 72))
+	field := func(name, value string) {
+		fmt.Fprintf(&out, "  %s %s\n", ui.Dim(fmt.Sprintf("%-17s", name+":")), value)
+	}
+	field("node", env.Node)
 	if env.Revision != nil {
-		fmt.Fprintf(&out, "  desired revision: %d (%s)\n", env.Revision.Number, env.Revision.ID)
-		fmt.Fprintf(&out, "  source: %s\n", describeSource(env.Revision.Source))
+		field("desired revision", fmt.Sprintf("%d (%s)", env.Revision.Number, env.Revision.ID))
+		field("source", describeSource(env.Revision.Source))
 	} else {
-		fmt.Fprintln(&out, "  desired revision: none")
+		field("desired revision", "none")
 	}
 	if env.ServingRelease != "" {
 		details := string(env.ServingRelease)
@@ -193,18 +197,18 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 				details += " commit " + release.CommitSHA
 			}
 		}
-		fmt.Fprintf(&out, "  serving release: %s\n", details)
+		field("serving release", details)
 	} else {
-		fmt.Fprintln(&out, "  serving release: none")
+		field("serving release", "none")
 	}
-	fmt.Fprintf(&out, "  deployable: %s\n", environmentDeployability(env))
+	field("deployable", ui.State(environmentDeployability(env)))
 	health := env.HealthState
 	if health == "" {
 		health = platform.HealthUnknown
 	}
-	fmt.Fprintf(&out, "  health: %s\n", health)
+	field("health", ui.State(string(health)))
 	if observation.WorkloadError != "" {
-		fmt.Fprintf(&out, "  workload observation: unknown (%s)\n", observation.WorkloadError)
+		field("workload observation", ui.State("unknown")+" ("+observation.WorkloadError+")")
 	}
 	rows := make([][]string, 0)
 	for _, process := range observation.Processes {
@@ -239,16 +243,16 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 		}
 		rows = append(rows, []string{"other", "unexpected", replica.Replica, replica.State, container, port, serving})
 	}
-	out.WriteString("Processes\n")
+	out.WriteString(ui.Section("Processes") + "\n")
 	if len(rows) == 0 {
 		out.WriteString("  (none observed and none desired)\n")
 	} else {
 		out.WriteString(writeTable([]string{"PROCESS", "KIND", "REPLICA", "STATE", "CONTAINER", "HOST PORT", "SERVING"}, rows))
 	}
 	if observation.DomainsError != "" {
-		fmt.Fprintf(&out, "Domains: unavailable (%s)\n", observation.DomainsError)
+		fmt.Fprintf(&out, "%s\n", ui.Warn("domains unavailable: "+observation.DomainsError))
 	} else if len(observation.Domains) > 0 {
-		out.WriteString("Domains\n")
+		out.WriteString(ui.Section("Domains") + "\n")
 		domainRows := make([][]string, 0, len(observation.Domains))
 		for _, domain := range observation.Domains {
 			primary := "no"
@@ -264,15 +268,15 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 				string(domain.CertificateState), string(domain.PublicState), ready,
 			})
 			if message := domainBindingError(domain.DomainBinding); message != "" {
-				domainRows = append(domainRows, []string{"", "", "", "", "", "", message})
+				domainRows = append(domainRows, []string{domain.Domain, "", "", "", "", "", message})
 			}
 		}
 		out.WriteString(writeTable([]string{"DOMAIN", "PRIMARY", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY"}, domainRows))
 	}
 	if observation.OperationsError != "" {
-		fmt.Fprintf(&out, "Last operations: unavailable (%s)\n", observation.OperationsError)
+		fmt.Fprintf(&out, "%s\n", ui.Warn("last operations unavailable: "+observation.OperationsError))
 	} else if len(observation.Operations) > 0 {
-		out.WriteString("Last operations\n")
+		out.WriteString(ui.Section("Last operations") + "\n")
 		out.WriteString(writeOperationTable(observation.Operations))
 	}
 	return out.String()

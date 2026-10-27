@@ -45,6 +45,16 @@ func TestSafeText(t *testing.T) {
 	}
 }
 
+func TestSafeStyledKeepsOnlySGR(t *testing.T) {
+	value := SafeStyled("\x1b[1;31mred\x1b[0m \x1b]52;c;clipboard\a \x1b[2J\n")
+	if !strings.Contains(value, "\x1b[1;31mred\x1b[0m") {
+		t.Fatalf("SGR was removed: %q", value)
+	}
+	if strings.ContainsAny(value, "\a") || strings.Contains(value, "\x1b]") || strings.Contains(value, "\x1b[2J") {
+		t.Fatalf("unsafe sequence survived: %q", value)
+	}
+}
+
 func TestWriterRedactsEveryField(t *testing.T) {
 	registry := &secrets.Registry{}
 	registry.Add("secret-value")

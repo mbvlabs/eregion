@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
@@ -77,7 +78,7 @@ func (a *app) hostDoctor(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	message := doctor.Message(report.Results)
+	message := doctorText(report)
 	failed := doctor.Failed(report.Results)
 	if len(failed) == 0 {
 		return result{data: report, plain: message}, nil
@@ -85,7 +86,7 @@ func (a *app) hostDoctor(cmd *cobra.Command, _ []string) (result, error) {
 	if !structuredOutput(cmd) {
 		// A terminal shows the whole report before the exit status; JSON keeps
 		// it in the failure envelope's details.
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), message)
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), message)
 	}
 	names := make([]string, 0, len(failed))
 	for _, finding := range failed {
@@ -100,6 +101,29 @@ func (a *app) hostDoctor(cmd *cobra.Command, _ []string) (result, error) {
 		"Fix each reported finding, then run eregion doctor again.")
 	fault.Details = map[string]any{"report": report, "summary": report.Summary}
 	return result{}, fault
+}
+
+// doctorText renders the same findings as doctor.Message with the section
+// header and meaning colours the rest of the human output uses.
+func doctorText(report doctor.Report) string {
+	var out strings.Builder
+	out.WriteString(ui.Header("Doctor", 72))
+	for _, line := range strings.Split(doctor.Message(report.Results), "\n") {
+		if line == "" {
+			continue
+		}
+		status, rest, ok := strings.Cut(line, " ")
+		switch strings.ToLower(status) {
+		case "pass", "warn", "fail", "skip":
+			out.WriteString("\n" + ui.State(strings.ToUpper(status)))
+			if ok {
+				out.WriteString(" " + rest)
+			}
+		default:
+			out.WriteString("\n" + line)
+		}
+	}
+	return out.String()
 }
 
 func planText(plan host.Plan) string {

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -267,24 +268,23 @@ func (a *app) domainList(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, contract.NewFault(contract.Unavailable, "the node returned invalid domain state", "Check binary compatibility before assuming domains are absent.")
 	}
 	if len(page.Items) == 0 {
-		return result{data: []platform.DomainBinding{}, plain: "No domains. Add one with eregion domain add <app> <environment> <hostname>."}, nil
+		return result{data: []platform.DomainBinding{}, plain: ui.Header("Domains", 72) + "\nNo domains. Add one with eregion domain add <app> <environment> <hostname>.\n"}, nil
 	}
-	var table strings.Builder
-	fmt.Fprintf(&table, "%-36s %-3s %-14s %-14s %-9s %-8s %-11s %-8s %s\n",
-		"DOMAIN", "PRI", "APP", "ENVIRONMENT", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY")
+	rows := make([][]string, 0, len(page.Items))
 	for _, item := range page.Items {
 		ready := "no"
 		if item.Ready() {
 			ready = "yes"
 		}
-		fmt.Fprintf(&table, "%-36s %-3s %-14s %-14s %-9s %-8s %-11s %-8s %s\n",
+		rows = append(rows, []string{
 			item.Domain, primaryMark(item.Primary), item.App, item.Environment,
-			item.RouteState, item.DNSState, item.CertificateState, item.PublicState, ready)
-		if err := domainBindingError(item); err != "" {
-			fmt.Fprintf(&table, "  %s\n", err)
+			string(item.RouteState), string(item.DNSState), string(item.CertificateState), string(item.PublicState), ready,
+		})
+		if message := domainBindingError(item); message != "" {
+			rows = append(rows, []string{item.Domain, "", "", "", "", "", "", "", message})
 		}
 	}
-	return result{data: page.Items, plain: table.String()}, nil
+	return result{data: page.Items, plain: ui.Header("Domains", 72) + "\n" + writeTable([]string{"DOMAIN", "PRI", "APP", "ENVIRONMENT", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY"}, rows)}, nil
 }
 
 func domainBindingError(item platform.DomainBinding) string {

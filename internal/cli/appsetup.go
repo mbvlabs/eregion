@@ -1288,29 +1288,7 @@ func writeProcessTable(processes []platform.ProcessSpec) string {
 }
 
 func writeTable(headers []string, rows [][]string) string {
-	widths := make([]int, len(headers))
-	for i, header := range headers {
-		widths[i] = len(header)
-	}
-	for _, row := range rows {
-		for i, value := range row {
-			if i < len(widths) && len(value) > widths[i] {
-				widths[i] = len(value)
-			}
-		}
-	}
-	var out strings.Builder
-	for i, header := range headers {
-		fmt.Fprintf(&out, "%-*s", widths[i]+2, header)
-	}
-	out.WriteString("\n")
-	for _, row := range rows {
-		for i, value := range row {
-			fmt.Fprintf(&out, "%-*s", widths[i]+2, value)
-		}
-		out.WriteString("\n")
-	}
-	return out.String()
+	return ui.Table(headers, rows)
 }
 
 func environmentDeployability(env platform.Environment) string {

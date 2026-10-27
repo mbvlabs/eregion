@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/output"
@@ -416,7 +417,7 @@ func (a *app) buildList(cmd *cobra.Command, args []string) (result, error) {
 	if err := json.Unmarshal(raw, &page); err != nil {
 		return result{}, invalidNodeData("build inventory")
 	}
-	return result{data: raw, plain: buildTable(page.Items)}, nil
+	return result{data: raw, plain: ui.Header("Builds for "+args[0]+"/"+args[1], 72) + "\n" + buildTable(page.Items)}, nil
 }
 
 func (a *app) releaseList(cmd *cobra.Command, args []string) (result, error) {
@@ -430,7 +431,7 @@ func (a *app) releaseList(cmd *cobra.Command, args []string) (result, error) {
 	if err := json.Unmarshal(raw, &page); err != nil {
 		return result{}, invalidNodeData("release inventory")
 	}
-	return result{data: raw, plain: releaseTable(page.Items)}, nil
+	return result{data: raw, plain: ui.Header("Releases for "+args[0]+"/"+args[1], 72) + "\n" + releaseTable(page.Items)}, nil
 }
 
 func deliveryFilters(cmd *cobra.Command, app, environment string) url.Values {
@@ -496,7 +497,7 @@ func (a *app) followBuildLogs(cmd *cobra.Command, client Backend, build platform
 	clean := a.followCleaner()
 	opts := viewer.FollowOptions{PollInterval: deliveryPollInterval(cmd), Clean: clean}
 	if !plainOutput(cmd) {
-		summary, err := viewer.Follow(cmd.Context(), client, build.OperationID, opts, nil)
+		summary, err := viewer.Follow(withoutWait(cmd.Context()), client, build.OperationID, opts, nil)
 		err = followError(summary, err)
 		return result{data: newFollowResult(summary)}, err
 	}
@@ -505,7 +506,7 @@ func (a *app) followBuildLogs(cmd *cobra.Command, client Backend, build platform
 		return result{}, contract.NewFault(contract.Internal, "viewer output is not configured", "Invoke the command through the eregion CLI entry point.")
 	}
 	presenter := viewer.NewPlain(config.out, config.err, clean)
-	summary, err := viewer.Follow(cmd.Context(), client, build.OperationID, opts, presenter.Observe)
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, build.OperationID, opts, presenter.Observe)
 	err = followError(summary, err)
 	if finishErr := presenter.Finish(summary, err, "eregion operations follow "+string(build.OperationID), time.Now()); finishErr != nil && err == nil {
 		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
@@ -782,32 +783,30 @@ func buildTable(builds []platform.BuildRecord) string {
 	if len(builds) == 0 {
 		return "(no builds)\n"
 	}
-	var out strings.Builder
-	fmt.Fprintf(&out, "%-36s %-10s %-13s %-36s %s\n", "ID", "STATE", "COMMIT", "RELEASE", "CREATED")
+	rows := make([][]string, 0, len(builds))
 	for _, build := range builds {
 		commit := build.CommitSHA
 		if len(commit) > 12 {
 			commit = commit[:12]
 		}
 		created := build.CreatedAt.UTC().Format(time.RFC3339)
-		fmt.Fprintf(&out, "%-36s %-10s %-13s %-36s %s\n", build.ID, build.State, commit, build.ReleaseID, created)
+		rows = append(rows, []string{string(build.ID), string(build.State), commit, string(build.ReleaseID), created})
 	}
-	return out.String()
+	return writeTable([]string{"ID", "STATE", "COMMIT", "RELEASE", "CREATED"}, rows)
 }
 
 func releaseTable(releases []platform.Release) string {
 	if len(releases) == 0 {
 		return "(no releases)\n"
 	}
-	var out strings.Builder
-	fmt.Fprintf(&out, "%-36s %-9s %-13s %-40s %s\n", "ID", "STATUS", "COMMIT", "IMAGE", "CREATED")
+	rows := make([][]string, 0, len(releases))
 	for _, release := range releases {
 		commit := release.CommitSHA
 		if len(commit) > 12 {
 			commit = commit[:12]
 		}
 		created := release.CreatedAt.UTC().Format(time.RFC3339)
-		fmt.Fprintf(&out, "%-36s %-9s %-13s %-40s %s\n", release.ID, release.Status, commit, release.Image, created)
+		rows = append(rows, []string{string(release.ID), string(release.Status), commit, release.Image, created})
 	}
-	return out.String()
+	return writeTable([]string{"ID", "STATUS", "COMMIT", "IMAGE", "CREATED"}, rows)
 }

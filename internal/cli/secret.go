@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -185,10 +186,18 @@ func (a *app) listSecrets(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	plain := fmt.Sprintf("Secrets for %s/%s (%d shown)\n", appName, environment, len(metadata))
+	rows := make([][]string, 0, len(metadata))
 	for _, item := range metadata {
-		plain += "  " + formatSecretMetadata(item) + "\n"
+		state := string(item.State)
+		if item.ArchivedAt != nil {
+			state = string(vault.StateArchived)
+		}
+		rows = append(rows, []string{
+			item.Name, state, fmt.Sprint(item.LatestRevision), item.Revision.KeyID, item.Revision.Hash,
+		})
 	}
+	plain := ui.Header(fmt.Sprintf("Secrets for %s/%s (%d shown)", appName, environment, len(metadata)), 72) + "\n" +
+		writeTable([]string{"NAME", "STATE", "REVISION", "KEY", "HASH"}, rows)
 	return result{data: map[string]any{"secrets": metadata}, plain: plain}, nil
 }
 

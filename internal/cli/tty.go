@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -17,6 +18,13 @@ func humanAtTerminal(cmd *cobra.Command) bool {
 	return !jsonMode && outputMode != "json" &&
 		term.IsTerminal(int(os.Stdin.Fd())) && //nolint:gosec // G115: file descriptors fit in int.
 		term.IsTerminal(int(os.Stderr.Fd())) //nolint:gosec // G115: file descriptors fit in int.
+}
+
+// humanPlainAt reports whether a command may draw loading feedback: human plain
+// output and the process's own terminal on stderr. Structured output, a pipe, a
+// captured stream and every non-terminal keep the append-only path.
+func humanPlainAt(cmd *cobra.Command) bool {
+	return cmd != nil && plainOutput(cmd) && cmd.ErrOrStderr() == os.Stderr && ui.Enabled(os.Stderr)
 }
 
 // requireHuman refuses when a command needs a person at a terminal. --yes

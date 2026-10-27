@@ -9,6 +9,7 @@ import (
 
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // The palette uses the 16 ANSI colors, so it follows the terminal's own
@@ -151,6 +152,84 @@ func Code(s string) string { return styleCode.Render(s) }
 
 // Dim renders secondary text.
 func Dim(s string) string { return styleDim.Render(s) }
+
+// Section renders a subheading inside a view.
+func Section(title string) string { return styleTitle.Render(title) }
+
+// State renders one state word with its meaning colour. Unrecognised values
+// are returned unchanged.
+func State(value string) string {
+	style, ok := stateStyle(value)
+	if !ok {
+		return value
+	}
+	return style.Render(value)
+}
+
+// Table renders headers and rows as aligned columns. Headers are dim; cells
+// that are state words are coloured by meaning and every other value keeps the
+// terminal's default foreground. Alignment uses visible widths, so styling
+// never shifts a column.
+func Table(headers []string, rows [][]string) string {
+	widths := make([]int, len(headers))
+	for i, header := range headers {
+		widths[i] = lipgloss.Width(header)
+	}
+	for _, row := range rows {
+		for i, raw := range row {
+			value := ansi.Strip(raw)
+			if i < len(widths) {
+				widths[i] = max(widths[i], lipgloss.Width(value))
+			}
+		}
+	}
+	var out strings.Builder
+	for i, header := range headers {
+		out.WriteString(styleDim.Render(header))
+		out.WriteString(strings.Repeat(" ", widths[i]-lipgloss.Width(header)+2))
+	}
+	out.WriteString("\n")
+	for _, row := range rows {
+		for i, raw := range row {
+			value := ansi.Strip(raw)
+			cell := State(value)
+			out.WriteString(cell)
+			if i < len(widths) {
+				out.WriteString(strings.Repeat(" ", widths[i]-lipgloss.Width(value)+2))
+			} else {
+				out.WriteString(" ")
+			}
+		}
+		out.WriteString("\n")
+	}
+	return out.String()
+}
+
+// stateStyle maps the leading word of value to the palette's meaning colour.
+func stateStyle(value string) (lipgloss.Style, bool) {
+	word := strings.ToLower(strings.TrimSpace(value))
+	if word == "" {
+		return lipgloss.Style{}, false
+	}
+	if strings.HasPrefix(word, "no (missing") {
+		return styleFail, true
+	}
+	first := word
+	if index := strings.IndexAny(first, " (:/"); index > 0 {
+		first = first[:index]
+	}
+	switch first {
+	case "ready", "active", "succeeded", "success", "running", "applied", "ok", "pass", "valid", "deployed", "healthy", "available", "configured", "enabled", "yes":
+		return styleOK, true
+	case "pending", "queued", "cancelling", "canceling", "unknown", "warn", "warning", "skipped", "skip", "archived", "inactive", "stale", "partial":
+		return styleWarn, true
+	case "failed", "failure", "fail", "missing", "unreachable", "error", "invalid", "cancelled", "canceled", "down", "unhealthy", "unavailable":
+		return styleFail, true
+	case "none", "-", "n/a", "no":
+		return styleDim, true
+	}
+	return lipgloss.Style{}, false
+}
 
 // ErrorBlock is a failure shown to a human.
 type ErrorBlock struct {

@@ -22,6 +22,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/buildinfo"
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/doctor"
@@ -217,6 +218,8 @@ type nodeClient struct {
 	operator    string
 	autoUpgrade bool
 	stderr      io.Writer
+	// wait enables the human loading line on stderr while a remote call runs.
+	wait bool
 
 	mu      sync.Mutex
 	checked bool
@@ -521,7 +524,118 @@ func invalidNodeData(what string) *contract.Fault {
 	return contract.NewFault(contract.Unavailable, "the node returned invalid "+what, "Check that the operator and node run the same build; do not assume the action was rejected.")
 }
 
+// waitLabel names what a remote call is doing, in the present tense, for the
+// human loading line. It uses only the request params, so it never invents a
+// server status.
+func waitLabel(method string, params any) string {
+	appName := func(filters map[string][]string) string {
+		if values := filters["app"]; len(values) > 0 {
+			return values[0]
+		}
+		return ""
+	}
+	switch p := params.(type) {
+	case rpcInventoryParams:
+		switch p.Collection {
+		case "apps":
+			if app := appName(p.Filters); app != "" {
+				return "Reading app " + app + "…"
+			}
+			return "Reading apps…"
+		case "environments":
+			if app := appName(p.Filters); app != "" {
+				return "Reading environments for " + app + "…"
+			}
+			return "Reading environments…"
+		case "domains":
+			return "Reading domains…"
+		case "releases":
+			return "Reading releases…"
+		case "builds":
+			return "Reading builds…"
+		}
+		return "Reading " + p.Collection + "…"
+	case rpcSecretParams:
+		switch method {
+		case methodSecretSet:
+			return "Writing secret " + p.Name + "…"
+		case methodSecretArchive:
+			return "Archiving secret " + p.Name + "…"
+		case methodSecretExport:
+			return "Exporting secret " + p.Name + "…"
+		default:
+			return "Reading secret " + p.Name + "…"
+		}
+	case rpcSecretListParams:
+		return "Reading secrets…"
+	case rpcSubmitParams:
+		if method == methodTest {
+			return "Testing…"
+		}
+		return "Submitting…"
+	case rpcOperationParams:
+		switch method {
+		case methodGet:
+			return "Reading operation…"
+		case methodEvents:
+			return "Reading events…"
+		case methodCancel:
+			return "Cancelling…"
+		}
+	case rpcEventsParams:
+		return "Reading events…"
+	case rpcWorkloadParams:
+		if p.Environment != "" {
+			return "Reading workloads for " + p.App + "/" + p.Environment + "…"
+		}
+		return "Reading workloads…"
+	case rpcLogParams:
+		return "Reading logs…"
+	case rpcOperationsListParams:
+		return "Reading operations…"
+	case rpcInstallParams:
+		return "Installing the node build…"
+	case rpcProtectInitParams:
+		return "Preparing two-factor setup…"
+	case rpcTokenCreateParams:
+		return "Minting token…"
+	case rpcTokenRevokeParams:
+		return "Revoking token…"
+	}
+	switch method {
+	case methodReady:
+		return "Checking readiness…"
+	case methodHostPlan:
+		return "Planning host changes…"
+	case methodHostApply:
+		return "Applying host changes…"
+	case methodHostDoctor:
+		return "Running doctor…"
+	case methodHostStatus:
+		return "Reading server status…"
+	case methodProtectConfirm:
+		return "Confirming two-factor setup…"
+	case methodProtectVerify:
+		return "Verifying code…"
+	case methodProtectStatus:
+		return "Reading two-factor status…"
+	case methodTokenList:
+		return "Reading tokens…"
+	case methodHandoffExport:
+		return "Exporting the handoff…"
+	case methodNodeInfo:
+		return "Reading the node…"
+	case methodVersion:
+		return "Checking the node version…"
+	}
+	return "Waiting for the node…"
+}
+
 func (n *nodeClient) call(ctx context.Context, method string, params any, opts rpcCallOptions) (json.RawMessage, error) {
+	if n.wait && opts.OnEvent == nil && !waitSuppressed(ctx) {
+		stop := ui.Wait(os.Stderr, waitLabel(method, params))
+		defer stop()
+	}
 	if method != methodVersion && method != methodUpgradeInstall {
 		if err := n.ensureVersion(ctx); err != nil {
 			return nil, err

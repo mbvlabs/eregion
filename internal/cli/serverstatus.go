@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/spf13/cobra"
 )
@@ -35,19 +36,24 @@ func (a *app) serverStatus(cmd *cobra.Command, _ []string) (result, error) {
 
 func statusText(status host.NodeStatus) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "node %s · role %s · eregion %s", status.Node, status.Role, status.NodeVersion)
+	out.WriteString(ui.Header("Server "+status.Node, 72))
+	field := func(name, value string) {
+		fmt.Fprintf(&out, "\n  %s %s", ui.Dim(fmt.Sprintf("%-8s", name)), value)
+	}
+	field("role", status.Role)
+	field("eregion", status.NodeVersion)
 	if status.CLI != "" && status.CLI != status.NodeVersion {
-		fmt.Fprintf(&out, " · cli %s", status.CLI)
+		field("cli", status.CLI)
 	}
-	fmt.Fprintf(&out, "\n  uptime  %s", uptimeText(status.UptimeSeconds))
+	field("uptime", uptimeText(status.UptimeSeconds))
 	if status.Disk.TotalBytes > 0 {
-		fmt.Fprintf(&out, "\n  disk    %s free of %s on %s (%.0f%% free)", humanBytes(status.Disk.FreeBytes), humanBytes(status.Disk.TotalBytes), status.Disk.Path, status.Disk.FreePct)
+		field("disk", fmt.Sprintf("%s free of %s on %s (%.0f%% free)", humanBytes(status.Disk.FreeBytes), humanBytes(status.Disk.TotalBytes), status.Disk.Path, status.Disk.FreePct))
 	}
-	schema := fmt.Sprintf("  schema  %d of %d (River %d of %d)", status.Schema.Current, status.Schema.Required, status.Schema.RiverCurrent, status.Schema.RiverRequired)
+	schema := fmt.Sprintf("%d of %d (River %d of %d)", status.Schema.Current, status.Schema.Required, status.Schema.RiverCurrent, status.Schema.RiverRequired)
 	if status.SchemaError != "" {
 		schema += ": " + status.SchemaError
 	}
-	out.WriteString("\n" + schema)
+	field("schema", schema)
 	units := make([]string, 0, len(status.Services))
 	for unit := range status.Services {
 		units = append(units, unit)
@@ -58,7 +64,7 @@ func statusText(status host.NodeStatus) string {
 		if status.Services[unit] {
 			state = "active"
 		}
-		fmt.Fprintf(&out, "\n  %-28s %s", unit, state)
+		fmt.Fprintf(&out, "\n  %-28s %s", unit, ui.State(state))
 	}
 	return out.String()
 }

@@ -68,3 +68,18 @@ func TestInventoryParamsCarryTheCollection(t *testing.T) {
 		t.Fatalf("query = %+v", query)
 	}
 }
+
+func TestWaitLabelNamesTheRemoteRead(t *testing.T) {
+	if got := waitLabel(methodInventory, rpcInventoryParams{
+		Collection: "apps",
+		Filters:    map[string][]string{"app": {"andurel"}},
+	}); got != "Reading app andurel…" {
+		t.Fatalf("app read label = %q", got)
+	}
+	if got := waitLabel(methodSubmit, rpcSubmitParams{Kind: "platform.deploy"}); got != "Submitting…" {
+		t.Fatalf("submit label = %q", got)
+	}
+	if got := waitLabel(methodHostDoctor, struct{}{}); got != "Running doctor…" {
+		t.Fatalf("doctor label = %q", got)
+	}
+}
