@@ -500,7 +500,11 @@ func pendingCommitFault(report ApplyReport, message string) error {
 }
 
 func (r *Runner) applyFault(step Step, execution engine.Execution, status engine.TaskStatus, report ApplyReport, cause error) error {
-	fault := &contract.Fault{Code: contract.Unavailable, Message: "host step " + step.ID() + " failed", Hint: "Fix the reported precondition, run host plan again, and resume with its confirmation token. Completed steps are not re-applied.", Cause: cause}
+	message := "host step " + step.ID() + " failed"
+	if cause != nil {
+		message += ": " + cause.Error()
+	}
+	fault := &contract.Fault{Code: contract.Unavailable, Message: message, Hint: "Completed steps are not re-applied.", Cause: cause}
 	var existing *contract.Fault
 	if errors.As(cause, &existing) && contract.KnownCode(existing.Code) {
 		copy := *existing
@@ -522,6 +526,10 @@ func (r *Runner) applyFault(step Step, execution engine.Execution, status engine
 	}
 	if status.Detail != "" && r.Secrets != nil {
 		fault.Details["step_detail"] = r.Secrets.Redact(status.Detail)
+	}
+	var script *engine.ScriptError
+	if errors.As(cause, &script) && len(script.Tail) > 0 {
+		fault.Details["output_tail"] = script.Tail
 	}
 	return fault
 }

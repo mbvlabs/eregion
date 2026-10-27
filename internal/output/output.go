@@ -95,12 +95,33 @@ func (w Writer) Write(envelope contract.Envelope, plain string) error {
 	if !envelope.OK {
 		fault := envelope.Error
 		text := fmt.Sprintf("error [%s]: %s\n", fault.Code, fault.Message)
+		if lines := outputTail(fault.Details); len(lines) > 0 {
+			text += "last output:\n  " + strings.Join(lines, "\n  ") + "\n"
+		}
 		if fault.Hint != "" {
 			text += "hint: " + fault.Hint + "\n"
 		}
 		return writeAll(w.Err, []byte(SafeText(w.Secrets.Redact(text))))
 	}
 	return writeAll(w.Out, []byte(SafeText(w.Secrets.Redact(strings.TrimRight(plain, "\n")+"\n"))))
+}
+
+// outputTail is a failed script's last output lines, as a host step fault
+// carries them locally ([]string) or decoded from a node envelope ([]any).
+func outputTail(details map[string]any) []string {
+	switch lines := details["output_tail"].(type) {
+	case []string:
+		return lines
+	case []any:
+		out := make([]string, 0, len(lines))
+		for _, line := range lines {
+			if text, ok := line.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // SafeText makes untrusted terminal controls visible; it never interprets ANSI/OSC.
