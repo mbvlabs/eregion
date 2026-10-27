@@ -586,22 +586,25 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		return failWithCandidates(fmt.Errorf("public verification failed after the Caddy switch: %w", err))
 	}
 
+	// Record the new release as serving before the previous containers go.
+	// Every route writer renders from the recorded serving deployment, so the
+	// periodic route maintenance can no longer point Caddy back at containers
+	// this deploy is about to remove.
+	if err := w.service.recordServing(ctx, env, release, dep, instances); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.syncRoutes(ctx); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
 	// The previous release is no longer routed. Removing its containers is
 	// cleanup, not part of the success decision.
 	w.service.removePreviousDeploymentContainers(ctx, tr, env, id, attempt, dep)
 	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
-            SET state='succeeded',completed_at=$2,updated_at=$2,message=$3,error_code='',instances=$4
+            SET state='succeeded',completed_at=$2,updated_at=$2,message=$3,error_code=''
             WHERE operation_id=$1 AND state IN ('pending','running')`, id, now,
-			"Serving release "+string(release.ID)+" passed candidate health and public verification.", mustJSON(instances)); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,serving_deployment_id=$3,applied_release_id=$2,health_state='healthy',
-                health_detail='serving release passed candidate health and public verification',
-                health_checked_at=$4,updated_at=$4
-            WHERE id=$1`, env.ID, release.ID, dep.ID, now); err != nil {
+			"Serving release "+string(release.ID)+" passed candidate health and public verification."); err != nil {
 			return err
 		}
 		if err := appendEvent(ctx, tx, op, contract.Event{
@@ -616,6 +619,32 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			map[string]any{"serving_release_id": release.ID, "serving_deployment_id": dep.ID, "health": "healthy", "instances": len(instances)})
 	}); err != nil {
 		return w.settle(ctx, id, attempt, err)
+	}
+	return nil
+}
+
+// recordServing makes the verified release the environment's serving release
+// and stores its instances on the deployment, the state route writers render.
+func (s *Service) recordServing(ctx context.Context, env platform.Environment, release platform.Release, dep platform.Deployment, instances []platform.DeploymentInstance) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return unavailable()
+	}
+	defer rollback(tx)
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments SET instances=$2,updated_at=$3 WHERE id=$1`,
+		dep.ID, mustJSON(instances), now); err != nil {
+		return unavailable()
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
+        SET serving_release_id=$2,serving_deployment_id=$3,applied_release_id=$2,health_state='healthy',
+            health_detail='serving release passed candidate health and public verification',
+            health_checked_at=$4,updated_at=$4
+        WHERE id=$1`, env.ID, release.ID, dep.ID, now); err != nil {
+		return unavailable()
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return unavailable()
 	}
 	return nil
 }
