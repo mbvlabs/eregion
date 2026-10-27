@@ -26,7 +26,7 @@ The binding, route, DNS record, certificate and public response are separate:
 | --- | --- | --- |
 | Binding | `eregion_platform_domains` row | Desired hostname, environment and primary flag. Accepted intent only. |
 | Route | `desired_revision`/`applied_revision`, `route_state`, `route_error` | Caddy accepted and loaded a routes file containing that domain. A pending/failed row does not delete the binding. |
-| DNS | `expected_addresses`, `dns_state` (`pending`/`ok`/`wrong`/`proxied`), `dns_addresses`, `dns_error` | 1.1.1.1 and 8.8.8.8 answers over UDP compared with the main node's public address. Proxied or wrong never becomes ready. |
+| DNS | `expected_addresses`, `dns_state` (`pending`/`ok`/`wrong`/`proxied`), `dns_addresses`, `dns_error` | 1.1.1.1 and 8.8.8.8 answers over UDP compared with the main node's public address. Wrong never becomes ready; a Cloudflare-proxied record reaches the node and counts like a direct one. |
 | Certificate | `certificate_state` (`pending`/`valid`/`failed`), `certificate_not_after`, `certificate_error` | TLS handshake to the hostname through local Caddy with SNI, chain and name verified against system roots. |
 | Public response | `public_state` (`pending`/`ok`/`failed`), `public_status`, `public_error` | HTTP response through local Caddy with the real hostname, using the environment revision's health path. |
 

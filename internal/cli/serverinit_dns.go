@@ -42,7 +42,7 @@ func (r *serverInit) askDNS() error {
 	name := r.answers.hostname()
 	body := strings.Join(append(hostRecordLines(hostDNSRecords(name, r.publicIPv4, "")),
 		"",
-		"Create it at your DNS provider, DNS only (no proxy).",
+		"Create it at your DNS provider; a Cloudflare proxy in front is fine.",
 		"eregion checks it after setting up the host; Caddy then gets the certificate."), "\n")
 	if r.live == nil {
 		if ready {
@@ -71,7 +71,7 @@ func (r *serverInit) checkDNS(ctx context.Context) {
 	case check.Matches:
 		task.end(ui.EndOK, "resolves to "+r.publicIPv4)
 	case check.Proxied:
-		task.end(ui.EndWarn, "proxied by Cloudflare; set the record to DNS only")
+		task.end(ui.EndOK, "proxied by Cloudflare")
 	default:
 		parts := make([]string, 0, len(check.Resolvers))
 		for _, a := range check.Resolvers {

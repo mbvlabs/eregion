@@ -16,8 +16,8 @@ var publicResolvers = []string{"1.1.1.1:53", "8.8.8.8:53"}
 
 // cloudflareRanges are Cloudflare's published proxy ranges
 // (https://www.cloudflare.com/ips/). An answer inside them means the record
-// is proxied (orange cloud): Caddy's HTTP challenge and the CI endpoint then
-// go through Cloudflare.
+// is proxied (orange cloud), which reaches the node through Cloudflare and is
+// as good as a direct record.
 var cloudflareRanges = mustPrefixes(
 	"173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
 	"141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",

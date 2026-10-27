@@ -1027,7 +1027,7 @@ func setupPlan(ans *setupAnswers, preview platform.Preview) string {
 		} else {
 			fmt.Fprintf(&out, "DNS record: point %s at the main node's public IPv4 address\n", ans.Domain)
 		}
-		fmt.Fprintln(&out, "Create it at the DNS provider, DNS only (no proxy).")
+		fmt.Fprintln(&out, "Create it at the DNS provider; a Cloudflare proxy in front is fine.")
 	} else {
 		fmt.Fprintln(&out, "domain: none; add one later with eregion domain add")
 	}

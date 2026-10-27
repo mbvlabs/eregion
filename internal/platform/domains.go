@@ -244,7 +244,7 @@ func mustPrefixes(values ...string) []netip.Prefix {
 }
 
 // CloudflareProxied reports whether an answer belongs to Cloudflare's proxy
-// ranges, which means the record is not DNS-only and cannot prove the app.
+// ranges: the record is proxied and reaches the node through Cloudflare.
 func CloudflareProxied(address string) bool {
 	addr, err := netip.ParseAddr(strings.TrimSpace(address))
 	if err != nil {
