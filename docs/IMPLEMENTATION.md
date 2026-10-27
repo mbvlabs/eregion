@@ -454,7 +454,7 @@ process. Deployability is the pure `platform.EvaluateDeployability` report over
 the current revision plus artifact/domain observations, with DNS reported as
 `unknown` until the domain row observes it. A deploy checks that report before
 recording a build or creating a container: source, runtime, a web process, a
-primary domain and an observed wrong/proxied DNS answer block with
+primary domain and an observed wrong DNS answer block with
 `precondition_failed` and a `missing` list. A merely unobserved DNS record does
 not block, matching deploycrate's gate on an unapplied managed binding; a source
 deploy produces its own artifact, so artifact readiness is not a blocker there.
@@ -536,7 +536,9 @@ the previous containers. A periodic maintenance job re-renders on worker start
 and every 30 seconds after a failure; it updates `route_state` per domain. A
 second periodic job observes DNS through 1.1.1.1 and 8.8.8.8 over UDP, then the
 certificate chain/expiry and public response through local Caddy with the real
-SNI. Proxied or wrong DNS stays unready. `domain add` records the main node's
+SNI. Wrong DNS stays unready. A Cloudflare-proxied record (deploycrate's
+Cloudflare mode) counts as reaching the node: the certificate and public checks
+still run against local Caddy, so readiness means the origin serves the host. `domain add` records the main node's
 public addresses so observation has an expected value. Inventory `domains` and
 `domain list` expose each state separately. See [network](network.md) before
 changing this path.

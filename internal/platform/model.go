@@ -189,10 +189,10 @@ func EvaluateDeployability(revision *EnvironmentRevision, state DeployabilitySta
 	}
 	// Deploycrate blocks only a managed DNS binding that is not applied, not a
 	// merely unobserved record. The first deploy right after app create must
-	// still pass while observation is pending; an observed wrong or proxied
-	// answer is a real blocker before any container work.
-	switch DNSState(dns) {
-	case DNSWrong, DNSProxied:
+	// still pass while observation is pending, and a Cloudflare-proxied record
+	// reaches the node through the proxy; only an observed wrong answer is a
+	// real blocker before any container work.
+	if DNSState(dns) == DNSWrong {
 		missing = append(missing, "dns")
 	}
 	return Deployability{Deployable: len(missing) == 0, Missing: missing, DNS: dns}

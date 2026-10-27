@@ -611,7 +611,7 @@ func envAppID(ctx context.Context, tx pgx.Tx, app string) string {
 // when the pure deployability report lists blockers. Deploycrate's gate blocks
 // on source, registry/artifact, runtime, a web process, a primary domain and a
 // managed DNS binding that is not applied. A merely unobserved record does not
-// block the first deploy; an observed wrong or proxied answer does. A source
+// block the first deploy, nor does a Cloudflare-proxied one; a wrong answer does. A source
 // deploy creates its artifact, and an explicit release is checked separately,
 // so artifact readiness is not a blocker here. An explicit release also carries
 // its own artifact, so it does not need the revision's source binding.

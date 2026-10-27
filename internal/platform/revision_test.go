@@ -157,8 +157,14 @@ func TestEvaluateDeployability(t *testing.T) {
 	proxied := EvaluateDeployability(revision, DeployabilityState{
 		ArtifactReady: true, PrimaryDomain: "api.example.com", DNS: string(DNSProxied),
 	})
-	if proxied.Deployable || len(proxied.Missing) != 1 || proxied.Missing[0] != "dns" {
-		t.Fatalf("proxied DNS report=%+v", proxied)
+	if !proxied.Deployable {
+		t.Fatalf("a Cloudflare-proxied record blocked deployment: %+v", proxied)
+	}
+	wrong := EvaluateDeployability(revision, DeployabilityState{
+		ArtifactReady: true, PrimaryDomain: "api.example.com", DNS: string(DNSWrong),
+	})
+	if wrong.Deployable || len(wrong.Missing) != 1 || wrong.Missing[0] != "dns" {
+		t.Fatalf("wrong DNS report=%+v", wrong)
 	}
 	if EvaluateDeployability(nil, DeployabilityState{ArtifactReady: true, PrimaryDomain: "api.example.com"}).Missing[0] != "source" {
 		t.Fatal("a nil revision must report a missing source")

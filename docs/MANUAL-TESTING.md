@@ -66,7 +66,7 @@ fails. Install the CLI from the published edge or alpha channel.
 | --- | --- |
 | App create | Guided `app create` with a private git repo, a `web` and a `worker` process, config, a secret and a domain ends with the app serving over HTTPS. The flag-only form produces the same revision. No SQL, raw JSON or manual Caddy edits. |
 | Deployability | An environment missing source, domain or DNS reports exactly what is missing and refuses to deploy. |
-| Domain and DNS | `domain add` shows the exact record; wrong or proxied DNS stays pending, never ready; the certificate verifies without `-k`; a second alias and the primary both serve. |
+| Domain and DNS | `domain add` shows the exact record; wrong DNS stays pending, never ready; a Cloudflare-proxied record becomes ready once the origin serves it; the certificate verifies without `-k`; a second alias and the primary both serve. |
 | Second deploy | A new commit, a changed config value and a rotated secret reach a new release; continuous requests during the switch see no failures (D17); old containers stop afterwards. |
 | Failed candidate | The failing commit leaves the previous release serving and its operation failed, not rewritten. |
 | Rollback | `rollback --confirm` restores the previous release with the secret revisions it used (D18); the public response matches. |

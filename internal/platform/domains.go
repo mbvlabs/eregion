@@ -87,11 +87,17 @@ type DomainBinding struct {
 }
 
 // Ready is true only when the route, DNS, certificate and public response all
-// observed success. An accepted binding or a written route is not enough.
+// observed success. An accepted binding or a written route is not enough. A
+// Cloudflare-proxied record counts as DNS success: the proxy reaches the node,
+// and the certificate and public checks run against the node's own Caddy.
 func (d DomainBinding) Ready() bool {
 	return d.RouteState == RouteApplied && d.AppliedRevision >= d.DesiredRevision &&
-		d.DNSState == DNSOK && d.CertificateState == CertificateValid && d.PublicState == PublicOK
+		DNSReachesNode(d.DNSState) && d.CertificateState == CertificateValid && d.PublicState == PublicOK
 }
+
+// DNSReachesNode reports whether public traffic for the record reaches the
+// main node: directly, or through a Cloudflare proxy.
+func DNSReachesNode(state DNSState) bool { return state == DNSOK || state == DNSProxied }
 
 // PublicResolvers are queried directly over UDP so a local cache cannot hide a
 // missing or proxied record.
@@ -180,7 +186,8 @@ func dnsLookupError(err error) string {
 }
 
 // ClassifyDNS compares the observed addresses with the main node's recorded
-// addresses. A proxied or wrong answer never becomes ready.
+// addresses. Cloudflare proxy addresses are reported as proxied; any other
+// mismatch is wrong and never becomes ready.
 func ClassifyDNS(expected, observed []string) DNSState {
 	want := addressSet(expected)
 	if len(want) == 0 {

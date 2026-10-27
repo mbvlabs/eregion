@@ -94,7 +94,7 @@ func (s *Service) observeDomain(ctx context.Context, domain domainObservation) e
 	publicStatus := 0
 	certificateObservedAt := (*time.Time)(nil)
 	publicObservedAt := (*time.Time)(nil)
-	if dnsState == platform.DNSOK {
+	if platform.DNSReachesNode(dnsState) {
 		certCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		certificate := platform.ObserveCertificate(certCtx, domain.name, platform.CaddyHTTPS)
 		cancel()
@@ -111,9 +111,6 @@ func (s *Service) observeDomain(ctx context.Context, domain domainObservation) e
 	}
 	if dnsError == "" && dnsState == platform.DNSWrong {
 		dnsError = "the public resolvers do not return the recorded address"
-	}
-	if dnsError == "" && dnsState == platform.DNSProxied {
-		dnsError = "the record is proxied by Cloudflare; set it to DNS only"
 	}
 	var statusArg any
 	if publicStatus != 0 {
