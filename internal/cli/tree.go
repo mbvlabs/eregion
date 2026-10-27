@@ -118,7 +118,7 @@ func (a *app) command(s spec) *cobra.Command {
 			a.started = true
 			res, err := s.run(cmd, args)
 			res.command = cmd.CommandPath()
-			res.next = s.meta.Next
+			res.next = concreteNext(cmd, args, s.meta.Next)
 			a.result = res
 			return err
 		}
@@ -233,4 +233,35 @@ func (a *app) help(cmd *cobra.Command) result {
 		}
 	}
 	return result{command: cmd.CommandPath(), data: command, plain: text, next: a.meta[cmd].Next}
+}
+
+// concreteNext fills <app>, <environment> and the command's other positional
+// placeholders in the result's next commands from the arguments and flags it
+// ran with, so an agent can run them as they are. The catalog keeps the
+// templates.
+func concreteNext(cmd *cobra.Command, args []string, next []string) []string {
+	values := map[string]string{}
+	for i, field := range strings.Fields(cmd.Use)[1:] {
+		if i < len(args) && strings.HasPrefix(field, "<") && strings.HasSuffix(field, ">") {
+			values[field] = args[i]
+		}
+	}
+	for placeholder, flag := range map[string]string{"<app>": "app", "<environment>": "environment"} {
+		if values[placeholder] == "" {
+			values[placeholder] = flagString(cmd, flag)
+		}
+	}
+	if values["<app>"] == "" && strings.HasPrefix(cmd.CommandPath(), "eregion app create") {
+		values["<app>"] = flagString(cmd, "name")
+	}
+	out := make([]string, 0, len(next))
+	for _, line := range next {
+		for placeholder, value := range values {
+			if value != "" {
+				line = strings.ReplaceAll(line, placeholder, value)
+			}
+		}
+		out = append(out, line)
+	}
+	return out
 }

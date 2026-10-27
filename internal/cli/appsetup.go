@@ -64,6 +64,9 @@ type setupAnswers struct {
 	HealthType    string
 	HealthPath    string
 	HealthTimeout int
+	// ReleaseCommand is the one-off command each deploy runs before the
+	// switch, such as a migration; empty runs none.
+	ReleaseCommand string
 
 	Processes    []platform.ProcessSpec
 	Config       map[string]string
@@ -102,7 +105,8 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	f.String("health-type", "http", "Health check type: http or tcp")
 	f.String("health-path", platform.DefaultHealthPath, "Loopback health path")
 	f.Int("health-timeout", platform.DefaultHealthTimeout, "Health timeout in seconds (1–300)")
-	f.StringArray("process", nil, "Complete process entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces the default web process)")
+	f.String("release-command", "", "Command line each deploy runs once before the switch, such as a migration")
+	f.StringArray("process", nil, "Complete process entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces the default web process). A worker has no port: queue=worker::1:/app/bin/queue")
 	f.StringArray("config", nil, "Plain configuration KEY=VALUE (repeatable)")
 	f.StringArray("secret", nil, "Vault secret NAME=PATH with a protected 0600 value file (repeatable)")
 	f.String("idempotency-key", "", "Stable submission key; one is generated when empty")
@@ -228,20 +232,21 @@ func askIntRange(title, description, def string, min, max int) (int, error) {
 func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, error) {
 	interactive := humanInteractive(cmd)
 	ans := &setupAnswers{
-		Node:          flagString(cmd, "node"),
-		BuildNode:     flagString(cmd, "build-node"),
-		GitURL:        flagString(cmd, "git-url"),
-		GitRef:        flagString(cmd, "git-ref"),
-		Image:         flagString(cmd, "image"),
-		Builder:       flagString(cmd, "builder"),
-		ContextPath:   flagString(cmd, "context-path"),
-		ContainerPort: flagInt(cmd, "container-port"),
-		HealthType:    strings.ToLower(flagString(cmd, "health-type")),
-		HealthPath:    flagString(cmd, "health-path"),
-		HealthTimeout: flagInt(cmd, "health-timeout"),
-		Domain:        flagString(cmd, "domain"),
-		Config:        map[string]string{},
-		SecretValues:  map[string][]byte{},
+		Node:           flagString(cmd, "node"),
+		BuildNode:      flagString(cmd, "build-node"),
+		GitURL:         flagString(cmd, "git-url"),
+		GitRef:         flagString(cmd, "git-ref"),
+		Image:          flagString(cmd, "image"),
+		Builder:        flagString(cmd, "builder"),
+		ContextPath:    flagString(cmd, "context-path"),
+		ContainerPort:  flagInt(cmd, "container-port"),
+		HealthType:     strings.ToLower(flagString(cmd, "health-type")),
+		HealthPath:     flagString(cmd, "health-path"),
+		HealthTimeout:  flagInt(cmd, "health-timeout"),
+		ReleaseCommand: flagString(cmd, "release-command"),
+		Domain:         flagString(cmd, "domain"),
+		Config:         map[string]string{},
+		SecretValues:   map[string][]byte{},
 	}
 	if ans.Node == "" {
 		ans.Node = defaultNodeName
@@ -796,6 +801,7 @@ func (ans *setupAnswers) environmentSpec() (platform.EnvironmentSpec, error) {
 		Runtime: platform.RuntimeSpec{
 			Node: ans.Node, HealthType: ans.HealthType, HealthPath: ans.HealthPath,
 			HealthTimeoutSeconds: ans.HealthTimeout,
+			ReleaseCommand:       commandSpecFromLine(ans.ReleaseCommand),
 		},
 		Processes:       processes,
 		Config:          ans.Config,
@@ -890,7 +896,11 @@ func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
 			value, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 			if err != nil || value < 1 || value > 65535 {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid process port", "Use a container port from 1 to 65535.")
+				hint := "Use a container port from 1 to 65535."
+				if kind == "worker" {
+					hint = "A worker has no port; leave it empty: " + name + "=worker::" + strings.Join(parts[2:], ":")
+				}
+				return nil, contract.NewFault(contract.ValidationFailed, "invalid process port", hint)
 			}
 			port = value
 		}
@@ -999,6 +1009,9 @@ func setupPlan(ans *setupAnswers, preview platform.Preview) string {
 		fmt.Fprintf(&out, "process: %s\n", process)
 	}
 	fmt.Fprintf(&out, "health: %s %s (%ds timeout)\n", strings.ToUpper(ans.HealthType), ans.HealthPath, ans.HealthTimeout)
+	if ans.ReleaseCommand != "" {
+		fmt.Fprintf(&out, "release command: %s\n", ans.ReleaseCommand)
+	}
 	if len(ans.Config) > 0 {
 		for _, key := range sortedKeys(ans.Config) {
 			fmt.Fprintf(&out, "config: %s=%s\n", key, ans.Config[key])
