@@ -184,7 +184,7 @@ func bootstrapFlags(cmd *cobra.Command) {
 func bootstrapInputFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
 	f.String("role", "main", "Placement: main, application, builder, or telemetry")
-	f.String("node", "local", "Node name; local and main are accepted names for the in-process local identity")
+	f.String("node", "main", "Node name; the host step writes it as EREGION_NODE_NAME")
 	f.String("database-url-file", "", "Owner-only external PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
 	f.String("binary", "", "eregion binary to install on the host; defaults to this executable")
 	f.String("api-listen", "127.0.0.1:8080", "API listener; non-loopback apply is access-changing")

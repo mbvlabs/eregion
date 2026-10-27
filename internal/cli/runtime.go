@@ -271,7 +271,12 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		// per-node resolver sees the same authenticated transport the worker
 		// uses; controlplane.New is given this instance and does not replace it.
 		if nodeTransport == nil {
-			local, localErr := node.NewLocal(node.DefaultStateDir(), "local", &secrets.Registry{})
+			localName := strings.TrimSpace(os.Getenv("EREGION_NODE_NAME"))
+			if localName == "" {
+				pool.Close()
+				return nil, nil, extensionRuntime{}, nil, contract.NewFault(contract.ValidationFailed, "the worker needs EREGION_NODE_NAME", "Set EREGION_NODE_NAME to this node's registered name before starting the worker.")
+			}
+			local, localErr := node.NewLocal(node.DefaultStateDir(), localName, &secrets.Registry{})
 			if localErr != nil {
 				pool.Close()
 				return nil, nil, extensionRuntime{}, nil, contract.NewFault(contract.ValidationFailed, "could not initialise the local node transport", "Check EREGION_NODE_STATE_DIR permissions and that every worker on this host uses the same directory.")

@@ -88,8 +88,8 @@ func TestSupportAndRoleMatrix(t *testing.T) {
 	if err != nil || !telemetry.Runtime || !telemetry.Telemetry || !telemetry.NodeAgent || telemetry.ControlPlane {
 		t.Fatalf("telemetry role: %+v %v", telemetry, err)
 	}
-	if cfg := DefaultConfig(RoleMain, ""); cfg.Node != "local" {
-		t.Fatal("main must match the core's local execution node")
+	if cfg := DefaultConfig(RoleMain, ""); cfg.Node != "main" {
+		t.Fatal("the default node name is main")
 	}
 }
 

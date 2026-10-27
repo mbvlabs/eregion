@@ -26,9 +26,7 @@ type Service struct {
 	enqueuePlatform func(context.Context, pgx.Tx, contract.Operation) (int64, error)
 	// transport is the node-dispatch boundary. Local today; SSH/WireGuard later.
 	transport node.Transport
-	// localNode is the identity of the in-process local transport, if any. It
-	// makes the main node consistent with `--node main` while keeping older
-	// "local" deployments valid through an alias.
+	// localNode is the identity of the in-process local transport, if any.
 	localNode string
 	// resolver reaches the node a piece of work is placed on: the enrolled
 	// node's own pinned SSH transport, or transport for the node it serves.

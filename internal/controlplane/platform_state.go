@@ -971,20 +971,15 @@ func contains(values []string, want string) bool {
 	return false
 }
 
-// ensureLocalNode makes the local development host usable without a manual
-// registration command. It records only capabilities actually found on the
-// host; it never claims remote identity or installs anything.
+// ensureLocalNode records the configured local node identity on every worker
+// start without a manual registration command. It refreshes the roles,
+// capabilities, status, and last-seen time of exactly that node row; it never
+// touches another node and only records capabilities actually found on the
+// host.
 func (s *Service) ensureLocalNode(ctx context.Context) error {
 	identity := strings.TrimSpace(s.localNode)
 	if identity == "" {
 		return nil
-	}
-	// loadNode resolves the "local"/"main" alias, so an older deployment is not
-	// duplicated when the configured identity changed.
-	if _, err := loadNode(ctx, s.pool, identity); err == nil {
-		return nil
-	} else if fault := contract.Classify(err); fault.Code != contract.NotFound {
-		return err
 	}
 	caps := []string{}
 	if _, err := exec.LookPath("docker"); err == nil {
@@ -1002,7 +997,8 @@ func (s *Service) ensureLocalNode(ctx context.Context) error {
 	}
 	_, err := s.pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities,address,status,last_seen_at)
         VALUES($1,$2,$3,'','ready',clock_timestamp())
-        ON CONFLICT (name) DO NOTHING`, identity, roles, caps)
+        ON CONFLICT (name) DO UPDATE SET roles=EXCLUDED.roles,capabilities=EXCLUDED.capabilities,
+            status='ready',last_seen_at=clock_timestamp(),updated_at=clock_timestamp()`, identity, roles, caps)
 	if err != nil {
 		return unavailable(err)
 	}

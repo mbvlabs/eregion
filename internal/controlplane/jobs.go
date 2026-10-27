@@ -104,8 +104,8 @@ type WorkerConfig struct {
 	// key directory). The zero value serves only the fallback Transport.
 	Nodes ResolverConfig
 	// LocalNodeName is the identity of the in-process local transport. Empty
-	// uses EREGION_NODE_NAME, then "local" for compatibility. A fresh main
-	// node bootstrap writes "main".
+	// uses EREGION_NODE_NAME. A worker that serves the local transport needs an
+	// explicit name; there is no fallback identity.
 	LocalNodeName string
 	// Resolver is an already-built per-node transport resolver. The process
 	// builds one resolver and shares it with extension dispatch, so there is
@@ -133,12 +133,12 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		if stateDir == "" {
 			stateDir = node.DefaultStateDir()
 		}
-		localName := config.LocalNodeName
+		localName := strings.TrimSpace(config.LocalNodeName)
 		if localName == "" {
 			localName = strings.TrimSpace(os.Getenv("EREGION_NODE_NAME"))
 		}
 		if localName == "" {
-			localName = "local"
+			return nil, contract.NewFault(contract.ValidationFailed, "the worker needs EREGION_NODE_NAME", "Set EREGION_NODE_NAME to this node's registered name before starting the worker.")
 		}
 		local, err := node.NewLocal(stateDir, localName, &secrets.Registry{})
 		if err != nil {
@@ -149,11 +149,6 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	} else if local, ok := service.transport.(*node.Local); ok {
 		// Tests and embedders inject the local transport directly.
 		service.localNode = local.NodeIdentity()
-	} else if identity, ok := service.transportIdentity(); ok && isLocalNodeName(identity) {
-		// A wrapped in-process transport (fault injectors in tests) still
-		// reports the local identity. Remote transports report enrolled node
-		// names and therefore never enter this branch.
-		service.localNode = identity
 	}
 	service.resolver = config.Resolver
 	if service.resolver == nil {

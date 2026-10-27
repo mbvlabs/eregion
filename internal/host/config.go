@@ -125,7 +125,7 @@ type Config struct {
 // the role-specific inputs.
 func DefaultConfig(role Role, node string) Config {
 	if node == "" {
-		node = "local"
+		node = "main"
 	}
 	return Config{
 		Node:                 node,
