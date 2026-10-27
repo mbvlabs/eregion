@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"fmt"
 	"os"
-	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/spf13/cobra"
@@ -35,17 +33,4 @@ func requireHuman(cmd *cobra.Command, action string) error {
 	}
 	return contract.NewFault(contract.InputRequired, action+" needs a human at an interactive terminal",
 		"Run it yourself in a terminal, without --json, --output json, --yes, or a pipe. There is no flag or environment variable for the authenticator code or the exported secrets.")
-}
-
-// readSecretTTY reads a value from the terminal without echo.
-func readSecretTTY(cmd *cobra.Command, label string) (string, error) {
-	if _, err := fmt.Fprint(cmd.ErrOrStderr(), label+": "); err != nil {
-		return "", err
-	}
-	raw, err := term.ReadPassword(int(os.Stdin.Fd())) //nolint:gosec // G115: file descriptors fit in int.
-	_, _ = fmt.Fprintln(cmd.ErrOrStderr())
-	if err != nil {
-		return "", contract.NewFault(contract.InputRequired, "could not read the terminal without echo", "Run the command in a real terminal.")
-	}
-	return strings.TrimSpace(string(raw)), nil
 }

@@ -152,7 +152,8 @@ func groupSecret(secret string) string {
 
 func readProtectCode(cmd *cobra.Command, label string) (string, error) {
 	for attempt := 1; ; attempt++ {
-		code, err := readSecretTTY(cmd, label)
+		// A one-time code expires in seconds; it is shown as typed.
+		code, err := ui.Input(label, "", "")
 		if err != nil {
 			return "", err
 		}
