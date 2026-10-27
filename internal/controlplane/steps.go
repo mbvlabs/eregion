@@ -193,6 +193,11 @@ func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt 
 			return err
 		}
 		acked = true
+		// Cleanup and setup steps can run beyond the planned count; the
+		// measured total never falls below what has completed.
+		if completed > total {
+			total = completed
+		}
 		return appendEvent(ctx, tx, op, contract.Event{
 			Kind:     "progress",
 			Progress: &contract.Progress{Current: uint64(completed), Total: uint64(total), Unit: "steps"},
