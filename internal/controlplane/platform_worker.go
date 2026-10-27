@@ -35,6 +35,7 @@ const (
 	deploymentPackStep         = "platform-pack-01-v1"
 	deploymentImageStep        = "platform-image-01-v1"
 	deploymentPullStep         = "platform-pull-01-v1"
+	deploymentNetworkStep      = "platform-network-01-v1"
 	deploymentRouteStep        = "platform-routes-01-v1"
 	deploymentPublicStep       = "platform-public-01-v1"
 	deploymentRestoreRouteStep = "platform-route-restore-01-v1"

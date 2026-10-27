@@ -16,6 +16,12 @@ import (
 
 type AppID string
 type EnvironmentID string
+
+// EnvironmentNetwork is the per-environment Docker bridge network every
+// process container and the release command join, as in deploycrate. Web and
+// service processes are reachable on it by their process name.
+func EnvironmentNetwork(id EnvironmentID) string { return "er-" + string(id) }
+
 type RevisionID string
 type ReleaseID string
 type DeploymentID string

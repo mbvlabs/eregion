@@ -424,6 +424,16 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
 	}
 
+	network := platform.EnvironmentNetwork(env.ID)
+	if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentNetworkStep, platform.ArgvPayload{
+		Step: deploymentNetworkStep,
+		Argv: []string{"docker", "network", "create", "--driver", "bridge",
+			"--label", "io.eregion.app=" + env.App, "--label", "io.eregion.environment=" + env.Name, network},
+		CheckArgv:      []string{"docker", "network", "inspect", "--format", "{{.Name}}", network},
+		TimeoutSeconds: 30,
+	}, nil); err != nil {
+		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+	}
 	containerEnv := cloneMap(env.Revision.Config)
 	if credentialKey != "" && !contains(env.Revision.SecretNames, credentialKey) {
 		delete(secretValues, credentialKey)
@@ -433,7 +443,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		releaseCommand = release.Command
 	}
 	if releaseCommand != nil {
-		commandArgs := []string{"docker", "run", "--rm", "--name", workloadCommandName(env, dep.ID), "--pull", "never"}
+		commandArgs := []string{"docker", "run", "--rm", "--name", workloadCommandName(env, dep.ID), "--pull", "never", "--network", network}
 		for _, key := range sortedPlatformKeys(containerEnv) {
 			commandArgs = append(commandArgs, "-e", key)
 		}
@@ -485,6 +495,8 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			Command:       planned.Command,
 			Labels:        planned.Labels,
 			Restart:       "unless-stopped",
+			Network:       network,
+			NetworkAlias:  networkAlias(planned.Process),
 		}, secretValues)
 		if err != nil {
 			return failWithCandidates(err)
@@ -1080,4 +1092,13 @@ func cloneMap(values map[string]string) map[string]string {
 func mustJSON(value any) []byte {
 	raw, _ := json.Marshal(value)
 	return raw
+}
+
+// networkAlias is the name a web or service process answers to on the
+// environment network; a worker takes no inbound traffic and gets none.
+func networkAlias(process platform.ProcessSpec) string {
+	if process.Kind == "web" || process.Kind == "service" {
+		return process.Name
+	}
+	return ""
 }

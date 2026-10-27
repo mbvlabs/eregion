@@ -197,11 +197,15 @@ type ContainerPayload struct {
 	// SecretEnvKeys names environment variables resolved from the transient
 	// request secrets. Values are never part of this payload or the journal.
 	SecretEnvKeys []string `json:"secret_env_keys,omitempty"`
-	// Command overrides the image entrypoint for one process. It is executed
-	// through the Buildpacks launcher, as deploycrate does.
+	// Command is the process command: run through the Buildpacks launcher for
+	// a Buildpacks image, as deploycrate does, otherwise as the entrypoint.
 	Command []string          `json:"command,omitempty"`
 	Labels  map[string]string `json:"labels,omitempty"`
 	Restart string            `json:"restart,omitempty"`
+	// Network is the environment's bridge network; NetworkAlias is the
+	// process name other containers on it reach this one by.
+	Network      string `json:"network,omitempty"`
+	NetworkAlias string `json:"network_alias,omitempty"`
 }
 
 type ContainerStep struct {
@@ -451,6 +455,12 @@ func ParsePublishedPort(output string, containerPort int) (int, error) {
 
 func (s *ContainerStep) runArgs(ctx context.Context, image string, rt engine.Runtime) ([]string, []string, error) {
 	args := []string{"docker", "run", "-d", "--name", s.payload.Name, "--pull", "never", "--restart", s.payload.Restart}
+	if s.payload.Network != "" {
+		args = append(args, "--network", s.payload.Network)
+		if s.payload.NetworkAlias != "" {
+			args = append(args, "--network-alias", s.payload.NetworkAlias)
+		}
+	}
 	if s.payload.Publish {
 		args = append(args, "-p", PublishArgument(s.payload.Bind, s.payload.HostPort, s.payload.ContainerPort))
 	}

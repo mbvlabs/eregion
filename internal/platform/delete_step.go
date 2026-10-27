@@ -49,7 +49,7 @@ func buildDeleteStep(exec engine.Execution, raw json.RawMessage) (engine.Step, e
 
 func (s *DeleteStep) ID() string { return s.payload.Step }
 func (s *DeleteStep) Describe() string {
-	return "Remove managed workload containers selected by ownership labels"
+	return "Remove managed workload containers and environment networks selected by ownership labels"
 }
 func (s *DeleteStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -62,8 +62,9 @@ func (s *DeleteStep) Check(ctx context.Context, rt engine.Runtime) (engine.Check
 	if err != nil {
 		return engine.CheckResult{Complete: false, Detail: "workload containers could not be listed"}, nil
 	}
-	if strings.TrimSpace(stdout) == "" {
-		return engine.CheckResult{Complete: true, Detail: "no managed workload containers remain"}, nil
+	networks, _, netErr := runArgv(probeCtx, workloadNetworkListArgs(s.payload.App, s.payload.Environment), nil, rt, s.ID(), nil)
+	if strings.TrimSpace(stdout) == "" && netErr == nil && strings.TrimSpace(networks) == "" {
+		return engine.CheckResult{Complete: true, Detail: "no managed workload containers or networks remain"}, nil
 	}
 	return engine.CheckResult{Complete: false, Detail: "managed workload containers still exist"}, nil
 }
@@ -76,15 +77,36 @@ func (s *DeleteStep) Apply(ctx context.Context, rt engine.Runtime, report engine
 		return engine.ApplyResult{}, permanentCommandError(fmt.Errorf("list workload containers: %w: %s", err, firstLine(stderr)))
 	}
 	identifiers := strings.Fields(stdout)
-	if len(identifiers) == 0 {
-		return engine.ApplyResult{Result: map[string]any{"removed": 0}}, nil
+	if len(identifiers) > 0 {
+		argv := append([]string{"docker", "rm", "--force"}, identifiers...)
+		_, rmStderr, err := runArgv(runCtx, argv, nil, rt, s.ID(), report)
+		if err != nil {
+			return engine.ApplyResult{}, permanentCommandError(fmt.Errorf("remove workload containers: %w: %s", err, firstLine(rmStderr)))
+		}
 	}
-	argv := append([]string{"docker", "rm", "--force"}, identifiers...)
-	_, rmStderr, err := runArgv(runCtx, argv, nil, rt, s.ID(), report)
+	// The environment networks go once no container is attached to them.
+	networkOut, netStderr, err := runArgv(runCtx, workloadNetworkListArgs(s.payload.App, s.payload.Environment), nil, rt, s.ID(), report)
 	if err != nil {
-		return engine.ApplyResult{}, permanentCommandError(fmt.Errorf("remove workload containers: %w: %s", err, firstLine(rmStderr)))
+		return engine.ApplyResult{}, permanentCommandError(fmt.Errorf("list environment networks: %w: %s", err, firstLine(netStderr)))
 	}
-	return engine.ApplyResult{Result: map[string]any{"removed": len(identifiers)}}, nil
+	networks := strings.Fields(networkOut)
+	if len(networks) > 0 {
+		argv := append([]string{"docker", "network", "rm"}, networks...)
+		if _, rmStderr, err := runArgv(runCtx, argv, nil, rt, s.ID(), report); err != nil {
+			return engine.ApplyResult{}, permanentCommandError(fmt.Errorf("remove environment networks: %w: %s", err, firstLine(rmStderr)))
+		}
+	}
+	return engine.ApplyResult{Result: map[string]any{"removed": len(identifiers), "networks_removed": len(networks)}}, nil
+}
+
+// workloadNetworkListArgs selects the environment networks by the same
+// ownership labels as the containers.
+func workloadNetworkListArgs(app, environment string) []string {
+	args := []string{"docker", "network", "ls", "--quiet", "--filter", "label=io.eregion.app=" + app}
+	if environment != "" {
+		args = append(args, "--filter", "label=io.eregion.environment="+environment)
+	}
+	return args
 }
 
 // workloadContainerListArgs builds the read-only Docker selector. It is pure and
