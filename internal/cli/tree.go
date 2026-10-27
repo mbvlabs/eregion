@@ -39,6 +39,8 @@ type app struct {
 	result  result
 	started bool
 	secrets *secrets.Registry
+	// nodeClients holds one client per context name for the command's life.
+	nodeClients map[string]*nodeClient
 }
 
 func readMeta(summary string, when, examples []string, next ...string) CommandMeta {

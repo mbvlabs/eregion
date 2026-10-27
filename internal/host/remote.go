@@ -13,6 +13,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/transport"
@@ -53,6 +54,79 @@ type Remote struct {
 	config RemoteConfig
 	auth   []ssh.AuthMethod
 	keys   *transport.HostKeys
+
+	// reuse keeps one connection for every Run; shared is that connection.
+	reuse  bool
+	mu     sync.Mutex
+	shared *ssh.Client
+}
+
+// KeepAlive makes Run reuse one connection for the Remote's lifetime instead
+// of dialing for every command. A check that must prove a new access path
+// needs a fresh dial and must not use it.
+func (r *Remote) KeepAlive() { r.reuse = true }
+
+// client returns the shared connection, dialing it when there is none, or a
+// new connection when connections are not reused.
+func (r *Remote) client(ctx context.Context) (*ssh.Client, error) {
+	if !r.reuse {
+		return r.connect(ctx)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.shared != nil {
+		return r.shared, nil
+	}
+	client, err := r.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r.shared = client
+	return client, nil
+}
+
+// session opens a session within the dial timeout: a shared connection that
+// silently died must not hang the command.
+func (r *Remote) session(ctx context.Context, client *ssh.Client) (*ssh.Session, error) {
+	type opened struct {
+		session *ssh.Session
+		err     error
+	}
+	result := make(chan opened, 1)
+	go func() {
+		session, err := client.NewSession()
+		result <- opened{session, err}
+	}()
+	timer := time.NewTimer(r.config.Timeout)
+	defer timer.Stop()
+	select {
+	case got := <-result:
+		return got.session, got.err
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	_ = client.Close()
+	if got := <-result; got.session != nil {
+		_ = got.session.Close()
+	}
+	return nil, fmt.Errorf("open an SSH session on %s: timed out", r.config.Address)
+}
+
+// release closes a connection after a command unless it is the shared one.
+func (r *Remote) release(client *ssh.Client) {
+	if !r.reuse {
+		_ = client.Close()
+	}
+}
+
+// discard closes a connection and forgets it if it was the shared one.
+func (r *Remote) discard(client *ssh.Client) {
+	r.mu.Lock()
+	if r.shared == client {
+		r.shared = nil
+	}
+	r.mu.Unlock()
+	_ = client.Close()
 }
 
 // NewRemote validates the target and loads the pinned host keys.
@@ -134,19 +208,29 @@ func (r *Remote) connect(ctx context.Context) (*ssh.Client, error) {
 	return ssh.NewClient(clientConn, channels, requests), nil
 }
 
-// Run executes one command over a fresh connection. Standard input is optional;
+// Run executes one command, over a fresh connection unless KeepAlive is set. Standard input is optional;
 // standard output and error are streamed to the caller so remote apply progress
 // is visible without waiting for the final envelope.
 func (r *Remote) Run(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) error {
-	client, err := r.connect(ctx)
+	client, err := r.client(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = client.Close() }()
-	session, err := client.NewSession()
+	session, err := r.session(ctx, client)
+	if err != nil && r.reuse {
+		// The shared connection went away; dial once more.
+		r.discard(client)
+		if client, err = r.client(ctx); err == nil {
+			session, err = r.session(ctx, client)
+		}
+	}
 	if err != nil {
+		if client != nil {
+			r.discard(client)
+		}
 		return err
 	}
+	defer r.release(client)
 	defer func() { _ = session.Close() }()
 	session.Stdin, session.Stdout, session.Stderr = stdin, stdout, stderr
 	if err := session.Start(command); err != nil {
@@ -158,7 +242,7 @@ func (r *Remote) Run(ctx context.Context, command string, stdin io.Reader, stdou
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		_ = client.Close()
+		r.discard(client)
 		<-done
 		return ctx.Err()
 	}

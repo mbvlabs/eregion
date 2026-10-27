@@ -710,9 +710,12 @@ func (n *nodeClient) callRaw(ctx context.Context, method string, params any, opt
 		return nil, ctx.Err()
 	}
 	detail := strings.TrimSpace(stderr.String())
-	hint := "Re-run with --verbose to see the node's stderr. sudo may be refusing eregion node rpc."
-	if detail != "" {
+	hint := "The connection closed before the node answered; run eregion doctor."
+	switch {
+	case detail != "":
 		hint = detail
+	case err != nil:
+		hint = "The connection closed before the node answered: " + err.Error()
 	}
 	return nil, contract.NewFault(contract.Unavailable, "eregion node rpc "+method+" on "+n.remoteTarget()+" ended without a result", hint)
 }

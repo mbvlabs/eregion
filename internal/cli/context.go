@@ -27,6 +27,11 @@ func (a *app) nodeClient(cmd *cobra.Command) (*nodeClient, error) {
 }
 
 func (a *app) nodeClientFor(cmd *cobra.Command, name string) (*nodeClient, error) {
+	// One command reuses one client: the version check runs once and every
+	// call shares one SSH connection over one WireGuard tunnel.
+	if client, ok := a.nodeClients[name]; ok {
+		return client, nil
+	}
 	store, err := host.LoadContextStore("")
 	if err != nil {
 		return nil, err
@@ -46,10 +51,16 @@ func (a *app) nodeClientFor(cmd *cobra.Command, name string) (*nodeClient, error
 	if cmd != nil {
 		autoUpgrade = autoUpgrade || boolFlag(cmd, "auto-upgrade-nodes")
 	}
-	return &nodeClient{
+	remote.KeepAlive()
+	client := &nodeClient{
 		remote: remote, route: current.SSH,
 		operator: current.SSH.User, autoUpgrade: autoUpgrade, stderr: cmd.ErrOrStderr(),
-	}, nil
+	}
+	if a.nodeClients == nil {
+		a.nodeClients = map[string]*nodeClient{}
+	}
+	a.nodeClients[name] = client
+	return client, nil
 }
 
 func (a *app) contextSpecs() []spec {
