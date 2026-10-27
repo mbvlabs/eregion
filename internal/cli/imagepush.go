@@ -125,13 +125,16 @@ func (a *app) imagePush(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, contract.NewFault(contract.Unavailable, "could not start local docker save", boundedDockerOutput(err.Error()))
 	}
 	pushed, pushErr := client.PushImage(saveCtx, appName, tag, stdout, localImage)
-	// Stop a save that is still running when the node refused the stream.
-	cancel()
-	_ = stdout.Close()
-	waitErr := save.Wait()
 	if pushErr != nil {
+		// Stop a save that is still running when the node refused the stream.
+		cancel()
+		_ = stdout.Close()
+		_ = save.Wait()
 		return result{}, pushErr
 	}
+	// The node read the whole stream; let docker save finish on its own.
+	_, _ = io.Copy(io.Discard, stdout)
+	waitErr := save.Wait()
 	if waitErr != nil {
 		if ctx.Err() != nil {
 			return result{}, ctx.Err()
@@ -149,7 +152,8 @@ func (a *app) imagePush(cmd *cobra.Command, args []string) (result, error) {
 	}
 	plain := fmt.Sprintf("Pushed %s to %s\nreference: %s\ntag: %s\nsize: %s\nnext: eregion env update %s <environment> --image %s",
 		localImage, node, pushed.Reference, pushed.TagReference, imageSize(pushed.SizeBytes), appName, pushed.Reference)
-	return result{data: pushed, plain: plain}, nil
+	next := []string{fmt.Sprintf("eregion env update %s <environment> --image %s", appName, pushed.Reference)}
+	return result{data: pushed, plain: plain, next: next}, nil
 }
 
 func localDockerImageID(ctx context.Context, image string) (string, error) {

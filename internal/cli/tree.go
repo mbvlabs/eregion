@@ -118,7 +118,9 @@ func (a *app) command(s spec) *cobra.Command {
 			a.started = true
 			res, err := s.run(cmd, args)
 			res.command = cmd.CommandPath()
-			res.next = concreteNext(cmd, args, s.meta.Next)
+			if res.next == nil {
+				res.next = concreteNext(cmd, args, s.meta.Next)
+			}
 			a.result = res
 			return err
 		}
