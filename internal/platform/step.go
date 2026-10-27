@@ -1020,9 +1020,15 @@ func validateLabelKey(key string) error {
 	return nil
 }
 
+// maxPlatformArgs bounds one node command: up to 64 configuration keys and
+// 128 secrets as -e pairs, 128 process arguments, and the fixed options.
+const maxPlatformArgs = 1024
+
 func validateArgv(argv []string) error {
-	if len(argv) == 0 || len(argv) > 64 {
-		return errors.New("a platform command needs 1–64 arguments")
+	// Each configuration key and secret is one -e argument besides the image,
+	// options and process arguments, so a real environment needs room.
+	if len(argv) == 0 || len(argv) > maxPlatformArgs {
+		return fmt.Errorf("a platform command needs 1–%d arguments", maxPlatformArgs)
 	}
 	for _, arg := range argv {
 		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {

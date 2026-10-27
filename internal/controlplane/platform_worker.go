@@ -164,6 +164,15 @@ func (w *platformWorker) settle(ctx context.Context, id contract.OperationID, at
 	if errors.Is(err, errPlatformCancelled) {
 		return w.service.cancelPlatform(ctx, id, attempt, "Cancellation acknowledged at a step boundary; completed effects were not rolled back.")
 	}
+	if errors.Is(err, engine.ErrPermanent) {
+		// A retry cannot fix a permanent step failure: fail the operation now
+		// and keep the reason, instead of letting River retry it silently.
+		message := err.Error()
+		if w.service.redaction != nil {
+			message = w.service.redaction.Redact(message)
+		}
+		return w.service.failPlatformOperation(ctx, id, attempt, contract.PreconditionFailed, message)
+	}
 	fault := contract.Classify(err)
 	if reason, ok := IsPlacementViolation(err); ok {
 		// A refusal is also an event, so an agent reading the operation sees the
