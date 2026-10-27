@@ -35,3 +35,19 @@ func TestContainerStepAcceptsBareAndPrefixedLabels(t *testing.T) {
 		t.Fatal("an invalid DNS prefix was accepted")
 	}
 }
+
+func TestProcessCommandArgsUseTheLauncherOnlyForBuildpacksImages(t *testing.T) {
+	for _, tc := range []struct {
+		command    []string
+		buildpacks bool
+		want       string
+	}{
+		{nil, false, "img"},
+		{[]string{"web"}, true, "--entrypoint /cnb/lifecycle/launcher img -- web"},
+		{[]string{"/app/bin/queue", "--workers", "4"}, false, "--entrypoint /app/bin/queue img --workers 4"},
+	} {
+		if got := strings.Join(processCommandArgs("img", tc.command, tc.buildpacks), " "); got != tc.want {
+			t.Errorf("processCommandArgs(%q, %v) = %q, want %q", tc.command, tc.buildpacks, got, tc.want)
+		}
+	}
+}

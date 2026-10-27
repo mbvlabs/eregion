@@ -356,7 +356,7 @@ func (s *ContainerStep) Apply(ctx context.Context, rt engine.Runtime, report eng
 	removeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	_, _, _ = runArgv(removeCtx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
 	cancel()
-	args, env, err := s.runArgs(s.payload.Image, rt)
+	args, env, err := s.runArgs(ctx, s.payload.Image, rt)
 	if err != nil {
 		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
 	}
@@ -365,7 +365,7 @@ func (s *ContainerStep) Apply(ctx context.Context, rt engine.Runtime, report eng
 	cancel()
 	if err != nil {
 		if s.payload.FallbackImage != "" {
-			fallbackArgs, fallbackEnv, fallbackEnvErr := s.runArgs(s.payload.FallbackImage, rt)
+			fallbackArgs, fallbackEnv, fallbackEnvErr := s.runArgs(ctx, s.payload.FallbackImage, rt)
 			if fallbackEnvErr != nil {
 				return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, fallbackEnvErr)
 			}
@@ -449,7 +449,7 @@ func ParsePublishedPort(output string, containerPort int) (int, error) {
 	return fallback, nil
 }
 
-func (s *ContainerStep) runArgs(image string, rt engine.Runtime) ([]string, []string, error) {
+func (s *ContainerStep) runArgs(ctx context.Context, image string, rt engine.Runtime) ([]string, []string, error) {
 	args := []string{"docker", "run", "-d", "--name", s.payload.Name, "--pull", "never", "--restart", s.payload.Restart}
 	if s.payload.Publish {
 		args = append(args, "-p", PublishArgument(s.payload.Bind, s.payload.HostPort, s.payload.ContainerPort))
@@ -475,15 +475,37 @@ func (s *ContainerStep) runArgs(image string, rt engine.Runtime) ([]string, []st
 		args = append(args, "-e", key)
 		env = append(env, key+"="+value)
 	}
-	if len(s.payload.Command) > 0 {
-		args = append(args, "--entrypoint", "/cnb/lifecycle/launcher")
-	}
-	args = append(args, image)
-	if len(s.payload.Command) > 0 {
-		args = append(args, "--")
-		args = append(args, s.payload.Command...)
-	}
+	args = append(args, processCommandArgs(image, s.payload.Command, buildpacksImage(ctx, image, rt, s.ID()))...)
 	return args, env, nil
+}
+
+// buildpacksLabel marks an image built by Cloud Native Buildpacks.
+const buildpacksLabel = "io.buildpacks.lifecycle.metadata"
+
+// buildpacksImage reports whether image was built by Cloud Native Buildpacks,
+// whose process commands run through the CNB launcher. A plain image has no
+// launcher; its process command replaces the entrypoint instead.
+func buildpacksImage(ctx context.Context, image string, rt engine.Runtime, step string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	stdout, _, err := runArgv(probeCtx, []string{"docker", "inspect", "--type=image", "--format", "{{index .Config.Labels \"" + buildpacksLabel + "\"}}", image}, nil, rt, step, nil)
+	value := strings.TrimSpace(stdout)
+	return err == nil && value != "" && value != "<no value>"
+}
+
+// processCommandArgs is the image and command part of docker run. A
+// Buildpacks image runs the command through its launcher, which sets up the
+// buildpack environment; a plain image runs it as the entrypoint. With no
+// command the image's own entrypoint and command run.
+func processCommandArgs(image string, command []string, buildpacks bool) []string {
+	switch {
+	case len(command) == 0:
+		return []string{image}
+	case buildpacks:
+		return append([]string{"--entrypoint", "/cnb/lifecycle/launcher", image, "--"}, command...)
+	default:
+		return append([]string{"--entrypoint", command[0], image}, command[1:]...)
+	}
 }
 
 // -------------------------------------------------------------- health step
