@@ -58,3 +58,13 @@ func TestNodeUpgradeModePushesOrFetchesTheVerifiedLinuxBuild(t *testing.T) {
 		})
 	}
 }
+
+func TestInventoryParamsCarryTheCollection(t *testing.T) {
+	query, err := rpcInventoryParams{Collection: "apps", Filters: map[string][]string{"limit": {"50"}}}.query()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if query.Collection != "apps" || query.Limit != 50 {
+		t.Fatalf("query = %+v", query)
+	}
+}

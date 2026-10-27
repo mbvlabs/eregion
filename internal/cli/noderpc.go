@@ -135,6 +135,18 @@ type rpcInventoryParams struct {
 	Filters    map[string][]string `json:"filters,omitempty"`
 }
 
+// query parses the filters with the collection the client sends separately.
+func (p rpcInventoryParams) query() (platform.InventoryQuery, error) {
+	filters := url.Values{}
+	for key, values := range p.Filters {
+		filters[key] = values
+	}
+	if p.Collection != "" {
+		filters.Set("collection", p.Collection)
+	}
+	return api.ParseInventoryQueryValues(filters)
+}
+
 type rpcSecretParams struct {
 	App              string `json:"app"`
 	Environment      string `json:"environment"`
@@ -1119,15 +1131,9 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		if err := decodeRPCParams(request.Params, &params); err != nil {
 			return nil, err
 		}
-		query, err := api.ParseInventoryQueryValues(params.Filters)
+		query, err := params.query()
 		if err != nil {
 			return nil, err
-		}
-		if params.Collection != "" {
-			query.Collection = params.Collection
-		}
-		if query.Collection == "" {
-			return nil, contract.NewFault(contract.InputRequired, "inventory collection is required", "Use summary, nodes, apps, environments, releases, deployments, or changes.")
 		}
 		return app.Inventory(ctx, actor, query)
 	case methodOperationsList:
