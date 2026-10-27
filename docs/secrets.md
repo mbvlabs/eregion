@@ -43,7 +43,7 @@ eregion secret export --app api --environment production --name DATABASE_URL --d
 Set reads an absolute protected file, creates/rotates under compare-and-swap and
 returns metadata, not a value. Export creates a new explicit 0600 file with
 `O_EXCL`; it never overwrites or prints plaintext. Values are 1–32768 bytes, no
-NUL; trailing newlines are not trimmed. Secret names match
+NUL; one trailing line break from the file is dropped. Secret names match
 `^[A-Z][A-Z0-9_]{0,127}$`. Revisions are immutable; archival retains them.
 
 Vault writes are direct credential transactions, not ordinary queued actions
