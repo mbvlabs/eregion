@@ -314,9 +314,15 @@ func (n *nodeClient) progress(event rpc.EventBody) {
 	if message == "" {
 		message = event.Kind
 	}
-	if message != "" {
-		fmt.Fprintln(n.stderr, message)
+	if message == "" {
+		return
 	}
+	// A host step's lines name the step: the first is the reason it applies,
+	// the rest are its script's output.
+	if event.Step != "" && message != event.Step {
+		message = event.Step + ": " + message
+	}
+	fmt.Fprintln(n.stderr, message)
 }
 
 func (n *nodeClient) SetSecret(ctx context.Context, namespace vault.Namespace, value []byte, expectedRevision uint64) (vault.Metadata, error) {

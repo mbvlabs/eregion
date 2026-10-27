@@ -77,6 +77,7 @@ type Event struct {
 // text for ordinary progress events.
 type EventBody struct {
 	Kind    string   `json:"kind,omitempty"`
+	Step    string   `json:"step,omitempty"`
 	Message string   `json:"message,omitempty"`
 	Log     *LogLine `json:"log,omitempty"`
 }

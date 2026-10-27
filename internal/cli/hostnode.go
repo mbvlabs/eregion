@@ -101,7 +101,7 @@ func hostProgress(out io.Writer, registry *secrets.Registry) engine.Reporter {
 		if strings.TrimSpace(message) == "" {
 			message = event.Step
 		}
-		line, err := rpc.MarshalEvent(rpc.EventBody{Kind: event.Kind, Message: message})
+		line, err := rpc.MarshalEvent(rpc.EventBody{Kind: event.Kind, Step: event.Step, Message: message})
 		if err != nil {
 			return
 		}
