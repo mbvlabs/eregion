@@ -10,7 +10,9 @@ import (
 )
 
 func TestTunnelSocketPathIsPrivateAndStable(t *testing.T) {
-	dir, err := os.MkdirTemp("", "eregion-tunnel")
+	// /tmp keeps the socket path under sun_path; macOS's TMPDIR is long
+	// enough to force the fallback location.
+	dir, err := os.MkdirTemp("/tmp", "er")
 	if err != nil {
 		t.Fatal(err)
 	}
