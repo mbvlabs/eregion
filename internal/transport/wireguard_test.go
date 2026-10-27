@@ -266,6 +266,8 @@ func TestWireGuardTunnelGoesDownAndReconnects(t *testing.T) {
 	if got := countEffects(t, wg.server.config.StateDir, second); got != 1 {
 		t.Fatalf("the reconnect wrote %d effects", got)
 	}
+	wg.server.waitTaskExit(t, first)
+	wg.server.waitTaskExit(t, second)
 }
 
 func TestWireGuardLostTunnelAfterDispatchRecoversThroughStatus(t *testing.T) {

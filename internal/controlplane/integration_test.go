@@ -487,7 +487,7 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	_ = reserved.Close()
 	endpoint := "http://" + address
 	nodeDir := t.TempDir()
-	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile, "EREGION_NODE_STATE_DIR="+nodeDir)
+	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile, "EREGION_NODE_STATE_DIR="+nodeDir, "EREGION_NODE_NAME=local")
 	start := func(args ...string) (*exec.Cmd, <-chan error) {
 		command := exec.Command(binary, args...)
 		command.Env = environment

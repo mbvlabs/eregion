@@ -48,11 +48,13 @@ var (
 func wordlist() []string {
 	wordsOnce.Do(func() {
 		for _, line := range strings.Split(wordlistRaw, "\n") {
-			if fields := strings.Fields(line); len(fields) == 2 {
+			// Words are joined with hyphens, so the four hyphenated entries
+			// (drop-down, felt-tip, t-shirt, yo-yo) are left out.
+			if fields := strings.Fields(line); len(fields) == 2 && !strings.Contains(fields[1], "-") {
 				words = append(words, fields[1])
 			}
 		}
-		if len(words) != 7776 {
+		if len(words) != 7772 {
 			panic("embedded EFF wordlist is damaged")
 		}
 	})
