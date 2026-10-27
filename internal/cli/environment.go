@@ -255,7 +255,7 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 	guided := false
 	var diff []string
 	if len(changed) == 0 && !webhookRequested && humanInteractive(cmd) {
-		edit, err := a.envUpdateGuided(current)
+		edit, err := a.envUpdateGuided(cmd, current)
 		if err != nil {
 			clearBytes(credential)
 			return result{}, setupPromptError("env update", err)

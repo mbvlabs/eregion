@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"github.com/spf13/cobra"
 	"maps"
 	"os"
 	"slices"
@@ -40,7 +41,7 @@ type guidedUpdateAnswers struct {
 // envUpdateGuided asks for the current revision's editable fields, prefilled.
 // It never submits or writes a vault value; the caller previews the patch and
 // confirms before doing either.
-func (a *app) envUpdateGuided(current platform.Environment) (*guidedEnvironmentUpdate, error) {
+func (a *app) envUpdateGuided(cmd *cobra.Command, current platform.Environment) (*guidedEnvironmentUpdate, error) {
 	base := revisionStateOf(current)
 	var credential []byte
 	keep := false
@@ -50,11 +51,11 @@ func (a *app) envUpdateGuided(current platform.Environment) (*guidedEnvironmentU
 		}
 	}()
 
-	node, err := askValidated("Application node", "The node runs the containers; it must have the application role and docker capability", current.Node, platform.ValidateName)
+	node, err := a.askNode(cmd, "Application node", "Runs the containers", current.Node, platform.RoleApplication, platform.CapabilityDocker, "", "")
 	if err != nil {
 		return nil, err
 	}
-	buildNode, err := askValidated("Builder node", "Empty builds on the application node", current.BuildNode, validateOptionalName)
+	buildNode, err := a.askNode(cmd, "Builder node", "Runs the Buildpacks builds", current.BuildNode, platform.RoleBuilder, platform.CapabilityBuildpacks, "The application node", node)
 	if err != nil {
 		return nil, err
 	}

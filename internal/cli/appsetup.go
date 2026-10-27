@@ -309,19 +309,14 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		ans.Environment = value
 	}
 	if interactive && !flagChanged(cmd, "node") {
-		value, err := askValidated("Application node", "The node runs the containers and must have the application role and docker capability", ans.Node, platform.ValidateName)
+		value, err := a.askNode(cmd, "Application node", "Runs the containers", ans.Node, platform.RoleApplication, platform.CapabilityDocker, "", "")
 		if err != nil {
 			return nil, err
 		}
 		ans.Node = value
 	}
 	if interactive && !flagChanged(cmd, "build-node") {
-		value, err := askValidated("Builder node", "Empty builds on the application node; a distinct builder needs builder + buildpacks", ans.BuildNode, func(value string) error {
-			if value == "" {
-				return nil
-			}
-			return platform.ValidateName(value)
-		})
+		value, err := a.askNode(cmd, "Builder node", "Runs the Buildpacks builds", ans.BuildNode, platform.RoleBuilder, platform.CapabilityBuildpacks, "The application node", ans.Node)
 		if err != nil {
 			return nil, err
 		}
