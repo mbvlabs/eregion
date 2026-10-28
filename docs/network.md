@@ -8,15 +8,17 @@ things must not be conflated: **domain binding**, **Caddy route**, **DNS record*
 ```sh
 eregion domain add hello production hello.example.com --dry-run --json
 eregion domain add hello production hello.example.com --primary --json
+eregion domain add hello production admin.example.com --check-path /users/sign-in --json
 eregion domain list --app hello --environment production --json
 eregion domain remove hello production hello.example.com --dry-run --json
 eregion domain remove hello production hello.example.com --confirm <token> --json
 ```
 
-App and env must already exist, migrations through 013 must be applied, and Caddy
+App and env must already exist, migrations through 016 must be applied, and Caddy
 must have been installed by setup with a public main hostname. Only local/main-node
 environments can receive these domain bindings. `domain add` is idempotent for the
-same binding; `--primary` promotes it and demotes the current primary. Every
+same binding; `--primary` promotes it and demotes the current primary, and
+`--check-path` sets that binding's HTTP observation path. Every
 environment has at most one primary (partial unique index). Removing the primary is
 refused: promote another hostname first.
 
@@ -24,11 +26,11 @@ The binding, route, DNS record, certificate and public response are separate:
 
 | Fact | Where it lives | Meaning |
 | --- | --- | --- |
-| Binding | `eregion_platform_domains` row | Desired hostname, environment and primary flag. Accepted intent only. |
+| Binding | `eregion_platform_domains` row | Desired hostname, environment, primary flag and optional `--check-path`. Accepted intent only. Empty `check_path` uses the environment's web health path. |
 | Route | `desired_revision`/`applied_revision`, `route_state`, `route_error` | Caddy accepted and loaded a routes file containing that domain. A pending/failed row does not delete the binding. |
 | DNS | `expected_addresses`, `dns_state` (`pending`/`ok`/`wrong`/`proxied`), `dns_addresses`, `dns_error` | 1.1.1.1 and 8.8.8.8 answers over UDP compared with the main node's public address. Wrong never becomes ready; a Cloudflare-proxied record reaches the node and counts like a direct one. |
 | Certificate | `certificate_state` (`pending`/`valid`/`failed`), `certificate_not_after`, `certificate_error` | TLS handshake to the hostname through local Caddy with SNI, chain and name verified against system roots. |
-| Public response | `public_state` (`pending`/`ok`/`failed`), `public_status`, `public_error` | HTTP response through local Caddy with the real hostname, using the environment revision's health path. |
+| Public response | `public_state` (`pending`/`ok`/`failed`), `public_status`, `public_error` | HTTP response through local Caddy with the real hostname, using that binding's check path (default: the environment revision's web health path). |
 
 `domain add` prints the exact A/AAAA record from the current context's WireGuard
 endpoint (the main node's public address) and records it as `expected_addresses`.
@@ -56,8 +58,13 @@ Route path:
    current table under the lock.
 
 A second periodic job observes DNS, certificate and public response separately
-(every five minutes and on worker start). Observations never change the binding or
-the route; a later run overwrites them. The command's success message proves an
+(every five minutes and on worker start). It walks every domain binding in keyset
+pages, using each binding's own check path, so an alias that serves no health
+route can still become ready. Observations never change the binding or the route;
+a later run overwrites them. A deploy's public verification uses the primary
+binding's check path and records `public check https://<host><path> → <status>`
+events; aliases are reported by the observer and are not deploy gates. The
+command's success message proves an
 accepted operation, not DNS, TLS or a healthy app; only `domain list` readiness
 aggregates all four observations.
 

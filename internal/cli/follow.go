@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/x/term"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/tui"
 	"github.com/mbvlabs/eregion/internal/viewer"
@@ -226,8 +225,13 @@ func (a *app) followJSON(cmd *cobra.Command, client Backend, id contract.Operati
 func (a *app) followPlain(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
 	presenter := viewer.NewPlain(config.out, config.err, clean)
 	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, presenter.Observe)
+	observedOK := err == nil
 	err = followError(summary, err)
-	if finishErr := presenter.Finish(summary, err, resumeCommand+" "+string(id), time.Now()); finishErr != nil && err == nil {
+	presentationErr := err
+	if observedOK {
+		presentationErr = nil // Keep the terminal outcome card for an observed failure.
+	}
+	if finishErr := presenter.Finish(summary, presentationErr, resumeCommand+" "+string(id), time.Now()); finishErr != nil && err == nil {
 		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
 	}
 	return result{data: newFollowResult(summary), streamed: true}, err
@@ -285,10 +289,15 @@ func (a *app) followInteractive(cmd *cobra.Command, client Backend, id contract.
 		In:            config.in,
 		Out:           config.out,
 	}, producer)
+	observedOK := err == nil
 	err = followError(summary, err)
+	presentationErr := err
+	if observedOK {
+		presentationErr = nil
+	}
 	// Bubble Tea restores the terminal on exit. Leave a stable, copyable summary.
 	presenter := viewer.NewPlain(config.out, config.err, clean)
-	if finishErr := presenter.Finish(summary, err, resumeCommand+" "+string(id), time.Now()); finishErr != nil && err == nil {
+	if finishErr := presenter.Finish(summary, presentationErr, resumeCommand+" "+string(id), time.Now()); finishErr != nil && err == nil {
 		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
 	}
 	return result{data: newFollowResult(summary), streamed: true}, err
@@ -305,12 +314,10 @@ func cleanEvent(event *contract.Event, clean viewer.Cleaner) {
 	}
 }
 
-// followError turns a detach into a contract fault with identity and a resume
-// command. The operation is never cancelled by leaving the viewer.
+// followError maps observed terminal outcomes and observation errors to CLI
+// faults. A failed operation is not a successful command just because polling
+// succeeded. Leaving the viewer never requests operation cancellation.
 func followError(summary viewer.Summary, err error) error {
-	if err == nil {
-		return nil
-	}
 	if summary.Detached || errors.Is(err, context.Canceled) {
 		return &contract.Fault{
 			Code:    contract.Cancelled,
@@ -318,6 +325,33 @@ func followError(summary viewer.Summary, err error) error {
 			Hint:    "Resume with " + resumeCommand + " " + string(summary.OperationID) + ".",
 			Details: viewer.FaultDetails(summary, resumeCommand),
 			Cause:   err,
+		}
+	}
+	if err == nil {
+		details := viewer.FaultDetails(summary, resumeCommand)
+		details["state"] = summary.State
+		if summary.ErrorCode != "" {
+			details["error_code"] = summary.ErrorCode
+		}
+		switch summary.State {
+		case contract.Failed:
+			code := summary.ErrorCode
+			if !contract.KnownCode(code) || code == contract.Cancelled {
+				code = contract.PreconditionFailed
+			}
+			return &contract.Fault{
+				Code: code, Message: "operation failed",
+				Hint:    "Inspect operation events before submitting again.",
+				Details: details,
+			}
+		case contract.Canceled:
+			return &contract.Fault{
+				Code: contract.Cancelled, Message: "operation was cancelled",
+				Hint:    "Inspect operation state before submitting again.",
+				Details: details,
+			}
+		default:
+			return nil
 		}
 	}
 	fault := contract.Classify(err)
@@ -330,15 +364,11 @@ func followError(summary viewer.Summary, err error) error {
 }
 
 func apiEndpoint(cmd *cobra.Command) string {
-	store, err := host.LoadContextStore("")
-	if err != nil {
+	current, err := selectedContext(cmd)
+	if err != nil || current.SSH == nil {
 		return ""
 	}
-	context, err := store.Get("")
-	if err != nil {
-		return ""
-	}
-	return "ssh " + context.SSH.User + "@" + context.SSH.Address
+	return "ssh " + current.SSH.User + "@" + current.SSH.Address
 }
 
 type terminalFile interface {

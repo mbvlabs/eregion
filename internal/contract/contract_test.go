@@ -179,6 +179,22 @@ func TestOperationErrorCodeIsMachineReadable(t *testing.T) {
 	if err := withoutCode.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	// A create may expose the deploy it queued in the same transaction. The
+	// field is optional and must be a real operation ID when present.
+	first := operation
+	first.FirstDeployOperationID = OperationID("op_" + strings.Repeat("b", 32))
+	if err := first.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = json.Marshal(first)
+	if err != nil || !strings.Contains(string(raw), `"first_deploy_operation_id":"op_`) {
+		t.Fatalf("first deploy identity is not on the wire: %s %v", raw, err)
+	}
+	badFirst := first
+	badFirst.FirstDeployOperationID = "deploy-1"
+	if badFirst.Validate() == nil {
+		t.Fatal("an invalid first deploy operation ID was accepted")
+	}
 }
 
 func TestEventErrorCodeOnlyOnAFailedState(t *testing.T) {

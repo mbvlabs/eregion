@@ -35,6 +35,21 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 	}
 	canonical := normalized.Canonical
 	inputHash := hashInput(canonical)
+	// A completed replay returns before any submission-side effect. Resolving a
+	// git ref needs the remote, and an unreachable remote must not turn an
+	// identical replay of an already-accepted operation into `unavailable`.
+	if existing, found, err := s.replaySubmission(ctx, sub.Kind, normalized.Target.String(), sub.Actor, sub.IdempotencyKey, inputHash); err != nil {
+		return existing, err
+	} else if found {
+		if err := attachFirstDeployOperation(ctx, s.pool, &existing); err != nil {
+			return contract.Operation{}, err
+		}
+		return existing, nil
+	}
+	resolved, err := s.resolveSubmissionGitRef(ctx, normalized)
+	if err != nil {
+		return zero, err
+	}
 	id, err := contract.NewOperationID()
 	if err != nil {
 		return zero, err
@@ -63,11 +78,18 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 			return zero, unavailable()
 		}
 		if existingHash != inputHash {
-			return zero, contract.NewFault(contract.Conflict, "idempotency key already binds different inputs", "Use the original inputs to recover the existing operation; use a new key only for deliberately new work.")
+			return zero, idempotencyInputConflict()
 		}
-		return scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
+		existing, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
+		if err != nil {
+			return zero, err
+		}
+		if err := attachFirstDeployOperation(ctx, tx, &existing); err != nil {
+			return zero, err
+		}
+		return existing, nil
 	}
-	if err := s.preparePlatform(ctx, tx, id, normalized, sub.Actor); err != nil {
+	if err := s.preparePlatform(ctx, tx, id, normalized, sub.Actor, resolved); err != nil {
 		return zero, err
 	}
 	if s.enqueuePlatform == nil {
@@ -85,6 +107,9 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 	if err != nil {
 		return zero, unavailable()
 	}
+	if err := attachFirstDeployOperation(ctx, tx, &op); err != nil {
+		return zero, err
+	}
 	if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: platformAcceptedMessage(sub.Kind)}); err != nil {
 		return zero, unavailable()
 	}
@@ -98,6 +123,68 @@ func hashInput(canonical json.RawMessage) string {
 	// hashInput keeps the canonical digest identical to the diagnostic path.
 	// It is intentionally a helper, not a second persistence format.
 	return sha256Hex(canonical)
+}
+
+func idempotencyInputConflict() error {
+	return contract.NewFault(contract.Conflict, "idempotency key already binds different inputs", "Use the original inputs to recover the existing operation; use a new key only for deliberately new work.")
+}
+
+// replaySubmission returns the operation an identical submission already
+// created. It deliberately runs before git ref resolution so a replay of an
+// accepted operation never depends on the remote being reachable. The
+// transaction's ON CONFLICT remains the arbiter for concurrent first
+// submissions; this read only short-circuits a completed replay.
+func (s *Service) replaySubmission(ctx context.Context, kind, target string, actor contract.Actor, key, inputHash string) (contract.Operation, bool, error) {
+	var existingID contract.OperationID
+	var existingHash string
+	err := s.pool.QueryRow(ctx, `SELECT id,input_hash FROM eregion_operations
+        WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5`,
+		actor.Kind, actor.Subject, kind, target, key).Scan(&existingID, &existingHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return contract.Operation{}, false, nil
+	}
+	if err != nil {
+		return contract.Operation{}, false, unavailable()
+	}
+	if existingHash != inputHash {
+		return contract.Operation{}, true, idempotencyInputConflict()
+	}
+	op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
+	if err != nil {
+		return contract.Operation{}, true, unavailable()
+	}
+	return op, true, nil
+}
+
+// rowQueryer is the read surface shared by pgxpool.Pool and pgx.Tx. The
+// first-deploy lookup must run inside the create transaction so the returned
+// ID is part of the same accepted submission.
+type rowQueryer interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// attachFirstDeployOperation exposes the deploy operation an app or
+// environment create queued in its own transaction. A create without deploy
+// intent has no such row, so the field stays empty rather than being invented.
+func attachFirstDeployOperation(ctx context.Context, q rowQueryer, op *contract.Operation) error {
+	if op.Kind != platform.KindAppCreate && op.Kind != platform.KindEnvironmentCreate {
+		return nil
+	}
+	var id contract.OperationID
+	err := q.QueryRow(ctx, `SELECT o.id
+        FROM eregion_platform_environment_revisions r
+        JOIN eregion_operations o ON o.idempotency_key = 'first-deploy:' || r.id
+            AND o.kind=$2 AND o.actor_kind=$3 AND o.actor_subject=$4
+        WHERE r.operation_id=$1
+        ORDER BY r.created_at, o.created_at LIMIT 1`, op.ID, platform.KindDeploy, op.Actor.Kind, op.Actor.Subject).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return unavailable()
+	}
+	op.FirstDeployOperationID = id
+	return nil
 }
 
 func platformAcceptedMessage(kind string) string {
@@ -140,7 +227,7 @@ func platformAcceptedMessage(kind string) string {
 	}
 }
 
-func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor) error {
+func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef) error {
 	switch input := normalized.Input.(type) {
 	case *platform.AppCreateInput:
 		appID, err := platform.NewAppID()
@@ -161,7 +248,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 				return err
 			}
 			if input.Deploy {
-				if err := s.queueFirstDeployTx(ctx, tx, envID, actor); err != nil {
+				if err := s.queueFirstDeployTx(ctx, tx, envID, actor, resolved); err != nil {
 					return err
 				}
 			}
@@ -195,7 +282,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		if input.Deploy {
-			if err := s.queueFirstDeployTx(ctx, tx, envID, actor); err != nil {
+			if err := s.queueFirstDeployTx(ctx, tx, envID, actor, resolved); err != nil {
 				return err
 			}
 		}
@@ -264,7 +351,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if env.ServingRelease != "" && env.ServingDeploymentID != "" {
 			target := "env/" + env.App + "/" + env.Name
 			restart := platform.RestartInput{App: env.App, Environment: env.Name}
-			if err := s.submitFollowupOperationTx(ctx, tx, platform.KindRestart, target, restart, actor, "scale-restart:"+string(revisionID)); err != nil {
+			if err := s.submitFollowupOperationTx(ctx, tx, platform.KindRestart, target, restart, actor, "scale-restart:"+string(revisionID), nil); err != nil {
 				return err
 			}
 		}
@@ -430,7 +517,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		}
 		releaseID := input.ReleaseID
 		if releaseID == "" {
-			releaseID, err = s.createReleaseFromRevisionTx(ctx, tx, id, env, input.Ref)
+			releaseID, err = s.createReleaseFromRevisionTx(ctx, tx, id, env, input.Ref, resolved)
 			if err != nil {
 				return err
 			}
@@ -501,6 +588,21 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if release.Status != platform.ReleaseReady {
 			return contract.NewFault(contract.PreconditionFailed, "serving release is not ready", "Deploy a ready release before restarting.")
 		}
+		if input.ExpectedServingDeploymentID != "" {
+			// A maintenance repair names the serving deployment it observed.
+			// The environment row is locked FOR UPDATE by this transaction, so
+			// a deploy accepted before this submission is visible here.
+			active, err := activeEnvironmentOperations(ctx, tx, env.App, env.Name, id)
+			if err != nil {
+				return err
+			}
+			if input.ExpectedServingDeploymentID != env.ServingDeploymentID {
+				return contract.NewFault(contract.PreconditionFailed, "serving deployment changed before the repair was queued", "The next maintenance run will re-observe the serving workload.")
+			}
+			if !repairSubmissionAllowed(input.ExpectedServingDeploymentID, env.ServingDeploymentID, active) {
+				return contract.NewFault(contract.Conflict, "environment has an active deploy, restart or rollback operation", "Let the current operation finish; the next maintenance run will re-observe.")
+			}
+		}
 		if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
 			return err
 		}
@@ -564,6 +666,9 @@ func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.En
 	case err == nil:
 		// Re-adding the same binding is idempotent; --primary promotes it and
 		// refreshes the recorded main-node addresses for DNS observation.
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET check_path=$2 WHERE name=$1`, input.Domain, input.CheckPath); err != nil {
+			return unavailable()
+		}
 		if len(input.Addresses) > 0 {
 			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET expected_addresses=$2 WHERE name=$1`, input.Domain, input.Addresses); err != nil {
 				return unavailable()
@@ -591,8 +696,8 @@ func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.En
 				return unavailable()
 			}
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary,expected_addresses)
-            VALUES($1,$2,$3,$4)`, input.Domain, env.ID, primary, input.Addresses); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary,expected_addresses,check_path)
+            VALUES($1,$2,$3,$4,$5)`, input.Domain, env.ID, primary, input.Addresses, input.CheckPath); err != nil {
 			return platformWriteError(err, input.Domain+" is already routed")
 		}
 	default:
@@ -640,6 +745,9 @@ func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platf
 }
 
 func (s *Service) prepareDeploymentTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, releaseID platform.ReleaseID, action platform.DeploymentAction, revisionID platform.RevisionID, previousDeploymentID platform.DeploymentID, secretRevisions []byte) error {
+	if err := checkReleaseCommandForDeploymentTx(ctx, tx, releaseID, revisionID, action); err != nil {
+		return err
+	}
 	depID, err := platform.NewDeploymentID()
 	if err != nil {
 		return unavailable()
@@ -668,15 +776,132 @@ func nullableDeploymentID(id platform.DeploymentID) any {
 	return string(id)
 }
 
+// resolvedGitRef is the exact commit a submission resolved before its
+// transaction opened. The transaction checks the URL and ref against the
+// revision it reads, so a concurrent revision change cannot record a commit
+// that belongs to another source.
+type resolvedGitRef struct {
+	Kind string
+	URL  string
+	Ref  string
+	SHA  string
+}
+
+// resolveSubmissionGitRef resolves a git ref before the submission transaction
+// opens for every path that creates a release from an environment revision:
+// deploy, CI and the webhook (which already sends a commit), and the first
+// deploy requested by app or env create. A failure here creates no operation.
+func (s *Service) resolveSubmissionGitRef(ctx context.Context, normalized platform.Normalized) (*resolvedGitRef, error) {
+	switch input := normalized.Input.(type) {
+	case *platform.DeployInput:
+		if input.ReleaseID != "" {
+			return nil, nil
+		}
+		env, err := s.environment(ctx, input.App, input.Environment)
+		if err != nil {
+			return nil, err
+		}
+		if env.Revision == nil {
+			return nil, nil
+		}
+		if env.Revision.Source.Kind != "git" {
+			// Record the kind so a revision that becomes git before the
+			// transaction opens conflicts instead of taking the git branch
+			// without an exact commit.
+			return &resolvedGitRef{Kind: env.Revision.Source.Kind, URL: env.Revision.Source.URL}, nil
+		}
+		ref := input.Ref
+		if ref == "" {
+			ref = env.Revision.Source.Ref
+		}
+		return s.resolveGitSourceRef(ctx, env.App, env.Name, env.Revision.Source, ref)
+	case *platform.AppCreateInput:
+		if !input.Deploy || input.Environment == nil {
+			return nil, nil
+		}
+		if input.Environment.Source.Kind != "git" {
+			return &resolvedGitRef{Kind: input.Environment.Source.Kind, URL: input.Environment.Source.URL}, nil
+		}
+		return s.resolveGitSourceRef(ctx, input.Name, input.Environment.Name, input.Environment.Source, input.Environment.Source.Ref)
+	case *platform.EnvironmentCreateInput:
+		if !input.Deploy {
+			return nil, nil
+		}
+		if input.Source.Kind != "git" {
+			return &resolvedGitRef{Kind: input.Source.Kind, URL: input.Source.URL}, nil
+		}
+		return s.resolveGitSourceRef(ctx, input.App, input.Name, input.Source, input.Source.Ref)
+	}
+	return nil, nil
+}
+
+func (s *Service) resolveGitSourceRef(ctx context.Context, app, environment string, source platform.SourceBinding, ref string) (*resolvedGitRef, error) {
+	// A submission that already carries a commit (the CI and webhook paths) needs
+	// no repository read and no credential. It is already exact.
+	if platform.IsGitCommit(ref) {
+		return &resolvedGitRef{Kind: "git", URL: source.URL, Ref: ref, SHA: ref}, nil
+	}
+	var credential []byte
+	if source.CredentialSecretName != "" {
+		value, _, err := s.resolveCredentialSecret(ctx, platform.Environment{App: app, Name: environment}, source.CredentialSecretName)
+		if err != nil {
+			return nil, err
+		}
+		credential = []byte(value)
+	}
+	resolve := s.resolveGitRef
+	if resolve == nil {
+		resolve = platform.ResolveGitRef
+	}
+	sha, err := resolve(ctx, source.URL, ref, credential)
+	if err != nil {
+		return nil, err
+	}
+	return &resolvedGitRef{Kind: "git", URL: source.URL, Ref: ref, SHA: sha}, nil
+}
+
+// sourceChangedDuringSubmission is the single conflict used when the revision
+// read by the transaction differs from the one the ref was resolved against.
+func sourceChangedDuringSubmission() error {
+	return contract.NewFault(contract.Conflict, "environment source changed during submission; retry", "Retry the deploy with the environment's current revision.")
+}
+
+// checkResolvedGitSource compares the submission-time resolution against the
+// revision the transaction reads. A source-kind change can never fall through
+// to another branch: a git source that became an image has no commit to record.
+// An explicit --ref owns the effective ref, so only a URL change conflicts then.
+func checkResolvedGitSource(resolved *resolvedGitRef, source platform.SourceBinding, refOverride string) error {
+	if resolved == nil || resolved.Kind != source.Kind {
+		return sourceChangedDuringSubmission()
+	}
+	if source.Kind != "git" {
+		return nil
+	}
+	if resolved.URL != source.URL {
+		return sourceChangedDuringSubmission()
+	}
+	if refOverride == "" && resolved.Ref != source.Ref {
+		return sourceChangedDuringSubmission()
+	}
+	if refOverride != "" && resolved.Ref != refOverride {
+		return sourceChangedDuringSubmission()
+	}
+	return nil
+}
+
 // createReleaseFromRevisionTx records the pending release and build for a
-// deploy from the environment's current revision. The worker resolves the git
-// ref to an exact commit, builds, records the digest, then deploys.
-func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, refOverride string) (platform.ReleaseID, error) {
+// deploy from the environment's current revision. The ref was resolved to an
+// exact commit before the transaction; the commit is recorded on both rows
+// before any build starts, and the worker only builds that commit.
+func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, refOverride string, resolved *resolvedGitRef) (platform.ReleaseID, error) {
 	if env.Revision == nil {
 		return "", contract.NewFault(contract.PreconditionFailed, "environment has no current revision", "Save an environment revision before deploying.")
 	}
 	state := env.Revision.RevisionState
 	source := state.Source
+	if err := checkResolvedGitSource(resolved, source, refOverride); err != nil {
+		return "", err
+	}
 	if refOverride != "" && source.Kind != "git" {
 		return "", contract.NewFault(contract.ValidationFailed, "ref is only valid for a git source", "Omit ref when the environment revision binds an image.")
 	}
@@ -703,6 +928,10 @@ func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, op
 		if err := platform.ValidateGitSourceURL(source.URL); err != nil {
 			return "", contract.NewFault(contract.PreconditionFailed, "the environment's git source is invalid", err.Error())
 		}
+		if !platform.IsGitCommit(resolved.SHA) {
+			return "", contract.NewFault(contract.PreconditionFailed, "the git ref did not resolve to an exact commit", "Retry the deploy so the ref resolves to a full commit SHA.")
+		}
+		commit = resolved.SHA
 		buildSource = platform.Source{
 			Type: "git", URL: source.URL, Ref: ref, Path: source.ContextPath,
 			CredentialSecretName: source.CredentialSecretName,
@@ -750,15 +979,11 @@ func (s *Service) createRetryReleaseTx(ctx context.Context, tx pgx.Tx, opID cont
 	if err := platform.ValidateImage(image); err != nil {
 		return err
 	}
-	if old.Source.Type == "git" {
-		if old.CommitSHA != "" {
-			old.Source.Ref = old.CommitSHA
-		}
-		if old.Source.Ref == "" {
-			return contract.NewFault(contract.PreconditionFailed, "build has no exact commit to retry", "Start a new deploy so the ref resolves to a commit first.")
-		}
+	source, commit, err := retryBuildSource(old.Source, old.CommitSHA)
+	if err != nil {
+		return err
 	}
-	sourceJSON, _ := json.Marshal(old.Source)
+	sourceJSON, _ := json.Marshal(source)
 	var buildJSON []byte
 	if oldRelease.Build != nil {
 		buildJSON, _ = json.Marshal(oldRelease.Build)
@@ -770,14 +995,14 @@ func (s *Service) createRetryReleaseTx(ctx context.Context, tx pgx.Tx, opID cont
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_releases
         (id,operation_id,app_id,environment_id,image,source,build,status,commit_sha)
         VALUES($1,$2,$3,$4,$5,$6,$7,'pending',$8)`,
-		releaseID, opID, envAppID(ctx, tx, env.App), env.ID, image, sourceJSON, nullableJSON(buildJSON), old.CommitSHA); err != nil {
+		releaseID, opID, envAppID(ctx, tx, env.App), env.ID, image, sourceJSON, nullableJSON(buildJSON), commit); err != nil {
 		return platformWriteError(err, "retry release could not be recorded")
 	}
 	revisionID := old.RevisionID
 	if revisionID == "" {
 		revisionID = env.RevisionID
 	}
-	buildID, err := insertBuildTx(ctx, tx, opID, env, releaseID, revisionID, old.Source, old.CommitSHA)
+	buildID, err := insertBuildTx(ctx, tx, opID, env, releaseID, revisionID, source, commit)
 	if err != nil {
 		return err
 	}
@@ -785,6 +1010,20 @@ func (s *Service) createRetryReleaseTx(ctx context.Context, tx pgx.Tx, opID cont
 		return unavailable()
 	}
 	return nil
+}
+
+// retryBuildSource selects the exact source a retry rebuilds. A git retry uses
+// only the original build's commit: it never falls back to a branch or tag name
+// that may have moved since that build was accepted.
+func retryBuildSource(source platform.Source, commit string) (platform.Source, string, error) {
+	if source.Type != "git" {
+		return source, commit, nil
+	}
+	if !platform.IsGitCommit(commit) {
+		return source, "", contract.NewFault(contract.PreconditionFailed, "build has no exact commit to retry", "Start a new deploy so the ref resolves to a commit first.")
+	}
+	source.Ref = commit
+	return source, commit, nil
 }
 
 func insertBuildTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, releaseID platform.ReleaseID, revisionID platform.RevisionID, source platform.Source, commit string) (platform.BuildID, error) {
@@ -828,7 +1067,7 @@ func rollbackSnapshotTx(ctx context.Context, tx pgx.Tx, env platform.Environment
 	return platform.RevisionID(revisionID), secretRevisions, nil
 }
 
-func (s *Service) queueFirstDeployTx(ctx context.Context, tx pgx.Tx, envID platform.EnvironmentID, actor contract.Actor) error {
+func (s *Service) queueFirstDeployTx(ctx context.Context, tx pgx.Tx, envID platform.EnvironmentID, actor contract.Actor, resolved *resolvedGitRef) error {
 	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE e.id=$1 FOR UPDATE OF e", envID))
 	if err != nil {
 		return unavailable()
@@ -837,13 +1076,13 @@ func (s *Service) queueFirstDeployTx(ctx context.Context, tx pgx.Tx, envID platf
 		return nil
 	}
 	input := platform.DeployInput{App: env.App, Environment: env.Name}
-	return s.submitFollowupOperationTx(ctx, tx, platform.KindDeploy, "env/"+env.App+"/"+env.Name, input, actor, "first-deploy:"+string(env.RevisionID))
+	return s.submitFollowupOperationTx(ctx, tx, platform.KindDeploy, "env/"+env.App+"/"+env.Name, input, actor, "first-deploy:"+string(env.RevisionID), resolved)
 }
 
 // submitFollowupOperationTx records one additional operation and River job in
 // the caller's transaction. It is used for the first deploy requested by app
 // create, so the intent is durable with the revision that requested it.
-func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind, target string, input any, actor contract.Actor, key string) error {
+func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind, target string, input any, actor contract.Actor, key string, resolved *resolvedGitRef) error {
 	raw, err := json.Marshal(input)
 	if err != nil {
 		return err
@@ -867,7 +1106,7 @@ func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind
 	if inserted.RowsAffected() == 0 {
 		return nil
 	}
-	if err := s.preparePlatform(ctx, tx, id, normalized, actor); err != nil {
+	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved); err != nil {
 		return err
 	}
 	if s.enqueuePlatform == nil {
@@ -1173,6 +1412,8 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.buil
     coalesce((SELECT array_agg(d.name ORDER BY d.name) FROM eregion_platform_domains d WHERE d.environment_id=e.id),'{}'),
     coalesce((SELECT d.name FROM eregion_platform_domains d WHERE d.environment_id=e.id AND d.is_primary ORDER BY d.created_at,d.name LIMIT 1),''),
     coalesce((SELECT d.dns_state FROM eregion_platform_domains d WHERE d.environment_id=e.id AND d.is_primary ORDER BY d.created_at,d.name LIMIT 1),''),
+    coalesce((SELECT array_agg(c.container_name ORDER BY c.container_name)
+              FROM eregion_platform_container_cleanup c WHERE c.environment_id=e.id),'{}'),
     EXISTS(SELECT 1 FROM eregion_platform_releases rr WHERE rr.environment_id=e.id AND rr.status='ready'),
     coalesce(e.current_revision_id,''),coalesce(r.number,0),coalesce(r.operation_id,''),
     coalesce(r.actor_kind,'system'),coalesce(r.actor_subject,''),coalesce(r.operation,''),coalesce(r.summary,''),
@@ -1196,7 +1437,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
 		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
-		&env.PrimaryDomain, &primaryDNS, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
+		&env.PrimaryDomain, &primaryDNS, &env.PendingCleanup, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
 		&actorKind, &actorSubject, &operation, &summary, &rawSource, &autoDeploy, &webhookSecretName,
 		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &deployIntent, &revisionCreated,
 		&env.CreatedAt, &env.UpdatedAt)
@@ -1310,7 +1551,7 @@ func (s *Service) inventoryEnvironments(ctx context.Context, query platform.Inve
 
 func (s *Service) inventoryDomains(ctx context.Context, query platform.InventoryQuery) ([]platform.DomainBinding, error) {
 	items := []platform.DomainBinding{}
-	statement := `SELECT d.name,a.name,e.name,d.is_primary,d.desired_revision,d.applied_revision,
+	statement := `SELECT d.name,a.name,e.name,d.is_primary,coalesce(d.check_path,''),d.desired_revision,d.applied_revision,
         d.route_state,d.route_error,d.route_applied_at,d.route_observed_at,
         d.expected_addresses,d.dns_state,d.dns_addresses,d.dns_error,d.dns_observed_at,
         d.certificate_state,d.certificate_not_after,d.certificate_error,d.certificate_observed_at,
@@ -1330,7 +1571,7 @@ func (s *Service) inventoryDomains(ctx context.Context, query platform.Inventory
 	for rows.Next() {
 		var item platform.DomainBinding
 		var rawInstances []byte
-		if err := rows.Scan(&item.Domain, &item.App, &item.Environment, &item.Primary,
+		if err := rows.Scan(&item.Domain, &item.App, &item.Environment, &item.Primary, &item.CheckPath,
 			&item.DesiredRevision, &item.AppliedRevision, &item.RouteState, &item.RouteError,
 			&item.RouteAppliedAt, &item.RouteObservedAt, &item.ExpectedAddresses,
 			&item.DNSState, &item.DNSAddresses, &item.DNSError, &item.DNSObservedAt,
@@ -1721,12 +1962,27 @@ func releaseByIDTx(ctx context.Context, tx pgx.Tx, id platform.ReleaseID) (platf
 
 // ---------------------------------------------------------------- dry run
 
-// Preview implements the optional dry-run planner used by the API.
-func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized platform.Normalized) (platform.Preview, error) {
+// Preview implements the optional dry-run planner used by the API. When the
+// actor already submitted this kind and target with idempotencyKey, the
+// preview reports the original operation and skips every conflict check: a
+// retry must reach the same submission without repeating its side effects.
+func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized platform.Normalized, idempotencyKey string) (platform.Preview, error) {
 	if err := actor.Validate(); err != nil {
 		return platform.Preview{}, err
 	}
 	preview := platform.Preview{Kind: normalized.Kind, Target: normalized.Target.String(), DryRun: true, Input: normalized.Input.Preview(), Summary: normalized.Summary}
+	if idempotencyKey != "" {
+		op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5",
+			actor.Kind, actor.Subject, normalized.Kind, normalized.Target.String(), idempotencyKey))
+		switch {
+		case err == nil:
+			preview.Replay, preview.Operation = true, &op
+			preview.Summary = "Replay the accepted operation " + string(op.ID) + "; the same submission already exists."
+			return preview, nil
+		case !errors.Is(err, pgx.ErrNoRows):
+			return preview, unavailable()
+		}
+	}
 	switch input := normalized.Input.(type) {
 	case *platform.DeployInput:
 		if input.ReleaseID == "" {

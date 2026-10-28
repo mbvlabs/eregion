@@ -22,6 +22,7 @@ const (
 	Unauthenticated      Code = "unauthenticated"
 	Forbidden            Code = "forbidden"
 	PreconditionFailed   Code = "precondition_failed"
+	DoctorFailed         Code = "doctor_failed"
 	ConfirmationRequired Code = "confirmation_required"
 	Conflict             Code = "conflict"
 	NodeVersionMismatch  Code = "node_version_mismatch"
@@ -34,7 +35,7 @@ const (
 var exits = map[Code]int{
 	Usage: 2, InvalidOutputMode: 2, InputRequired: 2, ValidationFailed: 2, MissingTool: 2,
 	NotFound: 3, Unauthenticated: 4, Forbidden: 4,
-	PreconditionFailed: 5, ConfirmationRequired: 5, Conflict: 5, NodeVersionMismatch: 5,
+	PreconditionFailed: 5, DoctorFailed: 5, ConfirmationRequired: 5, Conflict: 5, NodeVersionMismatch: 5,
 	RemoteUnreachable: 6, Unavailable: 6, Internal: 70, Cancelled: 130,
 }
 

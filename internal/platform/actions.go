@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -220,9 +221,12 @@ func (in *BuildRetryInput) Preview() any   { return in }
 
 // RestartInput reapplies the serving release with the environment's current
 // revision through the same blue/green path, so a scaled formation takes effect.
+// ExpectedServingDeploymentID is set by maintenance repair: the restart is
+// refused if the environment started serving a different deployment.
 type RestartInput struct {
-	App         string `json:"app,omitempty"`
-	Environment string `json:"environment,omitempty"`
+	App                         string       `json:"app,omitempty"`
+	Environment                 string       `json:"environment,omitempty"`
+	ExpectedServingDeploymentID DeploymentID `json:"expected_serving_deployment_id,omitempty"`
 }
 
 func (in *RestartInput) Target() Target {
@@ -1040,7 +1044,7 @@ func normalizeHealth(in HealthInput) (HealthInput, error) {
 	if in.Path == "" {
 		in.Path = DefaultHealthPath
 	}
-	if !strings.HasPrefix(in.Path, "/") || len(in.Path) > 256 || strings.ContainsAny(in.Path, " \t\r\n\x00?#") {
+	if !validAbsolutePath(in.Path) {
 		return in, invalid("health path", "Use an absolute path without whitespace, controls, query, or fragment, up to 256 bytes.")
 	}
 	if in.TimeoutSeconds == 0 {
@@ -1050,6 +1054,22 @@ func normalizeHealth(in HealthInput) (HealthInput, error) {
 		return in, invalid("health timeout", "Use 1–300 seconds.")
 	}
 	return in, nil
+}
+
+// validAbsolutePath is the shared absolute-path shape for a health or domain
+// check path: rooted, bounded, and free of a scheme, host, whitespace, control
+// characters, query and fragment.
+func validAbsolutePath(path string) bool {
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") ||
+		len(path) > 256 || strings.ContainsAny(path, " ?#") {
+		return false
+	}
+	for _, r := range path {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeReleaseCreate(target Target, raw json.RawMessage) (ActionInput, error) {
@@ -1238,6 +1258,11 @@ func normalizeRestart(target Target, raw json.RawMessage) (ActionInput, error) {
 		return nil, invalid("environment", "The app and environment fields must match the target, or be omitted.")
 	}
 	input.App, input.Environment = target.App, target.Environment
+	if input.ExpectedServingDeploymentID != "" {
+		if err := input.ExpectedServingDeploymentID.Validate(); err != nil {
+			return nil, invalid("expected_serving_deployment_id", err.Error())
+		}
+	}
 	return &input, nil
 }
 
@@ -1334,6 +1359,9 @@ type DomainInput struct {
 	Domain      string   `json:"domain"`
 	Primary     bool     `json:"primary,omitempty"`
 	Addresses   []string `json:"addresses,omitempty"`
+	// CheckPath is an optional per-binding HTTP path for observation and the
+	// deploy public check. Empty uses the environment's web health path (D29).
+	CheckPath string `json:"check_path,omitempty"`
 	// Confirm names the hostname being removed (MASTER D12). It is required
 	// for platform.domain.remove and validated by the node against the current
 	// binding; it is empty for add and for a dry run.
@@ -1365,6 +1393,9 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 		return nil, invalid("domain", "A domain action needs a hostname.")
 	}
 	input.Domain, input.Addresses = domain, addresses
+	if input.CheckPath != "" && !validAbsolutePath(input.CheckPath) {
+		return nil, invalid("check path", "Use an absolute path such as /users/sign-in without a scheme, host, whitespace, controls, query, or fragment, up to 256 bytes.")
+	}
 	if input.Confirm != "" {
 		input.Confirm = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Confirm), "."))
 		if input.Confirm != input.Domain {

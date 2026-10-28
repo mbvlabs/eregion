@@ -21,6 +21,10 @@ type result struct {
 	// append-only plain, or the interactive view) and the runner must not
 	// append a second envelope.
 	streamed bool
+	// streamFault is a failure the runner still has to show after a streamed
+	// command wrote its own output. ssh --command uses it for the sudo refusal,
+	// where the remote stream alone would hide the fault code and its fix.
+	streamFault error
 }
 
 type spec struct {
@@ -41,6 +45,8 @@ type app struct {
 	secrets *secrets.Registry
 	// nodeClients holds one client per context name for the command's life.
 	nodeClients map[string]*nodeClient
+	// loginSeams replaces the probe and readiness check in tests.
+	loginSeams loginSeams
 }
 
 func readMeta(summary string, when, examples []string, next ...string) CommandMeta {
@@ -72,6 +78,7 @@ func newApp() *app {
 	a.root.PersistentFlags().String("output", "plain", "Output mode: plain or json; follow commands also accept ndjson")
 	a.root.PersistentFlags().Bool("json", false, "Shorthand for --output json")
 	a.root.PersistentFlags().Bool("auto-upgrade-nodes", false, "Install this CLI's build on a node whose build differs before the command runs")
+	a.root.PersistentFlags().String("context", "", "Context name; overrides EREGION_CONTEXT and the current context")
 	a.root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		var required *pflag.ValueRequiredError
 		if errors.As(err, &required) {

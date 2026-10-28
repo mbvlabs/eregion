@@ -8,6 +8,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/protect"
 	"github.com/mbvlabs/eregion/internal/viewer"
 	"github.com/spf13/cobra"
 )
@@ -17,15 +18,27 @@ func addDeleteFlags(cmd *cobra.Command) {
 	cmd.Flags().Bool("dry-run", false, "Show the deletion plan without accepting work")
 	cmd.Flags().String("idempotency-key", "", "Stable submission key; one is generated when empty")
 	cmd.Flags().Bool("detach", false, "Return immediately after acceptance instead of following in a terminal")
+	cmd.Flags().Bool("yes", false, "Refused: deletion needs a code from the authenticator app")
+}
+
+// deleteMeta marks a delete command as prompting for the D7 factor at a human
+// terminal, the same way the export commands declare it. A dry run asks for
+// nothing and stays available to an agent.
+func deleteMeta(summary, example string) CommandMeta {
+	meta := platformDestructiveMeta(summary, example)
+	meta.DryRun = true
+	meta.Confirmation = "target"
+	meta.Prompts = true
+	meta.InputFlags = []string{"confirm"}
+	return meta
 }
 
 func (a *app) appDeleteSpec() spec {
-	meta := platformDestructiveMeta("Delete an application and every environment it owns",
+	meta := deleteMeta("Delete an application and every environment it owns",
 		"eregion app delete api --confirm api --json")
-	meta.DryRun = true
-	meta.Confirmation = "target"
 	meta.WhenToUse = []string{
 		"Remove an app after workload cleanup. The confirmation token must name the current app; --yes is never accepted.",
+		"A real deletion also needs a TOTP code typed at a human terminal (D7). A dry run needs neither the code nor a terminal.",
 		"Operation and event history is kept. Other apps keep serving and their Caddy routes are not rewritten away.",
 	}
 	meta.Examples = []string{
@@ -51,13 +64,12 @@ func (a *app) appDeleteSpec() spec {
 }
 
 func (a *app) envDeleteSpec() spec {
-	meta := platformDestructiveMeta("Delete one environment after workload cleanup",
+	meta := deleteMeta("Delete one environment after workload cleanup",
 		"eregion env delete api production --confirm api/production --json")
-	meta.DryRun = true
-	meta.Confirmation = "target"
 	meta.WhenToUse = []string{
 		"Remove one environment after its containers, routes and secrets are cleaned up. Deleting the last environment also deletes the app.",
 		"The confirmation token must name the current environment as app/environment; --yes is never accepted.",
+		"A real deletion also needs a TOTP code typed at a human terminal (D7). A dry run needs neither the code nor a terminal.",
 	}
 	meta.Examples = []string{
 		"eregion env delete api production --dry-run --json",
@@ -122,7 +134,18 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 	if err := platform.ValidateTargetConfirmation(target, confirm); err != nil {
 		return result{}, err
 	}
-	op, err := a.submitAccepted(cmd, kind, target.String(), input, confirm)
+	action := "eregion app delete"
+	if environment != "" {
+		action = "eregion env delete"
+	}
+	if err := requireHuman(cmd, action); err != nil {
+		return result{}, err
+	}
+	code, err := readProtectCode(cmd, "Code from the authenticator app")
+	if err != nil {
+		return result{}, err
+	}
+	op, err := a.submitAcceptedWithSecrets(cmd, kind, target.String(), input, confirm, map[string]string{protect.CodeSecret: code})
 	if err != nil {
 		return result{}, err
 	}
@@ -152,8 +175,13 @@ func (a *app) followAccepted(cmd *cobra.Command, client Backend, op contract.Ope
 	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, op.ID, viewer.FollowOptions{
 		PollInterval: viewer.DefaultPollInterval, Clean: clean,
 	}, presenter.Observe)
+	observedOK := err == nil
 	err = followError(summary, err)
-	if finishErr := presenter.Finish(summary, err, resumeCommand+" "+string(op.ID), time.Now()); finishErr != nil && err == nil {
+	presentationErr := err
+	if observedOK {
+		presentationErr = nil
+	}
+	if finishErr := presenter.Finish(summary, presentationErr, resumeCommand+" "+string(op.ID), time.Now()); finishErr != nil && err == nil {
 		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
 	}
 	if len(outcome) > 0 && outcome[0] != nil && !summary.Detached && summary.State.Terminal() {

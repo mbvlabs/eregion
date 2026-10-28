@@ -1,11 +1,13 @@
 package platform
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -85,6 +87,12 @@ func ValidateGitSourceURL(raw string) error {
 	return fmt.Errorf("git host %q is not in EREGION_GIT_ALLOWED_HOSTS", host)
 }
 
+// gitHostLookup resolves a git source hostname. Tests replace it to exercise
+// the address-refusal rules without network access.
+var gitHostLookup = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
 // CheckGitSourceResolution re-checks the host at build time. A default public
 // forge must resolve only to public addresses, which blocks DNS rebinding to an
 // internal service. An operator-added host may resolve to a private address
@@ -98,7 +106,7 @@ func CheckGitSourceResolution(ctx context.Context, raw string) error {
 	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	addresses, err := net.DefaultResolver.LookupIPAddr(resolveCtx, host)
+	addresses, err := gitHostLookup(resolveCtx, host)
 	if err != nil || len(addresses) == 0 {
 		return fmt.Errorf("could not resolve the git build host")
 	}
@@ -123,6 +131,140 @@ func CheckGitSourceResolution(ctx context.Context, raw string) error {
 		}
 	}
 	return nil
+}
+
+// ResolveGitRef resolves a branch, tag, or full commit SHA to the exact commit
+// a build must use. It runs before the submission transaction opens, so a
+// branch that moves afterwards cannot change what is built. The read credential
+// reaches git only through the askpass child environment, never argv.
+func ResolveGitRef(ctx context.Context, rawURL, ref string, credential []byte) (string, error) {
+	if err := ValidateGitSourceURL(rawURL); err != nil {
+		return "", contract.NewFault(contract.ValidationFailed, "the git source URL is not allowed", err.Error())
+	}
+	ref = strings.TrimSpace(ref)
+	if IsGitCommit(ref) {
+		return ref, nil
+	}
+	if abbreviatedGitSHA(ref) {
+		return "", contract.NewFault(contract.ValidationFailed, "the git ref is an abbreviated commit", "Use the full 40-character commit SHA, or a branch or tag name.")
+	}
+	if ref != "" && !validGitRef(ref) {
+		return "", contract.NewFault(contract.ValidationFailed, "invalid git ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen.")
+	}
+
+	resolveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	// The submission-time lookup must refuse the same internal addresses as the
+	// build. A hostname that resolves to loopback, link-local, a carrier-grade
+	// NAT address or (for a public forge) a private address never reaches git.
+	if err := CheckGitSourceResolution(resolveCtx, rawURL); err != nil {
+		return "", contract.NewFault(contract.PreconditionFailed, "the git build host is refused", err.Error()+"; use a public HTTPS host allowed by EREGION_GIT_ALLOWED_HOSTS, or fix its DNS answers.")
+	}
+
+	work, err := os.MkdirTemp("", "eregion-git-ref-*")
+	if err != nil {
+		return "", contract.NewFault(contract.Unavailable, "could not prepare the git ref check", "Check the node's temporary directory and retry.")
+	}
+	defer os.RemoveAll(work) //nolint:errcheck // best-effort cleanup of a private temp tree.
+	isolation, err := buildIsolation(work)
+	if err != nil {
+		return "", contract.NewFault(contract.Unavailable, "could not prepare the git ref check", "Check the node's temporary directory and retry.")
+	}
+	env, err := gitCredentialEnvironment(isolation, work, string(credential))
+	if err != nil {
+		return "", contract.NewFault(contract.Unavailable, "could not prepare the git askpass helper", "Check the node's temporary directory and retry.")
+	}
+	args := []string{"ls-remote", rawURL}
+	if ref == "" {
+		args = append(args, "HEAD")
+	} else {
+		args = append(args, "refs/heads/"+ref, "refs/tags/"+ref, "refs/tags/"+ref+"^{}")
+	}
+	command := exec.CommandContext(resolveCtx, "git", args...)
+	command.Env = env
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	stdout, err := command.Output()
+	if err != nil {
+		if resolveCtx.Err() != nil {
+			return "", contract.NewFault(contract.Unavailable, "the git repository did not answer within 30 seconds", "Check the repository URL and network, then retry.")
+		}
+		hint := "Check the repository URL and the read credential, then retry."
+		if detail := redactGitStderr(stderr.String(), credential); detail != "" {
+			hint = detail
+		}
+		return "", contract.NewFault(contract.Unavailable, "the git repository could not be reached", hint)
+	}
+	return matchGitRef(ref, string(stdout))
+}
+
+// redactGitStderr keeps the first stderr line as a hint while guaranteeing
+// that a credential echoed by a remote never reaches an error or an event.
+func redactGitStderr(stderr string, credential []byte) string {
+	detail := firstLine(stderr)
+	if detail == "" || len(credential) == 0 {
+		return detail
+	}
+	return strings.ReplaceAll(detail, string(credential), "***")
+}
+
+// IsGitCommit reports a full lowercase git commit SHA (SHA-1 or SHA-256).
+func IsGitCommit(value string) bool { return shaPattern.MatchString(value) }
+
+// matchGitRef picks the one commit a branch or tag names in git ls-remote
+// output. An annotated tag uses its peeled commit. A name that is both a branch
+// and a tag is ambiguous and refused rather than guessed.
+func matchGitRef(ref, output string) (string, error) {
+	var head, branch, tag, peeled string
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || !shaPattern.MatchString(fields[0]) {
+			continue
+		}
+		switch fields[1] {
+		case "HEAD":
+			head = fields[0]
+		case "refs/heads/" + ref:
+			branch = fields[0]
+		case "refs/tags/" + ref:
+			tag = fields[0]
+		case "refs/tags/" + ref + "^{}":
+			peeled = fields[0]
+		}
+	}
+	if ref == "" {
+		if head == "" {
+			return "", contract.NewFault(contract.PreconditionFailed, "the repository's default branch did not resolve to a commit", "Set an explicit ref on the environment source, then retry.")
+		}
+		return head, nil
+	}
+	if branch != "" && (tag != "" || peeled != "") {
+		return "", contract.NewFault(contract.ValidationFailed, "the git ref "+ref+" is both a branch and a tag", "Use the full commit SHA, or rename one of them so the ref is unambiguous.")
+	}
+	switch {
+	case branch != "":
+		return branch, nil
+	case peeled != "":
+		return peeled, nil
+	case tag != "":
+		return tag, nil
+	default:
+		return "", contract.NewFault(contract.PreconditionFailed, "the git ref "+ref+" was not found", "Use a branch or tag that exists in the repository, or the full commit SHA.")
+	}
+}
+
+// abbreviatedGitSHA reports a value that can only be meant as a shortened
+// commit. A full 40- or 64-character SHA is handled by ResolveGitRef itself.
+func abbreviatedGitSHA(ref string) bool {
+	if len(ref) < 4 || len(ref) == 40 || len(ref) == 64 {
+		return false
+	}
+	for _, r := range ref {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // DefaultBuildSourceRoots is the only default directory from which a directory

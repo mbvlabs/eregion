@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"golang.org/x/sync/errgroup"
 )
@@ -30,44 +31,81 @@ type domainObservation struct {
 	healthPath string
 }
 
+const domainObservationPageSize = 100
+
 // observeDomains records DNS, certificate and public-response state without
-// changing domain intent. A failed probe never removes the binding.
+// changing domain intent. A failed probe never removes the binding. The
+// observer describes the current desired binding, so its default path is the
+// current revision's health path; a deploy's public check uses the deployment's
+// pinned revision instead.
 func (s *Service) observeDomains(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT d.name,d.expected_addresses,
-        coalesce(NULLIF(r.runtime->>'health_path',''),e.health_path,'/')
-        FROM eregion_platform_domains d
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id
-        ORDER BY d.name LIMIT 50`)
-	if err != nil {
-		return unavailable()
-	}
-	var domains []domainObservation
-	for rows.Next() {
-		var domain domainObservation
-		if err := rows.Scan(&domain.name, &domain.expected, &domain.healthPath); err != nil {
-			rows.Close()
-			return unavailable()
-		}
-		domains = append(domains, domain)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return unavailable()
-	}
-	if len(domains) == 0 {
-		return nil
-	}
-	group, groupCtx := errgroup.WithContext(ctx)
-	group.SetLimit(4)
-	for _, domain := range domains {
-		domain := domain
-		group.Go(func() error {
-			return s.observeDomain(groupCtx, domain)
+	return walkDomainObservationPages(ctx, domainObservationPageSize,
+		func(ctx context.Context, after string, limit int) ([]domainObservation, error) {
+			rows, err := s.pool.Query(ctx, `SELECT d.name,d.expected_addresses,
+                coalesce(NULLIF(d.check_path,''), NULLIF(r.runtime->>'health_path',''), e.health_path, '/')
+                FROM eregion_platform_domains d
+                JOIN eregion_platform_environments e ON e.id=d.environment_id
+                LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id
+                WHERE d.name > $1
+                ORDER BY d.name LIMIT $2`, after, limit)
+			if err != nil {
+				return nil, unavailable()
+			}
+			defer rows.Close()
+			var domains []domainObservation
+			for rows.Next() {
+				var domain domainObservation
+				if err := rows.Scan(&domain.name, &domain.expected, &domain.healthPath); err != nil {
+					return nil, unavailable()
+				}
+				domains = append(domains, domain)
+			}
+			if err := rows.Err(); err != nil {
+				return nil, unavailable()
+			}
+			return domains, nil
+		},
+		func(groupCtx context.Context, domains []domainObservation) error {
+			group, groupCtx := errgroup.WithContext(groupCtx)
+			group.SetLimit(4)
+			for _, domain := range domains {
+				domain := domain
+				group.Go(func() error {
+					return s.observeDomain(groupCtx, domain)
+				})
+			}
+			return group.Wait()
 		})
+}
+
+// walkDomainObservationPages walks every domain in name order. Keyset paging
+// keeps the read bounded without silently stopping at the first page.
+func walkDomainObservationPages(
+	ctx context.Context,
+	pageSize int,
+	fetch func(context.Context, string, int) ([]domainObservation, error),
+	apply func(context.Context, []domainObservation) error,
+) error {
+	if pageSize < 1 {
+		return contract.NewFault(contract.Internal, "domain observation page size is invalid", "Fix the worker's domain observation page size.")
 	}
-	return group.Wait()
+	after := ""
+	for {
+		page, err := fetch(ctx, after, pageSize)
+		if err != nil {
+			return err
+		}
+		if len(page) == 0 {
+			return nil
+		}
+		if err := apply(ctx, page); err != nil {
+			return err
+		}
+		if len(page) < pageSize {
+			return nil
+		}
+		after = page[len(page)-1].name
+	}
 }
 
 func (s *Service) observeDomain(ctx context.Context, domain domainObservation) error {

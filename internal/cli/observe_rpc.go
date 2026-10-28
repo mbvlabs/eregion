@@ -124,51 +124,7 @@ func (n *nodeClient) ListOperations(ctx context.Context, query operations.ListQu
 // observeNodeWorkloads reads the node-local Docker ownership labels. It is a
 // read-only method; no journal, operation, or database row is written.
 func observeNodeWorkloads(ctx context.Context, params rpcWorkloadParams) (platform.Workloads, error) {
-	if err := platform.ValidateName(params.App); err != nil {
-		return platform.Workloads{}, err
-	}
-	if params.Environment != "" {
-		if err := platform.ValidateName(params.Environment); err != nil {
-			return platform.Workloads{}, err
-		}
-	}
-	args := []string{"docker", "ps", "--all", "--format", "{{json .}}", "--filter", "label=io.eregion.app=" + params.App}
-	if params.Environment != "" {
-		args = append(args, "--filter", "label=io.eregion.environment="+params.Environment)
-	}
-	raw, err := runDockerRead(ctx, args)
-	if err != nil {
-		return platform.Workloads{}, err
-	}
-	containers, err := platform.ParseDockerPS(raw)
-	if err != nil {
-		return platform.Workloads{}, contract.NewFault(contract.Unavailable, "the node returned an unreadable Docker observation", err.Error())
-	}
-	return platform.Workloads{
-		App: params.App, Environment: params.Environment,
-		ObservedAt: time.Now().UTC(), Containers: containers,
-	}, nil
-}
-
-func runDockerRead(ctx context.Context, argv []string) ([]byte, error) {
-	command := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: fixed argv, no shell.
-	var stderr bytes.Buffer
-	command.Stderr = &stderr
-	raw, err := command.Output()
-	if err == nil {
-		return raw, nil
-	}
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	detail := boundedDockerOutput(stderr.String())
-	if errors.Is(err, exec.ErrNotFound) || strings.Contains(strings.ToLower(detail), "cannot connect to the docker daemon") {
-		return nil, contract.NewFault(contract.PreconditionFailed, "Docker is not available on this node", "Install Docker and start it before observing or deleting workloads.")
-	}
-	if detail == "" {
-		detail = err.Error()
-	}
-	return nil, contract.NewFault(contract.Unavailable, "the node could not read Docker", detail)
+	return platform.ObserveLocalWorkloads(ctx, params.App, params.Environment)
 }
 
 // runDockerCombinedRead merges the container's stdout and stderr streams for a

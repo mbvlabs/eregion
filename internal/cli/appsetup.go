@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -495,7 +494,7 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		ans.Deploy = true
 	}
 
-	if _, err := ans.environmentSpec(); err != nil {
+	if _, err := ans.environmentSpec(cmd); err != nil {
 		return nil, err
 	}
 	keepSecrets = true
@@ -707,7 +706,7 @@ func (ans *setupAnswers) clearSecrets() {
 
 // environmentSpec turns the answers into the validated first revision of a
 // new environment.
-func (ans *setupAnswers) environmentSpec() (platform.EnvironmentSpec, error) {
+func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.EnvironmentSpec, error) {
 	if err := platform.ValidateName(ans.App); err != nil {
 		return platform.EnvironmentSpec{}, err
 	}
@@ -791,7 +790,7 @@ func (ans *setupAnswers) environmentSpec() (platform.EnvironmentSpec, error) {
 
 	var domainAddresses []string
 	if ans.Domain != "" {
-		domainAddresses = mainNodeAddresses(context.Background())
+		domainAddresses = mainNodeAddresses(cmd)
 	}
 	return platform.EnvironmentSpec{
 		Name: ans.Environment, Node: ans.Node, BuildNode: ans.BuildNode,
@@ -962,11 +961,11 @@ func validateGitURLShape(raw string) error {
 
 // domainDNSRecord returns the A record the operator must create for the
 // environment's public hostname, when the saved context exposes an IPv4.
-func domainDNSRecord(domain string) (hostDNSRecord, bool) {
+func domainDNSRecord(domain string, cmd *cobra.Command) (hostDNSRecord, bool) {
 	if domain == "" {
 		return hostDNSRecord{}, false
 	}
-	for _, value := range mainNodeAddresses(context.Background()) {
+	for _, value := range mainNodeAddresses(cmd) {
 		if ip := net.ParseIP(value); ip != nil && ip.To4() != nil {
 			return hostDNSRecord{Type: "A", Name: domain, Value: value}, true
 		}
@@ -976,7 +975,7 @@ func domainDNSRecord(domain string) (hostDNSRecord, bool) {
 
 // setupPlan is the secret-free plan shown before a guided submit and by
 // --dry-run in every mode.
-func setupPlan(ans *setupAnswers, preview platform.Preview) string {
+func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "app: %s\n", ans.App)
 	fmt.Fprintf(&out, "environment: %s\n", ans.Environment)
@@ -1022,7 +1021,7 @@ func setupPlan(ans *setupAnswers, preview platform.Preview) string {
 	}
 	if ans.Domain != "" {
 		fmt.Fprintf(&out, "domain: %s\n", ans.Domain)
-		if record, ok := domainDNSRecord(ans.Domain); ok {
+		if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
 			fmt.Fprintf(&out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
 		} else {
 			fmt.Fprintf(&out, "DNS record: point %s at the main node's public IPv4 address\n", ans.Domain)
@@ -1095,13 +1094,17 @@ func (a *app) previewAction(cmd *cobra.Command, kind, target string, input any) 
 	if err != nil {
 		return platform.Preview{}, err
 	}
-	data, err := client.SubmitAction(cmd.Context(), kind, target, raw, "", "", true)
+	key, _ := cmd.Flags().GetString("idempotency-key")
+	data, err := client.SubmitAction(cmd.Context(), kind, target, raw, key, "", true)
 	if err != nil {
 		return platform.Preview{}, err
 	}
 	var preview platform.Preview
 	if json.Unmarshal(data, &preview) != nil || !preview.DryRun || preview.Kind != kind || preview.Target != target {
 		return platform.Preview{}, invalidNodeData("action preview")
+	}
+	if preview.Replay && (preview.Operation == nil || preview.Operation.ID == "") {
+		return platform.Preview{}, invalidNodeData("action preview replay")
 	}
 	return preview, nil
 }
@@ -1110,6 +1113,12 @@ func (a *app) previewAction(cmd *cobra.Command, kind, target string, input any) 
 // action requires one, returning the durable operation it was accepted as. The
 // idempotency key is stable when the operator supplied one.
 func (a *app) submitAccepted(cmd *cobra.Command, kind, target string, input any, confirm string) (contract.Operation, error) {
+	return a.submitAcceptedWithSecrets(cmd, kind, target, input, confirm, nil)
+}
+
+// submitAcceptedWithSecrets is submitAccepted for a D7 factor-gated action:
+// the code travels in the same node request that performs it.
+func (a *app) submitAcceptedWithSecrets(cmd *cobra.Command, kind, target string, input any, confirm string, secretValues map[string]string) (contract.Operation, error) {
 	raw, err := json.Marshal(input)
 	if err != nil {
 		return contract.Operation{}, contract.NewFault(contract.Internal, "could not encode platform input", "Report the command and binary version.")
@@ -1125,7 +1134,7 @@ func (a *app) submitAccepted(cmd *cobra.Command, kind, target string, input any,
 	if err != nil {
 		return contract.Operation{}, err
 	}
-	data, err := client.SubmitAction(cmd.Context(), kind, target, raw, key, confirm, false)
+	data, err := client.SubmitActionWithSecrets(cmd.Context(), kind, target, raw, key, confirm, false, secretValues)
 	if err != nil {
 		return contract.Operation{}, err
 	}
@@ -1153,6 +1162,12 @@ func (a *app) putSecret(cmd *cobra.Command, namespace vault.Namespace, value []b
 		return vault.Metadata{}, err
 	}
 	return client.SetSecret(cmd.Context(), namespace, value, metadata.LatestRevision)
+}
+
+// setupSecretNames is the result shape's secret-name list without writing
+// anything. A replay already wrote these values in its original submission.
+func setupSecretNames(ans *setupAnswers) []string {
+	return sortedKeysBytes(ans.SecretValues)
 }
 
 // writeSetupSecrets stores the read credential and the environment secrets
@@ -1349,21 +1364,22 @@ func writeEnvironmentStatus(env platform.Environment) string {
 
 // setupResult is the secret-free result of app create or env create.
 type setupResult struct {
-	App                  string                 `json:"app"`
-	Environment          string                 `json:"environment"`
-	Node                 string                 `json:"node"`
-	Source               platform.SourceBinding `json:"source"`
-	Processes            []platform.ProcessSpec `json:"processes"`
-	ConfigKeys           []string               `json:"config_keys,omitempty"`
-	SecretNames          []string               `json:"secret_names,omitempty"`
-	CredentialSecretName string                 `json:"credential_secret_name,omitempty"`
-	Domain               string                 `json:"domain,omitempty"`
-	DNSRecord            *hostDNSRecord         `json:"dns_record,omitempty"`
-	Deploy               bool                   `json:"deploy"`
-	OperationID          contract.OperationID   `json:"operation_id,omitempty"`
-	DryRun               bool                   `json:"dry_run,omitempty"`
-	Preview              *platform.Preview      `json:"preview,omitempty"`
-	Warnings             []string               `json:"warnings,omitempty"`
+	App                    string                 `json:"app"`
+	Environment            string                 `json:"environment"`
+	Node                   string                 `json:"node"`
+	Source                 platform.SourceBinding `json:"source"`
+	Processes              []platform.ProcessSpec `json:"processes"`
+	ConfigKeys             []string               `json:"config_keys,omitempty"`
+	SecretNames            []string               `json:"secret_names,omitempty"`
+	CredentialSecretName   string                 `json:"credential_secret_name,omitempty"`
+	Domain                 string                 `json:"domain,omitempty"`
+	DNSRecord              *hostDNSRecord         `json:"dns_record,omitempty"`
+	Deploy                 bool                   `json:"deploy"`
+	OperationID            contract.OperationID   `json:"operation_id,omitempty"`
+	FirstDeployOperationID contract.OperationID   `json:"first_deploy_operation_id,omitempty"`
+	DryRun                 bool                   `json:"dry_run,omitempty"`
+	Preview                *platform.Preview      `json:"preview,omitempty"`
+	Warnings               []string               `json:"warnings,omitempty"`
 
 	created string
 	plan    string
@@ -1387,6 +1403,9 @@ func (r setupResult) plainText() string {
 		fmt.Fprintf(&out, "Created environment %s/%s on %s.\n", r.App, r.Environment, r.Node)
 	}
 	fmt.Fprintf(&out, "operation: %s\n", r.OperationID)
+	if r.FirstDeployOperationID != "" {
+		fmt.Fprintf(&out, "first deploy operation: %s\n", r.FirstDeployOperationID)
+	}
 	if r.Deploy {
 		out.WriteString("first deploy: queued from the revision\n")
 	}
@@ -1402,6 +1421,9 @@ func (r setupResult) plainText() string {
 		fmt.Fprintf(&out, "warning: %s\n", warning)
 	}
 	fmt.Fprintf(&out, "next: eregion env status %s %s --json\n", r.App, r.Environment)
+	if r.FirstDeployOperationID != "" {
+		fmt.Fprintf(&out, "follow: eregion operations follow %s\n", r.FirstDeployOperationID)
+	}
 	return out.String()
 }
 

@@ -75,13 +75,16 @@ func decodePayload(exec engine.Execution, raw json.RawMessage, dst any) error {
 // ---------------------------------------------------------------- argv step
 
 type ArgvPayload struct {
-	Step           string            `json:"step"`
-	Argv           []string          `json:"argv"`
-	CheckArgv      []string          `json:"check_argv,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
-	SecretEnvKeys  []string          `json:"secret_env_keys,omitempty"`
-	AllowFailure   bool              `json:"allow_failure,omitempty"`
-	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	Step          string            `json:"step"`
+	Argv          []string          `json:"argv"`
+	CheckArgv     []string          `json:"check_argv,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	SecretEnvKeys []string          `json:"secret_env_keys,omitempty"`
+	AllowFailure  bool              `json:"allow_failure,omitempty"`
+	// MissingOK makes a "No such container" removal result a success. It is
+	// only for idempotent cleanup, never for a step that creates state.
+	MissingOK      bool `json:"missing_ok,omitempty"`
+	TimeoutSeconds int  `json:"timeout_seconds,omitempty"`
 }
 
 type ArgvStep struct {
@@ -154,15 +157,35 @@ func (s *ArgvStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
 	}
 	stdout, stderr, err := runArgv(runCtx, s.payload.Argv, extraEnv, rt, s.ID(), report)
+	if err != nil && s.payload.MissingOK && containerAlreadyGone(stderr) {
+		return engine.ApplyResult{Result: map[string]any{
+			"stdout": truncate(stdout, 8192), "missing": true,
+		}}, nil
+	}
 	if err != nil && s.payload.AllowFailure {
 		return engine.ApplyResult{Result: map[string]any{
 			"stdout": truncate(stdout, 8192), "stderr": truncate(stderr, 4096), "exit_ignored": true,
 		}}, nil
 	}
 	if err != nil {
-		return engine.ApplyResult{}, permanentCommandError(err)
+		wrapped := permanentCommandError(err)
+		if s.payload.MissingOK {
+			detail := firstLine(stderr)
+			if detail == "" {
+				detail = err.Error()
+			}
+			wrapped = fmt.Errorf("%w: %s", wrapped, detail)
+		}
+		return engine.ApplyResult{}, wrapped
 	}
 	return engine.ApplyResult{Result: map[string]any{"stdout": truncate(stdout, 8192)}}, nil
+}
+
+// containerAlreadyGone classifies Docker's idempotent-removal answer. A
+// missing container is success; every other stderr line is a real failure.
+func containerAlreadyGone(stderr string) bool {
+	lowered := strings.ToLower(stderr)
+	return strings.Contains(lowered, "no such container") || strings.Contains(lowered, "no such object")
 }
 
 func stepEnv(values map[string]string, secretKeys []string, rt engine.Runtime) ([]string, error) {
@@ -677,13 +700,16 @@ func (s *HealthStep) Apply(ctx context.Context, rt engine.Runtime, report engine
 // ---------------------------------------------------------------- pack step
 
 type PackPayload struct {
-	Step    string            `json:"step"`
-	Image   string            `json:"image"`
-	Path    string            `json:"path,omitempty"`
-	GitURL  string            `json:"git_url,omitempty"`
-	GitRef  string            `json:"git_ref,omitempty"`
-	Builder string            `json:"builder"`
-	Env     map[string]string `json:"env,omitempty"`
+	Step    string `json:"step"`
+	Image   string `json:"image"`
+	Path    string `json:"path,omitempty"`
+	GitURL  string `json:"git_url,omitempty"`
+	GitRef  string `json:"git_ref,omitempty"`
+	Builder string `json:"builder"`
+	// GitContextPath is the Buildpacks context inside the git checkout. It is
+	// meaningless for a directory source and therefore valid only with GitURL.
+	GitContextPath string            `json:"git_context_path,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
 	// GitCredentialSecretKey names the transient secret value used by the
 	// embedded askpass helper. The value never enters the payload.
 	GitCredentialSecretKey string `json:"git_credential_secret_key,omitempty"`
@@ -714,6 +740,14 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	}
 	if payload.Path != "" && !filepath.IsAbs(payload.Path) {
 		return nil, errors.New("pack source path must be absolute")
+	}
+	if payload.GitContextPath != "" {
+		if payload.GitURL == "" {
+			return nil, errors.New("a git context path requires a git source")
+		}
+		if err := validateContextPath(payload.GitContextPath); err != nil {
+			return nil, err
+		}
 	}
 	if payload.GitURL != "" {
 		if err := ValidateGitSourceURL(payload.GitURL); err != nil {
@@ -839,6 +873,16 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 		if !shaPattern.MatchString(commit) {
 			return engine.ApplyResult{}, fmt.Errorf("%w: git ref did not resolve to an exact commit", engine.ErrPermanent)
 		}
+		if shaPattern.MatchString(s.payload.GitRef) && commit != s.payload.GitRef {
+			return engine.ApplyResult{}, fmt.Errorf("%w: checked-out commit %s does not match the resolved commit %s", engine.ErrPermanent, commit, s.payload.GitRef)
+		}
+	}
+	if s.payload.GitContextPath != "" {
+		resolved, err := resolveGitContextPath(source, s.payload.GitContextPath)
+		if err != nil {
+			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		}
+		source = resolved
 	}
 	info, err := os.Stat(source) //nolint:gosec // G304: resolved source root or a directory under the node root.
 	if err != nil || !info.IsDir() {
@@ -867,6 +911,35 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	return engine.ApplyResult{Result: result}, nil
 }
 
+// resolveGitContextPath resolves the revision's Buildpacks context inside the
+// checkout. Symlinks are resolved before the containment check, so a context
+// path cannot read outside the repository even when a directory inside it
+// points elsewhere. Every error names the configured path.
+func resolveGitContextPath(cloneRoot, contextPath string) (string, error) {
+	if contextPath == "" {
+		return cloneRoot, nil
+	}
+	if filepath.IsAbs(contextPath) {
+		return "", fmt.Errorf("git context path %q must be relative to the repository", contextPath)
+	}
+	root, err := filepath.EvalSymlinks(cloneRoot)
+	if err != nil {
+		return "", fmt.Errorf("git context path %q: the checkout is unreadable", contextPath)
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(root, filepath.FromSlash(contextPath)))
+	if err != nil {
+		return "", fmt.Errorf("git context path %q is not present in the repository", contextPath)
+	}
+	if resolved != root && !strings.HasPrefix(resolved, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("git context path %q resolves outside the repository", contextPath)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("git context path %q is not a directory", contextPath)
+	}
+	return resolved, nil
+}
+
 // watchBuildCancel stops a running build when the build-stop step writes the
 // cancel marker for the same operation and pack step.
 func watchBuildCancel(ctx context.Context, path string, cancel context.CancelFunc) {
@@ -889,20 +962,31 @@ func watchBuildCancel(ctx context.Context, path string, cancel context.CancelFun
 // names a read credential, the transient secret value. Only git child processes
 // receive it; pack itself runs with the isolated environment alone.
 func gitBuildEnvironment(isolation []string, work, secretKey string, rt engine.Runtime) ([]string, error) {
+	value := ""
+	if secretKey != "" {
+		resolved, ok := rt.SecretValues[secretKey]
+		if !ok || resolved == "" {
+			return nil, errors.New("git read credential is unavailable")
+		}
+		value = resolved
+	}
+	return gitCredentialEnvironment(isolation, work, value)
+}
+
+// gitCredentialEnvironment writes the askpass helper and returns a child
+// environment. The credential itself is only an environment value: it cannot
+// appear in argv, the step payload, the journal, or an event.
+func gitCredentialEnvironment(isolation []string, work, credential string) ([]string, error) {
 	askpass := filepath.Join(work, "git-askpass.sh")
 	if err := os.WriteFile(askpass, gitAskpassScript, 0o700); err != nil {
 		return nil, err
 	}
 	env := append([]string{}, isolation...)
 	env = append(env, "GIT_ASKPASS="+askpass, "GIT_TERMINAL_PROMPT=0")
-	if secretKey == "" {
+	if credential == "" {
 		return env, nil
 	}
-	value, ok := rt.SecretValues[secretKey]
-	if !ok || value == "" {
-		return nil, errors.New("git read credential is unavailable")
-	}
-	env = append(env, "EREGION_GIT_USERNAME=x-access-token", "EREGION_GIT_PASSWORD="+value)
+	env = append(env, "EREGION_GIT_USERNAME=x-access-token", "EREGION_GIT_PASSWORD="+credential)
 	return env, nil
 }
 

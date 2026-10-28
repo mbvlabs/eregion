@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/spf13/cobra"
@@ -75,7 +77,7 @@ func TestAppCreateFlagsBuildTheFirstRevision(t *testing.T) {
 		t.Fatalf("domain = %q", ans.Domain)
 	}
 
-	spec, err := ans.environmentSpec()
+	spec, err := ans.environmentSpec(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +112,7 @@ func TestAppCreateImageSourceUsesTheDefaultWebProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ans.clearSecrets()
-	spec, err := ans.environmentSpec()
+	spec, err := ans.environmentSpec(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,5 +255,30 @@ func TestEnvLinesReadsAPastedBlock(t *testing.T) {
 	want := []string{"PORT=8080", "SITE_NAME=Andurel", "EMPTY="}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("envLines = %q, want %q", got, want)
+	}
+}
+
+func TestSetupResultCarriesTheFirstDeployOperationID(t *testing.T) {
+	first := contract.OperationID("op_" + strings.Repeat("a", 32))
+	summary := setupResult{
+		App: "api", Environment: "production", Node: "main",
+		Deploy: true, OperationID: "op_" + contract.OperationID(strings.Repeat("b", 32)),
+		FirstDeployOperationID: first, created: "app",
+	}
+	raw, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["first_deploy_operation_id"] != string(first) {
+		t.Fatalf("first_deploy_operation_id = %v, want %s", decoded["first_deploy_operation_id"], first)
+	}
+	plain := summary.plainText()
+	if !strings.Contains(plain, "first deploy operation: "+string(first)) ||
+		!strings.Contains(plain, "follow: eregion operations follow "+string(first)) {
+		t.Fatalf("accepted plain output lacks the first deploy identity:\n%s", plain)
 	}
 }

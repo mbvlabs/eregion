@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -27,7 +29,9 @@ func (a *app) hostSpecs() []spec {
 	applyMeta.Next = []string{"eregion doctor", "eregion server status"}
 	doctorMeta := operationMeta("Check host drift, security, certificates, disk, versions and services", "eregion doctor --json")
 	doctorMeta.Next = []string{"eregion plan", "eregion apply"}
-	sshMeta := operationMeta("Open an interactive shell on the node over WireGuard", "eregion ssh")
+	sshMeta := operationMeta("Open a shell or run one command on the node over WireGuard", "eregion ssh --command 'uname -m'")
+	sshMeta.WhenToUse = []string{"Use an interactive shell at a terminal, or --command for one remote command over the pinned SSH route; the remote exit status becomes the command's status."}
+	sshMeta.Examples = []string{"eregion ssh", "eregion ssh --command 'uname -m'", "eregion ssh --command 'sudo systemctl status eregion' --json"}
 	sshMeta.Platforms = []string{"linux", "darwin"}
 	sshMeta.Prompts = false
 	sshMeta.Next = []string{"eregion server status"}
@@ -37,7 +41,9 @@ func (a *app) hostSpecs() []spec {
 			cmd.Flags().Bool("dry-run", false, "Show the plan without changing the host")
 		}, run: a.hostApply},
 		{use: "doctor", meta: doctorMeta, run: a.hostDoctor},
-		{use: "ssh [node]", meta: sshMeta, args: cobra.MaximumNArgs(1), run: a.ssh},
+		{use: "ssh [node]", meta: sshMeta, args: cobra.MaximumNArgs(1), flags: func(cmd *cobra.Command) {
+			cmd.Flags().String("command", "", "Run one command on the node and exit with its status")
+		}, run: a.ssh},
 	}
 }
 
@@ -74,7 +80,7 @@ func (a *app) hostDoctor(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	report, err := client.HostDoctor(cmd.Context())
+	report, err := client.HostDoctor(cmd.Context(), false)
 	if err != nil {
 		return result{}, err
 	}
@@ -185,10 +191,12 @@ func outputModeFromFlags(jsonMode bool, outputMode string) (string, error) {
 }
 
 func (a *app) ssh(cmd *cobra.Command, args []string) (result, error) {
-	if structuredOutput(cmd) || !stdoutIsTerminal() || !stdinIsTerminal() {
-		return result{}, contract.NewFault(contract.InputRequired,
-			"eregion ssh needs a terminal",
-			"Run it directly in a terminal; JSON and piped output cannot carry an interactive shell.")
+	command, _ := cmd.Flags().GetString("command")
+	structured := structuredOutput(cmd)
+	if command == "" && (structured || !stdoutIsTerminal() || !stdinIsTerminal()) {
+		return result{}, contract.NewFault(contract.Usage,
+			"eregion ssh needs a terminal or --command",
+			"Pass --command to run one command, or use a TTY for a shell.")
 	}
 	name := ""
 	if len(args) == 1 {
@@ -212,6 +220,21 @@ func (a *app) ssh(cmd *cobra.Command, args []string) (result, error) {
 	}
 	defer func() { _ = session.Close() }()
 
+	// Like ssh -t, a command from a terminal gets a PTY so sudo can prompt.
+	// Piped or structured output runs without one: a PTY merges stderr into
+	// stdout and turns newlines into \r\n, which breaks `ssh --command | jq`.
+	if !sshUsesPTY(command, structured, stdinIsTerminal(), stdoutIsTerminal()) {
+		stderr := &sudoPasswordWatch{w: os.Stderr}
+		session.Stdin, session.Stdout, session.Stderr = cmd.InOrStdin(), os.Stdout, stderr
+		err := session.Run(command)
+		var exitErr *ssh.ExitError
+		if errors.As(err, &exitErr) && stderr.seen {
+			fault := sshSudoFault(exitErr.ExitStatus())
+			return result{streamed: true, streamFault: fault}, fault
+		}
+		return sshExitResult(err)
+	}
+
 	width, height := 80, 24
 	if w, h, err := term.GetSize(int(os.Stdout.Fd())); err == nil { //nolint:gosec // G115: file descriptors fit in int.
 		width, height = w, h
@@ -227,17 +250,72 @@ func (a *app) ssh(cmd *cobra.Command, args []string) (result, error) {
 	}
 	defer func() { _ = term.Restore(fd, oldState) }()
 	session.Stdin, session.Stdout, session.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if command != "" {
+		return sshExitResult(session.Run(command))
+	}
 	if err := session.Shell(); err != nil {
 		return result{}, contract.NewFault(contract.Unavailable, "could not start the remote shell", err.Error())
 	}
-	if err := session.Wait(); err != nil {
-		var exitErr *ssh.ExitError
-		if errors.As(err, &exitErr) {
-			return result{streamed: true}, &exitStatusError{code: exitErr.ExitStatus()}
-		}
-		return result{streamed: true}, contract.NewFault(contract.Unavailable, "the remote shell ended unexpectedly", err.Error())
+	return sshExitResult(session.Wait())
+}
+
+// sshUsesPTY mirrors ssh -t: a command runs on a PTY only when the caller is a
+// terminal and structured output was not requested. A shell always needs one,
+// which the caller enforces before reaching this decision.
+func sshUsesPTY(command string, structured, stdinTTY, stdoutTTY bool) bool {
+	return command == "" || (!structured && stdinTTY && stdoutTTY)
+}
+
+// sshSudoFault is the diagnostic for a remote sudo that needed a password but
+// had no terminal. The runner prints it even though the remote stderr was
+// already streamed, so the fault code and fix do not disappear.
+func sshSudoFault(exitStatus int) error {
+	fault := contract.NewFault(contract.InputRequired,
+		"sudo on the node needs a password, and without a terminal there is none to ask for",
+		"Run the command from a terminal with stdout not piped so sudo can prompt, or write the output to a file with sudo and read it back with eregion ssh --command 'cat <file>'.")
+	fault.Details = map[string]any{"exit_status": exitStatus}
+	return fault
+}
+
+// sshExitResult turns the remote status into the operator's exit status. The
+// remote streams are already written, so the runner must not add an envelope.
+func sshExitResult(err error) (result, error) {
+	if err == nil {
+		return result{streamed: true}, nil
 	}
-	return result{streamed: true}, nil
+	var exitErr *ssh.ExitError
+	if errors.As(err, &exitErr) {
+		return result{streamed: true}, &exitStatusError{code: exitErr.ExitStatus()}
+	}
+	return result{streamed: true}, contract.NewFault(contract.Unavailable, "the remote command ended unexpectedly", err.Error())
+}
+
+// sudoPasswordWatch passes the remote stderr through and notes whether sudo
+// refused for want of a terminal to read the password from.
+type sudoPasswordWatch struct {
+	w    io.Writer
+	tail []byte
+	seen bool
+}
+
+// sudoNoTTY are the lines sudo prints when it needs a password but has no
+// terminal.
+var sudoNoTTY = [][]byte{[]byte("sudo: a terminal is required"), []byte("sudo: a password is required")}
+
+func (s *sudoPasswordWatch) Write(b []byte) (int, error) {
+	if !s.seen {
+		// Keep a short tail so a message split across writes still matches.
+		s.tail = append(s.tail, b...)
+		for _, m := range sudoNoTTY {
+			if bytes.Contains(s.tail, m) {
+				s.seen = true
+			}
+		}
+		if keep := 64; len(s.tail) > keep {
+			s.tail = append(s.tail[:0], s.tail[len(s.tail)-keep:]...)
+		}
+	}
+	return s.w.Write(b)
 }
 
 func stdinIsTerminal() bool  { return term.IsTerminal(int(os.Stdin.Fd())) }  //nolint:gosec // G115: file descriptors fit in int.

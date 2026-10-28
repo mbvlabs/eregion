@@ -1,6 +1,6 @@
 # Implementation reference
 
-Checked against source on 2026-10-27. This describes **current code**, not the
+Checked against the integrated source on 2026-10-28. This describes **current code**, not the
 target command tree or a real-host certification. Product decisions and all
 work status belong in [MASTER](MASTER.md); run evidence belongs in
 [MANUAL-TESTING](MANUAL-TESTING.md).
@@ -22,7 +22,10 @@ WireGuard and reads NDJSON back. Contexts carry the WireGuard identity and SSH
 key, not a bearer token. The HTTP API remains for the narrow CI/webhook path and
 the public `/readyz` endpoint; the operator CLI does not configure or use it.
 Before the first service call the CLI compares the node build with its own and
-refuses with `node_version_mismatch` unless the node was auto-upgraded.
+refuses with `node_version_mismatch` unless the node was auto-upgraded. A
+`--dry-run` invocation never installs or restarts a node binary: on a mismatch
+it returns `node_version_mismatch` naming the upgrade it would have made, for
+every command that takes `--dry-run`.
 Read-only RPC methods `platform.workloads` and `platform.logs` read Docker
 directly and do not need the control database; `operations.list` uses the shared
 application service. Operation reads and cancellation over node RPC carry the
@@ -83,23 +86,23 @@ bin/eregion help app create --json
 
 | Current commands | Meaning/limit |
 | --- | --- |
-| `server init` | Guided root first contact; Linux/macOS operator, arch-matching linux node binary, preflight, answer flags/TOML, plan/confirm, vault keyring and node_exporter steps, pending-init resume/discard, guarded handoff. First contact requires SSH on port 22; another port is refused before any remote change. The plan lists the host steps and the setup.sh access changes (admin user, wg0, firewall, SSH lockdown switchover). A pending init stores the pinned SSH host key and fingerprint; `--dns-ready` skips the confirmation prompt interactively, non-interactively and on resume. Declining the plan (or any exit that does not apply) removes the uploaded planning bundle from the server. |
-| `plan`, `apply [--dry-run]`, `doctor`, `ssh [node]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. |
+| `server init` | Guided root first contact; Linux/macOS operator, arch-matching linux node binary, preflight, answer flags/TOML, plan/confirm, vault keyring and node_exporter steps, pending-init resume/discard, the final doctor gate and guarded handoff. First contact requires SSH on port 22; another port is refused before any remote change. The plan lists the host steps and the setup.sh access changes (admin user, wg0, firewall, SSH lockdown switchover). A pending init stores the pinned SSH host key and fingerprint; `--dns-ready` skips the confirmation prompt interactively, non-interactively and on resume. `--skip-doctor` skips the gate with a warning; a failing check returns `doctor_failed` with the failed checks and resume hint. Declining the plan (or any exit that does not apply) removes the uploaded planning bundle from the server. |
+| `plan`, `apply [--dry-run]`, `doctor`, `ssh [node] [--command CMD]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. `ssh` opens a shell at a terminal or runs one command with `--command`; piped or JSON output runs without a PTY, a sudo password prompt becomes an `input_required` fault whose code and fix the runner still prints, and the remote exit status propagates. `--auto-upgrade-nodes` installs the operator's build on a mismatched node: a `dev` node accepts the caller's checksum, while a published node requires its own signed release manifest to match; `--dry-run` never installs. |
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
-| `login --file … --passphrase-file …` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle must carry the context, operator keys, admin user, WireGuard address/public key/endpoint and SSH host key. |
-| `context list/show/use/remove` | Saved contexts, target-confirmed removal with its key files. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. `context credential add` is removed: tokens are minted only through `token create` with the human factor (D7). |
-| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create` with the first domain, primary flag and main-node addresses; the binding commits in the same transaction before the first deploy is queued. List/status read inventory. `status` shows the serving release, processes, per-domain state and recent operations; `delete` takes `--confirm <app>` (D13). |
-| `env create/update/list/status/delete` | `create` accepts an environment with its first revision, optional domain binding and its first deploy unless `--no-deploy`; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` (D13). |
+| `login --file … --passphrase-file … [--replace NAME]` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle must carry the context, operator keys, admin user, WireGuard address/public key/endpoint and SSH host key. Login builds and proves the identity in a sibling temporary directory, pins the host key in a copy of known_hosts and runs the readiness check there; only then does it swap the directory and save the context. An existing context name is refused with `conflict` unless `--replace` names it exactly, and any failure leaves the old context and pinned key byte-for-byte unchanged. |
+| `context list/show/use/remove` | Saved contexts, target-confirmed removal with its key files. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. Every node command accepts the root `--context NAME`; resolution is the flag, then `EREGION_CONTEXT`, then the current context, and an unknown name is `not_found` with `eregion context list`. The node client, local identity reads (`secrets export`), DNS addresses and endpoint labels all use that one selected context, so they cannot disagree; only `context show/use` with no `--name` read the current context on purpose. `login` and `server init` keep their own naming inputs and refuse a `--context` that disagrees, including on `server init --resume`. `context credential add` is removed: tokens are minted only through `token create` with the human factor (D7). |
+| `app create/list/status/delete` | Guided or flag-only first environment: source, Buildpacks settings, processes, plain config, vault secret names and an optional domain. `create` accepts `platform.app.create` with the first domain, primary flag and main-node addresses; the binding commits in the same transaction before the first deploy is queued, and the accepted operation exposes that deploy's ID as `first_deploy_operation_id`. A retry with the operator's `--idempotency-key` previews as a replay, writes no vault revision, and returns the original operation including that ID; without the key an existing name is a conflict. In a terminal with deploy requested and no `--detach`, `create` follows the create operation and then the first deploy with the deploy viewer and outcome; Ctrl-C detaches with the follow command. `--detach`, JSON and no-TTY return at accepted. List/status read inventory. `status` shows the serving release, processes, per-domain state and recent operations; `delete` takes `--confirm <app>` and, unless `--dry-run`, a TOTP code typed at a human terminal (D7, D13). The node verifies the code and confirmation in the same submission; dry-run preview needs neither and stays available to an agent. |
+| `env create/update/list/status/delete` | `create` accepts an environment with its first revision, optional domain binding and its first deploy unless `--no-deploy`; the accepted operation exposes the queued deploy's `first_deploy_operation_id`, and a terminal follows create then the first deploy with the deploy viewer unless `--detach` is given. A retry with the operator's `--idempotency-key` replays the accepted operation including that ID without rewriting vault values; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. List/status include revision, processes and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>` and, unless `--dry-run`, a TOTP code typed at a human terminal (D7, D13). |
 | `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. A serving environment also queues a blue/green restart in the same transaction so the new formation runs immediately; without a serving deployment the next deploy applies it. |
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
 | `deploy <app> <env> [--ref REF \| --release ID]` | Node-mode `platform.deploy`. In a terminal it prints source, ref/commit, revision and processes, then follows the operation with the shared viewer (build log lines and stages). `--detach` returns after acceptance. |
 | `rollback <app> <env> [--to ID]` | Node-mode `platform.rollback`; requires `--confirm <app>/<env>`, validated by the node and control plane against the current target (D12). There is no plan-token scheme for rollback. |
 | `build list/logs/stop/retry`, `release list`, `restart <app> <env>` | Build lifecycle over `platform_builds`; `build logs` reads (and with `--follow` streams) the build operation's events. `build get` is served by the `builds` inventory filter. `restart` reapplies the serving release through the blue/green path. |
-| `domain add/remove <app> <environment> <hostname> [--primary]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `remove` takes `--confirm <hostname>` and refuses the primary. |
-| `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secrets export` rebuilds the server-init handoff (including the vault keyring) and honours `--secrets-out`. |
+| `domain add/remove <app> <environment> <hostname> [--primary] [--check-path PATH]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `add --check-path` sets the binding's optional observation path; empty defaults to the web health path. `domain add --dry-run --json` returns the preview object and DNS records under `data`. `remove` takes `--confirm <hostname>` and refuses the primary. |
+| `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secret export` carries the code in the same node request that returns the value (`vault.export`); there is no separate pre-check request to skip. `secrets export` rebuilds the server-init handoff (including the vault keyring) and honours `--secrets-out`. |
 | `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
-| `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. |
+| `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. `--json` without `--follow` returns one envelope; NDJSON requires `--output ndjson`, and `--json --follow` is a usage error that names that fix. |
 | `ui` | Full-screen workspace over the same inventory and node-mode action service. The graph still uses the telemetry read adapter for metrics. |
 | `operations list/get/follow/cancel` | Over node RPC the SSH-authenticated operator has server authority: an unfiltered list shows every operation on the node newest first (bounded by `--limit`), and snapshot/follow/cancel may open any operation, including CI tokens, the GitHub webhook and other operators' submissions. `--app`/`--environment` select the platform target and include the environment's `build/<id>` operations. State and limit filters apply. The public HTTP API remains strictly actor- and grant-scoped. |
 | `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. |
@@ -140,6 +143,13 @@ the destination's colour profile before `SafeText`, so a pipe, file, dumb
 terminal or `NO_COLOR` gets the same information without ANSI. JSON output is
 unchanged.
 
+Following a terminal failed operation renders its outcome and returns the
+recorded error code's nonzero exit status (fallback `precondition_failed`, exit
+5, for missing/unknown codes). JSON/NDJSON return a failure envelope with the
+operation ID and state. Successful follows exit 0; remote cancellation exits
+130 with wording distinct from viewer detach. Guided create and followed deploys
+share these semantics; accepted-only submissions do not claim completion.
+
 ## Release and local upgrade
 
 `internal/buildinfo` carries `Version`, `Commit`, `Channel` and the public
@@ -154,13 +164,23 @@ downloads the verified binary, checks its reported version and channel, and
 replaces only the running CLI. `upgrade.FetchNodeBinary` is the verified
 linux/amd64 or linux/arm64 download used when a macOS CLI or an architecture
 mismatch prevents pushing the operator's own executable: the node receives the
-release matching the CLI's version, the uploaded checksum is verified, and the
-API/worker units restart.
+release matching the CLI's version and the API/worker units restart. A dry run
+never reaches this path.
+
+The node-side `upgrade.install` receives the operator CLI's `Version` and
+`Channel` with the upload. A node built for a published channel resolves that
+version's signed manifest itself (`release.Client.Resolve`, cosign-verified) and
+accepts only the `linux/<arch>` artifact whose sha256 matches the staged file; a
+dev CLI against such a node is refused with an instruction to use a released
+CLI, and an unreachable manifest returns `unavailable`. The node never falls
+back to trusting the upload. A node whose own `buildinfo.Channel` is `dev` keeps
+the checksum-only developer path, which never applies to a published node. The
+API and worker units restart only after a verified install.
 There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 013
+## Database: embedded schema 016
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -181,6 +201,9 @@ node protocol version and database migration version are independent.
 | `011_environment_revisions.sql` | Immutable numbered environment revisions, current-revision pointer, deployment revision/secret snapshots and domain primary flag. Backfills one baseline revision per existing environment. |
 | `012_platform_deploy.sql` | First-class builds with exact commit and lifecycle; release build/commit links; deployment runtime instances, previous deployment and `restart` action; environment serving-deployment pointer. Backfills the serving deployment for existing successful environments. |
 | `013_domain_state.sql` | Per-domain desired/applied route revision, last route error and timestamps; recorded expected addresses and DNS state/answers; certificate state and expiry; public response state/status; observation timestamps. |
+| `014_release_command_runs.sql` | One durable release command run per `(release_id, command_digest)`: state, operation, error and timestamps. A release-scoped row, cascading with its release. |
+| `015_domain_check_path.sql` | Optional per-domain `check_path`; empty uses the environment's web health path. |
+| `016_container_cleanup.sql` | Leaked-container retry rows: container name PK, environment/node/deployment, reason, attempts, last error and next attempt. Cascades with the environment. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -198,7 +221,9 @@ Tables below have the literal `eregion_` prefix:
 | `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, build link, exact commit, pending/ready/failed status and error. |
 | `platform_deployments` | Deployment ID and unique operation FK; action (`deploy`, `rollback`, `restart`), release, previous release/deployment, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), recorded process instances/ports, state and errors. |
 | `platform_changes` | App/env history, sequence, operation/actor, desired/applied JSON and summary. |
-| `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment. `desired_revision`/`applied_revision` and `route_state`/`route_error` record the Caddy write; `expected_addresses` plus `dns_state`/`dns_addresses` record public-resolver observation; `certificate_state`/`certificate_not_after` and `public_state`/`public_status` keep the other observations separate. |
+| `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment, and an optional `check_path`. `desired_revision`/`applied_revision` and `route_state`/`route_error` record the Caddy write; `expected_addresses` plus `dns_state`/`dns_addresses` record public-resolver observation; `certificate_state`/`certificate_not_after` and `public_state`/`public_status` keep the other observations separate. |
+| `platform_release_command_runs` | `(release_id, command_digest)` PK; the owning operation, running/succeeded/failed state, error code/message and timestamps. One row per release and command specification; it cascades with its release. |
+| `platform_container_cleanup` | Container name PK; environment/node/deployment, reason, attempts, last error and next attempt. A failed removal is retried with backoff; the row cascades with its environment. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
 | `webhook_deliveries` | Hashed delivery ID, exact-body hash, actor/kind/target, pending/submitted state and operation ID. |
@@ -337,23 +362,34 @@ named by `EREGION_VAULT_KEY_FILE` in `control-plane.env`) and node_exporter
 lockdown implementation.
 
 After lockdown the CLI pins the WireGuard host key, saves the token-free context,
-and calls node RPC `ready` as the final gate. It then checks node_exporter over
-the tunnel and builds the handoff: every server secret in plain text (operator
-keys, sudo password, DSN, vault keyring) plus an armored age transfer bundle with
-a generated passphrase and break-glass instructions. A terminal waits for
-`stored`; JSON/no-TTY requires `--secrets-out` before any change and writes the
-whole record to a new 0600 file. No API token is in the handoff.
+and calls node RPC `ready`. It then checks node_exporter over the tunnel, asks the
+public resolvers once, waits for Caddy's certificate, and runs the doctor gate
+(`host.doctor` with `init: true`). Init mode carries an `AtInit` filter for checks
+that cannot pass before the first handoff; no current doctor check is excluded,
+and a pending certificate for the main hostname stays a warning. Any remaining
+`fail` stops init with `doctor_failed`, the failing checks and their fixes, and
+the resume instruction. `--skip-doctor` skips the gate and
+leaves a warning in the result. Only then does init build the handoff: every
+server secret in plain text (operator keys, sudo password, DSN, vault keyring)
+plus an armored age transfer bundle with a generated passphrase and break-glass
+instructions. A terminal waits for `stored`; JSON/no-TTY requires `--secrets-out`
+before any change and writes the whole record to a new 0600 file. No API token is
+in the handoff.
 
 The unfinished init is saved locally under the context store directory:
 `pending/<server>/init.json` (answers, learned facts, completed phases),
 `known_hosts` and the captured `vault-keyring.json`, all 0600. `--resume`
 continues at the first incomplete phase (first contact, operator identity, host
-bootstrap, WireGuard access, context, handoff). `--discard --confirm <server>`
-drops the local state and the generated identity and warns when the host was
-already bootstrapped. New init refuses while a context or pending init for the
-same server exists. `server init --dry-run`
-still connects, pins the host key and uploads a planning bundle; it stops before
-apply and removes the pending state it created.
+bootstrap, WireGuard access, context, readiness/certificate checks, doctor gate,
+handoff). After a failed doctor gate, resume therefore re-runs only the gate and
+the handoff; once the gate has passed it is not repeated, and the passing report
+(or the `--skip-doctor` marker) is stored in the pending init so the resumed
+result shows the same doctor line without inventing a new count.
+`--discard --confirm <server>` drops the local state and the generated identity
+and warns when the host was already bootstrapped. New init refuses while a context or pending init
+for the same server exists. `server init --dry-run` still connects, pins the host
+key and uploads a planning bundle; it stops before apply and removes the pending
+state it created. The interactive result card includes the doctor summary line.
 
 The age handoff is shown on the interactive path and written to `--secrets-out`
 on the unattended path; both carry the same record. DNS/TLS pending is a
@@ -386,8 +422,14 @@ error instead of refusing silently. `doctor` covers pending steps, sshd root and
 password login, the WireGuard-only public SSH rule, the firewall, the Caddy
 certificate for the main hostname, disk, CLI/node/schema/River versions and the
 role's systemd units; any `fail` finding makes the command exit non-zero.
-`ssh` is an interactive shell only (a terminal is required) and uses the
-context's pinned host key and identity. `node unlock-ssh` is hidden from the
+`ssh` uses the context's pinned host key and identity. Without `--command` it
+needs a terminal and opens an interactive shell; `--command` runs one remote
+command and exits with its status. The command gets a PTY only when stdin and
+stdout are terminals and output is plain, so `ssh --command … | cat` returns
+the remote bytes unchanged and sudo's no-terminal refusal becomes an
+`input_required` fault instead of a bare exit; because the remote streams are
+already written, the runner separately emits that fault and its fix on stderr
+(plain) or as the failure envelope (`--json`). `node unlock-ssh` is hidden from the
 operator tree: it runs only on Linux as root from the provider console, opens
 public SSH for 1–240 minutes through the embedded access scripts, and arms a
 transient systemd timer that re-locks without reopening the commit-confirm
@@ -420,7 +462,9 @@ does not automatically delete durable effect records. Corruption fails closed.
 
 ## Current application actions
 
-All use `POST /v1/operations`, the shared registry and one River job:
+All use the shared action registry and transactional River submission. Operators
+reach these services through node RPC; the HTTP adapter is not the operator
+control channel and refuses real app/environment deletes:
 
 | Kind | Target | Main input |
 | --- | --- | --- |
@@ -436,7 +480,7 @@ All use `POST /v1/operations`, the shared registry and one River job:
 | `platform.deploy` | `env/<app>/<env>` | Optional `release_id` and `ref`. Without a release it resolves the current revision's bound source to an exact commit, builds, records the release digest and deploys it with the current revision. With a release it redeploys that release with the current revision. CI and push to deploy submit `ref`. |
 | `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, then uses that deployment's revision and exact secret revisions. |
 | `platform.restart` | `env/<app>/<env>` | Reapplies the serving release with the current revision through the same blue/green path, so a scaled formation takes effect. |
-| `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary` and `addresses` (the main node's public A/AAAA targets). Removal also requires `confirm` equal to the current hostname; removing the primary is refused. |
+| `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary`, `addresses` (the selected main node's public A/AAAA targets) and `check_path` (an absolute HTTP path without control characters). Removal also requires `confirm` equal to the current hostname; removing the primary is refused. |
 | `platform.environment.delete` | `env/<app>/<env>` | `confirm` equal to `<app>/<environment>`; the worker removes labeled containers and routes before platform rows. |
 | `platform.app.delete` | `app/<app>` | `confirm` equal to `<app>`; every environment is deleted and the app record last. |
 
@@ -492,7 +536,10 @@ hosts. `EREGION_BUILD_SOURCE_ROOTS` controls directory roots;
 `EREGION_GIT_ALLOWED_HOSTS` replaces the public-forge allowlist. Git is rechecked
 at execution, with redirects/other protocols disabled; a private HTTPS read
 credential is supplied to git through the embedded askpass helper and the
-transient node secret map, never in the build payload. A directory/git build on
+transient node secret map, never in the build payload. A git revision's
+`context_path` selects the Buildpacks directory inside the checkout: the step
+evaluates symlinks, requires the result to stay inside the repository and to be
+a directory, and never falls back to the repository root. A directory/git build on
 a distinct build node is refused before `pack`: registry push/pull and dedicated
 credentials do not exist. Installing a registry alone does not move images.
 
@@ -509,12 +556,49 @@ Deploy sequence: deployability gate -> preflight -> build from the revision when
 the release is pending -> release command -> candidate containers for every
 process replica on dynamic loopback ports -> health for every web replica ->
 Caddy upstream switch with all web replica backends -> public HTTPS verification
-through local Caddy -> remove the previous deployment's containers. The gate
-refuses before any build or container work. A failure before the switch removes
-the candidates and leaves the previous release serving; a failure after the
-switch restores the previous upstreams. Rollback and restart use the same path
-with the recorded revision/secret snapshot and the current revision respectively.
+through local Caddy -> remove the previous deployment's containers. A container
+removal that fails is recorded in `platform_container_cleanup` and retried;
+the verified switch stays successful and the failure is never silently dropped.
+The gate
+refuses before any build or container work. The release command is release
+scoped: it runs once per release and command digest, before candidate
+containers, and a succeeded result is recorded. A repeat deploy of the same
+release and command skips it; a changed command digest runs again; a failed
+command fails the deploy and leaves the previous release serving. An unknown
+node outcome leaves the run row running; a later deploy never overwrites that
+ownership blindly. It resolves the original operation's recorded command step
+and node status: a completed step record becomes succeeded and is skipped; any
+other step state is resolved by node status because cancellation and retry
+exhaustion mark unfinished steps failed without proving what ran. A
+node-reported terminal failure with a nonempty matching inputs hash becomes
+failed and permits a new run. Missing or mismatched hashes (including failed
+status-query responses), running/absent/stale/unreachable effects and insufficient
+identity keep the original owner and defer. Recovery is read-only
+and never dispatches the command. `restart`,
+`process scale` and `rollback` never run it: they skip a succeeded command and
+refuse with `precondition_failed` ("deploy the release first") otherwise. A
+failure before the switch removes the candidates and leaves the previous
+release serving; a failure after the switch restores the previous upstreams.
+Rollback and restart use the same path with the recorded revision/secret
+snapshot and the current revision respectively.
 Explicit retry creates new work; it does not rewrite a terminal failed record.
+
+A source deploy resolves the revision's git ref (or `--ref`) to an exact commit
+before its submission transaction opens, reading a private repository with the
+revision's credential by name from the vault; an unreachable repository creates
+no operation. The submission-time read refuses the same internal host addresses
+as the build, so loopback/link-local answers are refused, and public forges also refuse
+private answers; explicitly allowlisted private forges retain their private-address
+policy. CI and push to deploy already carry the pushed commit. The commit
+is stored on the build and release rows when they are inserted, the pack step
+checks out exactly that commit and refuses if `HEAD` differs, and a concurrent
+source-kind or URL change makes the submission fail with `conflict`. A ref change
+also conflicts unless an explicit `--ref` owns the effective ref. Matching
+idempotency replays return before git resolution; concurrent first submissions
+still arbitrate transactionally. A failed git build is
+retried only at its recorded commit; without one the retry refuses with "no
+exact commit" and never falls back to a branch name.
+
 Node step events are persisted while the step runs in bounded, attempt-fenced
 batches, so `build logs --follow` and the deploy viewer show build output live;
 the worker's own secrets (control DSN, vault keyring material and the values
@@ -523,7 +607,8 @@ cleanup resolves the node recorded on that deployment's pinned revision, not onl
 the environment's current node.
 
 `app status` and `env status` join durable inventory with a read-only node RPC
-Docker observation (`platform.workloads`). Each desired process replica is shown
+Docker observation (`platform.workloads`). Pending cleanup rows are shown as
+`N leaked containers pending cleanup` in plain output and by name in JSON. Each desired process replica is shown
 with its container state and dynamic host port; a container from another
 deployment is shown but not marked serving. Docker read failure leaves the
 durable status visible and marks replica state `unknown`. Domains come from the
@@ -536,7 +621,13 @@ still uses the telemetry data source.
 
 Domains are changed in the submission transaction, then the worker reads all
 bindings, writes one Caddy site per domain with the serving deployment's web
-replica upstreams and reloads Caddy. Route writers take one PostgreSQL advisory
+replica upstreams and reloads Caddy. `domain add --check-path` sets a binding's
+HTTP observation path; empty uses the current desired revision's web health
+path for background observation. Deployment public verification instead defaults
+to that deployment's pinned revision path, including rollback. The observer
+walks every domain in keyset pages at its own check path, and a deploy's public
+check uses the primary binding's path and records the host, path and status in
+operation events. Aliases are observed, not deploy-gated. Route writers take one PostgreSQL advisory
 lock, adapt the new fragment through Caddy's `/adapt` endpoint, replace the file
 with a fsync+rename, then load it; a rejected load restores the prior **file**,
 not the domain rows. A deployment switch writes the same file with candidate
@@ -549,8 +640,18 @@ SNI. Wrong DNS stays unready. A Cloudflare-proxied record (deploycrate's
 Cloudflare mode) counts as reaching the node: the certificate and public checks
 still run against local Caddy, so readiness means the origin serves the host. `domain add` records the main node's
 public addresses so observation has an expected value. Inventory `domains` and
-`domain list` expose each state separately. See [network](network.md) before
-changing this path.
+`domain list` expose each state separately. A third periodic maintenance job
+retries due `platform_container_cleanup` rows with one-minute-to-one-hour
+backoff on worker start and every five minutes, deleting a row on success. A
+fourth job compares every environment's recorded serving instances with the
+node's labelled `docker ps --all` observation on worker start and every five
+minutes. A missing or exited serving container queues one `platform.restart`
+with the system actor and key `repair:<deployment>:<missing-names hash>`. The
+submission rechecks, under the environment row lock, that the observed serving
+deployment is still current and that no deploy, rollback, restart or delete is
+active; a stale queued repair refuses without touching workloads. The queued
+restart does not rerun the release command. See
+[network](network.md) before changing this path.
 
 ## API and extension seams
 

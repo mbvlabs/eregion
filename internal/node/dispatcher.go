@@ -2,11 +2,13 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
@@ -45,6 +47,9 @@ func NewDispatcherWithSteps(stateDir, nodeName string, registry *secrets.Registr
 func (d *Dispatcher) SetHooks(hooks Hooks) { d.hooks = hooks }
 
 func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Event)) (Response, error) {
+	if request.Method == MethodObserve {
+		return observeLocal(ctx, request)
+	}
 	if err := request.Execution.Validate(); err != nil {
 		return Response{}, fmt.Errorf("invalid execution identity: %w", err)
 	}
@@ -103,6 +108,26 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 	default:
 		return Response{}, fmt.Errorf("unknown node method %q", request.Method)
 	}
+}
+
+// observeLocal answers a read-only Docker observation on this node.
+func observeLocal(ctx context.Context, request Request) (Response, error) {
+	var payload ObservePayload
+	if len(request.Payload) > 0 {
+		if err := json.Unmarshal(request.Payload, &payload); err != nil {
+			return Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: "invalid observation payload"}, nil
+		}
+	}
+	workloads, err := platform.ObserveLocalWorkloads(ctx, payload.App, payload.Environment)
+	if err != nil {
+		fault := contract.Classify(err)
+		return Response{Status: engine.StatusFailed, ErrorCode: string(fault.Code), Detail: fault.Message}, nil
+	}
+	raw, err := json.Marshal(workloads)
+	if err != nil {
+		return Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: "the observation could not be encoded"}, nil
+	}
+	return Response{Status: engine.StatusCompleted, Result: raw}, nil
 }
 
 func permanent(err error) bool {

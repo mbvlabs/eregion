@@ -43,6 +43,10 @@ type Service struct {
 	secrets SecretResolver
 	// sourceRoots is the symlink-resolved directory-build allowlist.
 	sourceRoots []string
+	// resolveGitRef resolves a git branch or tag to an exact commit before a
+	// submission transaction opens. Tests replace it; production leaves it nil
+	// and uses platform.ResolveGitRef.
+	resolveGitRef func(context.Context, string, string, []byte) (string, error)
 	// redaction holds the worker's own secrets (control DSN, vault keyring
 	// material and the secret values handed to one node step). Node events are
 	// redacted with it before they are persisted.
@@ -155,7 +159,7 @@ func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contra
 			return zero, unavailable()
 		}
 		if existingHash != inputHash {
-			return zero, contract.NewFault(contract.Conflict, "idempotency key already binds different inputs", "Use the original inputs to recover the existing operation; use a new key only for deliberately new work.")
+			return zero, idempotencyInputConflict()
 		}
 		return scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
 	}

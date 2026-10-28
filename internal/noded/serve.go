@@ -16,6 +16,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
@@ -97,6 +98,9 @@ func Handle(config Config, steps *node.StepRegistry, request node.Request) node.
 }
 
 func handle(config Config, steps *node.StepRegistry, request node.Request) node.Response {
+	if request.Method == node.MethodObserve {
+		return observeResponse(request)
+	}
 	if err := request.Execution.Validate(); err != nil {
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: err.Error()}
 	}
@@ -108,6 +112,27 @@ func handle(config Config, steps *node.StepRegistry, request node.Request) node.
 	default:
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: "unknown node method " + string(request.Method)}
 	}
+}
+
+// observeResponse answers a read-only Docker ownership observation. A node
+// task is not spawned because there is no effect to journal.
+func observeResponse(request node.Request) node.Response {
+	var payload node.ObservePayload
+	if len(request.Payload) > 0 {
+		if err := json.Unmarshal(request.Payload, &payload); err != nil {
+			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: "invalid observation payload"}
+		}
+	}
+	workloads, err := platform.ObserveLocalWorkloads(context.Background(), payload.App, payload.Environment)
+	if err != nil {
+		fault := contract.Classify(err)
+		return node.Response{Status: engine.StatusFailed, ErrorCode: string(fault.Code), Detail: fault.Message}
+	}
+	raw, err := json.Marshal(workloads)
+	if err != nil {
+		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: "the observation could not be encoded"}
+	}
+	return node.Response{Status: engine.StatusCompleted, Result: raw}
 }
 
 // TaskLogTailBytes bounds the node task log tail the node returns with a

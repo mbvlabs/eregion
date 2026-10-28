@@ -41,32 +41,9 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 	if err := requireHuman(cmd, "eregion secrets export"); err != nil {
 		return result{}, err
 	}
-	store, err := host.LoadContextStore("")
+	identity, err := loadHandoffExportIdentity(cmd)
 	if err != nil {
 		return result{}, err
-	}
-	current, err := store.Get("")
-	if err != nil {
-		return result{}, err
-	}
-	if current.SSH == nil || current.SSH.WireGuard == nil {
-		return result{}, contract.NewFault(contract.PreconditionFailed, "context "+current.Name+" has no WireGuard operator keys", "This export needs a server-init context with the operator identity.")
-	}
-	dir, err := identityDir(current.Name)
-	if err != nil {
-		return result{}, err
-	}
-	sshKey, err := readIdentityFile(filepath.Join(dir, "ssh_ed25519"))
-	if err != nil {
-		return result{}, contract.NewFault(contract.PreconditionFailed, "the operator SSH key is missing", "The context file references keys that are no longer on this machine; restore them from the stored handoff.")
-	}
-	wgKey, err := transport.ReadWireGuardKey(filepath.Join(dir, "wireguard.key"))
-	if err != nil {
-		return result{}, contract.NewFault(contract.PreconditionFailed, "the operator WireGuard key is missing", "The context file references keys that are no longer on this machine; restore them from the stored handoff.")
-	}
-	sudoPassword, err := readIdentityFile(filepath.Join(dir, "sudo-password"))
-	if err != nil {
-		return result{}, contract.NewFault(contract.PreconditionFailed, "the operator sudo password is missing", "The context file references credentials that are no longer on this machine; restore them from the stored handoff.")
 	}
 	code, err := readProtectCode(cmd, "Code from the authenticator app")
 	if err != nil {
@@ -80,17 +57,7 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	publicHost, _, _ := net.SplitHostPort(current.SSH.WireGuard.Endpoint)
-	input := handoffRecordInput{
-		NodeName: exported.Node, Context: current.Name, Hostname: exported.Hostname,
-		PublicAddress: publicHost, Platform: exported.Platform, SSHHostKey: exported.SSHHostKey,
-		WireGuardEndpoint: current.SSH.WireGuard.Endpoint, WireGuardNodeAddress: current.SSH.WireGuard.NodeAddress,
-		WireGuardNodePublicKey: current.SSH.WireGuard.NodePublicKey,
-		AdminUser:              current.SSH.User, SudoPassword: strings.TrimSpace(sudoPassword),
-		OperatorWireGuardAddress: current.SSH.WireGuard.Address, OperatorWireGuardKey: wgKey.Encode(),
-		OperatorSSHKey: strings.TrimSpace(sshKey),
-		DatabaseURL:    exported.DatabaseURL, VaultKeyring: exported.VaultKeyring,
-	}
+	input := handoffExportInput(identity, exported)
 	record, err := newSecretsHandoff(input.Context, handoffGroups(input))
 	if err != nil {
 		return result{}, err
@@ -113,7 +80,7 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	data := map[string]any{
-		"node": exported.Node, "hostname": exported.Hostname, "context": current.Name, "exported": true,
+		"node": exported.Node, "hostname": exported.Hostname, "context": input.Context, "exported": true,
 	}
 	plain := "Re-exported the server handoff to the terminal"
 	if record.path != "" {
@@ -136,4 +103,59 @@ func readIdentityFile(path string) (string, error) {
 		return "", err
 	}
 	return string(raw), nil
+}
+
+// handoffExportIdentity is the selected context's operator identity, read from
+// the local context store. Everything the export record says about the
+// operator comes from here, so it must follow --context / EREGION_CONTEXT.
+type handoffExportIdentity struct {
+	context      host.Context
+	sshKey       string
+	wgKey        transport.WireGuardKey
+	sudoPassword string
+}
+
+func loadHandoffExportIdentity(cmd *cobra.Command) (handoffExportIdentity, error) {
+	current, err := selectedContext(cmd)
+	if err != nil {
+		return handoffExportIdentity{}, err
+	}
+	if current.SSH == nil || current.SSH.WireGuard == nil {
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "context "+current.Name+" has no WireGuard operator keys", "This export needs a server-init context with the operator identity.")
+	}
+	dir, err := identityDir(current.Name)
+	if err != nil {
+		return handoffExportIdentity{}, err
+	}
+	sshKey, err := readIdentityFile(filepath.Join(dir, "ssh_ed25519"))
+	if err != nil {
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator SSH key is missing", "The context file references keys that are no longer on this machine; restore them from the stored handoff.")
+	}
+	wgKey, err := transport.ReadWireGuardKey(filepath.Join(dir, "wireguard.key"))
+	if err != nil {
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator WireGuard key is missing", "The context file references keys that are no longer on this machine; restore them from the stored handoff.")
+	}
+	sudoPassword, err := readIdentityFile(filepath.Join(dir, "sudo-password"))
+	if err != nil {
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator sudo password is missing", "The context file references credentials that are no longer on this machine; restore them from the stored handoff.")
+	}
+	return handoffExportIdentity{context: current, sshKey: strings.TrimSpace(sshKey), wgKey: wgKey, sudoPassword: strings.TrimSpace(sudoPassword)}, nil
+}
+
+// handoffExportInput is the record's identity/route half. The exported half
+// (database URL, vault keyring, hostname) comes from the same node the selected
+// context reaches, so a mixed-context record cannot be built here.
+func handoffExportInput(identity handoffExportIdentity, exported rpcHandoffExportResult) handoffRecordInput {
+	current := identity.context
+	publicHost, _, _ := net.SplitHostPort(current.SSH.WireGuard.Endpoint)
+	return handoffRecordInput{
+		NodeName: exported.Node, Context: current.Name, Hostname: exported.Hostname,
+		PublicAddress: publicHost, Platform: exported.Platform, SSHHostKey: exported.SSHHostKey,
+		WireGuardEndpoint: current.SSH.WireGuard.Endpoint, WireGuardNodeAddress: current.SSH.WireGuard.NodeAddress,
+		WireGuardNodePublicKey: current.SSH.WireGuard.NodePublicKey,
+		AdminUser:              current.SSH.User, SudoPassword: identity.sudoPassword,
+		OperatorWireGuardAddress: current.SSH.WireGuard.Address, OperatorWireGuardKey: identity.wgKey.Encode(),
+		OperatorSSHKey: identity.sshKey,
+		DatabaseURL:    exported.DatabaseURL, VaultKeyring: exported.VaultKeyring,
+	}
 }

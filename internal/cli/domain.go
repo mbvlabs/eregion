@@ -13,7 +13,6 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/spf13/cobra"
 )
@@ -53,6 +52,7 @@ func (a *app) domainSpecs() []spec {
 			{use: "add <app> <environment> <hostname>", meta: add, args: cobra.ExactArgs(3), flags: func(cmd *cobra.Command) {
 				changeFlags(cmd)
 				cmd.Flags().Bool("primary", false, "Make this the environment's primary hostname, demoting the current one")
+				cmd.Flags().String("check-path", "", "HTTP path to observe on this hostname; empty uses the environment's web health path")
 			}, run: func(cmd *cobra.Command, args []string) (result, error) {
 				return a.domainAdd(cmd, args)
 			}},
@@ -71,11 +71,17 @@ func (a *app) domainSpecs() []spec {
 
 func (a *app) domainAdd(cmd *cobra.Command, args []string) (result, error) {
 	primary, _ := cmd.Flags().GetBool("primary")
-	input := platform.DomainInput{
+	return a.domainChange(cmd, platform.KindDomainAdd, domainAddInput(cmd, args, primary))
+}
+
+// domainAddInput records the selected context's public addresses as the
+// binding's expected DNS addresses. It follows --context / EREGION_CONTEXT.
+func domainAddInput(cmd *cobra.Command, args []string, primary bool) platform.DomainInput {
+	checkPath, _ := cmd.Flags().GetString("check-path")
+	return platform.DomainInput{
 		App: args[0], Environment: args[1], Domain: args[2],
-		Primary: primary, Addresses: mainNodeAddresses(cmd.Context()),
+		Primary: primary, Addresses: mainNodeAddresses(cmd), CheckPath: checkPath,
 	}
-	return a.domainChange(cmd, platform.KindDomainAdd, input)
 }
 
 func (a *app) domainRemove(cmd *cobra.Command, args []string) (result, error) {
@@ -115,10 +121,15 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 		} else {
 			records := domainRecords(input.Domain, input.Addresses)
 			preview.plain += "\n" + domainRecordText(input)
-			var value any
-			_ = json.Unmarshal(preview.data.(json.RawMessage), &value)
-			encoded, _ := json.Marshal(map[string]any{"preview": value, "dns_records": records})
-			preview.data = encoded
+			raw, ok := preview.data.(json.RawMessage)
+			if !ok {
+				return result{}, invalidNodeData("domain preview")
+			}
+			data, err := domainAddPreview(raw, records)
+			if err != nil {
+				return result{}, err
+			}
+			preview.data = data
 		}
 		return preview, nil
 	}
@@ -167,6 +178,21 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 
 	data, plain := a.domainChangeResult(cmd, kind, input, op)
 	return result{data: data, plain: plain}, nil
+}
+
+// domainAddPreview nests the dry-run preview and the DNS records. Its result is
+// a json.RawMessage, not []byte: a []byte in result.data would serialize as a
+// base64 string instead of the object agents read with jq .data.preview.
+func domainAddPreview(raw json.RawMessage, records []domainRecord) (json.RawMessage, error) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "the node returned an invalid preview", "Check binary compatibility before assuming the domain was refused.")
+	}
+	encoded, err := json.Marshal(map[string]any{"preview": value, "dns_records": records})
+	if err != nil {
+		return nil, contract.NewFault(contract.Internal, "could not encode the domain preview", "Report the command and binary version.")
+	}
+	return json.RawMessage(encoded), nil
 }
 
 func submitDomain(cmd *cobra.Command, client Backend, kind, target string, input json.RawMessage, key string, dryRun bool) (result, error) {
@@ -277,14 +303,14 @@ func (a *app) domainList(cmd *cobra.Command, _ []string) (result, error) {
 			ready = "yes"
 		}
 		rows = append(rows, []string{
-			item.Domain, primaryMark(item.Primary), item.App, item.Environment,
+			item.Domain, primaryMark(item.Primary), item.App, item.Environment, item.CheckPath,
 			string(item.RouteState), string(item.DNSState), string(item.CertificateState), string(item.PublicState), ready,
 		})
 		if message := domainBindingError(item); message != "" {
-			rows = append(rows, []string{item.Domain, "", "", "", "", "", "", "", message})
+			rows = append(rows, []string{item.Domain, "", "", "", "", "", "", "", "", message})
 		}
 	}
-	return result{data: page.Items, plain: ui.Header("Domains", 72) + "\n" + writeTable([]string{"DOMAIN", "PRI", "APP", "ENVIRONMENT", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY"}, rows)}, nil
+	return result{data: page.Items, plain: ui.Header("Domains", 72) + "\n" + writeTable([]string{"DOMAIN", "PRI", "APP", "ENVIRONMENT", "CHECK PATH", "ROUTE", "DNS", "CERTIFICATE", "PUBLIC", "READY"}, rows)}, nil
 }
 
 func domainBindingError(item platform.DomainBinding) string {
@@ -381,16 +407,18 @@ func primaryMark(primary bool) string {
 }
 
 // mainNodeAddresses is the address the domain's DNS record points at: the
-// current context's WireGuard endpoint (the main node's public address), or
-// the SSH target when the context predates WireGuard.
-func mainNodeAddresses(ctx context.Context) []string {
-	store, err := host.LoadContextStore("")
-	if err != nil {
-		return nil
-	}
-	current, err := store.Get("")
+// selected context's WireGuard endpoint (the main node's public address), or
+// the SSH target when the context predates WireGuard. It follows --context /
+// EREGION_CONTEXT through selectedContext so a binding never records another
+// server's address.
+func mainNodeAddresses(cmd *cobra.Command) []string {
+	current, err := selectedContext(cmd)
 	if err != nil || current.SSH == nil {
 		return nil
+	}
+	ctx := context.Background()
+	if cmd != nil && cmd.Context() != nil {
+		ctx = cmd.Context()
 	}
 	target := current.SSH.Address
 	if current.SSH.WireGuard != nil && current.SSH.WireGuard.Endpoint != "" {

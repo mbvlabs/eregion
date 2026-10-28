@@ -73,6 +73,10 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 		}
 		return runner.Apply(ctx, confirm, false)
 	case methodHostDoctor:
+		var params rpcDoctorParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
 		var drift host.Plan
 		var driftErr error
 		if cfgErr == nil {
@@ -83,6 +87,7 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 			}
 		}
 		facts := host.GatherFacts(ctx, cfg, cfgErr, drift, driftErr, request.ClientVersion, request.ClientCommit, registry)
+		facts.Init = params.Init
 		return doctor.BuildReport(doctor.Run(doctor.Checks(), facts)), nil
 	case methodHostStatus:
 		facts := host.GatherFacts(ctx, cfg, cfgErr, host.Plan{}, nil, request.ClientVersion, request.ClientCommit, registry)

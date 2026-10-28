@@ -58,7 +58,7 @@ func (s AppService) SubmitNormalized(ctx context.Context, actor contract.Actor, 
 	if dryRun {
 		if s.Operations != nil {
 			if previewer, ok := s.Operations.(platformPreviewService); ok {
-				return previewer.Preview(ctx, actor, normalized)
+				return previewer.Preview(ctx, actor, normalized, idempotencyKey)
 			}
 		}
 		return platform.Preview{

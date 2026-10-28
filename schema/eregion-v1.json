@@ -9,7 +9,7 @@
   ],
   "$defs": {
     "code": {
-      "enum": ["usage_error", "invalid_output_mode", "input_required", "validation_failed", "missing_tool", "not_found", "unauthenticated", "forbidden", "precondition_failed", "confirmation_required", "conflict", "node_version_mismatch", "remote_unreachable", "unavailable", "cancelled", "internal_error"]
+      "enum": ["usage_error", "invalid_output_mode", "input_required", "validation_failed", "missing_tool", "not_found", "unauthenticated", "forbidden", "precondition_failed", "doctor_failed", "confirmation_required", "conflict", "node_version_mismatch", "remote_unreachable", "unavailable", "cancelled", "internal_error"]
     },
     "fault": {
       "type": "object",
@@ -60,7 +60,8 @@
         "last_sequence": { "$ref": "#/$defs/sequence" },
         "error_code": { "$ref": "#/$defs/code" },
         "created_at": { "type": "string", "format": "date-time" },
-        "updated_at": { "type": "string", "format": "date-time" }
+        "updated_at": { "type": "string", "format": "date-time" },
+        "first_deploy_operation_id": { "$ref": "#/$defs/operationID" }
       },
       "allOf": [
         { "if": { "required": ["error_code"] }, "then": { "properties": { "state": { "const": "failed" } } } }

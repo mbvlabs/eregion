@@ -303,16 +303,28 @@ final and is the main alpha.2 item.
 
 ## 8. Current state
 
-Source state 2026-10-26: rows 1–10 are implemented on `master` and pass build,
-vet, the darwin build and the unit tests of the changed packages; a read-only
-audit traced every MANUAL-TESTING check and its blocking defects are fixed.
-**Nothing is qualified:** no real-host run is recorded for this build.
-Schema: embedded migrations through 013.
+Source state 2026-10-28: rows 1–15 are implemented in the integrated source on
+`master`. Rows 11–15 went through isolated implementation lanes and
+independent review, with rework and orchestrator acceptance; the final
+release-command evidence-classification correction was made by the orchestrator.
+Combined format, build, vet, darwin/arm64 build and selected isolated package
+tests pass. PostgreSQL integration tests are **not run** without an explicitly
+authorized test DSN. Schema: embedded migrations through 016; applied migrations
+001–013 are unchanged.
+**Nothing is qualified:** no real-host baseline is recorded for these changes,
+and this worktree is not a published or tagged build. Row 16 is next; row 17
+remains unimplemented and required before v1.0.0 final.
+
+The failed-follow exit defect is corrected at source level: followed failed
+operations return the recorded error code's nonzero status (fallback exit 5),
+including guided creates. Success exits 0; remote cancellation and viewer detach
+both exit 130 but have distinct messages and state evidence. Isolated regressions
+cover plain, JSON and NDJSON; real-server qualification remains outstanding.
 
 A source re-check on 2026-10-28 (snapshot `a7478c4`) and a real deployment of a
 second app (andurel-site, edge-8a7179d: image push, digest deploy, release
 command, web×2 + service + worker, Cloudflare-proxied domains) found open
-defects at the edges; rows 11–15 close them. The run is evidence, not a
+defects at the edges; the source changes for rows 11–15 address them. The run is evidence, not a
 baseline pass: older build, no failed candidate, rollback or zero-downtime
 check. Task-level detail for rows 11–15 lives in the temporary
 [ALPHA-SPEC](ALPHA-SPEC.md), deleted at the alpha.1 tag.
@@ -335,7 +347,10 @@ check. Task-level detail for rows 11–15 lives in the temporary
 One row at a time, in order (D16). A row is done when its user-visible flow
 works with flags, JSON, failure behavior and regression tests. Real-host checks
 are in MANUAL-TESTING. Exception: rows 11–14 touch disjoint behavior and may
-run in parallel per ALPHA-SPEC; row 15 follows them.
+run in parallel per ALPHA-SPEC; row 15 follows them. Rows 1–15 are implemented
+at source level (section 8); their real-host acceptance criteria below are not
+qualified. Row 16 uses the existing designated test server and still needs a recorded
+baseline for the candidate build; local implementation/review does not qualify it.
 
 | # | Outcome | Done when |
 | --- | --- | --- |

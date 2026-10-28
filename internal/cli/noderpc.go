@@ -30,12 +30,14 @@ import (
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/protect"
+	"github.com/mbvlabs/eregion/internal/release"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/tokens"
 	"github.com/mbvlabs/eregion/internal/upgrade"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh"
 )
 
 // Backend is the operator-side application surface. The saved-context
@@ -48,6 +50,9 @@ type Backend interface {
 	Cancel(context.Context, contract.OperationID) (json.RawMessage, error)
 	Ready(context.Context) error
 	SubmitAction(context.Context, string, string, json.RawMessage, string, string, bool) (json.RawMessage, error)
+	// SubmitActionWithSecrets carries the D7 human factor in the same request
+	// that performs a factor-gated deletion.
+	SubmitActionWithSecrets(context.Context, string, string, json.RawMessage, string, string, bool, map[string]string) (json.RawMessage, error)
 	PlatformInventory(context.Context, string, url.Values) (json.RawMessage, error)
 	Workloads(context.Context, string, string) (platform.Workloads, error)
 	Logs(context.Context, platform.LogQuery, func(platform.LogLine) error) (platform.LogResult, error)
@@ -56,10 +61,9 @@ type Backend interface {
 	ArchiveSecret(context.Context, vault.Namespace, uint64) (vault.Metadata, error)
 	GetSecretMetadata(context.Context, vault.Namespace) (vault.Metadata, error)
 	ListSecrets(context.Context, string, string, int) ([]vault.Metadata, error)
-	ExportSecret(context.Context, vault.Namespace) (vault.Metadata, []byte, error)
+	ExportSecret(context.Context, vault.Namespace, string) (vault.Metadata, []byte, error)
 	ProtectInit(context.Context, bool, string, string) (protect.Setup, error)
 	ProtectConfirm(context.Context, string) (protect.Status, error)
-	ProtectVerify(context.Context, string) error
 	ProtectStatus(context.Context) (protect.Status, error)
 	TokenCreate(context.Context, tokens.CreateRequest, string) (tokens.Issued, error)
 	TokenList(context.Context) ([]tokens.Metadata, error)
@@ -91,7 +95,6 @@ const (
 	methodHostStatus     = "host.status"
 	methodProtectInit    = "protect.init"
 	methodProtectConfirm = "protect.confirm"
-	methodProtectVerify  = "protect.verify"
 	methodProtectStatus  = "protect.status"
 	methodTokenCreate    = "token.create"
 	methodTokenList      = "token.list"
@@ -120,6 +123,10 @@ type rpcSubmitParams struct {
 	Kind   string          `json:"kind"`
 	Target string          `json:"target"`
 	Input  json.RawMessage `json:"input,omitempty"`
+}
+
+type rpcDoctorParams struct {
+	Init bool `json:"init,omitempty"`
 }
 
 type rpcOperationParams struct {
@@ -168,8 +175,10 @@ type rpcSecretExportResult struct {
 }
 
 type rpcInstallParams struct {
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
+	Path    string `json:"path"`
+	SHA256  string `json:"sha256"`
+	Version string `json:"version"`
+	Channel string `json:"channel"`
 }
 
 type rpcProtectInitParams struct {
@@ -220,13 +229,26 @@ type rpcCallOptions struct {
 	Label string
 }
 
+// nodeTransport is the SSH transport a nodeClient drives. *host.Remote is the
+// production implementation; tests use a fake that answers the wire protocol
+// and records calls.
+type nodeTransport interface {
+	Dial(ctx context.Context) (*ssh.Client, error)
+	Run(ctx context.Context, command string, stdin io.Reader, stdout, stderr io.Writer) error
+	Upload(ctx context.Context, destDir string, files []host.RemoteFile) error
+	Remove(ctx context.Context, remotePath string) error
+}
+
 type nodeClient struct {
-	remote      *host.Remote
+	remote      nodeTransport
 	route       *host.ContextSSH
 	operator    string
 	contextName string
 	autoUpgrade bool
-	stderr      io.Writer
+	// dryRun means the invocation previews its work: a version mismatch is
+	// reported, never repaired, because a dry run must not change the node.
+	dryRun bool
+	stderr io.Writer
 	// wait enables the human loading line on stderr while a remote call runs.
 	wait bool
 
@@ -260,7 +282,13 @@ func (n *nodeClient) Ready(ctx context.Context) error {
 }
 
 func (n *nodeClient) SubmitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool) (json.RawMessage, error) {
-	return n.call(ctx, methodSubmit, rpcSubmitParams{Kind: kind, Target: target, Input: input}, rpcCallOptions{DryRun: dryRun, IdempotencyKey: idempotencyKey, Confirm: confirm})
+	return n.SubmitActionWithSecrets(ctx, kind, target, input, idempotencyKey, confirm, dryRun, nil)
+}
+
+func (n *nodeClient) SubmitActionWithSecrets(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool, secretValues map[string]string) (json.RawMessage, error) {
+	return n.call(ctx, methodSubmit, rpcSubmitParams{Kind: kind, Target: target, Input: input}, rpcCallOptions{
+		Secrets: secretValues, DryRun: dryRun, IdempotencyKey: idempotencyKey, Confirm: confirm,
+	})
 }
 
 func (n *nodeClient) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {
@@ -293,10 +321,18 @@ func (n *nodeClient) HostApply(ctx context.Context, dryRun bool, confirm string)
 	return report, plan, nil
 }
 
-func (n *nodeClient) HostDoctor(ctx context.Context) (doctor.Report, error) {
+// HostDoctor asks the node for its read-only checks. initMode leaves out
+// checks that cannot pass before the first handoff.
+func (n *nodeClient) HostDoctor(ctx context.Context, initMode bool) (doctor.Report, error) {
 	var report doctor.Report
-	err := n.hostCall(ctx, methodHostDoctor, rpcCallOptions{}, &report)
-	return report, err
+	raw, err := n.call(ctx, methodHostDoctor, rpcDoctorParams{Init: initMode}, rpcCallOptions{})
+	if err != nil {
+		return report, err
+	}
+	if err := json.Unmarshal(raw, &report); err != nil {
+		return report, invalidNodeData("host doctor")
+	}
+	return report, nil
 }
 
 func (n *nodeClient) HostStatus(ctx context.Context) (host.NodeStatus, error) {
@@ -401,10 +437,10 @@ func (n *nodeClient) ListSecrets(ctx context.Context, app, environment string, l
 	return page.Secrets, nil
 }
 
-func (n *nodeClient) ExportSecret(ctx context.Context, namespace vault.Namespace) (vault.Metadata, []byte, error) {
+func (n *nodeClient) ExportSecret(ctx context.Context, namespace vault.Namespace, code string) (vault.Metadata, []byte, error) {
 	raw, err := n.call(ctx, methodSecretExport, rpcSecretParams{
 		App: namespace.App, Environment: namespace.Environment, Name: namespace.Name,
-	}, rpcCallOptions{})
+	}, rpcCallOptions{Secrets: map[string]string{protect.CodeSecret: code}})
 	if err != nil {
 		return vault.Metadata{}, nil, err
 	}
@@ -446,11 +482,6 @@ func (n *nodeClient) ProtectConfirm(ctx context.Context, code string) (protect.S
 		return protect.Status{}, invalidNodeData("two-factor confirmation")
 	}
 	return status, nil
-}
-
-func (n *nodeClient) ProtectVerify(ctx context.Context, code string) error {
-	_, err := n.call(ctx, methodProtectVerify, struct{}{}, rpcCallOptions{Secrets: map[string]string{protect.CodeSecret: code}})
-	return err
 }
 
 func (n *nodeClient) ProtectStatus(ctx context.Context) (protect.Status, error) {
@@ -626,8 +657,6 @@ func waitLabel(method string, params any) string {
 		return "Reading server status…"
 	case methodProtectConfirm:
 		return "Confirming two-factor setup…"
-	case methodProtectVerify:
-		return "Verifying code…"
 	case methodProtectStatus:
 		return "Reading two-factor status…"
 	case methodTokenList:
@@ -669,6 +698,13 @@ func (n *nodeClient) call(ctx context.Context, method string, params any, opts r
 }
 
 func (n *nodeClient) ensureVersion(ctx context.Context) error {
+	return n.ensureVersionFor(ctx, rpc.Build{Version: buildinfo.Version, Commit: buildinfo.Commit}, runtime.GOOS, runtime.GOARCH, buildinfo.Channel)
+}
+
+// ensureVersionFor is ensureVersion with the build, platform and release
+// channel explicit, so the decision is checked without depending on the host
+// that runs it.
+func (n *nodeClient) ensureVersionFor(ctx context.Context, want rpc.Build, goos, goarch, channel string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.checked {
@@ -678,7 +714,6 @@ func (n *nodeClient) ensureVersion(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	want := rpc.Build{Version: buildinfo.Version, Commit: buildinfo.Commit}
 	if nodeBuildMatches(got, want) {
 		n.checked = true
 		return nil
@@ -686,7 +721,13 @@ func (n *nodeClient) ensureVersion(ctx context.Context) error {
 	if !n.autoUpgrade {
 		return nodeVersionMismatch(nodeBuild(got), want)
 	}
-	mode, fault := nodeUpgradeMode(got)
+	// A dry run reports the upgrade it would make and never selects or runs an
+	// install path. This comes before the mode decision: a host that could not
+	// install still reports the mismatch instead of a mode precondition.
+	if n.dryRun {
+		return nodeDryRunUpgrade(nodeBuild(got), want)
+	}
+	mode, fault := nodeUpgradeModeFor(got, goos, goarch, want.Version, channel)
 	if fault != nil {
 		return fault
 	}
@@ -721,14 +762,10 @@ func nodeBuildMatches(got rpcVersionResult, want rpc.Build) bool {
 	return rpc.SameBuild(nodeBuild(got), want)
 }
 
-// nodeUpgradeMode decides how a mismatched node is brought to this CLI's build.
-// A linux CLI on the matching architecture uploads itself. A macOS CLI, or a
-// different architecture, cannot execute its own binary on the node, so it
+// nodeUpgradeModeFor decides how a mismatched node is brought to the CLI's
+// build. A linux CLI on the matching architecture uploads itself. A macOS CLI,
+// or a different architecture, cannot execute its own binary on the node, so it
 // downloads the verified linux/<node arch> release for this CLI's version.
-func nodeUpgradeMode(got rpcVersionResult) (string, *contract.Fault) {
-	return nodeUpgradeModeFor(got, runtime.GOOS, runtime.GOARCH, buildinfo.Version, buildinfo.Channel)
-}
-
 func nodeUpgradeModeFor(got rpcVersionResult, goos, goarch, version, channel string) (string, *contract.Fault) {
 	if goos != "linux" || (got.Arch != "" && goarch != got.Arch) {
 		if version == "dev" || channel == "" || channel == "dev" {
@@ -758,6 +795,16 @@ func nodeVersionMismatch(got, want rpc.Build) *contract.Fault {
 		fmt.Sprintf("the node runs eregion %s (%s); this CLI is %s (%s)", got.Version, got.Commit, want.Version, want.Commit),
 		"Run the same build on both sides, re-run with --auto-upgrade-nodes, or set auto_upgrade_nodes on the context.")
 	fault.Details = map[string]any{"node": got, "client": want}
+	return fault
+}
+
+// nodeDryRunUpgrade reports the upgrade a dry run would have performed. The
+// node build is left unchanged.
+func nodeDryRunUpgrade(got, want rpc.Build) *contract.Fault {
+	fault := contract.NewFault(contract.NodeVersionMismatch,
+		fmt.Sprintf("would upgrade node from %s to %s; run without --dry-run", got.Version, want.Version),
+		"A dry run never installs a node binary. Re-run without --dry-run to upgrade the node, or use a CLI that matches the node build.")
+	fault.Details = map[string]any{"node": got, "client": want, "dry_run": true}
 	return fault
 }
 
@@ -795,7 +842,10 @@ func (n *nodeClient) installUploadedBuild(ctx context.Context, raw []byte) error
 		return contract.NewFault(contract.Unavailable, "could not upload the node binary", err.Error())
 	}
 	defer func() { _ = n.remote.Remove(context.Background(), dir) }()
-	_, err := n.callRaw(ctx, methodUpgradeInstall, rpcInstallParams{Path: dir + "/eregion", SHA256: hex.EncodeToString(sum[:])}, rpcCallOptions{})
+	_, err := n.callRaw(ctx, methodUpgradeInstall, rpcInstallParams{
+		Path: dir + "/eregion", SHA256: hex.EncodeToString(sum[:]),
+		Version: buildinfo.Version, Channel: buildinfo.Channel,
+	}, rpcCallOptions{})
 	return err
 }
 
@@ -1003,6 +1053,12 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 		registerRPCMethodSecrets(registry, request.Method, data)
 		return writeRPCResult(stdout, data, err)
 	}
+	// The vault export is verified here, inside the same request that returns
+	// the value, and before the control database is opened so a recovery
+	// export still needs its factor while PostgreSQL is unreachable.
+	if err := guardLocalFactor(protect.NewStore(), request); err != nil {
+		return writeRPCResult(stdout, nil, err)
+	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	app, closeRuntime, err := openNodeApp(ctx, logger, registry)
@@ -1056,14 +1112,6 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		}
 		status, err := protect.NewStore().Confirm(request.Secrets[protect.CodeSecret])
 		return status, true, err
-	case methodProtectVerify:
-		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
-			return nil, true, err
-		}
-		if err := protect.NewStore().Verify(request.Secrets[protect.CodeSecret]); err != nil {
-			return nil, true, err
-		}
-		return map[string]bool{"verified": true}, true, nil
 	case methodProtectStatus:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
 			return nil, true, err
@@ -1257,6 +1305,9 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 				return nil, err
 			}
 		}
+		if err := submitFactor(protect.NewStore(), request, params.Kind); err != nil {
+			return nil, err
+		}
 		return app.PreviewOrSubmit(ctx, actor, params.Kind, params.Target, params.Input, request.IdempotencyKey, request.DryRun)
 	case methodGet:
 		var params rpcOperationParams
@@ -1379,6 +1430,33 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 	}
 }
 
+// guardLocalFactor enforces the D7 actions checked without the control
+// database: a vault export needs its code in the same request, and there is no
+// separate verify call for the CLI to skip.
+func guardLocalFactor(store *protect.Store, request rpc.Request) error {
+	if request.Method != methodSecretExport {
+		return nil
+	}
+	return requireFactor(store, request)
+}
+
+// submitFactor enforces the D7 factor on a real delete submission, after the
+// D12 target confirmation has been validated. A dry run previews the plan and
+// never needs the factor.
+func submitFactor(store *protect.Store, request rpc.Request, kind string) error {
+	if request.DryRun || !platform.RequiresHumanFactor(kind) {
+		return nil
+	}
+	return requireFactor(store, request)
+}
+
+// requireFactor verifies the code carried in the request secrets against the
+// node's protect store. An unconfigured store returns the run-eregion-protect
+// init precondition fault, and a code is consumed once.
+func requireFactor(store *protect.Store, request rpc.Request) error {
+	return store.Verify(request.Secrets[protect.CodeSecret])
+}
+
 func nodeOperator(request rpc.Request) (contract.Actor, error) {
 	subject := strings.TrimSpace(request.Operator)
 	if subject == "" {
@@ -1456,8 +1534,12 @@ func installNodeBinary(ctx context.Context, params rpcInstallParams) error {
 	if err := stage.Close(); err != nil {
 		return contract.NewFault(contract.Unavailable, "could not close the staged node binary", "Check the filesystem.")
 	}
-	if got := hex.EncodeToString(hash.Sum(nil)); got != params.SHA256 {
+	got := hex.EncodeToString(hash.Sum(nil))
+	if got != params.SHA256 {
 		return contract.NewFault(contract.PreconditionFailed, "the uploaded binary does not match its sha256", "Do not retry. Push the binary again from a verified build.")
+	}
+	if err := verifyReleaseUpload(ctx, &release.Client{}, params, got, buildinfo.Channel, runtime.GOARCH); err != nil {
+		return err
 	}
 	if err := os.Chmod(stagePath, 0o755); err != nil {
 		return contract.NewFault(contract.PreconditionFailed, "could not make the node binary executable", "Check /usr/local/bin permissions.")
@@ -1471,6 +1553,41 @@ func installNodeBinary(ctx context.Context, params rpcInstallParams) error {
 	command := exec.CommandContext(ctx, "systemctl", "restart", "eregion-api.service", "eregion-worker.service")
 	if output, err := command.CombinedOutput(); err != nil {
 		return contract.NewFault(contract.Unavailable, "the node binary was installed but the services did not restart", strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// releaseManifestClient resolves the signed release manifest a published node
+// trusts. *release.Client is the production implementation; tests inject a fake
+// the way internal/release injects a Verifier.
+type releaseManifestClient interface {
+	Resolve(ctx context.Context, channel, version string) (release.Manifest, error)
+}
+
+// verifyReleaseUpload is the install boundary for a published node: the node
+// itself resolves the signed manifest for the version and channel the operator
+// CLI names and accepts only that manifest's linux/<arch> artifact. A dev node
+// keeps the checksum-only developer path, which never applies to a published
+// node. A manifest that cannot be resolved is returned as-is; the node never
+// falls back to trusting the upload.
+func verifyReleaseUpload(ctx context.Context, client releaseManifestClient, params rpcInstallParams, uploadedSHA, nodeChannel, goarch string) error {
+	if nodeChannel == "" || nodeChannel == "dev" {
+		return nil
+	}
+	if params.Channel == "" || params.Channel == "dev" || params.Version == "" || params.Version == "dev" {
+		return contract.NewFault(contract.PreconditionFailed,
+			"a development CLI cannot install a node binary on this release node",
+			"Use a released eregion CLI for this node, installed from its channel with install.sh, or install the matching release on the node itself.")
+	}
+	manifest, err := client.Resolve(ctx, params.Channel, params.Version)
+	if err != nil {
+		return err
+	}
+	artifact, ok := manifest.Artifacts["linux/"+goarch]
+	if !ok || artifact.SHA256 != uploadedSHA {
+		return contract.NewFault(contract.PreconditionFailed,
+			"the uploaded binary is not the signed release artifact for linux/"+goarch,
+			"Refusing to install it. Upgrade the node through eregion --auto-upgrade-nodes, which uploads the verified release for the CLI's version and channel.")
 	}
 	return nil
 }

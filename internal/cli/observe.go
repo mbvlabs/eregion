@@ -207,6 +207,9 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 		health = platform.HealthUnknown
 	}
 	field("health", ui.State(string(health)))
+	if len(env.PendingCleanup) > 0 {
+		field("cleanup", fmt.Sprintf("%d leaked containers pending cleanup", len(env.PendingCleanup)))
+	}
 	if observation.WorkloadError != "" {
 		field("workload observation", ui.State("unknown")+" ("+observation.WorkloadError+")")
 	}

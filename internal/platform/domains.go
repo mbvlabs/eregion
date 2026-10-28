@@ -58,6 +58,9 @@ type DomainBinding struct {
 	App         string `json:"app"`
 	Environment string `json:"environment"`
 	Primary     bool   `json:"primary"`
+	// CheckPath is this binding's HTTP observation path; empty uses the
+	// environment's web health path.
+	CheckPath string `json:"check_path,omitempty"`
 
 	DesiredRevision int64      `json:"desired_revision"`
 	AppliedRevision int64      `json:"applied_revision"`

@@ -57,7 +57,10 @@ type Check struct {
 	ID       string
 	Category string
 	Security bool
-	Run      func(Facts) []Result
+	// AtInit marks a check that can pass during server init. The init gate
+	// omits every other check until the host is a finished, operating node.
+	AtInit bool
+	Run    func(Facts) []Result
 }
 
 // FirewallFacts is the observed ufw state.
@@ -70,7 +73,10 @@ type FirewallFacts struct {
 
 // Facts is every read-only observation the checks consume.
 type Facts struct {
-	Now         time.Time
+	Now time.Time
+	// Init is set by the server init gate. Checks that cannot pass before the
+	// first confirmed handoff are left out rather than reported as failures.
+	Init        bool
 	Node        string
 	Role        string
 	Hostname    string
@@ -125,20 +131,20 @@ func FreePct(total, free uint64) float64 {
 // Checks are the checks the node runs, in report order.
 func Checks() []Check {
 	return []Check{
-		{ID: "host.intent", Category: CatHost, Run: hostIntent},
-		{ID: "drift.pending", Category: CatHost, Run: driftPending},
-		{ID: "host.disk", Category: CatHost, Run: disk},
-		{ID: "ssh.root_login", Category: CatSecurity, Security: true, Run: sshRootLogin},
-		{ID: "ssh.password_auth", Category: CatSecurity, Security: true, Run: sshPasswordAuth},
-		{ID: "ssh.drop_in", Category: CatSecurity, Security: true, Run: sshDropIn},
-		{ID: "ssh.public_closed", Category: CatSecurity, Security: true, Run: sshPublicClosed},
-		{ID: "net.wireguard", Category: CatSecurity, Security: true, Run: wireGuard},
-		{ID: "fw.active", Category: CatSecurity, Security: true, Run: firewall},
-		{ID: "tls.certificate", Category: CatTLS, Run: certificate},
-		{ID: "version.cli_node", Category: CatVersions, Run: versionCLINode},
-		{ID: "version.schema", Category: CatVersions, Run: versionSchema},
-		{ID: "version.river", Category: CatVersions, Run: versionRiver},
-		{ID: "services.running", Category: CatServices, Run: services},
+		{ID: "host.intent", Category: CatHost, AtInit: true, Run: hostIntent},
+		{ID: "drift.pending", Category: CatHost, AtInit: true, Run: driftPending},
+		{ID: "host.disk", Category: CatHost, AtInit: true, Run: disk},
+		{ID: "ssh.root_login", Category: CatSecurity, Security: true, AtInit: true, Run: sshRootLogin},
+		{ID: "ssh.password_auth", Category: CatSecurity, Security: true, AtInit: true, Run: sshPasswordAuth},
+		{ID: "ssh.drop_in", Category: CatSecurity, Security: true, AtInit: true, Run: sshDropIn},
+		{ID: "ssh.public_closed", Category: CatSecurity, Security: true, AtInit: true, Run: sshPublicClosed},
+		{ID: "net.wireguard", Category: CatSecurity, Security: true, AtInit: true, Run: wireGuard},
+		{ID: "fw.active", Category: CatSecurity, Security: true, AtInit: true, Run: firewall},
+		{ID: "tls.certificate", Category: CatTLS, AtInit: true, Run: certificate},
+		{ID: "version.cli_node", Category: CatVersions, AtInit: true, Run: versionCLINode},
+		{ID: "version.schema", Category: CatVersions, AtInit: true, Run: versionSchema},
+		{ID: "version.river", Category: CatVersions, AtInit: true, Run: versionRiver},
+		{ID: "services.running", Category: CatServices, AtInit: true, Run: services},
 	}
 }
 
@@ -156,10 +162,14 @@ func Filter(checks []Check, only string) []Check {
 	return out
 }
 
-// Run runs checks against facts.
+// Run runs checks against facts. With Facts.Init, checks that cannot pass
+// during server init are left out.
 func Run(checks []Check, facts Facts) []Result {
 	var out []Result
 	for _, check := range checks {
+		if facts.Init && !check.AtInit {
+			continue
+		}
 		for _, result := range check.Run(facts) {
 			result.ID, result.Category, result.Security = check.ID, check.Category, check.Security
 			out = append(out, result)
@@ -186,6 +196,18 @@ type Report struct {
 // BuildReport computes the summary for results.
 func BuildReport(results []Result) Report {
 	return Report{Results: results, Summary: Summary(results)}
+}
+
+// SummaryLine is the compact success line shown by the init result card.
+func SummaryLine(summary map[Status]int) string {
+	parts := []string{fmt.Sprintf("%d ok", summary[Pass])}
+	if summary[Warn] > 0 {
+		parts = append(parts, fmt.Sprintf("%d warn", summary[Warn]))
+	}
+	if summary[Skip] > 0 {
+		parts = append(parts, fmt.Sprintf("%d skip", summary[Skip]))
+	}
+	return strings.Join(parts, " · ")
 }
 
 // Message renders problems first, then the status counts.

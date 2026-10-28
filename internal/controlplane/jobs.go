@@ -59,6 +59,14 @@ type domainObserveArgs struct{}
 
 func (domainObserveArgs) Kind() string { return "platform_domain_observe" }
 
+type containerCleanupArgs struct{}
+
+func (containerCleanupArgs) Kind() string { return "platform_container_cleanup" }
+
+type workloadRepairArgs struct{}
+
+func (workloadRepairArgs) Kind() string { return "platform_workload_repair" }
+
 type Runtime struct {
 	Service *Service
 	Jobs    *river.Client[pgx.Tx]
@@ -160,6 +168,8 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	river.AddWorker(workers, &reconcileWorker{service: service})
 	river.AddWorker(workers, &domainRouteWorker{service: service})
 	river.AddWorker(workers, &domainObserveWorker{service: service})
+	river.AddWorker(workers, &containerCleanupWorker{service: service})
+	river.AddWorker(workers, &workloadRepairWorker{service: service})
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
@@ -186,6 +196,18 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 			// overwrites the observation.
 			river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
 				return domainObserveArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
+			}, &river.PeriodicJobOpts{RunOnStart: true}),
+			// Retry containers a verified switch or a failed candidate could
+			// not remove. The row owns the backoff; the job only retries due
+			// work, so it never races the deploy that recorded it.
+			river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
+				return containerCleanupArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
+			}, &river.PeriodicJobOpts{RunOnStart: true}),
+			// Restore a serving container that disappeared (reboot, OOM, a
+			// manual rm). The queued restart is idempotent per serving
+			// deployment and missing-name set.
+			river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
+				return workloadRepairArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
 		}
 	}
@@ -544,6 +566,26 @@ type domainObserveWorker struct {
 
 func (w *domainObserveWorker) Work(ctx context.Context, _ *river.Job[domainObserveArgs]) error {
 	logDomainMaintenance("observation", w.service.observeDomains(ctx))
+	return nil
+}
+
+type containerCleanupWorker struct {
+	river.WorkerDefaults[containerCleanupArgs]
+	service *Service
+}
+
+func (w *containerCleanupWorker) Work(ctx context.Context, _ *river.Job[containerCleanupArgs]) error {
+	logMaintenance("container cleanup", w.service.retryDueContainerCleanups(ctx))
+	return nil
+}
+
+type workloadRepairWorker struct {
+	river.WorkerDefaults[workloadRepairArgs]
+	service *Service
+}
+
+func (w *workloadRepairWorker) Work(ctx context.Context, _ *river.Job[workloadRepairArgs]) error {
+	logMaintenance("workload repair", w.service.repairServingWorkloads(ctx))
 	return nil
 }
 

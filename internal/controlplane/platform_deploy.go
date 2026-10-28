@@ -53,7 +53,7 @@ func (w *platformWorker) runRelease(ctx context.Context, id contract.OperationID
 	}
 	buildSecrets := map[string]string{}
 	if input.Source.Type == "git" && input.Source.CredentialSecretName != "" {
-		value, _, resolveErr := w.resolveCredentialSecret(ctx, env, input.Source.CredentialSecretName)
+		value, _, resolveErr := w.service.resolveCredentialSecret(ctx, env, input.Source.CredentialSecretName)
 		if resolveErr != nil {
 			return w.settle(ctx, id, attempt, resolveErr)
 		}
@@ -117,7 +117,7 @@ func (w *platformWorker) runBuildRetry(ctx context.Context, id contract.Operatio
 	}
 	buildSecrets := map[string]string{}
 	if old.Source.CredentialSecretName != "" {
-		value, _, err := w.resolveCredentialSecret(ctx, env, old.Source.CredentialSecretName)
+		value, _, err := w.service.resolveCredentialSecret(ctx, env, old.Source.CredentialSecretName)
 		if err != nil {
 			return w.settle(ctx, id, attempt, err)
 		}
@@ -230,6 +230,7 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	case "git":
 		payload.GitURL = build.Source.URL
 		payload.GitRef = gitRef
+		payload.GitContextPath = build.Source.Path
 		payload.GitCredentialSecretKey = build.Source.CredentialSecretName
 	case "directory":
 		payload.Path = build.Source.Path
@@ -353,6 +354,11 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
+	if input, ok := normalized.Input.(*platform.RestartInput); ok && !repairRestartStillApplies(*input, env) {
+		return w.settle(ctx, id, attempt, contract.NewFault(contract.PreconditionFailed,
+			"serving deployment changed since the repair was queued",
+			"The next maintenance run will re-observe the serving workload."))
+	}
 	tr, err := w.service.resolver.TransportFor(ctx, env.Node)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
@@ -364,7 +370,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	needsBuild := release.Status != platform.ReleaseReady || release.ImageID == ""
 	credentialValue := ""
 	if needsBuild && credentialKey != "" && len(dep.SecretRevisions) == 0 {
-		value, ref, resolveErr := w.resolveCredentialSecret(ctx, env, credentialKey)
+		value, ref, resolveErr := w.service.resolveCredentialSecret(ctx, env, credentialKey)
 		if resolveErr != nil {
 			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, resolveErr)
 		}
@@ -438,26 +444,62 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if credentialKey != "" && !contains(env.Revision.SecretNames, credentialKey) {
 		delete(secretValues, credentialKey)
 	}
-	releaseCommand := env.Revision.Runtime.ReleaseCommand
-	if releaseCommand == nil {
-		releaseCommand = release.Command
-	}
+	releaseCommand := deploymentReleaseCommand(env, release)
 	if releaseCommand != nil {
-		commandArgs := []string{"docker", "run", "--rm", "--name", workloadCommandName(env, dep.ID), "--pull", "never", "--network", network}
-		for _, key := range sortedPlatformKeys(containerEnv) {
-			commandArgs = append(commandArgs, "-e", key)
-		}
-		for _, key := range sortedPlatformKeys(secretValues) {
-			commandArgs = append(commandArgs, "-e", key)
-		}
-		commandArgs = append(commandArgs, release.ImageID)
-		commandArgs = append(commandArgs, releaseCommand.Argv...)
-		if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentCommandStep, platform.ArgvPayload{
-			Step: deploymentCommandStep, Argv: commandArgs,
-			Env: containerEnv, SecretEnvKeys: sortedPlatformKeys(secretValues),
-			TimeoutSeconds: releaseCommand.TimeoutSeconds,
-		}, secretValues); err != nil {
+		digest := platform.ReleaseCommandDigest(*releaseCommand)
+		run, err := w.service.releaseCommandRun(ctx, release.ID, digest)
+		if err != nil {
 			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+		}
+		decision := releaseCommandAction(run, dep.Action, id)
+		if decision == releaseCommandRecover {
+			decision, err = w.recoverReleaseCommandRun(ctx, release.ID, digest, run, id)
+			if err != nil {
+				return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+			}
+		}
+		switch decision {
+		case releaseCommandSkip:
+			w.service.appendWorkerEvent(ctx, id, attempt, deploymentCommandStep, "release command already succeeded for this release")
+		case releaseCommandRefuse:
+			if dep.Action == platform.ActionDeploy {
+				return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
+					contract.NewFault(contract.Conflict, "the release command is already running for this release", "Wait for the other deployment to finish, then retry."))
+			}
+			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
+				contract.NewFault(contract.PreconditionFailed, "release command has not succeeded for this release", "Deploy the release first; restart, scale and rollback never run the release command."))
+		default:
+			commandArgs := []string{"docker", "run", "--rm", "--name", workloadCommandName(env, dep.ID), "--pull", "never", "--network", network}
+			for _, key := range sortedPlatformKeys(containerEnv) {
+				commandArgs = append(commandArgs, "-e", key)
+			}
+			for _, key := range sortedPlatformKeys(secretValues) {
+				commandArgs = append(commandArgs, "-e", key)
+			}
+			commandArgs = append(commandArgs, release.ImageID)
+			commandArgs = append(commandArgs, releaseCommand.Argv...)
+			if err := w.service.startReleaseCommandRun(ctx, release.ID, digest, id); err != nil {
+				return w.settle(ctx, id, attempt, err)
+			}
+			if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentCommandStep, platform.ArgvPayload{
+				Step: deploymentCommandStep, Argv: commandArgs,
+				Env: containerEnv, SecretEnvKeys: sortedPlatformKeys(secretValues),
+				TimeoutSeconds: releaseCommand.TimeoutSeconds,
+			}, secretValues); err != nil {
+				if !releaseCommandErrorIsTerminal(err) {
+					// The command may have run. Leave the row owned by this
+					// operation and retry; the next attempt asks node status
+					// before it dispatches the command again.
+					return w.settle(ctx, id, attempt, err)
+				}
+				if markErr := w.service.finishReleaseCommandRun(ctx, release.ID, digest, id, err); markErr != nil {
+					return w.settle(ctx, id, attempt, markErr)
+				}
+				return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+			}
+			if err := w.service.finishReleaseCommandRun(ctx, release.ID, digest, id, nil); err != nil {
+				return w.settle(ctx, id, attempt, err)
+			}
 		}
 	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
@@ -571,13 +613,14 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			Message: "Caddy now load balances release " + string(release.ID) + " across " + fmt.Sprint(len(candidateUpstreams)) + " web replica(s).",
 		})
 	}
+	publicPath := w.service.primaryCheckPath(ctx, env)
 	if _, err := w.service.runControlStep(ctx, id, attempt, deploymentPublicStep, map[string]any{
-		"domain": env.PrimaryDomain, "path": env.Revision.Runtime.HealthPath,
+		"domain": env.PrimaryDomain, "path": publicPath,
 	}, func() error {
 		if w.service.publicVerify != nil {
-			return w.service.publicVerify(ctx, env, env.Revision.Runtime.HealthPath)
+			return w.service.publicVerify(ctx, env, publicPath)
 		}
-		return w.service.verifyPublicRoute(ctx, env, env.Revision.Runtime.HealthPath)
+		return w.service.verifyPublicRoute(ctx, id, attempt, env, publicPath)
 	}); err != nil {
 		_ = w.service.syncRoutes(context.WithoutCancel(ctx))
 		_, _ = w.service.runControlStep(context.WithoutCancel(ctx), id, attempt, deploymentRestoreRouteStep, map[string]any{
@@ -663,11 +706,8 @@ func (w *platformWorker) finishDeploymentFailure(ctx context.Context, tr node.Tr
 	}
 	if len(candidates) > 0 {
 		cleanupCtx := context.WithoutCancel(ctx)
-		if err := w.service.removeDeploymentContainers(cleanupCtx, tr, id, attempt, candidates); err != nil {
-			w.service.appendWorkerEvent(ctx, id, attempt, "cleanup", "Candidate cleanup did not complete: "+contract.Classify(err).Message)
-			if contract.Classify(err).Code == contract.Unavailable {
-				return w.settle(ctx, id, attempt, err)
-			}
+		if err := w.service.removeDeploymentContainers(cleanupCtx, tr, id, attempt, env, dep.ID, env.Node, "candidate", candidates); err != nil {
+			w.service.appendWorkerEvent(ctx, id, attempt, "cleanup", "Candidate cleanup is recorded for retry: "+contract.Classify(err).Message)
 		}
 	}
 	return w.settle(ctx, id, attempt, cause)
@@ -788,12 +828,12 @@ func (w *platformWorker) resolveDeploymentSecrets(ctx context.Context, env platf
 	return container, credentialKey, values[credentialKey], refs, nil
 }
 
-func (w *platformWorker) resolveCredentialSecret(ctx context.Context, env platform.Environment, name string) (string, platform.SecretRevisionRef, error) {
+func (s *Service) resolveCredentialSecret(ctx context.Context, env platform.Environment, name string) (string, platform.SecretRevisionRef, error) {
 	var empty platform.SecretRevisionRef
-	if w.service.secrets == nil {
+	if s.secrets == nil {
 		return "", empty, contract.NewFault(contract.PreconditionFailed, "secret injection is not configured", "Set EREGION_VAULT_KEY_FILE on every control-plane worker.")
 	}
-	snapshot, ok := w.service.secrets.(EnvironmentSecretSnapshotResolver)
+	snapshot, ok := s.secrets.(EnvironmentSecretSnapshotResolver)
 	if !ok {
 		return "", empty, contract.NewFault(contract.PreconditionFailed, "secret name resolution is not configured", "Use a worker whose secret resolver supports environment revision secret names.")
 	}
@@ -930,22 +970,29 @@ func (s *Service) saveDeploymentInstances(ctx context.Context, id contract.Opera
 }
 
 // removeDeploymentContainers removes each recorded container through a durable
-// per-container cleanup step. Missing containers are not an error.
-func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transport, operationID contract.OperationID, attempt uint32, instances []platform.DeploymentInstance) error {
+// per-container cleanup step. Missing containers are not an error; any other
+// failure is recorded for maintenance retry and never changes the switch result.
+func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transport, operationID contract.OperationID, attempt uint32, env platform.Environment, deploymentID platform.DeploymentID, nodeName, reason string, instances []platform.DeploymentInstance) error {
 	worker := &platformWorker{service: s}
+	var failures []error
 	for _, instance := range instances {
 		if instance.Name == "" {
 			continue
 		}
 		step := cleanupStepID(instance.Name)
-		if _, err := worker.runStepOn(ctx, tr, operationID, attempt, step, platform.ArgvPayload{
+		_, err := worker.runStepOn(ctx, tr, operationID, attempt, step, platform.ArgvPayload{
 			Step: step, Argv: []string{"docker", "rm", "-f", instance.Name},
-			AllowFailure: true, TimeoutSeconds: 30,
-		}, nil); err != nil {
-			return err
+			MissingOK: true, TimeoutSeconds: 30,
+		}, nil)
+		if err == nil {
+			continue
 		}
+		if recordErr := s.recordContainerCleanup(ctx, instance.Name, env.ID, nodeName, deploymentID, reason, err); recordErr != nil {
+			failures = append(failures, recordErr)
+		}
+		failures = append(failures, err)
 	}
-	return nil
+	return errors.Join(failures...)
 }
 
 func previousDeploymentInstances(ctx context.Context, s *Service, deployment platform.Deployment) ([]platform.DeploymentInstance, string) {
@@ -982,21 +1029,39 @@ func (s *Service) removePreviousDeploymentContainers(ctx context.Context, curren
 	if len(instances) == 0 {
 		return
 	}
+	cleanupNode := nodeName
+	if cleanupNode == "" {
+		cleanupNode = env.Node
+	}
 	tr := current
 	if nodeName != "" && nodeName != env.Node {
 		if s.resolver == nil {
-			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup was not attempted: the worker has no node resolver.")
+			s.recordUnreachableCleanup(ctx, instances, env, deployment.PreviousDeploymentID, cleanupNode, "previous",
+				contract.NewFault(contract.Unavailable, "the worker has no node resolver", "Run cleanup in a worker configured with node transports."))
+			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup was recorded for retry: the worker has no node resolver.")
 			return
 		}
 		resolved, err := s.resolver.TransportFor(ctx, nodeName)
 		if err != nil {
-			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup could not reach node "+nodeName+": "+contract.Classify(err).Message)
+			s.recordUnreachableCleanup(ctx, instances, env, deployment.PreviousDeploymentID, cleanupNode, "previous", err)
+			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup was recorded for retry: could not reach node "+nodeName+": "+contract.Classify(err).Message)
 			return
 		}
 		tr = resolved
 	}
-	if err := s.removeDeploymentContainers(ctx, tr, id, attempt, instances); err != nil {
-		s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup did not complete: "+contract.Classify(err).Message)
+	if err := s.removeDeploymentContainers(ctx, tr, id, attempt, env, deployment.PreviousDeploymentID, cleanupNode, "previous", instances); err != nil {
+		s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup is pending: "+contract.Classify(err).Message)
+	}
+}
+
+// recordUnreachableCleanup keeps a leaked container visible when its node
+// cannot even be reached: maintenance retries the row when the node returns.
+func (s *Service) recordUnreachableCleanup(ctx context.Context, instances []platform.DeploymentInstance, env platform.Environment, deploymentID platform.DeploymentID, nodeName, reason string, cause error) {
+	for _, instance := range instances {
+		if instance.Name == "" {
+			continue
+		}
+		_ = s.recordContainerCleanup(ctx, instance.Name, env.ID, nodeName, deploymentID, reason, cause)
 	}
 }
 

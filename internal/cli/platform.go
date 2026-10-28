@@ -21,7 +21,7 @@ import (
 func platformMeta(summary, example string) CommandMeta {
 	meta := operationMeta(summary, example)
 	meta.WhenToUse = []string{summary + ". Runs on the node through SSH inside WireGuard; mutations are durable operations with explicit idempotency."}
-	meta.Environment = []string{"EREGION_CONTEXT_FILE"}
+	meta.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_CONTEXT"}
 	return meta
 }
 

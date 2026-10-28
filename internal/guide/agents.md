@@ -45,6 +45,10 @@ Destructive commands take a confirmation token that names the target:
   `--yes` never satisfies a destructive confirmation.
 - Ask the human before passing a destructive `--confirm`, and pass exactly the
   token the command reports.
+- `app delete` and `env delete` also need the D7 human factor: a TOTP code
+  typed at a human's terminal. You may preview a deletion with `--dry-run`,
+  but performing a deletion, exporting secrets and minting a token are
+  human-only. Do not attempt them on the human's behalf.
 - `confirmation_required`, a missing token or a mismatched token means nothing
   was changed. It is not a retry signal.
 
@@ -99,6 +103,8 @@ terminal, some need a human, and a retry may need the same idempotency key.
 
 - Never ask a human to paste a secret into a prompt, an operation input, an
   idempotency key or a log.
+- `config set` is for plain, non-sensitive values only. Credentials and other
+  sensitive values belong in `secret set`, never in `config set`.
 - `secret set` reads plaintext from a protected file (`--file`), not a flag.
   `secret export` writes only to an explicit protected destination
   (`--dest`), never prints the value, and needs a TOTP code at a human's
@@ -110,6 +116,9 @@ terminal, some need a human, and a retry may need the same idempotency key.
   from their authenticator app or a master password (MASTER D7). There is no
   flag, environment variable or stdin path that lets an agent mint its own
   token; do not look for a way around this.
+- Application-database backup is operator-owned (MASTER D4, D19). eregion does
+  not provision, back up or restore an application's database; the app reaches
+  the operator's database through a secret such as `DATABASE_URL`.
 
 ## Workflows
 

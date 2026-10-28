@@ -43,8 +43,13 @@ func Run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 }
 
 func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer, registry *secrets.Registry) int {
+	return runApp(ctx, args, in, out, stderr, registry, newApp())
+}
+
+// runApp is run with a caller-supplied app, so tests can add a command that
+// exercises runner presentation without a network transport.
+func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer, registry *secrets.Registry, a *app) int {
 	registerEnvironmentSecrets(registry)
-	a := newApp()
 	a.secrets = registry
 	selection := followSelectionFromArgs(args, a.valueFlags())
 	mode, err := output.OptionsFromArgs(args, a.valueFlags()...)
@@ -98,6 +103,13 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 	if a.result.streamed {
 		// The presenter already wrote its protocol (NDJSON result, stable plain
 		// summary, restored TUI plus summary, or an interactive SSH shell).
+		if a.result.streamFault != nil {
+			failure := contract.Failure(a.result.command, a.result.streamFault)
+			if writeErr := writer.Write(failure, ""); writeErr != nil {
+				_, _ = io.WriteString(stderr, "error [internal_error]: could not write command output\n")
+				return 70
+			}
+		}
 		var status *exitStatusError
 		if errors.As(err, &status) {
 			return status.code

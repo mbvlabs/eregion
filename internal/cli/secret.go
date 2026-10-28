@@ -20,7 +20,7 @@ func secretMeta(summary, example string) CommandMeta {
 		[]string{summary + ". Runs on the node through the active context; the operator is the SSH-authenticated admin, never the payload."},
 		[]string{example}, "eregion secret list --app <app> --environment <env> --json")
 	meta.Remote = true
-	meta.Environment = []string{"EREGION_CONTEXT_FILE"}
+	meta.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_CONTEXT"}
 	meta.ErrorCodes = []contract.Code{
 		contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed,
 		contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.Conflict,
@@ -251,10 +251,9 @@ func (a *app) exportSecret(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	if err := client.ProtectVerify(cmd.Context(), code); err != nil {
-		return result{}, err
-	}
-	metadata, value, err := client.ExportSecret(cmd.Context(), namespace)
+	// The code travels in the export request itself: the node verifies it and
+	// returns the value from one verified call, so a direct RPC cannot skip it.
+	metadata, value, err := client.ExportSecret(cmd.Context(), namespace, code)
 	if err != nil {
 		return result{}, err
 	}

@@ -69,6 +69,12 @@ func (a *app) logsSpecs() []spec {
 
 func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 	appName, environment := args[0], args[1]
+	follow, _ := cmd.Flags().GetBool("follow")
+	config := followConfig(cmd)
+	streamJSON, err := logsOutputMode(config, follow)
+	if err != nil {
+		return result{}, err
+	}
 	env, _, err := a.readEnvironment(cmd, appName, environment)
 	if err != nil {
 		return result{}, err
@@ -78,7 +84,6 @@ func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 			"Deploy a release before reading container logs; the previous logs belong to a formation that is no longer serving.")
 	}
 	process, _ := cmd.Flags().GetString("process")
-	follow, _ := cmd.Flags().GetBool("follow")
 	since, _ := cmd.Flags().GetDuration("since")
 	tail, _ := cmd.Flags().GetInt("tail")
 	query := platform.LogQuery{
@@ -92,12 +97,10 @@ func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	config := followConfig(cmd)
 	out := cmd.OutOrStdout()
 	if config != nil {
 		out = config.out
 	}
-	streamJSON := config != nil && (config.mode == "ndjson" || (follow && config.mode == string(output.JSON)))
 	clean := a.followCleaner()
 	emit := func(line platform.LogLine) error {
 		if streamJSON {
@@ -143,6 +146,20 @@ func (a *app) logs(cmd *cobra.Command, args []string) (result, error) {
 		plain.WriteString("warning: output was truncated\n")
 	}
 	return result{data: lines, plain: plain.String()}, nil
+}
+
+// logsOutputMode selects the logs wire format. Only --output ndjson streams
+// records; --json --follow is refused because one JSON envelope cannot also
+// carry an open stream, and --json without --follow is one final envelope.
+func logsOutputMode(config *followIO, follow bool) (bool, error) {
+	mode := string(output.Plain)
+	if config != nil {
+		mode = config.mode
+	}
+	if follow && mode == string(output.JSON) {
+		return false, contract.NewFault(contract.Usage, "--json cannot follow a log stream", "Use --output ndjson with --follow, or omit --follow for one JSON result.")
+	}
+	return mode == "ndjson", nil
 }
 
 func detachedLogsFault(count int) error {

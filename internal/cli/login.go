@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/bundle"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/transport"
 	"github.com/spf13/cobra"
@@ -28,17 +31,25 @@ func (a *app) loginSpecs() []spec {
 		[]string{"eregion login", "eregion login --file main-secrets.md --passphrase-file pass.txt --json"})
 	meta.Mutating, meta.Prompts, meta.Remote = true, true, true
 	meta.DryRunReason = "Login only writes the local context store and identity files."
-	meta.InputFlags = []string{"file", "passphrase-file"}
-	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed)
+	meta.InputFlags = []string{"file", "passphrase-file", "replace"}
+	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.Conflict)
 	return []spec{{
 		use:  "login",
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("file", "", "File with the transfer bundle (or the whole handoff); otherwise it is read from standard input")
 			cmd.Flags().String("passphrase-file", "", "File whose first line is the bundle passphrase; asked for in a terminal")
+			cmd.Flags().String("replace", "", "Replace this existing context; must name the context in the bundle exactly")
 		},
 		run: a.login,
 	}}
+}
+
+// loginSeams replace the network probe and readiness check in tests. The zero
+// value uses the real WireGuard probe and node RPC.
+type loginSeams struct {
+	probe func(context.Context, *host.ContextSSH, string) (ssh.PublicKey, error)
+	ready func(context.Context, *host.ContextSSH) error
 }
 
 // handoffRecord is the parsed secrets record: section title → label → value.
@@ -158,16 +169,49 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		a.secrets.Add(v)
 	}
 
+	if err := host.ValidateContextName(name); err != nil {
+		return result{}, err
+	}
+	if err := requireAgreedContext(cmd, name); err != nil {
+		return result{}, err
+	}
+	store, err := host.LoadContextStore("")
+	if err != nil {
+		return result{}, err
+	}
+	replace, _ := cmd.Flags().GetString("replace")
+	replace = strings.TrimSpace(replace)
+	if replace != "" && replace != name {
+		return result{}, contract.NewFault(contract.Conflict, "--replace must name the context in the bundle ("+name+")", "Use --replace "+name+", or omit --replace to keep the existing context.")
+	}
+	existing, lookupErr := store.Get(name)
+	exists := lookupErr == nil
+	if lookupErr != nil {
+		var fault *contract.Fault
+		if !errors.As(lookupErr, &fault) || fault.Code != contract.NotFound {
+			return result{}, lookupErr
+		}
+	}
+	if exists && replace != name {
+		return result{}, contract.NewFault(contract.Conflict, "context "+name+" already exists", "Use eregion login --replace "+name+" to replace it, or choose another server.")
+	}
+
 	dir, err := identityDir(name)
 	if err != nil {
 		return result{}, err
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return result{}, err
 	}
-	sshPath, wgPath := filepath.Join(dir, "ssh_ed25519"), filepath.Join(dir, "wireguard.key")
-	for path, content := range map[string]string{sshPath: sshKey + "\n", wgPath: wgKey + "\n", filepath.Join(dir, "sudo-password"): get("Operator", "Sudo password") + "\n"} {
-		_ = os.Remove(path)
+	// Build and prove the identity in a sibling directory first; the existing
+	// context is swapped only after probe and ready both succeed.
+	tempDir, err := os.MkdirTemp(filepath.Dir(dir), ".eregion-login-"+name+"-")
+	if err != nil {
+		return result{}, err
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+	sshPath, wgPath := filepath.Join(tempDir, "ssh_ed25519"), filepath.Join(tempDir, "wireguard.key")
+	for path, content := range map[string]string{sshPath: sshKey + "\n", wgPath: wgKey + "\n", filepath.Join(tempDir, "sudo-password"): get("Operator", "Sudo password") + "\n"} {
 		if err := writePrivate(path, []byte(content)); err != nil {
 			return result{}, err
 		}
@@ -179,9 +223,19 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
+	knownHostsBefore, hadKnownHosts, err := readOptionalFile(knownHosts)
+	if err != nil {
+		return result{}, err
+	}
+	tempKnownHosts := filepath.Join(tempDir, "known_hosts")
+	if hadKnownHosts {
+		if err := os.WriteFile(tempKnownHosts, knownHostsBefore, 0o600); err != nil {
+			return result{}, err
+		}
+	}
 	route := &host.ContextSSH{
 		Address: net.JoinHostPort(wireGuardAddress, "22"), User: adminUser,
-		Identity: sshPath, KnownHosts: knownHosts,
+		Identity: sshPath, KnownHosts: tempKnownHosts,
 		WireGuard: &host.ContextWireGuard{
 			PrivateKeyFile: wgPath, Address: get("Operator", "WireGuard address"),
 			NodeAddress: wireGuardAddress, NodePublicKey: get("Main node", "WireGuard public key"),
@@ -189,33 +243,97 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		},
 	}
 	// Pin the host key seen through the tunnel when it matches the record.
-	if !hostKeyPinned(knownHosts, route.Address) {
+	if !hostKeyPinned(tempKnownHosts, route.Address) {
 		want := get("Main node", "SSH host key")
 		keyType, _, _ := strings.Cut(want, " ")
-		key, err := probeOverWireGuard(cmd.Context(), route, keyType)
+		probe := a.loginSeams.probe
+		if probe == nil {
+			probe = probeOverWireGuard
+		}
+		key, err := probe(cmd.Context(), route, keyType)
 		if err != nil {
 			return result{}, contract.NewFault(contract.Unavailable, "the node does not answer over WireGuard", err.Error())
 		}
 		if got := key.Type() + " " + ssh.FingerprintSHA256(key); got != want {
 			return result{}, contract.NewFault(contract.PreconditionFailed, "the node's host key "+got+" does not match the record", "Do not continue until the server is checked.")
 		}
-		if err := pinHostKey(knownHosts, route.Address, key); err != nil {
+		if err := pinHostKey(tempKnownHosts, route.Address, key); err != nil {
 			return result{}, err
 		}
 	}
-	store, err := host.LoadContextStore("")
+	ready := a.loginSeams.ready
+	if ready == nil {
+		autoUpgrade := boolFlag(cmd, "auto-upgrade-nodes")
+		if exists {
+			autoUpgrade = autoUpgrade || existing.AutoUpgradeNodes
+		}
+		stderr := cmd.ErrOrStderr()
+		ready = func(ctx context.Context, route *host.ContextSSH) error {
+			return readyRoute(ctx, route, autoUpgrade, stderr)
+		}
+	}
+	if err := ready(cmd.Context(), route); err != nil {
+		return result{}, err
+	}
+	mergedKnownHosts, hadTempKnownHosts, err := readOptionalFile(tempKnownHosts)
 	if err != nil {
 		return result{}, err
 	}
-	if _, err := store.SaveContext(host.Context{Name: name, SSH: route}); err != nil {
+
+	// Swap atomically: the old identity is the backup until the new context,
+	// directory and pinned key are all in place.
+	backup := dir + ".replace-" + randomHex(6)
+	hadOld := false
+	if _, statErr := os.Stat(dir); statErr == nil {
+		hadOld = true
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return result{}, statErr
+	}
+	restoreStore := *store
+	restoreStore.Contexts = append([]host.Context(nil), store.Contexts...)
+	restore := func() {
+		_ = os.RemoveAll(dir)
+		if hadOld {
+			_ = os.Rename(backup, dir)
+		}
+		_ = restoreStore.Save()
+		if hadKnownHosts {
+			_ = engine.WriteFileAtomic(knownHosts, knownHostsBefore, 0o600)
+		} else {
+			_ = os.Remove(knownHosts)
+		}
+	}
+	if hadOld {
+		if err := os.Rename(dir, backup); err != nil {
+			return result{}, err
+		}
+	}
+	if err := os.Rename(tempDir, dir); err != nil {
+		if hadOld {
+			_ = os.Rename(backup, dir)
+		}
 		return result{}, err
 	}
-	client, err := a.contextClient(cmd)
-	if err == nil {
-		err = client.Ready(cmd.Context())
+	if hadTempKnownHosts {
+		if err := engine.WriteFileAtomic(knownHosts, mergedKnownHosts, 0o600); err != nil {
+			restore()
+			return result{}, err
+		}
 	}
-	if err != nil {
+	savedRoute := *route
+	savedRoute.Identity = filepath.Join(dir, "ssh_ed25519")
+	savedRoute.KnownHosts = knownHosts
+	if route.WireGuard != nil {
+		wg := *route.WireGuard
+		wg.PrivateKeyFile = filepath.Join(dir, "wireguard.key")
+		savedRoute.WireGuard = &wg
+	}
+	if _, err := store.SaveContext(host.Context{Name: name, SSH: &savedRoute}); err != nil {
+		restore()
 		return result{}, err
+	}
+	if hadOld {
+		_ = os.RemoveAll(backup)
 	}
 	data := map[string]string{"context": name, "route": route.User + "@" + route.Address + " over WireGuard"}
 	if interactive {
@@ -223,6 +341,28 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{data: data, streamed: true}, nil
 	}
 	return result{data: data, plain: "logged in to " + name}, nil
+}
+
+// readOptionalFile reads path and reports whether it exists.
+func readOptionalFile(path string) ([]byte, bool, error) {
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: eregion's own file.
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return raw, true, nil
+}
+
+// readyRoute checks a not-yet-saved route without touching the context store.
+func readyRoute(ctx context.Context, route *host.ContextSSH, autoUpgrade bool, stderr io.Writer) error {
+	remote, err := routeRemote(route, false)
+	if err != nil {
+		return contract.NewFault(contract.ValidationFailed, "the context's SSH route is not usable", err.Error())
+	}
+	client := &nodeClient{remote: remote, route: route, operator: route.User, autoUpgrade: autoUpgrade, stderr: stderr}
+	return client.Ready(ctx)
 }
 
 // probeOverWireGuard reads the node's SSH host key of keyType through the

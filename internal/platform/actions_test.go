@@ -129,3 +129,25 @@ func mustJSONInput(value any) json.RawMessage {
 	raw, _ := json.Marshal(value)
 	return raw
 }
+
+func TestContextPathInputGateRejectsPathsOutsideTheRepository(t *testing.T) {
+	registry := NewRegistry()
+	normalize := func(contextPath string) error {
+		raw, _ := json.Marshal(map[string]any{
+			"name": "production", "node": "app-1",
+			"source": map[string]any{
+				"kind": "git", "url": "https://github.com/acme/app.git", "context_path": contextPath,
+			},
+		})
+		_, err := registry.Normalize(KindEnvironmentCreate, "app/api", raw)
+		return err
+	}
+	if err := normalize("apps/web"); err != nil {
+		t.Fatalf("a relative context path was refused: %v", err)
+	}
+	for _, bad := range []string{"../x", "/srv/x", "apps/../../x"} {
+		if err := normalize(bad); err == nil {
+			t.Fatalf("context path %q was accepted", bad)
+		}
+	}
+}

@@ -258,15 +258,18 @@ type Environment struct {
 	HealthCheckedAt     *time.Time   `json:"health_checked_at,omitempty"`
 	// Domains are the public hostnames routed through Caddy to the serving web
 	// process replicas.
-	Domains       []string             `json:"domains"`
-	PrimaryDomain string               `json:"primary_domain,omitempty"`
-	ArtifactReady bool                 `json:"artifact_ready"`
-	RevisionID    RevisionID           `json:"current_revision_id,omitempty"`
-	Revision      *EnvironmentRevision `json:"revision,omitempty"`
-	Processes     []ProcessSpec        `json:"processes"`
-	Deployability Deployability        `json:"deployability"`
-	CreatedAt     time.Time            `json:"created_at"`
-	UpdatedAt     time.Time            `json:"updated_at"`
+	Domains       []string `json:"domains"`
+	PrimaryDomain string   `json:"primary_domain,omitempty"`
+	// PendingCleanup names containers a failed removal recorded for retry
+	// (D17). They are not serving and never change the switch result.
+	PendingCleanup []string             `json:"pending_cleanup,omitempty"`
+	ArtifactReady  bool                 `json:"artifact_ready"`
+	RevisionID     RevisionID           `json:"current_revision_id,omitempty"`
+	Revision       *EnvironmentRevision `json:"revision,omitempty"`
+	Processes      []ProcessSpec        `json:"processes"`
+	Deployability  Deployability        `json:"deployability"`
+	CreatedAt      time.Time            `json:"created_at"`
+	UpdatedAt      time.Time            `json:"updated_at"`
 }
 
 // BuildNodeName is where a build source for this environment runs. An empty
@@ -463,4 +466,10 @@ type Preview struct {
 	Summary  string   `json:"summary"`
 	Steps    []string `json:"steps,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
+	// Replay reports that the actor's idempotency key already owns this
+	// kind and target. Operation is that accepted operation; a preview with
+	// Replay set skipped every conflict check, so the caller must not repeat
+	// side effects such as vault writes before submitting the same inputs.
+	Replay    bool                `json:"replay,omitempty"`
+	Operation *contract.Operation `json:"operation,omitempty"`
 }

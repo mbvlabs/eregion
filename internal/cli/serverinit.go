@@ -18,6 +18,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/upgrade"
 	"github.com/spf13/cobra"
@@ -34,6 +35,8 @@ const (
 	phaseAccessSetup = "access_setup"
 	phaseAccess      = "wireguard_access"
 	phaseContext     = "context_saved"
+	phaseChecks      = "checks_passed"
+	phaseDoctor      = "doctor_passed"
 	phaseHandoff     = "handoff_stored"
 )
 
@@ -49,10 +52,10 @@ func (a *app) serverSpecs() []spec {
 	meta.Summary = "Set up a fresh server as the main node (control plane)"
 	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass every answer, a host key decision, --secrets-out and --confirm <server>; JSON and no-TTY use never prompt."}
 	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
-	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "hostname", "database-url-file", "context-name", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm"}
+	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "hostname", "database-url-file", "context-name", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm", "skip-doctor"}
 	meta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_CONTEXT_FILE"}
 	meta.NeedsRestart = "never"
-	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired, contract.MissingTool, contract.RemoteUnreachable, contract.NotFound)
+	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.DoctorFailed, contract.ConfirmationRequired, contract.MissingTool, contract.RemoteUnreachable, contract.NotFound)
 	return []spec{{
 		use:  "server",
 		meta: parent,
@@ -78,6 +81,7 @@ func (a *app) serverSpecs() []spec {
 				f.Bool("resume", false, "Continue an unfinished init")
 				f.Bool("discard", false, "Drop an unfinished init's local state; the server is not touched")
 				f.Bool("dns-ready", false, "The DNS record exists; don't wait for 'confirmed'")
+				f.Bool("skip-doctor", false, "Skip the final doctor gate; the result warns that it was not run")
 				f.Bool("dry-run", false, "Show the plan after read-only preflight checks")
 			},
 			run: a.serverInit,
@@ -102,21 +106,23 @@ type serverInitAnswers struct {
 }
 
 type serverInitSummary struct {
-	Server        string   `json:"server"`
-	Node          string   `json:"node"`
-	Platform      string   `json:"platform"`
-	Hostname      string   `json:"hostname"`
-	Context       string   `json:"context"`
-	AdminUser     string   `json:"admin_user"`
-	PublicAddress string   `json:"public_address"`
-	API           string   `json:"api"`
-	NodeExporter  string   `json:"node_exporter,omitempty"`
-	SecretsOut    string   `json:"secrets_out,omitempty"`
-	Steps         []string `json:"steps,omitempty"`
-	OperationID   string   `json:"operation_id,omitempty"`
-	DryRun        bool     `json:"dry_run,omitempty"`
-	Resumed       bool     `json:"resumed,omitempty"`
-	Warnings      []string `json:"warnings,omitempty"`
+	Server        string         `json:"server"`
+	Node          string         `json:"node"`
+	Platform      string         `json:"platform"`
+	Hostname      string         `json:"hostname"`
+	Context       string         `json:"context"`
+	AdminUser     string         `json:"admin_user"`
+	PublicAddress string         `json:"public_address"`
+	API           string         `json:"api"`
+	NodeExporter  string         `json:"node_exporter,omitempty"`
+	SecretsOut    string         `json:"secrets_out,omitempty"`
+	Steps         []string       `json:"steps,omitempty"`
+	OperationID   string         `json:"operation_id,omitempty"`
+	Doctor        *doctor.Report `json:"doctor,omitempty"`
+	DoctorSkipped bool           `json:"doctor_skipped,omitempty"`
+	DryRun        bool           `json:"dry_run,omitempty"`
+	Resumed       bool           `json:"resumed,omitempty"`
+	Warnings      []string       `json:"warnings,omitempty"`
 }
 
 type serverInit struct {
@@ -141,6 +147,8 @@ type serverInit struct {
 	operationID  string
 	vaultKeyring string
 	warnings     []string
+	// hostDoctor is replaced by tests; production reads the node's report.
+	hostDoctor func(context.Context, bool) (doctor.Report, error)
 }
 
 // hostname is the main node's public name, as the operator gave it.
@@ -182,6 +190,11 @@ func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error)
 	}
 	if summary.DryRun && !boolFlag(cmd, "discard") {
 		plain = "would set up server " + summary.Server + " (" + summary.Platform + "); nothing was applied"
+	}
+	if summary.Doctor != nil {
+		plain += "; doctor: " + doctor.SummaryLine(summary.Doctor.Summary)
+	} else if summary.DoctorSkipped {
+		plain += "; doctor: skipped (earlier run)"
 	}
 	if summary.SecretsOut != "" {
 		plain += "; secrets written to " + summary.SecretsOut
@@ -355,20 +368,28 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		}
 	}
 
-	task := r.start("ready", "Checking that the node RPC answers")
-	client, err := r.a.contextClient(r.cmd)
-	if err == nil {
-		err = client.Ready(ctx)
+	if !r.pending.Done(phaseChecks) {
+		task := r.start("ready", "Checking that the node RPC answers")
+		err := r.readyNode(ctx)
+		if err != nil {
+			task.end(ui.EndFail, "")
+			return err
+		}
+		task.end(ui.EndOK, "eregion node rpc over SSH in WireGuard")
+
+		summary.NodeExporter = r.checkNodeExporter(ctx, route)
+		r.checkDNS(ctx)
+		r.waitForCertificate(ctx)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := r.mark(phaseChecks); err != nil {
+			return err
+		}
 	}
-	if err != nil {
-		task.end(ui.EndFail, "")
+	if err := r.runDoctorGate(ctx, summary); err != nil {
 		return err
 	}
-	task.end(ui.EndOK, "eregion node rpc over SSH in WireGuard")
-
-	summary.NodeExporter = r.checkNodeExporter(ctx, route)
-	r.checkDNS(ctx)
-	r.waitForCertificate(ctx)
 
 	if !r.pending.Done(phaseHandoff) {
 		if err := r.handoff(ctx, summary); err != nil {
@@ -624,6 +645,9 @@ func (r *serverInit) validate() error {
 		return contract.NewFault(contract.Usage, "--password-stdin and --identity cannot be combined", "Use one first-contact credential.")
 	}
 	if err := host.ValidateContextName(ans.Context); err != nil {
+		return err
+	}
+	if err := requireAgreedContext(r.cmd, ans.Context); err != nil {
 		return err
 	}
 	if err := host.ValidateNodeName(ans.Node); err != nil {
@@ -1346,9 +1370,88 @@ func (r *serverInit) showPlan(plan host.Plan) {
 	r.live.Println(ui.PanelFit(title, body, r.live.Width()))
 }
 
-// showResumePlan lists the phases a resume will still run when the host phase
-// is already behind us, so the confirmation always shows a plan.
-func (r *serverInit) showResumePlan() {
+// runDoctorGate is MASTER 6.1's final init gate. It runs after the
+// certificate wait and before the handoff. A failing check returns
+// doctor_failed with the checks and their fixes; --skip-doctor marks the phase
+// done and leaves a warning in the result. Tests replace hostDoctor.
+func (r *serverInit) runDoctorGate(ctx context.Context, summary *serverInitSummary) error {
+	if r.pending.Done(phaseDoctor) {
+		summary.Doctor = r.pending.Doctor
+		summary.DoctorSkipped = r.pending.DoctorSkipped
+		if summary.DoctorSkipped {
+			r.warnings = append(r.warnings, "the doctor gate was skipped in an earlier run (--skip-doctor); run eregion doctor before relying on this server")
+		}
+		return nil
+	}
+	if boolFlag(r.cmd, "skip-doctor") {
+		warning := "the doctor gate was skipped (--skip-doctor); run eregion doctor before relying on this server"
+		r.warn(warning)
+		r.warnings = append(r.warnings, warning)
+		r.pending.Doctor = nil
+		r.pending.DoctorSkipped = true
+		return r.mark(phaseDoctor)
+	}
+	check := r.hostDoctor
+	if check == nil {
+		client, err := r.initNodeClient()
+		if err != nil {
+			return err
+		}
+		check = client.HostDoctor
+	}
+	task := r.start("doctor", "Running the doctor gate")
+	report, err := check(ctx, true)
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return err
+	}
+	summary.Doctor = &report
+	failed := doctor.Failed(report.Results)
+	if len(failed) > 0 {
+		names := make([]string, 0, len(failed))
+		for _, finding := range failed {
+			name := finding.ID
+			if finding.Subject != "" {
+				name += " " + finding.Subject
+			}
+			names = append(names, name)
+		}
+		task.end(ui.EndFail, "")
+		fault := contract.NewFault(contract.DoctorFailed,
+			fmt.Sprintf("%d doctor check(s) fail: %s", len(failed), strings.Join(names, ", ")),
+			"Run each fix (eregion doctor shows them), then eregion server init --resume.")
+		fault.Details = map[string]any{"checks": failed, "summary": report.Summary}
+		return fault
+	}
+	r.pending.Doctor = &report
+	r.pending.DoctorSkipped = false
+	if err := r.mark(phaseDoctor); err != nil {
+		task.end(ui.EndFail, "")
+		return err
+	}
+	task.end(ui.EndOK, doctor.SummaryLine(report.Summary))
+	return nil
+}
+
+// initNodeClient selects the context this init created. The ambient
+// --context/EREGION_CONTEXT selection is for ordinary commands; the readiness
+// check and doctor gate must inspect the server being initialized.
+func (r *serverInit) initNodeClient() (*nodeClient, error) {
+	return r.a.nodeClientFor(r.cmd, r.answers.Context)
+}
+
+// readyNode is the init's readiness probe over the explicit init context.
+func (r *serverInit) readyNode(ctx context.Context) error {
+	client, err := r.initNodeClient()
+	if err != nil {
+		return err
+	}
+	return client.Ready(ctx)
+}
+
+// resumeTasks lists the phases a resume still runs when the host phase is
+// already behind us.
+func (r *serverInit) resumeTasks() []string {
 	remaining := []string{}
 	if !r.pending.Done(phaseAccessSetup) {
 		remaining = append(remaining, "harden the host, create the admin user and bring up WireGuard")
@@ -1357,7 +1460,20 @@ func (r *serverInit) showResumePlan() {
 	if !r.pending.Done(phaseContext) {
 		remaining = append(remaining, "save the local context")
 	}
-	remaining = append(remaining, "check node readiness", "show the secrets handoff")
+	if !r.pending.Done(phaseChecks) {
+		remaining = append(remaining, "check node readiness, node_exporter, DNS and the certificate")
+	}
+	if !r.pending.Done(phaseDoctor) {
+		remaining = append(remaining, "run the doctor gate")
+	}
+	remaining = append(remaining, "show the secrets handoff")
+	return remaining
+}
+
+// showResumePlan shows the remaining phases when the host phase is already
+// behind us, so the confirmation always shows a plan.
+func (r *serverInit) showResumePlan() {
+	remaining := r.resumeTasks()
 	body := "host steps are already applied; remaining:\n- " + strings.Join(remaining, "\n- ")
 	if r.live == nil {
 		fmt.Fprintln(r.cmd.ErrOrStderr(), body)
@@ -1562,6 +1678,11 @@ func (r *serverInit) finish(s serverInitSummary) {
 	}
 	if s.NodeExporter != "" {
 		rows = append(rows, [2]string{"node_exporter", s.NodeExporter})
+	}
+	if s.Doctor != nil {
+		rows = append(rows, [2]string{"doctor", doctor.SummaryLine(s.Doctor.Summary)})
+	} else if s.DoctorSkipped {
+		rows = append(rows, [2]string{"doctor", "skipped (earlier run)"})
 	}
 	if s.SecretsOut != "" {
 		rows = append(rows, [2]string{"secrets", s.SecretsOut})

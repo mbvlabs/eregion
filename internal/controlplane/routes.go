@@ -228,10 +228,49 @@ func loadCaddyfile(ctx context.Context) error {
 	return nil
 }
 
+// primaryCheckPath is the primary binding's observation path: its own
+// --check-path, else the deployment's pinned revision health path (D29). The
+// worker already loaded the pinned revision into env; never read the current
+// revision here, which may be newer than the deployment being verified.
+func (s *Service) primaryCheckPath(ctx context.Context, env platform.Environment) string {
+	var explicit string
+	err := s.pool.QueryRow(ctx, `SELECT coalesce(d.check_path,'')
+        FROM eregion_platform_domains d
+        WHERE d.environment_id=$1 AND d.name=$2 AND d.is_primary
+        LIMIT 1`, env.ID, env.PrimaryDomain).Scan(&explicit)
+	if err != nil {
+		explicit = ""
+	}
+	return publicCheckPath(explicit, env)
+}
+
+// publicCheckPath is the pure path choice: explicit binding path, then the
+// deployment's pinned revision health path, then the legacy environment path.
+func publicCheckPath(explicit string, env platform.Environment) string {
+	if explicit != "" {
+		return explicit
+	}
+	if env.Revision != nil && env.Revision.Runtime.HealthPath != "" {
+		return env.Revision.Runtime.HealthPath
+	}
+	if env.Health.Path != "" {
+		return env.Health.Path
+	}
+	return "/"
+}
+
+func publicCheckMessage(host, path string, status int, probeErr error) string {
+	target := "https://" + host + path
+	if probeErr != nil {
+		return "public check " + target + " → error: " + probeErr.Error()
+	}
+	return fmt.Sprintf("public check %s → %d", target, status)
+}
+
 // verifyPublicRoute requests the primary domain through local Caddy. The URL
 // names the real host so Caddy selects the site and presents the certificate,
 // while the dial always goes to loopback. The route must answer 2xx/3xx.
-func (s *Service) verifyPublicRoute(ctx context.Context, env platform.Environment, healthPath string) error {
+func (s *Service) verifyPublicRoute(ctx context.Context, id contract.OperationID, attempt uint32, env platform.Environment, healthPath string) error {
 	domain := env.PrimaryDomain
 	if domain == "" {
 		return contract.NewFault(contract.PreconditionFailed, "environment has no primary domain", "Add a primary domain before deploying.")
@@ -256,6 +295,7 @@ func (s *Service) verifyPublicRoute(ctx context.Context, env platform.Environmen
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	last := "no response"
+	lastEvent := ""
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+domain+healthPath, nil)
 		if err != nil {
@@ -265,14 +305,28 @@ func (s *Service) verifyPublicRoute(ctx context.Context, env platform.Environmen
 		if err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			_ = resp.Body.Close()
+			message := publicCheckMessage(domain, healthPath, resp.StatusCode, nil)
+			if message != lastEvent {
+				s.appendWorkerEvent(ctx, id, attempt, deploymentPublicStep, message)
+				lastEvent = message
+			}
 			if resp.StatusCode >= 200 && resp.StatusCode < 400 {
 				return nil
 			}
 			last = fmt.Sprintf("status %d", resp.StatusCode)
 		} else {
 			last = err.Error()
+			message := publicCheckMessage(domain, healthPath, 0, err)
+			if message != lastEvent {
+				s.appendWorkerEvent(ctx, id, attempt, deploymentPublicStep, message)
+				lastEvent = message
+			}
 		}
 		if time.Now().After(deadline) {
+			message := "public check https://" + domain + healthPath + " → " + last
+			if message != lastEvent {
+				s.appendWorkerEvent(ctx, id, attempt, deploymentPublicStep, message)
+			}
 			return contract.NewFault(contract.PreconditionFailed, "the public route did not return a successful response", "Check DNS, the Caddy route, and the web process health; last result: "+last)
 		}
 		select {

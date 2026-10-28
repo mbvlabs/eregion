@@ -14,6 +14,13 @@ metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
 - Streaming commands opt into NDJSON; ordinary commands do not accept an arbitrary
   streaming mode. Service commands log on stderr and return their final result on
   shutdown. Explicit machine mode must never start Charm or prompt.
+- `logs` streams NDJSON only with `--output ndjson`. `--json --follow` is a usage
+  error whose fix is `--output ndjson`; `--json` without `--follow` returns one
+  final envelope. `ssh --command` is a passthrough: it writes the remote stdout
+  and stderr unchanged and exits with the remote status, so ordinary failures
+  have no envelope. The sudo no-terminal refusal is the exception: the runner
+  prints its `input_required` fault and fix on stderr (plain) or as the failure
+  envelope (`--json`) after the remote stream.
 - Structured/no-TTY parity is a product requirement. Some newer setup/login paths
   still need qualification; discovery metadata is not proof that they comply.
 - Output write failure exits 70; do not append a second envelope after a partial
@@ -42,7 +49,7 @@ Binary, node-protocol and database versions are separate from envelope version.
 | 2 | `usage_error`, `invalid_output_mode`, `input_required`, `validation_failed`, `missing_tool` |
 | 3 | `not_found` |
 | 4 | `unauthenticated`, `forbidden` |
-| 5 | `precondition_failed`, `confirmation_required`, `conflict`, `node_version_mismatch` |
+| 5 | `precondition_failed`, `doctor_failed`, `confirmation_required`, `conflict`, `node_version_mismatch` |
 | 6 | `unavailable`, `remote_unreachable`, including request deadlines |
 | 70 | `internal_error`, including output failure |
 | 130 | `cancelled` for interrupted client/viewer |
@@ -117,10 +124,18 @@ states, separate from operation state. Stale means **last known**, not stopped.
 
 - `--json` waits and returns one final observation envelope.
 - `--output ndjson` streams events and a terminal result record.
+- `logs --output ndjson` follows the same rule; with `--follow` it is the only
+  supported machine stream.
 - `--interactive` explicitly requests the terminal viewer and requires a TTY.
-- Current follower exits 0 when it observes any terminal operation state, including
-  **failed**. Check `data.state`/error code; exit 0 is not deployment success.
-- Early detach exits 130 and never invokes cancellation.
+- Following a succeeded operation exits 0. A failed operation returns a failure
+  envelope and the recorded error code's nonzero exit status; missing/unknown
+  codes (or `cancelled` on a failed state) fall back to `precondition_failed`
+  (exit 5). Failure details include `operation_id` and terminal `state`.
+  This applies to `operations follow`, followed deploys and guided creates;
+  accepted-only submissions still report acceptance, not completion.
+- A remotely cancelled operation exits 130 with "operation was cancelled".
+  Early detach also exits 130, but says the viewer detached and the operation
+  was not cancelled; it supplies a resume command and never invokes cancellation.
 
 ```json
 {"schema":"eregion/v1","type":"event","event":{"operation_id":"op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","sequence":"1","at":"2026-10-26T12:00:00Z","kind":"state","attempt":0,"state":"queued"}}

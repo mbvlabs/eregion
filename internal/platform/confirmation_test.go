@@ -7,6 +7,19 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 )
 
+func TestRequiresHumanFactorCoversTheDeleteKinds(t *testing.T) {
+	for kind, want := range map[string]bool{
+		KindAppDelete:         true,
+		KindEnvironmentDelete: true,
+		KindDeploy:            false,
+		KindRollback:          false,
+	} {
+		if got := RequiresHumanFactor(kind); got != want {
+			t.Fatalf("RequiresHumanFactor(%s) = %v, want %v", kind, got, want)
+		}
+	}
+}
+
 func TestValidateConfirmation(t *testing.T) {
 	target, err := NewEnvironmentTarget("api", "production")
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
@@ -52,8 +53,14 @@ type PendingInit struct {
 	// skips first contact can still build the handoff.
 	HostKey string `json:"host_key,omitempty"`
 	// SecretsOut is the record written by an earlier attempt, if any.
-	SecretsOut string            `json:"secrets_out,omitempty"`
-	Phases     map[string]string `json:"phases"`
+	SecretsOut string `json:"secrets_out,omitempty"`
+	// Doctor is the report that passed the gate. A resumed handoff after the
+	// gate therefore shows the same summary without rerunning doctor.
+	Doctor *doctor.Report `json:"doctor,omitempty"`
+	// DoctorSkipped records an explicit --skip-doctor pass so a resumed
+	// handoff says skipped rather than inventing a report.
+	DoctorSkipped bool              `json:"doctor_skipped,omitempty"`
+	Phases        map[string]string `json:"phases"`
 }
 
 // PendingRoot is the directory of unfinished inits, beside the context file.

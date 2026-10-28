@@ -2,12 +2,15 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 func hostResult(data any) result {
@@ -27,18 +30,14 @@ func (a *app) nodeClient(cmd *cobra.Command) (*nodeClient, error) {
 }
 
 func (a *app) nodeClientFor(cmd *cobra.Command, name string) (*nodeClient, error) {
+	current, err := contextByName(cmd, name)
+	if err != nil {
+		return nil, err
+	}
 	// One command reuses one client: the version check runs once and every
 	// call shares one SSH connection over one WireGuard tunnel.
-	if client, ok := a.nodeClients[name]; ok {
+	if client, ok := a.nodeClients[current.Name]; ok {
 		return client, nil
-	}
-	store, err := host.LoadContextStore("")
-	if err != nil {
-		return nil, err
-	}
-	current, err := store.Get(name)
-	if err != nil {
-		return nil, err
 	}
 	if current.SSH == nil {
 		return nil, contract.NewFault(contract.PreconditionFailed, "context "+current.Name+" has no SSH route", "Import a server init handoff with eregion login, or re-run server init.")
@@ -54,14 +53,89 @@ func (a *app) nodeClientFor(cmd *cobra.Command, name string) (*nodeClient, error
 	remote.KeepAlive()
 	client := &nodeClient{
 		remote: remote, route: current.SSH, contextName: current.Name,
-		operator: current.SSH.User, autoUpgrade: autoUpgrade, stderr: cmd.ErrOrStderr(),
+		operator: current.SSH.User, autoUpgrade: autoUpgrade, dryRun: boolFlag(cmd, "dry-run"), stderr: cmd.ErrOrStderr(),
 		wait: humanPlainAt(cmd),
 	}
 	if a.nodeClients == nil {
 		a.nodeClients = map[string]*nodeClient{}
 	}
-	a.nodeClients[name] = client
+	a.nodeClients[current.Name] = client
 	return client, nil
+}
+
+// contextFlag returns the root --context value for a command. A leaf sees it
+// as an inherited persistent flag; tests may pass the root itself.
+func contextFlag(cmd *cobra.Command) string {
+	if cmd == nil {
+		return ""
+	}
+	for _, flags := range []*pflag.FlagSet{cmd.Flags(), cmd.InheritedFlags(), cmd.PersistentFlags()} {
+		if flags.Lookup("context") == nil {
+			continue
+		}
+		value, _ := flags.GetString("context")
+		return strings.TrimSpace(value)
+	}
+	return ""
+}
+
+// resolveContextName is the context a node command addresses: --context, then
+// EREGION_CONTEXT, then the store's current context (an empty name).
+func resolveContextName(cmd *cobra.Command) string {
+	if name := contextFlag(cmd); name != "" {
+		return name
+	}
+	return strings.TrimSpace(os.Getenv("EREGION_CONTEXT"))
+}
+
+// selectedContext loads the context a command addresses: --context, then
+// EREGION_CONTEXT, then the store's current context. Every command-path read
+// of context state goes through contextByName, so local identity/route reads
+// and the node client can never disagree about which server they address.
+func selectedContext(cmd *cobra.Command) (host.Context, error) {
+	return contextByName(cmd, "")
+}
+
+// contextByName loads name, or the selected context when name is empty. A
+// positional node name (eregion ssh <node>) is the only non-empty caller.
+func contextByName(cmd *cobra.Command, name string) (host.Context, error) {
+	store, err := host.LoadContextStore("")
+	if err != nil {
+		return host.Context{}, err
+	}
+	if name == "" {
+		name = resolveContextName(cmd)
+	}
+	current, err := store.Get(name)
+	if err != nil {
+		return host.Context{}, contextLookupError(name, err)
+	}
+	return current, nil
+}
+
+// requireAgreedContext refuses --context when the command creates its own
+// context: login names it from the bundle, server init from its answers.
+func requireAgreedContext(cmd *cobra.Command, name string) error {
+	explicit := contextFlag(cmd)
+	if explicit == "" || explicit == name {
+		return nil
+	}
+	return contract.NewFault(contract.Usage, "--context "+explicit+" does not match the context this command creates ("+name+")", "Omit --context, or use the name this command creates.")
+}
+
+// contextLookupError names an unknown explicit context. The store's own error
+// only knows the current context, so a flag or variable needs its own message.
+func contextLookupError(name string, err error) error {
+	if name == "" {
+		return err
+	}
+	var fault *contract.Fault
+	if errors.As(err, &fault) && fault.Code == contract.NotFound {
+		named := contract.NewFault(contract.NotFound, "context "+name+" was not found", "List contexts with eregion context list.")
+		named.Details = map[string]any{"context": name}
+		return named
+	}
+	return err
 }
 
 func (a *app) contextSpecs() []spec {

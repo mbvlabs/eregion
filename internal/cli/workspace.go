@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/workspaceui"
 	"github.com/spf13/cobra"
@@ -125,16 +124,12 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	}, nil
 }
 
-func workspaceHost(_ *cobra.Command) string {
-	store, err := host.LoadContextStore("")
-	if err != nil {
+func workspaceHost(cmd *cobra.Command) string {
+	current, err := selectedContext(cmd)
+	if err != nil || current.SSH == nil {
 		return ""
 	}
-	context, err := store.Get("")
-	if err != nil || context.SSH == nil {
-		return ""
-	}
-	return context.SSH.User + "@" + context.SSH.Address
+	return current.SSH.User + "@" + current.SSH.Address
 }
 
 type workspaceLiveAPI struct {

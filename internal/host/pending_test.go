@@ -3,6 +3,8 @@ package host
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/mbvlabs/eregion/internal/doctor"
 )
 
 func TestPendingInitTransitions(t *testing.T) {
@@ -35,6 +37,8 @@ func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
 		DatabaseURLFile: "/root/eregion-db.url", Phases: map[string]string{},
 		HostKey: "ssh-ed25519 SHA256:host", HostKeyFingerprint: "SHA256:host",
 	}
+	doctorReport := doctor.BuildReport([]doctor.Result{{ID: "host.disk", Category: doctor.CatHost, Status: doctor.Pass, Detail: "70% free"}})
+	pending.Doctor = &doctorReport
 	pending.Mark("first_contact")
 	if err := pending.Save(); err != nil {
 		t.Fatal(err)
@@ -51,6 +55,21 @@ func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
 	}
 	if loaded.HostKey != pending.HostKey || loaded.HostKeyFingerprint != pending.HostKeyFingerprint {
 		t.Fatalf("host key was not saved: %+v", loaded)
+	}
+	if loaded.Doctor == nil || loaded.Doctor.Summary[doctor.Pass] != 1 || loaded.Doctor.Results[0].ID != "host.disk" {
+		t.Fatalf("doctor report was not saved: %+v", loaded.Doctor)
+	}
+	pending.Doctor = nil
+	pending.DoctorSkipped = true
+	if err := pending.Save(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = LoadPending("prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Doctor != nil || !loaded.DoctorSkipped {
+		t.Fatalf("skipped doctor state was not saved: %+v", loaded)
 	}
 	if err := SavePendingFile("prod", VaultKeyringName, []byte("{}\n")); err != nil {
 		t.Fatal(err)

@@ -18,7 +18,7 @@ type platformInventoryService interface {
 }
 
 type platformPreviewService interface {
-	Preview(context.Context, contract.Actor, platform.Normalized) (platform.Preview, error)
+	Preview(context.Context, contract.Actor, platform.Normalized, string) (platform.Preview, error)
 }
 
 const maxPlatformRequestBytes = platform.MaxInputBytes + 8192
@@ -44,6 +44,9 @@ func (s *Server) submitPlatformAction(r *http.Request, raw []byte) (any, int, er
 	if err != nil {
 		return nil, 0, err
 	}
+	if err := refuseHTTPFactorAction(normalized.Kind, request.DryRun); err != nil {
+		return nil, 0, err
+	}
 	if len(r.Header.Values("Idempotency-Key")) > 1 {
 		return nil, 0, contract.NewFault(contract.InputRequired, "exactly one Idempotency-Key header is required", "Reuse one stable key for retries of this submission.")
 	}
@@ -53,6 +56,18 @@ func (s *Server) submitPlatformAction(r *http.Request, raw []byte) (any, int, er
 		status = http.StatusOK
 	}
 	return data, status, err
+}
+
+// refuseHTTPFactorAction rejects a real submission of a D7 factor-gated
+// deletion. The HTTP API has no channel for the human code, so no grant may
+// perform one; a dry run changes nothing and stays a preview.
+func refuseHTTPFactorAction(kind string, dryRun bool) error {
+	if dryRun || !platform.RequiresHumanFactor(kind) {
+		return nil
+	}
+	return contract.NewFault(contract.Forbidden,
+		"deletions cannot be submitted over the HTTP API",
+		"A deletion needs the D7 human factor inside the request, and the HTTP API cannot carry it. Run eregion app delete or eregion env delete from a human terminal.")
 }
 
 func (s *Server) platformInventory(r *http.Request) (any, int, error) {

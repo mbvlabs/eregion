@@ -32,7 +32,7 @@ import (
 func operationMeta(summary, example string) CommandMeta {
 	meta := readMeta(summary, []string{summary + ". Runs on the node through the active context over SSH inside WireGuard; operations belong to the named operator."}, []string{example})
 	meta.Remote = true
-	meta.Environment = []string{"EREGION_CONTEXT_FILE"}
+	meta.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_CONTEXT"}
 	meta.ErrorCodes = []contract.Code{contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.Conflict, contract.PreconditionFailed, contract.NodeVersionMismatch, contract.Unavailable, contract.Internal, contract.Cancelled}
 	return meta
 }

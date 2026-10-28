@@ -23,7 +23,7 @@ func (a *app) envSpecs() []spec {
 	create.InputFlags = []string{
 		"app", "name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
 		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
-		"health-path", "process", "config", "secret", "domain", "no-deploy",
+		"health-path", "process", "config", "secret", "domain", "no-deploy", "detach",
 	}
 	create.Examples = []string{
 		"eregion env create",
@@ -67,6 +67,7 @@ func (a *app) envSpecs() []spec {
 					cmd.Flags().String("app", "", "Existing application name")
 					cmd.Flags().String("name", "", "Environment name")
 					cmd.Flags().Bool("no-deploy", false, "Do not queue the first deploy")
+					cmd.Flags().Bool("detach", false, "Submit and return without following the create and first deploy")
 					addSetupFlags(cmd, true)
 				},
 				run: a.envCreate,
@@ -134,23 +135,30 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, setupPromptError("env create", err)
 	}
 	defer ans.clearSecrets()
-	spec, err := ans.environmentSpec()
+	spec, err := ans.environmentSpec(cmd)
 	if err != nil {
 		return result{}, err
 	}
-	exists, err := a.appExists(cmd, ans.App)
-	if err != nil {
+	if err := validateIdempotencyFlag(cmd); err != nil {
 		return result{}, err
 	}
-	if !exists {
-		return result{}, contract.NewFault(contract.NotFound, "app "+ans.App+" was not found", "Create it with eregion app create, or choose an existing app.")
-	}
-	exists, err = a.environmentExists(cmd, ans.App, ans.Environment)
-	if err != nil {
-		return result{}, err
-	}
-	if exists {
-		return result{}, contract.NewFault(contract.Conflict, "environment "+ans.App+"/"+ans.Environment+" already exists", "Change it with eregion env update, or choose another name.")
+	if key, _ := cmd.Flags().GetString("idempotency-key"); key == "" {
+		// A named key reaches preview first: preview knows whether it replays
+		// an accepted submission and must skip the same conflict checks.
+		exists, err := a.appExists(cmd, ans.App)
+		if err != nil {
+			return result{}, err
+		}
+		if !exists {
+			return result{}, contract.NewFault(contract.NotFound, "app "+ans.App+" was not found", "Create it with eregion app create, or choose an existing app.")
+		}
+		exists, err = a.environmentExists(cmd, ans.App, ans.Environment)
+		if err != nil {
+			return result{}, err
+		}
+		if exists {
+			return result{}, contract.NewFault(contract.Conflict, "environment "+ans.App+"/"+ans.Environment+" already exists", "Change it with eregion env update, or choose another name.")
+		}
 	}
 	input := platform.EnvironmentCreateInput{App: ans.App, EnvironmentSpec: spec, Deploy: ans.Deploy}
 	target, err := platform.NewAppTarget(ans.App)
@@ -161,7 +169,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if err != nil {
 		return result{}, err
 	}
-	plan := setupPlan(ans, preview)
+	plan := setupPlan(ans, preview, cmd)
 	if interactive {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, ui.PanelFit("Plan for environment "+ans.App+"/"+ans.Environment, plan, 80))
@@ -182,7 +190,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, Deploy: ans.Deploy,
 		Warnings: preview.Warnings, created: "environment",
 	}
-	if record, ok := domainDNSRecord(ans.Domain); ok {
+	if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
 		summary.DNSRecord = &record
 	}
 	if ans.Deploy && ans.Domain == "" {
@@ -196,17 +204,31 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{data: summary, plain: summary.plainText()}, nil
 	}
 
-	secretNames, err := a.writeSetupSecrets(cmd, ans)
-	if err != nil {
-		return result{}, err
+	if preview.Replay {
+		// The original submission already wrote the values; a replay only
+		// needs the same accepted operation.
+		summary.SecretNames = setupSecretNames(ans)
+	} else {
+		secretNames, err := a.writeSetupSecrets(cmd, ans)
+		if err != nil {
+			return result{}, err
+		}
+		summary.SecretNames = secretNames
 	}
-	summary.SecretNames = secretNames
 	op, err := a.submitAccepted(cmd, platform.KindEnvironmentCreate, target.String(), input, "")
 	if err != nil {
 		return result{}, err
 	}
 	summary.OperationID = op.ID
+	summary.FirstDeployOperationID = op.FirstDeployOperationID
 	if interactive {
+		if ans.Deploy && followsByDefault(cmd) {
+			client, err := a.client(cmd)
+			if err != nil {
+				return result{}, err
+			}
+			return a.followGuidedCreate(cmd, client, op, target.String(), a.deployOutcome(ans.App, ans.Environment))
+		}
 		fmt.Fprintln(os.Stderr, "")
 		rows := [][2]string{
 			{"node", ans.Node},
@@ -215,6 +237,9 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 		if ans.Deploy {
 			rows = append(rows, [2]string{"first deploy", "queued from the revision"})
+			if summary.FirstDeployOperationID != "" {
+				rows = append(rows, [2]string{"first deploy operation", string(summary.FirstDeployOperationID)})
+			}
 		}
 		if ans.Domain != "" {
 			rows = append(rows, [2]string{"domain", ans.Domain})
@@ -224,11 +249,15 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 			}
 			rows = append(rows, [2]string{"DNS record", dns})
 		}
-		fmt.Fprintln(os.Stderr, ui.Card("Environment "+ans.App+"/"+ans.Environment+" created", rows, []string{
+		footer := []string{
 			ui.Dim("the revision is desired state, not a running deployment"),
 			ui.Dim("next:"),
 			"  " + ui.Code("eregion env status "+ans.App+" "+ans.Environment+" --json"),
-		}))
+		}
+		if summary.FirstDeployOperationID != "" {
+			footer = append(footer, "  "+ui.Code("eregion operations follow "+string(summary.FirstDeployOperationID)))
+		}
+		fmt.Fprintln(os.Stderr, ui.Card("Environment "+ans.App+"/"+ans.Environment+" created", rows, footer))
 		return result{streamed: true}, nil
 	}
 	return result{data: summary, plain: summary.plainText()}, nil

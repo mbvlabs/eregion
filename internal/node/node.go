@@ -17,9 +17,17 @@ import (
 type Method string
 
 const (
-	MethodRun    Method = "run"
-	MethodStatus Method = "status"
+	MethodRun     Method = "run"
+	MethodStatus  Method = "status"
+	MethodObserve Method = "observe"
 )
+
+// ObservePayload asks a node for its read-only Docker ownership observation.
+// It carries no execution identity: an observation has no effect to journal.
+type ObservePayload struct {
+	App         string `json:"app"`
+	Environment string `json:"environment,omitempty"`
+}
 
 // Request is transport-independent. Secrets are transient and must never be
 // written to River arguments, operation events, or the node journal.

@@ -152,6 +152,11 @@ func (s *Service) claimPlatform(ctx context.Context, id contract.OperationID, at
 
 var errPlatformCancelled = errors.New("platform operation cancelled at a safe boundary")
 
+// errNodeStepPermanentFailure marks an effect the node itself reported as
+// permanently failed. Transport, status and acknowledgement errors do not carry
+// it: their outcome is unknown and must be recovered through node status.
+var errNodeStepPermanentFailure = errors.New("node step permanently failed")
+
 func (w *platformWorker) settle(ctx context.Context, id contract.OperationID, attempt uint32, err error) error {
 	if err == nil {
 		return nil
@@ -735,6 +740,9 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 	if status.InputsHash != "" && status.InputsHash != inputsHash {
 		return nil, contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
 	}
+	if stepID == deploymentCommandStep && status.InputsHash == "" && (status.Status == engine.StatusCompleted || status.Status == engine.StatusFailed) {
+		return nil, contract.NewFault(contract.Unavailable, "release command status has no effect evidence", "Recover the original node effect before rerunning the release command.")
+	}
 	if status.Status == engine.StatusCompleted {
 		if !hasRecord {
 			if _, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, status.ExecutionID); err != nil {
@@ -775,6 +783,9 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 	if response.InputsHash != "" && response.InputsHash != inputsHash {
 		return nil, contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
 	}
+	if stepID == deploymentCommandStep && response.InputsHash == "" {
+		return nil, contract.NewFault(contract.Unavailable, "release command response has no effect evidence", "Recover the original node effect before rerunning the release command.")
+	}
 	switch response.Status {
 	case engine.StatusCompleted:
 		if _, err := w.service.ackStep(ctx, id, attempt, stepID, inputsHash, response.ExecutionID, response.Result, platformStepTotal); err != nil {
@@ -803,7 +814,8 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 		if response.Retryable {
 			return nil, fmt.Errorf("node step %s failed: %s", stepID, detail)
 		}
-		return nil, contract.NewFault(contract.PreconditionFailed, "node step failed: "+detail, "Inspect operation events and node state before resubmitting.")
+		return nil, errors.Join(errNodeStepPermanentFailure,
+			contract.NewFault(contract.PreconditionFailed, "node step failed: "+detail, "Inspect operation events and node state before resubmitting."))
 	default:
 		return nil, fmt.Errorf("node returned unexpected status %q for %s", response.Status, stepID)
 	}
@@ -1078,8 +1090,8 @@ func (s *Service) reconcileDeploymentCleanup(ctx context.Context, op contract.Op
 		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup could not reach the application node: "+contract.Classify(err).Message)
 		return
 	}
-	if err := s.removeDeploymentContainers(ctx, tr, op.ID, op.Attempt, instances); err != nil {
-		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup did not complete: "+contract.Classify(err).Message)
+	if err := s.removeDeploymentContainers(ctx, tr, op.ID, op.Attempt, env, dep.ID, nodeName, "candidate", instances); err != nil {
+		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup is recorded for retry: "+contract.Classify(err).Message)
 	}
 }
 

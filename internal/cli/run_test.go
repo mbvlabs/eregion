@@ -144,6 +144,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 			"eregion env update": true,
 			// These prompt only for the TOTP code at a terminal.
 			"eregion secret export": true, "eregion secrets export": true,
+			"eregion app delete": true, "eregion env delete": true,
 		}
 		prompts := command.Prompts && !guided[command.Path]
 		if prompts || (command.Output != "result" && !events) {

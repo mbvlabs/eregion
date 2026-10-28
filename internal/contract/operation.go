@@ -110,6 +110,10 @@ type Operation struct {
 	ErrorCode Code      `json:"error_code,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// FirstDeployOperationID is set on an accepted app or environment create
+	// that queued a first deploy in the same transaction. It is empty when the
+	// create requested no deploy.
+	FirstDeployOperationID OperationID `json:"first_deploy_operation_id,omitempty"`
 }
 
 func (o Operation) Validate() error {
@@ -128,6 +132,11 @@ func (o Operation) Validate() error {
 		}
 		if !KnownCode(o.ErrorCode) {
 			return NewFault(ValidationFailed, "invalid operation snapshot", "Use a known error code.")
+		}
+	}
+	if o.FirstDeployOperationID != "" {
+		if err := o.FirstDeployOperationID.Validate(); err != nil {
+			return NewFault(ValidationFailed, "invalid first deploy operation ID", "Use the operation ID returned by the accepted create.")
 		}
 	}
 	return nil

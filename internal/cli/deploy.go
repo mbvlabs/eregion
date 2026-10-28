@@ -301,6 +301,42 @@ func (a *app) runDelivery(cmd *cobra.Command, client Backend, action deliveryAct
 	return a.followAccepted(cmd, client, operation, action.Outcome)
 }
 
+// followGuidedCreate follows the accepted create, then the first deploy that
+// the create queued in the same transaction. It uses the deploy viewer and
+// outcome so a guided create ends where a guided deploy does. A create that
+// fails or detaches never starts the deploy follow; an absent first-deploy ID
+// is not invented.
+func (a *app) followGuidedCreate(cmd *cobra.Command, client Backend, op contract.Operation, deployTarget string, outcome func(context.Context, Backend, contract.Operation) []string) (result, error) {
+	created, err := a.followAccepted(cmd, client, op)
+	if err != nil {
+		if followed, ok := created.data.(followResult); ok && followed.Detached && op.FirstDeployOperationID != "" {
+			// The ordinary follow already printed the create's resume command.
+			// Name the queued deploy too, without changing the detach contract.
+			if config := followConfig(cmd); config != nil {
+				line := "first deploy: " + resumeCommand + " " + string(op.FirstDeployOperationID)
+				_, _ = fmt.Fprintln(config.out, a.followCleaner()(line))
+			}
+			if fault, ok := err.(*contract.Fault); ok && fault.Code == contract.Cancelled {
+				copy := *fault
+				copy.Hint = strings.TrimSpace(copy.Hint) + "\nThe first deploy is queued: " + resumeCommand + " " + string(op.FirstDeployOperationID) + "."
+				err = &copy
+			}
+		}
+		return created, err
+	}
+	if op.FirstDeployOperationID == "" {
+		return created, nil
+	}
+	summary, ok := created.data.(followResult)
+	if !ok || summary.State != contract.Succeeded {
+		return created, nil
+	}
+	deploy := contract.Operation{
+		ID: op.FirstDeployOperationID, Kind: platform.KindDeploy, Target: deployTarget,
+	}
+	return a.followAccepted(cmd, client, deploy, outcome)
+}
+
 func (a *app) deployCommand(cmd *cobra.Command, args []string) (result, error) {
 	input, err := deployInput(args[0], args[1], stringFlag(cmd, "ref"), stringFlag(cmd, "release"))
 	if err != nil {
@@ -507,8 +543,13 @@ func (a *app) followBuildLogs(cmd *cobra.Command, client Backend, build platform
 	}
 	presenter := viewer.NewPlain(config.out, config.err, clean)
 	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, build.OperationID, opts, presenter.Observe)
+	observedOK := err == nil
 	err = followError(summary, err)
-	if finishErr := presenter.Finish(summary, err, "eregion operations follow "+string(build.OperationID), time.Now()); finishErr != nil && err == nil {
+	presentationErr := err
+	if observedOK {
+		presentationErr = nil
+	}
+	if finishErr := presenter.Finish(summary, presentationErr, "eregion operations follow "+string(build.OperationID), time.Now()); finishErr != nil && err == nil {
 		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
 	}
 	return result{data: newFollowResult(summary), streamed: true}, err
