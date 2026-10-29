@@ -308,11 +308,13 @@ Source state 2026-10-28: rows 1–15 are implemented in the integrated source on
 independent review, with rework and orchestrator acceptance; the final
 release-command evidence-classification correction was made by the orchestrator.
 Combined format, build, vet, darwin/arm64 build and selected isolated package
-tests pass. PostgreSQL integration tests are **not run** without an explicitly
-authorized test DSN. Schema: embedded migrations through 016; applied migrations
-001–013 are unchanged.
-**Nothing is qualified:** no real-host baseline is recorded for these changes,
-and this worktree is not a published or tagged build. Row 16 is next; row 17
+tests pass. The PostgreSQL integration suite passes (without the race detector)
+against a disposable PostgreSQL 17 after the 2026-10-28 fixture fixes. Schema:
+embedded migrations through 016; applied migrations 001–013 are unchanged.
+**Nothing is qualified:** edge-ed6e4f35b78c was published but cannot upgrade an
+existing node (MANUAL-TESTING run record); the working-tree fix freezing
+`upgrade.install` params is not yet published, and no real-host baseline is
+recorded for these changes. Row 16 is next; row 17
 remains unimplemented and required before v1.0.0 final.
 
 The failed-follow exit defect is corrected at source level: followed failed

@@ -157,6 +157,9 @@ method the operator checks `version`; a different build fails with
 `node_version_mismatch` unless `--auto-upgrade-nodes` or the context's
 `auto_upgrade_nodes` permits pushing the operator's matching Linux binary.
 `version` and `upgrade.install` are exempt from the node-side build check.
+Their wire shape is frozen across builds because an older node runs them to
+reach the operator's build: `upgrade.install` params stay exactly `{path,
+sha256}`, and new install inputs are uploaded as files beside the binary.
 
 ## Confirmation is not authorization
 

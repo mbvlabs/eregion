@@ -45,6 +45,68 @@ test or live host inspection. Work and status live in [MASTER](MASTER.md).
   apps; it is not a sandbox, because an OS account holding a context's files
   (SSH key, sudo password) is root-equivalent on that server.
 
+## Pre-publication credential review — 2026-10-28
+
+**Result: no live credential was identified in the material inspected.** This is
+not a guarantee that every secret format or external GitHub surface is covered.
+The repository was still private during this read-only review; visibility,
+repository settings and credential values were not changed.
+
+Scope and evidence:
+
+- Candidate and remote `master`: `ed6e4f3`. Gitleaks **v8.24.3**, default rules,
+  recursive decoding depth 3, redacted reports, no project suppressions or
+  inline allow-comments honored. Scanned the complete tracked HEAD tree and
+  all locally retained branch/tag history (**232 commits**, including lane and
+  backup branches), not just the current files.
+- Six history candidates (two present in HEAD) were manually triaged: repeating
+  hexadecimal test tokens in API/CLI/webhook tests, a test assertion's secret
+  variable name, an old resource-command example and WireGuard's literal
+  `replace_allowed_ips` UAPI directive. These are fixtures/code, not identified
+  operational credentials. No rotation or history rewrite is indicated by them.
+- An additional local sweep inspected **1,993 Git blobs**, including locally
+  unreachable objects, for private-key blocks, provider/GitHub tokens and
+  credential-bearing URLs/assignments. Private-key markers were incomplete test
+  fixtures; URL credentials were test/example or loopback fixture values. No
+  live SSH/WireGuard key, production DSN or provider token was identified.
+- GitHub exposed one branch (`master`), no tags/releases, no Actions artifacts,
+  and no issues/PRs (including closed). Wiki and Pages were disabled. Scanned
+  available logs from **81 of 82 workflow runs** with no Gitleaks findings; the
+  candidate's unfinished CI run `40766668339` had no downloadable logs and was
+  not covered. Future logs require a fresh check.
+- Repository variables were empty; environment variables were release bucket
+  and public release URL configuration. R2 credentials are referenced through
+  GitHub environment **secrets**, not embedded values. Their encrypted values
+  cannot be read by this audit and were not fetched. Making the repository
+  public does not itself disclose those secret values, but workflow access to
+  them must remain restricted.
+- `scratchpad.md`, `.claude/settings.local.json` and `bin/eregion` are ignored,
+  untracked local files, not publication contents. Ignore rules are not access
+  control: do not force-add local credentials, handoffs, contexts or audit logs.
+  Scanner reports/log copies were kept outside the repository in an owner-only
+  local audit directory, not added to Git.
+
+Recommended GitHub hardening before accepting public contributions:
+
+1. Change the repository's default Actions token permissions from **write** to
+   **read**, and disable permission for Actions to approve pull requests. Current
+   workflows explicitly use `contents: read` (publish additionally needs
+   `id-token: write`), so the broad defaults are unnecessary.
+2. The `edge` and `stable` environments currently have no protection rules or
+   deployment-ref restrictions. Restrict edge to `master` and stable to intended
+   release tags; consider required approval for stable credential use. Current
+   publish triggers are push-to-master and version tags, not pull requests.
+3. Keep fork PR builds unprivileged. CI references no production secrets and
+   there are no repository self-hosted runners. Do not introduce privileged
+   `pull_request_target` execution of contributor code. The CI PostgreSQL
+   password is an intentional disposable-runner fixture, not a production key.
+
+Residual limits: pattern-based detection can miss custom/encoded secrets;
+non-GitHub external storage and private machine credential stores were not
+inspected. No remote history was rewritten, secrets rotated, workflow run
+triggered or repository visibility changed. Recheck newly generated content
+before publication if the candidate changes.
+
 ## Historical findings retained
 
 These preserve prior triage, not a new acceptance decision for every future

@@ -167,9 +167,11 @@ mismatch prevents pushing the operator's own executable: the node receives the
 release matching the CLI's version and the API/worker units restart. A dry run
 never reaches this path.
 
-The node-side `upgrade.install` receives the operator CLI's `Version` and
-`Channel` with the upload. A node built for a published channel resolves that
-version's signed manifest itself (`release.Client.Resolve`, cosign-verified) and
+`upgrade.install` params are frozen at `{path, sha256}`: an older node decodes
+them strictly and must accept the request that upgrades it. The operator CLI's
+`Version` and `Channel` travel instead as `release.json`, uploaded next to the
+binary. A node built for a published channel reads that declaration (an upload
+without one is refused) and resolves that version's signed manifest itself (`release.Client.Resolve`, cosign-verified) and
 accepts only the `linux/<arch>` artifact whose sha256 matches the staged file; a
 dev CLI against such a node is refused with an instruction to use a released
 CLI, and an unreachable manifest returns `unavailable`. The node never falls

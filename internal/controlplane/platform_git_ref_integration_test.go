@@ -21,11 +21,11 @@ func gitDeployFixture(t *testing.T) (*Service, *pgxpool.Pool) {
 	run := testRuntime(t, pool, 0)
 	s := run.Service
 	platformSubmit(t, s, platform.KindNodeRegister, "platform", "node-app-1", map[string]any{
-		"name": "app-1", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "app-shop", map[string]any{"name": "shop"})
 	platformSubmit(t, s, platform.KindEnvironmentCreate, "app/shop", "env-production", map[string]any{
-		"name": "production", "node": "app-1",
+		"name": "production", "node": "local",
 		"source": map[string]any{
 			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "main",
 			"builder": platform.DefaultBuilder,
@@ -33,6 +33,14 @@ func gitDeployFixture(t *testing.T) (*Service, *pgxpool.Pool) {
 		"domain": "shop.example.com", "domain_addresses": []string{"203.0.113.10"},
 	})
 	return s, pool
+}
+
+// moveEnvironmentSource publishes a new current revision with another source,
+// the way an environment update does while a deploy submission is resolving.
+// Revisions are immutable, so a source change is always a new revision.
+func moveEnvironmentSource(t *testing.T, s *Service, key string, source map[string]any) {
+	t.Helper()
+	platformSubmit(t, s, platform.KindEnvironmentUpdate, "env/shop/production", key, map[string]any{"source": source})
 }
 
 func TestIntegrationDeployStoresTheResolvedCommitAtInsert(t *testing.T) {
@@ -67,18 +75,12 @@ func TestIntegrationDeployStoresTheResolvedCommitAtInsert(t *testing.T) {
 func TestIntegrationDeployRefusesARevisionThatChangedAfterResolution(t *testing.T) {
 	s, pool := gitDeployFixture(t)
 	ctx := context.Background()
-	var revisionID string
-	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='shop' AND e.name='production'`).Scan(&revisionID); err != nil {
-		t.Fatal(err)
-	}
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
-		// Move the revision after it was read for resolution but before the
-		// submission transaction reads it again.
-		if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environment_revisions
-            SET source=jsonb_set(source,'{ref}','"other"') WHERE id=$1`, revisionID); err != nil {
-			return "", err
-		}
+		// Publish a new revision after the source was read for resolution but
+		// before the submission transaction reads it again.
+		moveEnvironmentSource(t, s, "move-ref", map[string]any{
+			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": platform.DefaultBuilder,
+		})
 		return submittedGitCommit, nil
 	}
 	_, err := s.Submit(ctx, platformSubmission(platform.KindDeploy, "env/shop/production", "deploy-moved", map[string]any{}))
@@ -97,18 +99,10 @@ func TestIntegrationDeployRefusesARevisionThatChangedAfterResolution(t *testing.
 func TestIntegrationDeployRefusesAGitToImageRevisionChange(t *testing.T) {
 	s, pool := gitDeployFixture(t)
 	ctx := context.Background()
-	var revisionID string
-	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='shop' AND e.name='production'`).Scan(&revisionID); err != nil {
-		t.Fatal(err)
-	}
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
-		// The revision becomes an image source after the ref was resolved but
-		// before the submission transaction reads it again.
-		if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environment_revisions
-            SET source='{"kind":"image","image":"example/app:1"}'::jsonb WHERE id=$1`, revisionID); err != nil {
-			return "", err
-		}
+		// A new revision binds an image after the ref was resolved but before
+		// the submission transaction reads it again.
+		moveEnvironmentSource(t, s, "move-kind", map[string]any{"kind": "image", "image": "example/app:1"})
 		return submittedGitCommit, nil
 	}
 	_, err := s.Submit(ctx, platformSubmission(platform.KindDeploy, "env/shop/production", "deploy-kind-moved", map[string]any{}))
@@ -127,18 +121,12 @@ func TestIntegrationDeployRefusesAGitToImageRevisionChange(t *testing.T) {
 func TestIntegrationDeployRefChangeWithOverrideDoesNotConflict(t *testing.T) {
 	s, pool := gitDeployFixture(t)
 	ctx := context.Background()
-	var revisionID string
-	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='shop' AND e.name='production'`).Scan(&revisionID); err != nil {
-		t.Fatal(err)
-	}
 	var resolvedRef string
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
 		resolvedRef = ref
-		if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environment_revisions
-            SET source=jsonb_set(source,'{ref}','"other"') WHERE id=$1`, revisionID); err != nil {
-			return "", err
-		}
+		moveEnvironmentSource(t, s, "move-ref", map[string]any{
+			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": platform.DefaultBuilder,
+		})
 		return submittedGitCommit, nil
 	}
 	op := platformSubmit(t, s, platform.KindDeploy, "env/shop/production", "deploy-override", map[string]any{"ref": "main"})

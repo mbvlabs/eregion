@@ -208,12 +208,27 @@ type scriptedDeployTransport struct {
 	mu        sync.Mutex
 	runs      map[string]int
 	down      map[string]int
+	hashes    map[string]string
 	lostStep  string
 	lostForOp contract.OperationID
 }
 
 func newScriptedDeployTransport() *scriptedDeployTransport {
-	return &scriptedDeployTransport{runs: map[string]int{}, down: map[string]int{}}
+	return &scriptedDeployTransport{runs: map[string]int{}, down: map[string]int{}, hashes: map[string]string{}}
+}
+
+// scriptedInputsHash is the hash a real node journals for a run: the step
+// built from the request payload, the same way the worker computes it.
+func scriptedInputsHash(request node.Request) string {
+	step, err := node.DefaultRegistry().Build(request.Execution, request.Payload)
+	if err != nil {
+		return ""
+	}
+	inputs, err := step.Inputs()
+	if err != nil {
+		return ""
+	}
+	return engine.InputsHash(step.ID(), inputs)
 }
 
 func (*scriptedDeployTransport) Name() string         { return "scripted-deploy" }
@@ -253,6 +268,7 @@ func (s *scriptedDeployTransport) Call(_ context.Context, request node.Request, 
 	case node.MethodStatus:
 		s.mu.Lock()
 		runs := s.runs[key]
+		hash := s.hashes[key]
 		failures := s.down[key]
 		if failures > 0 {
 			s.down[key] = failures - 1
@@ -262,15 +278,19 @@ func (s *scriptedDeployTransport) Call(_ context.Context, request node.Request, 
 			return node.Response{}, errors.New("node is unreachable")
 		}
 		if runs > 0 {
+			// Like the node journal, status reports the inputs hash recorded by
+			// the run; a status request carries no payload.
 			return node.Response{
 				Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
-				Executed: true, Result: scriptedResult(request),
+				InputsHash: hash, Executed: true, Result: scriptedResult(request),
 			}, nil
 		}
 		return node.Response{Status: engine.StatusAbsent, ExecutionID: request.Execution.ExecutionID()}, nil
 	case node.MethodRun:
+		hash := scriptedInputsHash(request)
 		s.mu.Lock()
 		s.runs[key]++
+		s.hashes[key] = hash
 		first := s.runs[key] == 1
 		lost := first && request.Execution.Step == s.lostStep && request.Execution.OperationID == s.lostForOp
 		if lost {
@@ -282,7 +302,7 @@ func (s *scriptedDeployTransport) Call(_ context.Context, request node.Request, 
 		}
 		return node.Response{
 			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
-			Executed: true, Result: scriptedResult(request),
+			InputsHash: hash, Executed: true, Result: scriptedResult(request),
 		}, nil
 	default:
 		return node.Response{}, fmt.Errorf("unexpected method %q", request.Method)

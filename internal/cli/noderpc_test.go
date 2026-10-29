@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -77,14 +79,26 @@ type fakeNodeTransport struct {
 	methods  []string
 	uploads  int
 	installs int
+	uploaded []string
+}
+
+// publishedInstallParams is the upgrade.install schema every published node
+// decodes strictly. A node on an older build must accept the request that
+// upgrades it, so the operator CLI may never send more than this.
+type publishedInstallParams struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
 }
 
 func (*fakeNodeTransport) Dial(context.Context) (*ssh.Client, error) {
 	return nil, errors.New("the fake transport does not dial")
 }
 
-func (f *fakeNodeTransport) Upload(context.Context, string, []host.RemoteFile) error {
+func (f *fakeNodeTransport) Upload(_ context.Context, _ string, files []host.RemoteFile) error {
 	f.uploads++
+	for _, file := range files {
+		f.uploaded = append(f.uploaded, file.Name)
+	}
 	return nil
 }
 
@@ -101,6 +115,10 @@ func (f *fakeNodeTransport) Run(_ context.Context, _ string, stdin io.Reader, st
 	case methodVersion:
 		data = f.version
 	case methodUpgradeInstall:
+		var params publishedInstallParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return err
+		}
 		f.installs++
 		f.version = f.fresh
 		data = map[string]bool{"installed": true}
@@ -204,6 +222,9 @@ func TestEnsureVersionNeverInstallsUnderDryRun(t *testing.T) {
 			if test.dryRun && transport.called(methodUpgradeInstall) {
 				t.Fatal("a dry run called upgrade.install")
 			}
+			if test.wantInstalls > 0 && strings.Join(transport.uploaded, ",") != "eregion,"+releaseDeclarationName {
+				t.Fatalf("uploaded %v, want the binary and its release declaration", transport.uploaded)
+			}
 		})
 	}
 }
@@ -225,12 +246,12 @@ func TestReleaseNodeInstallsOnlyTheVerifiedReleaseArtifact(t *testing.T) {
 	matching := release.Manifest{Artifacts: map[string]release.Artifact{
 		"linux/amd64": {SHA256: uploaded},
 	}}
-	releaseParams := rpcInstallParams{Path: "/tmp/eregion-x/eregion", SHA256: uploaded, Version: "1.0.0-alpha.1", Channel: "stable"}
+	releaseParams := `{"version":"1.0.0-alpha.1","channel":"stable"}`
 	for _, test := range []struct {
 		name        string
 		nodeChannel string
 		goarch      string
-		params      rpcInstallParams
+		params      string
 		manifest    release.Manifest
 		resolveErr  error
 		wantCode    contract.Code
@@ -247,13 +268,28 @@ func TestReleaseNodeInstallsOnlyTheVerifiedReleaseArtifact(t *testing.T) {
 		},
 		{
 			name: "release node refuses an artifact for another architecture", nodeChannel: "edge", goarch: "arm64",
-			params:   rpcInstallParams{Version: "edge-0123456789ab", Channel: "edge"},
+			params:   `{"version":"edge-0123456789ab","channel":"edge"}`,
 			manifest: matching, wantCode: contract.PreconditionFailed, wantResolve: true,
 		},
 		{
 			name: "release node refuses a dev CLI", nodeChannel: "stable", goarch: "amd64",
-			params:   rpcInstallParams{Version: "dev", Channel: "dev"},
+			params:   `{"version":"dev","channel":"dev"}`,
 			wantCode: contract.PreconditionFailed, wantHint: "released eregion CLI",
+		},
+		{
+			name: "release node refuses an upload without a declaration", nodeChannel: "edge", goarch: "amd64",
+			wantCode: contract.PreconditionFailed, wantHint: "released eregion CLI",
+		},
+		{
+			name: "release node refuses a malformed declaration", nodeChannel: "edge", goarch: "amd64",
+			params: `{"version":"edge-0123456789ab"`, wantCode: contract.ValidationFailed,
+		},
+		{
+			name: "release node refuses an unknown declaration field", nodeChannel: "edge", goarch: "amd64",
+			params: `{"version":"edge-0123456789ab","channel":"edge","sha256":"x"}`, wantCode: contract.ValidationFailed,
+		},
+		{
+			name: "dev node ignores a missing declaration", nodeChannel: "dev", goarch: "amd64",
 		},
 		{
 			name: "an unreachable manifest is unavailable", nodeChannel: "stable", goarch: "amd64", params: releaseParams,
@@ -263,7 +299,13 @@ func TestReleaseNodeInstallsOnlyTheVerifiedReleaseArtifact(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			resolver := &fakeReleaseManifest{manifest: test.manifest, err: test.resolveErr}
-			err := verifyReleaseUpload(context.Background(), resolver, test.params, uploaded, test.nodeChannel, test.goarch)
+			dir := t.TempDir()
+			if test.params != "" {
+				if err := os.WriteFile(filepath.Join(dir, releaseDeclarationName), []byte(test.params), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := verifyReleaseUpload(context.Background(), resolver, dir, uploaded, test.nodeChannel, test.goarch)
 			if test.wantCode == "" {
 				if err != nil {
 					t.Fatalf("verifyReleaseUpload = %v, want nil", err)
@@ -279,6 +321,50 @@ func TestReleaseNodeInstallsOnlyTheVerifiedReleaseArtifact(t *testing.T) {
 			}
 			if got := len(resolver.calls) > 0; got != test.wantResolve {
 				t.Fatalf("resolved the manifest = %v, want %v", got, test.wantResolve)
+			}
+		})
+	}
+}
+
+func TestReleaseNodeRefusesAnUnsafeReleaseDeclaration(t *testing.T) {
+	declaration := []byte(`{"version":"edge-0123456789ab","channel":"edge"}`)
+	for _, test := range []struct {
+		name    string
+		prepare func(t *testing.T, dir string)
+	}{
+		{name: "a symlinked declaration", prepare: func(t *testing.T, dir string) {
+			planted := filepath.Join(t.TempDir(), "planted.json")
+			if err := os.WriteFile(planted, declaration, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(planted, filepath.Join(dir, releaseDeclarationName)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "a group-writable upload directory", prepare: func(t *testing.T, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, releaseDeclarationName), declaration, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0o770); err != nil { //nolint:gosec // G302: the unsafe mode under test.
+				t.Fatal(err)
+			}
+		}},
+		{name: "an oversized declaration", prepare: func(t *testing.T, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, releaseDeclarationName), make([]byte, releaseDeclarationMaxBytes+1), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			test.prepare(t, dir)
+			resolver := &fakeReleaseManifest{}
+			err := verifyReleaseUpload(context.Background(), resolver, dir, strings.Repeat("a", 64), "edge", "amd64")
+			if fault := contract.Classify(err); err == nil || fault.Code != contract.PreconditionFailed {
+				t.Fatalf("verifyReleaseUpload = %v, want precondition_failed", err)
+			}
+			if len(resolver.calls) != 0 {
+				t.Fatal("an unsafe declaration resolved a manifest")
 			}
 		})
 	}

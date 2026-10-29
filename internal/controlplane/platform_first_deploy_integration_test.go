@@ -18,13 +18,13 @@ func TestIntegrationCreateExposesTheFirstDeployAtAcceptance(t *testing.T) {
 	s := run.Service
 	ctx := context.Background()
 	platformSubmit(t, s, platform.KindNodeRegister, "platform", "node-guided", map[string]any{
-		"name": "guided-node", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
 	const createKey = "cli:guided:create"
 	op := platformSubmit(t, s, platform.KindAppCreate, "platform", createKey, map[string]any{
 		"name": "guided",
 		"environment": map[string]any{
-			"name": "production", "node": "guided-node",
+			"name": "production", "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
 			"domain":           "guided.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
@@ -56,7 +56,7 @@ func TestIntegrationCreateExposesTheFirstDeployAtAcceptance(t *testing.T) {
 	replayed, err := s.Submit(ctx, platformSubmission(platform.KindAppCreate, platform.PlatformTarget().String(), createKey, map[string]any{
 		"name": "guided",
 		"environment": map[string]any{
-			"name": "production", "node": "guided-node",
+			"name": "production", "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
 			"domain":           "guided.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
@@ -76,12 +76,12 @@ func TestIntegrationCreateWithoutDeployHasNoFirstDeployOperation(t *testing.T) {
 	run := testRuntime(t, pool, 0)
 	s := run.Service
 	platformSubmit(t, s, platform.KindNodeRegister, "platform", "node-plain", map[string]any{
-		"name": "plain-node", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
 	op := platformSubmit(t, s, platform.KindAppCreate, "platform", "cli:plain:create", map[string]any{
 		"name": "plain",
 		"environment": map[string]any{
-			"name": "production", "node": "plain-node",
+			"name": "production", "node": "local",
 			"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
 		},
 	})

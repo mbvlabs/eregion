@@ -917,7 +917,9 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 // points elsewhere. Every error names the configured path.
 func resolveGitContextPath(cloneRoot, contextPath string) (string, error) {
 	if contextPath == "" {
-		return cloneRoot, nil
+		// The repository root resolves like ".", so every context path is
+		// returned as the same real path.
+		contextPath = "."
 	}
 	if filepath.IsAbs(contextPath) {
 		return "", fmt.Errorf("git context path %q must be relative to the repository", contextPath)

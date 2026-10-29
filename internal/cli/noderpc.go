@@ -174,12 +174,27 @@ type rpcSecretExportResult struct {
 	ValueBase64 string         `json:"value_base64"`
 }
 
+// rpcInstallParams is frozen. upgrade.install is how a node on an older build
+// reaches the operator's build, and every published node decodes these params
+// strictly, so a new field would make every older node refuse the upgrade.
+// Further install inputs travel as files in the upload directory instead.
 type rpcInstallParams struct {
-	Path    string `json:"path"`
-	SHA256  string `json:"sha256"`
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
+// releaseDeclaration names the signed release an uploaded node binary claims to
+// be. It is uploaded next to the binary; a release node resolves that manifest
+// itself and trusts the declaration only through the manifest's artifact hash.
+type releaseDeclaration struct {
 	Version string `json:"version"`
 	Channel string `json:"channel"`
 }
+
+const (
+	releaseDeclarationName     = "release.json"
+	releaseDeclarationMaxBytes = 4 << 10
+)
 
 type rpcProtectInitParams struct {
 	Rotate bool   `json:"rotate"`
@@ -838,14 +853,19 @@ func (n *nodeClient) installFetchedNodeBuild(ctx context.Context, nodeArch strin
 func (n *nodeClient) installUploadedBuild(ctx context.Context, raw []byte) error {
 	sum := sha256.Sum256(raw)
 	dir := "/tmp/eregion-upgrade-" + hex.EncodeToString(sum[:6])
-	if err := n.remote.Upload(ctx, dir, []host.RemoteFile{{Name: "eregion", Data: raw, Mode: 0o755}}); err != nil {
+	declaration, err := json.Marshal(releaseDeclaration{Version: buildinfo.Version, Channel: buildinfo.Channel})
+	if err != nil {
+		return err
+	}
+	files := []host.RemoteFile{
+		{Name: "eregion", Data: raw, Mode: 0o755},
+		{Name: releaseDeclarationName, Data: declaration, Mode: 0o600},
+	}
+	if err := n.remote.Upload(ctx, dir, files); err != nil {
 		return contract.NewFault(contract.Unavailable, "could not upload the node binary", err.Error())
 	}
 	defer func() { _ = n.remote.Remove(context.Background(), dir) }()
-	_, err := n.callRaw(ctx, methodUpgradeInstall, rpcInstallParams{
-		Path: dir + "/eregion", SHA256: hex.EncodeToString(sum[:]),
-		Version: buildinfo.Version, Channel: buildinfo.Channel,
-	}, rpcCallOptions{})
+	_, err = n.callRaw(ctx, methodUpgradeInstall, rpcInstallParams{Path: dir + "/eregion", SHA256: hex.EncodeToString(sum[:])}, rpcCallOptions{})
 	return err
 }
 
@@ -1538,7 +1558,7 @@ func installNodeBinary(ctx context.Context, params rpcInstallParams) error {
 	if got != params.SHA256 {
 		return contract.NewFault(contract.PreconditionFailed, "the uploaded binary does not match its sha256", "Do not retry. Push the binary again from a verified build.")
 	}
-	if err := verifyReleaseUpload(ctx, &release.Client{}, params, got, buildinfo.Channel, runtime.GOARCH); err != nil {
+	if err := verifyReleaseUpload(ctx, &release.Client{}, filepath.Dir(params.Path), got, buildinfo.Channel, runtime.GOARCH); err != nil {
 		return err
 	}
 	if err := os.Chmod(stagePath, 0o755); err != nil {
@@ -1565,14 +1585,18 @@ type releaseManifestClient interface {
 }
 
 // verifyReleaseUpload is the install boundary for a published node: the node
-// itself resolves the signed manifest for the version and channel the operator
-// CLI names and accepts only that manifest's linux/<arch> artifact. A dev node
-// keeps the checksum-only developer path, which never applies to a published
-// node. A manifest that cannot be resolved is returned as-is; the node never
-// falls back to trusting the upload.
-func verifyReleaseUpload(ctx context.Context, client releaseManifestClient, params rpcInstallParams, uploadedSHA, nodeChannel, goarch string) error {
+// itself resolves the signed manifest for the version and channel the upload's
+// release declaration names and accepts only that manifest's linux/<arch>
+// artifact. A dev node keeps the checksum-only developer path, which never
+// applies to a published node. A manifest that cannot be resolved is returned
+// as-is; the node never falls back to trusting the upload.
+func verifyReleaseUpload(ctx context.Context, client releaseManifestClient, uploadDir, uploadedSHA, nodeChannel, goarch string) error {
 	if nodeChannel == "" || nodeChannel == "dev" {
 		return nil
+	}
+	params, err := readReleaseDeclaration(uploadDir)
+	if err != nil {
+		return err
 	}
 	if params.Channel == "" || params.Channel == "dev" || params.Version == "" || params.Version == "dev" {
 		return contract.NewFault(contract.PreconditionFailed,
@@ -1590,6 +1614,47 @@ func verifyReleaseUpload(ctx context.Context, client releaseManifestClient, para
 			"Refusing to install it. Upgrade the node through eregion --auto-upgrade-nodes, which uploads the verified release for the CLI's version and channel.")
 	}
 	return nil
+}
+
+// readReleaseDeclaration reads the declaration uploaded next to the binary. An
+// upload without one came from a CLI that cannot name a signed release. The
+// upload directory must be private and the declaration a regular file, never a
+// symlink, so root does not read a declaration another local user planted.
+func readReleaseDeclaration(uploadDir string) (releaseDeclaration, error) {
+	missing := contract.NewFault(contract.PreconditionFailed,
+		"the uploaded node binary names no signed release",
+		"Use a released eregion CLI for this node, installed from its channel with install.sh, and re-run with --auto-upgrade-nodes.")
+	unsafe := contract.NewFault(contract.PreconditionFailed,
+		"the upload directory is not private",
+		"Do not retry. Remove the upload directory and push the binary again through eregion --auto-upgrade-nodes.")
+	dir, err := os.Lstat(uploadDir)
+	if err != nil || !dir.IsDir() || dir.Mode().Perm()&0o022 != 0 {
+		return releaseDeclaration{}, unsafe
+	}
+	path := filepath.Join(uploadDir, releaseDeclarationName)
+	linked, err := os.Lstat(path)
+	if err != nil {
+		return releaseDeclaration{}, missing
+	}
+	if !linked.Mode().IsRegular() || linked.Size() > releaseDeclarationMaxBytes {
+		return releaseDeclaration{}, unsafe
+	}
+	file, err := os.Open(path) //nolint:gosec // G304: a checked regular file inside the /tmp/eregion-* upload directory.
+	if err != nil {
+		return releaseDeclaration{}, missing
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !os.SameFile(linked, info) {
+		return releaseDeclaration{}, unsafe
+	}
+	decoder := json.NewDecoder(io.LimitReader(file, releaseDeclarationMaxBytes))
+	decoder.DisallowUnknownFields()
+	var declaration releaseDeclaration
+	if err := decoder.Decode(&declaration); err != nil {
+		return releaseDeclaration{}, contract.NewFault(contract.ValidationFailed, "the uploaded release declaration is malformed", "Push the binary again through eregion --auto-upgrade-nodes.")
+	}
+	return declaration, nil
 }
 
 func nodeBinaryPathDir() string {
