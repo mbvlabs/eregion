@@ -310,9 +310,66 @@ Local verification of the route correction: just check (format/vet/unit),
   just build, darwin/arm64 build: pass. Full PostgreSQL integration suite:
   pass (189.620s) against a new disposable PostgreSQL 17 on loopback port
   55439, removed afterwards. Race detector not run locally (no C compiler).
-Remaining blocker: publish/qualify the route correction, then establish
-  whether certificate issuance has an additional problem. No further app
-  baseline checks have passed yet.
+Route correction published as 5329590 (edge-5329590a3f48), CI (including
+  race integration) and edge publication pass. CLI/main upgraded; schema
+  16/16, River 7/7, doctor 18 pass; second apply no-op.
+Published-build retry op_85ed4ffb0f50d20de1b9be5835de8d46, existing release
+  rel_63507d362852c4fd97048936ad1f7e7b: release command correctly skipped,
+  candidate web/worker started, web health passed. Caddy polling confirmed
+  git-test1 stayed installed from 11:24:23 through 11:26:19 despite periodic
+  reconciliation. Public verification failed with TLS internal error after
+  the full 2-minute window (11:24:21–11:26:22); only then was the route removed
+  and both candidate containers cleaned up. Follow exit 5. No serving release.
+  Route-race correction: pass on host; certificate problem remains separate.
+Read-only diagnosis: ACME directory reachable from main over IPv4 and IPv6
+  (HTTP 200). Caddy sends logs to the system journal; no log files exist in
+  /var/log/caddy. Admin cannot read Caddy's journal or use sudo without human
+  authentication. Need privileged Caddy logs for the verification interval
+  before diagnosing ACME failure or retrying. No certificate bypass applied.
+Operator-supplied privileged Caddy logs establish the certificate failure:
+  HTTP-01 validation followed an HTTPS URL through Cloudflare and received
+  525 (origin TLS handshake failure). TLS-ALPN-01 also failed because the
+  Cloudflare edge did not negotiate acme-tls/1. Production Let's Encrypt
+  reported failed-authorization rate limiting with retry-after 2026-10-29
+  11:28:18 UTC. ZeroSSL fallback separately failed obtaining EAB credentials
+  (caddy_legacy_user_removed). Increasing the timeout cannot solve this.
+The proposed DNS-only workaround was rejected: proxied Cloudflare is a
+  supported product requirement, and deploycrate works without that step.
+Operator authorized and installed official Caddy 2.11.4 amd64 .deb on main,
+  verified with the upstream SHA-512 checksum, replacing Ubuntu's 2.6.2-14.
+  Configuration validated; Caddy restarted. Existing application hostnames
+  still return HTTPS 200/303, and doctor remains 18 pass. DNS stays proxied.
+Retry on Caddy 2.11.4: op_8587e038f577d90d756d0d174554bf76, same release.
+  Release command skipped, candidate health passed; TLS still failed for the
+  full 11:39:10–11:41:11 verification window. Follow exit 5; route restored
+  and both candidate containers removed. Upgrading Caddy alone did not fix it.
+Operator then disabled proxy for git-test1. At 11:43 UTC both 1.1.1.1 and
+  8.8.8.8 resolved its A record to 46.225.150.17, not main's 46.224.129.96
+  (confirmed by saved context and main's eth0 address). The other IP also
+  answers as Caddy and redirects HTTP to HTTPS, which can explain challenge
+  requests missing the Caddy instance holding the challenge. The previous
+  proxied origin value was not observable and must not be assumed verified.
+  No deploy was retried after discovering the DNS mismatch.
+Operator corrected both origin targets. git-test1 remains DNS-only,
+  git-test2 remains proxied. The first submission after the correction refused
+  before operation creation because the stored DNS observation was still wrong;
+  after the periodic observer refreshed to dns=ok, retry was accepted.
+First successful deploy: op_5a0dee15a50da94ace13bae428eeb1b1, 18.6s, exit 0,
+  edge-5329590a3f48 with manually upgraded Caddy 2.11.4, release
+  rel_63507d362852c4fd97048936ad1f7e7b (full deployment ID not captured).
+  Primary public check transitioned from TLS error at 11:49:43 to HTTP 200 at
+  11:49:46. External HTTPS (normal certificate verification) returns
+  `eregion sample: v1`; worker logs show `worker heartbeat version=v1`.
+Proxied alias: added git-test2 with /healthz, operation
+  op_eb772442b05bff4cbe21092e77f50b42. Within 12s external HTTPS through
+  Cloudflare (172.67.142.154) returned HTTP 200 and `eregion sample: v1`.
+  Local TLS verification against Caddy with git-test2 SNI/hostname verified
+  the origin certificate successfully. Fresh certificate issuance works with
+  the proxy ON and the correct origin; disabling proxy is not required.
+Remaining qualification: second-commit/zero-downtime deploy, failed candidate,
+  rollback, scale/restart and the rest of the baseline. The Caddy upgrade alone
+  was not a fix for the wrong DNS origin; Caddy 2.6.2 was not re-tested after
+  correcting DNS, so no version-specific ACME defect has been established.
 ```
 
 ```text

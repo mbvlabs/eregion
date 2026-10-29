@@ -2,8 +2,10 @@ package host
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -12,6 +14,31 @@ import (
 
 // CaddyfilePath is the distribution package's config, owned by eregion.
 const CaddyfilePath = platform.CaddyfilePath
+
+// CaddyVersion pins the same upstream release as deploycrate-ce setup.
+const CaddyVersion = "2.11.4"
+
+//go:embed scripts/install-caddy.sh
+var installCaddyScript string
+
+func caddyArtifact(arch string) (url, checksum string, ok bool) {
+	switch arch {
+	case "amd64":
+		checksum = "c41708ffb4af9bc6d19f7d22a7a034804352a21ecc62e1d3dfe3d58e30b38a3e"
+	case "arm64":
+		checksum = "aeab2e38bf77a0162611a1703a5e16c09475b000d41f7edaa9337734d16642fd"
+	default:
+		return "", "", false
+	}
+	return "https://github.com/caddyserver/caddy/releases/download/v" + CaddyVersion + "/caddy_" + CaddyVersion + "_linux_" + arch + ".deb", checksum, true
+}
+
+func (s *ingressStep) arch() string {
+	if s.cfg.Arch != "" {
+		return s.cfg.Arch
+	}
+	return runtime.GOARCH
+}
 
 // PublicAPIPaths are the only API paths Caddy exposes on the main node's
 // hostname: readiness, the per-environment CI deploy endpoint, and the
@@ -35,9 +62,9 @@ type ingressStep struct {
 	exec Exec
 }
 
-func (s *ingressStep) ID() string { return "host-ingress-v1" }
+func (s *ingressStep) ID() string { return "host-ingress-v2" }
 func (s *ingressStep) Describe() string {
-	return "Install Caddy for " + s.cfg.Hostname + " with an ACME certificate"
+	return "Install pinned Caddy " + CaddyVersion + " for " + s.cfg.Hostname + " with an ACME certificate"
 }
 func (s *ingressStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -58,13 +85,28 @@ import %s/*.caddy
 }
 
 func (s *ingressStep) Inputs() ([]byte, error) {
+	url, checksum, ok := caddyArtifact(s.arch())
+	if !ok {
+		return nil, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
+	}
 	return canonicalInput(struct {
 		Hostname  string `json:"hostname"`
 		Caddyfile string `json:"caddyfile"`
-	}{s.cfg.Hostname, contentSHA256(s.caddyfile())})
+		Version   string `json:"version"`
+		Arch      string `json:"arch"`
+		URL       string `json:"url"`
+		Checksum  string `json:"sha256"`
+	}{s.cfg.Hostname, contentSHA256(s.caddyfile()), CaddyVersion, s.arch(), url, checksum})
 }
 
 func (s *ingressStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
+	if _, _, ok := caddyArtifact(s.arch()); !ok {
+		return engine.CheckResult{}, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
+	}
+	version, err := s.exec.Output(ctx, "caddy version")
+	if err != nil || !pinnedCaddyVersion(version) {
+		return incomplete("Caddy must report pinned version " + CaddyVersion)
+	}
 	ok, _, err := sameFileContent(CaddyfilePath, s.caddyfile())
 	if err != nil {
 		return engine.CheckResult{}, err
@@ -82,12 +124,17 @@ func (s *ingressStep) Check(ctx context.Context, _ engine.Runtime) (engine.Check
 	if output != "active:ok" {
 		return incomplete("caddy.service is not active")
 	}
-	return complete("Caddy serves " + s.cfg.Hostname)
+	return complete("Caddy " + CaddyVersion + " serves " + s.cfg.Hostname)
 }
 
 func (s *ingressStep) Apply(ctx context.Context, _ engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
-	install := "set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\nif ! dpkg-query -W -f='${db:Status-Abbrev}' caddy 2>/dev/null | grep -q '^ii'; then apt-get update -qq; apt-get install -y --no-install-recommends caddy; fi"
-	if err := s.exec.Run(ctx, s.ID(), install, nil, report); err != nil {
+	url, checksum, ok := caddyArtifact(s.arch())
+	if !ok {
+		return engine.ApplyResult{}, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
+	}
+	if err := s.exec.Run(ctx, s.ID(), installCaddyScript, map[string]string{
+		"CADDY_VERSION": CaddyVersion, "CADDY_ARCH": s.arch(), "CADDY_URL": url, "CADDY_SHA256": checksum,
+	}, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	// The worker owns the routes file; it rewrites it on every domain change.
@@ -103,12 +150,15 @@ install -d -m 0755 -o %[1]s -g %[2]s %[3]s
 	script := `set -euo pipefail
 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 systemctl enable caddy.service >/dev/null 2>&1
-systemctl reload-or-restart caddy.service
+# A reload keeps the old executable in memory after a package upgrade.
+systemctl restart caddy.service
 systemctl is-active --quiet caddy.service`
 	if err := s.exec.Run(ctx, s.ID(), script, nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	return engine.ApplyResult{Notes: []string{"Caddy serves " + s.cfg.Hostname}, Result: map[string]any{"hostname": s.cfg.Hostname, "paths": PublicAPIPaths}}, nil
+	return engine.ApplyResult{Notes: []string{"Caddy " + CaddyVersion + " serves " + s.cfg.Hostname}, Result: map[string]any{
+		"hostname": s.cfg.Hostname, "paths": PublicAPIPaths, "version": CaddyVersion, "sha256": checksum,
+	}}, nil
 }
 
 func (s *ingressStep) Diff(context.Context, engine.Runtime) ([]string, error) {
@@ -116,7 +166,16 @@ func (s *ingressStep) Diff(context.Context, engine.Runtime) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return append([]string{"+ apt package caddy"}, simpleDiff(CaddyfilePath, raw, s.caddyfile())...), nil
+	url, checksum, ok := caddyArtifact(s.arch())
+	if !ok {
+		return nil, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
+	}
+	return append([]string{"+ install Caddy " + CaddyVersion + " from " + url, "+ verify sha256 " + checksum}, simpleDiff(CaddyfilePath, raw, s.caddyfile())...), nil
+}
+
+func pinnedCaddyVersion(output string) bool {
+	fields := strings.Fields(output)
+	return len(fields) > 0 && fields[0] == "v"+CaddyVersion
 }
 
 func (s *ingressStep) Plan(ctx context.Context, runtime engine.Runtime) (PlanEntry, error) {

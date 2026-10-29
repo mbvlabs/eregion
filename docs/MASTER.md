@@ -319,9 +319,17 @@ verified. The first app deploy exposed a release-command launcher/timeout leak,
 fixed and published in e344781; the retry verified that command and candidate
 health but failed TLS/public verification. A further diagnostic retry confirmed
 route reconciliation removes the candidate route before verification ends.
-The route-selection correction and longer public-check window are in the
-working tree, not yet published or host-qualified; a separate certificate
-issuance problem has not been excluded. See MANUAL-TESTING for operation IDs
+The route-selection correction and longer public-check window are published
+in edge-5329590a3f48, installed on the CLI and main, with green CI, clean doctor
+and a no-op second apply. Host polling verified the candidate route survives
+reconciliation for the full verification window. Initial retries still failed TLS. After disabling proxy on the primary exposed
+an incorrect DNS origin (46.225.150.17 rather than main's 46.224.129.96), the
+operator corrected both test hosts. The first deployment then succeeded, with
+web HTTPS 200 and worker heartbeats. A newly bound alias obtained a valid origin
+certificate and served HTTPS 200 while Cloudflare-proxied throughout. The
+primary is currently DNS-only; Caddy was manually upgraded to 2.11.4 before
+DNS correction, so no version-specific certificate defect was established.
+The rest of the application baseline remains outstanding. See MANUAL-TESTING for operation IDs
 and evidence. Row 16 is in progress; row 17 remains unimplemented and required
 before v1.0.0 final.
 
