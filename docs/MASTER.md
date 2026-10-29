@@ -335,9 +335,12 @@ failed-health isolation, rollback with pinned secret revisions, web×2 and
 restart with release-command skipping, monorepo build, moved-branch build retry,
 create replay and serving-container repair passed. A build-stop test exposed a
 host-lock deadlock-by-serialization: its cancellation marker waited for pack to
-finish. The narrow source fix lets only that private signal bypass the host
-lock, with regressions; publication and host retest remain pending. Fresh init,
-human-factor-positive flows and other remaining baseline variants are not yet
+finish. The narrow fix lets only that private signal bypass the host lock,
+with regressions; published edge-ef91d70f6215 passed the host retest (pack
+interrupted, deploy exit 130, prior release preserved). Route-write failure and
+automatic recovery, alias removal and unsigned/dev upload rejection also
+passed; doctor remains 18/0/0. Fresh init, human-factor-positive flows,
+cleanup/rejected-reload obstruction and other baseline variants are not yet
 qualified. See MANUAL-TESTING for precise evidence and skipped checks. See MANUAL-TESTING for operation IDs
 and evidence. Row 16 is in progress; row 17 remains unimplemented and required
 before v1.0.0 final.

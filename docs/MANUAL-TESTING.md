@@ -444,11 +444,39 @@ Fix in source: cancellation-marker step is host-lock-independent, retaining
   its own effect lock and normal journal. All other steps remain serialized.
   Regression holds host lock while running stop and checks marker is written;
   another regression checks ordinary steps still block and signal replay is
-  idempotent. Local check/build/vet/darwin build pass; host retest pending.
-Remaining: publish/retest build-stop fix. Guided terminal/detach, init on a
-  fresh authorized target, factor-positive CI/deletion/export, atomic login,
-  cleanup/reload-failure injection, signed-upload rejection and the remaining
-  baseline variants have not yet been qualified. Alpha is not complete.
+  idempotent. Local check/build/vet/darwin build pass.
+Build-stop retest: published ef91d70; CI and signed edge publication green.
+  CLI/main upgraded to edge-ef91d70f6215, second apply 0/17, doctor 18/0/0.
+  Build bld_d21b35126cd6010b2ec48ba11da6f328 was running go build when stop
+  op_3d2383275011db0f4d11b8c3dd61ca1d wrote the marker immediately (node step
+  2.0 seconds, entire stop 5.7 seconds). Pack reported interrupted rather than
+  completing. Original deploy op_5244c4b7bb966618bca76e6a69d9d072 cancelled,
+  exit 130; previous v3 release remained serving. PASS on this build.
+Alias removal: op_8f136156eb93ba45ca9d6a0c60ae87c5 submitted, then repeated
+  removal op recorded in 81-alias-remove-submit.json was followed to success.
+  Inventory omitted alias; primary kept serving. Alias restored afterward.
+Route-write failure/recovery: temporarily chmod 0555 the generated-routes
+  directory /etc/caddy/eregion.d, with an EXIT restoration trap. Alias add
+  op_09f89c35fa4f52ed12df2d76eae0d688 failed exit 5, both bindings visibly
+  route_state=failed with could-not-write error; primary still served v3.
+  Restored original 0755/uid999/gid983. Periodic reconciliation reapplied
+  desired routes without re-submission, cleared errors; both domains now
+  route=applied, certificate=valid, public=ok. Failed operation stays failed.
+  This qualifies write failure/recovery, NOT a rejected Caddy reload.
+Release upload rejection: RPC on published main given a private dummy upload
+  with correct SHA-256. Missing declaration rejected; dev declaration rejected;
+  naming the current signed edge release with unsigned payload rejected as
+  not the signed linux/amd64 artifact. No binary replacement or service restart;
+  temp upload removed; version still edge-ef91d70f6215. PASS.
+Historical unlabelled release container from pre-fix attempt:
+  eregion-githello-production-release-7e5cbbcbabf7 was still running with no
+  published ports; removed explicitly after confirming identity. No other app
+  containers targeted. NDJSON log snapshot parsed line-by-line successfully.
+Evidence: ~/.cache/eregion-run/71-* through 92-*; latest doctor 18/0/0.
+Remaining: guided terminal/detach, init on a fresh authorized target,
+  factor-positive CI/deletion/export, atomic login, cleanup obstruction,
+  rejected-reload injection and remaining baseline variants are not yet
+  qualified. Alpha is not complete.
 ```
 
 ```text
