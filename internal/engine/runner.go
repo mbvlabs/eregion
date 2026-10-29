@@ -285,16 +285,19 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		return TaskStatus{}, err
 	}
 
-	hostLock, err := Acquire(ctx, e.hostLockPath(), LockExclusive, e.lockTimeout())
-	if err != nil {
-		if errors.Is(err, ErrLockHeld) {
-			return TaskStatus{Status: StatusRunning, ExecutionID: exec.ExecutionID(), InputsHash: inputsHash, Detail: "another local host mutation holds the host lock"}, ErrLockHeld
+	independent, ok := step.(HostLockIndependent)
+	if !ok || !independent.IndependentOfHostLock() {
+		hostLock, err := Acquire(ctx, e.hostLockPath(), LockExclusive, e.lockTimeout())
+		if err != nil {
+			if errors.Is(err, ErrLockHeld) {
+				return TaskStatus{Status: StatusRunning, ExecutionID: exec.ExecutionID(), InputsHash: inputsHash, Detail: "another local host mutation holds the host lock"}, ErrLockHeld
+			}
+			return TaskStatus{}, err
 		}
-		return TaskStatus{}, err
+		defer hostLock()
 	}
-	defer hostLock()
 
-	// Check again under the host lock: another effect may have changed shared state.
+	// Check again after locking: another effect may have changed state.
 	check, err := step.Check(ctx, Runtime{DryRun: false, Secrets: e.registry(), SecretValues: e.SecretValues, Root: e.StateDir})
 	if err != nil {
 		return e.fail(exec, running, fmt.Errorf("check %s: %w", step.ID(), err))

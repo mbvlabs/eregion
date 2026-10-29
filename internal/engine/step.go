@@ -42,6 +42,15 @@ type Step interface {
 	CancelBoundary() Boundary
 }
 
+// HostLockIndependent is an opt-in for a step that only signals an in-flight
+// effect through its own private state, without mutating shared host resources.
+// Such a signal must not wait behind the effect it is meant to stop. The engine
+// still holds its per-effect lock and journals it normally. This is a property
+// of trusted step code, never a caller-controlled payload flag.
+type HostLockIndependent interface {
+	IndependentOfHostLock() bool
+}
+
 // Boundary is where a cancellation request may take effect for a step.
 type Boundary string
 

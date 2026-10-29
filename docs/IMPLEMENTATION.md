@@ -456,7 +456,12 @@ window.
 | `/etc/sudoers.d/eregion-node` | Admin's passwordless `/usr/local/bin/eregion node rpc` rule, validated by `visudo`. |
 
 Node effect identity is `operation:step`, stable across attempts. Execution
-identity is `operation:attempt:step`. Check durable status before dispatch;
+identity is `operation:attempt:step`. The engine serializes host mutations with
+a node-local host lock. The build-stop step alone opts out through the trusted
+`HostLockIndependent` step interface: it only writes an operation-private
+cancellation marker and must run while pack holds the host lock. It still takes
+its own effect lock and uses the normal durable journal; the request payload
+cannot select this behaviour. Check durable status before dispatch;
 acknowledge completed matching effects rather than reapply. Locks on the node
 are host-local. Per-environment PostgreSQL advisory locks serialize deployments
 across workers; River queue concurrency is not that lock. Journal compaction

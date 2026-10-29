@@ -373,6 +373,85 @@ Remaining qualification: second-commit/zero-downtime deploy, failed candidate,
 ```
 
 ```text
+Date / build / commit / channel: 2026-10-29 / edge-6d0e6bcdf65a / 6d0e6bc / edge
+Server: existing main, Ubuntu 26.04 amd64; schema 16/16, River 7/7
+Setup pin: official Caddy 2.11.4 packages for amd64/arm64, pinned SHA-256,
+  host-ingress-v2. Both upstream package hashes independently checked.
+  Local check/build/vet/darwin build pass. Initial 654469b edge signing failed
+  with Rekor conflict and macOS shell test failed on checksum tooling;
+  7d70ff6 signed successfully but macOS shell test still failed. Final 6d0e6bc
+  scopes Linux installer execution test to Linux; artifact/version tests stay
+  cross-platform. All CI jobs and edge publication pass for 6d0e6bc.
+CLI/main upgrade: pass, doctor 18/0/0, second apply 0/17. Caddy 2.11.4 already
+  installed manually, so automatic fresh installation remains NOT RUN.
+App: githello/production; git-test1 direct, git-test2 Cloudflare-proxied
+Second source commit: 6dc0468; APP_VERSION v2 and HELLO_SECRET revision 2.
+  Config/secret changes did not deploy (v1 kept serving until explicit deploy).
+  op_feb09d5b91fae33c1b9b71acbfb20aad succeeded, release
+  rel_6587e1fc95ab6a382279ed68b07eb076. Primary continuity: 107 v1 + 281 v2
+  responses, zero failures. Python alias monitor got 541 HTTP 403 responses
+  despite curl returning 200; not counted as alias continuity pass.
+Failed candidate: source 034eb82, op_f3c8d98c922de1ccf77254b62fdefff9,
+  release rel_b07293e8cb84db75c2d4cf64ad8a6718, HTTP health 503, exit 5.
+  Candidate web/worker removed. Prior v2 kept serving: curl monitor 342 primary
+  + 412 proxied-alias responses, all 200/v2.
+Rollback: op_007901e79d9e111d91e7013c6343b147 succeeded, v1 public response,
+  release rel_63507d362852c4fd97048936ad1f7e7b. Read-only node inventory
+  confirms deployment dep_17829516b0867de58811cc5ad36566da pinned HELLO_SECRET
+  revision 1, original deployment also 1, v2 deployment 2. No secret exported.
+Scale/restart: scale op_a76e2a47dc63ab399307664ca27b76a9 queued restart
+  op_ca824ea04f46caa801945e4617ad1295; explicit restart
+  op_b500b918c472987bb16b2aae28d41b3d. Both succeeded, two running web
+  replicas on distinct loopback ports plus worker without published port;
+  release command skipped in rollback, scale and restart. Restarts used the
+  current HELLO_SECRET revision 2, distinct from rollback's pinned revision 1.
+Repeated continuity with curl: op_62aed6ec69fbb7ac82beb77427e01ffd,
+  source 6dc0468, config v3, release rel_8353d51796535fdf752f2c3450052af8.
+  Primary 129 v2 + 136 v3; proxied alias 153 v2 + 163 v3; zero failures.
+  Previous containers removed after verification.
+Monorepo/moved-branch retry: revision context apps/web at source 034eb82
+  failed with named missing path, op_74435aa7a0c4fea621a9331f458d250a,
+  build bld_b921cb6d6db5d2e0365010a352d983bd. Branch then advanced to b895cb2
+  adding healthy apps/web. Retry op_038e1d3a1c7c6eb6e0207d2736a08742 still
+  checked out 034eb82 and failed on the original missing path (exit 5), proving
+  no fallback to moved branch/root. New deploy op_5e45b93d5ae086627a6ebfa63ab36304
+  built b895cb2 from apps/web and succeeded, release
+  rel_07d1c0fb27cdc0d68c7e5815a56e9328.
+Alias-specific path: git-test2 bound to /users/sign-in, public 200; /api/health
+  returns 404. Proxied alias serves v3; certificate verification remains on.
+Repair fault injection: using saved sudo credential over SSH (never printed),
+  removed only githello web replica githello-production-web-1-11ba8f12ce95.
+  Worker restart queued one system/maintenance restart
+  op_86d5c64bb534a6ae4df042651c0b4671; succeeded, both replicas restored,
+  same serving release, release command skipped. A second worker start queued
+  no additional repair. Doctor 18 pass, both test hosts serve v3.
+Contracts: logs --json single envelope; --json --follow refused exit 2;
+  domain dry-run JSON object; ssh command remote exit 7 preserved. App delete
+  dry-run allowed, real env delete/secret export/token create in JSON/no-TTY
+  refused exit 2. No factor bypass, export or deletion performed.
+Create replay: original githello-create-1 returned original create
+  op_49bbb5e2e870fac4005801dec7351c17 and first deploy
+  op_14cdbdbbe86aaa79823ef246167c0e66; secret metadata remains revisions 1
+  (GIT_READ_TOKEN) / 2 (HELLO_SECRET), no rotation from replay.
+Build stop: build bld_ea19d783ac55541189e81f29dcbce1d3, original operation
+  op_0dd481a2c083a6bf7901ee0af2775363. Stop op_e6734f665ded938f4bf7acf19e861b86
+  accepted at 12:36:41, dispatched at 12:36:43, but its node Apply only ran
+  at 12:36:57 when pack had finished. Deploy cancelled at boundary, exit 130;
+  previous release preserved. Retry op_6937cbe93056c26a5108757865dbeb49
+  built the same b895cb2 successfully. Stop-immediately check FAIL: global
+  host lock prevented cancellation marker reaching the in-flight build.
+Fix in source: cancellation-marker step is host-lock-independent, retaining
+  its own effect lock and normal journal. All other steps remain serialized.
+  Regression holds host lock while running stop and checks marker is written;
+  another regression checks ordinary steps still block and signal replay is
+  idempotent. Local check/build/vet/darwin build pass; host retest pending.
+Remaining: publish/retest build-stop fix. Guided terminal/detach, init on a
+  fresh authorized target, factor-positive CI/deletion/export, atomic login,
+  cleanup/reload-failure injection, signed-upload rejection and the remaining
+  baseline variants have not yet been qualified. Alpha is not complete.
+```
+
+```text
 Date / build / commit / channel:
 Operator OS/arch:
 Server provider, OS/arch, size:

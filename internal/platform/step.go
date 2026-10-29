@@ -1030,6 +1030,10 @@ func buildBuildStopStep(exec engine.Execution, raw json.RawMessage) (engine.Step
 	return &BuildStopStep{exec: exec, payload: payload}, nil
 }
 
+// Only writes an operation-private cancellation marker. Waiting for the global
+// host lock would prevent the marker reaching pack until pack had already ended.
+func (s *BuildStopStep) IndependentOfHostLock() bool { return true }
+
 func (s *BuildStopStep) ID() string                      { return s.payload.Step }
 func (s *BuildStopStep) Describe() string                { return "Stop a running Buildpacks process" }
 func (s *BuildStopStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }

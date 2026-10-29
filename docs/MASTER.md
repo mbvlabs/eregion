@@ -329,7 +329,16 @@ web HTTPS 200 and worker heartbeats. A newly bound alias obtained a valid origin
 certificate and served HTTPS 200 while Cloudflare-proxied throughout. The
 primary is currently DNS-only; Caddy was manually upgraded to 2.11.4 before
 DNS correction, so no version-specific certificate defect was established.
-The rest of the application baseline remains outstanding. See MANUAL-TESTING for operation IDs
+On edge-6d0e6bcdf65a (Caddy 2.11.4 pin published), the app baseline progressed:
+second-commit/config/secret deploy, continuous requests through both domains,
+failed-health isolation, rollback with pinned secret revisions, web×2 and
+restart with release-command skipping, monorepo build, moved-branch build retry,
+create replay and serving-container repair passed. A build-stop test exposed a
+host-lock deadlock-by-serialization: its cancellation marker waited for pack to
+finish. The narrow source fix lets only that private signal bypass the host
+lock, with regressions; publication and host retest remain pending. Fresh init,
+human-factor-positive flows and other remaining baseline variants are not yet
+qualified. See MANUAL-TESTING for precise evidence and skipped checks. See MANUAL-TESTING for operation IDs
 and evidence. Row 16 is in progress; row 17 remains unimplemented and required
 before v1.0.0 final.
 
