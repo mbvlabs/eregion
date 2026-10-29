@@ -218,7 +218,7 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		// Before the services: the worker's unit makes the routes dir writable,
 		// which must exist when it starts.
 		if r.Config.Hostname != "" {
-			steps = append(steps, &ingressStep{cfg: r.Config, exec: r.Exec})
+			steps = append(steps, newIngressSysctlStep(), &ingressStep{cfg: r.Config, exec: r.Exec})
 		}
 	}
 	steps = append(steps, &binaryStep{cfg: r.Config, role: role})
