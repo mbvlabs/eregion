@@ -19,7 +19,7 @@ if [ "$installed_version" != "v$CADDY_VERSION" ]; then
     package="$work/caddy.deb"
     curl --fail --silent --show-error --location --retry 3 --proto '=https' \
         --output "$package" "$CADDY_URL"
-    printf '%s  %s\n' "$CADDY_SHA256" "$package" | sha256sum --check --status
+    printf '%s  %s\n' "$CADDY_SHA256" "$package" | sha256sum -c >/dev/null
     export DEBIAN_FRONTEND=noninteractive
     apt-get -o dpkg::lock::timeout=300 -o Dpkg::Options::=--force-confold \
         install -y --no-install-recommends --allow-downgrades "$package"
