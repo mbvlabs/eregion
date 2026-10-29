@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -86,6 +87,9 @@ func TestPinnedCaddyVersionIsExact(t *testing.T) {
 // Only stub commands run: no downloads, apt, systemd or real host changes.
 // Use the real sha256sum to prove a corrupt package never reaches apt.
 func TestCaddyInstallerVerifiesBeforeInstallingAndChecksResult(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("executes a Debian/Ubuntu host installer using Linux checksum tools; artifact and version checks run on every platform")
+	}
 	for _, tc := range []struct {
 		name, installed, after        string
 		corrupt, wantInstall, wantErr bool
