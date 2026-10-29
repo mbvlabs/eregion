@@ -469,21 +469,14 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
 				contract.NewFault(contract.PreconditionFailed, "release command has not succeeded for this release", "Deploy the release first; restart, scale and rollback never run the release command."))
 		default:
-			commandArgs := []string{"docker", "run", "--rm", "--name", workloadCommandName(env, dep.ID), "--pull", "never", "--network", network}
-			for _, key := range sortedPlatformKeys(containerEnv) {
-				commandArgs = append(commandArgs, "-e", key)
-			}
-			for _, key := range sortedPlatformKeys(secretValues) {
-				commandArgs = append(commandArgs, "-e", key)
-			}
-			commandArgs = append(commandArgs, release.ImageID)
-			commandArgs = append(commandArgs, releaseCommand.Argv...)
 			if err := w.service.startReleaseCommandRun(ctx, release.ID, digest, id); err != nil {
 				return w.settle(ctx, id, attempt, err)
 			}
-			if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentCommandStep, platform.ArgvPayload{
-				Step: deploymentCommandStep, Argv: commandArgs,
-				Env: containerEnv, SecretEnvKeys: sortedPlatformKeys(secretValues),
+			if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentCommandStep, platform.ReleaseCommandPayload{
+				Step: deploymentCommandStep, Name: workloadCommandName(env, dep.ID),
+				Image: release.ImageID, Network: network, Command: releaseCommand.Argv,
+				Labels: platform.ReleaseCommandLabels(env.App, env.Name, release.ID, dep.ID),
+				Env:    containerEnv, SecretEnvKeys: sortedPlatformKeys(secretValues),
 				TimeoutSeconds: releaseCommand.TimeoutSeconds,
 			}, secretValues); err != nil {
 				if !releaseCommandErrorIsTerminal(err) {

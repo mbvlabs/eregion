@@ -235,6 +235,59 @@ Application baseline: not run (blocked on the node upgrade).
 ```
 
 ```text
+Date / build / commit / channel: 2026-10-29 / edge-22f52c676669 / 22f52c6 / edge
+CI for 22f52c6: pass (check with race, integration with race, macOS CLI);
+  Publish edge: pass
+Operator OS/arch: linux/amd64 (CLI upgraded edge-ed6e4f35b78c -> edge-22f52c676669: pass)
+Server: existing test server, context `main`, ubuntu 26.04 amd64
+Node upgrade dry run: pass; node_version_mismatch reported, node unchanged
+Node upgrade (`apply --auto-upgrade-nodes`): binary install PASS (node now
+  edge-22f52c676669, commit 22f52c676669); apply FAIL, exit 6, at
+  host-database-v1 "control-plane database is unavailable"
+Post-apply: eregion-api/eregion-worker crash-loop with exit 6; doctor 13 pass,
+  1 warn, 4 fail (drift.pending, version.schema, both services); schema 0/0
+  reported because the database cannot be read
+Cause: not eregion. The control database is reached through the operator
+  machine's Tailscale Funnel (TLS-terminated TCP); a network outage there at
+  08:35 UTC, before the upgrade, left the public Funnel ingress dropping TLS
+  handshakes. Re-adding the Funnel did not help; restarting tailscaled did
+  (all six ingress addresses then completed TLS from the server).
+Diagnosability gap (open): the fault cause is not surfaced by apply, plan,
+  doctor or server status, and admin cannot read /etc/eregion or the eregion
+  service journal, so the network error was not observable from the operator
+  path.
+Retry `apply --auto-upgrade-nodes`: pass, exit 0; applied host-database-v1
+  (schema 13 -> 16), api/worker restart and readiness. Second `apply`: no-op
+  (0 of 17). doctor: 18 pass, 0 warn, 0 fail. CLI/node edge-22f52c676669,
+  schema 16/16, River 7/7, all services active.
+Version lockstep / signed node upgrade from edge-8a7179d6d95d: pass.
+App: githello/production, private git https://github.com/mbvlabs/eregion-hello
+  (fine-grained read token), web + worker, release command
+  `eregion-hello release`, config APP_VERSION=v1, secret HELLO_SECRET, domain
+  git-test1.mbvlabs.com (Cloudflare proxied). Flag-only create (not the guided
+  form): accepted, op_49bbb5e2e870fac4005801dec7351c17; first deploy
+  op_14cdbdbbe86aaa79823ef246167c0e66.
+Private git clone + Buildpacks build: pass (commit ea1b225, pack 82s, release
+  rel_ef2f8f4e60684cb0722e616382a1d4af).
+First deploy: FAIL, exit 6, unavailable after 4m56s. The release command ran as
+  `docker run <image> eregion-hello release` without the CNB launcher, so the
+  image's default web process started and never exited; at the 120s timeout
+  the node killed only the docker client, the container kept running, the
+  error was retryable and every retry hit a container-name conflict.
+  Previous release unchanged (none). Leaked container
+  eregion-githello-production-release-7e5cbbcbabf7 still runs on main (no
+  published port); admin has no Docker access to remove it.
+Fix (working tree, not yet published): the release command is its own node
+  step (platform-command-01-v1, ReleaseCommandPayload) that runs through the
+  launcher for a Buildpacks image like a process command; nonzero exit,
+  start failure and timeout are terminal, and a timeout removes the container.
+  The release container now carries the app/environment ownership labels, so
+  app/env delete, status and logs find it; the leaked container above predates
+  this and has none, so it needs a one-time manual `docker rm -f`.
+Application baseline: blocked on publishing the release-command fix.
+```
+
+```text
 Date / build / commit / channel:
 Operator OS/arch:
 Server provider, OS/arch, size:

@@ -566,7 +566,15 @@ refuses before any build or container work. The release command is release
 scoped: it runs once per release and command digest, before candidate
 containers, and a succeeded result is recorded. A repeat deploy of the same
 release and command skips it; a changed command digest runs again; a failed
-command fails the deploy and leaves the previous release serving. An unknown
+command fails the deploy and leaves the previous release serving. The command
+runs in a one-off `--rm` container of the release image on the environment
+network, through the Buildpacks launcher for a Buildpacks image exactly like a
+process command (otherwise the image's default web process would start). It
+carries the app, environment, release and deployment ownership labels with
+process kind `release`, so status, logs and app/environment deletion find it. A
+nonzero exit, a container that does not start and a timeout are terminal for
+that deployment; on timeout the node removes the container, because killing the
+docker client leaves it running. An unknown
 node outcome leaves the run row running; a later deploy never overwrites that
 ownership blindly. It resolves the original operation's recorded command step
 and node status: a completed step record becomes succeeded and is skipped; any

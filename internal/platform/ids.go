@@ -301,6 +301,23 @@ func WorkloadLabels(app, environment, process, kind, replica string, release Rel
 	}
 }
 
+// ReleaseCommandKind labels the one-off release command container. No process
+// has this kind, so observation never mistakes it for a process replica.
+const ReleaseCommandKind = "release"
+
+// ReleaseCommandLabels are the ownership labels for a release command
+// container, so status, logs and app or environment deletion find it like a
+// process container.
+func ReleaseCommandLabels(app, environment string, release ReleaseID, deployment DeploymentID) map[string]string {
+	return map[string]string{
+		"io.eregion.app":          app,
+		"io.eregion.environment":  environment,
+		"io.eregion.process.kind": ReleaseCommandKind,
+		"io.eregion.release":      string(release),
+		"io.eregion.deployment":   string(deployment),
+	}
+}
+
 func trimForError(value string) string {
 	if len(value) > 160 {
 		return value[:160] + "…"
