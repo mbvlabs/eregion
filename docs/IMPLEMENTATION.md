@@ -558,7 +558,9 @@ Deploy sequence: deployability gate -> preflight -> build from the revision when
 the release is pending -> release command -> candidate containers for every
 process replica on dynamic loopback ports -> health for every web replica ->
 Caddy upstream switch with all web replica backends -> public HTTPS verification
-through local Caddy -> remove the previous deployment's containers. A container
+through local Caddy (retried for up to 2 minutes, as in deploycrate, because a
+new domain's site and its first certificate only appear at the switch) ->
+remove the previous deployment's containers. A container
 removal that fails is recorded in `platform_container_cleanup` and retried;
 the verified switch stays successful and the failure is never silently dropped.
 The gate
@@ -642,7 +644,12 @@ lock, adapt the new fragment through Caddy's `/adapt` endpoint, replace the file
 with a fsync+rename, then load it; a rejected load restores the prior **file**,
 not the domain rows. A deployment switch writes the same file with candidate
 upstreams and verifies the primary domain through local Caddy before removing
-the previous containers. A periodic maintenance job re-renders on worker start
+the previous containers. Every writer preserves the saved candidate instances
+while the deployment and operation are running and the switch step is running
+or completed, until public verification fails or restoration begins. Otherwise
+writers use the serving deployment. This prevents periodic reconciliation and
+unrelated domain writes from undoing the switch during verification; the
+candidate is a routing target, not yet a verified serving deployment. A periodic maintenance job re-renders on worker start
 and every 30 seconds after a failure; it updates `route_state` per domain. A
 second periodic job observes DNS through 1.1.1.1 and 8.8.8.8 over UDP, then the
 certificate chain/expiry and public response through local Caddy with the real

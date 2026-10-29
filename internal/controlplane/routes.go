@@ -69,11 +69,7 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 			return unavailable()
 		}
 	}
-	rows, err := tx.Query(ctx, `SELECT d.name,e.id,d.is_primary,coalesce(dep.instances,'[]'::jsonb)
-        FROM eregion_platform_domains d
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        LEFT JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id
-        ORDER BY d.name`)
+	rows, err := tx.Query(ctx, desiredRoutesQuery, deploymentRouteStep, deploymentPublicStep, deploymentRestoreRouteStep)
 	if err != nil {
 		return unavailable()
 	}
@@ -136,6 +132,36 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 	}
 	return s.finishRouteWrite(ctx, tx, routed, unrouted, nil, now)
 }
+
+// desiredRoutesQuery is shared by every route writer. Between the candidate
+// switch and recordServing, the serving pointer still names the previous
+// deployment. Rendering only that pointer would undo an in-flight switch (and
+// remove a first deploy's site) during public verification. The step records
+// and saved instances identify the active routing target without declaring it
+// verified/serving. Failure, cancellation or restoration selects serving again.
+// Include a running switch: its file write and step acknowledgement are not one
+// transaction, and another writer can run between them.
+const desiredRoutesQuery = `SELECT d.name,e.id,d.is_primary,
+        coalesce(candidate.instances,dep.instances,'[]'::jsonb)
+    FROM eregion_platform_domains d
+    JOIN eregion_platform_environments e ON e.id=d.environment_id
+    LEFT JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id
+    LEFT JOIN LATERAL (
+        SELECT active.instances
+        FROM eregion_platform_deployments active
+        JOIN eregion_operations op ON op.id=active.operation_id
+        JOIN eregion_operation_steps switched ON switched.operation_id=op.id AND switched.step=$1
+        WHERE active.environment_id=e.id AND active.state='running'
+          AND op.state='running' AND switched.state IN ('running','completed')
+          AND NOT EXISTS (
+              SELECT 1 FROM eregion_operation_steps failed
+              WHERE failed.operation_id=op.id AND failed.step=$2 AND failed.state='failed')
+          AND NOT EXISTS (
+              SELECT 1 FROM eregion_operation_steps restoring
+              WHERE restoring.operation_id=op.id AND restoring.step=$3)
+        ORDER BY active.created_at DESC,active.id DESC LIMIT 1
+    ) candidate ON true
+    ORDER BY d.name`
 
 // finishRouteWrite records the applied or failed route attempt and commits the
 // lock transaction. The file and the rows never claim more than the reload did.
@@ -267,6 +293,12 @@ func publicCheckMessage(host, path string, status int, probeErr error) string {
 	return fmt.Sprintf("public check %s → %d", target, status)
 }
 
+// publicCheckWindow bounds public verification after the Caddy switch, as in
+// deploycrate. A new domain's site first appears in Caddy at that switch, so
+// the window must cover Caddy obtaining its first certificate; ACME issuance
+// routinely takes longer than a web health timeout.
+const publicCheckWindow = 2 * time.Minute
+
 // verifyPublicRoute requests the primary domain through local Caddy. The URL
 // names the real host so Caddy selects the site and presents the certificate,
 // while the dial always goes to loopback. The route must answer 2xx/3xx.
@@ -293,7 +325,7 @@ func (s *Service) verifyPublicRoute(ctx context.Context, id contract.OperationID
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(publicCheckWindow)
 	last := "no response"
 	lastEvent := ""
 	for {

@@ -284,7 +284,35 @@ Fix (working tree, not yet published): the release command is its own node
   The release container now carries the app/environment ownership labels, so
   app/env delete, status and logs find it; the leaked container above predates
   this and has none, so it needs a one-time manual `docker rm -f`.
-Application baseline: blocked on publishing the release-command fix.
+Published e344781 (edge-e344781ced4b; CI pass, edge pass); CLI and main
+  upgraded, apply no-op, doctor 18/0/0.
+Second first-deploy attempt op_ec5db74078f168c2391b868a047f73c9: release
+  command pass (1.5s, launcher), web + worker candidates started, web health
+  pass, Caddy switch pass; public check FAIL after 30s, "tls: internal error"
+  (no certificate yet for git-test1). Route restored, candidates removed,
+  exit 5. Initial hypothesis: the 30s public-check window was too short for
+  first certificate issuance. That cause was NOT established; seeing an HTTP
+  redirect through Cloudflare did not prove successful ACME validation.
+Diagnostic retry on the same published build, using the existing release:
+  op_44c553d6e9d34a1740b79b870f3fd217. Release command correctly skipped;
+  candidate health passed. Read-only Caddy admin polling saw git-test1 appear
+  at 11:04:14 and disappear by 11:04:29, before the public probe failed at
+  11:04:46. Confirmed routing race: periodic reconciliation renders the old
+  serving pointer, undoing the candidate switch during public verification.
+Working-tree correction: every route writer selects the saved candidate
+  instances while its operation/deployment is running and the switch step
+  is running/completed, unless public verification failed or restoration
+  began. Otherwise it selects serving instances. Regression covers first
+  deploy, switch-before-ack, verification, and restoration after failure.
+  The public-check window also becomes 2 minutes, matching deploycrate, to
+  allow certificate issuance; this alone does not fix the routing race.
+Local verification of the route correction: just check (format/vet/unit),
+  just build, darwin/arm64 build: pass. Full PostgreSQL integration suite:
+  pass (189.620s) against a new disposable PostgreSQL 17 on loopback port
+  55439, removed afterwards. Race detector not run locally (no C compiler).
+Remaining blocker: publish/qualify the route correction, then establish
+  whether certificate issuance has an additional problem. No further app
+  baseline checks have passed yet.
 ```
 
 ```text

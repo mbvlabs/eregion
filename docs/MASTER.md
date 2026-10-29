@@ -311,11 +311,19 @@ Combined format, build, vet, darwin/arm64 build and selected isolated package
 tests pass. The PostgreSQL integration suite passes (without the race detector)
 against a disposable PostgreSQL 17 after the 2026-10-28 fixture fixes. Schema:
 embedded migrations through 016; applied migrations 001–013 are unchanged.
-**Nothing is qualified:** edge-ed6e4f35b78c was published but cannot upgrade an
-existing node (MANUAL-TESTING run record); the working-tree fix freezing
-`upgrade.install` params is not yet published, and no real-host baseline is
-recorded for these changes. Row 16 is next; row 17
-remains unimplemented and required before v1.0.0 final.
+**Alpha qualification remains incomplete.** On 2026-10-29 the existing `main`
+node upgraded from edge-8a7179d6d95d through the fixed signed upgrade path;
+CLI/node now run edge-e344781ced4b, schema 16/16, River 7/7, doctor 18 pass,
+and a second apply is a no-op. Private git cloning and a Buildpacks build were
+verified. The first app deploy exposed a release-command launcher/timeout leak,
+fixed and published in e344781; the retry verified that command and candidate
+health but failed TLS/public verification. A further diagnostic retry confirmed
+route reconciliation removes the candidate route before verification ends.
+The route-selection correction and longer public-check window are in the
+working tree, not yet published or host-qualified; a separate certificate
+issuance problem has not been excluded. See MANUAL-TESTING for operation IDs
+and evidence. Row 16 is in progress; row 17 remains unimplemented and required
+before v1.0.0 final.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
