@@ -97,115 +97,164 @@ fails. Install the CLI from the published edge or alpha channel.
 | Factor-gated removal | Real `app delete`/`env delete` need exact-target confirmation and a TOTP code at a human terminal; JSON/yes/pipes cannot perform them. Direct node submission without a valid same-request factor and all real HTTP delete submissions refuse; dry-run preview stays agent-usable. |
 | Removal | `domain remove`, `env delete --confirm` and `app delete --confirm` remove containers, routes and secrets per D13; other apps keep serving; operation history remains. |
 
-## Next run — publish edge and upgrade the existing test server
+## Resume testing — saved session state, 2026-10-29
 
-Candidate implementation commit: `ed6e4f3`. Use the test server already set up
-for this work; do **not** rerun `server init`, reset its database, or discard
-existing applications. Run fresh-init checks separately only on an explicitly
-authorized fresh target. No step below is recorded as passed yet.
+Start a fresh session by reading [MASTER](MASTER.md), then
+[IMPLEMENTATION](IMPLEMENTATION.md), then this section and the run records below.
+MASTER row 16 remains in progress; this is a resumption aid for its existing
+acceptance checklist, not a second work list. **Alpha.1 is not qualified.**
+Facts below are the last recorded observations, not a fresh host check.
 
-### 1. Publish the candidate
+### Target and build snapshot
 
-1. Complete the repository-publication secret review before changing visibility.
-   Visibility changes and any credential rotation are operator actions, not
-   implied by this procedure.
-2. Verify remote `master` contains the candidate; push only if needed and with
-   explicit authorization. The 2026-10-28 read-only check found remote `master`
-   already at `ed6e4f3`, with its edge workflow failed and no successful candidate
-   publication verified. After visibility/billing is resolved, explicitly rerun
-   that failed edge workflow (or authorize a new publish). Wait for success and
-   verify that the signed edge manifest identifies the intended commit. An older
-   edge build does not qualify these changes.
-3. Record the actual published version and commit in the run record below.
-   Neither this source commit nor a locally built `dev` binary is published-build
-   evidence. Do not create an alpha tag yet.
+| Item | Last recorded state |
+| --- | --- |
+| Repository | `/home/mbv/work/eregion`, branch `master`; saved evidence committed through `b5a1a56` (documentation-only). Uncommitted after it: this resume section, the 2026-10-29 resumed run record, and the unpublished `host-ingress-sysctl-v1` source fix (`internal/host/step_ingress_sysctl*.go`, `runner.go`). |
+| Tested CLI and main | `edge-ef91d70f6215`, source `ef91d70f6215180c64f73ba5b60bb3f3a2655d70`; CI and signed edge publication passed. Do not confuse a newer edge publication with an installed or qualified build. |
+| Existing server | Context/node `main`, host `exploration`, Ubuntu 26.04 amd64; public IP `46.224.129.96`; operator `admin@10.78.0.1:22` through embedded WireGuard, endpoint `46.224.129.96:51820`. |
+| Health | Doctor 18 pass / 0 warn / 0 fail; second apply 0 applied / 17 skipped; schema 16/16, River 7/7; Caddy 2.11.4; `net.ipv4.tcp_migrate_req=0` (diagnostic change reverted). A build with the sysctl step will apply one new step. |
+| External database | PostgreSQL 17 on the operator machine, container `eregion-cp-pg`, host port 5433. Main reaches it through TLS-terminated Tailscale Funnel `thelab.tailbbed89.ts.net:10000`. No DSN belongs in this document. |
+| Test app | `githello/production`, `APP_VERSION=v3`; web ×2 (`eregion-hello`, port 8080) and worker ×1 (`eregion-hello worker`, no port); release command `eregion-hello release`; health `/healthz`. |
+| Serving release | `rel_07d1c0fb27cdc0d68c7e5815a56e9328`, healthy monorepo source `b895cb2f54daeaedafac44397072db893cd8ef1c`; deployment `dep_4ca1b01d314414a4fdaef2730cd1760b`, revision 8, release command `eregion-hello release` (last checked 17:55 UTC). |
+| Source desired state | Private `https://github.com/mbvlabs/eregion-hello.git`, ref `main`, context `apps/web`, builder `paketobuildpacks/builder-jammy-base`, credential name `GIT_READ_TOKEN`. |
+| Primary | `https://git-test1.mbvlabs.com/`, last recorded DNS-only, returns `eregion sample: v3`. |
+| Alias | `https://git-test2.mbvlabs.com/users/sign-in`, Cloudflare-proxied, returns `alias ready`; binding check path `/users/sign-in`. Both bindings last observed route=applied, certificate=valid, public=ok. |
+| Secret metadata | Current `HELLO_SECRET` revision 2; original v1 rollback used its pinned revision 1. `GIT_READ_TOKEN` revision 1. Values must never be printed. |
 
-### 2. Upgrade the CLI and test server
+Fixture checkout: `/home/mbv/.cache/eregion-hello`. Useful source commits:
 
-Replace `<test-context>` with the existing saved test-server context. Confirm
-that it addresses the intended server before running the mutating apply.
+- `ea1b2254217fd440837fd01a1b7a75e3926f9c63`: original v1 root app.
+- `6dc04688b87d8b7d24087d4fe6ec74fcfd027fd7`: healthy root app with source-v2
+  header and alias route.
+- `034eb826f82fc134ecb38c6de523f32a4751be35`: intentionally unhealthy root
+  app unless `FAIL_HEALTH=0`; has **no** `apps/web` directory.
+- `b895cb2f54daeaedafac44397072db893cd8ef1c`: healthy `apps/web`; fixture
+  branch `main` last pointed here. Root source still has the deliberate failure.
+
+Do not deploy old root commits with the current `apps/web` context and mistake
+missing-path rejection for a health test. Read desired state before changing it.
+
+### Safe first checks
+
+These are inspection commands, not an instruction to upgrade or deploy:
 
 ```sh
-eregion context show --name <test-context> --json
-eregion upgrade --channel edge --yes
-eregion version --json
-eregion --context <test-context> apply --auto-upgrade-nodes
-eregion --context <test-context> doctor
-eregion --context <test-context> server status --json
+git status --short
+git log -1 --oneline
+eregion version
+eregion context show --name main --json
+eregion --context main server status --json
+eregion --context main doctor
+eregion --context main env status githello production --json
+eregion --context main domain list --app githello --json
+eregion --context main build list githello production --limit 10 --json
+curl --fail --show-error --silent https://git-test1.mbvlabs.com/
+curl --fail --show-error --silent https://git-test2.mbvlabs.com/users/sign-in
 ```
 
-`upgrade` replaces the local CLI only. `apply --auto-upgrade-nodes` installs the
-matching verified server binary and converges host steps, including pending
-control-database migrations. This mutates the test server and its configured
-external database; confirm both targets are authorized. Stop on an apply or
-doctor failure rather than running app tests on a partially upgraded host.
-Require matching candidate CLI/node builds, schema **16/16**, current River
-migrations and ready services with no unexplained doctor failures. Preserve
-sanitized output and errors, never credentials.
+If CLI/node versions differ, first record both. A new `upgrade` changes the local
+CLI only; `apply --auto-upgrade-nodes` mutates the server and possibly its
+configured database. Obtain applicable target authorization before changing
+builds, and rerun affected checks on the chosen published candidate. Never
+silently upgrade just to make an inspection command work.
 
-### 3. Exercise the disposable application
+### Evidence already available
 
-Use a dedicated test app, test repository and authorized domain; preserve any
-existing application that is not explicitly disposable. Use the application
-baseline table above as the acceptance checklist, in this order:
+Detailed pass/fail records and operation IDs are below. Logs and sanitized JSON
+are under `/home/mbv/.cache/eregion-run/` (operator-local, not Git artifacts):
 
-1. Guided `app create`: web plus worker, config, secret and domain; follow through
-   the first build/deploy to a working HTTPS URL. Record both operation IDs.
-2. Deploy a second commit while continuously requesting the public URL; verify
-   the new version and no failed requests during the switch.
-3. Deploy a deliberately failing-health commit; require nonzero CLI exit and
-   failed operation state while the previous release keeps serving.
-4. Roll back with exact-target confirmation; verify the previous version and its
-   recorded secret revisions at the public URL.
-5. Scale web to two replicas and restart; verify both backends and that the
-   already-succeeded release command is not executed again.
+| Evidence | Files |
+| --- | --- |
+| Pinned setup upgrade/convergence | `24-setup-apply.log` |
+| Second deploy and failed-health isolation | `27-*` through `32-*` |
+| Rollback secret metadata, scale and restart | `33-*` through `37-*` |
+| Zero-failure curl continuity on primary and proxied alias | `38-continuous-v3.json`, `39-*`, `40-*` |
+| Missing context, moved-branch retry, successful monorepo deploy | `41-*` through `46-*` |
+| JSON/refusal/SSH contracts and container repair | `47-*` through `60-*` |
+| Create replay and original build-stop failure | `61-*` through `69-*` |
+| Build-stop regression checks, published upgrade and passing host retest | `70-*` through `78-*` |
+| Alias removal, injected route-write failure and automatic recovery | `79-*` through `87-*`, `92-domain-recovery-final.json` |
+| Latest inventory, NDJSON logs and unsigned-upload rejection | `88-*` through `91-*` |
+| Release-command change/failure/refusal, cleanup obstruction, Caddy reload resets and `tcp_migrate_req`, rejected reload and recovery | `93-*` through `123-*` |
 
-### 4. Qualify the remaining fixes
+The Python alias continuity monitor returned 403 and is **not** passing evidence;
+use the later curl measurements. Saved binding/operation acceptance is not
+completion. The route-write test failed its operation as expected; periodic
+reconciliation subsequently recovered the routes without rewriting that failure.
+It does **not** qualify rejection of a Caddy reload.
 
-- Builds: monorepo context path and retry of the original commit after a branch
-  has moved; accepted same-key replay must not depend on the git remote.
-- Domains: alias-specific check path, primary public-check evidence and separate
-  desired/applied/DNS/TLS/public states.
-- Recovery: deliberately fail cleanup, remove the obstruction and observe retry;
-  remove one disposable app's serving container and verify worker repair without
-  reverting a competing deployment. Authorize each fault injection first.
-- Operator contracts: failed atomic login replacement, selected-context routing,
-  `ssh --command`, JSON/NDJSON shape, create replay and Ctrl-C detach.
-- Safety: dry-run leaves the node binary unchanged; real exports/deletes require
-  the same-request factor. Destructive checks affect only the disposable app.
-- Init doctor/resume and fresh-host hardening remain separate qualification
-  requirements; upgrading this existing server cannot establish them.
+### Remaining acceptance to select next
 
-### 5. Record and resolve results
+The complete baseline tables above remain authoritative for acceptance details;
+do not treat a passed subset as completion of an entire row.
 
-For every selected check, record pass/fail/not run, candidate build, operation,
-release/deployment IDs and sanitized serving/TLS evidence. An accepted submission
-is not a pass. Fix failures in source, review them, publish a new candidate with
-explicit authorization and repeat affected checks. Run PostgreSQL integration
-tests only against an explicitly authorized disposable test database, never the
-server's ambient control DSN. Do not declare the alpha qualified or tag it until
-the required baseline has a recorded pass for the build being shipped.
+| Baseline area | Recorded coverage and remaining qualification |
+| --- | --- |
+| Guided/operator flow | **Not run:** guided app/env create success and failure, Ctrl-C detach and reattach, flag/guided revision equivalence. Flag-only create and app-create replay passed. |
+| Login and contexts | **Not run:** atomic failed replacement, successful second-machine login, wrong-key refusal, context selection variants and removal. Preserve the working main context and identity. |
+| Zero-downtime switch | **Fail on edge-ef91d70f6215 under concurrent clients:** each Caddy `/load` resets a few in-flight TLS handshakes (Caddy's per-load SO_REUSEPORT listener). Source fix `host-ingress-sysctl-v1` (`net.ipv4.tcp_migrate_req=1`) is unpublished; after publishing, apply on main and repeat the dense four-to-six-loop primary test across several switches. |
+| Cleanup and route failure | Previous-container removal failure, visible cleanup row and later maintenance removal passed; rejected Caddy reload with restore and periodic recovery passed; write-failure recovery and alias removal passed. **Not run:** failed-candidate removal failure and concurrent/interrupted route changes. Use a scoped reversible fault and restoration guard; do not disturb other apps. |
+| Release-command recovery | Once-per-release skipping, a changed command running again, and restart/scale refusal after a failed run passed. **Not run:** rollback refusal (needs a release whose recorded command never succeeded) and unresolved/lost-response recovery variants. |
+| Build/repair variants | Monorepo, missing-path rejection, moved-branch retry, stop/retry and basic serving-container repair passed. **Not run:** symlink-escape rejection, replay with unavailable git, competing/stale repair variants and live build-log follow acceptance. |
+| CI/webhooks | **Not run:** authenticated CI deploy, expired/revoked/wrong-target token denial, public API restriction, signed push deployment, redelivery deduplication, other-branch/bad-signature rejection and webhook-secret rotation. Token creation requires the human factor; a webhook secret must never enter ordinary evidence. |
+| Protected operations/removal | JSON/no-TTY refusals and deletion preview passed. **Not run:** factor-positive token creation, both exports, app/env deletion including last environment, cleanup/history verification and direct same-request-factor rejection variants. Human enters the authenticator code; never derive it from node files. |
+| Fresh-host acceptance | **Not run:** fresh pinned Caddy installation, preflight/plan variants, init doctor/resume/skip-doctor, interrupted init/discard, lockdown revert, handoff and break-glass. Requires an explicitly authorized fresh target; main is not that target. |
+| Release/platform variants | Signed upgrades on main and unsigned/dev rejection passed. **Not run or partial:** macOS installed-CLI acceptance, remaining dry-run mismatch and failed-manifest-retrieval variants. Cross-compilation and CI are not a substitute for host acceptance. |
+
+No infrastructure outage or injected fault was left at the stopping point. The
+known open defect is the Caddy-reload connection reset above (fix in source,
+not yet published). Missing prerequisites: an authorized fresh server and
+human participation for factor-positive operations. Other unqualified variants
+remain **not run**, not implementation failures or passes.
+
+### Safety and local resources
+
+- Do not rerun `server init` on main, reset its database, edit applied migrations,
+  erase journals or remove existing apps, especially `andurel`. Restrict test
+  mutations to explicitly authorized fixtures and targets.
+- Keep Cloudflare proxy support and normal TLS verification. Do not use `-k` or
+  disable the proxy as a product fix. The earlier certificate problem was an
+  incorrect origin IP, not an established Caddy-version defect.
+- Saved operator credentials are under
+  `/home/mbv/.config/eregion/servers/main/`. The protected `sudo-password` file
+  can authenticate authorized OS fault-injection commands over SSH without
+  displaying it. Plain `sudo -n` is insufficient for Docker/systemctl commands;
+  do not log credentials or bypass the application's factor gates through root.
+- Private fixture read credential file:
+  `/home/mbv/.config/eregion-test-git-token`. Protected test secret files:
+  `/home/mbv/.cache/eregion-hello-secrets/HELLO_SECRET` and `HELLO_SECRET_V2` in
+  that directory. Reference files only; never print or copy values into docs.
+- Historical unlabelled release container
+  `eregion-githello-production-release-7e5cbbcbabf7` was removed. The injected
+  routes-directory permissions were restored to 0755, uid 999/gid 983. No
+  deliberate fault was left active.
+- The control database depends on the operator machine's Tailscale/Funnel. The
+  earlier outage recovered after the operator restarted Tailscale; diagnose
+  connectivity without exposing the DSN rather than resetting state.
+- Inspect selected tests before running them: `just check` includes tests that
+  can start Docker. Do not use an ambient production DSN as a test target or
+  touch `eregion-platform-test-pg` on port 55432. Prior disposable integration
+  run used loopback 55439 and removed its container afterward; any new run needs
+  its own authorized isolated target and explicit `EREGION_TEST_DATABASE_URL`.
+- For local Go builds, use `GOTMPDIR` and `TMPDIR` set to
+  `/home/mbv/.cache/eregion-gotmp` to avoid the previously full `/tmp`. Local race
+  testing lacks a C compiler; race checks were performed in CI.
+- This saved document does not authorize a new commit, push, branch, tag,
+  release, database or host mutation. Confirm applicable authorization first.
 
 ## Current qualification boundary
 
-The integrated 2026-10-28 source changes have no real-server baseline record.
-Every host check above remains **not run** for this worktree; earlier andurel-site
-observations cited in MASTER concern an older build, not qualification here.
-PostgreSQL integration tests (`just integration-norace`) **pass** for the
-working-tree fixes below against a disposable local PostgreSQL 17 container
-started for the run (bound to loopback, removed afterwards); the race build was
-not run locally (no C compiler) and is left to CI. Selected isolated
-tests/build/vet are developer evidence only.
-During implementation, one Lane E CLI test invocation accidentally included the
-excluded Docker SSH fixture; it is not authorized real-host or baseline evidence.
-Final validation explicitly excludes that test.
+Real-host evidence spans several published edge builds, recorded below.
+`edge-ef91d70f6215` is the latest installed and tested build; earlier passes are
+not automatically a full baseline pass for it. Source fixes have isolated
+regressions, build/vet and darwin/arm64 cross-build evidence; published CI also
+ran race checks. These are distinct from manual acceptance.
 
-Failed-follow acceptance: a failed deploy or failed guided first deploy returns
-nonzero with the recorded error code (fallback exit 5), while retaining the
-failed state/error and serving-state output. Successful follows exit 0; a remote
-cancellation and Ctrl-C detach both exit 130 but have distinct messages. JSON and
-NDJSON emit one failure envelope/result with operation ID and state. These checks
-have isolated regressions but remain **not run** on the test server.
+Failed deploy follows returned exit 5 on main, successful follows returned 0,
+and the build-stop retest returned 130 with terminal cancellation and the prior
+serving release preserved. Guided failure and viewer-detach acceptance remain
+not run. Complete and record the remaining baseline for the actual release
+candidate before asking the user to authorize `1.x` or `v1.0.0-alpha.1`.
 
 ## Run record
 
@@ -477,6 +526,92 @@ Remaining: guided terminal/detach, init on a fresh authorized target,
   factor-positive CI/deletion/export, atomic login, cleanup obstruction,
   rejected-reload injection and remaining baseline variants are not yet
   qualified. Alpha is not complete.
+```
+
+```text
+Date / build / commit / channel: 2026-10-29 / edge-ef91d70f6215 / ef91d70 / edge
+Operator OS/arch: linux/amd64; CLI and main edge-ef91d70f6215 (resumed snapshot)
+Server: existing main, Ubuntu 26.04 amd64, kernel 7.0.0-30; schema 16/16,
+  River 7/7; doctor 18/0/0 before and after
+App: githello/production; git-test1 direct, git-test2 Cloudflare-proxied
+Release command scope (changed command): env update to
+  `eregion-hello release changed`, op_9fb563245865bcaad59d77b502710111 (no
+  deploy). deploy --release rel_07d1c0fb27cdc0d68c7e5815a56e9328,
+  op_2e03c1f3b7d922dc49609a3b048e4ca2: command ran again for the same release
+  ("release command ran version=v3"), succeeded, 52+52 monitor requests 200.
+  PASS.
+Release command failed run: command `false`, op_16a4eefef2536158a493a810627b8af0;
+  deploy op_abfb7a138e27de0188d60aa28ee96b77 failed at platform-command-01-v1
+  (exit status 1), exit 5 precondition_failed; rel_07d1 kept serving. Then
+  restart and `process scale web 3` refused at submission, exit 5, "release
+  command has not succeeded for this release"; no operation and no revision
+  (replicas stayed 2). PASS. Rollback --to rel_8353d51796535fdf752f2c3450052af8
+  (op_b55430000c5515b87c929a0d8c53622d) succeeded and skipped the command: it
+  pins the release's recorded revision, whose command succeeded for that
+  release, so the current failed command does not apply. Correct by design;
+  a rollback refusal needs a release with no succeeded recorded command and
+  was not constructed. Restored `eregion-hello release`
+  (op_990bdfc52243088f97142a453396dd11); deploy
+  op_831954d2473e0f9b201f8747d3787c4b skipped the succeeded command, rel_07d1
+  serving again.
+Leaked-container retry: fault = temporary root /usr/local/bin/docker wrapper
+  failing only `rm -f githello-production-web-1-b99bb0a5d5a1` (everything else
+  exec /usr/bin/docker), 30-min systemd-run removal guard. Deploy
+  op_438306f739281d1a8b0a1586fcfa5859 SUCCEEDED; its cleanup step failed with
+  the simulated error; "Previous release cleanup is pending" event; env status
+  `pending_cleanup` named the container ("1 leaked containers pending
+  cleanup"). Maintenance at 17:40:09 retried and failed (fault active). Wrapper
+  and timer removed 17:41:28; the 17:45 maintenance run removed the container
+  and the row. PASS. Observations: the cleanup event says "an internal error
+  occurred" instead of the step error, and the final summary still says
+  "candidate cleanup completed" while previous-release cleanup is pending.
+Zero-downtime switch: FAIL under concurrent clients. During op_438306f7 one
+  primary request (DNS-only, direct to Caddy) failed with curl 35 "Recv
+  failure: Connection reset by peer" at 17:38:47.73, overlapping Caddy's
+  /load at 17:38:47.67. Dense reproduction (4 parallel fresh-TLS loops on the
+  primary, redeploying rel_07d1): op_a9e23a8a95ff5d75eed8933e0f530cd4 3 resets
+  / 596, op_50c38192df1cf847784e547268fcaf6c 2 / 579, all within ~10 ms of the
+  routes step. Earlier zero-failure runs used one sequential low-rate client.
+  Cause: Caddy 2.11.4 (listen_unix.go) binds a new SO_REUSEPORT listener per
+  config load and closes the old one; Linux resets connections still queued
+  on the closed socket (reset after ClientHello, before ServerHello; same
+  pattern as caddy.community topic 33952, no upstream fix). deploycrate
+  changes routes through the admin API, which reloads the same way.
+  Diagnostic: runtime-only `sysctl -w net.ipv4.tcp_migrate_req=1` on main;
+  op_dc411627c7accd271fcdcc34dbb6791a 0/584,
+  op_9ba884b586d44e50d2d79950612f756a 0/581 (4 loops),
+  op_99521edfc690f22bc9e2e7b2fd1f1f79 0/900,
+  op_94926b929ade66e8e30ecbb1a91179f3 0/851 (6 loops). Reverted to 0
+  afterwards. Source fix (working tree, unpublished): new host step
+  host-ingress-sysctl-v1 persists and applies the setting before Caddy.
+  Requires publish, upgrade/apply and a dense continuity retest.
+Rejected Caddy reload: domain remove git-test2
+  (op_160c91170612fcf59d842ad0dd5bf149) succeeded, alias 525. Fault = root
+  file /etc/caddy/eregion.d/zz-qualification-fault.caddy with an invalid
+  directive (fragment /adapt passes, full /load rejects), 15-min removal
+  guard. domain add git-test2 --check-path /users/sign-in,
+  op_e33190b41329d608ab4dbde45f1081c5: failed exit 5 "Caddy rejected the
+  routes (400)"; routes file restored without git-test2; git-test2 desired 1 /
+  applied 0 route_state=failed, git-test1 failed state recorded but still
+  serving v3. Deploy op_1542fa11ffa1d56408f9e157dbe57e33 under the fault
+  failed at platform-routes-01-v1, exit 5, candidates cleaned up, rel_07d1
+  still serving, monitor 131/131 200. Fault and timer removed 17:54:59;
+  within 45 s periodic reconciliation applied both routes without
+  resubmission: git-test1 24/24, git-test2 2/2 applied, certificate valid,
+  public ok, alias `alias ready` 200 through Cloudflare. Failed operations
+  stay failed. PASS (rejected reload and recovery). Concurrent/interrupted
+  route changes remain NOT RUN.
+Contract observation: `deploy --output ndjson` refuses with
+  invalid_output_mode although deploy follows and its help says follow
+  commands accept ndjson; `operations follow --output ndjson` works.
+Final state: rel_07d1 serving, deployment dep_4ca1b01d314414a4fdaef2730cd1760b,
+  revision 8, release command `eregion-hello release`, no pending cleanup,
+  no wrapper, fault file, guard timer or sysctl change left; doctor 18/0/0.
+Evidence: ~/.cache/eregion-run/93-* through 123-* (97/98/104/106/120 monitors,
+  112-* and 114-* dense runs).
+Remaining: publish and retest the TCP migration fix; guided create/detach,
+  login/context variants, release-command recovery variants, symlink escape,
+  CI/webhooks, factor-positive operations, fresh-host init and macOS install.
 ```
 
 ```text

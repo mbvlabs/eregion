@@ -339,17 +339,29 @@ finish. The narrow fix lets only that private signal bypass the host lock,
 with regressions; published edge-ef91d70f6215 passed the host retest (pack
 interrupted, deploy exit 130, prior release preserved). Route-write failure and
 automatic recovery, alias removal and unsigned/dev upload rejection also
-passed; doctor remains 18/0/0. Fresh init, human-factor-positive flows,
-cleanup/rejected-reload obstruction and other baseline variants are not yet
-qualified. See MANUAL-TESTING for precise evidence and skipped checks. See MANUAL-TESTING for operation IDs
-and evidence. Row 16 is in progress; row 17 remains unimplemented and required
-before v1.0.0 final.
+passed; doctor remains 18/0/0. A resumed run on the same build passed a changed
+release command re-running, restart/scale refusal after a failed command,
+previous-container cleanup obstruction with later maintenance removal, and a
+rejected Caddy reload with restore and automatic recovery. It also found that
+the D17 switch is **not** zero-downtime under concurrent clients: each Caddy
+config load resets a few in-flight TLS handshakes (2–3 per switch with four
+parallel clients) because Caddy rebinds its SO_REUSEPORT listener. A runtime
+`net.ipv4.tcp_migrate_req=1` removed every reset in four dense switches; the
+source fix is a new `host-ingress-sysctl-v1` step, implemented with tests but
+not yet published or host-verified. Fresh init, human-factor-positive flows
+and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resume testing” section for the saved target,
+fixture state, evidence locations and unqualified acceptance variants, and its
+run records for operation IDs. Row 16 is in progress; row 17 remains
+unimplemented and required before v1.0.0 final.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
 including guided creates. Success exits 0; remote cancellation and viewer detach
 both exit 130 but have distinct messages and state evidence. Isolated regressions
-cover plain, JSON and NDJSON; real-server qualification remains outstanding.
+cover plain, JSON and NDJSON. Real-host failed deploy follows returned exit 5,
+success returned 0 and the build-stop retest returned cancellation exit 130;
+guided failure, viewer detach and remaining output variants still need manual
+qualification.
 
 A source re-check on 2026-10-28 (snapshot `a7478c4`) and a real deployment of a
 second app (andurel-site, edge-8a7179d: image push, digest deploy, release
