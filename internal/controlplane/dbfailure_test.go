@@ -69,6 +69,12 @@ func TestClassifyDatabaseFailureClasses(t *testing.T) {
 			detail: "the connection timed out",
 		},
 		{
+			name:   "network timeout",
+			err:    &net.DNSError{Err: "i/o timeout", Name: "db.example.com", IsTimeout: true},
+			class:  DatabaseFailureTimeout,
+			detail: "the connection timed out",
+		},
+		{
 			name:   "other",
 			err:    errors.New("driver failed for postgres://operator:topsecret@db.example.com/eregion"),
 			class:  DatabaseFailureOther,

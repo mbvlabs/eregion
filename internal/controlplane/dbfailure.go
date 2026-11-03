@@ -76,7 +76,7 @@ func ClassifyDatabaseFailure(dsn string, err error) DatabaseFailure {
 		}
 		return failure
 	}
-	if pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded) {
+	if pgconn.Timeout(err) || errors.Is(err, context.DeadlineExceeded) || isNetTimeout(err) {
 		failure.Class = DatabaseFailureTimeout
 		failure.Detail = "the connection timed out"
 		failure.Fix = "Check routing and firewall rules between the node and PostgreSQL, and whether the database is accepting connections."
@@ -140,6 +140,11 @@ func ControlDatabaseFault(dsn string, cause error) *contract.Fault {
 			"detail":        failure.Detail,
 		},
 	}
+}
+
+func isNetTimeout(err error) bool {
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
 }
 
 func isTLSVerificationError(err error) bool {
