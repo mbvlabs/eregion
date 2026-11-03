@@ -262,6 +262,36 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 	}
 }
 
+func TestObserveRetentionInventoryMarksUnreadableCacheUnknown(t *testing.T) {
+	missingMount := filepath.Join(t.TempDir(), "missing")
+	answers := map[string]string{
+		"docker ps --all --quiet --no-trunc --filter label=io.eregion.app":       "",
+		"docker image ls --quiet --no-trunc --filter dangling=true":              "",
+		"docker image ls --all --quiet --no-trunc":                               "",
+		"docker volume ls --quiet --filter name=eregion-build-cache-":            testBuildCacheVolume + "\n",
+		"docker volume ls --quiet --filter name=eregion-launch-cache-":           "",
+		"docker volume ls --quiet --filter name=pack-cache-":                     "",
+		"docker volume inspect --format {{.Mountpoint}} " + testBuildCacheVolume: missingMount,
+	}
+	run := func(_ context.Context, argv ...string) ([]byte, error) {
+		return []byte(answers[strings.Join(argv, " ")]), nil
+	}
+	inventory, err := ObserveRetentionInventory(context.Background(),
+		RetentionInventoryPaths{DataDir: t.TempDir(), RegistryDir: filepath.Join(t.TempDir(), "absent")}, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.CacheVolumes) != 1 || !inventory.CacheVolumes[0].SizeUnknown {
+		t.Fatalf("unreadable cache volume = %+v, want an unknown size", inventory.CacheVolumes)
+	}
+	if !inventory.CacheSizeUnknown || inventory.CacheError == "" {
+		t.Fatalf("inventory cache measurement = unknown=%t error=%q", inventory.CacheSizeUnknown, inventory.CacheError)
+	}
+	if inventory.CacheVolumes[0].SizeBytes != 0 {
+		t.Fatalf("an unknown cache size carried a byte measurement: %+v", inventory.CacheVolumes[0])
+	}
+}
+
 func TestObserveRetentionInventoryWithoutARegistryIsEmpty(t *testing.T) {
 	inventory, err := ObserveRetentionInventory(context.Background(),
 		RetentionInventoryPaths{DataDir: t.TempDir(), RegistryDir: filepath.Join(t.TempDir(), "absent")},

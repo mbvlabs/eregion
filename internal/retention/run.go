@@ -39,7 +39,10 @@ const (
 	// ItemImageSkipped is a diagnostic, not a removal: it names a release whose
 	// image cannot be removed because the release has no immutable identity, or
 	// another retained release/container still uses that image.
-	ItemImageSkipped   ItemKind = "image_skipped"
+	ItemImageSkipped ItemKind = "image_skipped"
+	// ItemCacheSkipped is a diagnostic, not a removal: the Buildpacks cache
+	// could not be measured, so no cache entry is removed.
+	ItemCacheSkipped   ItemKind = "cache_skipped"
 	ItemBuildpackCache ItemKind = "buildpack_cache"
 	ItemContainer      ItemKind = "container"
 	ItemDanglingImage  ItemKind = "dangling_image"
@@ -83,6 +86,12 @@ type Run struct {
 	Errors         []RunError `json:"errors"`
 	StartedAt      time.Time  `json:"started_at"`
 	FinishedAt     *time.Time `json:"finished_at,omitempty"`
+	// CacheBytes is the latest complete Buildpacks cache measurement. Nil is
+	// unknown, never a healthy zero. CacheMeasuredAt is when the node observed
+	// it; doctor treats a measurement older than 48 hours as unknown.
+	CacheBytes      *int64     `json:"cache_bytes,omitempty"`
+	CacheMeasuredAt *time.Time `json:"cache_measured_at,omitempty"`
+	CacheError      string     `json:"cache_measurement_error,omitempty"`
 }
 
 // NewRunID returns a retention run identity in the database's rtr_ format.

@@ -190,6 +190,17 @@ func ObserveRetentionInventory(ctx context.Context, paths RetentionInventoryPath
 	}
 	inventory.CacheVolumes = volumes
 	inventory.Truncated = inventory.Truncated || truncated
+	for _, volume := range volumes {
+		if volume.SizeUnknown {
+			inventory.CacheSizeUnknown = true
+			inventory.CacheError = "one or more Buildpacks cache volumes could not be measured"
+			break
+		}
+	}
+	if truncated && !inventory.CacheSizeUnknown {
+		inventory.CacheSizeUnknown = true
+		inventory.CacheError = "the Buildpacks cache volume list was truncated"
+	}
 
 	inventory.Disk = retentionDisk(paths.DataDir)
 	return inventory, nil
@@ -381,41 +392,64 @@ func readCacheVolumes(ctx context.Context, run NodeReadRunner) ([]retention.Cach
 			return nil, false, dockerObservationFault("inspect build cache volume "+name, err)
 		}
 		mountpoint := strings.TrimSpace(string(raw))
-		volumes = append(volumes, retention.CacheVolume{
+		size, sizeErr := directorySize(ctx, mountpoint)
+		volume := retention.CacheVolume{
 			Name: name, Kind: kind, App: app, Environment: environment,
-			Ownerless: kind == "pack", SizeBytes: directorySize(ctx, mountpoint),
-		})
+			Ownerless: kind == "pack", SizeBytes: size,
+		}
+		if sizeErr != nil {
+			volume.SizeBytes = 0
+			volume.SizeUnknown = true
+		}
+		volumes = append(volumes, volume)
 	}
 	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
 	return volumes, truncated, nil
 }
 
-// directorySize sums regular files below one directory. A missing or
-// unreadable directory is an unknown size, not a failed inventory.
-func directorySize(ctx context.Context, root string) int64 {
+// directorySize sums regular files below one directory. A missing, unreadable
+// or timed-out directory is an unknown size, never a healthy zero.
+func directorySize(ctx context.Context, root string) (int64, error) {
 	root = strings.TrimSpace(root)
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) == "/" {
-		return 0
+		return 0, errors.New("the cache volume has no readable absolute mountpoint")
+	}
+	sizeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	info, err := os.Stat(root)
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() {
+		return 0, errors.New("the cache volume mountpoint is not a directory")
 	}
 	var total int64
 	entries := 0
-	_ = filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return nil //nolint:nilerr // An unreadable subtree is an unknown size, not a fault.
+	err = filepath.WalkDir(root, func(_ string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 		if entries++; entries%256 == 0 {
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if err := sizeCtx.Err(); err != nil {
+				return err
 			}
 		}
 		if entry.Type().IsRegular() {
 			if info, statErr := entry.Info(); statErr == nil {
 				total += info.Size()
+			} else {
+				return statErr
 			}
 		}
 		return nil
 	})
-	return total
+	if err != nil {
+		return 0, err
+	}
+	if err := sizeCtx.Err(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 // ---------------------------------------------------------------- registry

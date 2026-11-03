@@ -412,7 +412,7 @@ func observeRetentionInventoryTransport(ctx context.Context, transport node.Tran
 func retentionRemovalItems(items []retention.Item) []retention.Item {
 	removals := make([]retention.Item, 0, len(items))
 	for _, item := range items {
-		if item.Kind == retention.ItemRegistrySkipped || item.Kind == retention.ItemImageSkipped || item.Kind == retention.ItemRegistryGC {
+		if item.Kind == retention.ItemRegistrySkipped || item.Kind == retention.ItemImageSkipped || item.Kind == retention.ItemCacheSkipped || item.Kind == retention.ItemRegistryGC {
 			continue
 		}
 		removals = append(removals, item)

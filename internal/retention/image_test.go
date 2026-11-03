@@ -57,6 +57,28 @@ func TestPlanReleaseImagesUsesImmutableIdentityAndSharedProtection(t *testing.T)
 	}
 }
 
+func TestPlanUnknownCacheMeasurementDoesNotRemoveEntries(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.BuildpackCacheMaxBytes = 1 << 30
+	items := Plan(Input{
+		Cache: CacheInventory{
+			Bytes:   2 << 30,
+			Unknown: true,
+			Entries: []CacheEntry{{Path: "/cache/a", Bytes: 2 << 30, LastUsedAt: daysAgo(1)}},
+		},
+		ServerPolicy: policy,
+		Now:          planNow,
+	})
+	for _, item := range items {
+		if item.Kind == ItemBuildpackCache {
+			t.Fatalf("an unknown cache measurement planned a removal: %+v", item)
+		}
+	}
+	if !containsReference(items, ItemCacheSkipped, "*") {
+		t.Fatalf("unknown cache measurement did not produce a diagnostic: %+v", items)
+	}
+}
+
 func TestPlanPrunedReleaseStillRemovesPresentImage(t *testing.T) {
 	policy := DefaultPolicy()
 	prunedAt := planNow.Add(-time.Hour)

@@ -157,6 +157,10 @@ type CacheInventory struct {
 	DiskTotalBytes int64
 	// Entries are individually removable cache directories, in any order.
 	Entries []CacheEntry
+	// Unknown reports that at least one cache volume could not be measured or
+	// the volume list was truncated. The planner never treats that as zero: it
+	// plans no cache removal and emits a cache_skipped diagnostic.
+	Unknown bool
 }
 
 // CacheEntry is one removable Buildpacks cache directory.
@@ -548,6 +552,12 @@ func deploymentNewer(a, b Deployment) bool {
 }
 
 func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
+	if cache.Unknown {
+		return []Item{{
+			Kind: ItemCacheSkipped, Reference: "*",
+			Reason: "the Buildpacks cache could not be measured completely; no cache entry is removed",
+		}}
+	}
 	entries := make([]CacheEntry, 0, len(cache.Entries))
 	var entryBytes int64
 	seen := map[string]bool{}

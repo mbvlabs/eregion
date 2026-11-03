@@ -14,6 +14,11 @@ type Inventory struct {
 	DanglingImages    []InventoryImage            `json:"dangling_images"`
 	LocalImages       []LocalImage                `json:"local_images"`
 	Disk              Disk                        `json:"disk"`
+	// CacheSizeUnknown reports that at least one Buildpacks cache volume could
+	// not be measured. The planner must not treat the missing size as a healthy
+	// zero, and the retention run persists an unknown measurement.
+	CacheSizeUnknown bool   `json:"cache_size_unknown,omitempty"`
+	CacheError       string `json:"cache_error,omitempty"`
 	// Warnings record observations that could not be completed, such as a
 	// registry revision whose manifest blob is missing. They are not a failed
 	// inventory; the planner must treat the affected artifact as unknown.
@@ -52,6 +57,9 @@ type CacheVolume struct {
 	Environment string `json:"environment,omitempty"`
 	Ownerless   bool   `json:"ownerless,omitempty"`
 	SizeBytes   int64  `json:"size_bytes"`
+	// SizeUnknown reports a missing or unreadable volume mountpoint. SizeBytes
+	// is then not a measurement and must not be added as zero.
+	SizeUnknown bool `json:"size_unknown,omitempty"`
 }
 
 // InventoryContainer is one eregion-labeled Docker container.

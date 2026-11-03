@@ -75,15 +75,18 @@ func InputFromInventory(inventory Inventory, state PlatformState, now time.Time)
 		}
 		input.Cache.DiskUsedBytes = used
 	}
+	input.Cache.Unknown = inventory.CacheSizeUnknown
 	for _, volume := range inventory.CacheVolumes {
 		// Ownerless legacy pack caches are included: they belong to no
 		// environment but still occupy the node, and the node host lock makes
 		// their removal safe when no build is running.
-		input.Cache.Entries = append(input.Cache.Entries, CacheEntry{
-			Path:  volume.Name,
-			Bytes: volume.SizeBytes,
-		})
-		input.Cache.Bytes += volume.SizeBytes
+		entry := CacheEntry{Path: volume.Name, Bytes: volume.SizeBytes}
+		if volume.SizeUnknown {
+			input.Cache.Unknown = true
+			entry.Bytes = 0
+		}
+		input.Cache.Entries = append(input.Cache.Entries, entry)
+		input.Cache.Bytes += entry.Bytes
 	}
 
 	for _, container := range inventory.Containers {

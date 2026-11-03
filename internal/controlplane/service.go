@@ -37,6 +37,8 @@ type Service struct {
 	// beforeRetentionMark is a test-only seam between planning a retention run
 	// and marking its release rows. Production leaves it nil.
 	beforeRetentionMark func(context.Context, contract.OperationID)
+	// retentionMark injects a mark failure in tests. Production leaves it nil.
+	retentionMark func(context.Context, string) (bool, error)
 	// routeSwitch and publicVerify are test-only seams for deployments that
 	// run no Caddy on the test host. Production leaves them nil.
 	routeSwitch  func(context.Context, platform.Environment, []string) error

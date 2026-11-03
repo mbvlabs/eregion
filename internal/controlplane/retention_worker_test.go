@@ -107,7 +107,10 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 				{Repository: "api", Digest: keptDigest, ConfigDigest: newConfig, Bytes: 10, CreatedAt: &old},
 				{Repository: "api", Digest: orphanDigest, Bytes: 100, CreatedAt: &old},
 			},
-			CacheVolumes:   []retention.CacheVolume{},
+			CacheVolumes: []retention.CacheVolume{
+				{Name: "eregion-build-cache-617069_70726f64756374696f6e", Kind: "build", App: "api", Environment: "production", SizeBytes: 10},
+				{Name: "pack-cache-abc.build", Kind: "pack", Ownerless: true, SizeBytes: 20},
+			},
 			Containers:     []retention.InventoryContainer{},
 			DanglingImages: []retention.InventoryImage{},
 			LocalImages: []retention.LocalImage{
@@ -263,6 +266,15 @@ func TestIntegrationRetentionWorkerMarksRemovesThenGCs(t *testing.T) {
 	}
 	if status != string(retention.RunSucceeded) || plannedBytes != 100 || reclaimedBytes != 100 {
 		t.Fatalf("run = %s planned=%d reclaimed=%d errors=%s", status, plannedBytes, reclaimedBytes, errorsRaw)
+	}
+	var cacheBytes *int64
+	var cacheMeasuredAt *time.Time
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT cache_bytes,cache_measured_at
+        FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&cacheBytes, &cacheMeasuredAt); err != nil {
+		t.Fatal(err)
+	}
+	if cacheBytes == nil || *cacheBytes != 30 || cacheMeasuredAt == nil {
+		t.Fatalf("cache measurement = %v at %v, want 30 bytes and a time", cacheBytes, cacheMeasuredAt)
 	}
 	var removed []retention.Item
 	if err := json.Unmarshal(removedRaw, &removed); err != nil {
@@ -518,5 +530,143 @@ func TestIntegrationRetentionDailySubmissionIsIdempotent(t *testing.T) {
 	}
 	if operations != 1 || jobs != 1 {
 		t.Fatalf("daily retention operations=%d jobs=%d, want one operation and one job", operations, jobs)
+	}
+}
+
+func TestIntegrationRetentionRetryRevalidatesPolicyBeforeMarking(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	ctx := context.Background()
+	op := submitRetentionWorkerPrune(t, s, "retention-worker-policy-retry")
+	runID, err := retention.NewRunID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := retention.Run{
+		ID: runID, OperationID: string(op.ID), Status: retention.RunFailed,
+		Planned: []retention.Item{{
+			Kind: retention.ItemRelease, App: fixture.app, Environment: fixture.env, Reference: fixture.oldID,
+		}},
+		StartedAt: time.Now().UTC(),
+	}
+	if err := s.insertRetentionRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	platformSubmit(t, s, platform.KindEnvironmentUpdate, "env/"+fixture.app+"/"+fixture.env,
+		"retention-worker-policy-raised", map[string]any{
+			"retention": map[string]any{"keep_releases": 10},
+		})
+	if err := (&retentionWorker{service: s}).Work(ctx, retentionWorkerJob(op.ID, 1, 8)); err != nil {
+		t.Fatal(err)
+	}
+	var pruned *time.Time
+	if err := fixture.pool.QueryRow(ctx, `SELECT pruned_at FROM eregion_platform_releases WHERE id=$1`, fixture.oldID).Scan(&pruned); err != nil {
+		t.Fatal(err)
+	}
+	if pruned != nil {
+		t.Fatal("a release no longer eligible under the raised policy was marked pruned")
+	}
+	var plannedRaw []byte
+	if err := fixture.pool.QueryRow(ctx, `SELECT planned_items FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&plannedRaw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plannedRaw), fixture.oldID) {
+		t.Fatalf("the ineligible release remained in the persisted plan: %s", plannedRaw)
+	}
+}
+
+func TestIntegrationRetentionFailedMarkIsRetried(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	ctx := context.Background()
+	op := submitRetentionWorkerPrune(t, s, "retention-worker-failed-mark")
+	realMark := s.markRetentionRelease
+	first := true
+	s.retentionMark = func(ctx context.Context, releaseID string) (bool, error) {
+		if first {
+			first = false
+			return false, errors.New("transient mark failure")
+		}
+		return realMark(ctx, releaseID)
+	}
+	worker := &retentionWorker{service: s}
+	if err := worker.Work(ctx, retentionWorkerJob(op.ID, 1, 8)); err == nil {
+		t.Fatal("the failed mark did not fail the attempt")
+	}
+	var plannedRaw []byte
+	if err := fixture.pool.QueryRow(ctx, `SELECT planned_items FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&plannedRaw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(plannedRaw), fixture.oldID) {
+		t.Fatalf("the failed release mark was dropped from the retry plan: %s", plannedRaw)
+	}
+	if err := worker.Work(ctx, retentionWorkerJob(op.ID, 2, 8)); err != nil {
+		t.Fatal(err)
+	}
+	var pruned *time.Time
+	if err := fixture.pool.QueryRow(ctx, `SELECT pruned_at FROM eregion_platform_releases WHERE id=$1`, fixture.oldID).Scan(&pruned); err != nil {
+		t.Fatal(err)
+	}
+	if pruned == nil {
+		t.Fatal("the retried mark did not mark the release pruned")
+	}
+	oldConfig := "sha256:" + strings.Repeat("a", 64)
+	foundImage := false
+	for _, payload := range fixture.transport.payloads {
+		if payload.Kind == string(retention.ItemImage) && payload.Reference == oldConfig {
+			foundImage = true
+		}
+	}
+	if !foundImage {
+		t.Fatalf("the retried release image was not removed: %+v", fixture.transport.payloads)
+	}
+}
+
+func TestIntegrationRetentionPendingGCRunsWithoutNewDeletions(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	ctx := context.Background()
+	old := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	fixture.transport.inventory.RegistryArtifacts = []retention.InventoryRegistryArtifact{{
+		Repository: "api", Digest: "sha256:" + strings.Repeat("c", 64),
+		ConfigDigest: "sha256:" + strings.Repeat("b", 64), Bytes: 10, CreatedAt: &old,
+	}}
+	fixture.transport.inventory.LocalImages = nil
+	fixture.transport.inventory.DanglingImages = nil
+	if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_platform_releases SET pruned_at=clock_timestamp() WHERE id=$1`, fixture.oldID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention_gc_pending)
+        VALUES (true,true) ON CONFLICT (singleton) DO UPDATE SET retention_gc_pending=true`); err != nil {
+		t.Fatal(err)
+	}
+	fixture.transport.failSteps["platform-retention-gc-01-v1"] = 1
+	first := submitRetentionWorkerPrune(t, s, "retention-worker-gc-pending-1")
+	if err := (&retentionWorker{service: s}).Work(ctx, retentionWorkerJob(first.ID, 1, 8)); err == nil {
+		t.Fatal("the first GC attempt did not fail")
+	}
+	var pending bool
+	if err := fixture.pool.QueryRow(ctx, `SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if !pending {
+		t.Fatal("a failed GC did not leave the durable pending flag")
+	}
+	second := submitRetentionWorkerPrune(t, s, "retention-worker-gc-pending-2")
+	if err := (&retentionWorker{service: s}).Work(ctx, retentionWorkerJob(second.ID, 1, 8)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.pool.QueryRow(ctx, `SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending {
+		t.Fatal("a successful follow-up GC did not clear the pending flag")
+	}
+	var removedRaw []byte
+	if err := fixture.pool.QueryRow(ctx, `SELECT removed_items FROM eregion_retention_runs WHERE operation_id=$1`, second.ID).Scan(&removedRaw); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(removedRaw), string(retention.ItemRegistryGC)) {
+		t.Fatalf("the follow-up run did not record GC: %s", removedRaw)
 	}
 }
