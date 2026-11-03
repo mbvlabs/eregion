@@ -160,6 +160,9 @@ func TestCleanupCausesRedactSecretsStraddlingTheTruncationBoundary(t *testing.T)
 	if !strings.Contains(cause, "[REDACTED") {
 		t.Fatalf("cause does not show the redaction: %q", cause)
 	}
+	assertNoSecretFragment(t, service.cleanupCauseText(err), secret)
+	maintenance := contract.Classify(service.containerCleanupFailure(contract.Internal, raw))
+	assertNoSecretFragment(t, maintenance.Message, secret)
 	warning := contract.Classify(containerCleanupError([]string{"web-1"}, []string{cause}, []error{err}))
 	assertNoSecretFragment(t, warning.Message, secret)
 }
