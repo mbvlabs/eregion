@@ -43,6 +43,11 @@ type Input struct {
 	// a registry artifact no environment references. A zero field inherits the
 	// D30 default.
 	ServerPolicy Policy
+	// RegistryUnsafeReason, when non-empty, prevents every registry deletion
+	// and emits one registry_skipped diagnostic naming it. The inventory
+	// adapter sets it when the node capped its observation, so a missing
+	// artifact can never be mistaken for an unreferenced one.
+	RegistryUnsafeReason string
 	// Now fixes every age and grace calculation. Callers pass one timestamp
 	// for the whole plan so a run is reproducible.
 	Now time.Time
@@ -386,6 +391,9 @@ func Plan(in Input) []Item {
 
 	registryIndex := indexRegistryArtifacts(in.Registry)
 	skipReasons, skipAll := registrySkipReasons(releases, plannedReleaseIDs, protectedReleaseIDs, environmentByKey, registryIndex, localImages)
+	if in.RegistryUnsafeReason != "" {
+		skipReasons, skipAll = map[string]string{"*": in.RegistryUnsafeReason}, true
+	}
 	items = append(items, planRegistryArtifacts(registryIndex, protection, artifactMetadata, skipReasons, skipAll, now)...)
 	items = append(items, planBuildpackCache(serverPolicy, in.Cache)...)
 	items = append(items, planContainers(environmentByKey, in.Containers, inFlightReleases, inFlightDeployments, inFlightContainers)...)

@@ -7,13 +7,13 @@ import "time"
 // the input the retention planner reasons over. Every field is plain data: no
 // database row, journal entry or secret is part of it.
 type Inventory struct {
-	CollectedAt       time.Time          `json:"collected_at"`
-	RegistryArtifacts []RegistryArtifact `json:"registry_artifacts"`
-	CacheVolumes      []CacheVolume      `json:"cache_volumes"`
-	Containers        []Container        `json:"containers"`
-	DanglingImages    []Image            `json:"dangling_images"`
-	LocalImages       []LocalImage       `json:"local_images"`
-	Disk              Disk               `json:"disk"`
+	CollectedAt       time.Time                   `json:"collected_at"`
+	RegistryArtifacts []InventoryRegistryArtifact `json:"registry_artifacts"`
+	CacheVolumes      []CacheVolume               `json:"cache_volumes"`
+	Containers        []InventoryContainer        `json:"containers"`
+	DanglingImages    []InventoryImage            `json:"dangling_images"`
+	LocalImages       []LocalImage                `json:"local_images"`
+	Disk              Disk                        `json:"disk"`
 	// Warnings record observations that could not be completed, such as a
 	// registry revision whose manifest blob is missing. They are not a failed
 	// inventory; the planner must treat the affected artifact as unknown.
@@ -23,12 +23,12 @@ type Inventory struct {
 	Truncated bool `json:"truncated,omitempty"`
 }
 
-// RegistryArtifact is one manifest stored in the local OCI registry, keyed by
-// repository and manifest digest. Releases are referenced by Digest, not Tag,
+// InventoryRegistryArtifact is one manifest stored in the local OCI registry,
+// keyed by repository and manifest digest. Releases are referenced by Digest, not Tag,
 // so an artifact with no tags is still live when a release names its digest.
 // Identical digests in two repositories are two entries, because a registry
 // manifest delete names one repository.
-type RegistryArtifact struct {
+type InventoryRegistryArtifact struct {
 	Repository string   `json:"repository"`
 	Digest     string   `json:"digest"`
 	Tags       []string `json:"tags,omitempty"`
@@ -54,8 +54,8 @@ type CacheVolume struct {
 	SizeBytes   int64  `json:"size_bytes"`
 }
 
-// Container is one eregion-labeled Docker container.
-type Container struct {
+// InventoryContainer is one eregion-labeled Docker container.
+type InventoryContainer struct {
 	ID        string            `json:"id"`
 	Name      string            `json:"name"`
 	Image     string            `json:"image"`
@@ -65,9 +65,9 @@ type Container struct {
 	CreatedAt *time.Time        `json:"created_at,omitempty"`
 }
 
-// Image is one dangling Docker image: a layer set no tag and no container
+// InventoryImage is one dangling Docker image: a layer set no tag and no container
 // names. Its ID is the local immutable identifier a removal effect uses.
-type Image struct {
+type InventoryImage struct {
 	ID        string     `json:"id"`
 	SizeBytes int64      `json:"size_bytes"`
 	CreatedAt *time.Time `json:"created_at,omitempty"`

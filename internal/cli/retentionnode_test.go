@@ -39,13 +39,13 @@ func (t *retentionInventoryTransport) Run(_ context.Context, _ string, stdin io.
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	raw, err := json.Marshal(retention.Inventory{
 		CollectedAt: created,
-		RegistryArtifacts: []retention.RegistryArtifact{{
+		RegistryArtifacts: []retention.InventoryRegistryArtifact{{
 			Repository: "demo/app", Digest: "sha256:1111", Tags: []string{"v1"},
 			ConfigDigest: "sha256:2222", Bytes: 33, CreatedAt: &created,
 		}},
 		CacheVolumes:   []retention.CacheVolume{},
-		Containers:     []retention.Container{},
-		DanglingImages: []retention.Image{},
+		Containers:     []retention.InventoryContainer{},
+		DanglingImages: []retention.InventoryImage{},
 		LocalImages:    []retention.LocalImage{},
 	})
 	if err != nil {

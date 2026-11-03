@@ -149,10 +149,10 @@ func ObserveRetentionInventory(ctx context.Context, paths RetentionInventoryPath
 	paths = paths.resolved()
 	inventory := retention.Inventory{
 		CollectedAt:       time.Now().UTC(),
-		RegistryArtifacts: []retention.RegistryArtifact{},
+		RegistryArtifacts: []retention.InventoryRegistryArtifact{},
 		CacheVolumes:      []retention.CacheVolume{},
-		Containers:        []retention.Container{},
-		DanglingImages:    []retention.Image{},
+		Containers:        []retention.InventoryContainer{},
+		DanglingImages:    []retention.InventoryImage{},
 		LocalImages:       []retention.LocalImage{},
 	}
 	artifacts, warnings, truncated, err := readRegistryArtifacts(paths.RegistryDir)
@@ -211,7 +211,7 @@ type dockerContainerInspect struct {
 	SizeRw int64 `json:"SizeRw"`
 }
 
-func readRetentionContainers(ctx context.Context, run NodeReadRunner) ([]retention.Container, bool, error) {
+func readRetentionContainers(ctx context.Context, run NodeReadRunner) ([]retention.InventoryContainer, bool, error) {
 	raw, err := run(ctx, "docker", "ps", "--all", "--quiet", "--no-trunc", "--filter", "label=io.eregion.app")
 	if err != nil {
 		return nil, false, dockerObservationFault("list labeled containers", err)
@@ -219,7 +219,7 @@ func readRetentionContainers(ctx context.Context, run NodeReadRunner) ([]retenti
 	ids := splitLines(raw)
 	ids, truncated := capRetentionItems(ids)
 	if len(ids) == 0 {
-		return []retention.Container{}, false, nil
+		return []retention.InventoryContainer{}, false, nil
 	}
 	var inspected []dockerContainerInspect
 	for _, chunk := range chunkStrings(ids, 100) {
@@ -234,9 +234,9 @@ func readRetentionContainers(ctx context.Context, run NodeReadRunner) ([]retenti
 		}
 		inspected = append(inspected, page...)
 	}
-	containers := make([]retention.Container, 0, len(inspected))
+	containers := make([]retention.InventoryContainer, 0, len(inspected))
 	for _, item := range inspected {
-		containers = append(containers, retention.Container{
+		containers = append(containers, retention.InventoryContainer{
 			ID: item.ID, Name: strings.TrimPrefix(item.Name, "/"), Image: item.Config.Image,
 			State: item.State.Status, Labels: item.Config.Labels, SizeBytes: item.SizeRw,
 			CreatedAt: parseDockerTime(item.Created),
@@ -254,7 +254,7 @@ type dockerImageInspect struct {
 	Size    int64  `json:"Size"`
 }
 
-func readDanglingImages(ctx context.Context, run NodeReadRunner) ([]retention.Image, bool, error) {
+func readDanglingImages(ctx context.Context, run NodeReadRunner) ([]retention.InventoryImage, bool, error) {
 	raw, err := run(ctx, "docker", "image", "ls", "--quiet", "--no-trunc", "--filter", "dangling=true")
 	if err != nil {
 		return nil, false, dockerObservationFault("list dangling images", err)
@@ -262,7 +262,7 @@ func readDanglingImages(ctx context.Context, run NodeReadRunner) ([]retention.Im
 	ids := splitLines(raw)
 	ids, truncated := capRetentionItems(ids)
 	if len(ids) == 0 {
-		return []retention.Image{}, false, nil
+		return []retention.InventoryImage{}, false, nil
 	}
 	var inspected []dockerImageInspect
 	for _, chunk := range chunkStrings(ids, 100) {
@@ -277,9 +277,9 @@ func readDanglingImages(ctx context.Context, run NodeReadRunner) ([]retention.Im
 		}
 		inspected = append(inspected, page...)
 	}
-	images := make([]retention.Image, 0, len(inspected))
+	images := make([]retention.InventoryImage, 0, len(inspected))
 	for _, item := range inspected {
-		images = append(images, retention.Image{ID: item.ID, SizeBytes: item.Size, CreatedAt: parseDockerTime(item.Created)})
+		images = append(images, retention.InventoryImage{ID: item.ID, SizeBytes: item.Size, CreatedAt: parseDockerTime(item.Created)})
 	}
 	sort.Slice(images, func(i, j int) bool { return images[i].ID < images[j].ID })
 	return images, truncated, nil
@@ -424,16 +424,16 @@ func directorySize(ctx context.Context, root string) int64 {
 // reported, tagged or not. A repository or manifest blob that has already been
 // removed is absent; a revision is live only when Distribution's link file
 // still names its digest.
-func readRegistryArtifacts(registryDir string) ([]retention.RegistryArtifact, []string, bool, error) {
+func readRegistryArtifacts(registryDir string) ([]retention.InventoryRegistryArtifact, []string, bool, error) {
 	registryDir = strings.TrimSpace(registryDir)
 	if registryDir == "" {
-		return []retention.RegistryArtifact{}, nil, false, nil
+		return []retention.InventoryRegistryArtifact{}, nil, false, nil
 	}
 	base := filepath.Join(registryDir, "docker", "registry", "v2")
 	repositoriesRoot := filepath.Join(base, "repositories")
 	if _, err := os.Stat(repositoriesRoot); err != nil {
 		if os.IsNotExist(err) {
-			return []retention.RegistryArtifact{}, nil, false, nil
+			return []retention.InventoryRegistryArtifact{}, nil, false, nil
 		}
 		return nil, nil, false, err
 	}
@@ -441,7 +441,7 @@ func readRegistryArtifacts(registryDir string) ([]retention.RegistryArtifact, []
 	if err != nil {
 		return nil, nil, false, err
 	}
-	artifacts := []retention.RegistryArtifact{}
+	artifacts := []retention.InventoryRegistryArtifact{}
 	var warnings []string
 	truncated := false
 	for _, repository := range repositories {
@@ -468,7 +468,7 @@ func readRegistryArtifacts(registryDir string) ([]retention.RegistryArtifact, []
 			for _, size := range blobs {
 				bytes += size
 			}
-			artifacts = append(artifacts, retention.RegistryArtifact{
+			artifacts = append(artifacts, retention.InventoryRegistryArtifact{
 				Repository: repository, Digest: digest, Tags: tags[digest],
 				ConfigDigest: configDigest, Bytes: bytes, CreatedAt: created,
 			})
