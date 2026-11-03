@@ -215,3 +215,128 @@ func insertRetentionRelease(t *testing.T, pool *pgxpool.Pool, app, environment s
 	}
 	return releaseID
 }
+
+// TestIntegrationPrunedReleasePreviewsRefuse proves the dry-run planner applies
+// the same D30 refusal as submission: an explicit deploy release preview, an
+// explicit rollback preview, and a default rollback preview whose default
+// target is pruned all return precondition_failed. The default rollback
+// submission refuses the same target, so preview and submit agree.
+func TestIntegrationPrunedReleasePreviewsRefuse(t *testing.T) {
+	pool, _ := testPool(t, true)
+	run := testRuntime(t, pool, 0)
+	s := run.Service
+	ctx := context.Background()
+	platformSubmit(t, s, platform.KindNodeRegister, "platform", "preview-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	platformSubmit(t, s, platform.KindAppCreate, "platform", "preview-create", map[string]any{
+		"name": "preview",
+		"environment": map[string]any{
+			"name": "production", "node": "local",
+			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/preview:2026-11-03"},
+			"domain":           "preview.example.com",
+			"domain_addresses": []string{"203.0.113.10"},
+		},
+	})
+	prunedAt := time.Date(2026, 11, 3, 10, 30, 0, 0, time.UTC)
+	releaseID := insertRetentionRelease(t, pool, "preview", "production", &prunedAt)
+
+	assertPruned := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("a pruned release was accepted")
+		}
+		fault := contract.Classify(err)
+		if fault.Code != contract.PreconditionFailed {
+			t.Fatalf("code = %s, want %s: %v", fault.Code, contract.PreconditionFailed, err)
+		}
+		for _, want := range []string{string(releaseID), "2026-11-03T10:30:00Z"} {
+			if !strings.Contains(fault.Message, want) {
+				t.Fatalf("message %q does not name %q", fault.Message, want)
+			}
+		}
+		if !strings.Contains(strings.ToLower(fault.Hint), "deploy a new build") {
+			t.Fatalf("hint %q does not tell the operator to deploy a new build", fault.Hint)
+		}
+	}
+	preview := func(kind string, input any) error {
+		t.Helper()
+		_, err := previewSubmission(t, s, kind, "env/preview/production", input)
+		return err
+	}
+
+	t.Run("deploy release preview", func(t *testing.T) {
+		assertPruned(t, preview(platform.KindDeploy, map[string]any{"release_id": releaseID}))
+	})
+	t.Run("explicit rollback preview", func(t *testing.T) {
+		assertPruned(t, preview(platform.KindRollback, map[string]any{"to_release_id": releaseID}))
+	})
+
+	// A successful deployment of the pruned release makes it the default
+	// rollback target (previousRollbackRelease's one-step history fallback).
+	insertRetentionDeployment(t, pool, "preview", "production", releaseID)
+	t.Run("default rollback preview", func(t *testing.T) {
+		assertPruned(t, preview(platform.KindRollback, map[string]any{}))
+	})
+	t.Run("default rollback submission", func(t *testing.T) {
+		_, err := s.Submit(ctx, platformSubmission(platform.KindRollback, "env/preview/production", "preview-default-rollback", map[string]any{}))
+		assertPruned(t, err)
+	})
+	var operations, deployments int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE idempotency_key='preview-default-rollback'`).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_deployments d
+        JOIN eregion_platform_environments e ON e.id=d.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE a.name='preview' AND e.name='production'`).Scan(&deployments); err != nil {
+		t.Fatal(err)
+	}
+	if operations != 0 || deployments != 1 {
+		t.Fatalf("refused default rollback wrote %d operation(s); deployments = %d, want only the one-step history row", operations, deployments)
+	}
+}
+
+func previewSubmission(t *testing.T, s *Service, kind, target string, input any) (platform.Preview, error) {
+	t.Helper()
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalized, err := platform.Default().Normalize(kind, target, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s.Preview(context.Background(), testActor, normalized, "")
+}
+
+func insertRetentionDeployment(t *testing.T, pool *pgxpool.Pool, app, environment string, releaseID platform.ReleaseID) {
+	t.Helper()
+	ctx := context.Background()
+	var appID, environmentID string
+	if err := pool.QueryRow(ctx, `SELECT e.app_id,e.id FROM eregion_platform_environments e
+        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND e.name=$2`, app, environment).
+		Scan(&appID, &environmentID); err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, err := platform.NewDeploymentID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID, err := contract.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
+        VALUES($1,$2,$3,'system','retention-test',$4,'retention-test','{}'::jsonb,'succeeded')`,
+		operationID, platform.KindDeploy, "env/"+app+"/"+environment, "retention-deployment:"+string(deploymentID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_deployments
+        (id,operation_id,app_id,environment_id,action,release_id,state)
+        VALUES($1,$2,$3,$4,'deploy',$5,'succeeded')`,
+		deploymentID, operationID, appID, environmentID, releaseID); err != nil {
+		t.Fatal(err)
+	}
+}

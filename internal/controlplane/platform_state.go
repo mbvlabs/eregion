@@ -2322,6 +2322,9 @@ func (s *Service) planDeployment(ctx context.Context, target platform.Target, re
 	if release.App != env.App || release.Environment != env.Name {
 		return env, release, contract.NewFault(contract.ValidationFailed, "release belongs to another environment", "Use a release created for this app and environment.")
 	}
+	if err := refusePrunedRelease(release); err != nil {
+		return env, release, err
+	}
 	node, err := s.node(ctx, env.Node)
 	if err != nil {
 		return env, release, err
