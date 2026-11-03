@@ -622,12 +622,16 @@ does not already name it.
 Deploy-time secret resolution prefers the current revision's secret names,
 resolving each name's active latest revision and freezing the exact non-secret
 revision identities on the deployment. A private git read credential is resolved
-by NAME at build execution and passed only to the askpass child environment; the
-value never enters the revision, operation input, events or logs. The
-transitional pinned `secret_refs` path is used only when the revision names no
-secrets. `platform.app.create` and `platform.environment.create` with deploy
-intent queue the first deploy-from-revision operation in the same submission
-transaction.
+by NAME and pinned into that same snapshot on the first deploy attempt; later
+attempts of that deployment (River retry or rescued orphaned job) use the pinned
+revision, and resolve the active revision only when no snapshot pinned the
+credential. A standalone release or build retry has no deployment snapshot and
+resolves the active revision on each attempt. The credential is passed only to
+the askpass child environment; the value never enters the revision, operation
+input, events or logs. The transitional pinned `secret_refs` path is used only
+when the revision names no secrets. `platform.app.create` and
+`platform.environment.create` with deploy intent queue the first
+deploy-from-revision operation in the same submission transaction.
 
 Image releases inspect/pull the image. Buildpacks builds require builder role
 and capability, allowed source roots for directories, and allowlisted HTTPS git

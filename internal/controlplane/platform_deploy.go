@@ -363,19 +363,32 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	secretValues, credentialKey, _, secretRefs, err := w.resolveDeploymentSecrets(ctx, env, dep)
+	secretValues, credentialKey, pinnedCredential, secretRefs, err := w.resolveDeploymentSecrets(ctx, env, dep)
 	if err != nil {
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
 	}
 	needsBuild := release.Status != platform.ReleaseReady || release.ImageID == ""
+	// The git read credential is not an application secret, but it is part of
+	// the same snapshot: the first attempt pins its revision and every later
+	// attempt reuses that pinned revision. A retry whose snapshot already exists
+	// therefore reads the credential from resolveDeploymentSecrets, not only
+	// from the first-attempt branch below.
 	credentialValue := ""
-	if needsBuild && credentialKey != "" && len(dep.SecretRevisions) == 0 {
-		value, ref, resolveErr := w.service.resolveCredentialSecret(ctx, env, credentialKey)
-		if resolveErr != nil {
-			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, resolveErr)
+	if needsBuild && credentialKey != "" {
+		credentialValue = pinnedCredential
+		if credentialValue == "" {
+			// No snapshot pinned this credential (first attempt, or a snapshot
+			// written before the credential was pinned), so resolve the active
+			// revision now.
+			value, ref, resolveErr := w.service.resolveCredentialSecret(ctx, env, credentialKey)
+			if resolveErr != nil {
+				return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, resolveErr)
+			}
+			credentialValue = value
+			if len(dep.SecretRevisions) == 0 {
+				secretRefs[credentialKey] = ref
+			}
 		}
-		credentialValue = value
-		secretRefs[credentialKey] = ref
 	}
 	if len(dep.SecretRevisions) == 0 {
 		if err := w.service.recordDeploymentSecretSnapshot(ctx, id, env.RevisionID, secretRefs); err != nil {

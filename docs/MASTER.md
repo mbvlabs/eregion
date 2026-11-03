@@ -399,11 +399,15 @@ release host blackholed on the node, `apply --auto-upgrade-nodes` refused with
 `unavailable` naming the version manifest and installed nothing; after the fault
 was removed the upgrade completed and applied the new `host-journal-access-v1`
 step, after which admin reads the eregion journal without sudo. The same retest
-found **defect 4** (open): a rescued deployment attempt that already recorded
-its secret snapshot loses the git read credential and fails at the build step
-with `precondition_failed` "git read credential is unavailable", although a
-fresh deploy of the same revision succeeds. Details and IDs are in
-MANUAL-TESTING's 2026-11-03 record.
+found **defect 4** (fixed in source, not host-verified): a rescued deployment
+attempt that already recorded its secret snapshot loses the git read credential
+and fails at the build step with `precondition_failed` "git read credential is
+unavailable", although a fresh deploy of the same revision succeeds. The
+credential's non-secret revision is now pinned into the deployment's secret
+snapshot on the first attempt, and every retry, rescue or River retry resolves it
+from that snapshot; a regression test loses the first attempt after the snapshot
+and requires the second to build with the pinned credential. Details and IDs are
+in MANUAL-TESTING's 2026-11-03 record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
