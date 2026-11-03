@@ -314,14 +314,15 @@ earlier passes are context, not qualification.
 
 Source state 2026-11-03: rows 1–15 and 17 are implemented in the integrated
 source on `master`. Row 17 (retention) has isolated tests and is an alpha.1
-gate; it is not host-qualified. Row 16 (alpha qualification) remains in progress. Rows 11–15 went through
-isolated implementation lanes and independent review, with rework and
-orchestrator acceptance; the final release-command evidence-classification
-correction was made by the orchestrator.
+gate; host qualification is partial and blocked by defect 5 (worker registry
+inventory permissions). Row 16 (alpha qualification) remains in progress. Rows
+11–15 went through isolated implementation lanes and independent review, with
+rework and orchestrator acceptance; the final release-command
+evidence-classification correction was made by the orchestrator.
 Combined format, build, vet, darwin/arm64 build and selected isolated package
 tests pass. The PostgreSQL integration suite passes (without the race detector)
 against a disposable PostgreSQL 17 after the 2026-10-28 fixture fixes. Schema:
-embedded migrations through 017; applied migrations 001–013 are unchanged.
+embedded migrations through 019; applied migrations 001–013 are unchanged.
 **Alpha qualification remains incomplete.** On 2026-10-29 the existing `main`
 node upgraded from edge-8a7179d6d95d through the fixed signed upgrade path;
 CLI/node now run edge-e344781ced4b, schema 16/16, River 7/7, doctor 18 pass,
@@ -364,7 +365,7 @@ then had zero failures in 6,262 requests. Fresh init, human-factor-positive flow
 and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resume testing” section for the saved target,
 fixture state, evidence locations and unqualified acceptance variants, and its
 run records for operation IDs. Row 16 is in progress; row 17 is implemented at
-source level and is an alpha.1 gate, not yet host-qualified.
+source level and is an alpha.1 gate, not yet fully host-qualified (defect 5).
 
 On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
 switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
@@ -411,6 +412,27 @@ River retry resolves it from that snapshot. Regression tests lose the first
 attempt after the snapshot, and rotate the credential between a legacy snapshot
 and its retry, requiring the pinned revision. Details and IDs are in
 MANUAL-TESTING's 2026-11-03 record.
+
+The evening 2026-11-03 run on `main` upgraded `edge-13fdb2518757` ->
+`edge-1e541a7fad3e`, applied migrations 017–019 (schema 19/19, River 7/7) and
+`host-registry-v2` once (registry restarted; Caddy was not), and confirmed the
+access-changing apply within its rollback window. A second apply was 0 of 19 and
+continuous curls saw 633/633 HTTP 200. **Defect 4 is fixed and host-verified:**
+after a SIGKILL during the fresh git build, the worker rescued the operation in
+about 9 seconds and attempt 2 cloned the private repository with the pinned
+credential and served `rel_b7099da06361a0bfaa8ee6866e178152` (op_181c9da0…,
+423/423 HTTP 200, evidence 240–246). Retention policy show/set (new environment
+revision `erv_b8f5163889b07167f955396f2f5da061`), the `host-registry-v2`
+upgrade and the prune dry run passed host-side; the plan kept both apps'
+serving and rollback releases and changed nothing. **New open defect 5:** the
+worker's daily retention run fails `unavailable` "the node's registry storage
+is unreadable" because `host-directories-v1` creates
+`/var/lib/eregion/registry` as `root:root 0700` while the worker runs as
+`eregion`; the operator dry run masks it because its node RPC path runs as root.
+`doctor` is 19 pass / 1 warn (`host.retention`). The real prune, registry GC,
+pruned-rollback refusal, 30-release acceptance and the 20/0/0 doctor check
+therefore remain unqualified; details are in MANUAL-TESTING's 2026-11-03
+(evening) record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
