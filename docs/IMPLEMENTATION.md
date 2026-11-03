@@ -239,6 +239,7 @@ node protocol version and database migration version are independent.
 | `015_domain_check_path.sql` | Optional per-domain `check_path`; empty uses the environment's web health path. |
 | `016_container_cleanup.sql` | Leaked-container retry rows: container name PK, environment/node/deployment, reason, attempts, last error and next attempt. Cascades with the environment. |
 | `017_retention.sql` | D30 retention: the singleton `server_settings` row, the revision `retention` override block, `releases.pruned_at` and `retention_runs` observability. |
+| `018_retention_measurements.sql` | Durable cache measurement (`cache_bytes`, `cache_measured_at`, `cache_measurement_error`) on `retention_runs` and the node-wide `retention_gc_pending` follow-up on `server_settings`. Never rewrites published 017. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -260,7 +261,7 @@ Tables below have the literal `eregion_` prefix:
 | `platform_release_command_runs` | `(release_id, command_digest)` PK; the owning operation, running/succeeded/failed state, error code/message and timestamps. One row per release and command specification; it cascades with its release. |
 | `platform_container_cleanup` | Container name PK; environment/node/deployment, reason, attempts, last error and next attempt. A failed removal is retried with backoff; the row cascades with its environment. |
 | `server_settings` | Singleton row (`singleton` boolean PK); one `retention` jsonb block for the server-level default. An absent row or empty block means the D30 defaults in `internal/retention`. |
-| `retention_runs` | `rtr_…` ID, optional owning operation, pending/running/succeeded/failed/cancelled status, planned/removed item arrays, planned/reclaimed bytes, per-item errors JSON, start/finish timestamps. |
+| `retention_runs` | `rtr_…` ID, optional owning operation, pending/running/succeeded/failed/cancelled status, planned/removed item arrays, planned/reclaimed bytes, per-item errors JSON, start/finish timestamps, and the latest Buildpacks cache measurement (`cache_bytes` NULL means unknown, measured-at, error). |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
 | `webhook_deliveries` | Hashed delivery ID, exact-body hash, actor/kind/target, pending/submitted state and operation ID. |
@@ -300,7 +301,9 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
 
 ## Disk retention schema (D30)
 
-Migration 017 adds the durable state for work list row 17 (an alpha.1 gate).
+Migration 017 adds the durable state for work list row 17 (an alpha.1 gate);
+migration 018 adds the durable Buildpacks cache measurement and the node-wide
+registry GC follow-up without rewriting the published 017.
 `internal/retention`
 owns the D30 numbers (`DefaultPolicy`: newest 10 releases per environment, any
 release newer than 14 days, unreferenced registry artifacts after 14 days,
@@ -316,8 +319,8 @@ changes carry the block forward unchanged. `releases.pruned_at` marks a release
 whose artifact was removed while its row and history stay; `preparePlatform`
 refuses `deploy --release` and `rollback` to such a release with
 `precondition_failed`, naming the release and prune time. `retention_runs`
-stores the operation, status, planned/removed items, planned/reclaimed bytes and
-per-item errors for observability.
+stores the operation, status, planned/removed items, planned/reclaimed bytes,
+per-item errors and the latest complete cache measurement for observability.
 
 `retention.Plan` is the pure planner both the periodic job and `prune
 [--dry-run]` call. It receives `retention.Input` plain values filled from
@@ -326,9 +329,16 @@ keeps each environment's serving release,
 its rollback target (selected with the same rule as
 `previousRollbackRelease`), the newest `keep_releases` and every release newer
 than `keep_newer_than_days`, protects in-flight releases and containers, keeps
-registry artifacts shared with a kept release, and plans release, registry
-artifact, Buildpacks cache, ownerless container and dangling image items with a
-total-bytes helper. Registry matching normalizes registry hosts and ports.
+registry artifacts shared with a kept release, and plans release-row, immutable
+image, registry artifact, Buildpacks cache, ownerless container and dangling
+image items with a total-bytes helper. Release and image removals are separate:
+a release item only marks `pruned_at`, and an image item is emitted only for a
+release `ImageID` that no retained release or existing container still uses.
+Releases with no immutable `ImageID` get an `image_skipped` diagnostic and are
+never removed by tag. A pruned release whose image is still present keeps
+producing an image item on later runs. An incomplete cache measurement produces
+`cache_skipped` instead of a zero-byte healthy cache. Registry matching
+normalizes registry hosts and ports.
 A release tag protects whatever manifest it currently points to, but a tag never
 resolves a retained release: resolution requires an immutable manifest digest
 (`Image@sha256` or `Artifacts`), a matching inventory `ConfigDigest`, or an
@@ -438,9 +448,12 @@ run without repeating completed effects. Before every remaining effect and
 before GC, the worker re-runs the planner under its held locks and intersects
 the persisted items with the fresh eligibility set; a registry artifact,
 container, cache or image that became protected or disappeared is dropped with
-a recorded reason and never silently removed. A permanent node refusal fails
-the operation after recording the run; the next daily run retries it after the
-host is fixed. Operation events carry planned/removal/protection progress. The
+a recorded reason and never silently removed. A registry delete sets the
+node-wide `retention_gc_pending` flag before the manifest is touched; a
+successful GC clears it, and any later run drains it even with no new
+deletions. A permanent node refusal fails the operation after recording the
+run; the next daily run retries it after the host is fixed. Operation events
+carry planned/removal/protection progress. The
 build path records the local image config digest (`image_id`) but has no pushed
 manifest digest in its existing pack/inspect output; planning therefore
 resolves manifests through inventory `ConfigDigest` and local-image
@@ -466,15 +479,27 @@ install stays 0 warn / 0 fail; it warns only when `eregion-worker.service` has
 been continuously active for more than 48 hours without recording a run. The
 48-hour grace is not a policy value and does not hide a failed run.
 
-`host.build_cache` measures the same `eregion-build-cache-*`,
-`eregion-launch-cache-*` and legacy `pack-cache-*` volumes the inventory uses,
-and compares their total with the server policy's absolute
-`buildpack_cache_max_bytes` cap. Above the cap it warns and names
-`prune --dry-run`/`prune --confirm <server>`; the daily planner removes
-least-recently-used entries. The filesystem-percentage limit still makes cache
-entries eligible for the daily planner; general filesystem pressure is already
-surfaced by `host.disk`. Both rows are `AtInit` checks,
-so the main-node report is 20 results: the previous 18 plus retention and cache.
+`host.build_cache` reads the newest durable cache measurement from
+`retention_runs` (`cache_bytes`, `cache_measured_at`,
+`cache_measurement_error`) and compares it with the server policy's absolute
+`buildpack_cache_max_bytes` cap. Doctor never walks Docker volumes or cache
+directories synchronously. A missing measurement or one older than 48 hours is
+reported as unknown (pass), never as a healthy 0; a complete empty cache is a
+real 0. Above the cap it warns and names `prune --dry-run`/`prune --confirm
+<server>`; the daily planner removes least-recently-used entries. The
+filesystem-percentage limit still makes cache entries eligible for the daily
+planner; general filesystem pressure is already surfaced by `host.disk`. If the
+inventory could not size a cache volume, or the volume list was truncated, the
+retention run persists NULL and the planner emits `cache_skipped` rather than
+treating unreadable data as empty. Both rows are `AtInit` checks, so the
+main-node report is 20 results: the previous 18 plus retention and cache.
+
+`retention_gc_pending` in `server_settings` is the durable follow-up for a
+registry manifest delete. The worker sets it before the first delete, clears it
+only after a successful GC, and leaves it set when GC is deferred or fails. Any
+later retention run checks it even when it has no new deletions, runs GC when
+registry protection is resolvable, and clears it. A failed or dropped delete
+that never removed a manifest clears the flag it set for that attempt.
 
 ## Migration and external database policy
 
