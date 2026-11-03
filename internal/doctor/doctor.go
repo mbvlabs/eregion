@@ -119,6 +119,11 @@ type Facts struct {
 
 	Services      map[string]bool
 	ServicesKnown bool
+
+	// Retention is the last durable retention run; BuildCache is the measured
+	// Buildpacks cache against the server policy's absolute cap.
+	Retention  RetentionFacts
+	BuildCache BuildCacheFacts
 }
 
 // FreePct is the free share of a filesystem in percent.
@@ -135,6 +140,8 @@ func Checks() []Check {
 		{ID: "host.intent", Category: CatHost, AtInit: true, Run: hostIntent},
 		{ID: "drift.pending", Category: CatHost, AtInit: true, Run: driftPending},
 		{ID: "host.disk", Category: CatHost, AtInit: true, Run: disk},
+		{ID: "host.retention", Category: CatHost, AtInit: true, Run: retentionLastRun},
+		{ID: "host.build_cache", Category: CatHost, AtInit: true, Run: buildpackCache},
 		{ID: "ssh.root_login", Category: CatSecurity, Security: true, AtInit: true, Run: sshRootLogin},
 		{ID: "ssh.password_auth", Category: CatSecurity, Security: true, AtInit: true, Run: sshPasswordAuth},
 		{ID: "ssh.drop_in", Category: CatSecurity, Security: true, AtInit: true, Run: sshDropIn},

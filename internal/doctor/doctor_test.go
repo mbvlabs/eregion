@@ -3,6 +3,9 @@ package doctor
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/mbvlabs/eregion/internal/retention"
 )
 
 func TestSummaryFailedAndMessage(t *testing.T) {
@@ -88,6 +91,128 @@ func TestVersionSchemaReportsTheControlDatabaseFailure(t *testing.T) {
 	}
 	if !strings.Contains(results[0].Fix, "DNS") {
 		t.Fatalf("fix does not carry the class hint: %s", results[0].Fix)
+	}
+}
+
+func TestMainNodeReportHasTwentyResults(t *testing.T) {
+	// The documented alpha baseline is 20 pass / 0 warn / 0 fail on a healthy
+	// main node: the previous 18 results plus host.retention and
+	// host.build_cache.
+	facts := Facts{
+		Now:           time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		Hostname:      "main.example.com",
+		ServicesKnown: true,
+		Services:      map[string]bool{"eregion-api.service": true, "eregion-worker.service": true, "wg-quick@wg0.service": true, "caddy.service": true, "docker.service": true},
+		Retention:     RetentionFacts{Enabled: true, Known: true},
+		BuildCache:    BuildCacheFacts{Applicable: true, Known: true, CapBytes: 10 << 30},
+	}
+	if results := Run(Checks(), facts); len(results) != 20 {
+		t.Fatalf("main node doctor results = %d, want 20", len(results))
+	}
+}
+
+func TestRetentionLastRunPassesOnAFreshHost(t *testing.T) {
+	results := Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, Facts{
+		Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		Retention: RetentionFacts{
+			Enabled: true, Known: true,
+			WorkerAge: 12 * time.Hour, WorkerAgeKnown: true,
+		},
+	})
+	if len(results) != 1 || results[0].Status != Pass {
+		t.Fatalf("fresh retention row = %+v, want pass", results)
+	}
+	if !strings.Contains(results[0].Detail, "no retention run yet") {
+		t.Fatalf("fresh detail = %q", results[0].Detail)
+	}
+}
+
+func TestRetentionLastRunWarnsWhenTheWorkerNeverProducedARun(t *testing.T) {
+	results := Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, Facts{
+		Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		Retention: RetentionFacts{
+			Enabled: true, Known: true,
+			WorkerAge: 3 * 24 * time.Hour, WorkerAgeKnown: true,
+		},
+	})
+	if len(results) != 1 || results[0].Status != Warn {
+		t.Fatalf("missing-run retention row = %+v, want warn", results)
+	}
+}
+
+func TestRetentionLastRunReportsTheLastRun(t *testing.T) {
+	finished := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	results := Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, Facts{
+		Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		Retention: RetentionFacts{
+			Enabled: true, Known: true, HasRun: true,
+			LastSuccessAt: finished,
+			LastRun: RetentionRunFacts{
+				Status: retention.RunSucceeded, StartedAt: finished.Add(-time.Minute), FinishedAt: &finished,
+				RemovedItems: 3, ReclaimedBytes: 1 << 30, PlannedBytes: 2 << 30,
+			},
+		},
+	})
+	if len(results) != 1 || results[0].Status != Pass {
+		t.Fatalf("successful retention row = %+v, want pass", results)
+	}
+	for _, want := range []string{"3 item(s) removed", "1.0 GiB reclaimed", "2.0 GiB"} {
+		if !strings.Contains(results[0].Detail, want) {
+			t.Fatalf("detail lacks %q: %s", want, results[0].Detail)
+		}
+	}
+}
+
+func TestRetentionLastRunWarnsOnFailureAndStaleSuccess(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	failed := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	results := Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, Facts{
+		Now: now,
+		Retention: RetentionFacts{
+			Enabled: true, Known: true, HasRun: true,
+			LastSuccessAt: now.Add(-4 * 24 * time.Hour),
+			LastRun: RetentionRunFacts{
+				Status: retention.RunFailed, StartedAt: failed.Add(-time.Minute), FinishedAt: &failed,
+				Errors: 1,
+			},
+		},
+	})
+	if len(results) != 1 || results[0].Status != Warn {
+		t.Fatalf("failed retention row = %+v, want warn", results)
+	}
+
+	success := now.Add(-72 * time.Hour)
+	results = Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, Facts{
+		Now: now,
+		Retention: RetentionFacts{
+			Enabled: true, Known: true, HasRun: true,
+			LastSuccessAt: success,
+			LastRun: RetentionRunFacts{
+				Status: retention.RunSucceeded, StartedAt: success.Add(-time.Minute), FinishedAt: &success,
+			},
+		},
+	})
+	if len(results) != 1 || results[0].Status != Warn {
+		t.Fatalf("stale retention row = %+v, want warn", results)
+	}
+}
+
+func TestBuildpackCacheWarnsAboveThePolicyCap(t *testing.T) {
+	results := Run([]Check{{ID: "host.build_cache", Category: CatHost, Run: buildpackCache}}, Facts{
+		BuildCache: BuildCacheFacts{Applicable: true, Known: true, Bytes: 11 << 30, CapBytes: 10 << 30},
+	})
+	if len(results) != 1 || results[0].Status != Warn {
+		t.Fatalf("oversized cache = %+v, want warn", results)
+	}
+	results = Run([]Check{{ID: "host.build_cache", Category: CatHost, Run: buildpackCache}}, Facts{
+		BuildCache: BuildCacheFacts{Applicable: true, Known: true, Bytes: 2 << 30, CapBytes: 10 << 30},
+	})
+	if len(results) != 1 || results[0].Status != Pass {
+		t.Fatalf("cache under cap = %+v, want pass", results)
+	}
+	results = Run([]Check{{ID: "host.build_cache", Category: CatHost, Run: buildpackCache}}, Facts{})
+	if len(results) != 1 || results[0].Status != Pass {
+		t.Fatalf("role without builds = %+v, want pass", results)
 	}
 }
 

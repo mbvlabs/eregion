@@ -89,6 +89,7 @@ func GatherFacts(ctx context.Context, cfg Config, cfgErr error, drift Plan, drif
 	facts.SchemaCurrent, facts.SchemaRequired, facts.RiverCurrent, facts.RiverRequired, facts.SchemaKnown, facts.SchemaError, facts.SchemaFix = schemaVersions(ctx, cfg.DatabaseURL, redact)
 	facts.Services = serviceStates(ctx, ServiceUnits(cfg.Role, cfg.Hostname))
 	facts.ServicesKnown = len(facts.Services) > 0
+	facts.Retention, facts.BuildCache = doctor.GatherRetentionFacts(ctx, facts.Role, cfg.DatabaseURL)
 
 	if cfgErr != nil {
 		facts.ConfigError = redact(safeError(cfgErr))
