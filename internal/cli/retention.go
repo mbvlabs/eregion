@@ -246,7 +246,11 @@ func (a *app) retentionSet(cmd *cobra.Command, _ []string) (result, error) {
 	guided := !changedKeepReleases && !changedKeepDays && !changedArtifactGrace && !changedCacheBytes && !changedCachePercent && !clearOverride
 	if guided {
 		config := followConfig(cmd)
-		if config == nil || !isTerminal(config.in) || !isTerminal(config.out) {
+		mode, stdinTTY, stdoutTTY := "", false, false
+		if config != nil {
+			mode, stdinTTY, stdoutTTY = config.mode, isTerminal(config.in), isTerminal(config.out)
+		}
+		if !retentionSetGuided(mode, boolFlag(cmd, "json"), stdinTTY, stdoutTTY) {
 			return result{}, contract.NewFault(contract.InputRequired, "retention values are required without a terminal", "Pass --keep-releases, --keep-days and --artifact-grace-days; --cache-cap-bytes/--cache-cap-percent are server-only.")
 		}
 	}
@@ -353,6 +357,16 @@ func (a *app) retentionSetEnvironment(cmd *cobra.Command, client Backend, appNam
 	plain := fmt.Sprintf("Retention override for %s/%s committed as a new environment revision.\noperation: %s\nnext: eregion retention show --app %s --env %s --json\n",
 		appName, environment, operation.ID, appName, environment)
 	return result{data: data, plain: plain}, nil
+}
+
+// retentionSetGuided permits the interactive value interview only on an
+// attached plain terminal. Machine modes never prompt even when stdin/stdout
+// happen to be terminals.
+func retentionSetGuided(mode string, jsonFlag, stdinTTY, stdoutTTY bool) bool {
+	if jsonFlag || mode != "plain" {
+		return false
+	}
+	return stdinTTY && stdoutTTY
 }
 
 func guidedRetentionValues(policy retention.Policy) ([3]int, error) {

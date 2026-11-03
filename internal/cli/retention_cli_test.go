@@ -257,6 +257,24 @@ func TestRetentionSetEnvironmentCommitsARevision(t *testing.T) {
 	}
 }
 
+func TestRetentionSetNeverGuidesInMachineOutput(t *testing.T) {
+	if retentionSetGuided("json", false, true, true) {
+		t.Fatal("--json at a terminal entered the guided interview")
+	}
+	if retentionSetGuided("ndjson", false, true, true) {
+		t.Fatal("--output ndjson at a terminal entered the guided interview")
+	}
+	if retentionSetGuided("plain", true, true, true) {
+		t.Fatal("--json at a terminal entered the guided interview even with plain mode")
+	}
+	if !retentionSetGuided("plain", false, true, true) {
+		t.Fatal("a plain terminal could not enter the guided interview")
+	}
+	if retentionSetGuided("plain", false, false, true) {
+		t.Fatal("a piped stdin entered the guided interview")
+	}
+}
+
 func TestRetentionShowReturnsFieldSources(t *testing.T) {
 	keep := 2
 	backend := &retentionCLIBackend{
