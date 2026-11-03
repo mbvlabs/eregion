@@ -311,10 +311,11 @@ is the single `server_settings.retention` block, read and written by
 absent/empty block means the D30 defaults. `Service.EffectiveRetentionPolicy`
 returns the server default with the current revision's non-nil override fields
 replacing it, and unrelated revision changes carry the block forward unchanged.
-`releases.pruned_at` records when retention removed a release's artifact while
-its row and history stay. `retention_runs` stores the operation, status,
-planned/removed items, planned/reclaimed bytes and per-item errors for
-observability. The planner, node
+`releases.pruned_at` marks a release whose artifact was removed while its row
+and history stay; `preparePlatform` refuses `deploy --release` and `rollback` to
+such a release with `precondition_failed`, naming the release and prune time.
+`retention_runs` stores the operation, status, planned/removed items,
+planned/reclaimed bytes and per-item errors for observability. The planner, node
 effects, registry deletes/GC and `retention show|set` / `prune` commands are not
 part of this schema work.
 

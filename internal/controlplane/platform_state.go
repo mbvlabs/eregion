@@ -529,6 +529,9 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if release.App != env.App || release.Environment != env.Name {
 			return contract.NewFault(contract.ValidationFailed, "release belongs to another environment", "Use a release created for this app and environment.")
 		}
+		if err := refusePrunedRelease(release); err != nil {
+			return err
+		}
 		if release.Status != platform.ReleaseReady && input.ReleaseID != "" {
 			return contract.NewFault(contract.PreconditionFailed, "release is not ready", "Wait for the release operation to succeed, then deploy it.")
 		}
@@ -559,6 +562,9 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		}
 		if release.App != env.App || release.Environment != env.Name {
 			return contract.NewFault(contract.ValidationFailed, "release belongs to another environment", "Use a release created for this app and environment.")
+		}
+		if err := refusePrunedRelease(release); err != nil {
+			return err
 		}
 		if release.Status != platform.ReleaseReady {
 			return contract.NewFault(contract.PreconditionFailed, "release is not ready", "Roll back to a ready release.")

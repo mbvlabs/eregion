@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
 )
 
@@ -79,4 +82,16 @@ func (s *Service) EffectiveRetentionPolicy(ctx context.Context, app, environment
 		}
 	}
 	return retention.Merge(server, override)
+}
+
+// refusePrunedRelease refuses a deploy or rollback to a release whose artifact
+// disk retention removed. The release row stays for history (D30).
+func refusePrunedRelease(release platform.Release) error {
+	if release.PrunedAt == nil {
+		return nil
+	}
+	return contract.NewFault(contract.PreconditionFailed,
+		fmt.Sprintf("release %s for %s/%s was pruned at %s", release.ID, release.App, release.Environment,
+			release.PrunedAt.UTC().Format(time.RFC3339)),
+		"Deploy a new build instead; the pruned release's artifact is gone.")
 }

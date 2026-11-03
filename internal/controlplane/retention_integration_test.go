@@ -3,8 +3,11 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -113,4 +116,102 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT reclaimed_bytes FROM eregion_retention_runs WHERE id=$1`, runID).Scan(&reclaimed); err != nil || reclaimed != 1024 {
 		t.Fatalf("retention run reclaimed = %d err=%v", reclaimed, err)
 	}
+}
+
+// TestIntegrationPrunedReleaseRefusesDeployAndRollback proves D30: a release
+// row stays, but deploying it explicitly or rolling back to it refuses with
+// precondition_failed before any deployment is recorded.
+func TestIntegrationPrunedReleaseRefusesDeployAndRollback(t *testing.T) {
+	pool, _ := testPool(t, true)
+	run := testRuntime(t, pool, 0)
+	s := run.Service
+	ctx := context.Background()
+	platformSubmit(t, s, platform.KindNodeRegister, "platform", "pruned-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	platformSubmit(t, s, platform.KindAppCreate, "platform", "pruned-create", map[string]any{
+		"name": "pruned",
+		"environment": map[string]any{
+			"name": "production", "node": "local",
+			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/pruned:2026-11-03"},
+			"domain":           "pruned.example.com",
+			"domain_addresses": []string{"203.0.113.10"},
+		},
+	})
+	prunedAt := time.Date(2026, 11, 3, 10, 30, 0, 0, time.UTC)
+	releaseID := insertRetentionRelease(t, pool, "pruned", "production", &prunedAt)
+
+	for _, test := range []struct {
+		name  string
+		kind  string
+		key   string
+		input map[string]any
+	}{
+		{name: "deploy explicit release", kind: platform.KindDeploy, key: "pruned-deploy", input: map[string]any{"release_id": releaseID}},
+		{name: "rollback", kind: platform.KindRollback, key: "pruned-rollback", input: map[string]any{"to_release_id": releaseID}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := s.Submit(ctx, platformSubmission(test.kind, "env/pruned/production", test.key, test.input))
+			if err == nil {
+				t.Fatal("submission to a pruned release was accepted")
+			}
+			fault := contract.Classify(err)
+			if fault.Code != contract.PreconditionFailed {
+				t.Fatalf("code = %s, want %s: %v", fault.Code, contract.PreconditionFailed, err)
+			}
+			for _, want := range []string{string(releaseID), "2026-11-03T10:30:00Z"} {
+				if !strings.Contains(fault.Message, want) {
+					t.Fatalf("message %q does not name %q", fault.Message, want)
+				}
+			}
+			if !strings.Contains(strings.ToLower(fault.Hint), "deploy a new build") {
+				t.Fatalf("hint %q does not tell the operator to deploy a new build", fault.Hint)
+			}
+			var operations, deployments int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE idempotency_key=$1`, test.key).Scan(&operations); err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_deployments d
+                JOIN eregion_platform_environments e ON e.id=d.environment_id
+                JOIN eregion_platform_apps a ON a.id=e.app_id
+                WHERE a.name='pruned' AND e.name='production'`).Scan(&deployments); err != nil {
+				t.Fatal(err)
+			}
+			if operations != 0 || deployments != 0 {
+				t.Fatalf("refused submission wrote %d operation(s) and %d deployment(s)", operations, deployments)
+			}
+		})
+	}
+}
+
+func insertRetentionRelease(t *testing.T, pool *pgxpool.Pool, app, environment string, prunedAt *time.Time) platform.ReleaseID {
+	t.Helper()
+	ctx := context.Background()
+	var appID, environmentID string
+	if err := pool.QueryRow(ctx, `SELECT e.app_id,e.id FROM eregion_platform_environments e
+        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND e.name=$2`, app, environment).
+		Scan(&appID, &environmentID); err != nil {
+		t.Fatal(err)
+	}
+	releaseID, err := platform.NewReleaseID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID, err := contract.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
+        VALUES($1,$2,$3,'system','retention-test',$4,'retention-test','{}'::jsonb,'succeeded')`,
+		operationID, platform.KindReleaseCreate, "env/"+app+"/"+environment, "retention-release:"+string(releaseID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases
+        (id,operation_id,app_id,environment_id,image,source,status,pruned_at)
+        VALUES($1,$2,$3,$4,'ghcr.io/acme/pruned:2026-11-03','{"type":"image"}'::jsonb,'ready',$5)`,
+		releaseID, operationID, appID, environmentID, prunedAt); err != nil {
+		t.Fatal(err)
+	}
+	return releaseID
 }
