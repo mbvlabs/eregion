@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -48,16 +49,21 @@ func TestCleanupOperationIDIsStablePerLeak(t *testing.T) {
 	}
 }
 
-// A failed removal must name its containers in the cleanup event; joined step
-// errors alone classify as an internal error.
-func TestContainerCleanupErrorNamesFailedContainers(t *testing.T) {
+// A failed removal must name its containers and the node's reason in the
+// cleanup event; joined step errors alone classify as an internal error.
+func TestContainerCleanupErrorNamesFailedContainersAndCause(t *testing.T) {
 	step := errors.New("exit status 1: simulated removal failure")
-	err := containerCleanupError([]string{"demo-production-web-1-aaaa", "demo-production-web-2-aaaa"}, []error{step, step})
+	err := containerCleanupError([]string{"demo-production-web-1-aaaa", "demo-production-web-2-aaaa"},
+		[]string{"exit status 1: Error response from daemon: removal of container demo-production-web-1-aaaa is already in progress"},
+		[]error{step, step})
 	fault := contract.Classify(err)
 	if fault.Code != contract.Unavailable {
 		t.Fatalf("code = %s, want %s", fault.Code, contract.Unavailable)
 	}
-	for _, want := range []string{"2 container(s) could not be removed", "demo-production-web-1-aaaa", "demo-production-web-2-aaaa"} {
+	for _, want := range []string{
+		"2 container(s) could not be removed", "demo-production-web-1-aaaa", "demo-production-web-2-aaaa",
+		"Error response from daemon: removal of container demo-production-web-1-aaaa is already in progress",
+	} {
 		if !strings.Contains(fault.Message, want) {
 			t.Fatalf("message %q does not contain %q", fault.Message, want)
 		}
@@ -65,7 +71,52 @@ func TestContainerCleanupErrorNamesFailedContainers(t *testing.T) {
 	if !errors.Is(err, step) {
 		t.Fatal("the step error is no longer wrapped")
 	}
-	if containerCleanupError(nil, nil) != nil {
+	if containerCleanupError(nil, nil, nil) != nil {
 		t.Fatal("no failure must return nil")
+	}
+}
+
+// The warning keeps the node's own step reason, not the generic internal text.
+func TestCleanupStepCauseNamesTheStepReason(t *testing.T) {
+	step := "platform-cleanup-demo-production-web-1-aaaa-v1"
+	retryable := fmt.Errorf("node step %s failed: %s", step, "exit status 1: Error response from daemon: permission denied")
+	if got := cleanupStepCause(retryable, step); got != "exit status 1: Error response from daemon: permission denied" {
+		t.Fatalf("retryable cause = %q", got)
+	}
+	permanent := errors.Join(errNodeStepPermanentFailure,
+		contract.NewFault(contract.PreconditionFailed, "node step failed: exit status 1: container is marked for removal", "inspect the node"))
+	if got := cleanupStepCause(permanent, step); got != "exit status 1: container is marked for removal" {
+		t.Fatalf("permanent cause = %q", got)
+	}
+}
+
+// A Docker answer is untrusted terminal text: it must not carry controls or
+// newlines into an event, and it must stay one bounded line.
+func TestBoundedCleanupCauseSanitizesAndTruncates(t *testing.T) {
+	long := strings.Repeat("x", cleanupCauseLimit+40)
+	got := boundedCleanupCause("\x1b[31mError\x1b[0m\r\nresponse\tfrom daemon: " + long)
+	if strings.ContainsAny(got, "\x1b\r\n") {
+		t.Fatalf("cause kept control characters: %q", got)
+	}
+	if !strings.Contains(got, "Error") || !strings.Contains(got, "response from daemon:") {
+		t.Fatalf("cause lost the docker reason: %q", got)
+	}
+	if runes := []rune(got); len(runes) != cleanupCauseLimit+1 || runes[len(runes)-1] != '…' {
+		t.Fatalf("bounded cause has %d runes, want %d plus an ellipsis", len(runes), cleanupCauseLimit)
+	}
+	if got := boundedCleanupCause("   "); got != "" {
+		t.Fatalf("blank cause = %q", got)
+	}
+}
+
+// The maintenance retry records the node's removal reason, not just the
+// generic failure text, and bounds it the same way.
+func TestContainerCleanupFailureIncludesTheNodeReason(t *testing.T) {
+	fault := contract.Classify(containerCleanupFailure(contract.Internal, "exit status 1: Error response from daemon: device or resource busy"))
+	if !strings.Contains(fault.Message, "Error response from daemon: device or resource busy") {
+		t.Fatalf("maintenance detail = %q", fault.Message)
+	}
+	if unknown := contract.Classify(containerCleanupFailure(contract.Code("nonsense"), "")); unknown.Code != contract.Internal {
+		t.Fatalf("unknown code = %s", unknown.Code)
 	}
 }

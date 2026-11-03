@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
+	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -44,12 +46,43 @@ func containerCleanupBackoff(attempts int) time.Duration {
 	return backoff
 }
 
+// cleanupCauseLimit bounds the removal reason one cleanup warning carries. A
+// Docker answer is useful for diagnosis, not a transcript.
+const cleanupCauseLimit = 240
+
+// cleanupErrorText is the most specific reason a cleanup failure carries. A
+// classified fault keeps its public message; an unclassified step error is the
+// node's own text (Docker's stderr or the transport's reason).
+func cleanupErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	if fault := contract.Classify(err); fault.Code != contract.Internal {
+		return fault.Message
+	}
+	return err.Error()
+}
+
+// boundedCleanupCause flattens untrusted failure text to one visible line,
+// cutting anything longer than cleanupCauseLimit runes and marking the cut with
+// an ellipsis. Docker's answer is not trusted terminal input, so controls are
+// escaped and line breaks collapse to spaces. Callers redact it with the worker
+// registry first.
+func boundedCleanupCause(text string) string {
+	text = strings.Join(strings.Fields(output.SafeText(text)), " ")
+	runes := []rune(text)
+	if len(runes) > cleanupCauseLimit {
+		return string(runes[:cleanupCauseLimit]) + "…"
+	}
+	return text
+}
+
 // recordContainerCleanup upserts one leaked container and schedules its next
 // attempt. Success is recorded by deleting the row.
 func (s *Service) recordContainerCleanup(ctx context.Context, containerName string, environmentID platform.EnvironmentID, nodeName string, deploymentID platform.DeploymentID, reason string, cause error) error {
 	detail := ""
 	if cause != nil {
-		detail = boundedRouteError(contract.Classify(cause).Message)
+		detail = boundedCleanupCause(s.redact(cleanupErrorText(cause)))
 	}
 	var attempts int
 	if err := s.pool.QueryRow(ctx, `INSERT INTO eregion_platform_container_cleanup
@@ -145,14 +178,24 @@ func (s *Service) retryContainerCleanup(ctx context.Context, row containerCleanu
 	case engine.StatusCompleted:
 		return nil
 	case engine.StatusFailed:
-		code := contract.Code(response.ErrorCode)
-		if code == "" {
-			code = contract.Internal
-		}
-		return contract.NewFault(code, "container cleanup failed", response.Detail)
+		return containerCleanupFailure(contract.Code(response.ErrorCode), s.redact(response.Detail))
 	default:
 		return contract.NewFault(contract.Unavailable, "container cleanup did not finish", "The maintenance job will retry with backoff.")
 	}
+}
+
+// containerCleanupFailure is the maintenance worker's recorded retry failure.
+// The message carries the node's own removal reason; the durable row stores
+// the fault message, so a hint alone would lose it.
+func containerCleanupFailure(code contract.Code, detail string) error {
+	if !contract.KnownCode(code) {
+		code = contract.Internal
+	}
+	message := "container cleanup failed"
+	if cause := boundedCleanupCause(detail); cause != "" {
+		message += ": " + cause
+	}
+	return contract.NewFault(code, message, "The maintenance job retries with backoff; inspect the node's Docker state.")
 }
 
 // cleanupOperationID gives one cleanup row a stable node effect identity. The

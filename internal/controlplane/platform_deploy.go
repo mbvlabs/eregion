@@ -969,6 +969,7 @@ func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transp
 	worker := &platformWorker{service: s}
 	var failures []error
 	var failed []string
+	var causes []string
 	for _, instance := range instances {
 		if instance.Name == "" {
 			continue
@@ -981,24 +982,41 @@ func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transp
 		if err == nil {
 			continue
 		}
+		if cause := cleanupStepCause(err, step); cause != "" {
+			causes = append(causes, cause)
+		}
 		if recordErr := s.recordContainerCleanup(ctx, instance.Name, env.ID, nodeName, deploymentID, reason, err); recordErr != nil {
 			failures = append(failures, recordErr)
 		}
 		failures = append(failures, err)
 		failed = append(failed, instance.Name)
 	}
-	return containerCleanupError(failed, failures)
+	return containerCleanupError(failed, causes, failures)
 }
 
-// containerCleanupError puts a fault naming the containers ahead of the joined
-// step errors, so classification reports which removals failed instead of an
-// internal error.
-func containerCleanupError(failed []string, failures []error) error {
+// cleanupStepCause is the node's own reason for one failed removal. The step
+// error wraps Docker's answer as "node step <id> failed: ..." or as a fault
+// with the same detail; both reduce to the detail itself.
+func cleanupStepCause(err error, step string) string {
+	message := cleanupErrorText(err)
+	for _, prefix := range []string{"node step " + step + " failed: ", "node step failed: "} {
+		message = strings.TrimPrefix(message, prefix)
+	}
+	return boundedCleanupCause(message)
+}
+
+// containerCleanupError puts a fault naming the containers and the first
+// removal reason ahead of the joined step errors, so classification reports
+// what failed and why instead of an internal error.
+func containerCleanupError(failed, causes []string, failures []error) error {
 	if len(failed) == 0 {
 		return errors.Join(failures...)
 	}
-	summary := contract.NewFault(contract.Unavailable,
-		fmt.Sprintf("%d container(s) could not be removed: %s", len(failed), strings.Join(failed, ", ")),
+	message := fmt.Sprintf("%d container(s) could not be removed: %s", len(failed), strings.Join(failed, ", "))
+	if len(causes) > 0 {
+		message += " (" + causes[0] + ")"
+	}
+	summary := contract.NewFault(contract.Unavailable, message,
 		"Maintenance retries the removal; env status lists pending cleanup.")
 	return errors.Join(append([]error{summary}, failures...)...)
 }

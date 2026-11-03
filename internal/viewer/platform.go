@@ -87,6 +87,10 @@ type CleanupObservation struct {
 	At       time.Time
 	Sequence uint64
 	Duration time.Duration
+	// Detail is the worker's cleanup warning: it names the containers that
+	// could not be removed and the node's removal reason. A failed cleanup
+	// without a detail is honest: the event stream did not say why.
+	Detail string
 }
 
 // healthPassedPattern is a compatibility fallback for streams that predate
@@ -300,6 +304,11 @@ func (m *Model) observeCleanup(event contract.Event, role TargetRole) {
 	}
 	if event.Kind == "warning" {
 		m.Cleanup.Status = StageFailed
+		// Keep the last warning: per-step warnings come first and the worker's
+		// summary warning names the containers and the removal reason.
+		if message := strings.TrimSpace(event.Message); message != "" {
+			m.Cleanup.Detail = message
+		}
 	}
 }
 
@@ -374,6 +383,9 @@ func (m *Model) CleanupLine() string {
 	line := "container cleanup: " + string(m.Cleanup.Status)
 	if m.Cleanup.Status == StageCompleted && m.Cleanup.Duration > 0 {
 		line += " in " + FormatDuration(m.Cleanup.Duration)
+	}
+	if m.Cleanup.Status == StageFailed && m.Cleanup.Detail != "" {
+		line += " · " + m.Cleanup.Detail
 	}
 	return line
 }

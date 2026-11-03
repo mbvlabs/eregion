@@ -616,6 +616,9 @@ new domain's site and its first certificate only appear at the switch) ->
 remove the previous deployment's containers. A container
 removal that fails is recorded in `platform_container_cleanup` and retried;
 the verified switch stays successful and the failure is never silently dropped.
+The cleanup warning names the containers and the node's own removal reason
+(one redacted, bounded line), so a failed removal does not report only a
+generic internal error.
 The gate
 refuses before any build or container work. The release command is release
 scoped: it runs once per release and command digest, before candidate

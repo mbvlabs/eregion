@@ -1242,9 +1242,10 @@ func (s *Service) appendWorkerEvent(ctx context.Context, id contract.OperationID
 
 // appendCleanupWarning records that container cleanup did not complete. It is
 // a warning, so a viewer cannot report the cleanup as completed because a
-// later removal step succeeded.
+// later removal step succeeded. The message can carry the node's removal
+// reason, so the worker's own secrets are redacted before it is stored.
 func (s *Service) appendCleanupWarning(ctx context.Context, id contract.OperationID, attempt uint32, message string) {
-	s.appendWorkerEventWith(ctx, id, attempt, contract.Event{Kind: "warning", Stage: "cleanup", Message: message})
+	s.appendWorkerEventWith(ctx, id, attempt, contract.Event{Kind: "warning", Stage: "cleanup", Message: s.redact(message)})
 }
 
 // appendWorkerEventWith records one structured observation. It is best effort:

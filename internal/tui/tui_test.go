@@ -99,6 +99,32 @@ func TestPlatformTargetsHealthAndServingRender(t *testing.T) {
 	}
 }
 
+// A failed cleanup shows the removal reason, not only the failed state.
+func TestPlatformCleanupFailureShowsTheRemovalReason(t *testing.T) {
+	start := testNow.Add(-10 * time.Second)
+	view := viewer.New(testID, viewer.Options{})
+	view.Snapshot(contract.Operation{
+		ID: testID, Kind: "platform.deploy", Target: "env/payments/production",
+		Actor: contract.Actor{Kind: "ci", Subject: "release"}, State: contract.Running,
+		Attempt: 1, LastSequence: 3, CreatedAt: start, UpdatedAt: testNow,
+	}, testNow)
+	events := []contract.Event{
+		{OperationID: testID, Sequence: 1, At: start, Kind: "step", Attempt: 1, Stage: "platform-cleanup-01-v1", Message: "Node step started."},
+		{OperationID: testID, Sequence: 2, At: start.Add(time.Second), Kind: "warning", Attempt: 1, Stage: "cleanup",
+			Message: "Previous release cleanup is pending: 1 container(s) could not be removed: web-1 (exit status 1: Error response from daemon: permission denied)"},
+		{OperationID: testID, Sequence: 3, At: start.Add(2 * time.Second), Kind: "state", Attempt: 1, State: contract.Succeeded, Message: "deployed"},
+	}
+	if err := view.Page(events, testNow); err != nil {
+		t.Fatal(err)
+	}
+	rendered := newModel(*view, testOptions(160, 40)).render()
+	for _, want := range []string{"container cleanup: failed", "web-1", "permission denied"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered view is missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
 func TestLayoutsAreResponsive(t *testing.T) {
 	model := newModel(*fixtureModel(t, nil), testOptions(120, 30))
 	wide := model.render()

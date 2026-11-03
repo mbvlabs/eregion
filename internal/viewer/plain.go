@@ -163,6 +163,9 @@ func (p *Plain) Finish(summary Summary, err error, resume string, now time.Time)
 	}
 	if summary.Cleanup.Observed {
 		line += " · container cleanup " + string(summary.Cleanup.Status)
+		if summary.Cleanup.Status == StageFailed && summary.Cleanup.Detail != "" {
+			line += " · " + summary.Cleanup.Detail
+		}
 	}
 	return p.line(p.clean()(line))
 }

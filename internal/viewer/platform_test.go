@@ -1,6 +1,7 @@
 package viewer
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -162,18 +163,27 @@ func TestCleanupFailureIsNotOverwrittenByLaterRemovals(t *testing.T) {
 		event.DurationMS = &duration
 		return event
 	}
-	for name, events := range map[string][]contract.Event{
+	for name, test := range map[string]struct {
+		events []contract.Event
+		cause  string
+	}{
 		"step warning then later removals": {
-			platformEvent(1, start, "step", "platform-cleanup-aaaa-v1", "Node step started."),
-			platformEvent(2, start.Add(time.Second), "warning", "platform-cleanup-aaaa-v1", "Node step failed: simulated removal failure"),
-			platformEvent(3, start.Add(2*time.Second), "step", "platform-cleanup-bbbb-v1", "Node step started."),
-			completed(4, "platform-cleanup-bbbb-v1"),
-			platformEvent(5, start.Add(5*time.Second), "warning", "cleanup", "Candidate cleanup is recorded for retry: 1 container(s) could not be removed: web-1"),
+			events: []contract.Event{
+				platformEvent(1, start, "step", "platform-cleanup-aaaa-v1", "Node step started."),
+				platformEvent(2, start.Add(time.Second), "warning", "platform-cleanup-aaaa-v1", "Node step failed: simulated removal failure"),
+				platformEvent(3, start.Add(2*time.Second), "step", "platform-cleanup-bbbb-v1", "Node step started."),
+				completed(4, "platform-cleanup-bbbb-v1"),
+				platformEvent(5, start.Add(5*time.Second), "warning", "cleanup", "Candidate cleanup is recorded for retry: 1 container(s) could not be removed: web-1 (exit status 1: Error response from daemon: permission denied)"),
+			},
+			cause: "Error response from daemon: permission denied",
 		},
 		"worker warning after completed removals": {
-			platformEvent(1, start, "step", "platform-cleanup-aaaa-v1", "Node step started."),
-			completed(2, "platform-cleanup-aaaa-v1"),
-			platformEvent(3, start.Add(3*time.Second), "warning", "cleanup", "Previous release cleanup is pending: 1 container(s) could not be removed: web-1"),
+			events: []contract.Event{
+				platformEvent(1, start, "step", "platform-cleanup-aaaa-v1", "Node step started."),
+				completed(2, "platform-cleanup-aaaa-v1"),
+				platformEvent(3, start.Add(3*time.Second), "warning", "cleanup", "Previous release cleanup is pending: 1 container(s) could not be removed: web-1 (exit status 1: Error response from daemon: device or resource busy)"),
+			},
+			cause: "Error response from daemon: device or resource busy",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -181,18 +191,54 @@ func TestCleanupFailureIsNotOverwrittenByLaterRemovals(t *testing.T) {
 			model.Snapshot(contract.Operation{
 				ID: id, Kind: "platform.deploy", Target: "env/api/production",
 				Actor: contract.Actor{Kind: "operator", Subject: "admin"}, State: contract.Running,
-				Attempt: 1, LastSequence: uint64(len(events)), CreatedAt: start, UpdatedAt: start,
+				Attempt: 1, LastSequence: uint64(len(test.events)), CreatedAt: start, UpdatedAt: start,
 			}, start)
-			if err := model.Page(events, start.Add(10*time.Second)); err != nil {
+			if err := model.Page(test.events, start.Add(10*time.Second)); err != nil {
 				t.Fatal(err)
 			}
 			if model.Cleanup.Status != StageFailed {
 				t.Fatalf("cleanup status = %q, want failed", model.Cleanup.Status)
 			}
-			if line := model.CleanupLine(); line != "container cleanup: failed" {
+			if !strings.Contains(model.Cleanup.Detail, test.cause) {
+				t.Fatalf("cleanup detail = %q, want %q", model.Cleanup.Detail, test.cause)
+			}
+			line := model.CleanupLine()
+			if !strings.HasPrefix(line, "container cleanup: failed") || !strings.Contains(line, test.cause) {
 				t.Fatalf("cleanup line = %q", line)
 			}
 		})
+	}
+}
+
+// Plain output carries the cleanup reason in the warning event and in the
+// stable summary, so a redirected log explains a failed removal.
+func TestPlainCleanupOutputCarriesTheRemovalReason(t *testing.T) {
+	const cause = "exit status 1: Error response from daemon: device or resource busy"
+	id := contract.OperationID("op_" + strings.Repeat("c", 32))
+	start := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	event := platformEvent(1, start, "warning", "cleanup",
+		"Previous release cleanup is pending: 1 container(s) could not be removed: web-1 ("+cause+")")
+	event.OperationID = id
+	out := &bytes.Buffer{}
+	plain := NewPlain(out, out, nil)
+	if err := plain.Observe(Observation{Kind: ObservationEvents, At: start, Events: []contract.Event{event}}); err != nil {
+		t.Fatal(err)
+	}
+	model := New(id, Options{})
+	model.Snapshot(contract.Operation{
+		ID: id, Kind: "platform.deploy", Target: "env/api/production",
+		Actor: contract.Actor{Kind: "ci", Subject: "release"}, State: contract.Succeeded,
+		Attempt: 1, LastSequence: 1, CreatedAt: start, UpdatedAt: start,
+	}, start)
+	if err := model.Page([]contract.Event{event}, start.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := plain.Finish(modelSummary(model), nil, "", start.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Once in the warning event line, once in the summary.
+	if got := strings.Count(out.String(), cause); got != 2 {
+		t.Fatalf("cleanup reason appeared %d time(s) in plain output:\n%s", got, out.String())
 	}
 }
 
