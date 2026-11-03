@@ -1,11 +1,13 @@
 package platform
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -390,7 +392,8 @@ func TestRetentionRemoveRegistryDeleteHandlesGoneAndDisabledDeletes(t *testing.T
 	}
 }
 
-func TestRetentionGCStopsRestartsAndRecoversAnInterruptedAttempt(t *testing.T) {
+func gcStepForTest(t *testing.T) *RetentionGCStep {
+	t.Helper()
 	payload := RetentionGCPayload{
 		Step: "platform-retention-gc-01-v1", RegistryDir: "/srv/registry",
 		ConfigPath: "/etc/eregion/registry/config.yml", Unit: "eregion-registry.service",
@@ -400,14 +403,27 @@ func TestRetentionGCStopsRestartsAndRecoversAnInterruptedAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	step := built.(*RetentionGCStep)
+	return built.(*RetentionGCStep)
+}
+
+func TestRetentionGCScriptStopsRestartsAndFailsClosed(t *testing.T) {
+	step := gcStepForTest(t)
 	script := step.script()
-	if !strings.Contains(script, "systemctl stop 'eregion-registry.service'") ||
-		!strings.Contains(script, "systemctl start 'eregion-registry.service'") {
-		t.Fatalf("the registry is not stopped and restarted:\n%s", script)
-	}
-	if !strings.Contains(script, "garbage-collect /etc/docker/registry/config.yml") {
-		t.Fatalf("the collection command is missing:\n%s", script)
+	for _, want := range []string{
+		`unit='eregion-registry.service'`, "collector=eregion-registry-gc",
+		`systemctl stop "$unit"`, `systemctl start "$unit"`,
+		"garbage-collect /etc/docker/registry/config.yml",
+		`docker container inspect "$collector"`,
+		`docker rm --force "$collector"`,
+		`docker create --name "$collector"`,
+		`docker start --attach "$collector"`,
+		"no registry garbage-collect process is running",
+		"garbage-collect process is still running",
+		"is left stopped",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("the GC script lacks %q:\n%s", want, script)
+		}
 	}
 	if strings.Contains(script, "--delete-untagged") {
 		t.Fatalf("untagged manifests can still be live releases; they must never be deleted:\n%s", script)
@@ -418,34 +434,281 @@ func TestRetentionGCStopsRestartsAndRecoversAnInterruptedAttempt(t *testing.T) {
 	if !strings.Contains(script, RegistryImage) {
 		t.Fatalf("the collection container does not use the pinned registry image:\n%s", script)
 	}
-	if !strings.Contains(script, "--name eregion-registry-gc") ||
-		!strings.Contains(script, "docker container inspect eregion-registry-gc") ||
-		!strings.Contains(script, "docker rm --force eregion-registry-gc") {
-		t.Fatalf("a retry cannot detect and remove an orphaned collection container:\n%s", script)
+	if strings.Contains(script, `rm --force "$collector" >/dev/null 2>&1 || true`) {
+		t.Fatalf("an orphan removal failure is still ignored:\n%s", script)
 	}
-	if !strings.Contains(script, "failed to restart eregion-registry.service after garbage collection") ||
+	// The trap may only be armed after the stale collector and any running
+	// garbage-collect process are verified gone, and before our own collector
+	// starts.
+	verify := strings.Index(script, "garbage-collect process is still running")
+	create := strings.Index(script, `docker create --name "$collector"`)
+	restore := strings.Index(script, "restore_registry()")
+	trap := strings.Index(script, "trap restore_registry EXIT")
+	start := strings.Index(script, `docker start --attach "$collector"`)
+	if verify < 0 || create < 0 || restore < 0 || trap < 0 || start < 0 || !(verify < create && create < restore && restore < trap && trap < start) {
+		t.Fatalf("the restore trap is not armed between stale-collector verification and our collector start:\n%s", script)
+	}
+	stop := strings.Index(script, `systemctl stop "$unit"`)
+	if stop < 0 || strings.Contains(script[stop:restore], "systemctl start") {
+		t.Fatalf("the stale-collector path can start the registry before the collector is created:\n%s", script)
+	}
+	if !strings.Contains(script, "failed to restart $unit after garbage collection") ||
 		!strings.Contains(script, `exit "$status"`) {
 		t.Fatalf("a registry restart failure in the trap is suppressed:\n%s", script)
-	}
-	if strings.Contains(script, "systemctl start 'eregion-registry.service' >/dev/null 2>&1 || true") {
-		t.Fatalf("the trap still suppresses a restart failure:\n%s", script)
 	}
 	check, err := step.Check(context.Background(), engine.Runtime{})
 	if err != nil || check.Complete {
 		t.Fatalf("garbage collection must run when requested: %+v, %v", check, err)
 	}
 
-	invalid := payload
-	invalid.Unit = "not-a-unit"
-	raw, _ = json.Marshal(invalid)
-	if _, err := buildRetentionGCStep(retentionTestExecution(payload.Step), raw); err == nil {
+	invalid := RetentionGCPayload{
+		Step: "platform-retention-gc-01-v1", Unit: "not-a-unit",
+	}
+	raw, _ := json.Marshal(invalid)
+	if _, err := buildRetentionGCStep(retentionTestExecution(invalid.Step), raw); err == nil {
 		t.Fatal("an invalid registry unit was accepted")
 	}
-	invalid = payload
-	invalid.Image = "registry:2.8.3"
+	invalid = RetentionGCPayload{Step: "platform-retention-gc-01-v1", Image: "registry:2.8.3"}
 	raw, _ = json.Marshal(invalid)
-	if _, err := buildRetentionGCStep(retentionTestExecution(payload.Step), raw); err == nil {
+	if _, err := buildRetentionGCStep(retentionTestExecution(invalid.Step), raw); err == nil {
 		t.Fatal("an unpinned registry image was accepted")
+	}
+}
+
+type gcScriptResult struct {
+	exitCode     int
+	stderr       string
+	dockerCalls  []string
+	serviceCalls []string
+}
+
+// runRetentionGCScript runs the rendered script with fake docker and systemctl
+// programs. The script's absolute /usr/bin/docker is redirected to the fake.
+func runRetentionGCScript(t *testing.T, script string, env map[string]string) gcScriptResult {
+	t.Helper()
+	dir := t.TempDir()
+	dockerLog := filepath.Join(dir, "docker.log")
+	serviceLog := filepath.Join(dir, "systemctl.log")
+	dockerPath := filepath.Join(dir, "docker")
+	dockerScript := `#!/bin/sh
+echo "$*" >> "$FAKE_DOCKER_LOG"
+case "$1 $2" in
+  "container inspect")
+    if [ -f "$FAKE_ORPHAN" ]; then exit 0; fi
+    exit 1;;
+  "rm --force")
+    if [ "$3" = "eregion-registry-gc" ] && [ -f "$FAKE_ORPHAN" ] && [ "$FAKE_ORPHAN_RM" != "sticky" ]; then
+      case "$FAKE_ORPHAN_RM" in
+      fail) exit 1;;
+      esac
+      rm -f "$FAKE_ORPHAN"
+    fi
+    exit 0;;
+  "ps --quiet")
+    if [ -n "$FAKE_RUNNING" ]; then printf '%s\n' "$FAKE_RUNNING"; fi
+    exit 0;;
+  "inspect --type=container")
+    printf '%s\n' "$FAKE_RUNNING_COMMANDS"
+    exit 0;;
+  "create --name")
+    exit "$FAKE_CREATE";;
+  "start --attach")
+    exit "$FAKE_START";;
+esac
+exit 0
+`
+	if err := os.WriteFile(dockerPath, []byte(dockerScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	servicePath := filepath.Join(dir, "systemctl")
+	serviceScript := `#!/bin/sh
+echo "$*" >> "$FAKE_SYSTEMCTL_LOG"
+case "$1" in
+  stop)
+    : > "$FAKE_SERVICE_STOPPED"
+    exit 0;;
+  start)
+    if [ "$FAKE_SYSTEMCTL_START" = "0" ]; then rm -f "$FAKE_SERVICE_STOPPED"; fi
+    exit "$FAKE_SYSTEMCTL_START";;
+  is-active)
+    if [ -f "$FAKE_SERVICE_STOPPED" ]; then exit 1; fi
+    exit "$FAKE_SYSTEMCTL_ACTIVE";;
+esac
+exit 0
+`
+	if err := os.WriteFile(servicePath, []byte(serviceScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	script = strings.ReplaceAll(script, "/usr/bin/docker", dockerPath)
+	command := exec.Command("bash", "-c", script)
+	values := map[string]string{
+		"PATH":            dir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"FAKE_DOCKER_LOG": dockerLog, "FAKE_SYSTEMCTL_LOG": serviceLog,
+		"FAKE_SERVICE_STOPPED": filepath.Join(dir, "stopped"),
+		"FAKE_ORPHAN_RM":       "remove", "FAKE_CREATE": "0", "FAKE_START": "0",
+		"FAKE_SYSTEMCTL_START": "0", "FAKE_SYSTEMCTL_ACTIVE": "0",
+	}
+	for key, value := range env {
+		values[key] = value
+	}
+	if values["FAKE_ORPHAN"] == "1" {
+		orphanPath := filepath.Join(dir, "orphan")
+		if err := os.WriteFile(orphanPath, []byte("orphan\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		values["FAKE_ORPHAN"] = orphanPath
+	}
+	command.Env = make([]string, 0, len(values))
+	for key, value := range values {
+		command.Env = append(command.Env, key+"="+value)
+	}
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	err := command.Run()
+	result := gcScriptResult{stderr: stderr.String()}
+	if err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatal(err)
+		}
+		result.exitCode = exitErr.ExitCode()
+	}
+	result.dockerCalls = readLines(t, dockerLog)
+	result.serviceCalls = readLines(t, serviceLog)
+	return result
+}
+
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func firstCallIndex(calls []string, prefix string) int {
+	for index, call := range calls {
+		if strings.HasPrefix(call, prefix) {
+			return index
+		}
+	}
+	return -1
+}
+
+func serviceStarted(calls []string) bool {
+	for _, call := range calls {
+		if strings.HasPrefix(call, "start ") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRetentionGCScriptNormalPath(t *testing.T) {
+	result := runRetentionGCScript(t, gcStepForTest(t).script(), nil)
+	if result.exitCode != 0 {
+		t.Fatalf("exit=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	if !serviceStarted(result.serviceCalls) {
+		t.Fatalf("the registry was not restarted: %v", result.serviceCalls)
+	}
+	create := firstCallIndex(result.dockerCalls, "create --name")
+	start := firstCallIndex(result.dockerCalls, "start --attach")
+	if create < 0 || start < 0 || create > start {
+		t.Fatalf("collector calls = %v", result.dockerCalls)
+	}
+	if rm := firstCallIndex(result.dockerCalls, "rm --force eregion-registry-gc"); rm >= 0 && rm < create {
+		t.Fatalf("the normal path removed a collector before creating one: %v", result.dockerCalls)
+	}
+}
+
+func TestRetentionGCScriptRemovesAStaleCollector(t *testing.T) {
+	result := runRetentionGCScript(t, gcStepForTest(t).script(), map[string]string{"FAKE_ORPHAN": "1"})
+	if result.exitCode != 0 {
+		t.Fatalf("exit=%d stderr=%s", result.exitCode, result.stderr)
+	}
+	rm := firstCallIndex(result.dockerCalls, "rm --force eregion-registry-gc")
+	create := firstCallIndex(result.dockerCalls, "create --name")
+	if rm < 0 || create < 0 || rm > create {
+		t.Fatalf("a stale collector was not removed before the new one: %v", result.dockerCalls)
+	}
+	if !serviceStarted(result.serviceCalls) {
+		t.Fatalf("the registry was not restarted: %v", result.serviceCalls)
+	}
+}
+
+func TestRetentionGCScriptFailsClosedWhenAStaleCollectorCannotBeRemoved(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{name: "removal fails", env: map[string]string{"FAKE_ORPHAN": "1", "FAKE_ORPHAN_RM": "fail"}, want: "could not be removed"},
+		{name: "still present", env: map[string]string{"FAKE_ORPHAN": "1", "FAKE_ORPHAN_RM": "sticky"}, want: "still present after removal"},
+		{name: "process still running", env: map[string]string{
+			"FAKE_RUNNING":          "abc123",
+			"FAKE_RUNNING_COMMANDS": "[] [/bin/registry garbage-collect /etc/docker/registry/config.yml]",
+		}, want: "process is still running"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := runRetentionGCScript(t, gcStepForTest(t).script(), tc.env)
+			if result.exitCode == 0 {
+				t.Fatalf("the step succeeded: stderr=%s", result.stderr)
+			}
+			if serviceStarted(result.serviceCalls) {
+				t.Fatalf("the registry was started while a stale collector may still write: %v", result.serviceCalls)
+			}
+			if !strings.Contains(result.stderr, tc.want) || !strings.Contains(result.stderr, "left stopped") {
+				t.Fatalf("stderr = %q, want %q and a recovery instruction", result.stderr, tc.want)
+			}
+			if firstCallIndex(result.dockerCalls, "create --name") >= 0 {
+				t.Fatalf("a collector was created after the stale one could not be verified gone: %v", result.dockerCalls)
+			}
+		})
+	}
+}
+
+func TestRetentionGCScriptRestartsAfterItsOwnCollectorFails(t *testing.T) {
+	result := runRetentionGCScript(t, gcStepForTest(t).script(), map[string]string{"FAKE_START": "3"})
+	if result.exitCode == 0 {
+		t.Fatal("a failed collection succeeded")
+	}
+	if !serviceStarted(result.serviceCalls) {
+		t.Fatalf("a failed collection did not restart the registry: %v", result.serviceCalls)
+	}
+}
+
+func TestRetentionGCScriptFailsWhenARestartFails(t *testing.T) {
+	result := runRetentionGCScript(t, gcStepForTest(t).script(), map[string]string{"FAKE_SYSTEMCTL_START": "1"})
+	if result.exitCode == 0 {
+		t.Fatal("a failed registry restart succeeded")
+	}
+	if !strings.Contains(result.stderr, "failed to restart") {
+		t.Fatalf("stderr = %q", result.stderr)
+	}
+}
+
+func TestRetentionGCScriptFailsWhenItsCollectorCannotBeCreated(t *testing.T) {
+	result := runRetentionGCScript(t, gcStepForTest(t).script(), map[string]string{"FAKE_CREATE": "1"})
+	if result.exitCode == 0 {
+		t.Fatal("a collector creation failure succeeded")
+	}
+	if serviceStarted(result.serviceCalls) {
+		t.Fatalf("the registry was started without a collector: %v", result.serviceCalls)
+	}
+	if !strings.Contains(result.stderr, "could not create") {
+		t.Fatalf("stderr = %q", result.stderr)
 	}
 }
 

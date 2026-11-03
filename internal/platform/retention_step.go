@@ -530,34 +530,83 @@ func (s *RetentionGCStep) Check(context.Context, engine.Runtime) (engine.CheckRe
 	return engine.CheckResult{Detail: "registry garbage collection runs only when a prune requests it"}, nil
 }
 
-// script renders the GC effect. A failure before the collection finishes still
-// restarts the registry, and a failed restart is itself a step failure rather
-// than a suppressed trap. A named one-off container lets a retry remove the
-// leftover of an abruptly killed attempt before reopening the storage.
+// script renders the GC effect. A failed collection restarts the registry, but
+// a stale collector is handled fail-closed: the registry is stopped, the old
+// collector is removed and verified gone (both the container and any running
+// registry garbage-collect process) before the restore trap is armed. If that
+// cannot be verified, the script exits with the registry still stopped.
 func (s *RetentionGCStep) script() string {
 	unit := shellQuote(s.payload.Unit)
 	return `set -euo pipefail
-# A killed attempt may leave the collection container behind; remove it before
-# the storage is opened again.
-if /usr/bin/docker container inspect eregion-registry-gc >/dev/null 2>&1; then
-  /usr/bin/docker rm --force eregion-registry-gc >/dev/null 2>&1 || true
+unit=` + unit + `
+collector=eregion-registry-gc
+
+# Stop the serving registry first: no writer may touch the storage while a
+# stale collector is being removed.
+if ! systemctl stop "$unit"; then
+  echo "failed to stop $unit; registry garbage collection was not started" >&2
+  exit 1
+fi
+if systemctl is-active --quiet "$unit"; then
+  echo "$unit is still active after stop; registry garbage collection was not started" >&2
+  exit 1
+fi
+
+# A killed attempt may have left the collector behind. Remove it and prove it
+# is gone before arming the restore trap; otherwise leave the registry stopped
+# and say how to recover.
+stale_collector() {
+  /usr/bin/docker container inspect "$collector" >/dev/null 2>&1
+}
+if stale_collector; then
+  if ! /usr/bin/docker rm --force "$collector" >/dev/null 2>&1; then
+    echo "stale registry garbage-collector $collector could not be removed; $unit is left stopped. Remove it with 'docker rm -f $collector', verify no registry garbage-collect process is running, start $unit, then retry." >&2
+    exit 1
+  fi
+fi
+if stale_collector; then
+  echo "registry garbage-collector $collector is still present after removal; $unit is left stopped. Remove it with 'docker rm -f $collector', verify no registry garbage-collect process is running, start $unit, then retry." >&2
+  exit 1
+fi
+if ! running=$(/usr/bin/docker ps --quiet --no-trunc); then
+  echo "could not list containers to check for a stale registry garbage-collector; $unit is left stopped. Verify no registry garbage-collect process is running, start $unit, then retry." >&2
+  exit 1
+fi
+if [ -n "$running" ]; then
+  if ! commands=$(/usr/bin/docker inspect --type=container --format '{{.Config.Entrypoint}} {{.Config.Cmd}}' $running); then
+    echo "could not inspect running containers to check for a stale registry garbage-collector; $unit is left stopped. Verify no registry garbage-collect process is running, start $unit, then retry." >&2
+    exit 1
+  fi
+  if printf '%s\n' "$commands" | grep -q 'garbage-collect'; then
+    echo "a registry garbage-collect process is still running; $unit is left stopped. Wait for it to exit or stop it, verify no container is running 'garbage-collect', start $unit, then retry." >&2
+    exit 1
+  fi
+fi
+
+# The orphan is gone and nothing is writing. Create our own collector; only
+# then arm the trap, so a failed collection still restarts the registry.
+if ! /usr/bin/docker create --name "$collector" --network none \
+  --volume ` + shellQuote(s.payload.RegistryDir) + `:/var/lib/registry \
+  --volume ` + shellQuote(s.payload.ConfigPath) + `:/etc/docker/registry/config.yml:ro \
+  ` + shellQuote(s.payload.Image) + ` /bin/registry garbage-collect /etc/docker/registry/config.yml >/dev/null; then
+  echo "could not create the registry garbage-collector; $unit is stopped. Fix the collector error and retry, or start $unit manually." >&2
+  exit 1
 fi
 restore_registry() {
   status=$?
-  if ! systemctl start ` + unit + `; then
-    echo "failed to restart ` + s.payload.Unit + ` after garbage collection" >&2
+  if ! systemctl start "$unit"; then
+    echo "failed to restart $unit after garbage collection" >&2
     status=1
   fi
   exit "$status"
 }
 trap restore_registry EXIT
-systemctl stop ` + unit + `
-/usr/bin/docker run --rm --name eregion-registry-gc --network none \
-  --volume ` + shellQuote(s.payload.RegistryDir) + `:/var/lib/registry \
-  --volume ` + shellQuote(s.payload.ConfigPath) + `:/etc/docker/registry/config.yml:ro \
-  ` + shellQuote(s.payload.Image) + ` /bin/registry garbage-collect /etc/docker/registry/config.yml
-systemctl start ` + unit + `
-systemctl is-active --quiet ` + unit + ``
+/usr/bin/docker start --attach "$collector"
+if ! /usr/bin/docker rm --force "$collector" >/dev/null 2>&1; then
+  echo "warning: could not remove the finished registry garbage-collector $collector; a retry will remove it" >&2
+fi
+systemctl start "$unit"
+systemctl is-active --quiet "$unit"`
 }
 
 func (s *RetentionGCStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {

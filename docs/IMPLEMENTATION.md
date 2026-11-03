@@ -365,14 +365,18 @@ environment, and removes the immutable container ID; the registry container and
 any unowned container are refused. Removal and GC steps run under the node host
 lock, so they cannot race a pack build. A GC effect,
 `platform-retention-gc-01-v1`, stops `eregion-registry.service`, removes an
-orphaned `eregion-registry-gc` container from an interrupted attempt, runs
-`registry garbage-collect` in a one-off container against the same storage, and
-restarts the unit. A restart failure fails the step; it is never suppressed. It
-never passes `--delete-untagged`: releases are referenced by digest, so an
-untagged manifest can still be a live release; only manifests explicitly
-deleted through the API become unreferenced, and plain garbage collection
-removes their blobs. `image.push` takes the same host lock, so a registry
-restart or collection cannot interrupt a push.
+orphaned `eregion-registry-gc` container from an interrupted attempt, verifies
+no registry garbage-collect process remains, runs `registry garbage-collect` in
+a one-off container against the same storage, and restarts the unit. If the
+stale collector cannot be proven gone, the step fails with the registry left
+stopped and a recovery instruction; the restore trap is only armed after the
+orphan is verified gone and our collector is created. A failed collection or a
+failed restart fails the step; a restart failure is never suppressed. It never
+passes `--delete-untagged`: releases are referenced by digest, so an untagged
+manifest can still be a live release; only manifests explicitly deleted through
+the API become unreferenced, and plain garbage collection removes their blobs.
+`image.push` takes the same host lock, so a registry restart or collection
+cannot interrupt a push.
 
 `host-registry-v2` enables manifest deletion (`storage.delete.enabled: true`
 plus `REGISTRY_STORAGE_DELETE_ENABLED=true` in the unit) and restarts the
