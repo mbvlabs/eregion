@@ -717,10 +717,12 @@ type PackPayload struct {
 	// embedded askpass helper. The value never enters the payload.
 	GitCredentialSecretKey string `json:"git_credential_secret_key,omitempty"`
 	TimeoutSeconds         int    `json:"timeout_seconds,omitempty"`
-	// Cache names the explicit Buildpacks build-cache volume. BuildpackCacheVolume
-	// derives the deterministic per-environment name; an empty value keeps the
-	// builder's own default (no named eregion cache to attribute or prune).
-	Cache string `json:"cache,omitempty"`
+	// Cache and LaunchCache name the explicit Buildpacks cache volumes.
+	// BuildpackCacheVolume and BuildpackLaunchCacheVolume derive the
+	// deterministic per-environment names; an empty value keeps the builder's
+	// own default (no named eregion cache to attribute or prune).
+	Cache       string `json:"cache,omitempty"`
+	LaunchCache string `json:"launch_cache,omitempty"`
 }
 
 type PackStep struct {
@@ -787,6 +789,9 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	}
 	if payload.Cache != "" && !cacheVolumePattern.MatchString(payload.Cache) {
 		return nil, errors.New("a build cache must be an eregion build cache volume name")
+	}
+	if payload.LaunchCache != "" && !cacheVolumePattern.MatchString(payload.LaunchCache) {
+		return nil, errors.New("a launch cache must be an eregion launch cache volume name")
 	}
 	return &PackStep{exec: exec, payload: payload}, nil
 }
@@ -918,13 +923,18 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	return engine.ApplyResult{Result: result}, nil
 }
 
-// packBuildArgs renders one Buildpacks build. An explicit volume cache keeps a
-// cache attributable to one environment; pack otherwise leaves no named cache
-// to prune.
+// packBuildArgs renders one Buildpacks build. Explicit volume caches keep the
+// build and launch caches attributable to one environment; pack otherwise
+// creates a randomly keyed launch volume on every build.
 func packBuildArgs(payload PackPayload, source string) []string {
 	args := []string{"pack", "build", payload.Image, "--path", source, "--builder", payload.Builder}
 	if payload.Cache != "" {
 		args = append(args, "--cache", "type=build;format=volume;name="+payload.Cache)
+	}
+	if payload.LaunchCache != "" {
+		// pack 0.40 parses one cache type per flag occurrence; two flags set
+		// both the build and launch caches reliably.
+		args = append(args, "--cache", "type=launch;format=volume;name="+payload.LaunchCache)
 	}
 	for _, key := range sortedEnvKeys(payload.Env) {
 		args = append(args, "--env", key+"="+payload.Env[key])

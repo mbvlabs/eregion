@@ -3,6 +3,7 @@ package platform
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,16 +19,66 @@ import (
 	"github.com/mbvlabs/eregion/internal/retention"
 )
 
-// BuildpackCacheVolumePrefix names every Buildpacks build cache eregion
-// creates. pack is given an explicit cache volume so the cache is attributable
-// and can be pruned by name instead of by guessing pack's defaults.
-const BuildpackCacheVolumePrefix = "eregion-build-cache-"
+// Buildpacks cache volumes. An eregion cache embeds the app and environment
+// names hex-encoded, joined by "_": app and environment names cannot contain
+// "_", and hex is reversible and cannot collide (`a-b`/`c` vs `a`/`b-c`). The
+// encoding also avoids pack's reserved-name rewriting (`aux`, `com`, `con`,
+// `lpt`, `nul`, `prn`), which would otherwise silently change an explicit
+// volume name. A pre-upgrade pack build left pack's own
+// `pack-cache-<hash>.<build|launch>` volumes, reported as ownerless caches.
+const (
+	BuildpackCacheVolumePrefix       = "eregion-build-cache-"
+	BuildpackLaunchCacheVolumePrefix = "eregion-launch-cache-"
+	PackCacheVolumePrefix            = "pack-cache-"
+)
 
-// BuildpackCacheVolume is the deterministic cache volume of one environment.
-// App and environment names are already validated by the caller, so the result
-// is a plain Docker volume name.
+// BuildpackCacheVolume is the deterministic build-cache volume of one
+// environment. App and environment names are already validated by the caller.
 func BuildpackCacheVolume(app, environment string) string {
-	return BuildpackCacheVolumePrefix + app + "-" + environment
+	return BuildpackCacheVolumePrefix + hex.EncodeToString([]byte(app)) + "_" + hex.EncodeToString([]byte(environment))
+}
+
+// BuildpackLaunchCacheVolume is the deterministic launch-cache volume of one
+// environment.
+func BuildpackLaunchCacheVolume(app, environment string) string {
+	return BuildpackLaunchCacheVolumePrefix + hex.EncodeToString([]byte(app)) + "_" + hex.EncodeToString([]byte(environment))
+}
+
+// ParseBuildpacksCacheVolume reports which app and environment own a cache
+// volume. Kind is "build" or "launch" for an eregion cache and "pack" for a
+// legacy ownerless pack cache.
+func ParseBuildpacksCacheVolume(name string) (app, environment, kind string, ok bool) {
+	for _, candidate := range []struct {
+		prefix string
+		kind   string
+	}{
+		{BuildpackCacheVolumePrefix, "build"},
+		{BuildpackLaunchCacheVolumePrefix, "launch"},
+	} {
+		rest, found := strings.CutPrefix(name, candidate.prefix)
+		if !found {
+			continue
+		}
+		appHex, environmentHex, found := strings.Cut(rest, "_")
+		if !found || len(appHex)%2 != 0 || len(environmentHex)%2 != 0 {
+			return "", "", candidate.kind, false
+		}
+		appBytes, appErr := hex.DecodeString(appHex)
+		environmentBytes, environmentErr := hex.DecodeString(environmentHex)
+		if appErr != nil || environmentErr != nil {
+			return "", "", candidate.kind, false
+		}
+		app, environment = string(appBytes), string(environmentBytes)
+		if ValidateName(app) != nil || ValidateName(environment) != nil {
+			return "", "", candidate.kind, false
+		}
+		return app, environment, candidate.kind, true
+	}
+	if strings.HasPrefix(name, PackCacheVolumePrefix) &&
+		(strings.HasSuffix(name, ".build") || strings.HasSuffix(name, ".launch")) {
+		return "", "", "pack", true
+	}
+	return "", "", "", false
 }
 
 // Production node paths read by the retention inventory. They match
@@ -104,11 +155,12 @@ func ObserveRetentionInventory(ctx context.Context, paths RetentionInventoryPath
 		DanglingImages:    []retention.Image{},
 		LocalImages:       []retention.LocalImage{},
 	}
-	artifacts, truncated, err := readRegistryArtifacts(paths.RegistryDir)
+	artifacts, warnings, truncated, err := readRegistryArtifacts(paths.RegistryDir)
 	if err != nil {
 		return retention.Inventory{}, contract.NewFault(contract.Unavailable, "the node's registry storage is unreadable", err.Error())
 	}
 	inventory.RegistryArtifacts = artifacts
+	inventory.Warnings = append(inventory.Warnings, warnings...)
 	inventory.Truncated = inventory.Truncated || truncated
 
 	containers, truncated, err := readRetentionContainers(ctx, run)
@@ -292,18 +344,32 @@ func sortedCopy(values []string) []string {
 // --------------------------------------------------------------- cache volumes
 
 func readCacheVolumes(ctx context.Context, run NodeReadRunner) ([]retention.CacheVolume, bool, error) {
-	raw, err := run(ctx, "docker", "volume", "ls", "--quiet", "--filter", "name="+BuildpackCacheVolumePrefix)
-	if err != nil {
-		return nil, false, dockerObservationFault("list build cache volumes", err)
+	seen := map[string]bool{}
+	var names []string
+	for _, prefix := range []string{BuildpackCacheVolumePrefix, BuildpackLaunchCacheVolumePrefix, PackCacheVolumePrefix} {
+		raw, err := run(ctx, "docker", "volume", "ls", "--quiet", "--filter", "name="+prefix)
+		if err != nil {
+			return nil, false, dockerObservationFault("list build cache volumes", err)
+		}
+		for _, name := range splitLines(raw) {
+			if seen[name] {
+				continue
+			}
+			if _, _, _, ok := ParseBuildpacksCacheVolume(name); !ok {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
 	}
-	names := splitLines(raw)
 	names, truncated := capRetentionItems(names)
 	if len(names) == 0 {
 		return []retention.CacheVolume{}, false, nil
 	}
 	volumes := make([]retention.CacheVolume, 0, len(names))
 	for _, name := range names {
-		if !strings.HasPrefix(name, BuildpackCacheVolumePrefix) {
+		app, environment, kind, ok := ParseBuildpacksCacheVolume(name)
+		if !ok {
 			continue
 		}
 		raw, err := run(ctx, "docker", "volume", "inspect", "--format", "{{.Mountpoint}}", name)
@@ -314,7 +380,10 @@ func readCacheVolumes(ctx context.Context, run NodeReadRunner) ([]retention.Cach
 			return nil, false, dockerObservationFault("inspect build cache volume "+name, err)
 		}
 		mountpoint := strings.TrimSpace(string(raw))
-		volumes = append(volumes, retention.CacheVolume{Name: name, SizeBytes: directorySize(ctx, mountpoint)})
+		volumes = append(volumes, retention.CacheVolume{
+			Name: name, Kind: kind, App: app, Environment: environment,
+			Ownerless: kind == "pack", SizeBytes: directorySize(ctx, mountpoint),
+		})
 	}
 	sort.Slice(volumes, func(i, j int) bool { return volumes[i].Name < volumes[j].Name })
 	return volumes, truncated, nil
@@ -351,32 +420,34 @@ func directorySize(ctx context.Context, root string) int64 {
 // ---------------------------------------------------------------- registry
 
 // readRegistryArtifacts reads the filesystem storage of the local registry.
-// Releases are referenced by digest, so every manifest revision is reported,
-// tagged or not. A repository or manifest blob that has already been removed is
-// simply absent.
-func readRegistryArtifacts(registryDir string) ([]retention.RegistryArtifact, bool, error) {
+// Releases are referenced by digest, so every live manifest revision is
+// reported, tagged or not. A repository or manifest blob that has already been
+// removed is absent; a revision is live only when Distribution's link file
+// still names its digest.
+func readRegistryArtifacts(registryDir string) ([]retention.RegistryArtifact, []string, bool, error) {
 	registryDir = strings.TrimSpace(registryDir)
 	if registryDir == "" {
-		return []retention.RegistryArtifact{}, false, nil
+		return []retention.RegistryArtifact{}, nil, false, nil
 	}
 	base := filepath.Join(registryDir, "docker", "registry", "v2")
 	repositoriesRoot := filepath.Join(base, "repositories")
 	if _, err := os.Stat(repositoriesRoot); err != nil {
 		if os.IsNotExist(err) {
-			return []retention.RegistryArtifact{}, false, nil
+			return []retention.RegistryArtifact{}, nil, false, nil
 		}
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	repositories, err := registryRepositories(repositoriesRoot)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	artifacts := []retention.RegistryArtifact{}
+	var warnings []string
 	truncated := false
 	for _, repository := range repositories {
 		digests, err := registryManifestDigests(repositoriesRoot, repository)
 		if err != nil {
-			return nil, false, err
+			return nil, nil, false, err
 		}
 		tags := registryTags(repositoriesRoot, repository)
 		for _, digest := range digests {
@@ -385,7 +456,14 @@ func readRegistryArtifacts(registryDir string) ([]retention.RegistryArtifact, bo
 				break
 			}
 			blobs := map[string]int64{}
-			configDigest, created := collectRegistryManifest(base, digest, 0, blobs)
+			var artifactWarnings []string
+			configDigest, created, ok := collectRegistryManifest(base, digest, 0, blobs, &artifactWarnings)
+			warnings = append(warnings, artifactWarnings...)
+			if !ok {
+				// The revision link exists but its manifest blob is missing or
+				// unreadable. Never report a zero-byte artifact as known.
+				continue
+			}
 			var bytes int64
 			for _, size := range blobs {
 				bytes += size
@@ -402,7 +480,7 @@ func readRegistryArtifacts(registryDir string) ([]retention.RegistryArtifact, bo
 		}
 		return artifacts[i].Digest < artifacts[j].Digest
 	})
-	return artifacts, truncated, nil
+	return artifacts, warnings, truncated, nil
 }
 
 // registryRepositories finds every repository root by its _manifests
@@ -430,6 +508,9 @@ func registryRepositories(repositoriesRoot string) ([]string, error) {
 	return repositories, nil
 }
 
+// registryManifestDigests lists the revision digests Distribution still links.
+// The revision's `link` file is authoritative: a leftover directory without a
+// valid link is a deleted manifest, not a live artifact.
 func registryManifestDigests(repositoriesRoot, repository string) ([]string, error) {
 	root := filepath.Join(repositoriesRoot, filepath.FromSlash(repository), "_manifests", "revisions", "sha256")
 	entries, err := os.ReadDir(root)
@@ -444,7 +525,15 @@ func registryManifestDigests(repositoriesRoot, repository string) ([]string, err
 		if !entry.IsDir() || len(entry.Name()) != 64 || !lowerHex(entry.Name()) {
 			continue
 		}
-		digests = append(digests, "sha256:"+entry.Name())
+		raw, err := os.ReadFile(filepath.Join(root, entry.Name(), "link")) //nolint:gosec // G304: fixed registry storage layout.
+		if err != nil {
+			continue
+		}
+		digest := strings.TrimSpace(string(raw))
+		if digest != "sha256:"+entry.Name() {
+			continue
+		}
+		digests = append(digests, digest)
 	}
 	sort.Strings(digests)
 	return digests, nil
@@ -495,36 +584,67 @@ type registryManifest struct {
 
 // collectRegistryManifest walks one manifest (or index) and records every
 // distinct blob it references in blobs, keyed by digest, so shared layers of an
-// index are counted once. It returns the manifest's own config digest and the
-// newest creation time it found. Missing blobs are unknown facts.
-func collectRegistryManifest(base, digest string, depth int, blobs map[string]int64) (configDigest string, created *time.Time) {
+// index are counted once. It returns the manifest's own config digest, the
+// newest creation time it found, and whether the manifest itself was readable.
+// A missing referenced blob is recorded as a warning and its size is the
+// manifest's declaration, never a silent zero.
+func collectRegistryManifest(base, digest string, depth int, blobs map[string]int64, warnings *[]string) (configDigest string, created *time.Time, ok bool) {
 	raw, err := readRegistryBlob(base, digest)
 	if err != nil {
-		return "", nil
+		*warnings = append(*warnings, "registry manifest "+digest+" is missing or unreadable")
+		return "", nil, false
 	}
-	blobs[digest] = registryBlobSize(base, blobs[digest], digest)
+	blobs[digest] = resolveRegistryBlobSize(base, digest, blobs[digest], digest, warnings)
 	var manifest registryManifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return "", nil
+		*warnings = append(*warnings, "registry manifest "+digest+" is not valid manifest JSON")
+		return "", nil, false
 	}
 	if manifest.Config != nil {
 		configDigest = manifest.Config.Digest
-		blobs[configDigest] = registryBlobSize(base, manifest.Config.Size, configDigest)
+		blobs[configDigest] = resolveRegistryBlobSize(base, configDigest, manifest.Config.Size, digest, warnings)
 		created = registryConfigCreated(base, configDigest)
 	}
 	for _, layer := range manifest.Layers {
-		blobs[layer.Digest] = registryBlobSize(base, layer.Size, layer.Digest)
+		blobs[layer.Digest] = resolveRegistryBlobSize(base, layer.Digest, layer.Size, digest, warnings)
 	}
 	if depth < 3 {
 		for _, child := range manifest.Manifests {
-			blobs[child.Digest] = registryBlobSize(base, child.Size, child.Digest)
-			_, childCreated := collectRegistryManifest(base, child.Digest, depth+1, blobs)
+			if _, known := blobs[child.Digest]; !known {
+				// The index declares a size; the child's own manifest blob is
+				// resolved (and a missing one is warned about) below.
+				blobs[child.Digest] = child.Size
+			}
+			_, childCreated, childOK := collectRegistryManifest(base, child.Digest, depth+1, blobs, warnings)
+			if !childOK {
+				continue
+			}
 			if created == nil || (childCreated != nil && childCreated.After(*created)) {
 				created = childCreated
 			}
 		}
 	}
-	return configDigest, created
+	return configDigest, created, true
+}
+
+// resolveRegistryBlobSize reports a missing or unreadable blob explicitly and
+// returns the manifest's declared size when it has one. Only a known-present
+// blob without a declaration falls back to its file size.
+func resolveRegistryBlobSize(base, digest string, declared int64, manifest string, warnings *[]string) int64 {
+	path, ok := registryBlobPath(base, digest)
+	if !ok {
+		*warnings = append(*warnings, "registry manifest "+manifest+" references an invalid blob digest")
+		return declared
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		*warnings = append(*warnings, "registry blob "+digest+" referenced by "+manifest+" is missing or unreadable")
+		return declared
+	}
+	if declared > 0 {
+		return declared
+	}
+	return info.Size()
 }
 
 func registryConfigCreated(base, digest string) *time.Time {
@@ -546,22 +666,6 @@ func registryConfigCreated(base, digest string) *time.Time {
 	return &utc
 }
 
-// registryBlobSize prefers the size the manifest declares and falls back to the
-// blob file's own size when the declared value is absent.
-func registryBlobSize(base string, declared int64, digest string) int64 {
-	if declared > 0 || digest == "" {
-		return declared
-	}
-	path, ok := registryBlobPath(base, digest)
-	if !ok {
-		return declared
-	}
-	if info, err := os.Stat(path); err == nil {
-		return info.Size()
-	}
-	return declared
-}
-
 func readRegistryBlob(base, digest string) ([]byte, error) {
 	path, ok := registryBlobPath(base, digest)
 	if !ok {
@@ -570,12 +674,14 @@ func readRegistryBlob(base, digest string) ([]byte, error) {
 	return os.ReadFile(path) //nolint:gosec // G304: fixed registry storage layout under the node data directory.
 }
 
+// registryBlobPath is Distribution's filesystem layout: the digest is sharded
+// by its first two hex characters.
 func registryBlobPath(base, digest string) (string, bool) {
 	hex, ok := strings.CutPrefix(digest, "sha256:")
 	if !ok || len(hex) != 64 || !lowerHex(hex) {
 		return "", false
 	}
-	return filepath.Join(base, "blobs", "sha256", hex, "data"), true
+	return filepath.Join(base, "blobs", "sha256", hex[:2], hex, "data"), true
 }
 
 func lowerHex(value string) bool {

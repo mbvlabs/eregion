@@ -14,6 +14,10 @@ type Inventory struct {
 	DanglingImages    []Image            `json:"dangling_images"`
 	LocalImages       []LocalImage       `json:"local_images"`
 	Disk              Disk               `json:"disk"`
+	// Warnings record observations that could not be completed, such as a
+	// registry revision whose manifest blob is missing. They are not a failed
+	// inventory; the planner must treat the affected artifact as unknown.
+	Warnings []string `json:"warnings,omitempty"`
 	// Truncated reports that the node capped an unbounded list. The planner
 	// must not treat a truncated inventory as a complete picture of the node.
 	Truncated bool `json:"truncated,omitempty"`
@@ -36,12 +40,18 @@ type RegistryArtifact struct {
 	CreatedAt *time.Time `json:"created_at,omitempty"`
 }
 
-// CacheVolume is one Buildpacks build-cache volume created by an eregion pack
-// build. The volume name is deterministic per app and environment, so a cache
-// can be attributed and pruned without guessing.
+// CacheVolume is one Buildpacks cache volume created by an eregion pack build
+// or by pack's own default naming. Kind is "build", "launch", or "pack" for a
+// pre-upgrade pack-cache-* volume. App and Environment are set only for an
+// eregion-named cache; an Ownerless pack cache belongs to no environment and is
+// eligible for pruning when the node is not building.
 type CacheVolume struct {
-	Name      string `json:"name"`
-	SizeBytes int64  `json:"size_bytes"`
+	Name        string `json:"name"`
+	Kind        string `json:"kind"`
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+	Ownerless   bool   `json:"ownerless,omitempty"`
+	SizeBytes   int64  `json:"size_bytes"`
 }
 
 // Container is one eregion-labeled Docker container.

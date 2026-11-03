@@ -31,8 +31,7 @@ func retentionRemoveStepFor(t *testing.T, kind retention.ItemKind, reference str
 	if err != nil {
 		t.Fatal(err)
 	}
-	exec := retentionTestExecution(payload.Step)
-	step, err := buildRetentionRemoveStep(exec, raw)
+	step, err := buildRetentionRemoveStep(retentionTestExecution(payload.Step), raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +84,9 @@ func TestRetentionRemovePayloadValidation(t *testing.T) {
 		{Kind: string(retention.ItemContainer), Reference: "eregion-api-production-abc"},
 		{Kind: string(retention.ItemRelease), Reference: "sha256:" + strings.Repeat("b", 64)},
 		{Kind: string(retention.ItemDanglingImage), Reference: "eregion/api-production:abc"},
-		{Kind: string(retention.ItemBuildpackCache), Reference: "eregion-build-cache-api-production"},
+		{Kind: string(retention.ItemBuildpackCache), Reference: testBuildCacheVolume},
+		{Kind: string(retention.ItemBuildpackCache), Reference: testLaunchCacheVolume},
+		{Kind: string(retention.ItemBuildpackCache), Reference: "pack-cache-0123456789abcdef.build"},
 		{Kind: string(retention.ItemRegistryArtifact), Reference: "demo/app@sha256:" + strings.Repeat("c", 64)},
 	}
 	for _, payload := range valid {
@@ -94,8 +95,7 @@ func TestRetentionRemovePayloadValidation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		exec := retentionTestExecution(payload.Step)
-		if _, err := buildRetentionRemoveStep(exec, raw); err != nil {
+		if _, err := buildRetentionRemoveStep(retentionTestExecution(payload.Step), raw); err != nil {
 			t.Errorf("%s %s was refused: %v", payload.Kind, payload.Reference, err)
 		}
 	}
@@ -104,6 +104,7 @@ func TestRetentionRemovePayloadValidation(t *testing.T) {
 		{Kind: "unknown", Reference: "x"},
 		{Kind: string(retention.ItemContainer), Reference: "bad name"},
 		{Kind: string(retention.ItemBuildpackCache), Reference: "some-other-volume"},
+		{Kind: string(retention.ItemBuildpackCache), Reference: "pack-cache-random"},
 		{Kind: string(retention.ItemRegistryArtifact), Reference: "no-digest"},
 		{Kind: string(retention.ItemRegistryArtifact), Reference: "Demos/app@sha256:" + strings.Repeat("c", 64)},
 		{Kind: string(retention.ItemRegistryArtifact), Reference: "demo/app@sha256:short"},
@@ -111,8 +112,7 @@ func TestRetentionRemovePayloadValidation(t *testing.T) {
 	for _, payload := range invalid {
 		payload.Step = RetentionRemoveStepID(retention.ItemKind(payload.Kind), payload.Reference)
 		raw, _ := json.Marshal(payload)
-		exec := retentionTestExecution(payload.Step)
-		if _, err := buildRetentionRemoveStep(exec, raw); err == nil {
+		if _, err := buildRetentionRemoveStep(retentionTestExecution(payload.Step), raw); err == nil {
 			t.Errorf("%s %s was accepted", payload.Kind, payload.Reference)
 		}
 	}
@@ -123,36 +123,41 @@ func TestRetentionRemovePayloadValidation(t *testing.T) {
 		Registry: "registry.example.com:5000",
 	}
 	raw, _ := json.Marshal(payload)
-	exec := retentionTestExecution(payload.Step)
-	if _, err := buildRetentionRemoveStep(exec, raw); err == nil {
+	if _, err := buildRetentionRemoveStep(retentionTestExecution(payload.Step), raw); err == nil {
 		t.Fatal("a non-loopback registry was accepted")
 	}
 }
 
-// fakeDockerRemoval puts a docker script on PATH. When missing is true every
-// removal reports the daemon's already-gone answer, which retention retries
-// must treat as success.
-func fakeDockerRemoval(t *testing.T, missing bool) string {
+// fakeDocker puts a docker script on PATH. missing makes every inspect and
+// removal report the daemon's already-gone answer. containerInspect answers a
+// container ownership probe.
+func fakeRetentionDocker(t *testing.T, missing bool, containerInspect string) string {
 	t.Helper()
 	dir := t.TempDir()
 	log := filepath.Join(dir, "calls")
 	script := `#!/bin/sh
 echo "$*" >> "` + log + `"
-`
-	if missing {
-		script += `case "$1 $2" in
-  "image inspect"|"image rm") echo "Error response from daemon: No such image: $4" >&2; exit 1;;
-  "volume inspect"|"volume rm") echo "Error response from daemon: no such volume: $4" >&2; exit 1;;
-  "inspect --type=container") echo "Error: No such object: $4" >&2; exit 1;;
-  "rm --force") echo "Error response from daemon: No such container: $3" >&2; exit 1;;
+case "$1 $2" in
+  "image inspect"|"image rm")
+    if [ "$FAKE_MISSING" = 1 ]; then echo "Error response from daemon: No such image" >&2; exit 1; fi
+    exit 0;;
+  "volume inspect"|"volume rm")
+    if [ "$FAKE_MISSING" = 1 ]; then echo "Error response from daemon: no such volume" >&2; exit 1; fi
+    exit 0;;
+  "inspect --type=container")
+    if [ "$FAKE_MISSING" = 1 ]; then echo "Error: No such object" >&2; exit 1; fi
+    printf '%s' "$FAKE_CONTAINER_INSPECT"; exit 0;;
+  "rm --force")
+    exit 0;;
 esac
+exit 0
 `
-	}
-	script += "exit 0\n"
 	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_MISSING", map[bool]string{true: "1", false: "0"}[missing])
+	t.Setenv("FAKE_CONTAINER_INSPECT", containerInspect)
 	return log
 }
 
@@ -164,11 +169,12 @@ func TestRetentionRemoveStepTreatsAlreadyGoneAsSuccess(t *testing.T) {
 	}{
 		{retention.ItemRelease, "sha256:" + strings.Repeat("b", 64), "image rm"},
 		{retention.ItemDanglingImage, "eregion/api-production:old", "image rm"},
-		{retention.ItemContainer, "eregion-api-production-abc", "rm --force"},
-		{retention.ItemBuildpackCache, "eregion-build-cache-api-production", "volume rm"},
+		{retention.ItemContainer, "eregion-api-production-abc", "inspect --type=container"},
+		{retention.ItemBuildpackCache, testBuildCacheVolume, "volume rm"},
+		{retention.ItemBuildpackCache, "pack-cache-0123456789abcdef.build", "volume rm"},
 	} {
-		t.Run(string(tc.kind), func(t *testing.T) {
-			log := fakeDockerRemoval(t, true)
+		t.Run(string(tc.kind)+"/"+tc.reference, func(t *testing.T) {
+			log := fakeRetentionDocker(t, true, "")
 			step := retentionRemoveStepFor(t, tc.kind, tc.reference, nil)
 			check, err := step.Check(context.Background(), engine.Runtime{})
 			if err != nil {
@@ -190,24 +196,27 @@ func TestRetentionRemoveStepTreatsAlreadyGoneAsSuccess(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !strings.Contains(string(raw), tc.want) {
-				t.Fatalf("the removal command was not rendered: %s", raw)
+				t.Fatalf("the expected probe/removal command was not rendered: %s", raw)
 			}
 		})
 	}
 }
 
 func TestRetentionRemoveStepRendersTheRemovalCommands(t *testing.T) {
-	log := fakeDockerRemoval(t, false)
+	log := fakeRetentionDocker(t, false, "cid123|api|production|/eregion-api-production-abc")
 	for _, tc := range []struct {
 		kind      retention.ItemKind
 		reference string
+		extra     func(*RetentionRemovePayload)
 		want      string
 	}{
-		{retention.ItemContainer, "eregion-api-production-abc", "rm --force eregion-api-production-abc"},
-		{retention.ItemBuildpackCache, "eregion-build-cache-api-production", "volume rm eregion-build-cache-api-production"},
-		{retention.ItemRelease, "sha256:" + strings.Repeat("d", 64), "image rm sha256:" + strings.Repeat("d", 64)},
+		{retention.ItemContainer, "eregion-api-production-abc", func(payload *RetentionRemovePayload) {
+			payload.App, payload.Environment = "api", "production"
+		}, "rm --force cid123"},
+		{retention.ItemBuildpackCache, testBuildCacheVolume, nil, "volume rm " + testBuildCacheVolume},
+		{retention.ItemRelease, "sha256:" + strings.Repeat("d", 64), nil, "image rm sha256:" + strings.Repeat("d", 64)},
 	} {
-		step := retentionRemoveStepFor(t, tc.kind, tc.reference, nil)
+		step := retentionRemoveStepFor(t, tc.kind, tc.reference, tc.extra)
 		if _, err := step.Apply(context.Background(), engine.Runtime{}, nil); err != nil {
 			t.Fatal(err)
 		}
@@ -217,13 +226,87 @@ func TestRetentionRemoveStepRendersTheRemovalCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"rm --force eregion-api-production-abc",
-		"volume rm eregion-build-cache-api-production",
+		"rm --force cid123",
+		"volume rm " + testBuildCacheVolume,
 		"image rm sha256:" + strings.Repeat("d", 64),
 	} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("missing command %q in:\n%s", want, raw)
 		}
+	}
+}
+
+func TestRetentionRemoveContainerRequiresOwnershipAtExecutionTime(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		inspect     string
+		app         string
+		environment string
+		wantErr     string
+		wantRemoved bool
+	}{
+		{
+			name: "owned", inspect: "cid123|api|production|/eregion-api-production-abc",
+			app: "api", environment: "production", wantRemoved: true,
+		},
+		{
+			name: "registry container", inspect: "cid123|||/eregion-registry",
+			wantErr: "infrastructure container",
+		},
+		{
+			name: "unlabeled container", inspect: "cid123|<no value>|<no value>|/other",
+			wantErr: "ownership label",
+		},
+		{
+			name: "other app", inspect: "cid123|other|production|/eregion-other-production-abc",
+			app: "api", wantErr: "belongs to app",
+		},
+		{
+			name: "other environment", inspect: "cid123|api|staging|/eregion-api-staging-abc",
+			app: "api", environment: "production", wantErr: "belongs to environment",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := fakeRetentionDocker(t, false, tc.inspect)
+			step := retentionRemoveStepFor(t, retention.ItemContainer, "eregion-api-production-abc", func(payload *RetentionRemovePayload) {
+				payload.App, payload.Environment = tc.app, tc.environment
+			})
+			_, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+			raw, _ := os.ReadFile(log)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				if strings.Contains(string(raw), "rm --force") {
+					t.Fatalf("an unowned container was removed:\n%s", raw)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantRemoved || !strings.Contains(string(raw), "rm --force cid123") {
+				t.Fatalf("the owned container was not removed by its immutable ID:\n%s", raw)
+			}
+		})
+	}
+}
+
+func TestRetentionRemovalRunsUnderTheHostLock(t *testing.T) {
+	for _, step := range []engine.Step{
+		retentionRemoveStepFor(t, retention.ItemContainer, "eregion-api-production-abc", nil),
+		retentionRemoveStepFor(t, retention.ItemDanglingImage, "sha256:"+strings.Repeat("b", 64), nil),
+	} {
+		if _, ok := step.(engine.HostLockIndependent); ok {
+			t.Fatalf("%s must not opt out of the node host lock", step.ID())
+		}
+	}
+	gc, err := buildRetentionGCStep(retentionTestExecution("platform-retention-gc-01-v1"), []byte(`{"step":"platform-retention-gc-01-v1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := gc.(engine.HostLockIndependent); ok {
+		t.Fatal("garbage collection must not opt out of the node host lock")
 	}
 }
 
@@ -307,14 +390,13 @@ func TestRetentionRemoveRegistryDeleteHandlesGoneAndDisabledDeletes(t *testing.T
 	}
 }
 
-func TestRetentionGCScriptStopsRestartsAndNeverDeletesUntaggedManifests(t *testing.T) {
+func TestRetentionGCStopsRestartsAndRecoversAnInterruptedAttempt(t *testing.T) {
 	payload := RetentionGCPayload{
 		Step: "platform-retention-gc-01-v1", RegistryDir: "/srv/registry",
 		ConfigPath: "/etc/eregion/registry/config.yml", Unit: "eregion-registry.service",
 	}
 	raw, _ := json.Marshal(payload)
-	exec := retentionTestExecution(payload.Step)
-	built, err := buildRetentionGCStep(exec, raw)
+	built, err := buildRetentionGCStep(retentionTestExecution(payload.Step), raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -336,38 +418,58 @@ func TestRetentionGCScriptStopsRestartsAndNeverDeletesUntaggedManifests(t *testi
 	if !strings.Contains(script, RegistryImage) {
 		t.Fatalf("the collection container does not use the pinned registry image:\n%s", script)
 	}
+	if !strings.Contains(script, "--name eregion-registry-gc") ||
+		!strings.Contains(script, "docker container inspect eregion-registry-gc") ||
+		!strings.Contains(script, "docker rm --force eregion-registry-gc") {
+		t.Fatalf("a retry cannot detect and remove an orphaned collection container:\n%s", script)
+	}
+	if !strings.Contains(script, "failed to restart eregion-registry.service after garbage collection") ||
+		!strings.Contains(script, `exit "$status"`) {
+		t.Fatalf("a registry restart failure in the trap is suppressed:\n%s", script)
+	}
+	if strings.Contains(script, "systemctl start 'eregion-registry.service' >/dev/null 2>&1 || true") {
+		t.Fatalf("the trap still suppresses a restart failure:\n%s", script)
+	}
 	check, err := step.Check(context.Background(), engine.Runtime{})
 	if err != nil || check.Complete {
 		t.Fatalf("garbage collection must run when requested: %+v, %v", check, err)
 	}
 
 	invalid := payload
-	invalid.Step = payload.Step
 	invalid.Unit = "not-a-unit"
 	raw, _ = json.Marshal(invalid)
-	if _, err := buildRetentionGCStep(exec, raw); err == nil {
+	if _, err := buildRetentionGCStep(retentionTestExecution(payload.Step), raw); err == nil {
 		t.Fatal("an invalid registry unit was accepted")
 	}
 	invalid = payload
 	invalid.Image = "registry:2.8.3"
 	raw, _ = json.Marshal(invalid)
-	if _, err := buildRetentionGCStep(exec, raw); err == nil {
+	if _, err := buildRetentionGCStep(retentionTestExecution(payload.Step), raw); err == nil {
 		t.Fatal("an unpinned registry image was accepted")
 	}
 }
 
-func TestPackBuildUsesTheExplicitCacheVolume(t *testing.T) {
+func TestPackBuildUsesTheExplicitBuildAndLaunchCaches(t *testing.T) {
 	payload := PackPayload{
 		Image: "eregion/api-production:abc", Builder: DefaultBuilder, Path: t.TempDir(),
-		Env: map[string]string{"BP_JVM_VERSION": "21"}, Cache: BuildpackCacheVolume("api", "production"),
+		Env:         map[string]string{"BP_JVM_VERSION": "21"},
+		Cache:       BuildpackCacheVolume("api", "production"),
+		LaunchCache: BuildpackLaunchCacheVolume("api", "production"),
 	}
-	args := strings.Join(packBuildArgs(payload, "/src"), " ")
-	if !strings.Contains(args, "--cache type=build;format=volume;name=eregion-build-cache-api-production") {
-		t.Fatalf("pack build has no explicit cache volume: %s", args)
+	args := packBuildArgs(payload, "/src")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--cache type=build;format=volume;name="+testBuildCacheVolume) {
+		t.Fatalf("pack build has no explicit build cache: %s", joined)
 	}
-	payload.Cache = ""
+	if !strings.Contains(joined, "--cache type=launch;format=volume;name="+testLaunchCacheVolume) {
+		t.Fatalf("pack build has no explicit launch cache: %s", joined)
+	}
+	if strings.Count(joined, "--cache ") != 2 {
+		t.Fatalf("pack 0.40 needs one cache type per --cache flag: %s", joined)
+	}
+	payload.Cache, payload.LaunchCache = "", ""
 	if strings.Contains(strings.Join(packBuildArgs(payload, "/src"), " "), "--cache") {
-		t.Fatal("an unset cache must keep the builder's own default")
+		t.Fatal("unset caches must keep the builder's own defaults")
 	}
 
 	exec := retentionTestExecution("platform-pack-01-v1")
@@ -378,8 +480,9 @@ func TestPackBuildUsesTheExplicitCacheVolume(t *testing.T) {
 		t.Fatal("an unattributable cache volume was accepted")
 	}
 	payload.Cache = BuildpackCacheVolume("api", "production")
+	payload.LaunchCache = BuildpackLaunchCacheVolume("api", "production")
 	raw, _ = json.Marshal(payload)
 	if _, err := buildPackStep(exec, raw); err != nil {
-		t.Fatalf("the eregion cache volume was refused: %v", err)
+		t.Fatalf("the eregion cache volumes were refused: %v", err)
 	}
 }

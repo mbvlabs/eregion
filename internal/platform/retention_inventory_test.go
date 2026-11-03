@@ -14,27 +14,67 @@ const (
 	testConfigDigest   = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	testLayerDigest    = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
 	testUntaggedDigest = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+	testDeletedDigest  = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+	testMissingDigest  = "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+	// The cache names embed hex("api") and hex("production").
+	testBuildCacheVolume  = "eregion-build-cache-617069_70726f64756374696f6e"
+	testLaunchCacheVolume = "eregion-launch-cache-617069_70726f64756374696f6e"
 )
 
-func TestBuildpackCacheVolumeIsDeterministicPerEnvironment(t *testing.T) {
-	first := BuildpackCacheVolume("api", "production")
-	if first != "eregion-build-cache-api-production" {
-		t.Fatalf("cache volume = %q", first)
+func TestBuildpackCacheVolumeNamesAreUnambiguous(t *testing.T) {
+	first := BuildpackCacheVolume("a-b", "c")
+	second := BuildpackCacheVolume("a", "b-c")
+	if first == second {
+		t.Fatalf("cache volumes collide: %q", first)
 	}
-	if first != BuildpackCacheVolume("api", "production") {
-		t.Fatal("the cache volume name is not deterministic")
+	if first != "eregion-build-cache-612d62_63" || second != "eregion-build-cache-61_622d63" {
+		t.Fatalf("cache volumes = %q, %q", first, second)
 	}
-	if first == BuildpackCacheVolume("api", "staging") {
-		t.Fatal("two environments share one cache volume")
+	// pack rewrites reserved substrings in an explicit volume name; the hex
+	// encoding never contains one.
+	reserved := BuildpackCacheVolume("console", "nul")
+	if strings.Contains(reserved, "con") || strings.Contains(reserved, "nul") {
+		t.Fatalf("pack would rewrite the cache volume name %q", reserved)
 	}
-	if !cacheVolumePattern.MatchString(first) {
-		t.Fatalf("the generated cache volume name is not accepted by the retention steps: %q", first)
+	for name, want := range map[string][3]string{
+		first:                 {"a-b", "c", "build"},
+		second:                {"a", "b-c", "build"},
+		testLaunchCacheVolume: {"api", "production", "launch"},
+		testBuildCacheVolume:  {"api", "production", "build"},
+		reserved:              {"console", "nul", "build"},
+	} {
+		app, environment, kind, ok := ParseBuildpacksCacheVolume(name)
+		if !ok || app != want[0] || environment != want[1] || kind != want[2] {
+			t.Fatalf("parse %q = %q %q %q %v", name, app, environment, kind, ok)
+		}
+		if !cacheVolumePattern.MatchString(name) {
+			t.Fatalf("the retention steps refuse the generated cache volume %q", name)
+		}
+	}
+
+	legacy := "pack-cache-0123456789abcdef.build"
+	app, environment, kind, ok := ParseBuildpacksCacheVolume(legacy)
+	if !ok || kind != "pack" || app != "" || environment != "" {
+		t.Fatalf("legacy pack cache = %q %q %q %v", app, environment, kind, ok)
+	}
+	if !cacheVolumePattern.MatchString(legacy) {
+		t.Fatal("a legacy pack cache volume cannot be pruned")
+	}
+	for _, invalid := range []string{"eregion-build-cache-api", "eregion-build-cache-api_prod_extra", "pack-cache-random", "other-volume"} {
+		if _, _, _, ok := ParseBuildpacksCacheVolume(invalid); ok {
+			t.Fatalf("%q was parsed as an eregion cache", invalid)
+		}
+		if cacheVolumePattern.MatchString(invalid) {
+			t.Fatalf("%q is removable as a cache", invalid)
+		}
 	}
 }
 
 // writeRegistryFixture builds the filesystem layout of registry:2.8.3 with one
-// tagged and one untagged manifest, plus the same manifest in a second
-// repository. It returns the registry directory and the manifest blob lengths.
+// tagged and one untagged manifest, the same manifest in a second repository, a
+// deleted revision directory without its link, and a linked revision whose
+// manifest blob is missing. It returns the registry directory and the manifest
+// blob lengths.
 func writeRegistryFixture(t *testing.T) (string, int, int) {
 	t.Helper()
 	registryDir := filepath.Join(t.TempDir(), "registry")
@@ -42,7 +82,8 @@ func writeRegistryFixture(t *testing.T) (string, int, int) {
 	repo := filepath.Join(base, "repositories", "demo", "app", "_manifests")
 	putBlob := func(digest string, content []byte) {
 		hex := strings.TrimPrefix(digest, "sha256:")
-		path := filepath.Join(base, "blobs", "sha256", hex, "data")
+		// Distribution shards blobs by the first two hex characters.
+		path := filepath.Join(base, "blobs", "sha256", hex[:2], hex, "data")
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -77,26 +118,47 @@ func writeRegistryFixture(t *testing.T) (string, int, int) {
 	// them into one entry.
 	otherRepo := filepath.Join(base, "repositories", "other", "repo", "_manifests")
 	putLink(filepath.Join(otherRepo, "revisions", "sha256", strings.TrimPrefix(testManifestDigest, "sha256:"), "link"), testManifestDigest)
+
+	// A deleted revision leaves its directory behind but Distribution removes
+	// the link; it is not a live manifest.
+	deletedDir := filepath.Join(base, "repositories", "deleted", "repo", "_manifests", "revisions", "sha256", strings.TrimPrefix(testDeletedDigest, "sha256:"))
+	if err := os.MkdirAll(deletedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A revision link without a manifest blob is a warning, not a zero-byte
+	// artifact.
+	missingRepo := filepath.Join(base, "repositories", "missing", "repo", "_manifests")
+	putLink(filepath.Join(missingRepo, "revisions", "sha256", strings.TrimPrefix(testMissingDigest, "sha256:"), "link"), testMissingDigest)
 	return registryDir, len(manifest), len(untagged)
 }
 
 func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 	registryDir, taggedManifestBytes, untaggedManifestBytes := writeRegistryFixture(t)
-	volumeMount := filepath.Join(t.TempDir(), "volume")
-	if err := os.MkdirAll(volumeMount, 0o700); err != nil {
-		t.Fatal(err)
+	newVolume := func(name string, size int) string {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "cache.tar"), make([]byte, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
 	}
-	if err := os.WriteFile(filepath.Join(volumeMount, "cache.tar"), make([]byte, 4096), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	buildMount := newVolume("build", 4096)
+	launchMount := newVolume("launch", 1024)
+	legacyMount := newVolume("legacy", 512)
 
 	answers := map[string]string{
 		"docker ps --all --quiet --no-trunc --filter label=io.eregion.app":                             "cid1\n",
 		"docker container inspect --size cid1":                                                         `[{"Id":"cid1","Name":"/eregion-api-production-abc","Created":"2026-02-03T04:05:06.123456789Z","State":{"Status":"exited"},"Config":{"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Labels":{"io.eregion.app":"api","io.eregion.environment":"production"}},"SizeRw":1024}]`,
 		"docker image ls --quiet --no-trunc --filter dangling=true":                                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
 		"docker image inspect sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": `[{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Created":"2026-02-04T05:06:07Z","Size":2048}]`,
-		"docker volume ls --quiet --filter name=eregion-build-cache-":                                  "eregion-build-cache-api-production\n",
-		"docker volume inspect --format {{.Mountpoint}} eregion-build-cache-api-production":            volumeMount,
+		"docker volume ls --quiet --filter name=eregion-build-cache-":                                  testBuildCacheVolume + "\n",
+		"docker volume ls --quiet --filter name=eregion-launch-cache-":                                 testLaunchCacheVolume + "\n",
+		"docker volume ls --quiet --filter name=pack-cache-":                                           "pack-cache-0123456789abcdef.build\n",
+		"docker volume inspect --format {{.Mountpoint}} " + testBuildCacheVolume:                       buildMount,
+		"docker volume inspect --format {{.Mountpoint}} " + testLaunchCacheVolume:                      launchMount,
+		"docker volume inspect --format {{.Mountpoint}} pack-cache-0123456789abcdef.build":             legacyMount,
 		"docker image ls --all --quiet --no-trunc":                                                     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n",
 		"docker image inspect sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd": `[{"Id":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","RepoTags":["127.0.0.1:5000/demo/app:v1"],"RepoDigests":["127.0.0.1:5000/demo/app@` + testManifestDigest + `"]}]`,
 	}
@@ -150,6 +212,9 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 	if len(otherRepository.Tags) != 0 || otherRepository.Bytes != tagged.Bytes || otherRepository.ConfigDigest != testConfigDigest {
 		t.Fatalf("second-repository artifact facts = %+v", otherRepository)
 	}
+	if len(inventory.Warnings) == 0 || !strings.Contains(strings.Join(inventory.Warnings, "\n"), testMissingDigest) {
+		t.Fatalf("a missing manifest blob must be an explicit warning: %+v", inventory.Warnings)
+	}
 
 	if len(inventory.Containers) != 1 {
 		t.Fatalf("containers = %+v", inventory.Containers)
@@ -174,11 +239,23 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 	if got := inventory.LocalImages[0].RepoDigests; len(got) != 1 || got[0] != "127.0.0.1:5000/demo/app@"+testManifestDigest {
 		t.Fatalf("local image repository digests = %+v", got)
 	}
-	if len(inventory.CacheVolumes) != 1 {
+	if len(inventory.CacheVolumes) != 3 {
 		t.Fatalf("cache volumes = %+v", inventory.CacheVolumes)
 	}
-	if inventory.CacheVolumes[0].Name != "eregion-build-cache-api-production" || inventory.CacheVolumes[0].SizeBytes != 4096 {
-		t.Fatalf("cache volume = %+v", inventory.CacheVolumes[0])
+	buildCache := inventory.CacheVolumes[0]
+	if buildCache.Name != testBuildCacheVolume || buildCache.Kind != "build" ||
+		buildCache.App != "api" || buildCache.Environment != "production" || buildCache.SizeBytes != 4096 {
+		t.Fatalf("build cache = %+v", buildCache)
+	}
+	launchCache := inventory.CacheVolumes[1]
+	if launchCache.Name != testLaunchCacheVolume || launchCache.Kind != "launch" ||
+		launchCache.App != "api" || launchCache.SizeBytes != 1024 {
+		t.Fatalf("launch cache = %+v", launchCache)
+	}
+	legacyCache := inventory.CacheVolumes[2]
+	if legacyCache.Name != "pack-cache-0123456789abcdef.build" || legacyCache.Kind != "pack" ||
+		!legacyCache.Ownerless || legacyCache.SizeBytes != 512 {
+		t.Fatalf("legacy pack cache = %+v", legacyCache)
 	}
 	if inventory.Disk.TotalBytes <= 0 || inventory.Disk.FreeBytes < 0 {
 		t.Fatalf("disk = %+v", inventory.Disk)

@@ -7,14 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/spf13/cobra"
@@ -232,10 +236,43 @@ func nodeRegistryAddress() string {
 	return host.DefaultConfig(host.RoleMain, "").RegistryListen
 }
 
+// nodeHostLockPath is the lock every node host mutation takes: builds, host
+// apply, retention removal and garbage collection. The image push takes it too,
+// so a GC or registry restart cannot interrupt a push half-way.
+func nodeHostLockPath() string {
+	if value := strings.TrimSpace(os.Getenv("EREGION_NODE_STATE_DIR")); value != "" {
+		return filepath.Join(value, "host.lock")
+	}
+	if config, err := host.LoadNodeFile(host.DefaultNodeConfigPath()); err == nil && strings.TrimSpace(config.StateDir) != "" {
+		return filepath.Join(strings.TrimSpace(config.StateDir), "host.lock")
+	}
+	return filepath.Join(node.DefaultStateDir(), "host.lock")
+}
+
+// acquireNodeHostLock takes the node's host lock without waiting: a running
+// build or collection is reported, not stalled behind an image upload.
+func acquireNodeHostLock(ctx context.Context) (engine.Release, error) {
+	release, err := engine.Acquire(ctx, nodeHostLockPath(), engine.LockExclusive, 0)
+	if err != nil {
+		if errors.Is(err, engine.ErrLockHeld) {
+			return nil, contract.NewFault(contract.Unavailable,
+				"another host mutation is running on the node",
+				"Wait for the running build, apply or garbage collection to finish, then retry the image push.")
+		}
+		return nil, contract.NewFault(contract.Unavailable, "the node host lock is not available", err.Error())
+	}
+	return release, nil
+}
+
 func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Reader, out io.Writer) (rpcImagePushResult, error) {
 	if err := validateImagePushParams(params); err != nil {
 		return rpcImagePushResult{}, err
 	}
+	release, err := acquireNodeHostLock(ctx)
+	if err != nil {
+		return rpcImagePushResult{}, err
+	}
+	defer release()
 	if payload == nil {
 		payload = strings.NewReader("")
 	}

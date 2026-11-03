@@ -41,7 +41,7 @@ var (
 	retentionGCStepPattern     = regexp.MustCompile(`^platform-retention-gc-01-v1$`)
 	registryRepositoryPattern  = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
 	registryDigestPattern      = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
-	cacheVolumePattern         = regexp.MustCompile(`^eregion-build-cache-[a-z0-9][a-z0-9-]{0,200}$`)
+	cacheVolumePattern         = regexp.MustCompile(`^(eregion-(build|launch)-cache-[0-9a-f]{2,80}_[0-9a-f]{2,80}|pack-cache-[a-z0-9][a-z0-9_.-]*\.(build|launch))$`)
 	registryUnitPattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9@._-]{0,127}\.service$`)
 )
 
@@ -112,7 +112,7 @@ func buildRetentionRemoveStep(exec engine.Execution, raw json.RawMessage) (engin
 		}
 	case retention.ItemBuildpackCache:
 		if !cacheVolumePattern.MatchString(payload.Reference) {
-			return nil, errors.New("only an eregion build cache volume can be pruned")
+			return nil, errors.New("only an eregion build/launch cache or legacy pack cache volume can be pruned")
 		}
 	case retention.ItemContainer:
 		if !containerNamePattern.MatchString(payload.Reference) {
@@ -191,16 +191,77 @@ func (s *RetentionRemoveStep) dockerCheckArgs() []string {
 	switch retention.ItemKind(s.payload.Kind) {
 	case retention.ItemRelease, retention.ItemDanglingImage:
 		return []string{"docker", "image", "inspect", "--format", "{{.Id}}", s.payload.Reference}
-	case retention.ItemContainer:
-		return []string{"docker", "inspect", "--type=container", "--format", "{{.Id}}", s.payload.Reference}
 	case retention.ItemBuildpackCache:
 		return []string{"docker", "volume", "inspect", "--format", "{{.Name}}", s.payload.Reference}
 	}
 	return nil
 }
 
+// retentionContainerInspectFormat reads the immutable ID and ownership labels
+// in one Docker call. Container removal never trusts a name alone.
+const retentionContainerInspectFormat = `{{.Id}}|{{index .Config.Labels "io.eregion.app"}}|{{index .Config.Labels "io.eregion.environment"}}|{{.Name}}`
+
+type retentionContainer struct {
+	ID          string
+	App         string
+	Environment string
+	Name        string
+}
+
+func (s *RetentionRemoveStep) inspectContainer(ctx context.Context, rt engine.Runtime) (retentionContainer, bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	stdout, stderr, err := runArgv(probeCtx, []string{
+		"docker", "inspect", "--type=container", "--format", retentionContainerInspectFormat, s.payload.Reference,
+	}, nil, rt, s.ID(), nil)
+	if err != nil {
+		if alreadyGoneString(stderr) {
+			return retentionContainer{}, false, nil
+		}
+		return retentionContainer{}, false, permanentCommandError(fmt.Errorf("inspect container %s: %w: %s", s.payload.Reference, err, firstLine(stderr)))
+	}
+	parts := strings.SplitN(strings.TrimSpace(stdout), "|", 4)
+	if len(parts) != 4 || parts[0] == "" {
+		return retentionContainer{}, false, fmt.Errorf("%w: the node returned an unreadable container inspection", engine.ErrPermanent)
+	}
+	value := func(part string) string {
+		if part == "<no value>" {
+			return ""
+		}
+		return part
+	}
+	return retentionContainer{
+		ID: parts[0], App: value(parts[1]), Environment: value(parts[2]),
+		Name: strings.TrimPrefix(parts[3], "/"),
+	}, true, nil
+}
+
+// verifyContainer refuses to remove anything but an owned workload container.
+// The label check runs at execution time, so a recycled name cannot delete an
+// infrastructure container.
+func (s *RetentionRemoveStep) verifyContainer(container retentionContainer) error {
+	name := container.Name
+	if name == "" {
+		name = s.payload.Reference
+	}
+	if name == "eregion-registry" || s.payload.Reference == "eregion-registry" {
+		return fmt.Errorf("%w: %s is an eregion infrastructure container and is never removed by retention", engine.ErrPermanent, name)
+	}
+	if container.App == "" {
+		return fmt.Errorf("%w: container %s has no io.eregion.app ownership label", engine.ErrPermanent, name)
+	}
+	if s.payload.App != "" && container.App != s.payload.App {
+		return fmt.Errorf("%w: container %s belongs to app %q, not %q", engine.ErrPermanent, name, container.App, s.payload.App)
+	}
+	if s.payload.Environment != "" && container.Environment != s.payload.Environment {
+		return fmt.Errorf("%w: container %s belongs to environment %q, not %q", engine.ErrPermanent, name, container.Environment, s.payload.Environment)
+	}
+	return nil
+}
+
 func (s *RetentionRemoveStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckResult, error) {
-	if retention.ItemKind(s.payload.Kind) == retention.ItemRegistryArtifact {
+	kind := retention.ItemKind(s.payload.Kind)
+	if kind == retention.ItemRegistryArtifact {
 		exists, err := s.registryManifestExists(ctx)
 		if err != nil {
 			return engine.CheckResult{}, err
@@ -209,6 +270,19 @@ func (s *RetentionRemoveStep) Check(ctx context.Context, rt engine.Runtime) (eng
 			return engine.CheckResult{Detail: "registry manifest " + s.payload.Reference + " still exists"}, nil
 		}
 		return engine.CheckResult{Complete: true, Detail: "registry manifest " + s.payload.Reference + " is already gone"}, nil
+	}
+	if kind == retention.ItemContainer {
+		container, exists, err := s.inspectContainer(ctx, rt)
+		if err != nil {
+			return engine.CheckResult{}, err
+		}
+		if !exists {
+			return engine.CheckResult{Complete: true, Detail: "container " + s.payload.Reference + " is already gone"}, nil
+		}
+		if err := s.verifyContainer(container); err != nil {
+			return engine.CheckResult{}, err
+		}
+		return engine.CheckResult{Detail: "container " + container.Name + " (" + container.ID + ") still exists"}, nil
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -227,17 +301,32 @@ func (s *RetentionRemoveStep) Check(ctx context.Context, rt engine.Runtime) (eng
 const retentionDockerTimeout = 2 * time.Minute
 
 func (s *RetentionRemoveStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
-	if retention.ItemKind(s.payload.Kind) == retention.ItemRegistryArtifact {
+	kind := retention.ItemKind(s.payload.Kind)
+	if kind == retention.ItemRegistryArtifact {
 		return s.applyRegistryDelete(ctx, report)
 	}
 	runCtx, cancel := context.WithTimeout(ctx, retentionDockerTimeout)
 	defer cancel()
 	var argv []string
-	switch retention.ItemKind(s.payload.Kind) {
+	switch kind {
 	case retention.ItemRelease, retention.ItemDanglingImage:
 		argv = []string{"docker", "image", "rm", s.payload.Reference}
 	case retention.ItemContainer:
-		argv = []string{"docker", "rm", "--force", s.payload.Reference}
+		container, exists, err := s.inspectContainer(ctx, rt)
+		if err != nil {
+			return engine.ApplyResult{}, err
+		}
+		if !exists {
+			return engine.ApplyResult{Result: map[string]any{
+				"kind": s.payload.Kind, "reference": s.payload.Reference, "already_gone": true,
+			}}, nil
+		}
+		if err := s.verifyContainer(container); err != nil {
+			return engine.ApplyResult{}, err
+		}
+		// Remove the immutable ID, not the name: the name may have been
+		// recycled between inventory and execution.
+		argv = []string{"docker", "rm", "--force", container.ID}
 	case retention.ItemBuildpackCache:
 		argv = []string{"docker", "volume", "rm", s.payload.Reference}
 	default:
@@ -442,18 +531,33 @@ func (s *RetentionGCStep) Check(context.Context, engine.Runtime) (engine.CheckRe
 }
 
 // script renders the GC effect. A failure before the collection finishes still
-// restarts the registry through the trap.
+// restarts the registry, and a failed restart is itself a step failure rather
+// than a suppressed trap. A named one-off container lets a retry remove the
+// leftover of an abruptly killed attempt before reopening the storage.
 func (s *RetentionGCStep) script() string {
+	unit := shellQuote(s.payload.Unit)
 	return `set -euo pipefail
-restore_registry() { systemctl start ` + shellQuote(s.payload.Unit) + ` >/dev/null 2>&1 || true; }
-systemctl stop ` + shellQuote(s.payload.Unit) + `
+# A killed attempt may leave the collection container behind; remove it before
+# the storage is opened again.
+if /usr/bin/docker container inspect eregion-registry-gc >/dev/null 2>&1; then
+  /usr/bin/docker rm --force eregion-registry-gc >/dev/null 2>&1 || true
+fi
+restore_registry() {
+  status=$?
+  if ! systemctl start ` + unit + `; then
+    echo "failed to restart ` + s.payload.Unit + ` after garbage collection" >&2
+    status=1
+  fi
+  exit "$status"
+}
 trap restore_registry EXIT
-/usr/bin/docker run --rm --network none \
+systemctl stop ` + unit + `
+/usr/bin/docker run --rm --name eregion-registry-gc --network none \
   --volume ` + shellQuote(s.payload.RegistryDir) + `:/var/lib/registry \
   --volume ` + shellQuote(s.payload.ConfigPath) + `:/etc/docker/registry/config.yml:ro \
   ` + shellQuote(s.payload.Image) + ` /bin/registry garbage-collect /etc/docker/registry/config.yml
-systemctl start ` + shellQuote(s.payload.Unit) + `
-systemctl is-active --quiet ` + shellQuote(s.payload.Unit) + ``
+systemctl start ` + unit + `
+systemctl is-active --quiet ` + unit + ``
 }
 
 func (s *RetentionGCStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {

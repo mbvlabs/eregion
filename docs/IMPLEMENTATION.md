@@ -342,11 +342,15 @@ determined).
 `retention.inventory` is a read-only node RPC (`inventory` on the node
 transport) returning `retention.Inventory`: registry manifests keyed by
 `(repository, digest)` with their tags, config digest, created time and the
-bytes of the manifest plus its unique blobs; the `eregion-build-cache-` volumes
-and sizes; `io.eregion.app`-labeled containers with labels and state; dangling
+bytes of the manifest plus its unique blobs; the Buildpacks cache volumes and
+sizes; `io.eregion.app`-labeled containers with labels and state; dangling
 images; local images with their `RepoDigests`; and statfs total/free bytes for
 the data directory. Identical digests in two repositories stay two entries,
-because a registry delete names one repository.
+because a registry delete names one repository. Registry storage is read in
+Distribution's layout (`blobs/sha256/<first two hex>/<hex>/data`) and a
+revision is live only while its `_manifests/revisions/.../link` is valid. A
+missing manifest or referenced blob is an inventory warning, not a zero-byte
+artifact.
 
 Removal is one journaled node step per planner item:
 `platform-retention-remove-<12 hex>-v1`, where the suffix hashes the item kind
@@ -355,21 +359,32 @@ and reference. The kinds are `release` and `dangling_image` (local
 through the loopback registry API), `buildpack_cache` (`docker volume rm`) and
 `container` (`docker rm --force`). Already-gone is success, so a retried prune
 converges; a registry without deletes enabled fails with `405` naming
-`host-registry-v2`. A GC effect, `platform-retention-gc-01-v1`, stops
-`eregion-registry.service`, runs `registry garbage-collect` in a one-off
-container against the same storage, and restarts the unit. It never passes
-`--delete-untagged`: releases are referenced by digest, so an untagged manifest
-can still be a live release; only manifests explicitly deleted through the API
-become unreferenced, and plain garbage collection removes their blobs.
+`host-registry-v2`. Container removal re-inspects the container at execution
+time, requires the `io.eregion.app` ownership label and the payload's app and
+environment, and removes the immutable container ID; the registry container and
+any unowned container are refused. Removal and GC steps run under the node host
+lock, so they cannot race a pack build. A GC effect,
+`platform-retention-gc-01-v1`, stops `eregion-registry.service`, removes an
+orphaned `eregion-registry-gc` container from an interrupted attempt, runs
+`registry garbage-collect` in a one-off container against the same storage, and
+restarts the unit. A restart failure fails the step; it is never suppressed. It
+never passes `--delete-untagged`: releases are referenced by digest, so an
+untagged manifest can still be a live release; only manifests explicitly
+deleted through the API become unreferenced, and plain garbage collection
+removes their blobs. `image.push` takes the same host lock, so a registry
+restart or collection cannot interrupt a push.
 
 `host-registry-v2` enables manifest deletion (`storage.delete.enabled: true`
 plus `REGISTRY_STORAGE_DELETE_ENABLED=true` in the unit) and restarts the
 registry so a v1 node takes the change. A v1 node reports the new version as
 pending once; the second plan is a no-op. The control plane/deploy path builds
-with an explicit Buildpacks cache volume,
-`eregion-build-cache-<app>-<environment>`, through
-`pack build --cache type=build;format=volume;name=…`, so a cache is attributable
-and can be pruned by name.
+with explicit build and launch cache volumes,
+`eregion-build-cache-<hex app>_<hex environment>` and
+`eregion-launch-cache-<hex app>_<hex environment>`, through two `pack build
+--cache` flags. The encoding is reversible, cannot collide (`a-b`/`c` versus
+`a`/`b-c`) and avoids pack's reserved-name rewriting. Inventory also reports
+pre-upgrade `pack-cache-*.<build|launch>` volumes as ownerless caches; pruning
+one is safe under the node host lock because no pack build is running.
 
 ## Migration and external database policy
 
