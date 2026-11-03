@@ -301,6 +301,16 @@ tagged build. "Builds" or "appears in `commands --json`" is never the gate.
 Disk retention (D30) is not an alpha.1 gate; it is required before v1.0.0
 final and is the main alpha.2 item.
 
+Exception (R10): the macOS half of the install and upgrade checks is recorded
+as **not run (no Mac available)**. It must be qualified before v1.0.0 final
+and is not an alpha.1 gate; CI's macOS CLI job and the darwin/arm64 cross-build
+remain, but neither is host acceptance.
+
+Final qualification (R3, R11): alpha.1 is qualified by **one complete
+MANUAL-TESTING baseline run on a freshly initialized server with the candidate
+build**. `main` serves only intermediate testing and the node-upgrade checks;
+earlier passes are context, not qualification.
+
 ## 8. Current state
 
 Source state 2026-10-28: rows 1–15 are implemented in the integrated source on
@@ -346,13 +356,34 @@ rejected Caddy reload with restore and automatic recovery. It also found that
 the D17 switch is **not** zero-downtime under concurrent clients: each Caddy
 config load resets a few in-flight TLS handshakes (2–3 per switch with four
 parallel clients) because Caddy rebinds its SO_REUSEPORT listener. A runtime
-`net.ipv4.tcp_migrate_req=1` removed every reset in four dense switches; the
-source fix is a new `host-ingress-sysctl-v1` step, implemented with tests but
-not yet published or host-verified. Fresh init, human-factor-positive flows
+`net.ipv4.tcp_migrate_req=1` removed every reset in four dense switches. The
+fix, a new `host-ingress-sysctl-v1` step, is published as edge-42a0541c09d4
+and installed on main (second apply no-op, doctor 18/0/0); four dense switches
+then had zero failures in 6,262 requests. Fresh init, human-factor-positive flows
 and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resume testing” section for the saved target,
 fixture state, evidence locations and unqualified acceptance variants, and its
 run records for operation IDs. Row 16 is in progress; row 17 remains
 unimplemented and required before v1.0.0 final.
+
+On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
+switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
+phase, across a fresh build, a redeploy and a rollback, with the body changing
+between v3 and v3 src3), relative and absolute symlink-escape rejection,
+same-key replay after the branch was deleted,
+rollback refusal for a release whose command never succeeded, failed-candidate
+isolation with a cleanup-removal fault (the leak was recorded; later maintenance
+removal was not re-observed), interleaved domain changes with 7,074/7,074
+monitor responses, the dev-CLI dry-run version mismatch with the node unchanged,
+and terminal detach/replay plus explicit cancel. Live `build logs --follow` was
+observed without saved evidence. Two defects are fixed after the run and one
+remains open. Fixed: the Caddy public path `/v1/environments/*/deployments`
+matched one segment and returned 404 (2943e18, with a matcher regression test),
+and a failed container cleanup was summarised as "candidate cleanup completed"
+(4e827aa, now a warning event naming the containers). **Open defect 3:** a
+worker SIGKILL leaves its platform operation running until River's rescue,
+about 30 minutes (30m21s observed on op_f0d20fed6c26eb6bd138c84bd211e170); the
+fix is in progress for alpha.1 by rescuing this host's orphaned platform jobs
+on worker start. Neither fixed defect has been host-retested.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
@@ -360,8 +391,8 @@ including guided creates. Success exits 0; remote cancellation and viewer detach
 both exit 130 but have distinct messages and state evidence. Isolated regressions
 cover plain, JSON and NDJSON. Real-host failed deploy follows returned exit 5,
 success returned 0 and the build-stop retest returned cancellation exit 130;
-guided failure, viewer detach and remaining output variants still need manual
-qualification.
+terminal Ctrl-C detach/replay and explicit cancel passed (153/154). Guided
+failure and remaining output variants still need manual qualification.
 
 A source re-check on 2026-10-28 (snapshot `a7478c4`) and a real deployment of a
 second app (andurel-site, edge-8a7179d: image push, digest deploy, release

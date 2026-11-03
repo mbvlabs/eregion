@@ -97,7 +97,7 @@ fails. Install the CLI from the published edge or alpha channel.
 | Factor-gated removal | Real `app delete`/`env delete` need exact-target confirmation and a TOTP code at a human terminal; JSON/yes/pipes cannot perform them. Direct node submission without a valid same-request factor and all real HTTP delete submissions refuse; dry-run preview stays agent-usable. |
 | Removal | `domain remove`, `env delete --confirm` and `app delete --confirm` remove containers, routes and secrets per D13; other apps keep serving; operation history remains. |
 
-## Resume testing — saved session state, 2026-10-29
+## Resume testing — saved session state, updated 2026-10-31
 
 Start a fresh session by reading [MASTER](MASTER.md), then
 [IMPLEMENTATION](IMPLEMENTATION.md), then this section and the run records below.
@@ -109,15 +109,16 @@ Facts below are the last recorded observations, not a fresh host check.
 
 | Item | Last recorded state |
 | --- | --- |
-| Repository | `/home/mbv/work/eregion`, branch `master`; saved evidence committed through `b5a1a56` (documentation-only). Uncommitted after it: this resume section, the 2026-10-29 resumed run record, and the unpublished `host-ingress-sysctl-v1` source fix (`internal/host/step_ingress_sysctl*.go`, `runner.go`). |
-| Tested CLI and main | `edge-ef91d70f6215`, source `ef91d70f6215180c64f73ba5b60bb3f3a2655d70`; CI and signed edge publication passed. Do not confuse a newer edge publication with an installed or qualified build. |
+| Repository | `/home/mbv/work/eregion`, branch `master`; tested revision `42a0541` (TCP migration fix `c09b321` plus docs). Fixes `2943e18` (CI endpoint path) and `4e827aa` (cleanup reporting) are committed after it; the 2026-10-30/31 evidence updates may be uncommitted. |
+| Tested CLI and main | `edge-42a0541c09d4`, source `42a0541`; CI and signed edge publication passed. Earlier passes ran on `edge-ef91d70f6215`. Do not confuse a newer edge publication with an installed or qualified build. |
 | Existing server | Context/node `main`, host `exploration`, Ubuntu 26.04 amd64; public IP `46.224.129.96`; operator `admin@10.78.0.1:22` through embedded WireGuard, endpoint `46.224.129.96:51820`. |
-| Health | Doctor 18 pass / 0 warn / 0 fail; second apply 0 applied / 17 skipped; schema 16/16, River 7/7; Caddy 2.11.4; `net.ipv4.tcp_migrate_req=0` (diagnostic change reverted). A build with the sysctl step will apply one new step. |
+| Health | Doctor 18 pass / 0 warn / 0 fail; second apply 0 applied / 18 skipped; schema 16/16, River 7/7; Caddy 2.11.4 (not restarted by the upgrade); `net.ipv4.tcp_migrate_req=1` from `host-ingress-sysctl-v1`. |
+| Known open defect | Defect 3: a worker SIGKILL leaves its platform operation running until River's rescue, about 30 minutes (30m21s observed, evidence 149/150). Fix in progress for alpha.1. |
 | External database | PostgreSQL 17 on the operator machine, container `eregion-cp-pg`, host port 5433. Main reaches it through TLS-terminated Tailscale Funnel `thelab.tailbbed89.ts.net:10000`. No DSN belongs in this document. |
 | Test app | `githello/production`, `APP_VERSION=v3`; web ×2 (`eregion-hello`, port 8080) and worker ×1 (`eregion-hello worker`, no port); release command `eregion-hello release`; health `/healthz`. |
-| Serving release | `rel_07d1c0fb27cdc0d68c7e5815a56e9328`, healthy monorepo source `b895cb2f54daeaedafac44397072db893cd8ef1c`; deployment `dep_4ca1b01d314414a4fdaef2730cd1760b`, revision 8, release command `eregion-hello release` (last checked 17:55 UTC). |
+| Serving release | Latest recorded: `rel_0170b1be56a64a747d522a2831cb02d8`, source commit `3461a87`, redeployed by op_4dc3431876c9f4f0e5caae4cd22d695f and op_6f4a7968f5823f71cd1003ec33a81293 (deployment ID not captured). Earlier snapshot: `rel_07d1c0fb27cdc0d68c7e5815a56e9328`, source `b895cb2f54daeaedafac44397072db893cd8ef1c`, deployment `dep_4ca1b01d314414a4fdaef2730cd1760b`, revision 8. |
 | Source desired state | Private `https://github.com/mbvlabs/eregion-hello.git`, ref `main`, context `apps/web`, builder `paketobuildpacks/builder-jammy-base`, credential name `GIT_READ_TOKEN`. |
-| Primary | `https://git-test1.mbvlabs.com/`, last recorded DNS-only, returns `eregion sample: v3`. |
+| Primary | `https://git-test1.mbvlabs.com/`, last recorded DNS-only, returns `eregion sample: v3 src3`. |
 | Alias | `https://git-test2.mbvlabs.com/users/sign-in`, Cloudflare-proxied, returns `alias ready`; binding check path `/users/sign-in`. Both bindings last observed route=applied, certificate=valid, public=ok. |
 | Secret metadata | Current `HELLO_SECRET` revision 2; original v1 rollback used its pinned revision 1. `GIT_READ_TOKEN` revision 1. Values must never be printed. |
 
@@ -176,6 +177,8 @@ are under `/home/mbv/.cache/eregion-run/` (operator-local, not Git artifacts):
 | Alias removal, injected route-write failure and automatic recovery | `79-*` through `87-*`, `92-domain-recovery-final.json` |
 | Latest inventory, NDJSON logs and unsigned-upload rejection | `88-*` through `91-*` |
 | Release-command change/failure/refusal, cleanup obstruction, Caddy reload resets and `tcp_migrate_req`, rejected reload and recovery | `93-*` through `123-*` |
+| TCP migration dense continuity | `124-*` through `127-*` |
+| Release-changing dense switches, symlink escape, replay, failed-command rollback, failed-candidate cleanup, domain churn with worker kills, dev dry-run, detach/replay and cancel | `128-*` through `154-*` |
 
 The Python alias continuity monitor returned 403 and is **not** passing evidence;
 use the later curl measurements. Saved binding/operation acceptance is not
@@ -190,21 +193,26 @@ do not treat a passed subset as completion of an entire row.
 
 | Baseline area | Recorded coverage and remaining qualification |
 | --- | --- |
-| Guided/operator flow | **Not run:** guided app/env create success and failure, Ctrl-C detach and reattach, flag/guided revision equivalence. Flag-only create and app-create replay passed. |
-| Login and contexts | **Not run:** atomic failed replacement, successful second-machine login, wrong-key refusal, context selection variants and removal. Preserve the working main context and identity. |
-| Zero-downtime switch | **Fail on edge-ef91d70f6215 under concurrent clients:** each Caddy `/load` resets a few in-flight TLS handshakes (Caddy's per-load SO_REUSEPORT listener). Source fix `host-ingress-sysctl-v1` (`net.ipv4.tcp_migrate_req=1`) is unpublished; after publishing, apply on main and repeat the dense four-to-six-loop primary test across several switches. |
-| Cleanup and route failure | Previous-container removal failure, visible cleanup row and later maintenance removal passed; rejected Caddy reload with restore and periodic recovery passed; write-failure recovery and alias removal passed. **Not run:** failed-candidate removal failure and concurrent/interrupted route changes. Use a scoped reversible fault and restoration guard; do not disturb other apps. |
-| Release-command recovery | Once-per-release skipping, a changed command running again, and restart/scale refusal after a failed run passed. **Not run:** rollback refusal (needs a release whose recorded command never succeeded) and unresolved/lost-response recovery variants. |
-| Build/repair variants | Monorepo, missing-path rejection, moved-branch retry, stop/retry and basic serving-container repair passed. **Not run:** symlink-escape rejection, replay with unavailable git, competing/stale repair variants and live build-log follow acceptance. |
-| CI/webhooks | **Not run:** authenticated CI deploy, expired/revoked/wrong-target token denial, public API restriction, signed push deployment, redelivery deduplication, other-branch/bad-signature rejection and webhook-secret rotation. Token creation requires the human factor; a webhook secret must never enter ordinary evidence. |
-| Protected operations/removal | JSON/no-TTY refusals and deletion preview passed. **Not run:** factor-positive token creation, both exports, app/env deletion including last environment, cleanup/history verification and direct same-request-factor rejection variants. Human enters the authenticator code; never derive it from node files. |
-| Fresh-host acceptance | **Not run:** fresh pinned Caddy installation, preflight/plan variants, init doctor/resume/skip-doctor, interrupted init/discard, lockdown revert, handoff and break-glass. Requires an explicitly authorized fresh target; main is not that target. |
-| Release/platform variants | Signed upgrades on main and unsigned/dev rejection passed. **Not run or partial:** macOS installed-CLI acceptance, remaining dry-run mismatch and failed-manifest-retrieval variants. Cross-compilation and CI are not a substitute for host acceptance. |
+| Guided create | **Not run:** guided `app create`/`env create` success and failure, ending at a serving URL or a failed operation; guided vs flag-only revision equivalence. Flag-only create and app-create replay passed. Needs DNS A records git-test3/git-test4 → 46.224.129.96 and an agent in a PTY. |
+| CI endpoint | **Not run:** authenticated CI deploy; expired, revoked and wrong-environment tokens denied; nothing else of `/v1` reachable publicly. Needs defect 1 published and applied, plus a token created at a human terminal. |
+| Push to deploy | **Not run:** signed push deploys; a redelivery does not deploy twice; another branch or a bad signature does nothing; after rotation the old secret fails. Needs `env update --auto-deploy` at a human terminal and a GitHub webhook on `mbvlabs/eregion-hello`. |
+| Factor-gated ops | **Not run:** positive `token create`, `secrets export`, `secret export`, `app delete`, `env delete` (including deleting the last environment); cleanup and history verified. JSON/no-TTY refusals and deletion preview passed. Needs the human authenticator. |
+| Login and contexts | **Not run:** successful second-machine login from the bundle, atomic failed replacement, wrong host key, context selection and `context remove`. Needs the bundle from `secrets export`, then an agent. Preserve the working main context and identity. |
+| Upgrades | **Partial:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). **Not run:** `upgrade` between two edge builds and a failed manifest download during a node upgrade never falling back to checksum-only. Needs two published edge builds and an agent. |
+| macOS | **Not run (no Mac available, R10):** `install.sh` on macOS and an installed CLI against the server. CI's macOS CLI job and the darwin/arm64 cross-build are not host acceptance. Required before v1.0.0 final; not an alpha.1 gate. |
+| Disk retention (alpha.1 gate, R9) | **Not run:** every row 17 acceptance check: 30 releases → exactly the policy's set; `prune --dry-run` lists items and bytes; rollback to a pruned release refuses; a second `apply` is a no-op; registry GC frees space; doctor disk warnings. Needs T12 implemented, then an agent on the server. |
+| Fresh host | **Not run:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. Needs an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
+| Release-command recovery | **Not run:** lost or unresolved response recovery variants. Once-per-release skipping, a changed command running again and restart/scale refusal after a failed run passed. Needs a scoped fault; stays an alpha.1 gate (R4). |
+| Repair variants | **Not run:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. Needs a scoped fault. |
+| Final pass | **Not run:** the complete baseline (every row, including retention) on the candidate build, starting from a freshly initialized server (R3, R11). Earlier builds' passes are context, not qualification; the user authorizes `1.x` and the tag after the recorded pass. |
 
-No infrastructure outage or injected fault was left at the stopping point. The
-known open defect is the Caddy-reload connection reset above (fix in source,
-not yet published). Missing prerequisites: an authorized fresh server and
-human participation for factor-positive operations. Other unqualified variants
+Defect 3 is the only open known defect at the stopping point: a worker SIGKILL
+leaves its platform operation running for about 30 minutes until River rescues
+it (30m21s observed, evidence 149/150). The CI endpoint path and false
+cleanup-summary defects are fixed at source but not host-retested; the
+Caddy-reload reset fix is host-verified. Missing prerequisites for the remaining
+alpha.1 rows: an authorized fresh server and human participation for
+factor-positive operations. macOS is deferred (R10). Other unqualified variants
 remain **not run**, not implementation failures or passes.
 
 ### Safety and local resources
@@ -245,16 +253,25 @@ remain **not run**, not implementation failures or passes.
 ## Current qualification boundary
 
 Real-host evidence spans several published edge builds, recorded below.
-`edge-ef91d70f6215` is the latest installed and tested build; earlier passes are
-not automatically a full baseline pass for it. Source fixes have isolated
-regressions, build/vet and darwin/arm64 cross-build evidence; published CI also
-ran race checks. These are distinct from manual acceptance.
+`edge-42a0541c09d4` is the latest installed and tested build; earlier passes are
+not automatically a full baseline pass for it. The 2026-10-29/30 runs closed
+release-changing dense switches, symlink-escape rejection, same-key replay after
+the branch was deleted, rollback refusal for a release whose command never
+succeeded, failed-candidate leak recording, interleaved domain changes with
+worker kills, the dev-CLI dry-run mismatch and terminal detach/replay/cancel.
+They also found defect 3 (worker SIGKILL leaves an operation running for about
+30 minutes); the Caddy CI path and cleanup-summary defects are fixed after the
+run but not host-retested. Source fixes have isolated regressions, build/vet and
+darwin/arm64 cross-build evidence; published CI also ran race checks. These are
+distinct from manual acceptance.
 
 Failed deploy follows returned exit 5 on main, successful follows returned 0,
 and the build-stop retest returned 130 with terminal cancellation and the prior
-serving release preserved. Guided failure and viewer-detach acceptance remain
+serving release preserved. Terminal Ctrl-C detach/replay and explicit cancel
+passed (153/154); guided failure and the remaining output-mode variants remain
 not run. Complete and record the remaining baseline for the actual release
-candidate before asking the user to authorize `1.x` or `v1.0.0-alpha.1`.
+candidate, from a freshly initialized server (R11), before asking the user to
+authorize `1.x` or `v1.0.0-alpha.1`.
 
 ## Run record
 
@@ -612,6 +629,115 @@ Evidence: ~/.cache/eregion-run/93-* through 123-* (97/98/104/106/120 monitors,
 Remaining: publish and retest the TCP migration fix; guided create/detach,
   login/context variants, release-command recovery variants, symlink escape,
   CI/webhooks, factor-positive operations, fresh-host init and macOS install.
+```
+
+```text
+Date / build / commit / channel: 2026-10-29 / edge-42a0541c09d4 / 42a0541 / edge
+CI (race, integration, macOS CLI) and edge publication: pass
+CLI upgrade edge-ef91d70f6215 -> edge-42a0541c09d4: pass
+apply --auto-upgrade-nodes: pass; applied host-ingress-sysctl-v1 plus the
+  api/worker restarts and readiness for the new binary (4 of 18); Caddy not
+  restarted (active since 11:38 UTC). Second apply 0 of 18. Doctor 18/0/0;
+  schema 16/16, River 7/7. Kernel value 1; boot file present.
+Dense continuity retest (redeploy rel_07d1, six fresh-TLS loops on the
+  direct primary plus one loop on the proxied alias):
+  op_e63ac7b9a3dccba70827ac4e93ff1315 1200/1200 + 280/280,
+  op_5409d44112c85916e41f0cab6fc9d08e 1366/1366 + 338/338,
+  op_3757d4167c88fa5a17c703ee525f4286 1063/1063 + 269/269,
+  op_d5f8122c1dee93272e3afc0360afb339 1389/1389 + 357/357; each run switched
+  Caddy once. Zero failures (previous build: 2-3 resets per switch at four
+  loops). Caddy reload reset fix: PASS on host.
+Evidence: ~/.cache/eregion-run/124-* through 127-*.
+Remaining: as in the previous record, minus the TCP migration retest.
+```
+
+```text
+Date / build / commit / channel: 2026-10-30/31 / edge-42a0541c09d4 / 42a0541 / edge
+Operator OS/arch: linux/amd64; CLI and main edge-42a0541c09d4
+Server: existing main, Ubuntu 26.04 amd64; schema 16/16, River 7/7; doctor
+  18/0/0 and second apply 0/18 before the run; no upgrade during it
+App: githello/production; git-test1 direct, git-test2 Cloudflare-proxied
+Release-changing dense switches (128-131; six fresh-TLS primary loops plus one
+  alias loop): fresh build op_4da4ef81457eb47fc41e19bad2a70755 (commit 3461a87,
+  release rel_0170b1be56a64a747d522a2831cb02d8) 4,597 primary + 967 alias
+  responses (5,564 including the pre-switch phase); release redeploy
+  op_4dc3431876c9f4f0e5caae4cd22d695f 1,150 + 245; rollback to
+  rel_07d1c0fb27cdc0d68c7e5815a56e9328
+  op_51c9ca8c40a26b61d559383bf6183866 1,049 + 227. 7,673/7,673 responses
+  during the three switch windows (8,235/8,235 including the pre-switch
+  phase), no resets; bodies changed v3 <-> v3 src3 at the switches. A preceding
+  rollback op_ce09a4dbb762c46375677f4a19c8b6c9 also succeeded (24.4s, 61
+  events). PASS.
+Symlink escape (132-133): relative symlink op_e70ba096d8386648f75e73fb63025c49
+  and absolute symlink op_30fe551ab69119ebc83d3eecb1226118 both failed
+  precondition_failed naming context path "apps/web" absent/outside; previous
+  release kept serving. PASS.
+Same-key replay after branch deletion (134-136): key qual-replay,
+  op_f82e084105cafb638dfd52f6b7106445 succeeded (release
+  rel_ab664af01d2828346c363defe223e01e); replaying the same key returned the
+  same succeeded operation without another deploy (135); a new key was refused
+  because the branch was gone (136, precondition_failed). PASS.
+Failed release-command rollback (137-140): env update to command `false`
+  op_d6e7c1e706c0f9d51699e5caf753b888; deploy
+  op_af19655248dabe3766a06b28b52c4a89 failed at platform-command-01-v1 (exit
+  status 1) and rel_ab664af01d2828346c363defe223e01e kept serving; rollback to
+  rel_73e26b4973dd4d1deef36aed0e8ab334 was refused at submission
+  (precondition_failed, "release command has not succeeded for this release");
+  command restored op_d595b0296338811caf53a97477b323a3. PASS.
+Failed candidate with removal failure (141-146): a temporary docker wrapper
+  failed only the candidate web-1 removal (30-minute guard); FAIL_HEALTH config
+  op_0cccf6cb8ab9b041e0287871a0f2c385; deploy
+  op_308fae9fa06fe611113e1bb90381fbf7 failed health 503 and the previous
+  release kept serving; its cleanup step failed with the injected error and
+  144 showed pending_cleanup ["githello-production-web-1-037149ee58d2"].
+  Fault removed 09:04:26; FAIL_HEALTH unset
+  op_c34b332d6bfab5d8880bb2114d4ac91f. Candidate-cleanup warning was correct,
+  but the final summary still said "candidate cleanup completed" (defect 2).
+  No post-removal env status was saved, so the later maintenance removal was
+  not captured in 141-146. PASS for isolation and leak recording; removal not
+  evidenced.
+Interleaved domain changes and worker kills (147-150): add git-test3
+  op_adab749ca783474b144b1c08b8414ead, add git-test4
+  op_79bb8ebc76a8ba5c57e1705e40b165b7, remove git-test3
+  op_53147c6f3d81cd1b7d2d2d96a917d081, remove git-test4
+  op_20732130eeeb39f4262243381bd62da8 (follow not saved), re-add git-test3
+  op_f0d20fed6c26eb6bd138c84bd211e170. Monitor 147: 7,074/7,074 HTTP 200
+  (3,537 primary + 3,537 alias). SIGKILLs at 09:06:50 and 09:07:21 left the
+  re-add running until 09:37:39 (elapsed 30m21s), then it succeeded. DEFECT 3.
+Dev-CLI dry-run mismatch (151-152): `apply --dry-run --auto-upgrade-nodes`
+  refused node_version_mismatch and `server status` refused with the same code;
+  node binary SHA-256, size and service start timestamps were unchanged
+  before/after (152-node-*). 151 config set
+  op_cf611159edfef3dc7880f943aadb1455 succeeded; no lock left. PASS.
+Detach and cancel (153-154): real-terminal Ctrl-C detached from
+  op_6f4a7968f5823f71cd1003ec33a81293 after 39 events, exit 130, with the
+  follow hint; `operations follow` replayed it to success in 26.8s with
+  rel_0170b1be56a64a747d522a2831cb02d8 serving. Explicit `operations cancel`
+  op_39546ea45e1125630c1d8011a093f39e reached cancelling at sequence 14 and
+  cancelled at a step boundary (19.6s); rel_0170b1be56a64a747d522a2831cb02d8
+  still served. PASS.
+Live `build logs --follow`: streamed in a real terminal; no numbered evidence
+  file or operation ID was saved. PASS observed; evidence gap.
+Defects:
+  1. Caddy's public path `/v1/environments/*/deployments` let `*` match one
+     segment, so `/v1/environments/<app>/<env>/deployments` returned Caddy's
+     404. Fixed in 2943e18 with `*/*` and a matcher regression test; not yet
+     host-retested on main.
+  2. A cleanup failure was summarised as "candidate cleanup completed".
+     Observed in 143 (cleanup warning plus "completed" summary) and 144
+     (pending_cleanup). Fixed in 4e827aa: cleanup failures are warning events
+     naming the containers and failed state is retained; not host-retested.
+  3. A worker SIGKILL leaves its platform operation running until River's
+     rescue, about 30 minutes (30m21s observed on op_f0d2...). Fix in progress
+     for alpha.1 (rescue this host's orphaned platform jobs on worker start).
+Final state: rel_0170b1be56a64a747d522a2831cb02d8 serving; git-test3 re-added,
+  git-test4 removal accepted without a saved follow; no post-session env status
+  was captured. No injected fault, wrapper or guard timer was left; no upgrade
+  ran during the session.
+Evidence: ~/.cache/eregion-run/128-* through 154-*.
+Remaining: the full baseline on the candidate build from a freshly initialized
+  server (R3, R11), including guided create, CI, push to deploy, factor-positive
+  operations, login/contexts, retention and the other open rows.
 ```
 
 ```text

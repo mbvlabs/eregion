@@ -69,7 +69,7 @@ accepted operation, not DNS, TLS or a healthy app; only `domain list` readiness
 aggregates all four observations.
 
 The main hostname's Caddy site exposes **only** `/readyz`,
-`/v1/environments/*/deployments*` (the per-environment CI endpoint) and
+`/v1/environments/*/*/deployments[/*]` (the per-environment CI endpoint) and
 `/v1/webhooks/github/*/*` (per-environment push delivery), forwarding to
 loopback. Never expose the whole admin API as a workaround. Caddy's admin
 endpoint must stay local; access to it is administrative authority.
