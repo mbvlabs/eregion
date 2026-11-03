@@ -10,13 +10,14 @@ import (
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
 func isHostMethod(method string) bool {
 	switch method {
-	case methodHostPlan, methodHostApply, methodHostDoctor, methodHostStatus:
+	case methodHostPlan, methodHostApply, methodHostDoctor, methodHostStatus, methodRetentionInventory:
 		return true
 	}
 	return false
@@ -92,8 +93,23 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 	case methodHostStatus:
 		facts := host.GatherFacts(ctx, cfg, cfgErr, host.Plan{}, nil, request.ClientVersion, request.ClientCommit, registry)
 		return host.StatusFromFacts(facts), nil
+	case methodRetentionInventory:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, err
+		}
+		layout := host.DefaultLayout()
+		if cfg.Layout.DataDir != "" {
+			layout = cfg.Layout
+		}
+		inventory, err := platform.ObserveRetentionInventory(ctx, platform.RetentionInventoryPaths{
+			DataDir: layout.DataDir, RegistryDir: layout.RegistryDir,
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		return inventory, nil
 	default:
-		return nil, contract.NewFault(contract.Usage, "unknown host method "+request.Method, "Use host.plan, host.apply, host.doctor, or host.status.")
+		return nil, contract.NewFault(contract.Usage, "unknown host method "+request.Method, "Use host.plan, host.apply, host.doctor, host.status, or retention.inventory.")
 	}
 }
 

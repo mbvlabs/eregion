@@ -58,6 +58,8 @@ func StepFamilies() []Family {
 		{Match: packStepPattern.MatchString, Build: buildPackStep},
 		{Match: buildStopStepPattern.MatchString, Build: buildBuildStopStep},
 		{Match: deleteStepPattern.MatchString, Build: buildDeleteStep},
+		{Match: retentionRemoveStepPattern.MatchString, Build: buildRetentionRemoveStep},
+		{Match: retentionGCStepPattern.MatchString, Build: buildRetentionGCStep},
 	}
 }
 
@@ -715,6 +717,10 @@ type PackPayload struct {
 	// embedded askpass helper. The value never enters the payload.
 	GitCredentialSecretKey string `json:"git_credential_secret_key,omitempty"`
 	TimeoutSeconds         int    `json:"timeout_seconds,omitempty"`
+	// Cache names the explicit Buildpacks build-cache volume. BuildpackCacheVolume
+	// derives the deterministic per-environment name; an empty value keeps the
+	// builder's own default (no named eregion cache to attribute or prune).
+	Cache string `json:"cache,omitempty"`
 }
 
 type PackStep struct {
@@ -778,6 +784,9 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	}
 	if payload.TimeoutSeconds < 10 || payload.TimeoutSeconds > 1800 {
 		return nil, errors.New("build timeout must be 10–1800 seconds")
+	}
+	if payload.Cache != "" && !cacheVolumePattern.MatchString(payload.Cache) {
+		return nil, errors.New("a build cache must be an eregion build cache volume name")
 	}
 	return &PackStep{exec: exec, payload: payload}, nil
 }
@@ -889,10 +898,7 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	if err != nil || !info.IsDir() {
 		return engine.ApplyResult{}, fmt.Errorf("%w: build source %s is not a readable directory on the node", engine.ErrPermanent, source)
 	}
-	args := []string{"pack", "build", s.payload.Image, "--path", source, "--builder", s.payload.Builder}
-	for _, key := range sortedEnvKeys(s.payload.Env) {
-		args = append(args, "--env", key+"="+s.payload.Env[key])
-	}
+	args := packBuildArgs(s.payload, source)
 	buildRunCtx, cancel := context.WithTimeout(buildCtx, time.Duration(s.payload.TimeoutSeconds)*time.Second)
 	defer cancel()
 	_, stderr, err := runArgvClean(buildRunCtx, args, isolation, rt, s.ID(), report)
@@ -910,6 +916,20 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 		result["commit"] = commit
 	}
 	return engine.ApplyResult{Result: result}, nil
+}
+
+// packBuildArgs renders one Buildpacks build. An explicit volume cache keeps a
+// cache attributable to one environment; pack otherwise leaves no named cache
+// to prune.
+func packBuildArgs(payload PackPayload, source string) []string {
+	args := []string{"pack", "build", payload.Image, "--path", source, "--builder", payload.Builder}
+	if payload.Cache != "" {
+		args = append(args, "--cache", "type=build;format=volume;name="+payload.Cache)
+	}
+	for _, key := range sortedEnvKeys(payload.Env) {
+		args = append(args, "--env", key+"="+payload.Env[key])
+	}
+	return args
 }
 
 // resolveGitContextPath resolves the revision's Buildpacks context inside the
@@ -1145,8 +1165,12 @@ func validateArgv(argv []string) error {
 		switch argv[1] {
 		case "version", "pull", "run", "stop", "rm", "inspect", "port", "ps", "network", "restart":
 		case "image":
-			if len(argv) < 3 || (argv[2] != "inspect" && argv[2] != "ls") {
+			if len(argv) < 3 || (argv[2] != "inspect" && argv[2] != "ls" && argv[2] != "rm") {
 				return errors.New("unsupported docker image command")
+			}
+		case "volume":
+			if len(argv) < 3 || (argv[2] != "ls" && argv[2] != "inspect" && argv[2] != "rm") {
+				return errors.New("unsupported docker volume command")
 			}
 		default:
 			return errors.New("unsupported docker command")

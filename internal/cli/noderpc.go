@@ -31,6 +31,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/protect"
 	"github.com/mbvlabs/eregion/internal/release"
+	"github.com/mbvlabs/eregion/internal/retention"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/tokens"
@@ -70,38 +71,42 @@ type Backend interface {
 	TokenRevoke(context.Context, string, string) (tokens.Metadata, error)
 	HandoffExport(context.Context, string) (rpcHandoffExportResult, error)
 	NodeInfo(context.Context) (rpcNodeInfoResult, error)
+	// RetentionInventory reads the node's reclaimable disk artifacts for the
+	// disk-retention planner. It is read-only.
+	RetentionInventory(context.Context) (retention.Inventory, error)
 }
 
 const (
 	nodeBinaryPath = "/usr/local/bin/eregion"
 
-	methodVersion        = "version"
-	methodUpgradeInstall = "upgrade.install"
-	methodTest           = "operations.test"
-	methodSubmit         = "operations.submit"
-	methodGet            = "operations.get"
-	methodEvents         = "operations.events"
-	methodCancel         = "operations.cancel"
-	methodInventory      = "platform.inventory"
-	methodSecretSet      = "vault.set"
-	methodSecretArchive  = "vault.archive"
-	methodSecretMetadata = "vault.metadata"
-	methodSecretList     = "vault.list"
-	methodSecretExport   = "vault.export"
-	methodReady          = "ready"
-	methodHostPlan       = "host.plan"
-	methodHostApply      = "host.apply"
-	methodHostDoctor     = "host.doctor"
-	methodHostStatus     = "host.status"
-	methodProtectInit    = "protect.init"
-	methodProtectConfirm = "protect.confirm"
-	methodProtectStatus  = "protect.status"
-	methodTokenCreate    = "token.create"
-	methodTokenList      = "token.list"
-	methodTokenRevoke    = "token.revoke"
-	methodHandoffExport  = "handoff.export"
-	methodNodeInfo       = "node.info"
-	methodImagePush      = "image.push"
+	methodVersion            = "version"
+	methodUpgradeInstall     = "upgrade.install"
+	methodTest               = "operations.test"
+	methodSubmit             = "operations.submit"
+	methodGet                = "operations.get"
+	methodEvents             = "operations.events"
+	methodCancel             = "operations.cancel"
+	methodInventory          = "platform.inventory"
+	methodSecretSet          = "vault.set"
+	methodSecretArchive      = "vault.archive"
+	methodSecretMetadata     = "vault.metadata"
+	methodSecretList         = "vault.list"
+	methodSecretExport       = "vault.export"
+	methodReady              = "ready"
+	methodHostPlan           = "host.plan"
+	methodHostApply          = "host.apply"
+	methodHostDoctor         = "host.doctor"
+	methodHostStatus         = "host.status"
+	methodProtectInit        = "protect.init"
+	methodProtectConfirm     = "protect.confirm"
+	methodProtectStatus      = "protect.status"
+	methodTokenCreate        = "token.create"
+	methodTokenList          = "token.list"
+	methodTokenRevoke        = "token.revoke"
+	methodHandoffExport      = "handoff.export"
+	methodNodeInfo           = "node.info"
+	methodImagePush          = "image.push"
+	methodRetentionInventory = "retention.inventory"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -680,6 +685,8 @@ func waitLabel(method string, params any) string {
 		return "Exporting the handoff…"
 	case methodNodeInfo:
 		return "Reading the node…"
+	case methodRetentionInventory:
+		return "Reading retention inventory…"
 	case methodVersion:
 		return "Checking the node version…"
 	}

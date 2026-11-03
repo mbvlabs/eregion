@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -20,9 +21,10 @@ type Hooks struct {
 
 // Dispatcher executes node requests against one local state directory.
 type Dispatcher struct {
-	engine *engine.Engine
-	hooks  Hooks
-	steps  *StepRegistry
+	engine  *engine.Engine
+	hooks   Hooks
+	steps   *StepRegistry
+	dataDir string
 }
 
 func NewDispatcher(stateDir, nodeName string, registry *secrets.Registry) (*Dispatcher, error) {
@@ -40,7 +42,7 @@ func NewDispatcherWithSteps(stateDir, nodeName string, registry *secrets.Registr
 	if steps == nil {
 		steps = DefaultRegistry()
 	}
-	return &Dispatcher{engine: nodeEngine, steps: steps}, nil
+	return &Dispatcher{engine: nodeEngine, steps: steps, dataDir: filepath.Dir(stateDir)}, nil
 }
 
 // SetHooks installs test seams. It is not part of the wire protocol.
@@ -49,6 +51,9 @@ func (d *Dispatcher) SetHooks(hooks Hooks) { d.hooks = hooks }
 func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Event)) (Response, error) {
 	if request.Method == MethodObserve {
 		return observeLocal(ctx, request)
+	}
+	if request.Method == MethodInventory {
+		return inventoryLocal(ctx, d.dataDir)
 	}
 	if err := request.Execution.Validate(); err != nil {
 		return Response{}, fmt.Errorf("invalid execution identity: %w", err)
@@ -126,6 +131,20 @@ func observeLocal(ctx context.Context, request Request) (Response, error) {
 	raw, err := json.Marshal(workloads)
 	if err != nil {
 		return Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: "the observation could not be encoded"}, nil
+	}
+	return Response{Status: engine.StatusCompleted, Result: raw}, nil
+}
+
+// inventoryLocal answers a read-only disk-retention observation on this node.
+func inventoryLocal(ctx context.Context, dataDir string) (Response, error) {
+	inventory, err := platform.ObserveRetentionInventory(ctx, platform.RetentionInventoryPaths{DataDir: dataDir}, nil)
+	if err != nil {
+		fault := contract.Classify(err)
+		return Response{Status: engine.StatusFailed, ErrorCode: string(fault.Code), Detail: fault.Message}, nil
+	}
+	raw, err := json.Marshal(inventory)
+	if err != nil {
+		return Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: "the inventory could not be encoded"}, nil
 	}
 	return Response{Status: engine.StatusCompleted, Result: raw}, nil
 }

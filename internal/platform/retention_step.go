@@ -1,0 +1,464 @@
+package platform
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/retention"
+)
+
+// RegistryImage is the local registry, pinned by digest, not only by tag. The
+// digest is the multi-architecture official registry:2.8.3 image index. Host
+// convergence and the retention garbage-collect step both use exactly this
+// image.
+const RegistryImage = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
+
+// The registry's host paths. Host convergence may use another layout; the
+// retention effects target these defaults unless the payload names them.
+const (
+	RegistryUnit        = "eregion-registry.service"
+	RegistryConfigPath  = "/etc/eregion/registry/config.yml"
+	DefaultRegistryAddr = "127.0.0.1:5000"
+)
+
+var (
+	retentionRemoveStepPattern = regexp.MustCompile(`^platform-retention-remove-[0-9a-f]{12}-v1$`)
+	retentionGCStepPattern     = regexp.MustCompile(`^platform-retention-gc-01-v1$`)
+	registryRepositoryPattern  = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
+	registryDigestPattern      = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	cacheVolumePattern         = regexp.MustCompile(`^eregion-build-cache-[a-z0-9][a-z0-9-]{0,200}$`)
+	registryUnitPattern        = regexp.MustCompile(`^[a-z0-9][a-z0-9@._-]{0,127}\.service$`)
+)
+
+// RetentionRemovePayload removes one planner item from the node. The item's
+// kind is a retention.ItemKind, so the planner, run record and node effect use
+// one vocabulary. Reference rules:
+//
+//   - release / dangling_image: an image ID, digest or reference
+//   - registry_artifact:        <repository>@sha256:<digest>; the delete is
+//     scoped to that repository, never to the bare digest
+//   - buildpack_cache:          the cache volume name
+//   - container:                the container name
+type RetentionRemovePayload struct {
+	Step        string `json:"step"`
+	Kind        string `json:"kind"`
+	Reference   string `json:"reference"`
+	Registry    string `json:"registry,omitempty"`
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+}
+
+// RetentionRemoveStepID derives the per-item step identity. One operation can
+// remove several items without their journal records colliding, and the same
+// kind and reference always produce the same effect key.
+func RetentionRemoveStepID(kind retention.ItemKind, reference string) string {
+	sum := sha256.Sum256([]byte(string(kind) + "\x00" + reference))
+	return "platform-retention-remove-" + hex.EncodeToString(sum[:6]) + "-v1"
+}
+
+// RegistryArtifactReference renders the reference form of one registry
+// manifest.
+func RegistryArtifactReference(repository, digest string) string {
+	return repository + "@" + digest
+}
+
+func parseRegistryArtifactReference(reference string) (repository, digest string, err error) {
+	repository, digest, ok := strings.Cut(strings.TrimSpace(reference), "@")
+	if !ok || repository == "" || digest == "" {
+		return "", "", errors.New("a registry artifact reference must be repository@sha256:<digest>")
+	}
+	return repository, digest, nil
+}
+
+func buildRetentionRemoveStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
+	var payload RetentionRemovePayload
+	if err := decodePayload(exec, raw, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Step != exec.Step {
+		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
+	}
+	kind := retention.ItemKind(payload.Kind)
+	switch kind {
+	case retention.ItemRelease, retention.ItemDanglingImage:
+		if err := ValidateImage(payload.Reference); err != nil {
+			return nil, err
+		}
+	case retention.ItemRegistryArtifact:
+		repository, digest, err := parseRegistryArtifactReference(payload.Reference)
+		if err != nil {
+			return nil, err
+		}
+		if !registryRepositoryPattern.MatchString(repository) {
+			return nil, fmt.Errorf("invalid registry repository %q", repository)
+		}
+		if !registryDigestPattern.MatchString(digest) {
+			return nil, fmt.Errorf("invalid registry digest %q", digest)
+		}
+	case retention.ItemBuildpackCache:
+		if !cacheVolumePattern.MatchString(payload.Reference) {
+			return nil, errors.New("only an eregion build cache volume can be pruned")
+		}
+	case retention.ItemContainer:
+		if !containerNamePattern.MatchString(payload.Reference) {
+			return nil, errors.New("invalid container name")
+		}
+	default:
+		return nil, fmt.Errorf("unknown retention item kind %q", payload.Kind)
+	}
+	if payload.App != "" {
+		if err := ValidateName(payload.App); err != nil {
+			return nil, err
+		}
+	}
+	if payload.Environment != "" {
+		if err := ValidateName(payload.Environment); err != nil {
+			return nil, err
+		}
+	}
+	if kind == retention.ItemRegistryArtifact {
+		address, err := normalizeRegistryAddress(payload.Registry)
+		if err != nil {
+			return nil, err
+		}
+		payload.Registry = address
+	} else {
+		payload.Registry = ""
+	}
+	if expected := RetentionRemoveStepID(kind, payload.Reference); payload.Step != expected {
+		// The step ID is derived from the item, so a mismatched ID would make
+		// the same reference look like two different effects.
+		return nil, fmt.Errorf("step ID %q does not match the item identity %q", payload.Step, expected)
+	}
+	return &RetentionRemoveStep{exec: exec, payload: payload}, nil
+}
+
+// normalizeRegistryAddress validates a loopback registry endpoint. A retention
+// effect never reaches a remote registry.
+func normalizeRegistryAddress(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = DefaultRegistryAddr
+	}
+	host, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return "", fmt.Errorf("invalid registry address %q: %w", value, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return "", errors.New("the registry address must be a loopback literal IP")
+	}
+	if port == "" || strings.HasPrefix(port, "0") {
+		return "", errors.New("invalid registry port")
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 {
+		return "", errors.New("invalid registry port")
+	}
+	return value, nil
+}
+
+// RetentionRemoveStep performs one idempotent removal. Already-gone state is
+// success: retention runs may be retried after a partial prune.
+type RetentionRemoveStep struct {
+	exec    engine.Execution
+	payload RetentionRemovePayload
+}
+
+func (s *RetentionRemoveStep) ID() string { return s.payload.Step }
+func (s *RetentionRemoveStep) Describe() string {
+	return "Remove retention item " + s.payload.Kind + " " + s.payload.Reference
+}
+func (s *RetentionRemoveStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
+func (s *RetentionRemoveStep) Inputs() ([]byte, error)         { return json.Marshal(s.payload) }
+
+func (s *RetentionRemoveStep) dockerCheckArgs() []string {
+	switch retention.ItemKind(s.payload.Kind) {
+	case retention.ItemRelease, retention.ItemDanglingImage:
+		return []string{"docker", "image", "inspect", "--format", "{{.Id}}", s.payload.Reference}
+	case retention.ItemContainer:
+		return []string{"docker", "inspect", "--type=container", "--format", "{{.Id}}", s.payload.Reference}
+	case retention.ItemBuildpackCache:
+		return []string{"docker", "volume", "inspect", "--format", "{{.Name}}", s.payload.Reference}
+	}
+	return nil
+}
+
+func (s *RetentionRemoveStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckResult, error) {
+	if retention.ItemKind(s.payload.Kind) == retention.ItemRegistryArtifact {
+		exists, err := s.registryManifestExists(ctx)
+		if err != nil {
+			return engine.CheckResult{}, err
+		}
+		if exists {
+			return engine.CheckResult{Detail: "registry manifest " + s.payload.Reference + " still exists"}, nil
+		}
+		return engine.CheckResult{Complete: true, Detail: "registry manifest " + s.payload.Reference + " is already gone"}, nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	_, stderr, err := runArgv(probeCtx, s.dockerCheckArgs(), nil, rt, s.ID(), nil)
+	if err != nil {
+		if alreadyGoneString(stderr) {
+			return engine.CheckResult{Complete: true, Detail: s.payload.Kind + " " + s.payload.Reference + " is already gone"}, nil
+		}
+		return engine.CheckResult{}, permanentCommandError(fmt.Errorf("inspect %s: %w: %s", s.payload.Reference, err, firstLine(stderr)))
+	}
+	return engine.CheckResult{Detail: s.payload.Kind + " " + s.payload.Reference + " still exists"}, nil
+}
+
+// retentionDockerTimeout bounds one Docker mutation. Removing an image or a
+// cache volume is local and short; a stuck daemon must not hold the operation.
+const retentionDockerTimeout = 2 * time.Minute
+
+func (s *RetentionRemoveStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
+	if retention.ItemKind(s.payload.Kind) == retention.ItemRegistryArtifact {
+		return s.applyRegistryDelete(ctx, report)
+	}
+	runCtx, cancel := context.WithTimeout(ctx, retentionDockerTimeout)
+	defer cancel()
+	var argv []string
+	switch retention.ItemKind(s.payload.Kind) {
+	case retention.ItemRelease, retention.ItemDanglingImage:
+		argv = []string{"docker", "image", "rm", s.payload.Reference}
+	case retention.ItemContainer:
+		argv = []string{"docker", "rm", "--force", s.payload.Reference}
+	case retention.ItemBuildpackCache:
+		argv = []string{"docker", "volume", "rm", s.payload.Reference}
+	default:
+		return engine.ApplyResult{}, fmt.Errorf("%w: unknown retention item kind %q", engine.ErrPermanent, s.payload.Kind)
+	}
+	_, stderr, err := runArgv(runCtx, argv, nil, rt, s.ID(), report)
+	if err != nil {
+		if alreadyGoneString(stderr) {
+			return engine.ApplyResult{Result: map[string]any{
+				"kind": s.payload.Kind, "reference": s.payload.Reference, "already_gone": true,
+			}}, nil
+		}
+		return engine.ApplyResult{}, permanentCommandError(fmt.Errorf("remove %s %s: %w: %s", s.payload.Kind, s.payload.Reference, err, firstLine(stderr)))
+	}
+	return engine.ApplyResult{Result: map[string]any{
+		"kind": s.payload.Kind, "reference": s.payload.Reference, "removed": true,
+	}}, nil
+}
+
+func alreadyGoneString(text string) bool {
+	lowered := strings.ToLower(text)
+	return strings.Contains(lowered, "no such image") || strings.Contains(lowered, "no such container") ||
+		strings.Contains(lowered, "no such object") || strings.Contains(lowered, "no such volume") ||
+		strings.Contains(lowered, "not found")
+}
+
+// ------------------------------------------------------------ registry delete
+
+var retentionRegistryHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	// The registry is a loopback service; an ambient HTTP proxy must never see
+	// a delete request.
+	Transport: &http.Transport{Proxy: nil},
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+var registryManifestAccept = strings.Join([]string{
+	"application/vnd.oci.image.index.v1+json",
+	"application/vnd.docker.distribution.manifest.list.v2+json",
+	"application/vnd.oci.image.manifest.v1+json",
+	"application/vnd.docker.distribution.manifest.v2+json",
+}, ", ")
+
+func (s *RetentionRemoveStep) registryURL() (string, error) {
+	repository, digest, err := parseRegistryArtifactReference(s.payload.Reference)
+	if err != nil {
+		return "", err
+	}
+	return (&url.URL{
+		Scheme: "http",
+		Host:   s.payload.Registry,
+		Path:   "/v2/" + repository + "/manifests/" + digest,
+	}).String(), nil
+}
+
+func (s *RetentionRemoveStep) registryManifestExists(ctx context.Context) (bool, error) {
+	endpoint, err := s.registryURL()
+	if err != nil {
+		return false, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, endpoint, nil)
+	if err != nil {
+		return false, err
+	}
+	request.Header.Set("Accept", registryManifestAccept)
+	response, err := retentionRegistryHTTPClient.Do(request)
+	if err != nil {
+		return false, contract.NewFault(contract.Unavailable, "the local registry is not reachable", err.Error())
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		_ = response.Body.Close()
+	}()
+	switch response.StatusCode {
+	case http.StatusOK:
+		return true, nil
+	case http.StatusNotFound:
+		return false, nil
+	case http.StatusMethodNotAllowed:
+		// A registry without manifest reads cannot answer this check; report
+		// presence so Apply issues the delete and its own status is decisive.
+		return true, nil
+	default:
+		return false, contract.NewFault(contract.Unavailable, "the local registry answered the manifest check with "+response.Status, "")
+	}
+}
+
+func (s *RetentionRemoveStep) applyRegistryDelete(ctx context.Context, report engine.Reporter) (engine.ApplyResult, error) {
+	endpoint, err := s.registryURL()
+	if err != nil {
+		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	}
+	request.Header.Set("Accept", registryManifestAccept)
+	response, err := retentionRegistryHTTPClient.Do(request)
+	if err != nil {
+		return engine.ApplyResult{}, contract.NewFault(contract.Unavailable, "the local registry is not reachable", err.Error())
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		_ = response.Body.Close()
+	}()
+	switch {
+	case response.StatusCode == http.StatusAccepted || response.StatusCode == http.StatusOK:
+		if report != nil {
+			report(engine.Event{Kind: "log", Step: s.ID(), Message: "deleted registry manifest " + s.payload.Reference})
+		}
+		return engine.ApplyResult{Result: map[string]any{
+			"kind": s.payload.Kind, "reference": s.payload.Reference, "removed": true,
+		}}, nil
+	case response.StatusCode == http.StatusNotFound:
+		return engine.ApplyResult{Result: map[string]any{
+			"kind": s.payload.Kind, "reference": s.payload.Reference, "already_gone": true,
+		}}, nil
+	case response.StatusCode == http.StatusMethodNotAllowed:
+		return engine.ApplyResult{}, fmt.Errorf("%w: the registry refuses deletes; apply host-registry-v2 to enable REGISTRY_STORAGE_DELETE_ENABLED", engine.ErrPermanent)
+	case response.StatusCode >= 500:
+		return engine.ApplyResult{}, contract.NewFault(contract.Unavailable, "the local registry failed the manifest delete", response.Status)
+	default:
+		return engine.ApplyResult{}, fmt.Errorf("%w: the registry refused the manifest delete: %s", engine.ErrPermanent, response.Status)
+	}
+}
+
+// ------------------------------------------------------------ garbage collect
+
+// RetentionGCPayload is the registry garbage-collection effect. Empty paths
+// mean the production layout.
+type RetentionGCPayload struct {
+	Step        string `json:"step"`
+	RegistryDir string `json:"registry_dir,omitempty"`
+	ConfigPath  string `json:"config_path,omitempty"`
+	Unit        string `json:"unit,omitempty"`
+	Image       string `json:"image,omitempty"`
+}
+
+func buildRetentionGCStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
+	var payload RetentionGCPayload
+	if err := decodePayload(exec, raw, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Step != exec.Step {
+		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
+	}
+	payload.RegistryDir = defaultString(payload.RegistryDir, DefaultRegistryDir)
+	payload.ConfigPath = defaultString(payload.ConfigPath, RegistryConfigPath)
+	payload.Unit = defaultString(payload.Unit, RegistryUnit)
+	payload.Image = defaultString(payload.Image, RegistryImage)
+	for name, value := range map[string]string{
+		"registry directory": payload.RegistryDir, "registry configuration": payload.ConfigPath,
+	} {
+		if !filepath.IsAbs(value) || strings.ContainsAny(value, "\x00\r\n") {
+			return nil, fmt.Errorf("the %s must be an absolute path without control characters", name)
+		}
+	}
+	if !registryUnitPattern.MatchString(payload.Unit) {
+		return nil, errors.New("invalid registry systemd unit")
+	}
+	if err := ValidateImage(payload.Image); err != nil {
+		return nil, err
+	}
+	if !strings.Contains(payload.Image, "@sha256:") {
+		return nil, errors.New("the registry garbage-collect image must be pinned by digest")
+	}
+	return &RetentionGCStep{exec: exec, payload: payload}, nil
+}
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return strings.TrimSpace(value)
+}
+
+// shellQuote renders one argument for the embedded bash scripts.
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+// RetentionGCStep stops the registry, garbage-collects its unreferenced blobs
+// in a one-off container, and restarts it. It never passes --delete-untagged:
+// eregion references releases by digest, so an untagged manifest can still be
+// the live artifact of a release. Only manifests explicitly deleted through the
+// registry API become unreferenced, and plain garbage collection removes their
+// blobs.
+type RetentionGCStep struct {
+	exec    engine.Execution
+	payload RetentionGCPayload
+}
+
+func (s *RetentionGCStep) ID() string                      { return s.payload.Step }
+func (s *RetentionGCStep) Describe() string                { return "Garbage-collect the local OCI registry" }
+func (s *RetentionGCStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
+func (s *RetentionGCStep) Inputs() ([]byte, error)         { return json.Marshal(s.payload) }
+
+func (s *RetentionGCStep) Check(context.Context, engine.Runtime) (engine.CheckResult, error) {
+	return engine.CheckResult{Detail: "registry garbage collection runs only when a prune requests it"}, nil
+}
+
+// script renders the GC effect. A failure before the collection finishes still
+// restarts the registry through the trap.
+func (s *RetentionGCStep) script() string {
+	return `set -euo pipefail
+restore_registry() { systemctl start ` + shellQuote(s.payload.Unit) + ` >/dev/null 2>&1 || true; }
+systemctl stop ` + shellQuote(s.payload.Unit) + `
+trap restore_registry EXIT
+/usr/bin/docker run --rm --network none \
+  --volume ` + shellQuote(s.payload.RegistryDir) + `:/var/lib/registry \
+  --volume ` + shellQuote(s.payload.ConfigPath) + `:/etc/docker/registry/config.yml:ro \
+  ` + shellQuote(s.payload.Image) + ` /bin/registry garbage-collect /etc/docker/registry/config.yml
+systemctl start ` + shellQuote(s.payload.Unit) + `
+systemctl is-active --quiet ` + shellQuote(s.payload.Unit) + ``
+}
+
+func (s *RetentionGCStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
+	if err := (engine.Shell{Secrets: rt.Secrets}).Run(ctx, s.ID(), s.script(), nil, report); err != nil {
+		return engine.ApplyResult{}, err
+	}
+	return engine.ApplyResult{Result: map[string]any{"unit": s.payload.Unit, "collected": true}}, nil
+}

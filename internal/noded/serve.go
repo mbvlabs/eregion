@@ -101,6 +101,9 @@ func handle(config Config, steps *node.StepRegistry, request node.Request) node.
 	if request.Method == node.MethodObserve {
 		return observeResponse(request)
 	}
+	if request.Method == node.MethodInventory {
+		return inventoryResponse(config)
+	}
 	if err := request.Execution.Validate(); err != nil {
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.ValidationFailed), Detail: err.Error()}
 	}
@@ -131,6 +134,22 @@ func observeResponse(request node.Request) node.Response {
 	raw, err := json.Marshal(workloads)
 	if err != nil {
 		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: "the observation could not be encoded"}
+	}
+	return node.Response{Status: engine.StatusCompleted, Result: raw}
+}
+
+// inventoryResponse answers a read-only disk-retention observation. A node
+// task is not spawned because there is no effect to journal.
+func inventoryResponse(config Config) node.Response {
+	inventory, err := platform.ObserveRetentionInventory(context.Background(),
+		platform.RetentionInventoryPaths{DataDir: filepath.Dir(config.StateDir)}, nil)
+	if err != nil {
+		fault := contract.Classify(err)
+		return node.Response{Status: engine.StatusFailed, ErrorCode: string(fault.Code), Detail: fault.Message}
+	}
+	raw, err := json.Marshal(inventory)
+	if err != nil {
+		return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Internal), Detail: "the inventory could not be encoded"}
 	}
 	return node.Response{Status: engine.StatusCompleted, Result: raw}
 }

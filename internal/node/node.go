@@ -16,10 +16,14 @@ import (
 // Method is one node request.
 type Method string
 
+// MethodInventory is a read-only disk-retention observation. Like MethodObserve
+// it carries no execution identity: there is no effect to journal. Its result
+// is a retention.Inventory.
 const (
-	MethodRun     Method = "run"
-	MethodStatus  Method = "status"
-	MethodObserve Method = "observe"
+	MethodRun       Method = "run"
+	MethodStatus    Method = "status"
+	MethodObserve   Method = "observe"
+	MethodInventory Method = "inventory"
 )
 
 // ObservePayload asks a node for its read-only Docker ownership observation.

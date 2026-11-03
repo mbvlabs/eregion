@@ -225,6 +225,7 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	payload := platform.PackPayload{
 		Step: deploymentPackStep, Image: release.Image,
 		Builder: buildInfo.Builder, Env: buildInfo.Env, TimeoutSeconds: 900,
+		Cache: platform.BuildpackCacheVolume(release.App, release.Environment),
 	}
 	switch build.Source.Type {
 	case "git":
