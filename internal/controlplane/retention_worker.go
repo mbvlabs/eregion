@@ -459,7 +459,10 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 		stepID := platform.RetentionRemoveStepID(item.Kind, reference)
 		payload := platform.RetentionRemovePayload{
 			Step: stepID, Kind: string(item.Kind), Reference: reference,
-			App: item.App, Environment: item.Environment,
+		}
+		if item.Kind == retention.ItemContainer {
+			payload.App = item.App
+			payload.Environment = item.Environment
 		}
 		if item.Kind == retention.ItemRegistryArtifact {
 			payload.Registry = platform.DefaultRegistryAddr
