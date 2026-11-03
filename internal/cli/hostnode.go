@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -11,6 +12,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/retention"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
@@ -111,6 +113,25 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 	default:
 		return nil, contract.NewFault(contract.Usage, "unknown host method "+request.Method, "Use host.plan, host.apply, host.doctor, host.status, or retention.inventory.")
 	}
+}
+
+func observeLocalRetentionInventory(ctx context.Context) (retention.Inventory, string, error) {
+	layout := host.DefaultLayout()
+	localNode := ""
+	if config, err := host.LoadNodeFile(host.DefaultNodeConfigPath()); err == nil {
+		localNode = config.Node
+		if config.StateDir != "" {
+			layout.DataDir = filepath.Dir(config.StateDir)
+			layout.RegistryDir = filepath.Join(layout.DataDir, "registry")
+		}
+	}
+	inventory, err := platform.ObserveRetentionInventory(ctx, platform.RetentionInventoryPaths{
+		DataDir: layout.DataDir, RegistryDir: layout.RegistryDir,
+	}, nil)
+	if err != nil {
+		return retention.Inventory{}, localNode, err
+	}
+	return inventory, localNode, nil
 }
 
 func hostProgress(out io.Writer, registry *secrets.Registry) engine.Reporter {

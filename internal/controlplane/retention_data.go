@@ -118,9 +118,6 @@ func (s *Service) environmentRetentionOverride(ctx context.Context, app, environ
 // RetentionPlan evaluates the one planner for one node without mutating
 // anything. It is the machine-readable body of `eregion prune --dry-run`.
 func (s *Service) RetentionPlan(ctx context.Context, nodeName, app, environment string) (retention.PlanResult, error) {
-	if app == "" && environment != "" {
-		return retention.PlanResult{}, contract.NewFault(contract.InputRequired, "--app is required with --env", "Pass both names, or neither to plan every environment.")
-	}
 	resolved, err := s.retentionNodeName(nodeName)
 	if err != nil {
 		return retention.PlanResult{}, err
@@ -128,6 +125,38 @@ func (s *Service) RetentionPlan(ctx context.Context, nodeName, app, environment 
 	inventory, input, err := s.loadRetentionInput(ctx, resolved, time.Now().UTC())
 	if err != nil {
 		return retention.PlanResult{}, err
+	}
+	return retentionResultFromInput(resolved, app, environment, inventory, input)
+}
+
+// RetentionPlanWithInventory evaluates the planner with an inventory the node
+// RPC already observed. The node-mode dry run uses it so planning never needs a
+// loopback transport inside an insert-only RPC process.
+func (s *Service) RetentionPlanWithInventory(ctx context.Context, nodeName, app, environment string, inventory retention.Inventory) (retention.PlanResult, error) {
+	resolved, err := s.retentionNodeName(nodeName)
+	if err != nil {
+		return retention.PlanResult{}, err
+	}
+	now := time.Now().UTC()
+	environments, err := s.retentionEnvironmentRows(ctx, resolved)
+	if err != nil {
+		return retention.PlanResult{}, err
+	}
+	server, err := s.ServerRetentionPolicy(ctx)
+	if err != nil {
+		return retention.PlanResult{}, err
+	}
+	state, err := s.retentionPlatformState(ctx, resolved, environments, server)
+	if err != nil {
+		return retention.PlanResult{}, err
+	}
+	input := retention.InputFromInventory(retention.Inventory{}, state, now)
+	return retentionResultFromInput(resolved, app, environment, inventory, input)
+}
+
+func retentionResultFromInput(nodeName, app, environment string, inventory retention.Inventory, input retention.Input) (retention.PlanResult, error) {
+	if app == "" && environment != "" {
+		return retention.PlanResult{}, contract.NewFault(contract.InputRequired, "--app is required with --env", "Pass both names, or neither to plan every environment.")
 	}
 	if app != "" {
 		if err := platform.ValidateName(app); err != nil {
@@ -147,7 +176,7 @@ func (s *Service) RetentionPlan(ctx context.Context, nodeName, app, environment 
 		InFlight:     input.InFlight,
 		ServerPolicy: input.ServerPolicy,
 	}, input.Now)
-	result.Node = resolved
+	result.Node = nodeName
 	return result, nil
 }
 

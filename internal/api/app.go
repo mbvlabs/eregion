@@ -30,6 +30,7 @@ type AppService struct {
 // environment revision.
 type RetentionService interface {
 	RetentionPlan(ctx context.Context, node, app, environment string) (retention.PlanResult, error)
+	RetentionPlanWithInventory(ctx context.Context, node, app, environment string, inventory retention.Inventory) (retention.PlanResult, error)
 	RetentionShow(ctx context.Context, app, environment string) (retention.PolicyView, error)
 	SetServerRetentionPolicy(ctx context.Context, policy retention.Policy) error
 }

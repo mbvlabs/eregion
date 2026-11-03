@@ -1417,7 +1417,17 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		if app.Retention == nil {
 			return nil, contract.NewFault(contract.Unavailable, "retention is not configured on this node", "Start the control-plane service on the node.")
 		}
-		return app.Retention.RetentionPlan(ctx, params.Node, params.App, params.Environment)
+		inventory, localNode, err := observeLocalRetentionInventory(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if params.Node != "" && localNode != "" && params.Node != localNode {
+			return nil, contract.NewFault(contract.PreconditionFailed, "the retention plan names another node", "Plan the node this request is connected to, or run the plan from its worker.")
+		}
+		if params.Node == "" {
+			params.Node = localNode
+		}
+		return app.Retention.RetentionPlanWithInventory(ctx, params.Node, params.App, params.Environment, inventory)
 	case methodRetentionShow:
 		var params rpcRetentionShowParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
