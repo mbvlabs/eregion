@@ -18,8 +18,9 @@ type Input struct {
 	// Releases is every platform release row, including rows already marked
 	// pruned. Release rows are never deleted; only their artifacts disappear.
 	Releases []Release
-	// Deployments is the platform deployment history. Only succeeded rows are
-	// used, to find the release a rollback would target.
+	// Deployments is the platform deployment history. Succeeded rows supply the
+	// rollback target; a pending or running row is treated as in-flight and
+	// protects its release. Callers may pass only succeeded rows.
 	Deployments []Deployment
 	// Registry is the node registry's manifests and digests.
 	Registry RegistryInventory
@@ -183,8 +184,9 @@ type Image struct {
 // InFlight is the set of resources a pending or running operation still owns.
 // A release here is never planned for pruning, and a container here is never
 // removed. Candidate releases of an in-progress blue/green deploy belong in
-// Releases; a candidate deployment ID in Deployments is enough to protect its
-// containers.
+// Releases; a candidate deployment ID in Deployments protects its containers.
+// A pending or running deployment in Input.Deployments is also treated as
+// in-flight, so a caller may simply pass the whole deployment history.
 type InFlight struct {
 	Releases    []string
 	Deployments []string
@@ -211,6 +213,23 @@ func Plan(in Input) []Item {
 	inFlightReleases := stringSet(in.InFlight.Releases)
 	inFlightDeployments := stringSet(in.InFlight.Deployments)
 	inFlightContainers := stringSet(in.InFlight.Containers)
+	// A pending or running deployment in the history is an in-flight candidate
+	// even when the caller did not separately repeat it in InFlight. Protecting
+	// its release here keeps both the release and its artifacts out of the plan.
+	for _, deployment := range in.Deployments {
+		if deployment.State == "pending" || deployment.State == "running" {
+			inFlightDeployments[deployment.ID] = true
+		}
+		if !inFlightDeployments[deployment.ID] {
+			continue
+		}
+		if deployment.Release != "" {
+			inFlightReleases[deployment.Release] = true
+		}
+		if deployment.PreviousRelease != "" {
+			inFlightReleases[deployment.PreviousRelease] = true
+		}
+	}
 
 	environments := append([]Environment(nil), in.Environments...)
 	sort.SliceStable(environments, func(i, j int) bool {

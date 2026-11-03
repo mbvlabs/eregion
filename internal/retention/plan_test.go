@@ -213,6 +213,28 @@ func TestPlanProtectsInFlightResources(t *testing.T) {
 	assertStrings(t, "container items", referencesByKind(items, ItemContainer), []string{"stale"})
 }
 
+func TestPlanProtectsPendingDeploymentRelease(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.KeepReleases = 1
+	policy.KeepNewerThanDays = 1
+	releases := numberedReleases("rel", "api", "production", 3, 30)
+	releases[1].ImageID = "sha256:pending"
+	items := Plan(Input{
+		Environments: []Environment{{App: "api", Name: "production", ServingRelease: "rel_0003", Policy: policy}},
+		Releases:     releases,
+		Deployments: []Deployment{
+			{ID: "dep_pending", App: "api", Environment: "production", Release: "rel_0002", PreviousRelease: "rel_0003", State: "running"},
+		},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Digest: "sha256:pending", CreatedAt: daysAgo(30), Bytes: 10},
+		}},
+		Now: planNow,
+	})
+
+	assertStrings(t, "release items", referencesByKind(items, ItemRelease), []string{"rel_0001"})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), nil)
+}
+
 func TestPlanContainersAndDanglingImages(t *testing.T) {
 	releases := []Release{{
 		ID: "rel_serving", App: "api", Environment: "production",
