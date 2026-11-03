@@ -1883,7 +1883,7 @@ func previousRollbackRelease(ctx context.Context, tx pgx.Tx, env platform.Enviro
 		var previous string
 		err := tx.QueryRow(ctx, `SELECT coalesce(previous_release_id,'') FROM eregion_platform_deployments
             WHERE environment_id=$1 AND state='succeeded' AND release_id=$2 AND previous_release_id IS NOT NULL
-            ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1`, env.ID, env.ServingRelease).Scan(&previous)
+            ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC LIMIT 1`, env.ID, env.ServingRelease).Scan(&previous)
 		if err == nil && previous != "" {
 			return platform.ReleaseID(previous), nil
 		}
@@ -1894,7 +1894,7 @@ func previousRollbackRelease(ctx context.Context, tx pgx.Tx, env platform.Enviro
 	var previous string
 	err := tx.QueryRow(ctx, `SELECT release_id FROM eregion_platform_deployments
         WHERE environment_id=$1 AND state='succeeded' AND release_id IS DISTINCT FROM $2
-        ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1`, env.ID, nullableReleaseID(env.ServingRelease)).Scan(&previous)
+        ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC LIMIT 1`, env.ID, nullableReleaseID(env.ServingRelease)).Scan(&previous)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -1909,7 +1909,7 @@ func (s *Service) previousRollbackRelease(ctx context.Context, env platform.Envi
 		var previous string
 		err := s.pool.QueryRow(ctx, `SELECT coalesce(previous_release_id,'') FROM eregion_platform_deployments
             WHERE environment_id=$1 AND state='succeeded' AND release_id=$2 AND previous_release_id IS NOT NULL
-            ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1`, env.ID, env.ServingRelease).Scan(&previous)
+            ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC LIMIT 1`, env.ID, env.ServingRelease).Scan(&previous)
 		if err == nil && previous != "" {
 			return platform.ReleaseID(previous), nil
 		}
@@ -1920,7 +1920,7 @@ func (s *Service) previousRollbackRelease(ctx context.Context, env platform.Envi
 	var previous string
 	err := s.pool.QueryRow(ctx, `SELECT release_id FROM eregion_platform_deployments
         WHERE environment_id=$1 AND state='succeeded' AND release_id IS DISTINCT FROM $2
-        ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1`, env.ID, nullableReleaseID(env.ServingRelease)).Scan(&previous)
+        ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC LIMIT 1`, env.ID, nullableReleaseID(env.ServingRelease)).Scan(&previous)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
