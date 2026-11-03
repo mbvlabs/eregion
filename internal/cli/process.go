@@ -91,6 +91,11 @@ func (a *app) processScale(cmd *cobra.Command, args []string) (result, error) {
 	replicas, _ := strconv.Atoi(args[3])
 	input := platform.ProcessScaleInput{App: args[0], Environment: args[1], Process: args[2], Replicas: replicas}
 	target := "env/" + args[0] + "/" + args[1]
+	// Reject an unusable viewer before the preview or any submission.
+	follow := !boolFlag(cmd, "detach") && (followsByDefault(cmd) || streamsNDJSON(cmd))
+	if err := validateFollowRequest(cmd, follow); err != nil {
+		return result{}, err
+	}
 	preview, err := a.previewAction(cmd, platform.KindProcessScale, target, input)
 	if err != nil {
 		return result{}, err
@@ -110,7 +115,6 @@ func (a *app) processScale(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, err
 	}
 	data["operation_id"] = op.ID
-	follow := !boolFlag(cmd, "detach") && (followsByDefault(cmd) || streamsNDJSON(cmd))
 	if follow {
 		client, err := a.client(cmd)
 		if err != nil {

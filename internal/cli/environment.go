@@ -139,6 +139,10 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if err != nil {
 		return result{}, err
 	}
+	follow := !boolFlag(cmd, "detach") && (streamsNDJSON(cmd) || (interactive && ans.Deploy && followsByDefault(cmd)))
+	if err := validateFollowRequest(cmd, follow); err != nil {
+		return result{}, err
+	}
 	if err := validateIdempotencyFlag(cmd); err != nil {
 		return result{}, err
 	}

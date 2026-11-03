@@ -273,6 +273,9 @@ func (a *app) runDelivery(cmd *cobra.Command, client Backend, action deliveryAct
 	// NDJSON is an explicit streaming request; --detach still means accept and
 	// return, so it wins over the format's default follow.
 	follow := !boolFlag(cmd, "detach") && (followsByDefault(cmd) || streamsNDJSON(cmd))
+	if err := validateFollowRequest(cmd, follow); err != nil {
+		return result{}, err
+	}
 	var plain string
 	var raw json.RawMessage
 	if dryRun || (follow && plainOutput(cmd)) {
@@ -356,6 +359,9 @@ func (a *app) followGuidedCreateNDJSON(cmd *cobra.Command, client Backend, op co
 	opts := viewer.FollowOptions{PollInterval: interval, Clean: clean}
 	stream, summary, err := a.followNDJSONSummary(cmd, client, op.ID, opts, config, clean)
 	if err != nil || summary.State != contract.Succeeded || op.FirstDeployOperationID == "" {
+		if summary.Detached && op.FirstDeployOperationID != "" {
+			err = withFirstDeployResume(err, op.FirstDeployOperationID)
+		}
 		err = finishNDJSON(stream, cmd, summary, err)
 		return result{data: newFollowResult(summary), streamed: true}, err
 	}
@@ -365,6 +371,24 @@ func (a *app) followGuidedCreateNDJSON(cmd *cobra.Command, client Backend, op co
 	stream, summary, err = a.followNDJSONSummary(cmd, client, deploy.ID, opts, config, clean)
 	err = finishNDJSON(stream, cmd, summary, err)
 	return result{data: newFollowResult(summary), streamed: true}, err
+}
+
+// withFirstDeployResume names the deploy queued by a guided create when the
+// create viewer detaches. The operation is not cancelled, so the operator can
+// resume the create or the first deploy.
+func withFirstDeployResume(err error, id contract.OperationID) error {
+	fault := contract.Classify(err)
+	if fault.Code != contract.Cancelled || id == "" {
+		return err
+	}
+	details := make(map[string]any, len(fault.Details)+1)
+	for key, value := range fault.Details {
+		details[key] = value
+	}
+	details["first_deploy_operation_id"] = string(id)
+	fault.Details = details
+	fault.Hint = strings.TrimSpace(fault.Hint) + "\nThe first deploy is queued: " + resumeCommand + " " + string(id) + "."
+	return fault
 }
 
 func (a *app) deployCommand(cmd *cobra.Command, args []string) (result, error) {

@@ -105,6 +105,13 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 		return result{}, err
 	}
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	config := followConfig(cmd)
+	ndjson := config != nil && config.mode == "ndjson"
+	follow := !boolFlag(cmd, "detach") && config != nil &&
+		(ndjson || (config.mode == "plain" && isTerminal(config.in) && isTerminal(config.out)))
+	if err := validateFollowRequest(cmd, follow); err != nil {
+		return result{}, err
+	}
 	rawInput := normalized.Canonical
 	if kind == platform.KindDomainRemove && !dryRun {
 		if err := platform.ValidateDomainConfirmation(input.Domain, input.Confirm); err != nil {
@@ -162,9 +169,6 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 		}
 		return result{data: data, plain: plain}, nil
 	}
-	config := followConfig(cmd)
-	ndjson := config != nil && config.mode == "ndjson"
-	follow := config != nil && (ndjson || (config.mode == "plain" && isTerminal(config.in) && isTerminal(config.out)))
 	if follow {
 		// Show the record before the worker starts so it can be created while
 		// the operation runs. NDJSON carries only the event protocol.

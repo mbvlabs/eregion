@@ -215,6 +215,16 @@ func validateFollow(cmd *cobra.Command) error {
 	return nil
 }
 
+// validateFollowRequest rejects unusable viewer options before a command
+// accepts work. Without it, an operation could be queued for a command that
+// can never display it.
+func validateFollowRequest(cmd *cobra.Command, follow bool) error {
+	if !follow {
+		return nil
+	}
+	return validateFollow(cmd)
+}
+
 type followResult struct {
 	Operation    contract.Operation      `json:"operation"`
 	State        contract.State          `json:"state"`

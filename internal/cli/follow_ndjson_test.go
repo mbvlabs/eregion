@@ -194,6 +194,13 @@ type ndjsonFollowBackend struct {
 	firstDeploy bool
 	submitted   []string
 	gets        int
+	state       contract.State
+	errorCode   contract.Code
+	cancelOn    contract.OperationID
+	cancel      context.CancelFunc
+	replay      *contract.Operation
+	calls       int
+	dryRuns     int
 }
 
 func newNDJSONBackend() *ndjsonFollowBackend {
@@ -204,9 +211,70 @@ func newNDJSONBackend() *ndjsonFollowBackend {
 	}
 }
 
+// runWithBackend runs the real command tree with the in-memory operator
+// backend. It never resolves a saved context or touches a server.
+func runWithBackend(t *testing.T, ctx context.Context, backend *ndjsonFollowBackend, args []string) (int, string, string) {
+	t.Helper()
+	a := newApp()
+	a.backend = backend
+	var stdout, stderr bytes.Buffer
+	exit := runApp(ctx, args, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
+	return exit, stdout.String(), stderr.String()
+}
+
+// prepareFollowingBackend supplies the inventory a command reads before it
+// submits or follows one operation.
+func prepareFollowingBackend(name string, backend *ndjsonFollowBackend) {
+	switch name {
+	case "deploy":
+		raw, _ := json.Marshal(map[string]any{"items": []platform.Environment{{
+			App: "api", Name: "production", Node: "main",
+		}}})
+		backend.inventory["environments"] = raw
+	case "env create":
+		raw, _ := json.Marshal(map[string]any{"items": []platform.App{{Name: "api"}}})
+		backend.inventory["apps"] = raw
+	case "build logs":
+		raw, _ := json.Marshal(map[string]any{"items": []platform.BuildRecord{{
+			ID:          platform.BuildID("bld_" + strings.Repeat("a", 32)),
+			OperationID: followTestID,
+			App:         "api",
+			Environment: "production",
+			State:       platform.BuildSucceeded,
+			CreatedAt:   time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		}}})
+		backend.inventory["builds"] = raw
+	case "logs":
+		raw, _ := json.Marshal(map[string]any{"items": []platform.Environment{{
+			App: "api", Name: "production", ServingDeploymentID: platform.DeploymentID("dep_" + strings.Repeat("a", 32)),
+		}}})
+		backend.inventory["environments"] = raw
+	}
+}
+
+func followingSubmits(name string) bool {
+	switch name {
+	case "deploy", "rollback", "restart", "build stop", "build retry",
+		"app create", "env create", "domain add", "domain remove", "process scale":
+		return true
+	}
+	return false
+}
+
 func (f *ndjsonFollowBackend) SubmitAction(_ context.Context, kind, target string, _ json.RawMessage, _, _ string, dryRun bool) (json.RawMessage, error) {
+	f.calls++
 	if dryRun {
-		return json.Marshal(platform.Preview{Kind: kind, Target: target, DryRun: true, Summary: "plan"})
+		f.dryRuns++
+		preview := platform.Preview{Kind: kind, Target: target, DryRun: true, Summary: "plan"}
+		if f.replay != nil && kind == f.replay.Kind && target == f.replay.Target {
+			preview.Replay = true
+			preview.Operation = f.replay
+		}
+		return json.Marshal(preview)
+	}
+	if f.replay != nil && kind == f.replay.Kind && target == f.replay.Target {
+		f.submitted = append(f.submitted, kind)
+		return json.Marshal(*f.replay)
 	}
 	return f.accept(kind, target)
 }
@@ -217,7 +285,12 @@ func (f *ndjsonFollowBackend) SubmitActionWithSecrets(ctx context.Context, kind,
 
 func (f *ndjsonFollowBackend) accept(kind, target string) (json.RawMessage, error) {
 	at := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
-	op := guidedOperation(followTestID, kind, target, contract.Succeeded, 2, at)
+	state := f.state
+	if state == "" {
+		state = contract.Succeeded
+	}
+	op := guidedOperation(followTestID, kind, target, state, 2, at)
+	op.ErrorCode = f.errorCode
 	if f.firstDeploy && (kind == platform.KindAppCreate || kind == platform.KindEnvironmentCreate) {
 		op.FirstDeployOperationID = ndjsonDeployID
 		deploy := guidedOperation(ndjsonDeployID, platform.KindDeploy, "env/api/production", contract.Succeeded, 2, at.Add(time.Second))
@@ -230,7 +303,7 @@ func (f *ndjsonFollowBackend) accept(kind, target string) (json.RawMessage, erro
 	f.operations[op.ID] = op
 	f.events[op.ID] = []contract.Event{
 		guidedStateEvent(op, 1, contract.Queued, at.Add(-time.Second)),
-		guidedStateEvent(op, 2, contract.Succeeded, at),
+		guidedStateEvent(op, 2, state, at),
 	}
 	f.submitted = append(f.submitted, kind)
 	return json.Marshal(op)
@@ -242,7 +315,11 @@ func (f *ndjsonFollowBackend) Get(_ context.Context, id contract.OperationID) (j
 	if !ok {
 		return nil, contract.NewFault(contract.NotFound, "operation not found", "Inspect the operation list.")
 	}
-	return json.Marshal(op)
+	raw, err := json.Marshal(op)
+	if id == f.cancelOn && f.cancel != nil {
+		f.cancel()
+	}
+	return raw, err
 }
 
 func (f *ndjsonFollowBackend) Events(_ context.Context, cursor contract.Cursor, limit int) (json.RawMessage, error) {
@@ -285,6 +362,7 @@ func (f *ndjsonFollowBackend) Logs(_ context.Context, query platform.LogQuery, e
 }
 
 var ndjsonDeployID = contract.OperationID("op_" + strings.Repeat("d", 32))
+var ndjsonReplayID = contract.OperationID("op_" + strings.Repeat("e", 32))
 
 // TestFollowingCommandsStreamNDJSON runs every real command through the
 // runner with an in-memory backend. Each successful follow must emit the same
@@ -300,28 +378,9 @@ func TestFollowingCommandsStreamNDJSON(t *testing.T) {
 				guidedStateEvent(backend.operations[followTestID], 1, contract.Queued, at.Add(-time.Second)),
 				guidedStateEvent(backend.operations[followTestID], 2, contract.Succeeded, at),
 			}
-			switch test.name {
-			case "app create", "env create":
+			prepareFollowingBackend(test.name, backend)
+			if test.name == "app create" || test.name == "env create" {
 				backend.firstDeploy = true
-				if test.name == "env create" {
-					raw, _ := json.Marshal(map[string]any{"items": []platform.App{{Name: "api"}}})
-					backend.inventory["apps"] = raw
-				}
-			case "build logs":
-				raw, _ := json.Marshal(map[string]any{"items": []platform.BuildRecord{{
-					ID:          platform.BuildID("bld_" + strings.Repeat("a", 32)),
-					OperationID: followTestID,
-					App:         "api",
-					Environment: "production",
-					State:       platform.BuildSucceeded,
-					CreatedAt:   at,
-				}}})
-				backend.inventory["builds"] = raw
-			case "logs":
-				raw, _ := json.Marshal(map[string]any{"items": []platform.Environment{{
-					App: "api", Name: "production", ServingDeploymentID: platform.DeploymentID("dep_" + strings.Repeat("a", 32)),
-				}}})
-				backend.inventory["environments"] = raw
 			}
 			a := newApp()
 			a.backend = backend
@@ -370,6 +429,208 @@ func TestFollowingCommandsStreamNDJSON(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFollowingSubmitValidatesViewerBeforeSubmit(t *testing.T) {
+	app := newApp()
+	wantExit := contract.ExitCode(contract.NewFault(contract.ValidationFailed, "invalid follow option", "fix it"))
+	for _, test := range followingCommands {
+		if !followingSubmits(test.name) {
+			continue
+		}
+		cmd, err := app.resolve(strings.Fields(test.path)[1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if flagFor(cmd, "poll-interval") == nil {
+			continue
+		}
+		t.Run(test.name, func(t *testing.T) {
+			backend := newNDJSONBackend()
+			prepareFollowingBackend(test.name, backend)
+			args := append(append([]string{}, test.args...), "--output", "ndjson", "--poll-interval", "0")
+			exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)
+			if exit != wantExit || stderr != "" {
+				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+			}
+			envelope := decodeNDJSONResult(t, stdout)
+			if envelope.OK || envelope.Error == nil || envelope.Error.Code != contract.ValidationFailed {
+				t.Fatalf("envelope=%+v", envelope)
+			}
+			if backend.calls != 0 || len(backend.submitted) != 0 {
+				t.Fatalf("invalid follow options reached the backend: calls=%d submitted=%v", backend.calls, backend.submitted)
+			}
+		})
+	}
+}
+
+func TestFollowingSubmitNDJSONOutcomes(t *testing.T) {
+	for _, outcome := range []struct {
+		name      string
+		state     contract.State
+		errorCode contract.Code
+		wantCode  contract.Code
+		wantExit  int
+	}{
+		{name: "failed", state: contract.Failed, errorCode: contract.PreconditionFailed, wantCode: contract.PreconditionFailed, wantExit: contract.ExitCode(contract.NewFault(contract.PreconditionFailed, "failed", "inspect"))},
+		{name: "cancelled", state: contract.Canceled, wantCode: contract.Cancelled, wantExit: 130},
+	} {
+		for _, test := range followingCommands {
+			if !followingSubmits(test.name) {
+				continue
+			}
+			t.Run(test.name+"/"+outcome.name, func(t *testing.T) {
+				backend := newNDJSONBackend()
+				backend.state, backend.errorCode = outcome.state, outcome.errorCode
+				prepareFollowingBackend(test.name, backend)
+				args := append(append([]string{}, test.args...), "--output", "ndjson")
+				exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)
+				if exit != outcome.wantExit || stderr != "" {
+					t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+				}
+				envelope, _ := decodeNDJSONStream(t, stdout)
+				if envelope.Command != test.path || envelope.OK || envelope.Error == nil {
+					t.Fatalf("envelope=%+v", envelope)
+				}
+				if envelope.Error.Code != outcome.wantCode || envelope.Error.Details["operation_id"] != string(followTestID) || envelope.Error.Details["state"] != string(outcome.state) {
+					t.Fatalf("fault=%+v", envelope.Error)
+				}
+			})
+		}
+	}
+}
+
+func TestFollowingSubmitNDJSONDetach(t *testing.T) {
+	for _, test := range followingCommands {
+		if !followingSubmits(test.name) {
+			continue
+		}
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			backend := newNDJSONBackend()
+			backend.state = contract.Running
+			backend.cancelOn, backend.cancel = followTestID, cancel
+			prepareFollowingBackend(test.name, backend)
+			args := append(append([]string{}, test.args...), "--output", "ndjson")
+			exit, stdout, stderr := runWithBackend(t, ctx, backend, args)
+			if exit != 130 || stderr != "" {
+				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+			}
+			envelope, _ := decodeNDJSONStream(t, stdout)
+			if envelope.Command != test.path || envelope.OK || envelope.Error == nil || envelope.Error.Code != contract.Cancelled {
+				t.Fatalf("envelope=%+v", envelope)
+			}
+			if !strings.Contains(envelope.Error.Message, "viewer detached") {
+				t.Fatalf("detach message = %q", envelope.Error.Message)
+			}
+			resume, _ := envelope.Error.Details["resume"].(string)
+			if envelope.Error.Details["operation_id"] != string(followTestID) || !strings.Contains(resume, resumeCommand) {
+				t.Fatalf("detach details = %+v", envelope.Error.Details)
+			}
+		})
+	}
+}
+
+func TestGuidedCreateNDJSONDetachNamesFirstDeploy(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+	}{
+		{name: "app create", args: []string{"app", "create", "--name", "api", "--environment", "production", "--node", "main", "--git-url", "https://github.com/acme/api"}},
+		{name: "env create", args: []string{"env", "create", "--app", "api", "--name", "production", "--node", "main", "--git-url", "https://github.com/acme/api"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			backend := newNDJSONBackend()
+			backend.state = contract.Running
+			backend.firstDeploy = true
+			backend.cancelOn, backend.cancel = followTestID, cancel
+			prepareFollowingBackend(test.name, backend)
+			args := append(append([]string{}, test.args...), "--output", "ndjson")
+			exit, stdout, stderr := runWithBackend(t, ctx, backend, args)
+			if exit != 130 || stderr != "" {
+				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+			}
+			envelope, _ := decodeNDJSONStream(t, stdout)
+			if envelope.Error == nil || envelope.Error.Code != contract.Cancelled {
+				t.Fatalf("envelope=%+v", envelope)
+			}
+			if envelope.Error.Details["first_deploy_operation_id"] != string(ndjsonDeployID) || envelope.Error.Details["operation_id"] != string(followTestID) {
+				t.Fatalf("detach details = %+v", envelope.Error.Details)
+			}
+			if !strings.Contains(envelope.Error.Hint, "first deploy is queued") {
+				t.Fatalf("detach hint = %q", envelope.Error.Hint)
+			}
+		})
+	}
+}
+
+func TestFollowingSubmitNDJSONDryRun(t *testing.T) {
+	app := newApp()
+	for _, test := range followingCommands {
+		cmd, err := app.resolve(strings.Fields(test.path)[1:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if flagFor(cmd, "dry-run") == nil {
+			continue
+		}
+		t.Run(test.name, func(t *testing.T) {
+			backend := newNDJSONBackend()
+			prepareFollowingBackend(test.name, backend)
+			args := append(append([]string{}, test.args...), "--dry-run", "--output", "ndjson")
+			exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)
+			if exit != 0 || stderr != "" {
+				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+			}
+			envelope, eventOps := decodeNDJSONStream(t, stdout)
+			if envelope.Command != test.path || !envelope.OK {
+				t.Fatalf("envelope=%+v", envelope)
+			}
+			if len(eventOps) != 0 || len(backend.submitted) != 0 || backend.calls == 0 {
+				t.Fatalf("dry run events=%v submitted=%v calls=%d", eventOps, backend.submitted, backend.calls)
+			}
+		})
+	}
+}
+
+func TestGuidedCreateNDJSONIdempotentReplay(t *testing.T) {
+	at := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	replay := guidedOperation(ndjsonReplayID, platform.KindAppCreate, platform.PlatformTarget().String(), contract.Succeeded, 2, at)
+	backend := newNDJSONBackend()
+	backend.replay = &replay
+	backend.operations[replay.ID] = replay
+	backend.events[replay.ID] = []contract.Event{
+		guidedStateEvent(replay, 1, contract.Queued, at.Add(-time.Second)),
+		guidedStateEvent(replay, 2, contract.Succeeded, at),
+	}
+	args := []string{
+		"app", "create", "--name", "api", "--environment", "production", "--node", "main",
+		"--git-url", "https://github.com/acme/api", "--idempotency-key", "stable-replay-key", "--output", "ndjson",
+	}
+	exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)
+	if exit != 0 || stderr != "" {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
+	}
+	envelope, eventOps := decodeNDJSONStream(t, stdout)
+	if envelope.Command != "eregion app create" || !envelope.OK {
+		t.Fatalf("envelope=%+v", envelope)
+	}
+	if eventOps[ndjsonReplayID] == 0 {
+		t.Fatalf("replayed operation did not stream: %v", eventOps)
+	}
+	if len(backend.submitted) != 1 || backend.dryRuns != 1 {
+		t.Fatalf("replay submitted=%v dryRuns=%d", backend.submitted, backend.dryRuns)
+	}
+	data, err := json.Marshal(envelope.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), string(ndjsonReplayID)) {
+		t.Fatalf("replayed operation is missing from the result: %s", data)
 	}
 }
 
