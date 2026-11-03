@@ -88,6 +88,7 @@ re-queue the older one's live platform jobs.
 | `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, CI deploy, per-environment push webhook and private proxy adapters. |
 | `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
 | `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps, Caddy route renderer and the domain DNS/TLS/HTTP observation helpers. |
+| `internal/retention` | D30 retention policy, environment override merge/validation, Buildpacks cache limits and run/item records shared by the planner, CLI and node effects. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
 | `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps (incl. vault keyring and node_exporter), local pending-init state, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
@@ -213,7 +214,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 016
+## Database: embedded schema 017
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -237,6 +238,7 @@ node protocol version and database migration version are independent.
 | `014_release_command_runs.sql` | One durable release command run per `(release_id, command_digest)`: state, operation, error and timestamps. A release-scoped row, cascading with its release. |
 | `015_domain_check_path.sql` | Optional per-domain `check_path`; empty uses the environment's web health path. |
 | `016_container_cleanup.sql` | Leaked-container retry rows: container name PK, environment/node/deployment, reason, attempts, last error and next attempt. Cascades with the environment. |
+| `017_retention.sql` | D30 retention: the singleton `server_settings` row, the revision `retention` override block, `releases.pruned_at` and `retention_runs` observability. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -249,14 +251,16 @@ Tables below have the literal `eregion_` prefix:
 | `platform_nodes` | Name; roles/capabilities, status, SSH address/user/**host key**, attested identity, probes, build concurrency/user and WireGuard public state. Private keys stay in files. |
 | `platform_apps` | Opaque app ID and unique name. No stored setup wizard/source configuration. |
 | `platform_environments` | App FK + name; runtime/build node, stable/candidate/container ports, bind, health settings/observation, config, pinned secret refs, desired/applied/serving release IDs, `serving_deployment_id` and `current_revision_id`. The deploy worker reads the revision and the serving deployment's recorded instance ports; the mutable legacy config/health/port fields remain only as mirrored compatibility columns for the older CLI surface. `secret_refs` remains the transitional pinned form, used only when the current revision names no secrets. |
-| `platform_environment_revisions` | Immutable `erv_…` ID and per-environment number; operation/actor/operation/summary change record; source binding, auto-deploy flag, webhook secret NAME, runtime JSON, processes JSON, plain config and secret NAMEs, plus the first-deploy intent flag. An UPDATE trigger refuses edits; deleting the environment still cascades. |
+| `platform_environment_revisions` | Immutable `erv_…` ID and per-environment number; operation/actor/operation/summary change record; source binding, auto-deploy flag, webhook secret NAME, runtime JSON, processes JSON, plain config and secret NAMEs, the `retention` override JSON, plus the first-deploy intent flag. An UPDATE trigger refuses edits; deleting the environment still cascades. |
 | `platform_builds` | `bld_…` ID and unique operation FK; app/env, pinned revision and release, source, exact commit, pending/running/succeeded/failed/cancelled lifecycle, timestamps and error. Logs are the owning operation's events. |
-| `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, build link, exact commit, pending/ready/failed status and error. |
+| `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, build link, exact commit, pending/ready/failed status and error, and `pruned_at` when disk retention removed the artifact. The row is never deleted. |
 | `platform_deployments` | Deployment ID and unique operation FK; action (`deploy`, `rollback`, `restart`), release, previous release/deployment, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), recorded process instances/ports, state and errors. |
 | `platform_changes` | App/env history, sequence, operation/actor, desired/applied JSON and summary. |
 | `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment, and an optional `check_path`. `desired_revision`/`applied_revision` and `route_state`/`route_error` record the Caddy write; `expected_addresses` plus `dns_state`/`dns_addresses` record public-resolver observation; `certificate_state`/`certificate_not_after` and `public_state`/`public_status` keep the other observations separate. |
 | `platform_release_command_runs` | `(release_id, command_digest)` PK; the owning operation, running/succeeded/failed state, error code/message and timestamps. One row per release and command specification; it cascades with its release. |
 | `platform_container_cleanup` | Container name PK; environment/node/deployment, reason, attempts, last error and next attempt. A failed removal is retried with backoff; the row cascades with its environment. |
+| `server_settings` | Singleton row (`singleton` boolean PK); one `retention` jsonb block for the server-level default. An absent row or empty block means the D30 defaults in `internal/retention`. |
+| `retention_runs` | `rtr_…` ID, optional owning operation, pending/running/succeeded/failed/cancelled status, planned/removed item arrays, planned/reclaimed bytes, per-item errors JSON, start/finish timestamps. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
 | `webhook_deliveries` | Hashed delivery ID, exact-body hash, actor/kind/target, pending/submitted state and operation ID. |
@@ -293,6 +297,26 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
   control-plane migrations. DNS records live at the provider; a domain binding
   is not a DNS record.
 - Roles/rows do not prove tools, credentials, services or routes are installed.
+
+## Disk retention schema (D30)
+
+Migration 017 adds the durable state for work list row 17. `internal/retention`
+owns the D30 numbers (`DefaultPolicy`: newest 10 releases per environment, any
+release newer than 14 days, unreferenced registry artifacts after 14 days,
+Buildpacks caches above 10 GiB or 80% disk), the environment `Override` block,
+field-by-field `Merge`, range validation and the cache-limit check; the serving
+release and its rollback target remain a planner invariant. The server default
+is the single `server_settings.retention` block, read and written by
+`Service.ServerRetentionPolicy` and `Service.SetServerRetentionPolicy`; an
+absent/empty block means the D30 defaults. `Service.EffectiveRetentionPolicy`
+returns the server default with the current revision's non-nil override fields
+replacing it, and unrelated revision changes carry the block forward unchanged.
+`releases.pruned_at` records when retention removed a release's artifact while
+its row and history stay. `retention_runs` stores the operation, status,
+planned/removed items, planned/reclaimed bytes and per-item errors for
+observability. The planner, node
+effects, registry deletes/GC and `retention show|set` / `prune` commands are not
+part of this schema work.
 
 ## Migration and external database policy
 

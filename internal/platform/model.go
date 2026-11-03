@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/retention"
 )
 
 // Roles and capabilities are placement facts. They are declared on a node and
@@ -120,6 +121,10 @@ type RevisionState struct {
 	Processes         []ProcessSpec     `json:"processes"`
 	Config            map[string]string `json:"config"`
 	SecretNames       []string          `json:"secret_names"`
+	// Retention overrides the server default retention policy for this
+	// environment. Nil fields inherit the server value; changing any field
+	// commits a new revision like every other piece of desired state (D30).
+	Retention retention.Override `json:"retention,omitempty"`
 	// DeployIntent records that the operator asked for a first deploy. The
 	// control plane queues that deploy with the revision.
 	DeployIntent bool `json:"deploy_intent,omitempty"`
@@ -334,6 +339,9 @@ type Release struct {
 	Error       string               `json:"error,omitempty"`
 	CreatedAt   time.Time            `json:"created_at"`
 	CompletedAt *time.Time           `json:"completed_at,omitempty"`
+	// PrunedAt is set when disk retention removed this release's artifact. The
+	// row and history stay, but a deploy or rollback to it refuses (D30).
+	PrunedAt *time.Time `json:"pruned_at,omitempty"`
 }
 
 type BuildState string

@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+
+	"github.com/mbvlabs/eregion/internal/retention"
 )
 
 const (
@@ -69,6 +71,9 @@ type EnvironmentSpec struct {
 	Processes         []ProcessSpec     `json:"processes,omitempty"`
 	Config            map[string]string `json:"config,omitempty"`
 	SecretNames       []string          `json:"secret_names,omitempty"`
+	// Retention overrides the server retention policy for this environment;
+	// unset fields inherit (D30).
+	Retention retention.Override `json:"retention,omitempty"`
 
 	// Domain optionally binds the environment's first public hostname in the
 	// same submission transaction, before any first deploy is queued. A first
@@ -108,6 +113,9 @@ type EnvironmentUpdateInput struct {
 	Processes         *[]ProcessSpec     `json:"processes,omitempty"`
 	Config            *map[string]string `json:"config,omitempty"`
 	SecretNames       *[]string          `json:"secret_names,omitempty"`
+	// Retention replaces the environment's override block; omitted means keep
+	// the current revision's override unchanged (D30).
+	Retention *retention.Override `json:"retention,omitempty"`
 }
 
 func (in *EnvironmentUpdateInput) Target() Target {
@@ -369,6 +377,7 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 		Processes:         spec.Processes,
 		Config:            spec.Config,
 		SecretNames:       spec.SecretNames,
+		Retention:         spec.Retention.Clone(),
 	}
 	if len(state.Config) == 0 && len(spec.Env) > 0 {
 		state.Config = spec.Env
@@ -412,6 +421,7 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 	spec.Processes = state.Processes
 	spec.Config = state.Config
 	spec.SecretNames = state.SecretNames
+	spec.Retention = state.Retention.Clone()
 	if len(state.Processes) == 0 {
 		spec.Processes = []ProcessSpec{defaultWebProcess(spec.ContainerPort)}
 	}
@@ -547,6 +557,11 @@ func normalizeEnvironmentUpdate(target Target, raw json.RawMessage) (ActionInput
 			return nil, err
 		}
 		input.WebhookSecretName = &name
+	}
+	if input.Retention != nil {
+		if err := input.Retention.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	return &input, nil
 }
@@ -686,6 +701,9 @@ func NormalizeRevisionState(state *RevisionState) error {
 	state.WebhookSecretName = name
 	if state.AutoDeploy && state.Source.Kind != "git" {
 		return invalid("auto_deploy", "Automatic deployment requires a git source binding.")
+	}
+	if err := state.Retention.Validate(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -920,6 +938,7 @@ func CloneRevisionState(state RevisionState) RevisionState {
 	out.Source.BuildEnv = cloneStringMap(state.Source.BuildEnv)
 	out.Config = cloneStringMap(state.Config)
 	out.SecretNames = append([]string(nil), state.SecretNames...)
+	out.Retention = state.Retention.Clone()
 	out.Processes = make([]ProcessSpec, len(state.Processes))
 	for i, process := range state.Processes {
 		process.Args = append([]string(nil), process.Args...)
@@ -981,6 +1000,9 @@ func ApplyEnvironmentPatch(base RevisionState, patch EnvironmentUpdateInput) Rev
 	}
 	if patch.SecretNames != nil {
 		out.SecretNames = append([]string(nil), (*patch.SecretNames)...)
+	}
+	if patch.Retention != nil {
+		out.Retention = patch.Retention.Clone()
 	}
 	return out
 }

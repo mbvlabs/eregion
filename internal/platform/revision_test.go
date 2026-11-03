@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/mbvlabs/eregion/internal/retention"
 )
 
 func TestEnvironmentRevisionNormalizers(t *testing.T) {
@@ -56,14 +58,21 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, input := range map[string]map[string]any{
-		"unknown field":   {"health": map[string]any{"path": "/"}},
-		"bad source":      {"source": map[string]any{"kind": "git", "url": "http://github.com/acme/api"}},
-		"bad process":     {"processes": []map[string]any{{"name": "web", "kind": "web"}}},
-		"bad secret name": {"secret_names": []string{"database_url"}},
+		"unknown field":               {"health": map[string]any{"path": "/"}},
+		"bad source":                  {"source": map[string]any{"kind": "git", "url": "http://github.com/acme/api"}},
+		"bad process":                 {"processes": []map[string]any{{"name": "web", "kind": "web"}}},
+		"bad secret name":             {"secret_names": []string{"database_url"}},
+		"bad retention":               {"retention": map[string]any{"keep_releases": 0}},
+		"server-only retention field": {"retention": map[string]any{"buildpack_cache_max_bytes": 1 << 30}},
 	} {
 		if _, err := normalize(KindEnvironmentUpdate, "env/api/production", input); err == nil {
 			t.Errorf("%s: must be refused", name)
 		}
+	}
+	if _, err := normalize(KindEnvironmentUpdate, "env/api/production", map[string]any{
+		"retention": map[string]any{"keep_releases": 3, "artifact_grace_days": 30},
+	}); err != nil {
+		t.Fatalf("a valid retention override was refused: %v", err)
 	}
 
 	if _, err := normalize(KindProcessScale, "env/api/production", map[string]any{"process": "web", "replicas": 3}); err != nil {
@@ -127,6 +136,39 @@ func TestEnvironmentRevisionPatchMerge(t *testing.T) {
 	}
 	if len(without.SecretNames) != 1 {
 		t.Fatal("secret attach mutated the previous revision")
+	}
+}
+
+func TestRetentionOverrideIsCarriedByOtherRevisionChanges(t *testing.T) {
+	keep := 5
+	base := RevisionState{
+		Runtime:   RuntimeSpec{Node: "app-1", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
+		Processes: []ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+		Config:    map[string]string{},
+		Retention: retention.Override{KeepReleases: &keep},
+	}
+	config := map[string]string{"LOG_LEVEL": "debug"}
+	merged := ApplyEnvironmentPatch(base, EnvironmentUpdateInput{Config: &config})
+	if merged.Retention.KeepReleases == nil || *merged.Retention.KeepReleases != 5 {
+		t.Fatalf("a config change dropped the retention override: %+v", merged.Retention)
+	}
+	*merged.Retention.KeepReleases = 9
+	if *base.Retention.KeepReleases != 5 {
+		t.Fatal("a patched revision aliased the previous retention override")
+	}
+	grace := 30
+	replaced := ApplyEnvironmentPatch(base, EnvironmentUpdateInput{Retention: &retention.Override{ArtifactGraceDays: &grace}})
+	if replaced.Retention.KeepReleases != nil || replaced.Retention.ArtifactGraceDays == nil || *replaced.Retention.ArtifactGraceDays != 30 {
+		t.Fatalf("the retention patch did not replace the override block: %+v", replaced.Retention)
+	}
+	zero := 0
+	invalidRevision := base
+	invalidRevision.Retention = retention.Override{KeepReleases: &zero}
+	if err := NormalizeRevisionState(&invalidRevision); err == nil {
+		t.Fatal("a revision with keep_releases < 1 was normalized")
+	}
+	if err := NormalizeRevisionState(&base); err != nil {
+		t.Fatalf("a valid retention override was refused: %v", err)
 	}
 }
 

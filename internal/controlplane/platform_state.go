@@ -1419,7 +1419,7 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.buil
     coalesce(r.actor_kind,'system'),coalesce(r.actor_subject,''),coalesce(r.operation,''),coalesce(r.summary,''),
     coalesce(r.source,'{}'::jsonb),coalesce(r.auto_deploy,false),coalesce(r.webhook_secret_name,''),
     coalesce(r.runtime,'{}'::jsonb),coalesce(r.processes,'[]'::jsonb),coalesce(r.config,'{}'::jsonb),
-    coalesce(r.secret_names,'{}'),coalesce(r.deploy_intent,false),r.created_at,
+    coalesce(r.secret_names,'{}'),coalesce(r.retention,'{}'::jsonb),coalesce(r.deploy_intent,false),r.created_at,
     e.created_at,e.updated_at
     FROM eregion_platform_environments e
     JOIN eregion_platform_apps a ON a.id=e.app_id
@@ -1427,7 +1427,7 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.buil
 
 func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var env platform.Environment
-	var rawEnv, rawRefs, rawSource, rawRuntime, rawProcesses, rawConfig []byte
+	var rawEnv, rawRefs, rawSource, rawRuntime, rawProcesses, rawConfig, rawRetention []byte
 	var desired, applied, serving, servingDeployment, revisionID string
 	var revisionNumber int
 	var operationID, actorKind, actorSubject, operation, summary, webhookSecretName, primaryDNS string
@@ -1439,7 +1439,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
 		&env.PrimaryDomain, &primaryDNS, &env.PendingCleanup, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
 		&actorKind, &actorSubject, &operation, &summary, &rawSource, &autoDeploy, &webhookSecretName,
-		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &deployIntent, &revisionCreated,
+		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &rawRetention, &deployIntent, &revisionCreated,
 		&env.CreatedAt, &env.UpdatedAt)
 	if err != nil {
 		return env, err
@@ -1489,6 +1489,11 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 			}
 		}
 		revision.SecretNames = secretNames
+		if len(rawRetention) > 0 {
+			if err := json.Unmarshal(rawRetention, &revision.Retention); err != nil {
+				return env, err
+			}
+		}
 		revision.DeployIntent = deployIntent
 		if revisionCreated != nil {
 			revision.CreatedAt = *revisionCreated
@@ -1601,7 +1606,7 @@ func (s *Service) inventoryDomains(ctx context.Context, query platform.Inventory
 }
 
 const releaseSelect = `SELECT r.id,r.operation_id,a.name,e.name,r.image,r.image_id,r.source,r.build,r.command,r.status,
-    r.error_code,r.error,r.created_at,r.completed_at,coalesce(r.build_id,''),r.commit_sha
+    r.error_code,r.error,r.created_at,r.completed_at,coalesce(r.build_id,''),r.commit_sha,r.pruned_at
     FROM eregion_platform_releases r
     JOIN eregion_platform_apps a ON a.id=r.app_id
     JOIN eregion_platform_environments e ON e.id=r.environment_id`
@@ -1612,7 +1617,7 @@ func scanReleaseRow(row pgx.Row) (platform.Release, error) {
 	var buildID string
 	err := row.Scan(&release.ID, &release.OperationID, &release.App, &release.Environment, &release.Image, &release.ImageID,
 		&source, &build, &command, &release.Status, &release.ErrorCode, &release.Error, &release.CreatedAt, &release.CompletedAt,
-		&buildID, &release.CommitSHA)
+		&buildID, &release.CommitSHA, &release.PrunedAt)
 	if err != nil {
 		return release, err
 	}

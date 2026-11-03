@@ -29,12 +29,14 @@ func insertEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, envID platform.
 	runtime, _ := json.Marshal(state.Runtime)
 	processes, _ := json.Marshal(state.Processes)
 	config, _ := json.Marshal(state.Config)
+	retentionOverride, _ := json.Marshal(state.Retention)
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
         (id,environment_id,number,operation_id,actor_kind,actor_subject,operation,summary,
-         source,auto_deploy,webhook_secret_name,runtime,processes,config,secret_names,deploy_intent)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+         source,auto_deploy,webhook_secret_name,runtime,processes,config,secret_names,deploy_intent,retention)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
 		revisionID, envID, number, nullableOperationID(opID), actor.Kind, actor.Subject, operation, summary,
-		source, state.AutoDeploy, state.WebhookSecretName, runtime, processes, config, state.SecretNames, state.DeployIntent); err != nil {
+		source, state.AutoDeploy, state.WebhookSecretName, runtime, processes, config, state.SecretNames, state.DeployIntent,
+		retentionOverride); err != nil {
 		return "", 0, platformWriteError(err, "environment revision could not be recorded")
 	}
 	return revisionID, number, nil
@@ -132,6 +134,7 @@ func revisionStateFromSpec(spec platform.EnvironmentSpec, node string, deployInt
 		Processes:         spec.Processes,
 		Config:            spec.Config,
 		SecretNames:       spec.SecretNames,
+		Retention:         spec.Retention.Clone(),
 		DeployIntent:      deployIntent,
 	}
 	if state.Runtime.Node == "" {
@@ -221,20 +224,25 @@ func currentRevisionStateTx(ctx context.Context, tx pgx.Tx, env platform.Environ
 
 const revisionSelect = `SELECT r.id,a.name,e.name,r.number,coalesce(r.operation_id,''),
     r.actor_kind,r.actor_subject,r.operation,r.summary,r.source,r.auto_deploy,r.webhook_secret_name,
-    r.runtime,r.processes,r.config,r.secret_names,r.deploy_intent,r.created_at
+    r.runtime,r.processes,r.config,r.secret_names,r.retention,r.deploy_intent,r.created_at
     FROM eregion_platform_environment_revisions r
     JOIN eregion_platform_environments e ON e.id=r.environment_id
     JOIN eregion_platform_apps a ON a.id=e.app_id`
 
 func scanRevisionRow(row pgx.Row) (platform.EnvironmentRevision, error) {
 	var revision platform.EnvironmentRevision
-	var source, runtime, processes, config []byte
+	var source, runtime, processes, config, retentionOverride []byte
 	err := row.Scan(&revision.ID, &revision.App, &revision.Environment, &revision.Number,
 		&revision.OperationID, &revision.Actor.Kind, &revision.Actor.Subject, &revision.Operation,
 		&revision.Summary, &source, &revision.AutoDeploy, &revision.WebhookSecretName,
-		&runtime, &processes, &config, &revision.SecretNames, &revision.DeployIntent, &revision.CreatedAt)
+		&runtime, &processes, &config, &revision.SecretNames, &retentionOverride, &revision.DeployIntent, &revision.CreatedAt)
 	if err != nil {
 		return revision, err
+	}
+	if len(retentionOverride) > 0 {
+		if err := json.Unmarshal(retentionOverride, &revision.Retention); err != nil {
+			return revision, err
+		}
 	}
 	if len(source) > 0 {
 		if err := json.Unmarshal(source, &revision.Source); err != nil {
