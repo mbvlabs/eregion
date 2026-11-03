@@ -12,9 +12,10 @@ import (
 
 // D30's numbers are authoritative: keep the newest 10 releases per
 // environment plus any release newer than 14 days; remove registry artifacts no
-// release references after 14 days; prune Buildpacks caches above 10 GiB or
-// 80% disk. The serving release and its rollback target are always kept, which
-// is an invariant of the planner, not a configurable field.
+// release references after 14 days; prune Buildpacks caches above 10 GiB or when
+// filesystem utilization is above 80%. The serving release and its rollback
+// target are always kept, which is an invariant of the planner, not a
+// configurable field.
 const (
 	DefaultKeepReleases             = 10
 	DefaultKeepNewerThanDays        = 14

@@ -303,21 +303,31 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
 Migration 017 adds the durable state for work list row 17. `internal/retention`
 owns the D30 numbers (`DefaultPolicy`: newest 10 releases per environment, any
 release newer than 14 days, unreferenced registry artifacts after 14 days,
-Buildpacks caches above 10 GiB or 80% disk), the environment `Override` block,
-field-by-field `Merge`, range validation and the cache-limit check; the serving
-release and its rollback target remain a planner invariant. The server default
-is the single `server_settings.retention` block, read and written by
-`Service.ServerRetentionPolicy` and `Service.SetServerRetentionPolicy`; an
-absent/empty block means the D30 defaults. `Service.EffectiveRetentionPolicy`
-returns the server default with the current revision's non-nil override fields
-replacing it, and unrelated revision changes carry the block forward unchanged.
-`releases.pruned_at` marks a release whose artifact was removed while its row
-and history stay; `preparePlatform` refuses `deploy --release` and `rollback` to
-such a release with `precondition_failed`, naming the release and prune time.
-`retention_runs` stores the operation, status, planned/removed items,
-planned/reclaimed bytes and per-item errors for observability. The planner, node
-effects, registry deletes/GC and `retention show|set` / `prune` commands are not
-part of this schema work.
+Buildpacks caches above 10 GiB or 80% filesystem utilization), the environment
+`Override` block, field-by-field `Merge`, range validation and the cache-limit
+check; the serving release and its rollback target remain a planner invariant.
+The server default is the single `server_settings.retention` block, read and
+written by `Service.ServerRetentionPolicy` and
+`Service.SetServerRetentionPolicy`; an absent/empty block means the D30
+defaults. `Service.EffectiveRetentionPolicy` returns the server default with the
+current revision's non-nil override fields replacing it, and unrelated revision
+changes carry the block forward unchanged. `releases.pruned_at` marks a release
+whose artifact was removed while its row and history stay; `preparePlatform`
+refuses `deploy --release` and `rollback` to such a release with
+`precondition_failed`, naming the release and prune time. `retention_runs`
+stores the operation, status, planned/removed items, planned/reclaimed bytes and
+per-item errors for observability.
+
+`retention.Plan` is the pure planner both the periodic job and `prune
+[--dry-run]` will call. It receives `retention.Input` plain values filled from
+the platform rows and node inventory, keeps each environment's serving release,
+its rollback target (selected with the same rule as
+`previousRollbackRelease`), the newest `keep_releases` and every release newer
+than `keep_newer_than_days`, protects in-flight releases and containers, keeps
+registry digests shared with a kept release, and plans release, registry
+artifact, Buildpacks cache, ownerless container and dangling image items with a
+total-bytes helper. Node effects, registry deletes/GC and `retention show|set` /
+`prune` commands are not part of this schema work.
 
 ## Migration and external database policy
 
