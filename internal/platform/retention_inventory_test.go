@@ -3,7 +3,10 @@ package platform
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,19 +141,11 @@ func writeRegistryFixture(t *testing.T) (string, int, int) {
 
 func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 	registryDir, taggedManifestBytes, untaggedManifestBytes := writeRegistryFixture(t)
-	newVolume := func(name string, size int) string {
-		path := filepath.Join(t.TempDir(), name)
-		if err := os.MkdirAll(path, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(path, "cache.tar"), make([]byte, size), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return path
-	}
-	buildMount := newVolume("build", 4096)
-	launchMount := newVolume("launch", 1024)
-	legacyMount := newVolume("legacy", 512)
+	dockerSocket := dockerAPISocket(t, http.StatusOK, `{"Volumes":[
+        {"Name":"`+testBuildCacheVolume+`","UsageData":{"Size":4096,"RefCount":0}},
+        {"Name":"`+testLaunchCacheVolume+`","UsageData":{"Size":1024,"RefCount":0}},
+        {"Name":"pack-cache-0123456789abcdef.build","UsageData":{"Size":512,"RefCount":0}}
+    ]}`)
 
 	answers := map[string]string{
 		"docker ps --all --quiet --no-trunc --filter label=io.eregion.app":                             "cid1\n",
@@ -160,9 +155,6 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 		"docker volume ls --quiet --filter name=eregion-build-cache-":                                  testBuildCacheVolume + "\n",
 		"docker volume ls --quiet --filter name=eregion-launch-cache-":                                 testLaunchCacheVolume + "\n",
 		"docker volume ls --quiet --filter name=pack-cache-":                                           "pack-cache-0123456789abcdef.build\n",
-		"docker volume inspect --format {{.Mountpoint}} " + testBuildCacheVolume:                       buildMount,
-		"docker volume inspect --format {{.Mountpoint}} " + testLaunchCacheVolume:                      launchMount,
-		"docker volume inspect --format {{.Mountpoint}} pack-cache-0123456789abcdef.build":             legacyMount,
 		"docker image ls --all --quiet --no-trunc":                                                     "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n",
 		"docker image inspect sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd": `[{"Id":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","RepoTags":["127.0.0.1:5000/demo/app:v1"],"RepoDigests":["127.0.0.1:5000/demo/app@` + testManifestDigest + `"]}]`,
 	}
@@ -176,7 +168,7 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 	}
 
 	inventory, err := ObserveRetentionInventory(context.Background(),
-		RetentionInventoryPaths{DataDir: t.TempDir(), RegistryDir: registryDir}, run)
+		RetentionInventoryPaths{DataDir: t.TempDir(), RegistryDir: registryDir, DockerSocket: dockerSocket}, run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,34 +258,113 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 	}
 }
 
-func TestObserveRetentionInventoryMarksUnreadableCacheUnknown(t *testing.T) {
-	missingMount := filepath.Join(t.TempDir(), "missing")
-	answers := map[string]string{
-		"docker ps --all --quiet --no-trunc --filter label=io.eregion.app":       "",
-		"docker image ls --quiet --no-trunc --filter dangling=true":              "",
-		"docker image ls --all --quiet --no-trunc":                               "",
-		"docker volume ls --quiet --filter name=eregion-build-cache-":            testBuildCacheVolume + "\n",
-		"docker volume ls --quiet --filter name=eregion-launch-cache-":           "",
-		"docker volume ls --quiet --filter name=pack-cache-":                     "",
-		"docker volume inspect --format {{.Mountpoint}} " + testBuildCacheVolume: missingMount,
+func TestObserveRetentionInventoryMarksUnknownCacheSizes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			name:   "docker reports -1",
+			status: http.StatusOK,
+			body:   `{"Volumes":[{"Name":"` + testBuildCacheVolume + `","UsageData":{"Size":-1,"RefCount":0}}]}`,
+		},
+		{
+			name:   "volume missing from the response",
+			status: http.StatusOK,
+			body:   `{"Volumes":[]}`,
+		},
+		{
+			name:   "docker API error",
+			status: http.StatusInternalServerError,
+			body:   `{}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dockerSocket := dockerAPISocket(t, tc.status, tc.body)
+			answers := map[string]string{
+				"docker ps --all --quiet --no-trunc --filter label=io.eregion.app": "",
+				"docker image ls --quiet --no-trunc --filter dangling=true":        "",
+				"docker image ls --all --quiet --no-trunc":                         "",
+				"docker volume ls --quiet --filter name=eregion-build-cache-":      testBuildCacheVolume + "\n",
+				"docker volume ls --quiet --filter name=eregion-launch-cache-":     "",
+				"docker volume ls --quiet --filter name=pack-cache-":               "",
+			}
+			run := func(_ context.Context, argv ...string) ([]byte, error) {
+				return []byte(answers[strings.Join(argv, " ")]), nil
+			}
+			inventory, err := ObserveRetentionInventory(context.Background(),
+				RetentionInventoryPaths{DataDir: t.TempDir(), RegistryDir: filepath.Join(t.TempDir(), "absent"), DockerSocket: dockerSocket}, run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(inventory.CacheVolumes) != 1 || !inventory.CacheVolumes[0].SizeUnknown {
+				t.Fatalf("unknown cache volume = %+v, want an unknown size", inventory.CacheVolumes)
+			}
+			if !inventory.CacheSizeUnknown || inventory.CacheError == "" {
+				t.Fatalf("inventory cache measurement = unknown=%t error=%q", inventory.CacheSizeUnknown, inventory.CacheError)
+			}
+			if inventory.CacheVolumes[0].SizeBytes != 0 {
+				t.Fatalf("an unknown cache size carried a byte measurement: %+v", inventory.CacheVolumes[0])
+			}
+		})
 	}
-	run := func(_ context.Context, argv ...string) ([]byte, error) {
-		return []byte(answers[strings.Join(argv, " ")]), nil
-	}
-	inventory, err := ObserveRetentionInventory(context.Background(),
-		RetentionInventoryPaths{DataDir: t.TempDir(), RegistryDir: filepath.Join(t.TempDir(), "absent")}, run)
+}
+
+func TestReadDockerVolumeSizesParsesUsageData(t *testing.T) {
+	dockerSocket := dockerAPISocket(t, http.StatusOK, `{"Volumes":[
+        {"Name":"known","UsageData":{"Size":4096,"RefCount":1}},
+        {"Name":"unknown","UsageData":{"Size":-1,"RefCount":0}},
+        {"Name":"missing-usage"},
+        {"Name":"zero","UsageData":{"Size":0,"RefCount":0}}
+    ]}`)
+	sizes, err := readDockerVolumeSizes(context.Background(), dockerSocket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(inventory.CacheVolumes) != 1 || !inventory.CacheVolumes[0].SizeUnknown {
-		t.Fatalf("unreadable cache volume = %+v, want an unknown size", inventory.CacheVolumes)
+	if sizes["known"] != 4096 {
+		t.Fatalf("known size = %d", sizes["known"])
 	}
-	if !inventory.CacheSizeUnknown || inventory.CacheError == "" {
-		t.Fatalf("inventory cache measurement = unknown=%t error=%q", inventory.CacheSizeUnknown, inventory.CacheError)
+	if size, ok := sizes["zero"]; !ok || size != 0 {
+		t.Fatalf("a reported zero is a known measurement: %d %t", size, ok)
 	}
-	if inventory.CacheVolumes[0].SizeBytes != 0 {
-		t.Fatalf("an unknown cache size carried a byte measurement: %+v", inventory.CacheVolumes[0])
+	for _, name := range []string{"unknown", "missing-usage"} {
+		if _, ok := sizes[name]; ok {
+			t.Fatalf("%s must be unknown, not a measurement", name)
+		}
 	}
+}
+
+func dockerAPISocket(t *testing.T, status int, body string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "eregion-docker-api-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
+	socket := filepath.Join(dir, "d.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet || request.URL.Path != "/system/df" {
+			http.NotFound(w, request)
+			return
+		}
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = listener.Close()
+	})
+	return socket
 }
 
 func TestObserveRetentionInventoryWithoutARegistryIsEmpty(t *testing.T) {

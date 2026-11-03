@@ -358,9 +358,12 @@ transport) returning `retention.Inventory`: registry manifests keyed by
 bytes of the manifest plus its unique blobs; the Buildpacks cache volumes and
 sizes; `io.eregion.app`-labeled containers with labels and state; dangling
 images; local images with their `RepoDigests`; and statfs total/free bytes for
-the data directory. Identical digests in two repositories stay two entries,
-because a registry delete names one repository. Registry storage is read in
-Distribution's layout (`blobs/sha256/<first two hex>/<hex>/data`) and a
+the data directory. Cache sizes come from Docker's `GET /system/df` calculation
+over the Docker socket; the worker never walks `/var/lib/docker`. A missing
+entry, `UsageData.Size == -1`, an API error or the five-minute bound is an
+unknown size, never zero. Identical digests in two repositories stay two
+entries, because a registry delete names one repository. Registry storage is
+read in Distribution's layout (`blobs/sha256/<first two hex>/<hex>/data`) and a
 revision is live only while its `_manifests/revisions/.../link` is valid. A
 missing manifest or referenced blob is an inventory warning, not a zero-byte
 artifact.

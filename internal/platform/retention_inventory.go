@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -87,12 +90,17 @@ func ParseBuildpacksCacheVolume(name string) (app, environment, kind string, ok 
 const (
 	DefaultDataDir     = "/var/lib/eregion"
 	DefaultRegistryDir = DefaultDataDir + "/registry"
+	// DefaultDockerSocket is the local Docker API the worker reaches through
+	// its docker-group membership. Volume sizes come from GET /system/df.
+	DefaultDockerSocket = "/var/run/docker.sock"
 )
 
-// RetentionInventoryPaths are the node directories the inventory reads.
+// RetentionInventoryPaths are the node directories and Docker socket the
+// inventory reads.
 type RetentionInventoryPaths struct {
-	DataDir     string
-	RegistryDir string
+	DataDir      string
+	RegistryDir  string
+	DockerSocket string
 }
 
 func (p RetentionInventoryPaths) resolved() RetentionInventoryPaths {
@@ -101,6 +109,9 @@ func (p RetentionInventoryPaths) resolved() RetentionInventoryPaths {
 	}
 	if strings.TrimSpace(p.RegistryDir) == "" {
 		p.RegistryDir = filepath.Join(p.DataDir, "registry")
+	}
+	if strings.TrimSpace(p.DockerSocket) == "" {
+		p.DockerSocket = DefaultDockerSocket
 	}
 	return p
 }
@@ -185,7 +196,7 @@ func ObserveRetentionInventory(ctx context.Context, paths RetentionInventoryPath
 	inventory.LocalImages = localImages
 	inventory.Truncated = inventory.Truncated || truncated
 
-	volumes, truncated, err := readCacheVolumes(ctx, run)
+	volumes, truncated, err := readCacheVolumes(ctx, paths.DockerSocket, run)
 	if err != nil {
 		return retention.Inventory{}, err
 	}
@@ -374,7 +385,27 @@ func sortedCopy(values []string) []string {
 
 // --------------------------------------------------------------- cache volumes
 
-func readCacheVolumes(ctx context.Context, run NodeReadRunner) ([]retention.CacheVolume, bool, error) {
+// dockerDiskUsageTimeout bounds the Docker API's volume-size calculation. A
+// big host can take a while; the retention job runs in the background, and a
+// timeout means unknown sizes, never zero.
+const dockerDiskUsageTimeout = 5 * time.Minute
+
+// maxDockerDiskUsageResponse bounds one /system/df response. It is large enough
+// for the volume list of a busy host and small enough that a broken Docker API
+// cannot exhaust the node protocol frame.
+const maxDockerDiskUsageResponse = 32 << 20
+
+type dockerDiskUsage struct {
+	Volumes []struct {
+		Name      string `json:"Name"`
+		UsageData *struct {
+			Size     int64 `json:"Size"`
+			RefCount int64 `json:"RefCount"`
+		} `json:"UsageData"`
+	} `json:"Volumes"`
+}
+
+func readCacheVolumes(ctx context.Context, dockerSocket string, run NodeReadRunner) ([]retention.CacheVolume, bool, error) {
 	seen := map[string]bool{}
 	var names []string
 	for _, prefix := range []string{BuildpackCacheVolumePrefix, BuildpackLaunchCacheVolumePrefix, PackCacheVolumePrefix} {
@@ -397,26 +428,38 @@ func readCacheVolumes(ctx context.Context, run NodeReadRunner) ([]retention.Cach
 	if len(names) == 0 {
 		return []retention.CacheVolume{}, false, nil
 	}
+
+	// The Docker API computes volume usage as the daemon, so the worker never
+	// walks /var/lib/docker (which is root-only on a normal Docker install).
+	// A failed or timed-out calculation leaves every name unknown; the planner
+	// must not treat that as a healthy zero.
+	sizes := map[string]int64{}
+	sizeCtx, cancel := context.WithTimeout(ctx, dockerDiskUsageTimeout)
+	measured, sizeErr := readDockerVolumeSizes(sizeCtx, dockerSocket)
+	cancel()
+	if sizeErr != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		measured = nil
+	}
+	if measured != nil {
+		sizes = measured
+	}
+
 	volumes := make([]retention.CacheVolume, 0, len(names))
 	for _, name := range names {
 		app, environment, kind, ok := ParseBuildpacksCacheVolume(name)
 		if !ok {
 			continue
 		}
-		raw, err := run(ctx, "docker", "volume", "inspect", "--format", "{{.Mountpoint}}", name)
-		if err != nil {
-			if alreadyGone(err) {
-				continue
-			}
-			return nil, false, dockerObservationFault("inspect build cache volume "+name, err)
-		}
-		mountpoint := strings.TrimSpace(string(raw))
-		size, sizeErr := directorySize(ctx, mountpoint)
 		volume := retention.CacheVolume{
 			Name: name, Kind: kind, App: app, Environment: environment,
-			Ownerless: kind == "pack", SizeBytes: size,
+			Ownerless: kind == "pack",
 		}
-		if sizeErr != nil {
+		if size, known := sizes[name]; known {
+			volume.SizeBytes = size
+		} else {
 			volume.SizeBytes = 0
 			volume.SizeUnknown = true
 		}
@@ -426,49 +469,58 @@ func readCacheVolumes(ctx context.Context, run NodeReadRunner) ([]retention.Cach
 	return volumes, truncated, nil
 }
 
-// directorySize sums regular files below one directory. A missing, unreadable
-// or timed-out directory is an unknown size, never a healthy zero.
-func directorySize(ctx context.Context, root string) (int64, error) {
-	root = strings.TrimSpace(root)
-	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) == "/" {
-		return 0, errors.New("the cache volume has no readable absolute mountpoint")
+// readDockerVolumeSizes reads GET /system/df over the Docker socket. Docker
+// reports UsageData.Size == -1 when it cannot calculate a volume's size; that
+// is unknown, not a zero-byte cache. A volume missing from the response is also
+// unknown.
+func readDockerVolumeSizes(ctx context.Context, socket string) (map[string]int64, error) {
+	socket = strings.TrimSpace(socket)
+	if socket == "" {
+		socket = DefaultDockerSocket
 	}
-	sizeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	info, err := os.Stat(root)
+	var usage dockerDiskUsage
+	if err := getDockerAPI(ctx, socket, "/system/df", &usage); err != nil {
+		return nil, err
+	}
+	sizes := make(map[string]int64, len(usage.Volumes))
+	for _, volume := range usage.Volumes {
+		if strings.TrimSpace(volume.Name) == "" || volume.UsageData == nil || volume.UsageData.Size < 0 {
+			continue
+		}
+		sizes[volume.Name] = volume.UsageData.Size
+	}
+	return sizes, nil
+}
+
+// getDockerAPI performs one read-only request over the local Docker socket.
+func getDockerAPI(ctx context.Context, socket, path string, target any) error {
+	dialer := &net.Dialer{}
+	transport := &http.Transport{
+		Proxy:             nil,
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", socket)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker"+path, nil)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if !info.IsDir() {
-		return 0, errors.New("the cache volume mountpoint is not a directory")
-	}
-	var total int64
-	entries := 0
-	err = filepath.WalkDir(root, func(_ string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entries++; entries%256 == 0 {
-			if err := sizeCtx.Err(); err != nil {
-				return err
-			}
-		}
-		if entry.Type().IsRegular() {
-			if info, statErr := entry.Info(); statErr == nil {
-				total += info.Size()
-			} else {
-				return statErr
-			}
-		}
-		return nil
-	})
+	response, err := (&http.Client{Transport: transport}).Do(request)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	if err := sizeCtx.Err(); err != nil {
-		return 0, err
+	defer func() {
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("the Docker API returned %s", response.Status)
 	}
-	return total, nil
+	if err := json.NewDecoder(io.LimitReader(response.Body, maxDockerDiskUsageResponse)).Decode(target); err != nil {
+		return fmt.Errorf("the Docker API response is unreadable: %w", err)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------- registry
