@@ -52,8 +52,9 @@ type Policy struct {
 	// that many days.
 	ArtifactGraceDays int `json:"artifact_grace_days"`
 	// BuildpackCacheMaxBytes and BuildpackCacheMaxPercent are the two D30
-	// Buildpacks-cache limits. Exceeding either one makes the cache eligible
-	// for pruning.
+	// Buildpacks-cache limits: the absolute cache size and the whole
+	// filesystem's used-percentage threshold. Exceeding either one makes the
+	// cache eligible for pruning.
 	BuildpackCacheMaxBytes   int64 `json:"buildpack_cache_max_bytes"`
 	BuildpackCacheMaxPercent int   `json:"buildpack_cache_max_percent"`
 }
