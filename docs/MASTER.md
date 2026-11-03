@@ -108,7 +108,7 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D27 | Plaintext secret read | No `secret get`. `secret export` is human-only behind the D7 factor. |
 | D28 | Push to deploy | In the alpha, as in deploycrate: an environment with auto-deploy on deploys every push to its bound branch through a signed GitHub webhook. Each environment has its own webhook URL and generated secret, shown once when auto-deploy is turned on and replaceable by rotation; the signature is checked over the raw body before parsing, deliveries are deduplicated by delivery ID, and pushes to other branches are ignored. The routing lives in the environment revision, not in service environment variables. |
 | D29 | Domain check path | Each domain binding has an optional check path (`domain add … --check-path PATH`), defaulting to the `web` process health path. The domain observer and the D17 public verification request each host at its own path, so an alias that serves no health route can still be ready. deploycrate has one path per web process; this is an eregion extension found in a real deployment. |
-| D30 | Disk retention | Required for v1.0.0, not alpha.1. A retention policy (server default, per-environment override) and one planner used by a periodic River job and by `eregion prune [--dry-run]`. Defaults: keep the newest 10 releases per environment plus any newer than 14 days, always the serving release and its rollback target; registry artifacts no release references after 14 days; Buildpacks caches above 10 GiB or 80% disk; ownerless labeled containers and dangling images always. Release rows are never deleted; a pruned release records `pruned_at` and a rollback to it refuses clearly. Registry deletion needs a new registry host-step version with deletes enabled plus garbage collection. A real `eregion prune` requires `--confirm <server>` and a dry run needs no confirmation. |
+| D30 | Disk retention | Required for alpha.1 (R9). A retention policy (server default, per-environment override) and one planner used by a periodic River job and by `eregion prune [--dry-run]`. Defaults: keep the newest 10 releases per environment plus any newer than 14 days, always the serving release and its rollback target; registry artifacts no release references after 14 days; Buildpacks caches above 10 GiB or 80% disk; ownerless labeled containers and dangling images always. Release rows are never deleted; a pruned release records `pruned_at` and a rollback to it refuses clearly. Registry deletion needs a new registry host-step version with deletes enabled plus garbage collection. A real `eregion prune` requires `--confirm <server>` and a dry run needs no confirmation. `doctor` reports the last run and warns when the Buildpacks cache exceeds the policy's absolute cap. |
 | D31 | Workload repair | As deploycrate's `workload_reconciliation`: on worker start the control plane compares each serving deployment's recorded containers with Docker and queues one restart of the serving release for an environment whose serving containers are missing. A restart never re-runs the release command (D21). |
 
 ## 4. The application model
@@ -168,6 +168,7 @@ eregion domain add|list|remove [--primary] [--check-path PATH]
 eregion config set|unset|list                          # plain variables
 eregion secret set|list|archive|export                 # values write-only
 eregion logs <app> <env> [--process NAME] [--follow]  ·  restart <app> <env>
+eregion retention show|set  ·  prune [--dry-run] [--confirm <server>]
 eregion operations list|get|follow|cancel
 eregion token create|list|revoke  ·  protect init|status
 eregion ssh [node] [--command CMD]  ·  node unlock-ssh # break-glass
@@ -175,9 +176,6 @@ eregion upgrade
 eregion ui  ·  commands | guide agents | skill install | version
 eregion node …                                         # node mode, not for operators
 ```
-
-Before v1.0.0 final, after alpha.1 (D30): `retention show|set` and
-`prune [--dry-run]`.
 
 After v1: `node add|list|status|remove`, `env promote`, access modes, the
 telemetry node and `metrics`.
@@ -218,8 +216,8 @@ node before it replaces anything, and an existing context name needs
 eregion version first and refuses with `node_version_mismatch` unless
 `--auto-upgrade-nodes` is given or set on the context. `upgrade` replaces only
 the local CLI and says so; `apply --auto-upgrade-nodes` upgrades the node and
-converges its steps; `doctor` reports drift, security, certificates, disk and
-versions. `eregion ssh` opens a shell over WireGuard.
+converges its steps; `doctor` reports drift, security, certificates, disk,
+retention and versions. `eregion ssh` opens a shell over WireGuard.
 
 ### 6.3 App setup (deploycrate)
 
@@ -298,8 +296,9 @@ compatibility contract in vaire's form (formats, JSON, commands, the
 
 An alpha is cut when MANUAL-TESTING's baseline passes on a real server for the
 tagged build. "Builds" or "appears in `commands --json`" is never the gate.
-Disk retention (D30) is not an alpha.1 gate; it is required before v1.0.0
-final and is the main alpha.2 item.
+Disk retention (D30) is an alpha.1 gate (R9): the policy, daily run, `prune
+[--dry-run]`, registry deletes and garbage collection, and the doctor retention
+and cache rows qualify with the rest of the baseline.
 
 Exception (R10): the macOS half of the install and upgrade checks is recorded
 as **not run (no Mac available)**. It must be qualified before v1.0.0 final
@@ -313,14 +312,16 @@ earlier passes are context, not qualification.
 
 ## 8. Current state
 
-Source state 2026-10-28: rows 1–15 are implemented in the integrated source on
-`master`. Rows 11–15 went through isolated implementation lanes and
-independent review, with rework and orchestrator acceptance; the final
-release-command evidence-classification correction was made by the orchestrator.
+Source state 2026-11-03: rows 1–15 and 17 are implemented in the integrated
+source on `master`. Row 17 (retention) has isolated tests and is an alpha.1
+gate; it is not host-qualified. Row 16 (alpha qualification) remains in progress. Rows 11–15 went through
+isolated implementation lanes and independent review, with rework and
+orchestrator acceptance; the final release-command evidence-classification
+correction was made by the orchestrator.
 Combined format, build, vet, darwin/arm64 build and selected isolated package
 tests pass. The PostgreSQL integration suite passes (without the race detector)
 against a disposable PostgreSQL 17 after the 2026-10-28 fixture fixes. Schema:
-embedded migrations through 016; applied migrations 001–013 are unchanged.
+embedded migrations through 017; applied migrations 001–013 are unchanged.
 **Alpha qualification remains incomplete.** On 2026-10-29 the existing `main`
 node upgraded from edge-8a7179d6d95d through the fixed signed upgrade path;
 CLI/node now run edge-e344781ced4b, schema 16/16, River 7/7, doctor 18 pass,
@@ -362,8 +363,8 @@ and installed on main (second apply no-op, doctor 18/0/0); four dense switches
 then had zero failures in 6,262 requests. Fresh init, human-factor-positive flows
 and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resume testing” section for the saved target,
 fixture state, evidence locations and unqualified acceptance variants, and its
-run records for operation IDs. Row 16 is in progress; row 17 remains
-unimplemented and required before v1.0.0 final.
+run records for operation IDs. Row 16 is in progress; row 17 is implemented at
+source level and is an alpha.1 gate, not yet host-qualified.
 
 On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
 switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
@@ -446,10 +447,11 @@ check. Task-level detail for rows 11–15 lives in the temporary
 One row at a time, in order (D16). A row is done when its user-visible flow
 works with flags, JSON, failure behavior and regression tests. Real-host checks
 are in MANUAL-TESTING. Exception: rows 11–14 touch disjoint behavior and may
-run in parallel per ALPHA-SPEC; row 15 follows them. Rows 1–15 are implemented
-at source level (section 8); their real-host acceptance criteria below are not
-qualified. Row 16 uses the existing designated test server and still needs a recorded
-baseline for the candidate build; local implementation/review does not qualify it.
+run in parallel per ALPHA-SPEC; row 15 follows them. Rows 1–15 and 17 are
+implemented at source level (section 8); their real-host acceptance criteria
+below are not qualified. Row 17 is an alpha.1 gate. Row 16 uses the existing
+designated test server and still needs a recorded baseline for the candidate
+build; local implementation/review does not qualify it.
 
 | # | Outcome | Done when |
 | --- | --- | --- |
@@ -469,7 +471,7 @@ baseline for the candidate build; local implementation/review does not qualify i
 | 14 | **Operator contracts.** Atomic `login` with `--replace`; same-key create retry returns the original operation without writing secrets again; `--context`/`EREGION_CONTEXT`; `logs --json` is one envelope (NDJSON only with `--output ndjson`); every operation-following command streams the same NDJSON events; `domain add --json` returns an object; `ssh --command`. | Each has a regression test; a failed import leaves an existing context working. |
 | 15 | **Guided finish.** Guided `app create`/`env create` follow build and deploy to serving or failed, Ctrl-C detaches (vaire's flow); `server init` ends with vaire's doctor gate (`doctor_failed`, `--resume`, `--skip-doctor`). | Guided create ends at a serving URL or a failed operation with its error; init on a healthy host ends with a clean doctor summary. |
 | 16 | **Alpha qualification.** MANUAL-TESTING baseline on a real server for the tagged build. | Recorded pass; then the user authorizes `1.x` and `v1.0.0-alpha.1`. |
-| 17 | **Disk retention (D30), alpha.2, required for v1.0.0.** Policy, planner, periodic job, `retention show|set`, `prune [--dry-run]`, registry deletes and GC, `doctor` disk warnings. | A node with 30 releases keeps exactly the policy's set; `prune --dry-run` lists what would go and the bytes; rollback to a pruned release refuses clearly; a second `apply` stays a no-op. |
+| 17 | **Disk retention (D30), alpha.1 gate.** Policy, planner, periodic job, `retention show|set`, `prune [--dry-run]`, registry deletes and GC, `doctor` retention and Buildpacks cache rows. Implemented and tested at source level; host qualification is pending. | A node with 30 releases keeps exactly the policy's set; `prune --dry-run` lists what would go and the bytes; rollback to a pruned release refuses clearly; a second `apply` stays a no-op. |
 
 ## Reference index
 

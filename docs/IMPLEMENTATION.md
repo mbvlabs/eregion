@@ -300,7 +300,8 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
 
 ## Disk retention schema (D30)
 
-Migration 017 adds the durable state for work list row 17. `internal/retention`
+Migration 017 adds the durable state for work list row 17 (an alpha.1 gate).
+`internal/retention`
 owns the D30 numbers (`DefaultPolicy`: newest 10 releases per environment, any
 release newer than 14 days, unreferenced registry artifacts after 14 days,
 Buildpacks caches above 10 GiB or 80% filesystem utilization), the environment
@@ -319,7 +320,7 @@ stores the operation, status, planned/removed items, planned/reclaimed bytes and
 per-item errors for observability.
 
 `retention.Plan` is the pure planner both the periodic job and `prune
-[--dry-run]` will call. It receives `retention.Input` plain values filled from
+[--dry-run]` call. It receives `retention.Input` plain values filled from
 the platform rows and node inventory through `retention.InputFromInventory`,
 keeps each environment's serving release,
 its rollback target (selected with the same rule as
@@ -453,6 +454,27 @@ normal `platform.environment.update` revision, never a direct row edit.
 `prune --dry-run` prints the plan items and bytes; a real `prune` needs
 `--confirm <server>` and submits the operation, following it through the same
 viewer as other mutating commands.
+
+### Retention doctor rows
+
+`host.retention` reads the newest `retention_runs` row on the main role and
+reports its finish time, status, removed-item count, reclaimed bytes and the
+run's planned reclaimable bytes. A failed, cancelled or stale running row warns;
+a last success older than 48 hours warns once the daily job has had time to run.
+Before the first run, the row passes with "no retention run yet" so a fresh
+install stays 0 warn / 0 fail; it warns only when `eregion-worker.service` has
+been continuously active for more than 48 hours without recording a run. The
+48-hour grace is not a policy value and does not hide a failed run.
+
+`host.build_cache` measures the same `eregion-build-cache-*`,
+`eregion-launch-cache-*` and legacy `pack-cache-*` volumes the inventory uses,
+and compares their total with the server policy's absolute
+`buildpack_cache_max_bytes` cap. Above the cap it warns and names
+`prune --dry-run`/`prune --confirm <server>`; the daily planner removes
+least-recently-used entries. The filesystem-percentage limit still makes cache
+entries eligible for the daily planner; general filesystem pressure is already
+surfaced by `host.disk`. Both rows are `AtInit` checks,
+so the main-node report is 20 results: the previous 18 plus retention and cache.
 
 ## Migration and external database policy
 
@@ -613,8 +635,10 @@ CLI's version with `upgrade.FetchNodeBinary`, verifies the upload checksum and
 installs it. A development build has no release to fetch and fails with a clear
 error instead of refusing silently. `doctor` covers pending steps, sshd root and
 password login, the WireGuard-only public SSH rule, the firewall, the Caddy
-certificate for the main hostname, disk, CLI/node/schema/River versions and the
-role's systemd units; any `fail` finding makes the command exit non-zero.
+certificate for the main hostname, disk, the last retention run, the Buildpacks
+cache against the policy cap, CLI/node/schema/River versions and the role's
+systemd units; any `fail` finding makes the command exit non-zero. A healthy
+main node reports 20 pass / 0 warn / 0 fail.
 
 An unreachable control database is classified before it reaches operator output:
 `dns_resolution`, `tcp_connect` (refused or unreachable), `tls_handshake`,

@@ -613,7 +613,8 @@ Delete `docs/ALPHA-PLAN.md` once its content lives here and in MASTER.
 
 ## Not in this spec
 
-Row 17 (retention, D30) gets its own spec after alpha.1. So does anything in
-MASTER "after v1". Field findings deferred by the one-pager: image
+Row 17 (retention, D30) is an alpha.1 gate (MASTER R9) and is implemented
+outside this temporary rows 11–15 spec. Anything in MASTER "after v1" is also
+out of scope. Field findings deferred by the one-pager: image
 inspect/list, a durable image-push operation, `env status --sanitized`, and
 app-database backup (operator-owned, stated in the agent guide by A1's guide edit).
