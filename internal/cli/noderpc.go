@@ -74,6 +74,11 @@ type Backend interface {
 	// RetentionInventory reads the node's reclaimable disk artifacts for the
 	// disk-retention planner. It is read-only.
 	RetentionInventory(context.Context) (retention.Inventory, error)
+	// RetentionPlan evaluates the same planner as a real prune without
+	// enabling any effect.
+	RetentionPlan(context.Context, string, string, string) (retention.PlanResult, error)
+	RetentionShow(context.Context, string, string) (retention.PolicyView, error)
+	RetentionSetServer(context.Context, retention.Policy) (retention.PolicyView, error)
 }
 
 const (
@@ -107,6 +112,9 @@ const (
 	methodNodeInfo           = "node.info"
 	methodImagePush          = "image.push"
 	methodRetentionInventory = "retention.inventory"
+	methodRetentionPlan      = "retention.plan"
+	methodRetentionShow      = "retention.show"
+	methodRetentionSet       = "retention.set"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -147,6 +155,21 @@ type rpcEventsParams struct {
 type rpcInventoryParams struct {
 	Collection string              `json:"collection"`
 	Filters    map[string][]string `json:"filters,omitempty"`
+}
+
+type rpcRetentionPlanParams struct {
+	Node        string `json:"node,omitempty"`
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+}
+
+type rpcRetentionShowParams struct {
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+}
+
+type rpcRetentionSetParams struct {
+	Policy retention.Policy `json:"policy"`
 }
 
 // query parses the filters with the collection the client sends separately.
@@ -687,6 +710,12 @@ func waitLabel(method string, params any) string {
 		return "Reading the node…"
 	case methodRetentionInventory:
 		return "Reading retention inventory…"
+	case methodRetentionPlan:
+		return "Planning disk retention…"
+	case methodRetentionShow:
+		return "Reading retention policy…"
+	case methodRetentionSet:
+		return "Writing the retention policy…"
 	case methodVersion:
 		return "Checking the node version…"
 	}
@@ -1290,6 +1319,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		return api.AppService{}, nil, err
 	}
 	appService := api.NewAppService(run.Service, parts.Vault, func(ctx context.Context) error { return controlplane.Ready(ctx, pool) })
+	appService.Retention = run.Service
 	return appService, func() { run.Close(); pool.Close() }, nil
 }
 
@@ -1379,6 +1409,36 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, err
 		}
 		return app.Inventory(ctx, actor, query)
+	case methodRetentionPlan:
+		var params rpcRetentionPlanParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		if app.Retention == nil {
+			return nil, contract.NewFault(contract.Unavailable, "retention is not configured on this node", "Start the control-plane service on the node.")
+		}
+		return app.Retention.RetentionPlan(ctx, params.Node, params.App, params.Environment)
+	case methodRetentionShow:
+		var params rpcRetentionShowParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		if app.Retention == nil {
+			return nil, contract.NewFault(contract.Unavailable, "retention is not configured on this node", "Start the control-plane service on the node.")
+		}
+		return app.Retention.RetentionShow(ctx, params.App, params.Environment)
+	case methodRetentionSet:
+		var params rpcRetentionSetParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		if app.Retention == nil {
+			return nil, contract.NewFault(contract.Unavailable, "retention is not configured on this node", "Start the control-plane service on the node.")
+		}
+		if err := app.Retention.SetServerRetentionPolicy(ctx, params.Policy); err != nil {
+			return nil, err
+		}
+		return app.Retention.RetentionShow(ctx, "", "")
 	case methodOperationsList:
 		var params rpcOperationsListParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {

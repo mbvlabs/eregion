@@ -9,6 +9,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/retention"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
 
@@ -19,6 +20,18 @@ type AppService struct {
 	Operations operations.Service
 	Vault      VaultService
 	ReadyCheck func(context.Context) error
+	// Retention is the optional disk-retention surface. It performs the same
+	// planner and policy writes as the periodic job.
+	Retention RetentionService
+}
+
+// RetentionService is the node-side retention surface. It is separate from
+// operations because show and plan are read-only and server policy is not an
+// environment revision.
+type RetentionService interface {
+	RetentionPlan(ctx context.Context, node, app, environment string) (retention.PlanResult, error)
+	RetentionShow(ctx context.Context, app, environment string) (retention.PolicyView, error)
+	SetServerRetentionPolicy(ctx context.Context, policy retention.Policy) error
 }
 
 // NewAppService builds the shared boundary.

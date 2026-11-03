@@ -141,7 +141,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 		guided := map[string]bool{
 			"eregion server init": true, "eregion login": true, "eregion upgrade": true,
 			"eregion skill install": true, "eregion app create": true, "eregion env create": true,
-			"eregion env update": true,
+			"eregion env update": true, "eregion retention set": true,
 			// These prompt only for the TOTP code at a terminal.
 			"eregion secret export": true, "eregion secrets export": true,
 			"eregion app delete": true, "eregion env delete": true,

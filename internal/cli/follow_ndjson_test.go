@@ -14,6 +14,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/retention"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
@@ -27,6 +28,7 @@ var followingCommands = []struct {
 	args []string
 }{
 	{name: "deploy", path: "eregion deploy", args: []string{"deploy", "api", "production"}},
+	{name: "prune", path: "eregion prune", args: []string{"prune", "--confirm", "main"}},
 	{name: "rollback", path: "eregion rollback", args: []string{"rollback", "api", "production", "--confirm", "api/production"}},
 	{name: "restart", path: "eregion restart", args: []string{"restart", "api", "production"}},
 	{name: "build stop", path: "eregion build stop", args: []string{"build", "stop", "bld_" + strings.Repeat("a", 32)}},
@@ -255,7 +257,7 @@ func prepareFollowingBackend(name string, backend *ndjsonFollowBackend) {
 func followingSubmits(name string) bool {
 	switch name {
 	case "deploy", "rollback", "restart", "build stop", "build retry",
-		"app create", "env create", "domain add", "domain remove", "process scale":
+		"app create", "env create", "domain add", "domain remove", "process scale", "prune":
 		return true
 	}
 	return false
@@ -281,6 +283,15 @@ func (f *ndjsonFollowBackend) SubmitAction(_ context.Context, kind, target strin
 
 func (f *ndjsonFollowBackend) SubmitActionWithSecrets(ctx context.Context, kind, target string, input json.RawMessage, key, confirm string, dryRun bool, _ map[string]string) (json.RawMessage, error) {
 	return f.SubmitAction(ctx, kind, target, input, key, confirm, dryRun)
+}
+
+func (f *ndjsonFollowBackend) NodeInfo(context.Context) (rpcNodeInfoResult, error) {
+	return rpcNodeInfoResult{Node: "main", Hostname: "main", Platform: "linux/amd64"}, nil
+}
+
+func (f *ndjsonFollowBackend) RetentionPlan(context.Context, string, string, string) (retention.PlanResult, error) {
+	f.calls++
+	return retention.PlanResult{Node: "main", Items: []retention.Item{}}, nil
 }
 
 func (f *ndjsonFollowBackend) accept(kind, target string) (json.RawMessage, error) {
