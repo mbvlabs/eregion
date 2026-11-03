@@ -379,7 +379,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		if credentialValue == "" {
 			// No snapshot pinned this credential (first attempt, or a snapshot
 			// written before the credential was pinned), so resolve the active
-			// revision now.
+			// revision now. A legacy snapshot keeps its application pins and
+			// gains the credential pin, so a rotation between attempts cannot
+			// change the credential inside one deployment.
 			value, ref, resolveErr := w.service.resolveCredentialSecret(ctx, env, credentialKey)
 			if resolveErr != nil {
 				return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, resolveErr)
@@ -387,6 +389,10 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			credentialValue = value
 			if len(dep.SecretRevisions) == 0 {
 				secretRefs[credentialKey] = ref
+			} else if _, pinned := dep.SecretRevisions[credentialKey]; !pinned {
+				if err := w.service.pinDeploymentCredentialSecret(ctx, id, attempt, credentialKey, ref); err != nil {
+					return w.settle(ctx, id, attempt, err)
+				}
 			}
 		}
 	}
@@ -873,6 +879,34 @@ func (s *Service) recordDeploymentSecretSnapshot(ctx context.Context, id contrac
             updated_at=clock_timestamp()
         WHERE operation_id=$1`, id, nullableRevisionID(revisionID), raw); err != nil {
 		return unavailable()
+	}
+	return nil
+}
+
+// pinDeploymentCredentialSecret merges a missing git read credential revision
+// into an existing deployment secret snapshot. It is attempt-fenced, preserves
+// the application pins already recorded, and never replaces a credential that
+// another attempt pinned first.
+func (s *Service) pinDeploymentCredentialSecret(ctx context.Context, id contract.OperationID, attempt uint32, name string, ref platform.SecretRevisionRef) error {
+	raw, err := json.Marshal(ref)
+	if err != nil {
+		return unavailable(err)
+	}
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, _ *contract.Operation) error {
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
+            SET secret_revisions=secret_revisions || jsonb_build_object($2::text,$3::jsonb),
+                updated_at=clock_timestamp()
+            WHERE operation_id=$1 AND secret_revisions<>'{}'::jsonb
+              AND NOT (secret_revisions ? $2)`, id, name, raw); err != nil {
+			return unavailable()
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
 	}
 	return nil
 }

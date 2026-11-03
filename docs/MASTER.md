@@ -404,10 +404,12 @@ attempt that already recorded its secret snapshot loses the git read credential
 and fails at the build step with `precondition_failed` "git read credential is
 unavailable", although a fresh deploy of the same revision succeeds. The
 credential's non-secret revision is now pinned into the deployment's secret
-snapshot on the first attempt, and every retry, rescue or River retry resolves it
-from that snapshot; a regression test loses the first attempt after the snapshot
-and requires the second to build with the pinned credential. Details and IDs are
-in MANUAL-TESTING's 2026-11-03 record.
+snapshot on the first attempt; a legacy snapshot without it gains the pin on the
+next attempt while keeping the application pins, and every retry, rescue or
+River retry resolves it from that snapshot. Regression tests lose the first
+attempt after the snapshot, and rotate the credential between a legacy snapshot
+and its retry, requiring the pinned revision. Details and IDs are in
+MANUAL-TESTING's 2026-11-03 record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),

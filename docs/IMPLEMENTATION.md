@@ -624,12 +624,14 @@ resolving each name's active latest revision and freezing the exact non-secret
 revision identities on the deployment. A private git read credential is resolved
 by NAME and pinned into that same snapshot on the first deploy attempt; later
 attempts of that deployment (River retry or rescued orphaned job) use the pinned
-revision, and resolve the active revision only when no snapshot pinned the
-credential. A standalone release or build retry has no deployment snapshot and
-resolves the active revision on each attempt. The credential is passed only to
-the askpass child environment; the value never enters the revision, operation
-input, events or logs. The transitional pinned `secret_refs` path is used only
-when the revision names no secrets. `platform.app.create` and
+revision. A snapshot written before the credential was pinned keeps its
+application pins and gains the credential pin on the next attempt, so a rotation
+between attempts cannot change the credential used by that deployment. A
+standalone release or build retry has no deployment snapshot and resolves the
+active revision on each attempt. The credential is passed only to the askpass
+child environment; the value never enters the revision, operation input, events
+or logs. The transitional pinned `secret_refs` path is used only when the
+revision names no secrets. `platform.app.create` and
 `platform.environment.create` with deploy intent queue the first
 deploy-from-revision operation in the same submission transaction.
 
