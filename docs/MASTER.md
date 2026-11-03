@@ -383,7 +383,27 @@ and a failed container cleanup was summarised as "candidate cleanup completed"
 worker SIGKILL leaves its platform operation running until River's rescue,
 about 30 minutes (30m21s observed on op_f0d20fed6c26eb6bd138c84bd211e170); the
 fix is in progress for alpha.1 by rescuing this host's orphaned platform jobs
-on worker start. Neither fixed defect has been host-retested.
+on worker start. Neither fixed defect had been host-retested at that point.
+
+On 2026-11-03 a further run on `main` upgraded `edge-42a0541c09d4` ->
+`edge-a77d3bfa4fe6` -> `edge-13fdb2518757` (both signed; the previous CLI binary
+was kept) and host-retested defect 1: the API's 405/401 now replace Caddy's 404
+on `/v1/environments/githello/production/deployments` while `/v1/apps` stays
+404. A second apply is a no-op (0 of 19) and doctor is 18/0/0. The ingress step
+reloaded Caddy without restarting it, and continuous curls saw 306/306,
+1,773/1,773 and 300/300 HTTP 200 across the reload, a worker-kill deploy and a
+node upgrade. Defect 3 is fixed and host-verified: a SIGKILLed worker's
+operation was rescued in about 9 seconds instead of 30 minutes, with a warning
+event naming the orphaned job. The signed-manifest check passed: with the
+release host blackholed on the node, `apply --auto-upgrade-nodes` refused with
+`unavailable` naming the version manifest and installed nothing; after the fault
+was removed the upgrade completed and applied the new `host-journal-access-v1`
+step, after which admin reads the eregion journal without sudo. The same retest
+found **defect 4** (open): a rescued deployment attempt that already recorded
+its secret snapshot loses the git read credential and fails at the build step
+with `precondition_failed` "git read credential is unavailable", although a
+fresh deploy of the same revision succeeds. Details and IDs are in
+MANUAL-TESTING's 2026-11-03 record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),

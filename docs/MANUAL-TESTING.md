@@ -109,14 +109,14 @@ Facts below are the last recorded observations, not a fresh host check.
 
 | Item | Last recorded state |
 | --- | --- |
-| Repository | `/home/mbv/work/eregion`, branch `master`; tested revision `42a0541` (TCP migration fix `c09b321` plus docs). Fixes `2943e18` (CI endpoint path) and `4e827aa` (cleanup reporting) are committed after it; the 2026-10-30/31 evidence updates may be uncommitted. |
-| Tested CLI and main | `edge-42a0541c09d4`, source `42a0541`; CI and signed edge publication passed. Earlier passes ran on `edge-ef91d70f6215`. Do not confuse a newer edge publication with an installed or qualified build. |
-| Existing server | Context/node `main`, host `exploration`, Ubuntu 26.04 amd64; public IP `46.224.129.96`; operator `admin@10.78.0.1:22` through embedded WireGuard, endpoint `46.224.129.96:51820`. |
-| Health | Doctor 18 pass / 0 warn / 0 fail; second apply 0 applied / 18 skipped; schema 16/16, River 7/7; Caddy 2.11.4 (not restarted by the upgrade); `net.ipv4.tcp_migrate_req=1` from `host-ingress-sysctl-v1`. |
-| Known open defect | Defect 3: a worker SIGKILL leaves its platform operation running until River's rescue, about 30 minutes (30m21s observed, evidence 149/150). Fix in progress for alpha.1. |
+| Repository | `/home/mbv/work/eregion`, branch `master`; tested revisions `a77d3bf` (worker rescue) and `13fdb25` (control-DB failure classification plus `host-journal-access-v1`), both with green CI and signed edge publication. `42a0541` and earlier builds are context, not qualification. |
+| Tested CLI and main | `edge-13fdb2518757`, source `13fdb25`; the 2026-11-03 run upgraded `edge-42a0541c09d4` -> `edge-a77d3bfa4fe6` and then to `edge-13fdb2518757`. Earlier passes ran on `edge-ef91d70f6215` and `edge-42a0541c09d4`. Do not confuse a newer edge publication with an installed or qualified build. |
+| Existing server | Context/node `main`, host `exploration`, Ubuntu 26.04 amd64; public IP `46.224.129.96`; main hostname `db2.mbvlabs.com`; operator `admin@10.78.0.1:22` through embedded WireGuard, endpoint `46.224.129.96:51820`. |
+| Health | Doctor 18 pass / 0 warn / 0 fail; second apply 0 applied / 19 skipped (19 host steps since `host-journal-access-v1`); schema 16/16, River 7/7; Caddy 2.11.4 (not restarted by any of the 2026-11-03 upgrades or applies); `net.ipv4.tcp_migrate_req=1` from `host-ingress-sysctl-v1`; admin reads the eregion journal without sudo. |
+| Known open defect | Defect 4: a retried/rescued deployment attempt that already recorded its deployment secret snapshot loses the git read credential and fails at the build step with `precondition_failed` "git read credential is unavailable" (op_d0f76b56af719f63cb8141fa0c6f61c4 attempt 2). Defect 3 (worker SIGKILL left an operation running ~30 minutes) is fixed and host-verified on `a77d3bf` (rescue in 9.0s). |
 | External database | PostgreSQL 17 on the operator machine, container `eregion-cp-pg`, host port 5433. Main reaches it through TLS-terminated Tailscale Funnel `thelab.tailbbed89.ts.net:10000`. No DSN belongs in this document. |
 | Test app | `githello/production`, `APP_VERSION=v3`; web ×2 (`eregion-hello`, port 8080) and worker ×1 (`eregion-hello worker`, no port); release command `eregion-hello release`; health `/healthz`. |
-| Serving release | Latest recorded: `rel_0170b1be56a64a747d522a2831cb02d8`, source commit `3461a87`, redeployed by op_4dc3431876c9f4f0e5caae4cd22d695f and op_6f4a7968f5823f71cd1003ec33a81293 (deployment ID not captured). Earlier snapshot: `rel_07d1c0fb27cdc0d68c7e5815a56e9328`, source `b895cb2f54daeaedafac44397072db893cd8ef1c`, deployment `dep_4ca1b01d314414a4fdaef2730cd1760b`, revision 8. |
+| Serving release | `rel_b38312bd825f8c7e66ae3fe906148795`, source commit `3461a87`, deployment `dep_7f256e534322e9bf0fc627047c5523d4`, built and deployed by op_5e277f6637276de54c3011fc1fc52a0f on 2026-11-03. Earlier snapshot: `rel_0170b1be56a64a747d522a2831cb02d8`, source commit `3461a87`, redeployed by op_4dc3431876c9f4f0e5caae4cd22d695f and op_6f4a7968f5823f71cd1003ec33a81293. |
 | Source desired state | Private `https://github.com/mbvlabs/eregion-hello.git`, ref `main`, context `apps/web`, builder `paketobuildpacks/builder-jammy-base`, credential name `GIT_READ_TOKEN`. |
 | Primary | `https://git-test1.mbvlabs.com/`, last recorded DNS-only, returns `eregion sample: v3 src3`. |
 | Alias | `https://git-test2.mbvlabs.com/users/sign-in`, Cloudflare-proxied, returns `alias ready`; binding check path `/users/sign-in`. Both bindings last observed route=applied, certificate=valid, public=ok. |
@@ -179,6 +179,7 @@ are under `/home/mbv/.cache/eregion-run/` (operator-local, not Git artifacts):
 | Release-command change/failure/refusal, cleanup obstruction, Caddy reload resets and `tcp_migrate_req`, rejected reload and recovery | `93-*` through `123-*` |
 | TCP migration dense continuity | `124-*` through `127-*` |
 | Release-changing dense switches, symlink escape, replay, failed-command rollback, failed-candidate cleanup, domain churn with worker kills, dev dry-run, detach/replay and cancel | `128-*` through `154-*` |
+| CLI upgrade between two edge builds, signed node upgrades, CI endpoint path, worker-kill rescue, failed-manifest refusal, journal access | `155-*` through `207-*` (monitors `170`, `180`, `195`) |
 
 The Python alias continuity monitor returned 403 and is **not** passing evidence;
 use the later curl measurements. Saved binding/operation acceptance is not
@@ -198,7 +199,7 @@ do not treat a passed subset as completion of an entire row.
 | Push to deploy | **Not run:** signed push deploys; a redelivery does not deploy twice; another branch or a bad signature does nothing; after rotation the old secret fails. Needs `env update --auto-deploy` at a human terminal and a GitHub webhook on `mbvlabs/eregion-hello`. |
 | Factor-gated ops | **Not run:** positive `token create`, `secrets export`, `secret export`, `app delete`, `env delete` (including deleting the last environment); cleanup and history verified. JSON/no-TTY refusals and deletion preview passed. Needs the human authenticator. |
 | Login and contexts | **Not run:** successful second-machine login from the bundle, atomic failed replacement, wrong host key, context selection and `context remove`. Needs the bundle from `secrets export`, then an agent. Preserve the working main context and identity. |
-| Upgrades | **Partial:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). **Not run:** `upgrade` between two edge builds and a failed manifest download during a node upgrade never falling back to checksum-only. Needs two published edge builds and an agent. |
+| Upgrades | **Partial pass:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). `upgrade` between two edge builds passed on 2026-11-03 (`42a0541` -> `a77d3bf` -> `13fdb25`, previous-binary copy kept); a failed manifest download during a node upgrade refused with `unavailable` and no checksum-only fallback (`193-*`). Still **not run:** `install.sh` acceptance on Linux/macOS for these builds. |
 | macOS | **Not run (no Mac available, R10):** `install.sh` on macOS and an installed CLI against the server. CI's macOS CLI job and the darwin/arm64 cross-build are not host acceptance. Required before v1.0.0 final; not an alpha.1 gate. |
 | Disk retention (alpha.1 gate, R9) | **Not run:** every row 17 acceptance check: 30 releases → exactly the policy's set; `prune --dry-run` lists items and bytes; rollback to a pruned release refuses; a second `apply` is a no-op; registry GC frees space; doctor disk warnings. Needs T12 implemented, then an agent on the server. |
 | Fresh host | **Not run:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. Needs an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
@@ -206,12 +207,17 @@ do not treat a passed subset as completion of an entire row.
 | Repair variants | **Not run:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. Needs a scoped fault. |
 | Final pass | **Not run:** the complete baseline (every row, including retention) on the candidate build, starting from a freshly initialized server (R3, R11). Earlier builds' passes are context, not qualification; the user authorizes `1.x` and the tag after the recorded pass. |
 
-Defect 3 is the only open known defect at the stopping point: a worker SIGKILL
-leaves its platform operation running for about 30 minutes until River rescues
-it (30m21s observed, evidence 149/150). The CI endpoint path and false
-cleanup-summary defects are fixed at source but not host-retested; the
-Caddy-reload reset fix is host-verified. Missing prerequisites for the remaining
-alpha.1 rows: an authorized fresh server and human participation for
+Defect 3 is fixed and host-verified on `a77d3bf`: a worker SIGKILL now rescues
+the operation on worker start (9.0s measured, evidence 183; the earlier
+observation was 30m21s, evidence 149/150). The same retest exposed **defect 4**:
+a retried/rescued deployment attempt that already recorded its deployment secret
+snapshot loses the git read credential and fails with `precondition_failed`
+"git read credential is unavailable" (op_d0f76b56af719f63cb8141fa0c6f61c4).
+Defect 4 is open; a fresh deploy of the same revision succeeded. The CI endpoint
+path (defect 1) is now host-retested and passes; the cleanup-summary fix is
+host-retested in a successful redeploy only, not with a forced cleanup failure.
+The Caddy-reload reset fix is host-verified. Missing prerequisites for the
+remaining alpha.1 rows: an authorized fresh server and human participation for
 factor-positive operations. macOS is deferred (R10). Other unqualified variants
 remain **not run**, not implementation failures or passes.
 
@@ -253,15 +259,18 @@ remain **not run**, not implementation failures or passes.
 ## Current qualification boundary
 
 Real-host evidence spans several published edge builds, recorded below.
-`edge-42a0541c09d4` is the latest installed and tested build; earlier passes are
+`edge-13fdb2518757` is the latest installed and tested build; earlier passes are
 not automatically a full baseline pass for it. The 2026-10-29/30 runs closed
 release-changing dense switches, symlink-escape rejection, same-key replay after
 the branch was deleted, rollback refusal for a release whose command never
 succeeded, failed-candidate leak recording, interleaved domain changes with
 worker kills, the dev-CLI dry-run mismatch and terminal detach/replay/cancel.
-They also found defect 3 (worker SIGKILL leaves an operation running for about
-30 minutes); the Caddy CI path and cleanup-summary defects are fixed after the
-run but not host-retested. Source fixes have isolated regressions, build/vet and
+They also found defect 3 (worker SIGKILL left an operation running for about
+30 minutes); the 2026-11-03 run verified its rescue fix, retested the CI
+endpoint path on the host, passed the between-two-edge-builds upgrade and the
+failed-manifest fail-closed check, and applied `host-journal-access-v1`. The
+same run found defect 4 (a rescued deployment attempt loses the git read
+credential). Source fixes have isolated regressions, build/vet and
 darwin/arm64 cross-build evidence; published CI also ran race checks. These are
 distinct from manual acceptance.
 
@@ -738,6 +747,115 @@ Evidence: ~/.cache/eregion-run/128-* through 154-*.
 Remaining: the full baseline on the candidate build from a freshly initialized
   server (R3, R11), including guided create, CI, push to deploy, factor-positive
   operations, login/contexts, retention and the other open rows.
+```
+
+```text
+Date / build / commit / channel: 2026-11-03 / edge-a77d3bfa4fe6 and
+  edge-13fdb2518757 / a77d3bf and 13fdb25 / edge
+CI and publication: a77d3bf CI and Publish edge pass (run 41691456825);
+  13fdb25 CI and Publish edge pass (run 41692644196). Publication of the two
+  later master commits was not used by this run.
+Operator OS/arch: linux/amd64. CLI upgrade edge-42a0541c09d4 ->
+  edge-a77d3bfa4fe6: pass, previous binary kept at ~/.local/bin/eregion.prev
+  (reports edge-42a0541c09d4). CLI upgrade edge-a77d3bfa4fe6 ->
+  edge-13fdb2518757 with `upgrade --version` for the second-build check: pass,
+  previous binary reports edge-a77d3bfa4fe6.
+Server: existing main, Ubuntu 26.04 amd64; before the run CLI and node
+  edge-42a0541c09d4, schema 16/16, River 7/7, doctor 18/0/0.
+Safe first checks (155-163): pass. Context main reaches admin@10.78.0.1 over
+  WireGuard; server status role=main, all five services active, 57.4 GiB free;
+  githello/production serving rel_0170b1be56a64a747d522a2831cb02d8 with web x2
+  and worker x1; git-test1 200 "eregion sample: v3 src3", git-test2 200
+  "alias ready". Only the leftover git-test3 alias remains from the 2026-10-30
+  domain churn (dns=wrong, certificate/public pending); git-test4 is gone.
+Node upgrade dry run (42a0541 -> a77dbf): pass, exit 5, node_version_mismatch
+  "would upgrade node ..."; node binary sha256/size/mtime and API, worker and
+  Caddy start timestamps identical before and after (169 vs 171).
+Node upgrade (`apply --auto-upgrade-nodes`): pass, exit 0, 18:17:36-18:17:51,
+  op_74a0c28c3ed7ca35e57c297fbf6a8419, 4 applied of 18: host-ingress-v2 (the
+  CI path matcher fix; Caddyfile now /v1/environments/*/*/deployments), API and
+  worker restarts, readiness. Node now edge-a77d3bfa4fe6. Caddy was reloaded
+  by the ingress step, not restarted (caddy.service ActiveEnterTimestamp stayed
+  2026-10-29 11:38:24 UTC). Monitor 170: 306/306 HTTP 200 (102 each on
+  git-test1, git-test2 and andurel's eregion-test), zero failures.
+Second apply: pass, op_5b4b1b9f317d0c2673349d350a796d5d, 0 applied of 18, no
+  step executed. Doctor: 18 pass / 0 warn / 0 fail.
+CI endpoint retest on the main hostname db2.mbvlabs.com (read from the managed
+  Caddyfile, 177-179): GET
+  /v1/environments/githello/production/deployments returns HTTP 405,
+  allow: POST, with the API's {"error":"use POST ...","code":"usage_error"}
+  (not Caddy's 404); POST without a token returns 401 unauthenticated "exactly
+  one Bearer token is required"; /v1/apps returns Caddy's 404. Defect 1 host
+  retest: PASS. No deploy was submitted on the CI path.
+Defect 3 retest (180-183): deploy op_d0f76b56af719f63cb8141fa0c6f61c4 (fresh
+  build of 3461a87) submitted 18:21:23; eregion-worker.service SIGKILLed at
+  18:21:41 (systemd "on client request"); restart 18:21:46; the new worker
+  logged "Recovered orphaned platform jobs before worker start" with
+  requeued=1 at 18:21:48; operations follow showed the warning "Recovered
+  orphaned platform job 167151 left running by an earlier worker process on
+  this host" at 18:21:48.660; attempt 2 started at 18:21:50.543. Rescue latency
+  about 9s, not 30 minutes. PASS for defect 3.
+  The rescued attempt then FAILED at 18:21:54 with precondition_failed
+  "git read credential is unavailable": bld_fc680448ac7db566b4d0dae3cd5a15f6
+  and rel_53a22cfea2e1f3a2fa9dd523ac4c5510 failed; rel_0170b1be... kept
+  serving; follow exit 5. This is defect 4 (below), not a recurrence of the
+  30-minute stall. A fresh deploy of the same revision,
+  op_5e277f6637276de54c3011fc1fc52a0f, succeeded 18:23:25-18:25:19 and built
+  bld_48d3acf6d2555726880f191d12a5d1bc -> release
+  rel_b38312bd825f8c7e66ae3fe906148795, deployment
+  dep_7f256e534322e9bf0fc627047c5523d4. So the credential itself is intact;
+  monitor 180: 1,773/1,773 HTTP 200, zero failures.
+Failed-manifest check (a77dbf -> 13fdb25, 188-194): pass. The CLI was moved to
+  the exact signed edge-13fdb2518757; `apply --dry-run --auto-upgrade-nodes`
+  refused node_version_mismatch. Temporary scoped fault: /etc/hosts on main
+  mapped eregion.mbvlabs.com to 127.0.0.1, with a copied backup and a
+  10-minute systemd-run restoration guard. The node's resolver returned
+  127.0.0.1 and its manifest fetch failed. `apply --auto-upgrade-nodes` then
+  failed closed: exit 6, unavailable "release URL is unreachable", naming
+  https://eregion.mbvlabs.com/releases/edge-13fdb2518757/manifest.json. The node
+  binary sha256/size/mtime and API, worker and Caddy start timestamps were
+  identical to before the attempt, and no /tmp/eregion-* upload was left; there
+  was no checksum-only fallback. The fault was removed (original /etc/hosts
+  restored, backup deleted, timer stopped, marker count 0) and the manifest
+  fetch returned 200 again.
+Completed upgrade (`apply --auto-upgrade-nodes`): pass, exit 0, 18:28:32-18:28:46,
+  op_f9559862af54228b02167a95f2ff3615, 4 applied of 19: the new
+  host-journal-access-v1 (admin added to systemd-journal), API and worker
+  restarts, readiness. Node now edge-13fdb2518757, binary sha256
+  aefec7b9f65ccbb94e5766e6e5cd44d2d2edb0f5d87226615421a7a2a540d7e9, exactly
+  the signed manifest's linux/amd64 artifact. Caddy was not restarted (same
+  ActiveEnterTimestamp). Monitor 195: 300/300 HTTP 200, zero failures.
+  Second apply op_3a20c78b82b65cb6054c8ef72a1f0432: 0 applied of 19. Doctor:
+  18 pass / 0 warn / 0 fail (the new step adds no doctor check). As admin,
+  `journalctl -u eregion-worker.service` and `-u eregion-api.service` now
+  return entries without sudo, exit 0 (199).
+Defects:
+  1. Fixed in 2943e18 and now host-retested: the API's 405/401 replace Caddy's
+     404 on the CI deploy path; /v1/apps stays Caddy's 404.
+  3. Fixed in a77d3bf and host-verified: SIGKILL rescue in about 9s with a
+     warning event naming the orphaned job (was 30m21s).
+  4. NEW, open: a rescued/retried deployment attempt that already recorded its
+     deployment secret snapshot loses the git read credential and fails at the
+     build step (op_d0f76b56af719f63cb8141fa0c6f61c4 attempt 2,
+     "git read credential is unavailable") although GIT_READ_TOKEN revision 1
+     is active and a fresh deploy of the same revision succeeded. The snapshot
+     pins include the credential, but platform_deploy.go only resolves the
+     credential into buildSecrets when len(dep.SecretRevisions)==0 and discards
+     the resolver's credential value on the snapshot path, while the credential
+     is not in the revision's secret_names. No code was changed.
+Final state: rel_b38312bd825f8c7e66ae3fe906148795 serves githello/production
+  (dep_7f256e534322e9bf0fc627047c5523d4, health healthy); git-test1 and
+  git-test2 route=applied, certificate=valid, public=ok; git-test3 remains
+  dns=wrong/pending; no pending cleanup; CLI, node and publish line
+  edge-13fdb2518757; schema 16/16, River 7/7; doctor 18/0/0; no injected
+  fault, hosts backup or guard timer left.
+Evidence: ~/.cache/eregion-run/155-* through 207-* (monitors 170, 180, 195;
+  rescue journal 183; blocked manifest 193; node before/after 190/193/198).
+Remaining: defect 4; the full baseline on a freshly initialized server (R3,
+  R11), including guided create, an authenticated CI deploy, push to deploy,
+  factor-positive operations, login/contexts, retention and the other open
+  rows. The Upgrades row now has the two-edge-build upgrade and failed-manifest
+  checks; `install.sh` on Linux/macOS and macOS remain not run (R10).
 ```
 
 ```text
