@@ -44,11 +44,12 @@ func (s *ingressStep) arch() string {
 // hostname: readiness, the per-environment CI deploy endpoint, and the
 // per-environment GitHub webhook, which verifies its own HMAC signature.
 // Everything else of the API stays on loopback, reached by the CLI through SSH
-// over WireGuard.
+// over WireGuard. Caddy matches a pattern with an inner wildcard as a glob in
+// which each * is one path segment, so <app>/<env> needs two.
 var PublicAPIPaths = []string{
 	"/readyz",
-	"/v1/environments/*/deployments",
-	"/v1/environments/*/deployments/*",
+	"/v1/environments/*/*/deployments",
+	"/v1/environments/*/*/deployments/*",
 	"/v1/webhooks/github/*/*",
 }
 
@@ -132,6 +133,10 @@ func (s *ingressStep) Apply(ctx context.Context, _ engine.Runtime, report engine
 	if !ok {
 		return engine.ApplyResult{}, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
 	}
+	// Only a changed executable needs a restart, which drops every site's
+	// connections; a Caddyfile change on the pinned version reloads.
+	installed, err := s.exec.Output(ctx, "caddy version")
+	restart := err != nil || !pinnedCaddyVersion(installed)
 	if err := s.exec.Run(ctx, s.ID(), installCaddyScript, map[string]string{
 		"CADDY_VERSION": CaddyVersion, "CADDY_ARCH": s.arch(), "CADDY_URL": url, "CADDY_SHA256": checksum,
 	}, report); err != nil {
@@ -147,18 +152,27 @@ install -d -m 0755 -o %[1]s -g %[2]s %[3]s
 	if err := writePublicFile(CaddyfilePath, s.caddyfile(), "root", "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	script := `set -euo pipefail
-caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
-systemctl enable caddy.service >/dev/null 2>&1
-# A reload keeps the old executable in memory after a package upgrade.
-systemctl restart caddy.service
-systemctl is-active --quiet caddy.service`
-	if err := s.exec.Run(ctx, s.ID(), script, nil, report); err != nil {
+	if err := s.exec.Run(ctx, s.ID(), caddyActivateScript(restart), nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	return engine.ApplyResult{Notes: []string{"Caddy " + CaddyVersion + " serves " + s.cfg.Hostname}, Result: map[string]any{
 		"hostname": s.cfg.Hostname, "paths": PublicAPIPaths, "version": CaddyVersion, "sha256": checksum,
 	}}, nil
+}
+
+// caddyActivateScript validates the Caddyfile and activates it. A reload keeps
+// the old executable in memory after a package upgrade, so a changed binary
+// restarts; reload-or-restart also starts a stopped service.
+func caddyActivateScript(restart bool) string {
+	activate := "systemctl reload-or-restart caddy.service"
+	if restart {
+		activate = "systemctl restart caddy.service"
+	}
+	return `set -euo pipefail
+caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+systemctl enable caddy.service >/dev/null 2>&1
+` + activate + `
+systemctl is-active --quiet caddy.service`
 }
 
 func (s *ingressStep) Diff(context.Context, engine.Runtime) ([]string, error) {

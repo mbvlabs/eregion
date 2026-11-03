@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -144,5 +145,64 @@ printf '%s' "$TEST_AFTER" > "$TEST_VERSION_FILE"
 				t.Fatal("install does not preserve existing config")
 			}
 		})
+	}
+}
+
+// caddyPathMatch mirrors Caddy 2.11's path matcher for the pattern forms used in
+// PublicAPIPaths: a single trailing * is a prefix match, otherwise path.Match,
+// where each * is one segment.
+func caddyPathMatch(pattern, requestPath string) bool {
+	if strings.Count(pattern, "*") == 1 && strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(requestPath, strings.TrimSuffix(pattern, "*"))
+	}
+	matched, _ := path.Match(pattern, requestPath)
+	return matched
+}
+
+func TestPublicAPIPathsReachTheHandlers(t *testing.T) {
+	matches := func(requestPath string) bool {
+		for _, pattern := range PublicAPIPaths {
+			if caddyPathMatch(pattern, requestPath) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, public := range []string{
+		"/readyz",
+		"/v1/environments/api/production/deployments",
+		"/v1/environments/api/production/deployments/op_0123456789abcdef0123456789abcdef",
+		"/v1/webhooks/github/api/production",
+	} {
+		if !matches(public) {
+			t.Errorf("%s is not exposed by Caddy", public)
+		}
+	}
+	for _, private := range []string{
+		"/", "/v1/operations", "/v1/secrets", "/v1/secrets/x", "/v1/apps",
+		"/v1/environments/api/production", "/v1/environments/api/deployments",
+		"/private/x", "/metrics",
+	} {
+		if matches(private) {
+			t.Errorf("%s must stay on loopback", private)
+		}
+	}
+}
+
+// A Caddyfile change on the pinned binary must reload, so a host upgrade does
+// not drop every site's connections; a changed binary must restart.
+func TestCaddyActivationRestartsOnlyForANewBinary(t *testing.T) {
+	reload := caddyActivateScript(false)
+	if !strings.Contains(reload, "systemctl reload-or-restart caddy.service") || strings.Contains(reload, "systemctl restart caddy.service") {
+		t.Fatalf("pinned binary does not reload:\n%s", reload)
+	}
+	restart := caddyActivateScript(true)
+	if !strings.Contains(restart, "systemctl restart caddy.service") || strings.Contains(restart, "reload-or-restart") {
+		t.Fatalf("new binary does not restart:\n%s", restart)
+	}
+	for _, script := range []string{reload, restart} {
+		if !strings.HasPrefix(script, "set -euo pipefail\ncaddy validate ") || !strings.HasSuffix(script, "systemctl is-active --quiet caddy.service") {
+			t.Fatalf("activation must validate first and verify last:\n%s", script)
+		}
 	}
 }
