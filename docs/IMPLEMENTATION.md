@@ -446,6 +446,17 @@ error instead of refusing silently. `doctor` covers pending steps, sshd root and
 password login, the WireGuard-only public SSH rule, the firewall, the Caddy
 certificate for the main hostname, disk, CLI/node/schema/River versions and the
 role's systemd units; any `fail` finding makes the command exit non-zero.
+
+An unreachable control database is classified before it reaches operator output:
+`dns_resolution`, `tcp_connect` (refused or unreachable), `tls_handshake`,
+`tls_verification`, `authentication`, `timeout`, or `other`. The message names
+the DSN's host and port only and never its user, password, database name, query
+parameters, full connection string, or raw driver error. `plan` adds the
+class's fix as the step hint, `apply` carries it in the step fault, the existing
+`version.schema` doctor row reports the class and fix (so the doctor check count
+does not change), and `server status` shows it in `schema_error` plus
+`schema_fix`.
+
 `ssh` uses the context's pinned host key and identity. Without `--command` it
 needs a terminal and opens an interactive shell; `--command` runs one remote
 command and exits with its status. The command gets a PTY only when stdin and

@@ -74,6 +74,23 @@ func TestPendingCertificateStaysAWarningAtInit(t *testing.T) {
 	}
 }
 
+func TestVersionSchemaReportsTheControlDatabaseFailure(t *testing.T) {
+	results := Run([]Check{{ID: "version.schema", Category: CatVersions, AtInit: true, Run: versionSchema}}, Facts{
+		SchemaKnown: false,
+		SchemaError: "control database unreachable (dns_resolution) at db.example.com:5432: the database hostname did not resolve",
+		SchemaFix:   "Check the database hostname and DNS resolution on the node.",
+	})
+	if len(results) != 1 || results[0].Status != Fail {
+		t.Fatalf("version.schema = %+v", results)
+	}
+	if !strings.Contains(results[0].Detail, "dns_resolution") || !strings.Contains(results[0].Detail, "db.example.com:5432") {
+		t.Fatalf("detail does not name the class and endpoint: %s", results[0].Detail)
+	}
+	if !strings.Contains(results[0].Fix, "DNS") {
+		t.Fatalf("fix does not carry the class hint: %s", results[0].Fix)
+	}
+}
+
 func TestSummaryLineNamesTheInitCounts(t *testing.T) {
 	line := SummaryLine(map[Status]int{Pass: 12, Warn: 1, Fail: 0, Skip: 2})
 	if line != "12 ok · 1 warn · 2 skip" {

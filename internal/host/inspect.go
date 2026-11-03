@@ -86,7 +86,7 @@ func GatherFacts(ctx context.Context, cfg Config, cfgErr error, drift Plan, drif
 	facts.DiskTotal, facts.DiskFree, facts.DiskKnown = diskUsage(cfg.Layout.DataDir)
 	facts.DiskPath = nearestExisting(cfg.Layout.DataDir)
 	facts.UptimeSeconds = uptimeSeconds()
-	facts.SchemaCurrent, facts.SchemaRequired, facts.RiverCurrent, facts.RiverRequired, facts.SchemaKnown, facts.SchemaError = schemaVersions(ctx, cfg.DatabaseURL, redact)
+	facts.SchemaCurrent, facts.SchemaRequired, facts.RiverCurrent, facts.RiverRequired, facts.SchemaKnown, facts.SchemaError, facts.SchemaFix = schemaVersions(ctx, cfg.DatabaseURL, redact)
 	facts.Services = serviceStates(ctx, ServiceUnits(cfg.Role, cfg.Hostname))
 	facts.ServicesKnown = len(facts.Services) > 0
 
@@ -105,6 +105,7 @@ type NodeStatus struct {
 	NodeCommit    string                     `json:"node_commit,omitempty"`
 	Schema        controlplane.MigrationPlan `json:"schema"`
 	SchemaError   string                     `json:"schema_error,omitempty"`
+	SchemaFix     string                     `json:"schema_fix,omitempty"`
 	Services      map[string]bool            `json:"services"`
 	UptimeSeconds int64                      `json:"uptime_seconds"`
 	Disk          DiskStatus                 `json:"disk"`
@@ -127,7 +128,7 @@ func StatusFromFacts(facts doctor.Facts) NodeStatus {
 			Current: facts.SchemaCurrent, Required: facts.SchemaRequired,
 			RiverCurrent: facts.RiverCurrent, RiverRequired: facts.RiverRequired,
 		},
-		SchemaError: facts.SchemaError, Services: facts.Services,
+		SchemaError: facts.SchemaError, SchemaFix: facts.SchemaFix, Services: facts.Services,
 		UptimeSeconds: facts.UptimeSeconds,
 		Disk: DiskStatus{
 			Path: facts.DiskPath, TotalBytes: facts.DiskTotal, FreeBytes: facts.DiskFree,
@@ -230,20 +231,22 @@ func serviceStates(ctx context.Context, units []string) map[string]bool {
 	return states
 }
 
-func schemaVersions(ctx context.Context, dsn string, redact func(string) string) (current, required, riverCurrent, riverRequired int, known bool, detail string) {
+func schemaVersions(ctx context.Context, dsn string, redact func(string) string) (current, required, riverCurrent, riverRequired int, known bool, detail, fix string) {
 	if strings.TrimSpace(dsn) == "" {
-		return 0, 0, 0, 0, false, "the node has no control database URL"
+		return 0, 0, 0, 0, false, "the node has no control database URL", "Set EREGION_DATABASE_URL in the node's protected service environment, then run eregion apply."
 	}
 	pool, err := controlplane.Open(ctx, dsn)
 	if err != nil {
-		return 0, 0, 0, 0, false, redact(safeError(err))
+		failure := controlplane.ClassifyDatabaseFailure(dsn, err)
+		return 0, 0, 0, 0, false, redact(failure.Summary()), redact(failure.Fix)
 	}
 	defer pool.Close()
 	plan, err := controlplane.PlanMigrations(ctx, pool)
 	if err != nil {
-		return 0, 0, 0, 0, false, redact(safeError(err))
+		failure := controlplane.ClassifyDatabaseFailure(dsn, err)
+		return 0, 0, 0, 0, false, redact(failure.Summary()), redact(failure.Fix)
 	}
-	return plan.Current, plan.Required, plan.RiverCurrent, plan.RiverRequired, true, ""
+	return plan.Current, plan.Required, plan.RiverCurrent, plan.RiverRequired, true, "", ""
 }
 
 func certificateExpiry(root, hostname string) (time.Time, bool, string) {

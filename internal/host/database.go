@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 
@@ -50,7 +51,7 @@ type PostgresDatabase struct{}
 func (PostgresDatabase) Inspect(ctx context.Context, dsn string) (DatabaseState, error) {
 	pool, err := controlplane.Open(ctx, dsn)
 	if err != nil {
-		return DatabaseState{}, err
+		return DatabaseState{}, databaseError(dsn, err)
 	}
 	defer pool.Close()
 	return inspectDatabase(ctx, pool, dsn)
@@ -59,7 +60,7 @@ func (PostgresDatabase) Inspect(ctx context.Context, dsn string) (DatabaseState,
 func (PostgresDatabase) Migrate(ctx context.Context, dsn string) (DatabaseState, error) {
 	pool, err := controlplane.Open(ctx, dsn)
 	if err != nil {
-		return DatabaseState{}, err
+		return DatabaseState{}, databaseError(dsn, err)
 	}
 	defer pool.Close()
 	before, err := inspectDatabase(ctx, pool, dsn)
@@ -70,7 +71,7 @@ func (PostgresDatabase) Migrate(ctx context.Context, dsn string) (DatabaseState,
 		return before, contract.NewFault(contract.PreconditionFailed, "the database role cannot apply pending migrations", "Grant the migration role CREATE on the database and schema, or apply migrations with an operator role before bootstrap.")
 	}
 	if _, err := controlplane.Migrate(ctx, pool); err != nil {
-		return before, err
+		return before, databaseError(dsn, err)
 	}
 	return inspectDatabase(ctx, pool, dsn)
 }
@@ -85,7 +86,7 @@ func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (Datab
         has_schema_privilege(current_user, 'public', 'CREATE')`).Scan(
 		&state.User, &state.Database, &state.ServerVersion, &ssl, &state.CanCreateDatabase, &state.CanCreateSchema)
 	if err != nil {
-		return DatabaseState{}, contract.NewFault(contract.Unavailable, "could not inspect the control-plane database", "Check connectivity, PostgreSQL version 17 or newer, and the migration role's privileges.")
+		return DatabaseState{}, databaseError(dsn, err)
 	}
 	state.TLS = ssl != nil && *ssl
 	parsed, err := parseDatabaseURL(dsn)
@@ -97,7 +98,7 @@ func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (Datab
 	}
 	plan, err := controlplane.PlanMigrations(ctx, pool)
 	if err != nil {
-		return DatabaseState{}, err
+		return DatabaseState{}, databaseError(dsn, err)
 	}
 	state.Current, state.Required = plan.Current, plan.Required
 	state.RiverCurrent, state.RiverRequired = plan.RiverCurrent, plan.RiverRequired
@@ -107,6 +108,20 @@ func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (Datab
 type databaseURL struct {
 	password         string
 	plaintextAllowed bool
+}
+
+// databaseError keeps validation and schema faults intact and classifies a
+// connection failure. The returned fault names the class and host:port, never
+// the DSN, user, or password.
+func databaseError(dsn string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var fault *contract.Fault
+	if errors.As(err, &fault) && fault.Code != contract.Unavailable && fault.Code != contract.Internal {
+		return err
+	}
+	return controlplane.ControlDatabaseFault(dsn, err)
 }
 
 func parseDatabaseURL(dsn string) (databaseURL, error) {

@@ -146,6 +146,9 @@ func planText(plan host.Plan) string {
 		fmt.Fprintf(&out, "  %-28s %-4s %s\n", entry.ID, entry.Version, status)
 		if entry.Error != "" {
 			fmt.Fprintf(&out, "    %s\n", entry.Error)
+			if entry.Hint != "" {
+				fmt.Fprintf(&out, "    fix: %s\n", entry.Hint)
+			}
 		} else if entry.Detail != "" {
 			fmt.Fprintf(&out, "    %s\n", entry.Detail)
 		}

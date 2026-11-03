@@ -54,6 +54,9 @@ func statusText(status host.NodeStatus) string {
 		schema += ": " + status.SchemaError
 	}
 	field("schema", schema)
+	if status.SchemaFix != "" {
+		field("schema fix", status.SchemaFix)
+	}
 	units := make([]string, 0, len(status.Services))
 	for unit := range status.Services {
 		units = append(units, unit)

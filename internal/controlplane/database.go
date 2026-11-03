@@ -138,12 +138,12 @@ func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		return nil, unavailable()
+		return nil, ControlDatabaseFault(dsn, err)
 	}
 	var version int
 	if err := pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::integer").Scan(&version); err != nil {
 		pool.Close()
-		return nil, unavailable()
+		return nil, ControlDatabaseFault(dsn, err)
 	}
 	if version < 170000 {
 		pool.Close()
@@ -179,12 +179,12 @@ func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, err
 	plan := MigrationPlan{Required: requiredVersion()}
 	var exists bool
 	if err := pool.QueryRow(ctx, "SELECT to_regclass('eregion_schema_migrations') IS NOT NULL").Scan(&exists); err != nil {
-		return plan, unavailable()
+		return plan, unavailable(err)
 	}
 	if exists {
 		rows, err := pool.Query(ctx, "SELECT version, checksum FROM eregion_schema_migrations ORDER BY version")
 		if err != nil {
-			return plan, unavailable()
+			return plan, unavailable(err)
 		}
 		defer rows.Close()
 		expected := 1
@@ -192,7 +192,7 @@ func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, err
 			var version int
 			var checksum string
 			if err := rows.Scan(&version, &checksum); err != nil {
-				return plan, unavailable()
+				return plan, unavailable(err)
 			}
 			applied, known := migrationByVersion(version)
 			if !known || version > requiredVersion() {
@@ -210,7 +210,7 @@ func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, err
 			expected++
 		}
 		if err := rows.Err(); err != nil {
-			return plan, unavailable()
+			return plan, unavailable(err)
 		}
 	}
 	m, err := migrator(pool)
@@ -220,12 +220,12 @@ func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, err
 	versions := m.AllVersions()
 	plan.RiverRequired = versions[len(versions)-1].Version
 	if err := pool.QueryRow(ctx, "SELECT to_regclass('river_migration') IS NOT NULL").Scan(&exists); err != nil {
-		return plan, unavailable()
+		return plan, unavailable(err)
 	}
 	if exists {
 		applied, err := m.ExistingVersions(ctx)
 		if err != nil {
-			return plan, unavailable()
+			return plan, unavailable(err)
 		}
 		for _, version := range applied {
 			if version.Version > plan.RiverCurrent {
@@ -257,7 +257,7 @@ func Ready(ctx context.Context, pool *pgxpool.Pool) error {
 func Migrate(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
-		return MigrationPlan{}, unavailable()
+		return MigrationPlan{}, unavailable(err)
 	}
 	defer conn.Release()
 	defer func() {

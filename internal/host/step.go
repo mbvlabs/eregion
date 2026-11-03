@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -20,6 +21,7 @@ type PlanEntry struct {
 	Detail      string   `json:"detail,omitempty"`
 	Diff        []string `json:"diff,omitempty"`
 	Error       string   `json:"error,omitempty"`
+	Hint        string   `json:"hint,omitempty"`
 }
 
 // StepVersion extracts the trailing version suffix from a step ID
@@ -48,18 +50,26 @@ func planEntry(ctx context.Context, step Step, runtime engine.Runtime) (entry Pl
 	entry.Complete = check.Complete
 	entry.Detail = check.Detail
 	if checkErr != nil {
-		entry.Error = safeError(checkErr)
+		entry.Error, entry.Hint = safeError(checkErr), safeHint(checkErr)
 		return entry, nil
 	}
 	if !check.Complete {
 		if d, ok := step.(differ); ok {
 			entry.Diff, err = d.Diff(ctx, runtime)
 			if err != nil {
-				entry.Error = safeError(err)
+				entry.Error, entry.Hint = safeError(err), safeHint(err)
 			}
 		}
 	}
 	return entry, nil
+}
+
+func safeHint(err error) string {
+	var fault *contract.Fault
+	if errors.As(err, &fault) {
+		return strings.TrimSpace(fault.Hint)
+	}
+	return ""
 }
 
 func safeError(err error) string {

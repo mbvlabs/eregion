@@ -294,6 +294,7 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 		entry, _ := step.Plan(ctx, runtimeView)
 		entry.Error = r.Secrets.Redact(entry.Error)
 		entry.Detail = r.Secrets.Redact(entry.Detail)
+		entry.Hint = r.Secrets.Redact(entry.Hint)
 		for i := range entry.Diff {
 			entry.Diff[i] = r.Secrets.Redact(entry.Diff[i])
 		}

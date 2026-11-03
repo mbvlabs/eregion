@@ -115,6 +115,7 @@ type Facts struct {
 	RiverRequired  int
 	SchemaKnown    bool
 	SchemaError    string
+	SchemaFix      string
 
 	Services      map[string]bool
 	ServicesKnown bool
@@ -402,7 +403,11 @@ func versionSchema(facts Facts) []Result {
 		if facts.SchemaError != "" {
 			detail += ": " + facts.SchemaError
 		}
-		return one(Fail, detail, "check EREGION_DATABASE_URL on the node, then run eregion apply")
+		fix := facts.SchemaFix
+		if fix == "" {
+			fix = "check EREGION_DATABASE_URL on the node, then run eregion apply"
+		}
+		return one(Fail, detail, fix)
 	}
 	detail := fmt.Sprintf("schema %d of %d", facts.SchemaCurrent, facts.SchemaRequired)
 	if facts.SchemaCurrent != facts.SchemaRequired {
