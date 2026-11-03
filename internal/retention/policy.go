@@ -166,18 +166,23 @@ func Merge(server Policy, override Override) (Policy, error) {
 	return override.Apply(server), nil
 }
 
-// BuildpackCacheExceeded reports whether a cache of cacheBytes on a node whose
-// filesystem holds diskTotalBytes exceeds either D30 limit. The two limits are
-// independent: either one triggers pruning. A non-positive diskTotalBytes
-// means the disk size is unknown, so only the absolute limit applies.
-func (p Policy) BuildpackCacheExceeded(cacheBytes, diskTotalBytes int64) bool {
+// BuildpackCacheExceeded reports whether a node needs its Buildpacks cache
+// pruned. D30's two limits are independent: a cache larger than the absolute
+// cap or a filesystem already more than the configured percentage used both
+// trigger pruning. filesystemUsedBytes is total filesystem use (the cache is
+// part of it), not free or non-cache use. A non-positive filesystemTotalBytes
+// means the filesystem size is unknown, so only the absolute limit applies.
+func (p Policy) BuildpackCacheExceeded(cacheBytes, filesystemUsedBytes, filesystemTotalBytes int64) bool {
 	if cacheBytes > p.BuildpackCacheMaxBytes {
 		return true
 	}
-	if diskTotalBytes <= 0 {
+	if filesystemTotalBytes <= 0 {
 		return false
 	}
-	return float64(cacheBytes) > float64(diskTotalBytes)*float64(p.BuildpackCacheMaxPercent)/100
+	if filesystemUsedBytes < 0 {
+		filesystemUsedBytes = 0
+	}
+	return float64(filesystemUsedBytes) > float64(filesystemTotalBytes)*float64(p.BuildpackCacheMaxPercent)/100
 }
 
 func validateRange(field string, value, minimum, maximum int64) error {

@@ -153,21 +153,25 @@ func TestPolicyJSONRoundTrip(t *testing.T) {
 func TestBuildpackCacheExceeded(t *testing.T) {
 	policy := DefaultPolicy()
 	cases := []struct {
-		name     string
-		cache    int64
-		disk     int64
-		exceeded bool
+		name  string
+		cache int64
+		used  int64
+		total int64
+		want  bool
 	}{
-		{name: "below both limits", cache: 9 << 30, disk: 100 << 30, exceeded: false},
-		{name: "above absolute limit", cache: 11 << 30, disk: 100 << 30, exceeded: true},
-		{name: "above disk percent", cache: 45 << 30, disk: 50 << 30, exceeded: true},
-		{name: "unknown disk uses absolute only", cache: 9 << 30, disk: 0, exceeded: false},
-		{name: "unknown disk above absolute", cache: 11 << 30, disk: 0, exceeded: true},
+		{name: "below both limits", cache: 5 << 30, used: 50 << 30, total: 100 << 30, want: false},
+		{name: "above absolute limit", cache: 11 << 30, used: 20 << 30, total: 200 << 30, want: true},
+		{name: "above disk utilization", cache: 5 << 30, used: 90 << 30, total: 100 << 30, want: true},
+		{name: "at disk utilization is not above", cache: 5 << 30, used: 80 << 30, total: 100 << 30, want: false},
+		{name: "unknown disk uses absolute only", cache: 9 << 30, used: 90 << 30, total: 0, want: false},
+		{name: "unknown disk above absolute", cache: 11 << 30, used: 0, total: 0, want: true},
+		{name: "negative use clamps to zero", cache: 5 << 30, used: -1, total: 100 << 30, want: false},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
-			if got := policy.BuildpackCacheExceeded(test.cache, test.disk); got != test.exceeded {
-				t.Fatalf("BuildpackCacheExceeded(%d, %d) = %t, want %t", test.cache, test.disk, got, test.exceeded)
+			got := policy.BuildpackCacheExceeded(test.cache, test.used, test.total)
+			if got != test.want {
+				t.Fatalf("BuildpackCacheExceeded(%d, %d, %d) = %t, want %t", test.cache, test.used, test.total, got, test.want)
 			}
 		})
 	}
