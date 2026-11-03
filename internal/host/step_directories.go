@@ -20,11 +20,21 @@ type dirSpec struct {
 type directoriesStep struct {
 	cfg  Config
 	role RoleConfig
+	// ownership is a test seam. Production leaves it nil and compares the real
+	// on-disk owners, which a non-root unit test cannot create.
+	ownership func(os.FileInfo, string, string) (bool, error)
 }
 
-func (s *directoriesStep) ID() string { return "host-directories-v1" }
+func (s *directoriesStep) ID() string { return "host-directories-v2" }
 func (s *directoriesStep) Describe() string {
-	return "Create private bootstrap, node, configuration, and registry directories"
+	return "Create private bootstrap, node, configuration, and worker-readable registry directories"
+}
+
+func (s *directoriesStep) ownershipMatches(info os.FileInfo, owner, group string) (bool, error) {
+	if s.ownership != nil {
+		return s.ownership(info, owner, group)
+	}
+	return ownershipMatches(info, owner, group)
 }
 func (s *directoriesStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -76,7 +86,18 @@ func (s *directoriesStep) specs() []dirSpec {
 		specs = append(specs, dirSpec{Path: s.cfg.Layout.ConfigDir, Mode: 0o750, Owner: "root", Group: group})
 	}
 	if s.role.Registry {
-		specs = append(specs, dirSpec{Path: s.cfg.Layout.RegistryDir, Mode: 0o700, Owner: "root", Group: "root"})
+		// The registry container writes as root with the default umask, so the
+		// blobs and directories below are world-readable. Only this top-level
+		// directory blocks the unprivileged worker's retention inventory. Give
+		// the service group read and traversal, never write.
+		group := s.cfg.Layout.Group
+		if group == "" {
+			group = s.cfg.Layout.User
+		}
+		if group == "" {
+			group = "root"
+		}
+		specs = append(specs, dirSpec{Path: s.cfg.Layout.RegistryDir, Mode: 0o750, Owner: "root", Group: group})
 	}
 	if home := s.nodeHome(); home != "" {
 		specs = append(specs, dirSpec{Path: home, Mode: 0o700, Owner: s.nodeUser(), Group: s.nodeGroup()})
@@ -109,7 +130,7 @@ func (s *directoriesStep) Check(_ context.Context, _ engine.Runtime) (engine.Che
 		if info.Mode().Perm() != spec.Mode {
 			wrong = append(wrong, fmt.Sprintf("%s mode %04o (want %04o)", spec.Path, info.Mode().Perm(), spec.Mode))
 		}
-		ok, err := ownershipMatches(info, spec.Owner, spec.Group)
+		ok, err := s.ownershipMatches(info, spec.Owner, spec.Group)
 		if err != nil || !ok {
 			wrong = append(wrong, spec.Path+" ownership")
 		}
@@ -163,6 +184,10 @@ func (s *directoriesStep) Diff(context.Context, engine.Runtime) ([]string, error
 		}
 		if info.Mode().Perm() != spec.Mode {
 			out = append(out, fmt.Sprintf("~ mode %s: %04o -> %04o", spec.Path, info.Mode().Perm(), spec.Mode))
+		}
+		ok, err := s.ownershipMatches(info, spec.Owner, spec.Group)
+		if err != nil || !ok {
+			out = append(out, fmt.Sprintf("~ ownership %s: %s:%s", spec.Path, spec.Owner, spec.Group))
 		}
 	}
 	return out, nil

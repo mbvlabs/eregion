@@ -365,6 +365,21 @@ revision is live only while its `_manifests/revisions/.../link` is valid. A
 missing manifest or referenced blob is an inventory warning, not a zero-byte
 artifact.
 
+The inventory runs on the node transport that serves the target node. An
+enrolled node is read by the root `eregion node rpc` process; the main node's
+local transport, which `eregion-worker.service` uses for its daily run, runs
+in-process as the unprivileged `eregion` account. `host-directories-v2` creates
+`/var/lib/eregion/registry` as `root:eregion 0750` (`host-directories-v1` used
+`root:root 0700`) so that local worker can read the tree the root registry
+container writes with the default umask, without write access. A permission
+failure names the registry path and the `eregion apply` fix; other unreadable
+states stay generic. Removal and the Docker/HTTP parts of GC do not need that
+read permission: removal uses the Docker group (`SupplementaryGroups=docker` on
+the API and worker units) and the registry HTTP API, and GC runs `registry
+garbage-collect` in a one-off container. The GC script also stops and starts
+`eregion-registry.service`; that systemd action remains root-only, so the local
+path as the unprivileged worker account cannot perform it.
+
 Removal is one journaled node step per planner item:
 `platform-retention-remove-<12 hex>-v1`, where the suffix hashes the item kind
 and reference. The kinds are `release` and `dangling_image` (local
@@ -481,6 +496,9 @@ viewer as other mutating commands.
 reports its finish time, status, removed-item count, reclaimed bytes and the
 run's planned reclaimable bytes. A failed, cancelled or stale running row warns;
 a last success older than 48 hours warns once the daily job has had time to run.
+When the newest failed run's first error names unreadable registry storage, the
+warn points at `eregion apply` and `host-directories-v2` instead of a generic
+retry.
 Before the first run, the row passes with "no retention run yet" so a fresh
 install stays 0 warn / 0 fail; it warns only when `eregion-worker.service` has
 been continuously active for more than 48 hours without recording a run. The
@@ -689,6 +707,14 @@ so `journalctl` can read the eregion units without sudo. Server init's access
 setup applies the same membership on a fresh host; the versioned step converges
 an existing host. Check is complete when the membership or an absent admin
 account already matches, so a second apply does not run it again.
+
+`host-directories-v2` keeps the bootstrap, node, configuration and data
+directories private and makes only the registry storage readable by the service
+group: `/var/lib/eregion/registry` is `root:eregion 0750`, never writable by
+`eregion`. A node that ran `host-directories-v1` reports the new version as
+pending once; a second plan is a no-op. The registry container still runs as
+root, so the group mode does not affect its writes. This is what lets the
+worker's local retention inventory read manifests and blobs as `eregion`.
 
 `ssh` uses the context's pinned host key and identity. Without `--command` it
 needs a terminal and opens an interactive shell; `--command` runs one remote

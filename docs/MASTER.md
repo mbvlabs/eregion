@@ -314,8 +314,9 @@ earlier passes are context, not qualification.
 
 Source state 2026-11-03: rows 1–15 and 17 are implemented in the integrated
 source on `master`. Row 17 (retention) has isolated tests and is an alpha.1
-gate; host qualification is partial and blocked by defect 5 (worker registry
-inventory permissions). Row 16 (alpha qualification) remains in progress. Rows
+gate; host qualification is partial, and defect 5 (worker registry inventory
+permissions) is fixed in source but not host-verified. Row 16 (alpha
+qualification) remains in progress. Rows
 11–15 went through isolated implementation lanes and independent review, with
 rework and orchestrator acceptance; the final release-command
 evidence-classification correction was made by the orchestrator.
@@ -365,7 +366,8 @@ then had zero failures in 6,262 requests. Fresh init, human-factor-positive flow
 and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resume testing” section for the saved target,
 fixture state, evidence locations and unqualified acceptance variants, and its
 run records for operation IDs. Row 16 is in progress; row 17 is implemented at
-source level and is an alpha.1 gate, not yet fully host-qualified (defect 5).
+source level and is an alpha.1 gate, not yet fully host-qualified (defect 5 is
+fixed in source, not host-verified).
 
 On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
 switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
@@ -424,15 +426,19 @@ credential and served `rel_b7099da06361a0bfaa8ee6866e178152` (op_181c9da0…,
 423/423 HTTP 200, evidence 240–246). Retention policy show/set (new environment
 revision `erv_b8f5163889b07167f955396f2f5da061`), the `host-registry-v2`
 upgrade and the prune dry run passed host-side; the plan kept both apps'
-serving and rollback releases and changed nothing. **New open defect 5:** the
-worker's daily retention run fails `unavailable` "the node's registry storage
-is unreadable" because `host-directories-v1` creates
-`/var/lib/eregion/registry` as `root:root 0700` while the worker runs as
-`eregion`; the operator dry run masks it because its node RPC path runs as root.
-`doctor` is 19 pass / 1 warn (`host.retention`). The real prune, registry GC,
-pruned-rollback refusal, 30-release acceptance and the 20/0/0 doctor check
-therefore remain unqualified; details are in MANUAL-TESTING's 2026-11-03
-(evening) record.
+serving and rollback releases and changed nothing. **Defect 5 (fixed in source,
+not host-verified):** the worker's daily retention run failed `unavailable`
+"the node's registry storage is unreadable" because
+`host-directories-v1` created `/var/lib/eregion/registry` as `root:root 0700`
+while the worker runs as `eregion`; the operator dry run masked it because its
+node RPC path runs as root. `host-directories-v2` now creates the directory as
+`root:eregion 0750` on fresh installs and converges an existing node once,
+without making the storage writable by `eregion`. The inventory's permission
+failure names the path and the `eregion apply` fix, and `host.retention` points
+at the same step. At the run, `doctor` was 19 pass / 1 warn (`host.retention`).
+The real prune, registry GC, pruned-rollback refusal, 30-release acceptance and
+the 20/0/0 doctor check therefore remain unqualified; details are in
+MANUAL-TESTING's 2026-11-03 (evening) record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),

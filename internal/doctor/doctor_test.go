@@ -197,6 +197,48 @@ func TestRetentionLastRunWarnsOnFailureAndStaleSuccess(t *testing.T) {
 	}
 }
 
+func TestRetentionLastRunPointsAtTheRegistryStorageFix(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	failed := now.Add(-time.Hour)
+	for _, message := range []string{
+		"retention did not complete: the node's registry storage is unreadable",
+		"retention did not complete: the node's registry storage at /var/lib/eregion/registry is not readable; run eregion apply to apply host-directories-v2",
+	} {
+		facts := Facts{
+			Now: now,
+			Retention: RetentionFacts{
+				Enabled: true, Known: true, HasRun: true,
+				LastRun: RetentionRunFacts{
+					Status: retention.RunFailed, StartedAt: failed.Add(-time.Minute), FinishedAt: &failed,
+					Errors: 1, Error: message,
+				},
+			},
+		}
+		results := Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, facts)
+		if len(results) != 1 || results[0].Status != Warn {
+			t.Fatalf("registry storage failure %q = %+v, want warn", message, results)
+		}
+		if !strings.Contains(results[0].Fix, "eregion apply") || !strings.Contains(results[0].Fix, "host-directories-v2") {
+			t.Fatalf("registry storage failure fix = %q", results[0].Fix)
+		}
+	}
+
+	facts := Facts{
+		Now: now,
+		Retention: RetentionFacts{
+			Enabled: true, Known: true, HasRun: true,
+			LastRun: RetentionRunFacts{
+				Status: retention.RunFailed, StartedAt: failed.Add(-time.Minute), FinishedAt: &failed,
+				Errors: 1, Error: "the node could not list dangling images",
+			},
+		},
+	}
+	results := Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, facts)
+	if len(results) != 1 || strings.Contains(results[0].Fix, "host-directories-v2") {
+		t.Fatalf("an unrelated failure points at the registry permission fix: %+v", results)
+	}
+}
+
 func TestBuildCacheMeasurementReadsOnlyFreshDurableValues(t *testing.T) {
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 	fresh := now.Add(-time.Hour)

@@ -2,11 +2,15 @@ package platform
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mbvlabs/eregion/internal/contract"
 )
 
 const (
@@ -304,5 +308,68 @@ func TestObserveRetentionInventoryWithoutARegistryIsEmpty(t *testing.T) {
 	}
 	if inventory.CacheVolumes == nil || inventory.Containers == nil || inventory.DanglingImages == nil || inventory.LocalImages == nil {
 		t.Fatal("an empty inventory must encode empty arrays, not null")
+	}
+}
+
+func TestRegistryStorageFaultNamesThePathAndTheFixOnPermissionDenied(t *testing.T) {
+	registryDir := "/var/lib/eregion/registry"
+	err := registryStorageFault(registryDir, &os.PathError{Op: "open", Path: filepath.Join(registryDir, "docker"), Err: fs.ErrPermission})
+	var fault *contract.Fault
+	if !errors.As(err, &fault) {
+		t.Fatalf("permission failure = %v, want a contract fault", err)
+	}
+	if fault.Code != contract.Unavailable {
+		t.Fatalf("permission failure code = %s", fault.Code)
+	}
+	if !strings.Contains(fault.Message, registryDir) {
+		t.Fatalf("permission failure does not name the path: %q", fault.Message)
+	}
+	if !strings.Contains(fault.Message, "eregion apply") || !strings.Contains(fault.Message, "host-directories-v2") {
+		t.Fatalf("permission failure does not name the fix: %q", fault.Message)
+	}
+	if !strings.Contains(fault.Hint, "0750") {
+		t.Fatalf("permission failure hint = %q", fault.Hint)
+	}
+}
+
+func TestRegistryStorageFaultKeepsOtherReadFailuresGeneric(t *testing.T) {
+	registryDir := "/var/lib/eregion/registry"
+	err := registryStorageFault(registryDir, &os.PathError{Op: "read", Path: registryDir, Err: fs.ErrInvalid})
+	var fault *contract.Fault
+	if !errors.As(err, &fault) {
+		t.Fatalf("read failure = %v, want a contract fault", err)
+	}
+	if strings.Contains(fault.Message, "eregion apply") {
+		t.Fatalf("an unrelated read failure points at the permission fix: %q", fault.Message)
+	}
+	if !strings.Contains(fault.Message, registryDir) || !strings.Contains(fault.Message, "unreadable") {
+		t.Fatalf("read failure = %q", fault.Message)
+	}
+}
+
+func TestObserveRetentionInventoryReportsAnUnreadableRegistryDirectory(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the directory mode this test needs")
+	}
+	registryDir := filepath.Join(t.TempDir(), "registry")
+	if err := os.MkdirAll(filepath.Join(registryDir, "docker", "registry", "v2", "repositories"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(registryDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = os.Chmod(registryDir, 0o750)
+	}()
+
+	_, err := ObserveRetentionInventory(context.Background(),
+		RetentionInventoryPaths{DataDir: t.TempDir(), RegistryDir: registryDir},
+		func(_ context.Context, _ ...string) ([]byte, error) { return nil, nil })
+	var fault *contract.Fault
+	if !errors.As(err, &fault) {
+		t.Fatalf("unreadable registry = %v, want a contract fault", err)
+	}
+	if fault.Code != contract.Unavailable || !strings.Contains(fault.Message, registryDir) || !strings.Contains(fault.Message, "eregion apply") {
+		t.Fatalf("unreadable registry fault = %+v", fault)
 	}
 }

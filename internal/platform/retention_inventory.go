@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -157,7 +158,7 @@ func ObserveRetentionInventory(ctx context.Context, paths RetentionInventoryPath
 	}
 	artifacts, warnings, truncated, err := readRegistryArtifacts(paths.RegistryDir)
 	if err != nil {
-		return retention.Inventory{}, contract.NewFault(contract.Unavailable, "the node's registry storage is unreadable", err.Error())
+		return retention.Inventory{}, registryStorageFault(paths.RegistryDir, err)
 	}
 	inventory.RegistryArtifacts = artifacts
 	inventory.Warnings = append(inventory.Warnings, warnings...)
@@ -204,6 +205,24 @@ func ObserveRetentionInventory(ctx context.Context, paths RetentionInventoryPath
 
 	inventory.Disk = retentionDisk(paths.DataDir)
 	return inventory, nil
+}
+
+// registryStorageFault names the exact storage path and, for the common
+// permission case, the fix. The worker reads the registry as the unprivileged
+// service account; host-directories-v2 makes only the top-level directory
+// group-readable, because the registry container writes the tree below it as
+// root with the default umask.
+func registryStorageFault(registryDir string, err error) error {
+	registryDir = strings.TrimSpace(registryDir)
+	if errors.Is(err, fs.ErrPermission) {
+		return &contract.Fault{
+			Code:    contract.Unavailable,
+			Message: "the node's registry storage at " + registryDir + " is not readable; run eregion apply to apply host-directories-v2",
+			Hint:    "host-directories-v2 makes " + registryDir + " root:eregion 0750 so the worker can read manifests and blobs without write access. If the step is current, check the directory owner, group and mode.",
+			Cause:   err,
+		}
+	}
+	return contract.NewFault(contract.Unavailable, "the node's registry storage at "+registryDir+" is unreadable", err.Error())
 }
 
 // --------------------------------------------------------------- containers

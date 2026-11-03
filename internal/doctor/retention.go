@@ -45,6 +45,9 @@ type RetentionRunFacts struct {
 	PlannedBytes   int64
 	ReclaimedBytes int64
 	Errors         int
+	// Error is the first recorded run error. It lets doctor point at a known
+	// fix instead of a generic retry instruction.
+	Error string
 }
 
 // BuildCacheFacts is the latest durable Buildpacks cache measurement and the
@@ -101,12 +104,14 @@ func loadRetentionFacts(ctx context.Context, dsn string, facts *RetentionFacts, 
 	err = pool.QueryRow(queryCtx, `SELECT status,started_at,finished_at,
         jsonb_array_length(planned_items),jsonb_array_length(removed_items),
         planned_bytes,reclaimed_bytes,jsonb_array_length(errors),
+        coalesce(errors->0->>'message',''),
         cache_bytes,cache_measured_at,cache_measurement_error
         FROM eregion_retention_runs
         ORDER BY started_at DESC,id DESC LIMIT 1`).
 		Scan(&facts.LastRun.Status, &facts.LastRun.StartedAt, &finished,
 			&facts.LastRun.PlannedItems, &facts.LastRun.RemovedItems,
 			&facts.LastRun.PlannedBytes, &facts.LastRun.ReclaimedBytes, &facts.LastRun.Errors,
+			&facts.LastRun.Error,
 			&cacheBytes, &cacheMeasuredAt, &cacheError)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -220,7 +225,12 @@ func retentionLastRun(facts Facts) []Result {
 		if run.Errors > 0 {
 			detail += fmt.Sprintf(" recorded %d error(s)", run.Errors)
 		}
-		return one(Warn, detail, "inspect eregion operations list --json, fix the reported node or registry error, then run eregion prune --dry-run")
+		if retentionRegistryStorageError(run.Error) {
+			return one(Warn, detail+": the worker could not read the registry storage",
+				"run eregion apply on the node to apply host-directories-v2, which grants the worker read access to the registry storage")
+		}
+		return one(Warn, detail,
+			"inspect eregion operations list --json, fix the reported node or registry error, then run eregion prune --dry-run")
 	}
 
 	if facts.Retention.LastSuccessAt.IsZero() {
@@ -238,6 +248,16 @@ func retentionLastRun(facts Facts) []Result {
 		detail += fmt.Sprintf(" (the plan reclaimable was %s)", humanBytes(run.PlannedBytes))
 	}
 	return one(Pass, detail, "")
+}
+
+// retentionRegistryStorageError recognizes the permission failure the worker
+// records when host-directories-v1 left the registry storage root-only. The
+// message text is the durable run error, not a fresh observation.
+func retentionRegistryStorageError(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "registry storage") &&
+		(strings.Contains(lower, "unreadable") || strings.Contains(lower, "not readable") ||
+			strings.Contains(lower, "cannot read") || strings.Contains(lower, "permission denied"))
 }
 
 func buildpackCache(facts Facts) []Result {
