@@ -324,9 +324,15 @@ the platform rows and node inventory, keeps each environment's serving release,
 its rollback target (selected with the same rule as
 `previousRollbackRelease`), the newest `keep_releases` and every release newer
 than `keep_newer_than_days`, protects in-flight releases and containers, keeps
-registry digests shared with a kept release, and plans release, registry
+registry artifacts shared with a kept release, and plans release, registry
 artifact, Buildpacks cache, ownerless container and dangling image items with a
-total-bytes helper. Node effects, registry deletes/GC and `retention show|set` /
+total-bytes helper. Registry matching normalizes registry hosts and ports and
+accepts a release's repository tag, manifest digest or image config digest
+(`RegistryArtifact.Tags` and `.ConfigDigest`); removal items are
+repository-qualified (`repo@sha256:…`) and never collapse across repositories.
+If a retained release's reference cannot be resolved to an inventory artifact,
+the planner emits a `registry_skipped` diagnostic and plans no deletion for that
+repository. Node effects, registry deletes/GC and `retention show|set` /
 `prune` commands are not part of this schema work.
 
 ## Migration and external database policy

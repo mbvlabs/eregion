@@ -107,16 +107,27 @@ type Deployment struct {
 // RegistryInventory is the registry content a plan may delete.
 type RegistryInventory struct {
 	// Artifacts are manifests or digests known to the registry. Duplicate
-	// digests are planned once.
+	// (repository, digest) pairs are planned once.
 	Artifacts []RegistryArtifact
 }
 
 // RegistryArtifact is one manifest or digest in the node registry.
 type RegistryArtifact struct {
-	// Digest identifies the artifact and is matched against Release artifacts.
+	// Digest identifies the manifest and is matched against Release artifacts.
 	Digest string
-	// Repository is the registry repository, for operator-readable output.
+	// Repository is the registry repository, for operator-readable output and
+	// for matching a Release.Image tag. An inventory catalog usually omits the
+	// registry host; matching normalizes both spellings.
 	Repository string
+	// Tags are the tags currently pointing at this manifest in Repository.
+	// They let a kept release whose Image is repository:tag protect the
+	// manifest even though Release.ImageID is a config digest, not a manifest
+	// digest.
+	Tags []string
+	// ConfigDigest is the image config digest exposed by the registry, when
+	// known. It matches Release.ImageID (Docker's image ID) so a kept release's
+	// local image identity can still protect its manifest.
+	ConfigDigest string
 	// CreatedAt is when the manifest was pushed; old unreferenced artifacts
 	// are removed after the policy's grace period.
 	CreatedAt time.Time
@@ -270,7 +281,6 @@ func Plan(in Input) []Item {
 		protectedReleaseIDs[releaseID] = true
 	}
 	plannedReleaseIDs := map[string]bool{}
-	plannedArtifacts := map[string]plannedArtifact{}
 	items := []Item{}
 
 	seenEnvironments := map[environmentKey]bool{}
@@ -324,46 +334,43 @@ func Plan(in Input) []Item {
 				Reason: fmt.Sprintf("outside the newest %d releases and older than the %d-day keep window",
 					policy.KeepReleases, policy.KeepNewerThanDays),
 			})
-			for _, reference := range releaseArtifactRefs(release) {
-				existing, exists := plannedArtifacts[reference]
-				if !exists {
-					plannedArtifacts[reference] = plannedArtifact{
-						app:         release.App,
-						environment: release.Environment,
-						release:     release.ID,
-						graceDays:   policy.ArtifactGraceDays,
-					}
-					continue
-				}
-				if policy.ArtifactGraceDays > existing.graceDays {
-					existing.graceDays = policy.ArtifactGraceDays
-					plannedArtifacts[reference] = existing
-				}
-			}
 		}
 	}
 
-	// A kept release protects every artifact it still needs, including a digest
-	// shared with a release that is being pruned.
-	protectedArtifacts := map[string]bool{}
+	// Artifact ownership and grace come from every release row, including rows
+	// pruned by an earlier run. A pruned release's environment override still
+	// governs artifacts that remain in the registry.
+	artifactMetadata := newArtifactMetadataIndex(serverPolicy)
+	for _, release := range releases {
+		policy := serverPolicy
+		if environment, known := environmentByKey[environmentKey{app: release.App, environment: release.Environment}]; known {
+			policy = normalizedPolicy(environment.Policy)
+		}
+		artifactMetadata.recordRelease(release, policy)
+	}
+
+	// A retained release protects every artifact and image it still needs,
+	// including a digest or tag shared with a release that is being pruned.
+	protection := newRegistryProtection()
+	protectedImageDigests := map[string]bool{}
 	retainedReleaseIDs := map[string]bool{}
 	for _, release := range releases {
-		if plannedReleaseIDs[release.ID] {
-			continue
-		}
-		if release.PrunedAt != nil && !protectedReleaseIDs[release.ID] {
+		if !registryReleaseRetained(release, plannedReleaseIDs, protectedReleaseIDs, environmentByKey) {
 			continue
 		}
 		retainedReleaseIDs[release.ID] = true
-		for _, reference := range releaseArtifactRefs(release) {
-			protectedArtifacts[reference] = true
+		protection.addRelease(release)
+		for _, digest := range releaseImageDigests(release) {
+			protectedImageDigests[digest] = true
 		}
 	}
 
-	items = append(items, planRegistryArtifacts(in.Registry, protectedArtifacts, plannedArtifacts, serverPolicy, now)...)
+	registryIndex := indexRegistryArtifacts(in.Registry)
+	skipReasons, skipAll := registrySkipReasons(releases, plannedReleaseIDs, protectedReleaseIDs, environmentByKey, registryIndex)
+	items = append(items, planRegistryArtifacts(registryIndex, protection, artifactMetadata, skipReasons, skipAll, now)...)
 	items = append(items, planBuildpackCache(serverPolicy, in.Cache)...)
 	items = append(items, planContainers(environmentByKey, in.Containers, inFlightReleases, inFlightDeployments, inFlightContainers)...)
-	items = append(items, planDanglingImages(in.Images, protectedArtifacts, retainedReleaseIDs)...)
+	items = append(items, planDanglingImages(in.Images, protectedImageDigests, retainedReleaseIDs)...)
 	return items
 }
 
@@ -385,8 +392,8 @@ func TotalBytes(items []Item) int64 {
 // the serving release supplies its previous_release_id; when that history is
 // absent, the latest succeeded deployment for a different release is the
 // target. Deployments are ordered by completed_at DESC NULLS LAST, then
-// created_at DESC. An empty result means the environment has no rollback
-// target.
+// created_at DESC, then id DESC. An empty result means the environment has no
+// rollback target.
 //
 // The control plane keeps this query in platform_state.go because it reads a
 // transaction; the planner uses this pure copy of the same selection rule so
@@ -424,13 +431,6 @@ func RollbackTarget(app, environment, serving string, deployments []Deployment) 
 type environmentKey struct {
 	app         string
 	environment string
-}
-
-type plannedArtifact struct {
-	app         string
-	environment string
-	release     string
-	graceDays   int
 }
 
 func environmentKeyOf(environment Environment) environmentKey {
@@ -474,30 +474,20 @@ func stringSet(values []string) map[string]bool {
 	return set
 }
 
-func releaseArtifactRefs(release Release) []string {
-	references := make([]string, 0, len(release.Artifacts)+2)
-	for _, reference := range release.Artifacts {
-		if reference = strings.TrimSpace(reference); reference != "" {
-			references = append(references, reference)
+func releaseImageDigests(release Release) []string {
+	digests := make([]string, 0, len(release.Artifacts)+2)
+	for _, raw := range release.Artifacts {
+		if digest := normalizeDigest(raw); validDigest(digest) {
+			digests = append(digests, digest)
 		}
 	}
-	if imageID := strings.TrimSpace(release.ImageID); imageID != "" {
-		references = append(references, imageID)
+	if digest := normalizeDigest(release.ImageID); validDigest(digest) {
+		digests = append(digests, digest)
 	}
-	image := strings.TrimSpace(release.Image)
-	if image == "" {
-		return references
+	if reference, ok := parseImageReference(release.Image); ok && reference.digest != "" {
+		digests = append(digests, reference.digest)
 	}
-	if index := strings.Index(image, "@"); index >= 0 {
-		if digest := strings.TrimSpace(image[index+1:]); digest != "" {
-			references = append(references, digest)
-		}
-		return references
-	}
-	if strings.HasPrefix(image, "sha256:") || strings.HasPrefix(image, "sha512:") {
-		references = append(references, image)
-	}
-	return references
+	return digests
 }
 
 func deploymentNewer(a, b Deployment) bool {
@@ -516,54 +506,6 @@ func deploymentNewer(a, b Deployment) bool {
 		return a.CreatedAt.After(b.CreatedAt)
 	}
 	return a.ID > b.ID
-}
-
-func planRegistryArtifacts(registry RegistryInventory, protected map[string]bool, planned map[string]plannedArtifact, serverPolicy Policy, now time.Time) []Item {
-	artifacts := append([]RegistryArtifact(nil), registry.Artifacts...)
-	sort.SliceStable(artifacts, func(i, j int) bool {
-		left := strings.TrimSpace(artifacts[i].Digest)
-		right := strings.TrimSpace(artifacts[j].Digest)
-		if left != right {
-			return left < right
-		}
-		return artifacts[i].Repository < artifacts[j].Repository
-	})
-
-	items := []Item{}
-	seen := map[string]bool{}
-	for _, artifact := range artifacts {
-		reference := strings.TrimSpace(artifact.Digest)
-		if reference == "" || seen[reference] {
-			continue
-		}
-		seen[reference] = true
-		if protected[reference] {
-			continue
-		}
-		owner, referencedByPruned := planned[reference]
-		graceDays := serverPolicy.ArtifactGraceDays
-		if referencedByPruned {
-			graceDays = owner.graceDays
-		}
-		if !artifact.CreatedAt.Before(daysBefore(now, graceDays)) {
-			continue
-		}
-		item := Item{
-			Kind:      ItemRegistryArtifact,
-			Reference: reference,
-			Bytes:     artifact.Bytes,
-		}
-		if referencedByPruned {
-			item.App = owner.app
-			item.Environment = owner.environment
-			item.Reason = fmt.Sprintf("registry artifact referenced by pruned release %s and older than %d days",
-				owner.release, graceDays)
-		} else {
-			item.Reason = fmt.Sprintf("registry artifact is unreferenced by any kept release and older than %d days", graceDays)
-		}
-		items = append(items, item)
-	}
-	return items
 }
 
 func planBuildpackCache(policy Policy, cache CacheInventory) []Item {

@@ -24,14 +24,21 @@ type ItemKind string
 const (
 	ItemRelease          ItemKind = "release"
 	ItemRegistryArtifact ItemKind = "registry_artifact"
-	ItemBuildpackCache   ItemKind = "buildpack_cache"
-	ItemContainer        ItemKind = "container"
-	ItemDanglingImage    ItemKind = "dangling_image"
+	// ItemRegistrySkipped is a diagnostic, not a removal: it names a registry
+	// repository the planner deliberately left untouched because a kept
+	// release's reference could not be resolved to an inventory artifact.
+	// Executors must not attempt to remove it.
+	ItemRegistrySkipped ItemKind = "registry_skipped"
+	ItemBuildpackCache  ItemKind = "buildpack_cache"
+	ItemContainer       ItemKind = "container"
+	ItemDanglingImage   ItemKind = "dangling_image"
 )
 
-// Item is one planned or removed retention object. Reference is the release
-// ID, image digest, container name or cache path. Bytes is the reclaimed size
-// when known, zero otherwise.
+// Item is one planned or removed retention object, or a diagnostic skip. A
+// registry_skipped item has no removal target; every other kind names one.
+// Reference is the release ID, repository-qualified registry artifact (or
+// repository for a skip), image ID, container name or cache path. Bytes is the
+// reclaimed size when known, zero otherwise.
 type Item struct {
 	Kind        ItemKind `json:"kind"`
 	App         string   `json:"app,omitempty"`

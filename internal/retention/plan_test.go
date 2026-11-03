@@ -152,27 +152,26 @@ func TestPlanKeepsSharedDigest(t *testing.T) {
 	policy.KeepReleases = 1
 	policy.KeepNewerThanDays = 1
 	releases := numberedReleases("rel", "api", "production", 3, 30)
-	releases[0].Artifacts = []string{"sha256:shared"}
-	releases[0].ImageID = "sha256:unique"
+	releases[0].Artifacts = []string{"sha256:shared", "sha256:unique"}
 	releases[2].Artifacts = []string{"sha256:shared"}
 	items := Plan(Input{
 		Environments: []Environment{{App: "api", Name: "production", ServingRelease: "rel_0003", Policy: policy}},
 		Releases:     releases,
 		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
-			{Digest: "sha256:shared", CreatedAt: daysAgo(30), Bytes: 100},
-			{Digest: "sha256:unique", CreatedAt: daysAgo(30), Bytes: 200},
-			{Digest: "sha256:orphan", CreatedAt: daysAgo(30), Bytes: 300},
+			{Repository: "api", Digest: "sha256:shared", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:unique", CreatedAt: daysAgo(30), Bytes: 200},
+			{Repository: "api", Digest: "sha256:orphan", CreatedAt: daysAgo(30), Bytes: 300},
 		}},
 		Now: planNow,
 	})
 
 	assertStrings(t, "release items", referencesByKind(items, ItemRelease), []string{"rel_0001", "rel_0002"})
-	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"sha256:orphan", "sha256:unique"})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"api@sha256:orphan", "api@sha256:unique"})
 	for _, item := range items {
-		if item.Kind == ItemRegistryArtifact && item.Reference == "sha256:shared" {
+		if item.Kind == ItemRegistryArtifact && item.Reference == "api@sha256:shared" {
 			t.Fatal("shared digest referenced by a kept release was planned")
 		}
-		if item.Kind == ItemRegistryArtifact && item.Reference == "sha256:unique" {
+		if item.Kind == ItemRegistryArtifact && item.Reference == "api@sha256:unique" {
 			if item.App != "api" || item.Environment != "production" || item.Bytes != 200 {
 				t.Fatalf("unique artifact item = %+v, want owner api/production and 200 bytes", item)
 			}
@@ -195,7 +194,7 @@ func TestPlanProtectsInFlightResources(t *testing.T) {
 			Containers:  []string{"candidate-name", "container-id"},
 		},
 		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
-			{Digest: "sha256:inflight", CreatedAt: daysAgo(30), Bytes: 10},
+			{Repository: "api", Digest: "sha256:manifest-inflight", ConfigDigest: "sha256:inflight", CreatedAt: daysAgo(30), Bytes: 10},
 		}},
 		Containers: []Container{
 			{Name: "inflight-release", App: "api", Environment: "production", Release: "rel_0001"},
@@ -226,7 +225,7 @@ func TestPlanProtectsPendingDeploymentRelease(t *testing.T) {
 			{ID: "dep_pending", App: "api", Environment: "production", Release: "rel_0002", PreviousRelease: "rel_0003", State: "running"},
 		},
 		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
-			{Digest: "sha256:pending", CreatedAt: daysAgo(30), Bytes: 10},
+			{Repository: "api", Digest: "sha256:manifest-pending", ConfigDigest: "sha256:pending", CreatedAt: daysAgo(30), Bytes: 10},
 		}},
 		Now: planNow,
 	})
@@ -247,6 +246,9 @@ func TestPlanContainersAndDanglingImages(t *testing.T) {
 			ServingDeployment: "dep_serving", Policy: DefaultPolicy(),
 		}},
 		Releases: releases,
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:kept-digest", CreatedAt: daysAgo(1), Bytes: 100},
+		}},
 		Containers: []Container{
 			{Name: "serving-release", App: "api", Environment: "production", Release: "rel_serving"},
 			{Name: "serving-deployment", App: "api", Environment: "production", Deployment: "dep_serving"},
@@ -363,18 +365,258 @@ func TestPlanUsesEnvironmentArtifactGrace(t *testing.T) {
 	shortGrace.KeepNewerThanDays = 1
 	shortGrace.ArtifactGraceDays = 1
 	releases := []Release{
-		{ID: "rel_0001", App: "api", Environment: "staging", ImageID: "sha256:short", CreatedAt: daysAgo(30)},
+		{ID: "rel_0001", App: "api", Environment: "staging", Image: "registry.example.com:5000/team/api@sha256:short", CreatedAt: daysAgo(30)},
 		{ID: "rel_0002", App: "api", Environment: "staging", CreatedAt: daysAgo(20)},
 	}
 	items := Plan(Input{
 		Environments: []Environment{{App: "api", Name: "staging", ServingRelease: "rel_0002", Policy: shortGrace}},
 		Releases:     releases,
 		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
-			{Digest: "sha256:short", CreatedAt: daysAgo(5), Bytes: 10},
+			{Repository: "team/api", Digest: "sha256:short", CreatedAt: daysAgo(5), Bytes: 10},
 		}},
 		Now: planNow,
 	})
-	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"sha256:short"})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"team/api@sha256:short"})
+}
+
+func TestPlanProtectsTaggedReleaseManifest(t *testing.T) {
+	releases := []Release{{
+		ID: "rel_serving", App: "api", Environment: "production",
+		Image:     "registry/api:v1",
+		ImageID:   "sha256:config",
+		CreatedAt: daysAgo(1),
+	}}
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: releases,
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:manifest", Tags: []string{"v1"}, CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:old", Tags: []string{"v0"}, CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"api@sha256:old"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+}
+
+func TestPlanFailsSafeForUnresolvedKeptTag(t *testing.T) {
+	releases := []Release{{
+		ID: "rel_serving", App: "api", Environment: "production",
+		Image:     "registry.example.com:5000/api:v1",
+		ImageID:   "sha256:config",
+		CreatedAt: daysAgo(1),
+	}}
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: releases,
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:manifest", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "worker", Digest: "sha256:old", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"worker@sha256:old"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), []string{"api"})
+}
+
+func TestPlanMissingEnvironmentReleaseFailsSafe(t *testing.T) {
+	items := Plan(Input{
+		Releases: []Release{{
+			ID: "rel_ghost", App: "api", Environment: "ghost",
+			Image:     "registry.example.com:5000/team/ghost:v1",
+			CreatedAt: daysAgo(1),
+		}},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "team/ghost", Digest: "sha256:manifest", CreatedAt: daysAgo(30), Bytes: 100},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), nil)
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), []string{"team/ghost"})
+}
+
+func TestPlanRegistryItemsAreRepositoryQualified(t *testing.T) {
+	items := Plan(Input{
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:shared", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:shared", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "worker", Digest: "sha256:shared", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact),
+		[]string{"api@sha256:shared", "worker@sha256:shared"})
+}
+
+func TestPlanProtectsConfigDigest(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{{
+			ID: "rel_serving", App: "api", Environment: "production",
+			ImageID:   "sha256:config",
+			CreatedAt: daysAgo(1),
+		}},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:manifest-kept", ConfigDigest: "sha256:config", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:manifest-old", ConfigDigest: "sha256:other", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"api@sha256:manifest-old"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+}
+
+func TestPlanArtifactGraceSurvivesPrunedRelease(t *testing.T) {
+	shortGrace := DefaultPolicy()
+	shortGrace.KeepReleases = 1
+	shortGrace.KeepNewerThanDays = 1
+	shortGrace.ArtifactGraceDays = 1
+	prunedAt := planNow
+	items := Plan(Input{
+		Environments: []Environment{{App: "api", Name: "staging", ServingRelease: "rel_0002", Policy: shortGrace}},
+		Releases: []Release{
+			{
+				ID: "rel_0001", App: "api", Environment: "staging",
+				Image: "registry.example.com:5000/team/api:v1", CreatedAt: daysAgo(30), PrunedAt: &prunedAt,
+			},
+			{ID: "rel_0002", App: "api", Environment: "staging", CreatedAt: daysAgo(20)},
+		},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "team/api", Digest: "sha256:manifest", Tags: []string{"v1"}, CreatedAt: daysAgo(5), Bytes: 10},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"team/api@sha256:manifest"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+}
+
+func TestImageReferenceNormalization(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want imageRef
+		ok   bool
+	}{
+		{
+			name: "registry host and port with tag",
+			raw:  "registry.example.com:5000/api:v1",
+			want: imageRef{repository: "api", tag: "v1"},
+			ok:   true,
+		},
+		{
+			name: "https prefix",
+			raw:  "https://registry.example.com:5000/team/api:v1",
+			want: imageRef{repository: "team/api", tag: "v1"},
+			ok:   true,
+		},
+		{
+			name: "digest reference",
+			raw:  "registry.example.com:5000/team/api@sha256:MANIFEST",
+			want: imageRef{repository: "team/api", digest: "sha256:manifest"},
+			ok:   true,
+		},
+		{
+			name: "tag and digest",
+			raw:  "registry.example.com/team/api:v1@sha256:manifest",
+			want: imageRef{repository: "team/api", tag: "v1", digest: "sha256:manifest"},
+			ok:   true,
+		},
+		{
+			name: "no tag means latest",
+			raw:  "127.0.0.1:5000/api",
+			want: imageRef{repository: "api", tag: "latest"},
+			ok:   true,
+		},
+		{
+			name: "localhost registry",
+			raw:  "localhost:5000/team/api:latest",
+			want: imageRef{repository: "team/api", tag: "latest"},
+			ok:   true,
+		},
+		{
+			name: "repository and tag only",
+			raw:  "api:v1",
+			want: imageRef{repository: "api", tag: "v1"},
+			ok:   true,
+		},
+		{
+			name: "namespace repository",
+			raw:  "team/api:v1",
+			want: imageRef{repository: "team/api", tag: "v1"},
+			ok:   true,
+		},
+		{
+			name: "docker hub host is stripped",
+			raw:  "docker.io/library/api:v1",
+			want: imageRef{repository: "library/api", tag: "v1"},
+			ok:   true,
+		},
+		{
+			name: "uppercase normalizes",
+			raw:  "DOCKER.IO/Team/API:V1",
+			want: imageRef{repository: "team/api", tag: "V1"},
+			ok:   true,
+		},
+		{
+			name: "pure digest",
+			raw:  "sha256:ABC",
+			want: imageRef{digest: "sha256:abc"},
+			ok:   true,
+		},
+		{
+			name: "empty reference",
+			raw:  " ",
+			ok:   false,
+		},
+		{
+			name: "missing digest",
+			raw:  "registry.example.com/api@sha256:",
+			ok:   false,
+		},
+		{
+			name: "missing tag",
+			raw:  "registry.example.com/api:",
+			ok:   false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := parseImageReference(test.raw)
+			if ok != test.ok {
+				t.Fatalf("parseImageReference(%q) ok = %t, want %t", test.raw, ok, test.ok)
+			}
+			if ok && got != test.want {
+				t.Fatalf("parseImageReference(%q) = %+v, want %+v", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestNormalizeRepository(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{raw: "api", want: "api"},
+		{raw: "API", want: "api"},
+		{raw: "team/api", want: "team/api"},
+		{raw: "registry.example.com:5000/api", want: "api"},
+		{raw: "localhost:5000/team/api", want: "team/api"},
+		{raw: "docker.io/library/api", want: "library/api"},
+		{raw: "api@sha256:abc", want: "api"},
+		{raw: "registry.example.com:5000/team/api/", want: "team/api"},
+	}
+	for _, test := range tests {
+		if got := normalizeRepository(test.raw); got != test.want {
+			t.Fatalf("normalizeRepository(%q) = %q, want %q", test.raw, got, test.want)
+		}
+	}
 }
 
 func TestPlanIsIdempotentAfterPruning(t *testing.T) {
@@ -421,8 +663,8 @@ func TestPlanOrderIsDeterministic(t *testing.T) {
 			{ID: "dep_2", App: "api", Environment: "staging", Release: "stg_0001", PreviousRelease: "stg_0002", State: DeploymentStateSucceeded, CreatedAt: daysAgo(29), CompletedAt: timePointer(daysAgo(29))},
 		},
 		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
-			{Digest: "sha256:z", CreatedAt: daysAgo(30), Bytes: 1},
-			{Digest: "sha256:a", CreatedAt: daysAgo(30), Bytes: 1},
+			{Repository: "api", Digest: "sha256:z", CreatedAt: daysAgo(30), Bytes: 1},
+			{Repository: "api", Digest: "sha256:a", CreatedAt: daysAgo(30), Bytes: 1},
 		}},
 		Cache: CacheInventory{
 			Bytes:          12 << 30,
@@ -458,7 +700,7 @@ func TestPlanOrderIsDeterministic(t *testing.T) {
 		t.Fatalf("plan changed with input order:\nfirst  = %+v\nsecond = %+v", first, second)
 	}
 	assertStrings(t, "cache items", referencesByKind(first, ItemBuildpackCache), []string{"/cache/oldest"})
-	assertStrings(t, "artifact items", referencesByKind(first, ItemRegistryArtifact), []string{"sha256:a", "sha256:z"})
+	assertStrings(t, "artifact items", referencesByKind(first, ItemRegistryArtifact), []string{"api@sha256:a", "api@sha256:z"})
 }
 
 // TestRollbackTargetSQLCases mirrors every branch of the control plane's
@@ -526,6 +768,15 @@ func TestRollbackTargetSQLCases(t *testing.T) {
 				{ID: "dep_b", App: "api", Environment: "production", Release: "rel_3", PreviousRelease: "rel_2", State: DeploymentStateSucceeded, CreatedAt: daysAgo(3), CompletedAt: timePointer(daysAgo(5))},
 			},
 			want: "rel_1",
+		},
+		{
+			name:    "id breaks an exact timestamp tie",
+			serving: "rel_3",
+			deployments: []Deployment{
+				{ID: "dep_a", App: "api", Environment: "production", Release: "rel_3", PreviousRelease: "rel_1", State: DeploymentStateSucceeded, CreatedAt: daysAgo(5), CompletedAt: timePointer(daysAgo(5))},
+				{ID: "dep_b", App: "api", Environment: "production", Release: "rel_3", PreviousRelease: "rel_2", State: DeploymentStateSucceeded, CreatedAt: daysAgo(5), CompletedAt: timePointer(daysAgo(5))},
+			},
+			want: "rel_2",
 		},
 		{
 			name:    "fallback chooses the latest different release",
