@@ -1,8 +1,12 @@
 package controlplane
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/mbvlabs/eregion/internal/contract"
 )
 
 func TestContainerCleanupBackoff(t *testing.T) {
@@ -41,5 +45,27 @@ func TestCleanupOperationIDIsStablePerLeak(t *testing.T) {
 	}
 	if got := containerCleanupBackoff(1); got != time.Minute {
 		t.Fatalf("first cleanup retry = %s", got)
+	}
+}
+
+// A failed removal must name its containers in the cleanup event; joined step
+// errors alone classify as an internal error.
+func TestContainerCleanupErrorNamesFailedContainers(t *testing.T) {
+	step := errors.New("exit status 1: simulated removal failure")
+	err := containerCleanupError([]string{"demo-production-web-1-aaaa", "demo-production-web-2-aaaa"}, []error{step, step})
+	fault := contract.Classify(err)
+	if fault.Code != contract.Unavailable {
+		t.Fatalf("code = %s, want %s", fault.Code, contract.Unavailable)
+	}
+	for _, want := range []string{"2 container(s) could not be removed", "demo-production-web-1-aaaa", "demo-production-web-2-aaaa"} {
+		if !strings.Contains(fault.Message, want) {
+			t.Fatalf("message %q does not contain %q", fault.Message, want)
+		}
+	}
+	if !errors.Is(err, step) {
+		t.Fatal("the step error is no longer wrapped")
+	}
+	if containerCleanupError(nil, nil) != nil {
+		t.Fatal("no failure must return nil")
 	}
 }

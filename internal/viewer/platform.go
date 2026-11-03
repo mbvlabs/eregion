@@ -79,7 +79,7 @@ type ServingRelease struct {
 	Source    string
 }
 
-// CleanupObservation states whether the candidate cleanup step was observed.
+// CleanupObservation states whether a container cleanup step was observed.
 // Cleanup is a durable step, so its absence is a fact the viewer can report.
 type CleanupObservation struct {
 	Observed bool
@@ -124,7 +124,7 @@ func classifyStage(stage string) (TargetRole, string) {
 		return TargetRollback, "restore previous release"
 	case strings.HasPrefix(lower, "platform-health-03-"):
 		return TargetRestoreHealth, "restore health"
-	case strings.HasPrefix(lower, "platform-cleanup-"):
+	case strings.HasPrefix(lower, "platform-cleanup-"), lower == "cleanup":
 		return TargetCleanup, "cleanup"
 	case strings.HasPrefix(lower, "platform-node-"):
 		return TargetNode, "node check"
@@ -144,7 +144,9 @@ func (m *Model) observePlatformStep(event contract.Event) {
 	m.currentLabel = label
 	if role == TargetCleanup {
 		m.Cleanup.Observed = true
-		m.Cleanup.Status = StageRunning
+		if m.Cleanup.Status != StageFailed {
+			m.Cleanup.Status = StageRunning
+		}
 		m.Cleanup.At = event.At
 		m.Cleanup.Sequence = event.Sequence
 	}
@@ -290,7 +292,9 @@ func (m *Model) observeCleanup(event contract.Event, role TargetRole) {
 	m.Cleanup.Observed = true
 	m.Cleanup.At = event.At
 	m.Cleanup.Sequence = event.Sequence
-	if event.DurationMS != nil {
+	// One failed removal leaves cleanup failed for the operation even when a
+	// later container's removal completes.
+	if event.DurationMS != nil && m.Cleanup.Status != StageFailed {
 		m.Cleanup.Status = StageCompleted
 		m.Cleanup.Duration = time.Duration(*event.DurationMS) * time.Millisecond
 	}
@@ -361,14 +365,14 @@ func (m *Model) ServingLine() string {
 	return "serving release: unknown · no serving-container event was emitted"
 }
 
-// CleanupLine states whether the candidate cleanup step happened. The worker
+// CleanupLine states whether container cleanup happened. The worker
 // emits it as a durable step, so "not observed" is not the same as "pending".
 func (m *Model) CleanupLine() string {
 	if !m.Cleanup.Observed {
-		return "candidate cleanup: not observed"
+		return "container cleanup: not observed"
 	}
-	line := "candidate cleanup: " + string(m.Cleanup.Status)
-	if m.Cleanup.Duration > 0 {
+	line := "container cleanup: " + string(m.Cleanup.Status)
+	if m.Cleanup.Status == StageCompleted && m.Cleanup.Duration > 0 {
 		line += " in " + FormatDuration(m.Cleanup.Duration)
 	}
 	return line

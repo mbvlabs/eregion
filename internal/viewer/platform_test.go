@@ -150,6 +150,52 @@ func TestStructuredEventsNameServingReleaseHealthAndCleanup(t *testing.T) {
 	}
 }
 
+// A failed removal stays visible after later removals complete, and the
+// worker's cleanup warning alone marks cleanup failed.
+func TestCleanupFailureIsNotOverwrittenByLaterRemovals(t *testing.T) {
+	id := contract.OperationID("op_" + strings.Repeat("b", 32))
+	start := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	duration := int64(300)
+	completed := func(sequence uint64, step string) contract.Event {
+		event := platformEvent(sequence, start.Add(time.Duration(sequence)*time.Second), "log", step, "Node step completed.")
+		event.Step = step
+		event.DurationMS = &duration
+		return event
+	}
+	for name, events := range map[string][]contract.Event{
+		"step warning then later removals": {
+			platformEvent(1, start, "step", "platform-cleanup-aaaa-v1", "Node step started."),
+			platformEvent(2, start.Add(time.Second), "warning", "platform-cleanup-aaaa-v1", "Node step failed: simulated removal failure"),
+			platformEvent(3, start.Add(2*time.Second), "step", "platform-cleanup-bbbb-v1", "Node step started."),
+			completed(4, "platform-cleanup-bbbb-v1"),
+			platformEvent(5, start.Add(5*time.Second), "warning", "cleanup", "Candidate cleanup is recorded for retry: 1 container(s) could not be removed: web-1"),
+		},
+		"worker warning after completed removals": {
+			platformEvent(1, start, "step", "platform-cleanup-aaaa-v1", "Node step started."),
+			completed(2, "platform-cleanup-aaaa-v1"),
+			platformEvent(3, start.Add(3*time.Second), "warning", "cleanup", "Previous release cleanup is pending: 1 container(s) could not be removed: web-1"),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			model := New(id, Options{})
+			model.Snapshot(contract.Operation{
+				ID: id, Kind: "platform.deploy", Target: "env/api/production",
+				Actor: contract.Actor{Kind: "operator", Subject: "admin"}, State: contract.Running,
+				Attempt: 1, LastSequence: uint64(len(events)), CreatedAt: start, UpdatedAt: start,
+			}, start)
+			if err := model.Page(events, start.Add(10*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if model.Cleanup.Status != StageFailed {
+				t.Fatalf("cleanup status = %q, want failed", model.Cleanup.Status)
+			}
+			if line := model.CleanupLine(); line != "container cleanup: failed" {
+				t.Fatalf("cleanup line = %q", line)
+			}
+		})
+	}
+}
+
 func TestStructuredHealthReplacesFailureWarning(t *testing.T) {
 	id := contract.OperationID("op_" + strings.Repeat("b", 32))
 	start := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)

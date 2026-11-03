@@ -700,7 +700,7 @@ func (w *platformWorker) finishDeploymentFailure(ctx context.Context, tr node.Tr
 	if len(candidates) > 0 {
 		cleanupCtx := context.WithoutCancel(ctx)
 		if err := w.service.removeDeploymentContainers(cleanupCtx, tr, id, attempt, env, dep.ID, env.Node, "candidate", candidates); err != nil {
-			w.service.appendWorkerEvent(ctx, id, attempt, "cleanup", "Candidate cleanup is recorded for retry: "+contract.Classify(err).Message)
+			w.service.appendCleanupWarning(ctx, id, attempt, "Candidate cleanup is recorded for retry: "+contract.Classify(err).Message)
 		}
 	}
 	return w.settle(ctx, id, attempt, cause)
@@ -968,6 +968,7 @@ func (s *Service) saveDeploymentInstances(ctx context.Context, id contract.Opera
 func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transport, operationID contract.OperationID, attempt uint32, env platform.Environment, deploymentID platform.DeploymentID, nodeName, reason string, instances []platform.DeploymentInstance) error {
 	worker := &platformWorker{service: s}
 	var failures []error
+	var failed []string
 	for _, instance := range instances {
 		if instance.Name == "" {
 			continue
@@ -984,8 +985,22 @@ func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transp
 			failures = append(failures, recordErr)
 		}
 		failures = append(failures, err)
+		failed = append(failed, instance.Name)
 	}
-	return errors.Join(failures...)
+	return containerCleanupError(failed, failures)
+}
+
+// containerCleanupError puts a fault naming the containers ahead of the joined
+// step errors, so classification reports which removals failed instead of an
+// internal error.
+func containerCleanupError(failed []string, failures []error) error {
+	if len(failed) == 0 {
+		return errors.Join(failures...)
+	}
+	summary := contract.NewFault(contract.Unavailable,
+		fmt.Sprintf("%d container(s) could not be removed: %s", len(failed), strings.Join(failed, ", ")),
+		"Maintenance retries the removal; env status lists pending cleanup.")
+	return errors.Join(append([]error{summary}, failures...)...)
 }
 
 func previousDeploymentInstances(ctx context.Context, s *Service, deployment platform.Deployment) ([]platform.DeploymentInstance, string) {
@@ -1031,19 +1046,19 @@ func (s *Service) removePreviousDeploymentContainers(ctx context.Context, curren
 		if s.resolver == nil {
 			s.recordUnreachableCleanup(ctx, instances, env, deployment.PreviousDeploymentID, cleanupNode, "previous",
 				contract.NewFault(contract.Unavailable, "the worker has no node resolver", "Run cleanup in a worker configured with node transports."))
-			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup was recorded for retry: the worker has no node resolver.")
+			s.appendCleanupWarning(ctx, id, attempt, "Previous release cleanup was recorded for retry: the worker has no node resolver.")
 			return
 		}
 		resolved, err := s.resolver.TransportFor(ctx, nodeName)
 		if err != nil {
 			s.recordUnreachableCleanup(ctx, instances, env, deployment.PreviousDeploymentID, cleanupNode, "previous", err)
-			s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup was recorded for retry: could not reach node "+nodeName+": "+contract.Classify(err).Message)
+			s.appendCleanupWarning(ctx, id, attempt, "Previous release cleanup was recorded for retry: could not reach node "+nodeName+": "+contract.Classify(err).Message)
 			return
 		}
 		tr = resolved
 	}
 	if err := s.removeDeploymentContainers(ctx, tr, id, attempt, env, deployment.PreviousDeploymentID, cleanupNode, "previous", instances); err != nil {
-		s.appendWorkerEvent(ctx, id, attempt, "cleanup", "Previous release cleanup is pending: "+contract.Classify(err).Message)
+		s.appendCleanupWarning(ctx, id, attempt, "Previous release cleanup is pending: "+contract.Classify(err).Message)
 	}
 }
 

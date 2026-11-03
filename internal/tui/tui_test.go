@@ -82,7 +82,7 @@ func platformFixtureModel(t *testing.T) *viewer.Model {
 func TestPlatformTargetsHealthAndServingRender(t *testing.T) {
 	model := newModel(*platformFixtureModel(t), testOptions(120, 34))
 	rendered := model.render()
-	for _, want := range []string{"serving release:", "rel_00000000000000000000000000000001", "image sha256:", "TARGETS", "candidate health", "HEALTH OBSERVATIONS", "health passed", "3 probe(s)", "30s deadline", "TARGETS", "candidate cleanup: completed", "build log"} {
+	for _, want := range []string{"serving release:", "rel_00000000000000000000000000000001", "image sha256:", "TARGETS", "candidate health", "HEALTH OBSERVATIONS", "health passed", "3 probe(s)", "30s deadline", "TARGETS", "container cleanup: completed", "build log"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("missing %q:\n%s", want, rendered)
 		}

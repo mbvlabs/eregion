@@ -162,7 +162,7 @@ func (p *Plain) Finish(summary Summary, err error, resume string, now time.Time)
 		}
 	}
 	if summary.Cleanup.Observed {
-		line += " · candidate cleanup " + string(summary.Cleanup.Status)
+		line += " · container cleanup " + string(summary.Cleanup.Status)
 	}
 	return p.line(p.clean()(line))
 }

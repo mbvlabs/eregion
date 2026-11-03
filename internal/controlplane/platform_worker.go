@@ -1076,7 +1076,7 @@ func (s *Service) reconcileDeploymentCleanup(ctx context.Context, op contract.Op
 		return
 	}
 	if s.resolver == nil {
-		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup was not attempted: the worker has no node resolver.")
+		s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Candidate cleanup was not attempted: the worker has no node resolver.")
 		return
 	}
 	// The candidate's pinned revision records the node it ran on; the
@@ -1087,11 +1087,11 @@ func (s *Service) reconcileDeploymentCleanup(ctx context.Context, op contract.Op
 	}
 	tr, err := s.resolver.TransportFor(ctx, nodeName)
 	if err != nil {
-		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup could not reach the application node: "+contract.Classify(err).Message)
+		s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Candidate cleanup could not reach the application node: "+contract.Classify(err).Message)
 		return
 	}
 	if err := s.removeDeploymentContainers(ctx, tr, op.ID, op.Attempt, env, dep.ID, nodeName, "candidate", instances); err != nil {
-		s.appendWorkerEvent(ctx, op.ID, op.Attempt, "cleanup", "Candidate cleanup is recorded for retry: "+contract.Classify(err).Message)
+		s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Candidate cleanup is recorded for retry: "+contract.Classify(err).Message)
 	}
 }
 
@@ -1227,6 +1227,13 @@ func insertPlatformChange(ctx context.Context, tx pgx.Tx, op *contract.Operation
 // appendWorkerEvent records a best-effort observation under the attempt fence.
 func (s *Service) appendWorkerEvent(ctx context.Context, id contract.OperationID, attempt uint32, stage, message string) {
 	s.appendWorkerEventWith(ctx, id, attempt, contract.Event{Kind: "log", Stage: stage, Message: message})
+}
+
+// appendCleanupWarning records that container cleanup did not complete. It is
+// a warning, so a viewer cannot report the cleanup as completed because a
+// later removal step succeeded.
+func (s *Service) appendCleanupWarning(ctx context.Context, id contract.OperationID, attempt uint32, message string) {
+	s.appendWorkerEventWith(ctx, id, attempt, contract.Event{Kind: "warning", Stage: "cleanup", Message: message})
 }
 
 // appendWorkerEventWith records one structured observation. It is best effort:
