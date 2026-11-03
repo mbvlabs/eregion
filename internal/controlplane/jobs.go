@@ -420,9 +420,11 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 			// One retention operation per UTC day. The job only submits the
 			// operation; its idempotency key makes a restart return the same
 			// accepted work, and the operation's own River job does the pruning.
+			// RunOnStart catches up after a restart that would otherwise skip a
+			// day's only scheduled run.
 			river.NewPeriodicJob(river.PeriodicInterval(24*time.Hour), func() (river.JobArgs, *river.InsertOpts) {
 				return retentionArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
-			}, &river.PeriodicJobOpts{RunOnStart: false}),
+			}, &river.PeriodicJobOpts{RunOnStart: true}),
 		}
 	}
 	client, err := river.NewClient(riverpgxv5.New(pool), riverConfig)

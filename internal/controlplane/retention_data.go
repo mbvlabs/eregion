@@ -379,11 +379,15 @@ func (s *Service) retentionInventory(ctx context.Context, nodeName string) (rete
 	if err != nil {
 		return retention.Inventory{}, err
 	}
+	return observeRetentionInventoryTransport(ctx, transport)
+}
+
+func observeRetentionInventoryTransport(ctx context.Context, transport node.Transport) (retention.Inventory, error) {
 	response, err := transport.Call(ctx, node.Request{
 		Method: node.MethodInventory, RequestID: newRequestID(),
 	}, nil)
 	if err != nil {
-		return retention.Inventory{}, fmt.Errorf("node inventory %s: %w", nodeName, err)
+		return retention.Inventory{}, fmt.Errorf("node inventory %s: %w", transport.Name(), err)
 	}
 	if response.Status != engine.StatusCompleted {
 		code := contract.Code(response.ErrorCode)
@@ -408,7 +412,7 @@ func (s *Service) retentionInventory(ctx context.Context, nodeName string) (rete
 func retentionRemovalItems(items []retention.Item) []retention.Item {
 	removals := make([]retention.Item, 0, len(items))
 	for _, item := range items {
-		if item.Kind == retention.ItemRegistrySkipped || item.Kind == retention.ItemRegistryGC {
+		if item.Kind == retention.ItemRegistrySkipped || item.Kind == retention.ItemImageSkipped || item.Kind == retention.ItemRegistryGC {
 			continue
 		}
 		removals = append(removals, item)

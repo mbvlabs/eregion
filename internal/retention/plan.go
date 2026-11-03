@@ -180,6 +180,10 @@ type Container struct {
 	// io.eregion.deployment ownership labels.
 	Release    string
 	Deployment string
+	// Image is the image reference or immutable image ID Docker reports for
+	// the container. It protects an image that a stopped or running container
+	// still uses from retention removal.
+	Image string
 	// State is Docker's container state, kept for operator-readable reasons.
 	State string
 	// Bytes is the container's writable-layer size when known.
@@ -397,7 +401,15 @@ func Plan(in Input) []Item {
 	items = append(items, planRegistryArtifacts(registryIndex, protection, artifactMetadata, skipReasons, skipAll, now)...)
 	items = append(items, planBuildpackCache(serverPolicy, in.Cache)...)
 	items = append(items, planContainers(environmentByKey, in.Containers, inFlightReleases, inFlightDeployments, inFlightContainers)...)
-	items = append(items, planDanglingImages(in.Images, protectedImageDigests, retainedReleaseIDs)...)
+	imageItems := planReleaseImages(releases, plannedReleaseIDs, protectedReleaseIDs, in.Containers, in.LocalImages, in.Images)
+	plannedImageIDs := map[string]bool{}
+	for _, item := range imageItems {
+		if item.Kind == ItemImage {
+			plannedImageIDs[item.Reference] = true
+		}
+	}
+	items = append(items, imageItems...)
+	items = append(items, planDanglingImages(in.Images, protectedImageDigests, retainedReleaseIDs, plannedImageIDs)...)
 	return items
 }
 
@@ -666,7 +678,108 @@ func humanBytes(bytes int64) string {
 	return fmt.Sprintf("%d bytes", bytes)
 }
 
-func planDanglingImages(images []Image, protectedArtifacts, retainedReleaseIDs map[string]bool) []Item {
+// planReleaseImages plans the immutable local-image removal for releases that
+// are being pruned, and for releases an earlier run already marked pruned whose
+// image is still present. It never removes by a tag: a release without an
+// ImageID keeps its row only. An image shared with a retained release or any
+// existing container (running or stopped) is kept and reported as a diagnostic.
+func planReleaseImages(releases []Release, planned, protected map[string]bool, containers []Container, localImages []LocalImageRef, dangling []Image) []Item {
+	retainedImages := map[string]string{}
+	for _, release := range releases {
+		if planned[release.ID] {
+			continue
+		}
+		if release.PrunedAt != nil && !protected[release.ID] {
+			continue
+		}
+		imageID := normalizeDigest(release.ImageID)
+		if !validDigest(imageID) {
+			continue
+		}
+		if _, exists := retainedImages[imageID]; !exists {
+			retainedImages[imageID] = release.ID
+		}
+	}
+	containerImages := map[string]string{}
+	for _, container := range containers {
+		imageID := normalizeDigest(container.Image)
+		if !validDigest(imageID) {
+			continue
+		}
+		if _, exists := containerImages[imageID]; !exists {
+			containerImages[imageID] = containerReference(container)
+		}
+	}
+	presentImages := map[string]bool{}
+	for _, image := range localImages {
+		if imageID := normalizeDigest(image.ID); imageID != "" {
+			presentImages[imageID] = true
+		}
+	}
+	for _, image := range dangling {
+		if imageID := normalizeDigest(image.ID); imageID != "" {
+			presentImages[imageID] = true
+		}
+	}
+
+	plannedImages := map[string]bool{}
+	items := []Item{}
+	for _, release := range releases {
+		isPlanned := planned[release.ID]
+		isPruned := release.PrunedAt != nil && !protected[release.ID]
+		if !isPlanned && !isPruned {
+			continue
+		}
+		imageID := normalizeDigest(release.ImageID)
+		if !validDigest(imageID) {
+			if isPlanned {
+				items = append(items, Item{
+					Kind: ItemImageSkipped, App: release.App, Environment: release.Environment,
+					Release: release.ID, Reference: release.ID,
+					Reason: "release has no immutable image ID; the release row is marked pruned but no image is removed by a mutable tag",
+				})
+			}
+			continue
+		}
+		if owner, shared := retainedImages[imageID]; shared {
+			if isPlanned {
+				items = append(items, Item{
+					Kind: ItemImageSkipped, App: release.App, Environment: release.Environment,
+					Release: release.ID, Reference: release.ID,
+					Reason: "image " + imageID + " is still used by retained release " + owner,
+				})
+			}
+			continue
+		}
+		if container, shared := containerImages[imageID]; shared {
+			if isPlanned {
+				items = append(items, Item{
+					Kind: ItemImageSkipped, App: release.App, Environment: release.Environment,
+					Release: release.ID, Reference: release.ID,
+					Reason: "image " + imageID + " is still used by container " + container,
+				})
+			}
+			continue
+		}
+		if !isPlanned && !presentImages[imageID] {
+			// The earlier run's image is already gone. The release row stays
+			// pruned; a later run has nothing to remove.
+			continue
+		}
+		if plannedImages[imageID] {
+			continue
+		}
+		plannedImages[imageID] = true
+		items = append(items, Item{
+			Kind: ItemImage, App: release.App, Environment: release.Environment,
+			Release: release.ID, Reference: imageID,
+			Reason: "release image is not used by a retained release or container",
+		})
+	}
+	return items
+}
+
+func planDanglingImages(images []Image, protectedArtifacts, retainedReleaseIDs, plannedImageIDs map[string]bool) []Item {
 	sorted := append([]Image(nil), images...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return imageReference(sorted[i]) < imageReference(sorted[j])
@@ -681,7 +794,7 @@ func planDanglingImages(images []Image, protectedArtifacts, retainedReleaseIDs m
 			continue
 		}
 		reference := imageReference(image)
-		if reference == "" || protectedArtifacts[reference] {
+		if reference == "" || protectedArtifacts[reference] || plannedImageIDs[reference] {
 			continue
 		}
 		if digest := strings.TrimSpace(image.Digest); digest != "" && protectedArtifacts[digest] {

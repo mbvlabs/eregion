@@ -169,14 +169,17 @@ sha256}`, and new install inputs are uploaded as files beside the binary.
 
 `retention.plan` params are `{node?,app?,environment?}`; it returns
 `{node,items,planned_bytes,warnings?}` with planner item kinds `release`,
-`registry_artifact`, `buildpack_cache`, `container`, `dangling_image` and the
-diagnostic `registry_skipped` (`reference:"*"` when a truncated inventory or an
-unresolvable kept release skipped the whole registry). `planned_bytes` counts
-only real removals. `retention.show` takes `{app?,environment?}` and returns
+`image`, `buildpack_cache`, `container`, `dangling_image` and the diagnostics
+`registry_skipped`, `image_skipped` (`reference:"*"` for a whole-registry skip
+when a truncated inventory or an unresolvable kept release prevented registry
+deletion). `image` names an immutable local image ID; `release` only marks the
+release row, never a tag. `planned_bytes` counts only real removals.
+`retention.show` takes `{app?,environment?}` and returns
 `{scope:"server"|"environment",server,override,effective,sources}` where
 `sources` maps each effective field to `server` or `environment`.
 `retention.set` takes `{policy}` and returns the updated server view; an
 environment override is a normal `platform.environment.update` revision.
+Machine output never enters the guided retention interview.
 
 A real `eregion prune` submits `platform.retention.prune` on target
 `node/<server>` with `input:{node}`, after the CLI validates `--confirm
@@ -185,8 +188,7 @@ A real `eregion prune` submits `platform.retention.prune` on target
 the same planner and fill `retention_runs` only on a real run.
 
 ```json
-{"node":"main","dry_run":true,"items":[{"kind":"registry_artifact","reference":"api@sha256:…","bytes":1024,"reason":"registry artifact is unreferenced by any kept release and older than 14 days"}],"planned_bytes":1024}
-```
+{"node":"main","dry_run":true,"items":[{"kind":"registry_artifact","reference":"api@sha256:…","bytes":1024,"reason":"registry artifact is unreferenced by any kept release and older than 14 days"}],"planned_bytes":1024}```
 
 ## Confirmation is not authorization
 

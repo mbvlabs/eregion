@@ -94,6 +94,7 @@ func InputFromInventory(inventory Inventory, state PlatformState, now time.Time)
 			Environment: container.Labels[ContainerEnvironmentLabel],
 			Release:     container.Labels[ContainerReleaseLabel],
 			Deployment:  container.Labels[ContainerDeploymentLabel],
+			Image:       container.Image,
 			State:       container.State,
 			Bytes:       container.SizeBytes,
 		})
@@ -108,6 +109,9 @@ func InputFromInventory(inventory Inventory, state PlatformState, now time.Time)
 	}
 
 	for _, image := range inventory.LocalImages {
+		if len(image.RepoTags) == 0 && len(image.RepoDigests) == 0 {
+			continue
+		}
 		input.LocalImages = append(input.LocalImages, LocalImageRef{
 			ID:          image.ID,
 			RepoDigests: append([]string(nil), image.RepoDigests...),

@@ -31,7 +31,15 @@ const (
 	ItemRegistrySkipped ItemKind = "registry_skipped"
 	// ItemRegistryGC records the registry garbage-collection effect in a run's
 	// removed items. The planner never emits it.
-	ItemRegistryGC     ItemKind = "registry_gc"
+	ItemRegistryGC ItemKind = "registry_gc"
+	// ItemImage removes one local Docker image by its immutable image ID. It is
+	// planned separately from ItemRelease so marking a release row can never
+	// imply removing a tag or an image another release still needs.
+	ItemImage ItemKind = "image"
+	// ItemImageSkipped is a diagnostic, not a removal: it names a release whose
+	// image cannot be removed because the release has no immutable identity, or
+	// another retained release/container still uses that image.
+	ItemImageSkipped   ItemKind = "image_skipped"
 	ItemBuildpackCache ItemKind = "buildpack_cache"
 	ItemContainer      ItemKind = "container"
 	ItemDanglingImage  ItemKind = "dangling_image"
@@ -46,9 +54,12 @@ type Item struct {
 	Kind        ItemKind `json:"kind"`
 	App         string   `json:"app,omitempty"`
 	Environment string   `json:"environment,omitempty"`
-	Reference   string   `json:"reference,omitempty"`
-	Bytes       int64    `json:"bytes,omitempty"`
-	Reason      string   `json:"reason,omitempty"`
+	// Release owns an ItemImage or ItemImageSkipped item. It lets the executor
+	// re-check the right release after a retry without parsing the reason.
+	Release   string `json:"release,omitempty"`
+	Reference string `json:"reference,omitempty"`
+	Bytes     int64  `json:"bytes,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // RunError is one per-item retention failure. A failure never hides the rest

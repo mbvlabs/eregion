@@ -110,8 +110,11 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 			CacheVolumes:   []retention.CacheVolume{},
 			Containers:     []retention.InventoryContainer{},
 			DanglingImages: []retention.InventoryImage{},
-			LocalImages:    []retention.LocalImage{},
-			Disk:           retention.Disk{TotalBytes: 1 << 40, FreeBytes: 1 << 39},
+			LocalImages: []retention.LocalImage{
+				{ID: oldConfig, RepoTags: []string{"127.0.0.1:5000/api:old"}},
+				{ID: newConfig, RepoTags: []string{"127.0.0.1:5000/api:new"}},
+			},
+			Disk: retention.Disk{TotalBytes: 1 << 40, FreeBytes: 1 << 39},
 		},
 		failSteps: map[string]int{},
 	}
@@ -269,20 +272,39 @@ func TestIntegrationRetentionWorkerMarksRemovesThenGCs(t *testing.T) {
 	for _, item := range removed {
 		kinds = append(kinds, string(item.Kind))
 	}
-	wantKinds := []string{"release", "registry_artifact", "registry_gc"}
-	if strings.Join(kinds, ",") != strings.Join(wantKinds, ",") {
-		t.Fatalf("removed kinds = %v, want %v", kinds, wantKinds)
+	if len(kinds) != 4 || kinds[0] != "release" || kinds[3] != "registry_gc" {
+		t.Fatalf("removed kinds = %v", kinds)
+	}
+	seenImage, seenRegistry := false, false
+	for _, item := range removed {
+		switch item.Kind {
+		case retention.ItemImage:
+			seenImage = true
+		case retention.ItemRegistryArtifact:
+			seenRegistry = true
+		}
+	}
+	if !seenImage || !seenRegistry {
+		t.Fatalf("the run did not remove both the local image and the registry manifest: %+v", removed)
 	}
 
-	// The removal effects must be release image, registry manifest, GC.
 	if len(fixture.transport.payloads) != 2 {
 		t.Fatalf("removal payloads = %+v", fixture.transport.payloads)
 	}
-	if fixture.transport.payloads[0].Kind != string(retention.ItemRelease) {
-		t.Fatalf("first effect = %+v, want the release image", fixture.transport.payloads[0])
+	seenImage, seenRegistry = false, false
+	for _, payload := range fixture.transport.payloads {
+		switch payload.Kind {
+		case string(retention.ItemImage):
+			seenImage = true
+		case string(retention.ItemRegistryArtifact):
+			if payload.Reference != fixture.orphan {
+				t.Fatalf("registry effect = %+v, want the orphan manifest", payload)
+			}
+			seenRegistry = true
+		}
 	}
-	if fixture.transport.payloads[1].Kind != string(retention.ItemRegistryArtifact) || fixture.transport.payloads[1].Reference != fixture.orphan {
-		t.Fatalf("second effect = %+v, want the orphan manifest", fixture.transport.payloads[1])
+	if !seenImage || !seenRegistry {
+		t.Fatalf("removal payloads = %+v", fixture.transport.payloads)
 	}
 	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != "platform-retention-gc-01-v1" {
 		t.Fatalf("last step = %s, want the registry garbage collection", got)
@@ -380,5 +402,121 @@ func TestIntegrationRetentionWorkerProtectsAReleaseThatBecomesServing(t *testing
 		if payload.Kind == string(retention.ItemRegistryArtifact) {
 			t.Fatalf("a registry artifact was removed while a protected release was present: %+v", payload)
 		}
+	}
+}
+
+func TestIntegrationRetentionWorkerKeepsSharedReleaseImage(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	// A retained release already owns the planned release's image ID because
+	// its ImageID is the same config digest.
+	sharedConfig := "sha256:" + strings.Repeat("f", 64)
+	if _, err := fixture.pool.Exec(context.Background(), `UPDATE eregion_platform_releases SET image_id=$1 WHERE id=$2`,
+		sharedConfig, fixture.newID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(context.Background(), `UPDATE eregion_platform_releases SET image_id=$1 WHERE id=$2`,
+		sharedConfig, fixture.oldID); err != nil {
+		t.Fatal(err)
+	}
+	op := submitRetentionWorkerPrune(t, s, "retention-worker-shared-image")
+	if err := (&retentionWorker{service: s}).Work(context.Background(), retentionWorkerJob(op.ID, 1, 8)); err != nil {
+		t.Fatal(err)
+	}
+	for _, payload := range fixture.transport.payloads {
+		if payload.Kind == string(retention.ItemImage) && payload.Reference == sharedConfig {
+			t.Fatalf("a shared release image was removed: %+v", payload)
+		}
+	}
+	var pruned *time.Time
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT pruned_at FROM eregion_platform_releases WHERE id=$1`, fixture.oldID).Scan(&pruned); err != nil {
+		t.Fatal(err)
+	}
+	if pruned == nil {
+		t.Fatal("the old release row was not marked pruned")
+	}
+}
+
+func TestIntegrationRetentionWorkerRemovesAPrunedReleasesPresentImage(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	if _, err := fixture.pool.Exec(context.Background(), `UPDATE eregion_platform_releases SET pruned_at=clock_timestamp() WHERE id=$1`, fixture.oldID); err != nil {
+		t.Fatal(err)
+	}
+	op := submitRetentionWorkerPrune(t, s, "retention-worker-pruned-image")
+	if err := (&retentionWorker{service: s}).Work(context.Background(), retentionWorkerJob(op.ID, 1, 8)); err != nil {
+		t.Fatal(err)
+	}
+	oldConfig := "sha256:" + strings.Repeat("a", 64)
+	found := false
+	for _, payload := range fixture.transport.payloads {
+		if payload.Kind == string(retention.ItemImage) && payload.Reference == oldConfig {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a pruned release's still-present image was not removed: %+v", fixture.transport.payloads)
+	}
+}
+
+func TestIntegrationRetentionWorkerRevalidatesOnRetry(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	orphanConfig := "sha256:" + strings.Repeat("e", 64)
+	fixture.transport.inventory.RegistryArtifacts[1].ConfigDigest = orphanConfig
+	op := submitRetentionWorkerPrune(t, s, "retention-worker-revalidate")
+	orphanStep := platform.RetentionRemoveStepID(retention.ItemRegistryArtifact, fixture.orphan)
+	fixture.transport.failSteps[orphanStep] = 1
+	worker := &retentionWorker{service: s}
+	if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 1, 8)); err == nil {
+		t.Fatal("the first attempt did not fail the registry effect")
+	}
+	// The new retained release owns the orphan manifest's config digest, so a
+	// retry must not delete the now-protected registry artifact.
+	insertRetentionWorkerRelease(t, fixture.pool, fixture.app, fixture.env,
+		"127.0.0.1:5000/api:protector", orphanConfig, time.Now().UTC())
+	if err := worker.Work(context.Background(), retentionWorkerJob(op.ID, 2, 8)); err != nil {
+		t.Fatal(err)
+	}
+	dispatches := 0
+	for _, step := range fixture.transport.steps {
+		if step == orphanStep {
+			dispatches++
+		}
+		if step == "platform-retention-gc-01-v1" {
+			t.Fatalf("GC ran after the registry deletion was dropped: %v", fixture.transport.steps)
+		}
+	}
+	if dispatches != 1 {
+		t.Fatalf("the protected registry artifact was dispatched %d times, want only the failed first attempt", dispatches)
+	}
+	var removedRaw []byte
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT removed_items FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&removedRaw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(removedRaw), "registry_artifact") {
+		t.Fatalf("the retry recorded a protected registry artifact as removed: %s", removedRaw)
+	}
+}
+
+func TestIntegrationRetentionDailySubmissionIsIdempotent(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	ctx := context.Background()
+	if err := s.submitDailyRetention(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.submitDailyRetention(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var operations, jobs int
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE kind=$1`, platform.KindRetentionPrune).Scan(&operations); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.pool.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE kind='platform_retention'`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if operations != 1 || jobs != 1 {
+		t.Fatalf("daily retention operations=%d jobs=%d, want one operation and one job", operations, jobs)
 	}
 }

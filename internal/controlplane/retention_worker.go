@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -150,9 +152,6 @@ func (s *Service) runRetentionAttempt(ctx context.Context, op contract.Operation
 		return err
 	}
 	defer environmentLocks()
-	if environments, err = s.retentionEnvironmentRows(ctx, nodeName); err != nil {
-		return err
-	}
 
 	run, exists, err := s.retentionRunForOperation(ctx, op.ID)
 	if err != nil {
@@ -199,16 +198,7 @@ func (s *Service) runRetentionAttempt(ctx context.Context, op contract.Operation
 		}
 	}
 
-	server, err := s.ServerRetentionPolicy(ctx)
-	if err != nil {
-		return err
-	}
-	state, err := s.retentionPlatformState(ctx, nodeName, environments, server)
-	if err != nil {
-		return err
-	}
-	input := retention.InputFromInventory(retention.Inventory{}, state, now)
-	return s.executeRetentionRun(ctx, op, attempt, &run, input, nodeName)
+	return s.executeRetentionRun(ctx, op, attempt, &run, nodeName)
 }
 
 // retentionRunForOperation returns the newest run for one operation. A retry
@@ -338,8 +328,10 @@ func (s *Service) recordRetentionPlanFailure(ctx context.Context, op contract.Op
 // executeRetentionRun applies one planned run: mark release rows, remove the
 // artifacts, and garbage-collect the registry if any manifest was deleted.
 // Every effect records its own success or failure, so a retry resumes rather
-// than repeating completed removals.
-func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation, attempt uint32, run *retention.Run, input retention.Input, nodeName string) error {
+// than repeating completed removals. Before an artifact is removed the run is
+// re-evaluated against the current protection state; anything no longer
+// eligible is dropped with a recorded reason.
+func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation, attempt uint32, run *retention.Run, nodeName string) error {
 	target, err := platform.ParseTarget(op.Target)
 	if err != nil || target.Kind != platform.TargetNode {
 		return contract.NewFault(contract.PreconditionFailed, "retention target is not a node", "Submit prune as node/<server>.")
@@ -350,10 +342,6 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 	transport, err := s.resolver.TransportFor(ctx, nodeName)
 	if err != nil {
 		return err
-	}
-	releaseByID := map[string]retention.Release{}
-	for _, release := range input.Releases {
-		releaseByID[release.ID] = release
 	}
 	if s.beforeRetentionMark != nil {
 		s.beforeRetentionMark(ctx, op.ID)
@@ -367,52 +355,65 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 	protected := map[string]bool{}
 	markFailed := map[string]bool{}
 	protectedScopes := map[string]bool{}
-	planned := make([]retention.Item, 0, len(run.Planned))
+	changed := false
 	for _, item := range run.Planned {
 		if item.Kind != retention.ItemRelease || removed[retentionItemKey(item)] {
-			planned = append(planned, item)
 			continue
 		}
 		safe, err := s.markRetentionRelease(ctx, item.Reference)
 		if err != nil {
 			markFailed[item.Reference] = true
-			if release, ok := releaseByID[item.Reference]; ok {
-				protectedScopes[release.App+"\x00"+release.Environment] = true
-			}
+			protectedScopes[item.App+"\x00"+item.Environment] = true
 			s.recordRetentionRunError(run, "mark_release", item.Reference, err)
 			failures = append(failures, err)
-			planned = append(planned, item)
 			continue
 		}
 		if !safe {
 			protected[item.Reference] = true
-			if release, ok := releaseByID[item.Reference]; ok {
-				protectedScopes[release.App+"\x00"+release.Environment] = true
-			}
+			protectedScopes[item.App+"\x00"+item.Environment] = true
 			s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
 				"Release "+item.Reference+" became serving, a rollback target or in flight after planning; it is not pruned.")
 			continue
 		}
-		planned = append(planned, item)
+		run.Removed = append(run.Removed, item)
+		removed[retentionItemKey(item)] = true
+		changed = true
+		s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Marked release "+item.Reference+" pruned; its row remains for history.")
 	}
-	if len(protected) > 0 || len(markFailed) > 0 {
-		filtered := make([]retention.Item, 0, len(planned))
-		for _, item := range planned {
-			switch item.Kind {
-			case retention.ItemRegistryArtifact, retention.ItemDanglingImage:
-				// A protected or unmarked release may own an untagged
-				// manifest or image; removing it could destroy a now-serving
-				// artifact. The next run re-plans after the release settles.
-				continue
-			case retention.ItemContainer:
-				if protectedScopes[item.App+"\x00"+item.Environment] {
-					continue
-				}
-			}
-			filtered = append(filtered, item)
+
+	filtered := make([]retention.Item, 0, len(run.Planned))
+	for _, item := range run.Planned {
+		if removed[retentionItemKey(item)] {
+			changed = true
+			continue
 		}
-		run.Planned = filtered
-		run.PlannedBytes = retention.TotalBytes(run.Planned)
+		switch item.Kind {
+		case retention.ItemRelease:
+			if protected[item.Reference] || markFailed[item.Reference] {
+				changed = true
+				continue
+			}
+		case retention.ItemImage, retention.ItemImageSkipped:
+			if protected[item.Release] || markFailed[item.Release] {
+				changed = true
+				continue
+			}
+			fallthrough
+		case retention.ItemRegistryArtifact, retention.ItemDanglingImage:
+			if len(protected) > 0 || len(markFailed) > 0 {
+				changed = true
+				continue
+			}
+		case retention.ItemContainer:
+			if protectedScopes[item.App+"\x00"+item.Environment] {
+				changed = true
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+	run.Planned = filtered
+	if changed {
 		if err := s.updateRetentionRun(ctx, *run); err != nil {
 			return err
 		}
@@ -425,40 +426,39 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 		}
 	}
 
-	skipRegistryForProtected := len(protected) > 0 || len(markFailed) > 0
-	if skipRegistryForProtected {
-		s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
-			"A release became protected or could not be marked after planning; registry and dangling-image deletions are skipped so its artifact cannot be removed. The next run re-plans them.")
-	}
-	for _, item := range run.Planned {
-		if item.Kind == retention.ItemRegistrySkipped || item.Kind == retention.ItemRegistryGC {
+	attempted := map[string]bool{}
+	for {
+		item, ok := nextRetentionRemoval(run, removed, attempted)
+		if !ok {
+			break
+		}
+		// Re-run protection and resolution before every effect. A retry or a
+		// manually changed release/container must not delete something that
+		// became protected after the original plan.
+		if _, err := s.revalidateRetentionRun(ctx, nodeName, attempt, run, removed); err != nil {
+			return err
+		}
+		if !retentionPlanContains(run, item) {
 			continue
 		}
-		if removed[retentionItemKey(item)] {
-			continue
-		}
-		if item.Kind == retention.ItemRelease && (protected[item.Reference] || markFailed[item.Reference]) {
-			continue
-		}
-		if skipRegistryForProtected {
-			switch item.Kind {
-			case retention.ItemRegistryArtifact, retention.ItemDanglingImage:
+		attempted[retentionItemKey(item)] = true
+		if item.Kind == retention.ItemImage {
+			shared, reason, err := s.retentionImageStillShared(ctx, item.Reference, item.Release, transport)
+			if err != nil {
+				s.recordRetentionRunError(run, "image_shared_check", item.Reference, err)
+				failures = append(failures, err)
 				continue
-			case retention.ItemContainer:
-				if protectedScopes[item.App+"\x00"+item.Environment] {
-					continue
-				}
+			}
+			if shared {
+				s.recordRetentionSkip(run, "image_skipped", item.Reference, reason)
+				s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
+					"Skipped local image "+item.Reference+" for release "+item.Release+": "+reason)
+				continue
 			}
 		}
-		reference, err := retentionRemovalReference(item, releaseByID)
-		if err != nil {
-			s.recordRetentionRunError(run, string(item.Kind), item.Reference, err)
-			failures = append(failures, err)
-			continue
-		}
-		stepID := platform.RetentionRemoveStepID(item.Kind, reference)
+		stepID := platform.RetentionRemoveStepID(item.Kind, item.Reference)
 		payload := platform.RetentionRemovePayload{
-			Step: stepID, Kind: string(item.Kind), Reference: reference,
+			Step: stepID, Kind: string(item.Kind), Reference: item.Reference,
 		}
 		if item.Kind == retention.ItemContainer {
 			payload.App = item.App
@@ -488,19 +488,28 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 	}
 
 	if registryRemoved && !removed[retentionGCMarker] {
-		stepID := "platform-retention-gc-01-v1"
-		payload := platform.RetentionGCPayload{Step: stepID}
-		if _, err := (&platformWorker{service: s}).runStepOn(ctx, transport, op.ID, attempt, stepID, payload, nil); err != nil {
-			s.recordRetentionRunError(run, "registry_gc", "registry-gc", err)
+		allowed, reason, err := s.retentionGCEligible(ctx, nodeName)
+		if err != nil {
+			s.recordRetentionRunError(run, "registry_gc_check", "registry-gc", err)
 			failures = append(failures, err)
+		} else if !allowed {
+			s.recordRetentionSkip(run, "registry_gc_skipped", "registry-gc", reason)
+			s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Skipped registry garbage collection: "+reason)
 		} else {
-			marker := retention.Item{Kind: retention.ItemRegistryGC, Reference: "registry-gc"}
-			run.Removed = append(run.Removed, marker)
-			removed[retentionGCMarker] = true
-			if err := s.updateRetentionRun(ctx, *run); err != nil {
-				return err
+			stepID := "platform-retention-gc-01-v1"
+			payload := platform.RetentionGCPayload{Step: stepID}
+			if _, err := (&platformWorker{service: s}).runStepOn(ctx, transport, op.ID, attempt, stepID, payload, nil); err != nil {
+				s.recordRetentionRunError(run, "registry_gc", "registry-gc", err)
+				failures = append(failures, err)
+			} else {
+				marker := retention.Item{Kind: retention.ItemRegistryGC, Reference: "registry-gc"}
+				run.Removed = append(run.Removed, marker)
+				removed[retentionGCMarker] = true
+				if err := s.updateRetentionRun(ctx, *run); err != nil {
+					return err
+				}
+				s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Registry garbage collection completed.")
 			}
-			s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Registry garbage collection completed.")
 		}
 	}
 
@@ -530,21 +539,128 @@ func retentionItemKey(item retention.Item) string {
 	return string(item.Kind) + "\x00" + item.Reference
 }
 
-func retentionRemovalReference(item retention.Item, releases map[string]retention.Release) (string, error) {
-	if item.Kind != retention.ItemRelease {
-		return item.Reference, nil
+func nextRetentionRemoval(run *retention.Run, removed, attempted map[string]bool) (retention.Item, bool) {
+	for _, item := range run.Planned {
+		if removed[retentionItemKey(item)] || attempted[retentionItemKey(item)] {
+			continue
+		}
+		switch item.Kind {
+		case retention.ItemRelease, retention.ItemRegistrySkipped, retention.ItemImageSkipped, retention.ItemRegistryGC:
+			continue
+		}
+		return item, true
 	}
-	release, ok := releases[item.Reference]
-	if !ok {
-		return "", contract.NewFault(contract.NotFound, "release not found while pruning", "Inspect the release row and retry the operation.")
+	return retention.Item{}, false
+}
+
+func retentionPlanContains(run *retention.Run, item retention.Item) bool {
+	key := retentionItemKey(item)
+	for _, candidate := range run.Planned {
+		if retentionItemKey(candidate) == key {
+			return true
+		}
 	}
-	if release.ImageID != "" {
-		return release.ImageID, nil
+	return false
+}
+
+// revalidateRetentionRun intersects the persisted remaining items with a fresh
+// plan under the attempt's locks. A retry after a release became serving, or
+// after a new release/container started using an artifact, must not delete the
+// now-protected object just because it was eligible in the original plan.
+func (s *Service) revalidateRetentionRun(ctx context.Context, nodeName string, attempt uint32, run *retention.Run, removed map[string]bool) (retention.Input, error) {
+	_, input, err := s.loadRetentionInput(ctx, nodeName, time.Now().UTC())
+	if err != nil {
+		return retention.Input{}, err
 	}
-	if release.Image != "" {
-		return release.Image, nil
+	eligible := map[string]bool{}
+	for _, item := range retention.Plan(input) {
+		eligible[retentionItemKey(item)] = true
 	}
-	return "", contract.NewFault(contract.PreconditionFailed, "release has no image identity to remove", "Inspect the release row; the next retention run retries it.")
+	kept := make([]retention.Item, 0, len(run.Planned))
+	dropped := 0
+	for _, item := range run.Planned {
+		if removed[retentionItemKey(item)] {
+			continue
+		}
+		if item.Kind == retention.ItemRegistrySkipped || item.Kind == retention.ItemImageSkipped || item.Kind == retention.ItemRegistryGC {
+			kept = append(kept, item)
+			continue
+		}
+		if eligible[retentionItemKey(item)] {
+			kept = append(kept, item)
+			continue
+		}
+		dropped++
+		s.recordRetentionSkip(run, "stale_plan", item.Reference,
+			"item is no longer eligible under the current protection state; it was dropped before removal")
+	}
+	run.Planned = kept
+	if err := s.updateRetentionRun(ctx, *run); err != nil {
+		return retention.Input{}, err
+	}
+	if dropped > 0 {
+		s.appendWorkerEvent(context.WithoutCancel(ctx), runOperationID(run), attempt, "retention",
+			fmt.Sprintf("Retention dropped %d stale planned item(s) before removal.", dropped))
+	}
+	return input, nil
+}
+
+func runOperationID(run *retention.Run) contract.OperationID {
+	return contract.OperationID(run.OperationID)
+}
+
+// retentionImageStillShared re-checks the immutable local image against the
+// current release rows and the node's current container list. A retained
+// release, an in-flight release, or any stopped/running container that uses the
+// image blocks its removal.
+func (s *Service) retentionImageStillShared(ctx context.Context, imageID, releaseID string, transport node.Transport) (bool, string, error) {
+	imageID = strings.TrimSpace(imageID)
+	var owner string
+	err := s.pool.QueryRow(ctx, `SELECT r.id FROM eregion_platform_releases r
+        WHERE r.image_id=$1 AND r.id<>$2 AND (
+            r.pruned_at IS NULL
+            OR EXISTS (SELECT 1 FROM eregion_platform_deployments d
+                       WHERE d.state IN ('pending','running') AND (d.release_id=r.id OR d.previous_release_id=r.id))
+            OR EXISTS (SELECT 1 FROM eregion_operations o
+                       WHERE o.id=r.operation_id AND o.state IN ('queued','running','cancelling'))
+        )
+        ORDER BY r.created_at DESC,r.id LIMIT 1`, imageID, releaseID).Scan(&owner)
+	switch {
+	case err == nil:
+		return true, "image is still used by retained release " + owner, nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return false, "", unavailable(err)
+	}
+	inventory, err := observeRetentionInventoryTransport(ctx, transport)
+	if err != nil {
+		return false, "", err
+	}
+	for _, container := range inventory.Containers {
+		if strings.TrimSpace(container.Image) == imageID {
+			return true, "image is still used by container " + container.Name, nil
+		}
+	}
+	return false, "", nil
+}
+
+// retentionGCEligible re-runs the planner immediately before garbage
+// collection. If registry protection is unresolved for any retained release,
+// GC is deferred rather than deleting blobs from an uncertain storage state.
+func (s *Service) retentionGCEligible(ctx context.Context, nodeName string) (bool, string, error) {
+	_, input, err := s.loadRetentionInput(ctx, nodeName, time.Now().UTC())
+	if err != nil {
+		return false, "", err
+	}
+	for _, item := range retention.Plan(input) {
+		if item.Kind == retention.ItemRegistrySkipped {
+			reason := item.Reason
+			if reason == "" {
+				reason = "registry protection is unresolved"
+			}
+			return false, reason, nil
+		}
+	}
+	return true, "", nil
 }
 
 func (s *Service) recordRetentionRunError(run *retention.Run, stage, reference string, cause error) {
@@ -553,6 +669,10 @@ func (s *Service) recordRetentionRunError(run *retention.Run, stage, reference s
 		message = "retention effect failed"
 	}
 	run.Errors = append(run.Errors, retention.RunError{Stage: stage, Reference: reference, Message: message})
+}
+
+func (s *Service) recordRetentionSkip(run *retention.Run, stage, reference, reason string) {
+	run.Errors = append(run.Errors, retention.RunError{Stage: stage, Reference: reference, Message: reason})
 }
 
 // markRetentionRelease re-checks the release under the environment row lock

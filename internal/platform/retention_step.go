@@ -49,7 +49,7 @@ var (
 // kind is a retention.ItemKind, so the planner, run record and node effect use
 // one vocabulary. Reference rules:
 //
-//   - release / dangling_image: an image ID, digest or reference
+//   - release / image / dangling_image: an image ID, digest or reference
 //   - registry_artifact:        <repository>@sha256:<digest>; the delete is
 //     scoped to that repository, never to the bare digest
 //   - buildpack_cache:          the cache volume name
@@ -95,7 +95,7 @@ func buildRetentionRemoveStep(exec engine.Execution, raw json.RawMessage) (engin
 	}
 	kind := retention.ItemKind(payload.Kind)
 	switch kind {
-	case retention.ItemRelease, retention.ItemDanglingImage:
+	case retention.ItemRelease, retention.ItemImage, retention.ItemDanglingImage:
 		if err := ValidateImage(payload.Reference); err != nil {
 			return nil, err
 		}
@@ -189,7 +189,7 @@ func (s *RetentionRemoveStep) Inputs() ([]byte, error)         { return json.Mar
 
 func (s *RetentionRemoveStep) dockerCheckArgs() []string {
 	switch retention.ItemKind(s.payload.Kind) {
-	case retention.ItemRelease, retention.ItemDanglingImage:
+	case retention.ItemRelease, retention.ItemImage, retention.ItemDanglingImage:
 		return []string{"docker", "image", "inspect", "--format", "{{.Id}}", s.payload.Reference}
 	case retention.ItemBuildpackCache:
 		return []string{"docker", "volume", "inspect", "--format", "{{.Name}}", s.payload.Reference}
@@ -309,7 +309,7 @@ func (s *RetentionRemoveStep) Apply(ctx context.Context, rt engine.Runtime, repo
 	defer cancel()
 	var argv []string
 	switch kind {
-	case retention.ItemRelease, retention.ItemDanglingImage:
+	case retention.ItemRelease, retention.ItemImage, retention.ItemDanglingImage:
 		argv = []string{"docker", "image", "rm", s.payload.Reference}
 	case retention.ItemContainer:
 		container, exists, err := s.inspectContainer(ctx, rt)

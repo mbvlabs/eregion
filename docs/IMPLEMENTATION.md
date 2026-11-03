@@ -406,29 +406,41 @@ truncation; inventory warnings are returned beside the plan.
 `retentionWorker` runs on the maintenance queue. A daily River periodic job
 submits one `platform.retention.prune` operation per UTC day on
 `node/<server>` with an idempotency key, so a worker restart reuses the accepted
-work instead of creating a second prune. The operation's own River job claims
-the operation and then acquires sorted PostgreSQL advisory locks for
-`platform`, `node/<server>` and every environment target before reading state,
-so accepted deploys, rollbacks, restarts and app/environment deletes serialize
-with it. The plan is evaluated under those locks, but `pruned_at` is still set
-in a separate transaction that re-locks the environment row and re-checks the
-release: a release that became serving, the current rollback target, or part of
-a pending/running deployment or active release operation is removed from that
-run's planned items and is never pruned. The same check protects a deploy
-accepted after the periodic job was scheduled.
+work instead of creating a second prune and the startup catch-up cannot create
+two runs in one day. The operation's own River job claims the operation and then
+acquires sorted PostgreSQL advisory locks for `platform`, `node/<server>` and
+every environment target before reading state, so accepted deploys, rollbacks,
+restarts and app/environment deletes serialize with it. The plan is evaluated
+under those locks, but `pruned_at` is still set in a separate transaction that
+re-locks the environment row and re-checks the release: a release that became
+serving, the current rollback target, or part of a pending/running deployment
+or active release operation is removed from that run's planned items and is
+never pruned. The same check protects a deploy accepted after the periodic job
+was scheduled.
 
 A run inserts one `retention_runs` row with its planned items and bytes, then
 executes in order: mark each release row `pruned_at`, dispatch the journaled
 `platform-retention-remove-*` steps for release images, registry artifacts,
 cache volumes, containers and dangling images, then run
 `platform-retention-gc-01-v1` if any registry manifest was actually deleted.
+Release rows are marked separately from image removal: an `image` item names
+only an immutable image ID, and a release with no `ImageID` is never removed by
+its mutable tag. The planner protects an image shared with any retained,
+serving, rollback or in-flight release and with any existing container (running
+or stopped), reporting an `image_skipped` diagnostic instead. A release already
+marked `pruned_at` whose image is still present is planned again on later runs,
+so an exhausted removal failure converges instead of becoming invisible.
 Every successful item is appended to `removed_items` and its bytes to
 `reclaimed_bytes`; every failed item is recorded in `errors` and the operation
 returns a retryable error, so River retries the unfinished items from the same
-run without repeating completed effects. A permanent node refusal fails the
-operation after recording the run; the next daily run retries it after the host
-is fixed. Operation events carry planned/removal/protection progress. The build
-path records the local image config digest (`image_id`) but has no pushed
+run without repeating completed effects. Before every remaining effect and
+before GC, the worker re-runs the planner under its held locks and intersects
+the persisted items with the fresh eligibility set; a registry artifact,
+container, cache or image that became protected or disappeared is dropped with
+a recorded reason and never silently removed. A permanent node refusal fails
+the operation after recording the run; the next daily run retries it after the
+host is fixed. Operation events carry planned/removal/protection progress. The
+build path records the local image config digest (`image_id`) but has no pushed
 manifest digest in its existing pack/inspect output; planning therefore
 resolves manifests through inventory `ConfigDigest` and local-image
 `RepoDigests`, and no extra registry read is added to every build.

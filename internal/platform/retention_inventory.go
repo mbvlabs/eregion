@@ -293,9 +293,10 @@ type dockerLocalImageInspect struct {
 	RepoDigests []string `json:"RepoDigests"`
 }
 
-// readLocalImages reports local images that name a registry repository@digest.
-// The control plane uses those references to map a release's registry tag or
-// config digest to the manifest digest the registry stores.
+// readLocalImages reports local images that carry a tag or a registry
+// repository@digest. RepoDigests lets the control plane map a release's
+// registry tag or config digest to the manifest digest the registry stores;
+// RepoTags lets retention find a pruned release's still-tagged local image.
 func readLocalImages(ctx context.Context, run NodeReadRunner) ([]retention.LocalImage, bool, error) {
 	raw, err := run(ctx, "docker", "image", "ls", "--all", "--quiet", "--no-trunc")
 	if err != nil {
@@ -321,7 +322,7 @@ func readLocalImages(ctx context.Context, run NodeReadRunner) ([]retention.Local
 	}
 	images := make([]retention.LocalImage, 0, len(inspected))
 	for _, item := range inspected {
-		if len(item.RepoDigests) == 0 {
+		if len(item.RepoTags) == 0 && len(item.RepoDigests) == 0 {
 			continue
 		}
 		images = append(images, retention.LocalImage{
