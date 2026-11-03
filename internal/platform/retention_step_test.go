@@ -422,6 +422,26 @@ func gcStepForTest(t *testing.T) *RetentionGCStep {
 	return built.(*RetentionGCStep)
 }
 
+func TestRetentionGCScriptUsesOnlyThePolkitAllowedSystemdVerbs(t *testing.T) {
+	script := gcStepForTest(t).script()
+	allowed := map[string]bool{"start": true, "stop": true, "restart": true, "is-active": true}
+	for _, line := range strings.Split(script, "\n") {
+		fields := strings.Fields(line)
+		for i, field := range fields {
+			if field != "systemctl" || i+1 >= len(fields) {
+				continue
+			}
+			verb := fields[i+1]
+			if !allowed[verb] {
+				t.Fatalf("the GC script calls systemctl %s, which host-registry-gc-polkit-v1 does not allow:\n%s", verb, line)
+			}
+		}
+	}
+	if strings.Contains(script, "sudo ") || strings.Contains(script, "pkexec") {
+		t.Fatalf("the GC script tries to elevate privileges instead of using the narrow polkit rule:\n%s", script)
+	}
+}
+
 func TestRetentionGCScriptStopsRestartsAndFailsClosed(t *testing.T) {
 	step := gcStepForTest(t)
 	script := step.script()

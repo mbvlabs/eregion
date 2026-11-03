@@ -5,6 +5,29 @@ import (
 	"testing"
 )
 
+func TestPackagesInstallPolicyKitOnTheRegistryRole(t *testing.T) {
+	if got := (&packagesStep{}).ID(); got != "host-packages-v2" {
+		t.Fatalf("adding polkitd changed the package contract; use a new step version, got %q", got)
+	}
+	main, err := ConfigForRole(RoleMain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packages := (&packagesStep{role: main}).packages()
+	if !slices.Contains(packages, "polkitd") {
+		t.Fatalf("main packages %v lack polkitd", packages)
+	}
+	application, err := ConfigForRole(RoleApplication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range (&packagesStep{role: application}).packages() {
+		if name == "polkitd" {
+			t.Fatal("the application role installs the polkit policy daemon it does not use")
+		}
+	}
+}
+
 func TestTelemetryComposePackageFollowsDistribution(t *testing.T) {
 	role, err := ConfigForRole(RoleTelemetry)
 	if err != nil {

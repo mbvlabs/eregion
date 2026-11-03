@@ -435,7 +435,10 @@ node RPC path runs as root. `host-directories-v2` now creates the directory as
 `root:eregion 0750` on fresh installs and converges an existing node once,
 without making the storage writable by `eregion`. The inventory's permission
 failure names the path and the `eregion apply` fix, and `host.retention` points
-at the same step. At the run, `doctor` was 19 pass / 1 warn (`host.retention`).
+at the same step. `host-packages-v2` installs `polkitd` and
+`host-registry-gc-polkit-v1` lets the worker start, stop and restart only
+`eregion-registry.service`; the fail-closed GC script is unchanged. At the run,
+`doctor` was 19 pass / 1 warn (`host.retention`).
 The real prune, registry GC, pruned-rollback refusal, 30-release acceptance and
 the 20/0/0 doctor check therefore remain unqualified; details are in
 MANUAL-TESTING's 2026-11-03 (evening) record.

@@ -16,7 +16,7 @@ type packagesStep struct {
 	distro string
 }
 
-func (s *packagesStep) ID() string { return "host-packages-v1" }
+func (s *packagesStep) ID() string { return "host-packages-v2" }
 func (s *packagesStep) Describe() string {
 	return "Install the role's distribution packages (repository versions)"
 }
@@ -31,6 +31,12 @@ func (s *packagesStep) packages() []string {
 		// Builds in this increment fetch source with git and execute it on the
 		// build host. Git is part of the build prerequisite, not optional.
 		packages = append(packages, "git")
+	}
+	if s.role.Registry {
+		// The worker's retention garbage collection restarts the registry
+		// unit through polkit. Minimal images do not always install polkitd;
+		// it pulls the system D-Bus and logind dependencies with it.
+		packages = append(packages, "polkitd")
 	}
 	if s.role.NodeAgent {
 		// Enrollment probes `wg`, and private connectivity renders WireGuard

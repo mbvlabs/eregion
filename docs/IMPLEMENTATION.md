@@ -377,8 +377,20 @@ states stay generic. Removal and the Docker/HTTP parts of GC do not need that
 read permission: removal uses the Docker group (`SupplementaryGroups=docker` on
 the API and worker units) and the registry HTTP API, and GC runs `registry
 garbage-collect` in a one-off container. The GC script also stops and starts
-`eregion-registry.service`; that systemd action remains root-only, so the local
-path as the unprivileged worker account cannot perform it.
+`eregion-registry.service`. `host-registry-gc-polkit-v1` writes
+`/etc/polkit-1/rules.d/50-eregion-registry-gc.rules`, which authorizes only the
+configured service user (`eregion` by default) on only
+`org.freedesktop.systemd1.manage-units` for only `eregion-registry.service`,
+and only the `start`, `stop` and `restart` verbs. Every other user, unit and
+verb keeps the distribution's default authentication policy. `host-packages-v2`
+adds `polkitd` on the registry role so minimal Debian 13 and Ubuntu 26.04
+images have the policy daemon and system D-Bus. The worker unit's
+`NoNewPrivileges`, `ProtectSystem=strict` and `PrivateTmp` do not block the
+system D-Bus call; it has no `RestrictAddressFamilies`, `PrivateUsers` or
+`PrivateNetwork` setting. The GC script itself is unchanged, so its fail-closed
+stale-collector path, restart trap and journaled step semantics are retained.
+A polkit rule is smaller than a root-owned trigger/path-unit protocol and keeps
+the existing script as the single GC implementation.
 
 Removal is one journaled node step per planner item:
 `platform-retention-remove-<12 hex>-v1`, where the suffix hashes the item kind
@@ -715,6 +727,14 @@ group: `/var/lib/eregion/registry` is `root:eregion 0750`, never writable by
 pending once; a second plan is a no-op. The registry container still runs as
 root, so the group mode does not affect its writes. This is what lets the
 worker's local retention inventory read manifests and blobs as `eregion`.
+
+`host-packages-v2` adds `polkitd` to the registry role so a minimal image has
+the policy daemon. `host-registry-gc-polkit-v1` writes the narrow rule above;
+the file is root-owned `0644` in a root:polkitd `0750` directory so `polkitd`
+can read it and cannot modify it. A node without the rule reports
+`host-registry-gc-polkit-v1` pending once; a node without `polkitd` installs it
+through `host-packages-v2`. Both steps are part of fresh init, and a second
+plan is a no-op.
 
 `ssh` uses the context's pinned host key and identity. Without `--command` it
 needs a terminal and opens an interactive shell; `--command` runs one remote
