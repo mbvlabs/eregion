@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
 func TestContainerCleanupBackoff(t *testing.T) {
@@ -78,14 +79,15 @@ func TestContainerCleanupErrorNamesFailedContainersAndCause(t *testing.T) {
 
 // The warning keeps the node's own step reason, not the generic internal text.
 func TestCleanupStepCauseNamesTheStepReason(t *testing.T) {
+	service := &Service{}
 	step := "platform-cleanup-demo-production-web-1-aaaa-v1"
 	retryable := fmt.Errorf("node step %s failed: %s", step, "exit status 1: Error response from daemon: permission denied")
-	if got := cleanupStepCause(retryable, step); got != "exit status 1: Error response from daemon: permission denied" {
+	if got := service.cleanupStepCause(retryable, step); got != "exit status 1: Error response from daemon: permission denied" {
 		t.Fatalf("retryable cause = %q", got)
 	}
 	permanent := errors.Join(errNodeStepPermanentFailure,
 		contract.NewFault(contract.PreconditionFailed, "node step failed: exit status 1: container is marked for removal", "inspect the node"))
-	if got := cleanupStepCause(permanent, step); got != "exit status 1: container is marked for removal" {
+	if got := service.cleanupStepCause(permanent, step); got != "exit status 1: container is marked for removal" {
 		t.Fatalf("permanent cause = %q", got)
 	}
 }
@@ -112,11 +114,72 @@ func TestBoundedCleanupCauseSanitizesAndTruncates(t *testing.T) {
 // The maintenance retry records the node's removal reason, not just the
 // generic failure text, and bounds it the same way.
 func TestContainerCleanupFailureIncludesTheNodeReason(t *testing.T) {
-	fault := contract.Classify(containerCleanupFailure(contract.Internal, "exit status 1: Error response from daemon: device or resource busy"))
+	service := &Service{}
+	fault := contract.Classify(service.containerCleanupFailure(contract.Internal, "exit status 1: Error response from daemon: device or resource busy"))
 	if !strings.Contains(fault.Message, "Error response from daemon: device or resource busy") {
 		t.Fatalf("maintenance detail = %q", fault.Message)
 	}
-	if unknown := contract.Classify(containerCleanupFailure(contract.Code("nonsense"), "")); unknown.Code != contract.Internal {
+	if unknown := contract.Classify(service.containerCleanupFailure(contract.Code("nonsense"), "")); unknown.Code != contract.Internal {
 		t.Fatalf("unknown code = %s", unknown.Code)
+	}
+}
+
+// assertNoSecretFragment fails when any short window of secret survives, so a
+// cause that was truncated before redaction cannot pass by exposing a prefix.
+func assertNoSecretFragment(t *testing.T, text, secret string) {
+	t.Helper()
+	window := 8
+	if len(secret) < window {
+		window = len(secret)
+	}
+	for i := 0; i+window <= len(secret); i++ {
+		if fragment := secret[i : i+window]; strings.Contains(text, fragment) {
+			t.Fatalf("cause %q exposes secret fragment %q", text, fragment)
+		}
+	}
+}
+
+// The registry matches exact values, so a secret that crosses the truncation
+// boundary must be redacted from the raw cause before it is shortened.
+func TestCleanupCausesRedactSecretsStraddlingTheTruncationBoundary(t *testing.T) {
+	secret := "sk_live_" + strings.Repeat("9f8e7d6c", 6)
+	registry := &secrets.Registry{}
+	registry.Add(secret)
+	service := &Service{redaction: registry}
+	step := "platform-cleanup-demo-production-web-1-aaaa-v1"
+	base := "exit status 1: Error response from daemon: "
+	filler := strings.Repeat("x", cleanupCauseLimit-len(base)-24)
+	raw := base + filler + secret + " trailing text"
+	// Guard the test setup: shortening first would expose the secret's prefix.
+	if leaked := boundedCleanupCause(raw); !strings.Contains(leaked, secret[:8]) {
+		t.Fatalf("setup does not straddle the boundary: %q", leaked)
+	}
+	err := fmt.Errorf("node step %s failed: %s", step, raw)
+	cause := service.cleanupStepCause(err, step)
+	assertNoSecretFragment(t, cause, secret)
+	if !strings.Contains(cause, "[REDACTED") {
+		t.Fatalf("cause does not show the redaction: %q", cause)
+	}
+	warning := contract.Classify(containerCleanupError([]string{"web-1"}, []string{cause}, []error{err}))
+	assertNoSecretFragment(t, warning.Message, secret)
+}
+
+// A secret containing newlines (or sitting between them) is only an exact
+// registry match before whitespace normalization collapses it.
+func TestCleanupCausesRedactSecretsAroundNewlines(t *testing.T) {
+	secret := "multi\nline-secret-value"
+	registry := &secrets.Registry{}
+	registry.Add(secret)
+	service := &Service{redaction: registry}
+	step := "platform-cleanup-demo-production-web-1-aaaa-v1"
+	raw := "\n" + secret + "\nsecond line"
+	err := fmt.Errorf("node step %s failed: %s", step, raw)
+	cause := service.cleanupStepCause(err, step)
+	assertNoSecretFragment(t, cause, secret)
+	assertNoSecretFragment(t, service.cleanupCauseText(fmt.Errorf("node step %s failed: %s", step, raw)), secret)
+	maintenance := contract.Classify(service.containerCleanupFailure(contract.Internal, "exit status 1: "+raw))
+	assertNoSecretFragment(t, maintenance.Message, secret)
+	if strings.Contains(cause, "line-secret-value") || strings.Contains(maintenance.Message, "line-secret-value") {
+		t.Fatalf("newline secret survived: cause=%q maintenance=%q", cause, maintenance.Message)
 	}
 }

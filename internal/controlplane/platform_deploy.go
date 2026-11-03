@@ -982,7 +982,7 @@ func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transp
 		if err == nil {
 			continue
 		}
-		if cause := cleanupStepCause(err, step); cause != "" {
+		if cause := s.cleanupStepCause(err, step); cause != "" {
 			causes = append(causes, cause)
 		}
 		if recordErr := s.recordContainerCleanup(ctx, instance.Name, env.ID, nodeName, deploymentID, reason, err); recordErr != nil {
@@ -996,9 +996,12 @@ func (s *Service) removeDeploymentContainers(ctx context.Context, tr node.Transp
 
 // cleanupStepCause is the node's own reason for one failed removal. The step
 // error wraps Docker's answer as "node step <id> failed: ..." or as a fault
-// with the same detail; both reduce to the detail itself.
-func cleanupStepCause(err error, step string) string {
-	message := cleanupErrorText(err)
+// with the same detail; both reduce to the detail itself. Redaction runs on the
+// raw text before the wrapper is trimmed, whitespace is normalized and the
+// result is truncated: a secret can cross the truncation boundary or contain a
+// newline that normalization would collapse.
+func (s *Service) cleanupStepCause(err error, step string) string {
+	message := s.redact(cleanupErrorText(err))
 	for _, prefix := range []string{"node step " + step + " failed: ", "node step failed: "} {
 		message = strings.TrimPrefix(message, prefix)
 	}

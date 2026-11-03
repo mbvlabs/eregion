@@ -66,8 +66,10 @@ func cleanupErrorText(err error) string {
 // boundedCleanupCause flattens untrusted failure text to one visible line,
 // cutting anything longer than cleanupCauseLimit runes and marking the cut with
 // an ellipsis. Docker's answer is not trusted terminal input, so controls are
-// escaped and line breaks collapse to spaces. Callers redact it with the worker
-// registry first.
+// escaped and line breaks collapse to spaces. Callers must redact it with the
+// worker registry first: the registry matches exact values, so a secret that
+// crosses the truncation boundary or contains normalizable whitespace is only
+// removable from the raw text.
 func boundedCleanupCause(text string) string {
 	text = strings.Join(strings.Fields(output.SafeText(text)), " ")
 	runes := []rune(text)
@@ -77,12 +79,20 @@ func boundedCleanupCause(text string) string {
 	return text
 }
 
+// cleanupCauseText is one failed removal as the durable cleanup row records it.
+// Redaction runs on the raw text before normalization and truncation; doing it
+// afterwards could leave a fragment of a secret that crossed the boundary or
+// contained a collapsed newline.
+func (s *Service) cleanupCauseText(err error) string {
+	return boundedCleanupCause(s.redact(cleanupErrorText(err)))
+}
+
 // recordContainerCleanup upserts one leaked container and schedules its next
 // attempt. Success is recorded by deleting the row.
 func (s *Service) recordContainerCleanup(ctx context.Context, containerName string, environmentID platform.EnvironmentID, nodeName string, deploymentID platform.DeploymentID, reason string, cause error) error {
 	detail := ""
 	if cause != nil {
-		detail = boundedCleanupCause(s.redact(cleanupErrorText(cause)))
+		detail = s.cleanupCauseText(cause)
 	}
 	var attempts int
 	if err := s.pool.QueryRow(ctx, `INSERT INTO eregion_platform_container_cleanup
@@ -178,7 +188,7 @@ func (s *Service) retryContainerCleanup(ctx context.Context, row containerCleanu
 	case engine.StatusCompleted:
 		return nil
 	case engine.StatusFailed:
-		return containerCleanupFailure(contract.Code(response.ErrorCode), s.redact(response.Detail))
+		return s.containerCleanupFailure(contract.Code(response.ErrorCode), response.Detail)
 	default:
 		return contract.NewFault(contract.Unavailable, "container cleanup did not finish", "The maintenance job will retry with backoff.")
 	}
@@ -186,13 +196,14 @@ func (s *Service) retryContainerCleanup(ctx context.Context, row containerCleanu
 
 // containerCleanupFailure is the maintenance worker's recorded retry failure.
 // The message carries the node's own removal reason; the durable row stores
-// the fault message, so a hint alone would lose it.
-func containerCleanupFailure(code contract.Code, detail string) error {
+// the fault message, so a hint alone would lose it. Redaction runs on the raw
+// detail before normalization and truncation.
+func (s *Service) containerCleanupFailure(code contract.Code, detail string) error {
 	if !contract.KnownCode(code) {
 		code = contract.Internal
 	}
 	message := "container cleanup failed"
-	if cause := boundedCleanupCause(detail); cause != "" {
+	if cause := boundedCleanupCause(s.redact(detail)); cause != "" {
 		message += ": " + cause
 	}
 	return contract.NewFault(code, message, "The maintenance job retries with backoff; inspect the node's Docker state.")
