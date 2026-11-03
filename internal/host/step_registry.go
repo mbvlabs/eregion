@@ -7,20 +7,20 @@ import (
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// RegistryImage is pinned by digest, not only by tag. The digest is the
-// multi-architecture official registry:2.8.3 image index.
-const RegistryImage = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373"
+// The registry image is pinned by digest in platform.RegistryImage, which the
+// host step and the retention garbage-collect effect share.
 
 type registryStep struct {
 	cfg  Config
 	exec Exec
 }
 
-func (s *registryStep) ID() string { return "host-registry-v1" }
+func (s *registryStep) ID() string { return "host-registry-v2" }
 func (s *registryStep) Describe() string {
-	return "Install the local OCI registry pinned by image digest"
+	return "Install the local OCI registry with manifest deletion enabled and a garbage-collect path"
 }
 func (s *registryStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -39,7 +39,7 @@ storage:
   filesystem:
     rootdirectory: /var/lib/registry
   delete:
-    enabled: false
+    enabled: true
 http:
   addr: :5000
   headers:
@@ -60,13 +60,13 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 ExecStartPre=/usr/bin/docker pull %s
-ExecStart=/usr/bin/docker run --rm --name eregion-registry --publish %s:5000 --volume %s:/var/lib/registry --volume %s:/etc/docker/registry/config.yml:ro %s
+ExecStart=/usr/bin/docker run --rm --name eregion-registry --env REGISTRY_STORAGE_DELETE_ENABLED=true --publish %s:5000 --volume %s:/var/lib/registry --volume %s:/etc/docker/registry/config.yml:ro %s
 ExecStop=/usr/bin/docker stop eregion-registry
 TimeoutStopSec=30s
 
 [Install]
 WantedBy=multi-user.target
-`, RegistryImage, s.cfg.RegistryListen, s.cfg.Layout.RegistryDir, s.configPath(), RegistryImage))
+`, platform.RegistryImage, s.cfg.RegistryListen, s.cfg.Layout.RegistryDir, s.configPath(), platform.RegistryImage))
 }
 
 func (s *registryStep) Inputs() ([]byte, error) {
@@ -76,7 +76,7 @@ func (s *registryStep) Inputs() ([]byte, error) {
 		Config string `json:"config"`
 		Unit   string `json:"unit"`
 		Dir    string `json:"dir"`
-	}{RegistryImage, s.cfg.RegistryListen, contentSHA256(s.config()), contentSHA256(s.unit()), s.cfg.Layout.RegistryDir})
+	}{platform.RegistryImage, s.cfg.RegistryListen, contentSHA256(s.config()), contentSHA256(s.unit()), s.cfg.Layout.RegistryDir})
 }
 
 func (s *registryStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
@@ -93,7 +93,8 @@ func (s *registryStep) Check(ctx context.Context, _ engine.Runtime) (engine.Chec
 	}
 	script := fmt.Sprintf(`if systemctl is-enabled eregion-registry.service >/dev/null 2>&1; then echo enabled:ok; else echo enabled:missing; fi
 if systemctl is-active eregion-registry.service >/dev/null 2>&1; then echo active:ok; else echo active:missing; fi
-if docker image inspect %s >/dev/null 2>&1; then echo image:ok; else echo image:missing; fi`, shellQuote(RegistryImage))
+if docker image inspect %s >/dev/null 2>&1; then echo image:ok; else echo image:missing; fi
+if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' eregion-registry 2>/dev/null | grep -q '^REGISTRY_STORAGE_DELETE_ENABLED=true$'; then echo deletion:ok; else echo deletion:missing; fi`, shellQuote(platform.RegistryImage))
 	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, script)
 	if err != nil {
 		return engine.CheckResult{}, err
@@ -120,16 +121,17 @@ func (s *registryStep) Apply(ctx context.Context, runtime engine.Runtime, report
 	script := fmt.Sprintf(`set -euo pipefail
 systemctl daemon-reload
 /usr/bin/docker pull %s
-systemctl enable --now eregion-registry.service
-systemctl is-active --quiet eregion-registry.service`, shellQuote(RegistryImage))
+systemctl enable eregion-registry.service
+systemctl restart eregion-registry.service
+systemctl is-active --quiet eregion-registry.service`, shellQuote(platform.RegistryImage))
 	if err := s.exec.Run(ctx, s.ID(), script, nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	return engine.ApplyResult{Notes: []string{"local registry running at " + s.cfg.RegistryListen}, Result: map[string]any{"image": RegistryImage, "listen": s.cfg.RegistryListen}}, nil
+	return engine.ApplyResult{Notes: []string{"local registry running at " + s.cfg.RegistryListen + " with manifest deletes enabled"}, Result: map[string]any{"image": platform.RegistryImage, "listen": s.cfg.RegistryListen}}, nil
 }
 
 func (s *registryStep) Diff(context.Context, engine.Runtime) ([]string, error) {
-	out := []string{"+ registry image " + RegistryImage, "+ registry listen " + s.cfg.RegistryListen}
+	out := []string{"+ registry image " + platform.RegistryImage, "+ registry listen " + s.cfg.RegistryListen, "+ registry manifest deletion enabled with garbage collection"}
 	raw, _, exists, err := fileState(s.configPath())
 	if err != nil {
 		return nil, err

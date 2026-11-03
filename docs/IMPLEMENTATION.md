@@ -87,7 +87,7 @@ re-queue the older one's live platform jobs.
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
 | `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, CI deploy, per-environment push webhook and private proxy adapters. |
 | `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
-| `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps, Caddy route renderer and the domain DNS/TLS/HTTP observation helpers. |
+| `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps, disk-retention inventory and removal/GC node effects, Caddy route renderer and the domain DNS/TLS/HTTP observation helpers. |
 | `internal/retention` | D30 retention policy, environment override merge/validation, Buildpacks cache limits and run/item records shared by the planner, CLI and node effects. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
 | `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps (incl. vault keyring and node_exporter), local pending-init state, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
@@ -335,8 +335,41 @@ resolves a retained release: resolution requires an immutable manifest digest
 and never collapse across repositories. If a retained release has no resolvable
 immutable identity, the planner emits a `registry_skipped` diagnostic and plans
 no deletion for its repository (or all repositories when none can be
-determined). Node effects, registry deletes/GC and `retention show|set` /
-`prune` commands are not part of this schema work.
+determined).
+
+### Retention node effects
+
+`retention.inventory` is a read-only node RPC (`inventory` on the node
+transport) returning `retention.Inventory`: registry manifests keyed by
+`(repository, digest)` with their tags, config digest, created time and the
+bytes of the manifest plus its unique blobs; the `eregion-build-cache-` volumes
+and sizes; `io.eregion.app`-labeled containers with labels and state; dangling
+images; local images with their `RepoDigests`; and statfs total/free bytes for
+the data directory. Identical digests in two repositories stay two entries,
+because a registry delete names one repository.
+
+Removal is one journaled node step per planner item:
+`platform-retention-remove-<12 hex>-v1`, where the suffix hashes the item kind
+and reference. The kinds are `release` and `dangling_image` (local
+`docker image rm`), `registry_artifact` (`DELETE /v2/<repo>/manifests/<digest>`
+through the loopback registry API), `buildpack_cache` (`docker volume rm`) and
+`container` (`docker rm --force`). Already-gone is success, so a retried prune
+converges; a registry without deletes enabled fails with `405` naming
+`host-registry-v2`. A GC effect, `platform-retention-gc-01-v1`, stops
+`eregion-registry.service`, runs `registry garbage-collect` in a one-off
+container against the same storage, and restarts the unit. It never passes
+`--delete-untagged`: releases are referenced by digest, so an untagged manifest
+can still be a live release; only manifests explicitly deleted through the API
+become unreferenced, and plain garbage collection removes their blobs.
+
+`host-registry-v2` enables manifest deletion (`storage.delete.enabled: true`
+plus `REGISTRY_STORAGE_DELETE_ENABLED=true` in the unit) and restarts the
+registry so a v1 node takes the change. A v1 node reports the new version as
+pending once; the second plan is a no-op. The control plane/deploy path builds
+with an explicit Buildpacks cache volume,
+`eregion-build-cache-<app>-<environment>`, through
+`pack build --cache type=build;format=volume;name=…`, so a cache is attributable
+and can be pruned by name.
 
 ## Migration and external database policy
 
