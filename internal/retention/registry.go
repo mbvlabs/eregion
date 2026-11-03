@@ -20,6 +20,52 @@ type repositoryTag struct {
 	tag        string
 }
 
+type registryConfigReference struct {
+	repository string
+	digest     string
+}
+
+// localImageReference is one immutable repository digest for a local image ID.
+type localImageReference struct {
+	repository string
+	digest     string
+}
+
+// localImageIndex maps a Docker image config digest to the repository digests
+// Docker recorded for it.
+type localImageIndex map[string][]localImageReference
+
+func indexLocalImages(images []LocalImageRef) localImageIndex {
+	index := localImageIndex{}
+	for _, image := range images {
+		id := normalizeDigest(image.ID)
+		if id == "" {
+			continue
+		}
+		seen := map[localImageReference]bool{}
+		for _, existing := range index[id] {
+			seen[existing] = true
+		}
+		for _, raw := range image.RepoDigests {
+			reference, parsed := parseImageReference(raw)
+			if !parsed || reference.digest == "" {
+				continue
+			}
+			candidate := localImageReference{repository: reference.repository, digest: reference.digest}
+			if seen[candidate] {
+				continue
+			}
+			seen[candidate] = true
+			index[id] = append(index[id], candidate)
+		}
+	}
+	return index
+}
+
+func (i localImageIndex) references(id string) []localImageReference {
+	return i[normalizeDigest(id)]
+}
+
 type registryArtifactEntry struct {
 	artifact RegistryArtifact
 	key      artifactIdentity
@@ -30,14 +76,13 @@ type registryArtifactEntry struct {
 type registryInventoryIndex struct {
 	entries   []registryArtifactEntry
 	manifests map[artifactIdentity]bool
-	tags      map[repositoryTag]bool
 	digests   map[string]bool
+	configs   []registryConfigReference
 }
 
 func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 	index := registryInventoryIndex{
 		manifests: map[artifactIdentity]bool{},
-		tags:      map[repositoryTag]bool{},
 		digests:   map[string]bool{},
 	}
 	raw := append([]RegistryArtifact(nil), registry.Artifacts...)
@@ -93,8 +138,11 @@ func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 	for _, entry := range index.entries {
 		index.manifests[entry.key] = true
 		index.digests[entry.key.digest] = true
-		for _, tag := range entry.artifact.Tags {
-			index.tags[repositoryTag{repository: entry.key.repository, tag: tag}] = true
+		if entry.artifact.ConfigDigest != "" {
+			index.configs = append(index.configs, registryConfigReference{
+				repository: entry.key.repository,
+				digest:     entry.artifact.ConfigDigest,
+			})
 		}
 	}
 	return index
@@ -137,22 +185,38 @@ func mergeTags(existing, incoming []string) []string {
 	return merged
 }
 
-func (i registryInventoryIndex) hasManifest(repository, digest string) bool {
-	return i.manifests[artifactIdentity{repository: repository, digest: normalizeDigest(digest)}]
-}
-
-func (i registryInventoryIndex) hasTag(repository, tag string) bool {
-	tag = strings.TrimSpace(tag)
-	for key := range i.tags {
-		if key.tag == tag && repositoryMatches(key.repository, repository) {
+// hasManifestFor reports whether an inventory artifact with the manifest digest
+// exists in the release's repository. An empty repository matches any
+// repository, which is the only option when the release names a bare digest.
+func (i registryInventoryIndex) hasManifestFor(repository, digest string) bool {
+	digest = normalizeDigest(digest)
+	if !validDigest(digest) {
+		return false
+	}
+	if repository == "" {
+		return i.digests[digest]
+	}
+	for key := range i.manifests {
+		if key.digest == digest && repositoryMatches(key.repository, repository) {
 			return true
 		}
 	}
 	return false
 }
 
-func (i registryInventoryIndex) hasDigest(digest string) bool {
-	return i.digests[normalizeDigest(digest)]
+// hasConfigDigest reports whether an inventory artifact exposes the image config
+// digest, optionally limited to the release's repository.
+func (i registryInventoryIndex) hasConfigDigest(repository, digest string) bool {
+	digest = normalizeDigest(digest)
+	if !validDigest(digest) {
+		return false
+	}
+	for _, config := range i.configs {
+		if config.digest == digest && (repository == "" || repositoryMatches(config.repository, repository)) {
+			return true
+		}
+	}
+	return false
 }
 
 // repositoryMatches compares a release repository with an inventory
@@ -196,7 +260,7 @@ func newRegistryProtection() registryProtection {
 	}
 }
 
-func (p *registryProtection) addRelease(release Release) {
+func (p *registryProtection) addRelease(release Release, localImages localImageIndex) {
 	reference, parsed := parseImageReference(release.Image)
 	if parsed {
 		if reference.digest != "" {
@@ -217,6 +281,12 @@ func (p *registryProtection) addRelease(release Release) {
 		p.digests[digest] = true
 		if parsed && reference.repository != "" {
 			p.manifests[artifactIdentity{repository: reference.repository, digest: digest}] = true
+		}
+	}
+	for _, local := range localImages.references(release.ImageID) {
+		p.digests[local.digest] = true
+		if local.repository != "" {
+			p.manifests[artifactIdentity{repository: local.repository, digest: local.digest}] = true
 		}
 	}
 	if config := normalizeDigest(release.ImageID); validDigest(config) {
@@ -269,7 +339,7 @@ func newArtifactMetadataIndex(serverPolicy Policy) artifactMetadataIndex {
 	}
 }
 
-func (i *artifactMetadataIndex) recordRelease(release Release, policy Policy) {
+func (i *artifactMetadataIndex) recordRelease(release Release, policy Policy, localImages localImageIndex) {
 	metadata := artifactMetadata{
 		app:         release.App,
 		environment: release.Environment,
@@ -296,6 +366,12 @@ func (i *artifactMetadataIndex) recordRelease(release Release, policy Policy) {
 		mergeArtifactMetadata(i.digests, digest, metadata)
 		if parsed && reference.repository != "" {
 			mergeArtifactMetadata(i.manifests, artifactIdentity{repository: reference.repository, digest: digest}, metadata)
+		}
+	}
+	for _, local := range localImages.references(release.ImageID) {
+		mergeArtifactMetadata(i.digests, local.digest, metadata)
+		if local.repository != "" {
+			mergeArtifactMetadata(i.manifests, artifactIdentity{repository: local.repository, digest: local.digest}, metadata)
 		}
 	}
 	if config := normalizeDigest(release.ImageID); validDigest(config) {
@@ -368,11 +444,67 @@ func registryReleaseRetained(release Release, planned, protected map[string]bool
 	return true
 }
 
-// registrySkipReasons implements the fail-safe rule: when a retained release's
-// image reference cannot be resolved to an inventory artifact in its
-// repository, that repository plans no deletions. A reference with no usable
-// repository skips the whole registry.
-func registrySkipReasons(releases []Release, planned, protected map[string]bool, environments map[environmentKey]Environment, index registryInventoryIndex) (map[string]string, bool) {
+// releaseRepository returns the normalized repository named by Release.Image,
+// or an empty string when it cannot be determined.
+func releaseRepository(release Release) string {
+	reference, parsed := parseImageReference(release.Image)
+	if !parsed {
+		return ""
+	}
+	return reference.repository
+}
+
+func releaseReferencesRegistry(release Release) bool {
+	if strings.TrimSpace(release.Image) != "" {
+		return true
+	}
+	if validDigest(normalizeDigest(release.ImageID)) {
+		return true
+	}
+	for _, raw := range release.Artifacts {
+		if validDigest(normalizeDigest(raw)) {
+			return true
+		}
+	}
+	return false
+}
+
+// releaseHasImmutableIdentity reports whether a retained release can be tied to
+// an inventory artifact through something a moved tag cannot change: a manifest
+// digest or the image config digest. A tag is protection, never resolution.
+func releaseHasImmutableIdentity(release Release, repository string, index registryInventoryIndex, localImages localImageIndex) bool {
+	reference, parsed := parseImageReference(release.Image)
+	if parsed && reference.digest != "" && index.hasManifestFor(repository, reference.digest) {
+		return true
+	}
+	for _, raw := range release.Artifacts {
+		digest := normalizeDigest(raw)
+		if validDigest(digest) && index.hasManifestFor(repository, digest) {
+			return true
+		}
+	}
+	for _, local := range localImages.references(release.ImageID) {
+		repositoryForLocal := repository
+		if repositoryForLocal == "" {
+			repositoryForLocal = local.repository
+		}
+		if index.hasManifestFor(repositoryForLocal, local.digest) {
+			return true
+		}
+	}
+	config := normalizeDigest(release.ImageID)
+	return validDigest(config) && index.hasConfigDigest(repository, config)
+}
+
+// registrySkipReasons implements the fail-safe rule: when a retained release
+// has no immutable identity that resolves to an inventory artifact, its
+// repository plans no deletions. A release without a usable repository skips
+// the whole registry.
+// registrySkipReasons implements the fail-safe rule: when a retained release
+// has no immutable identity that resolves to an inventory artifact, that
+// repository plans no deletions. A release with no usable repository skips the
+// whole registry. A tag is never resolution.
+func registrySkipReasons(releases []Release, planned, protected map[string]bool, environments map[environmentKey]Environment, index registryInventoryIndex, localImages localImageIndex) (map[string]string, bool) {
 	reasons := map[string]string{}
 	skipAll := false
 	allReason := ""
@@ -393,47 +525,22 @@ func registrySkipReasons(releases []Release, planned, protected map[string]bool,
 		if !registryReleaseRetained(release, planned, protected, environments) {
 			continue
 		}
-		image := strings.TrimSpace(release.Image)
-		if image == "" {
-			for _, raw := range release.Artifacts {
-				digest := normalizeDigest(raw)
-				if !validDigest(digest) {
-					continue
-				}
-				if !index.hasDigest(digest) {
-					skipEverything(fmt.Sprintf("release %s references manifest %s, which is not in the registry inventory", release.ID, digest))
-					break
-				}
-			}
+		if !releaseReferencesRegistry(release) {
 			continue
 		}
-		reference, parsed := parseImageReference(image)
-		if !parsed || reference.repository == "" {
-			skipEverything(fmt.Sprintf("release %s image %q cannot be resolved to a registry repository", release.ID, image))
+		repository := releaseRepository(release)
+		if releaseHasImmutableIdentity(release, repository, index, localImages) {
 			continue
 		}
-		unresolved := func(detail string) {
-			skipRepository(reference.repository, fmt.Sprintf("release %s image %q does not resolve to a registry inventory artifact (%s)",
-				release.ID, image, detail))
+		reason := fmt.Sprintf("release %s has no immutable image digest or config digest that resolves to a registry inventory artifact", release.ID)
+		if image := strings.TrimSpace(release.Image); image != "" {
+			reason = fmt.Sprintf("%s (image %q)", reason, image)
 		}
-		if reference.digest != "" {
-			if !index.hasManifest(reference.repository, reference.digest) {
-				unresolved("missing manifest " + reference.digest)
-			}
-		} else if reference.tag != "" {
-			if !index.hasTag(reference.repository, reference.tag) {
-				unresolved("missing tag " + reference.tag)
-			}
+		if repository == "" {
+			skipEverything(reason)
+			continue
 		}
-		for _, raw := range release.Artifacts {
-			digest := normalizeDigest(raw)
-			if !validDigest(digest) {
-				continue
-			}
-			if !index.hasManifest(reference.repository, digest) {
-				unresolved("missing manifest " + digest)
-			}
-		}
+		skipRepository(repository, reason)
 	}
 	if skipAll {
 		return map[string]string{"*": allReason}, true

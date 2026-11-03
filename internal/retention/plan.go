@@ -22,6 +22,11 @@ type Input struct {
 	// rollback target; a pending or running row is treated as in-flight and
 	// protects its release. Callers may pass only succeeded rows.
 	Deployments []Deployment
+	// LocalImages maps Docker's local image ID (config digest) to the
+	// repository digests Docker recorded for that image. It lets a release's
+	// ImageID resolve to its immutable manifest after a tag moved. The node
+	// inventory adapter fills it; older callers may omit it.
+	LocalImages []LocalImageRef
 	// Registry is the node registry's manifests and digests.
 	Registry RegistryInventory
 	// Cache is the Buildpacks cache and the filesystem state it lives on.
@@ -71,8 +76,9 @@ type Release struct {
 	// Image is the registry reference recorded on the release, usually
 	// repository:tag. A digest after "@" is treated as an artifact reference.
 	Image string
-	// ImageID is the local Docker image identity (sha256:…) or registry digest
-	// the release needs. It is matched against RegistryInventory and Images.
+	// ImageID is the local Docker image identity: the image config digest.
+	// It is not a manifest digest. It matches RegistryArtifact.ConfigDigest,
+	// images on the node, and LocalImageRef RepoDigests.
 	ImageID string
 	// Artifacts lists any further registry manifest digests the release needs.
 	// A digest shared with a kept release is never removed.
@@ -120,9 +126,9 @@ type RegistryArtifact struct {
 	// registry host; matching normalizes both spellings.
 	Repository string
 	// Tags are the tags currently pointing at this manifest in Repository.
-	// They let a kept release whose Image is repository:tag protect the
-	// manifest even though Release.ImageID is a config digest, not a manifest
-	// digest.
+	// A tag is extra protection only: it protects whatever manifest it points
+	// at, but never resolves a retained release after a tag move. Immutable
+	// manifest or config digests resolve the release.
 	Tags []string
 	// ConfigDigest is the image config digest exposed by the registry, when
 	// known. It matches Release.ImageID (Docker's image ID) so a kept release's
@@ -190,6 +196,18 @@ type Image struct {
 	Bytes int64
 	// Release is the optional io.eregion.release label.
 	Release string
+}
+
+// LocalImageRef is the planner's minimal view of one Docker image on the node.
+// It is intentionally compatible with a richer inventory LocalImage: only the
+// config ID and RepoDigests are needed to map Release.ImageID to a manifest.
+type LocalImageRef struct {
+	// ID is Docker's local image ID, which is the image config digest
+	// (sha256:…), matching Release.ImageID.
+	ID string
+	// RepoDigests are Docker's repository@sha256:… entries for the image. They
+	// are immutable manifest identities even when the release's tag has moved.
+	RepoDigests []string
 }
 
 // InFlight is the set of resources a pending or running operation still owns.
@@ -275,6 +293,7 @@ func Plan(in Input) []Item {
 		key := environmentKey{app: release.App, environment: release.Environment}
 		releasesByEnvironment[key] = append(releasesByEnvironment[key], release)
 	}
+	localImages := indexLocalImages(in.LocalImages)
 
 	protectedReleaseIDs := map[string]bool{}
 	for releaseID := range inFlightReleases {
@@ -346,7 +365,7 @@ func Plan(in Input) []Item {
 		if environment, known := environmentByKey[environmentKey{app: release.App, environment: release.Environment}]; known {
 			policy = normalizedPolicy(environment.Policy)
 		}
-		artifactMetadata.recordRelease(release, policy)
+		artifactMetadata.recordRelease(release, policy, localImages)
 	}
 
 	// A retained release protects every artifact and image it still needs,
@@ -359,14 +378,14 @@ func Plan(in Input) []Item {
 			continue
 		}
 		retainedReleaseIDs[release.ID] = true
-		protection.addRelease(release)
+		protection.addRelease(release, localImages)
 		for _, digest := range releaseImageDigests(release) {
 			protectedImageDigests[digest] = true
 		}
 	}
 
 	registryIndex := indexRegistryArtifacts(in.Registry)
-	skipReasons, skipAll := registrySkipReasons(releases, plannedReleaseIDs, protectedReleaseIDs, environmentByKey, registryIndex)
+	skipReasons, skipAll := registrySkipReasons(releases, plannedReleaseIDs, protectedReleaseIDs, environmentByKey, registryIndex, localImages)
 	items = append(items, planRegistryArtifacts(registryIndex, protection, artifactMetadata, skipReasons, skipAll, now)...)
 	items = append(items, planBuildpackCache(serverPolicy, in.Cache)...)
 	items = append(items, planContainers(environmentByKey, in.Containers, inFlightReleases, inFlightDeployments, inFlightContainers)...)

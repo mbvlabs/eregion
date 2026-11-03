@@ -326,13 +326,16 @@ its rollback target (selected with the same rule as
 than `keep_newer_than_days`, protects in-flight releases and containers, keeps
 registry artifacts shared with a kept release, and plans release, registry
 artifact, Buildpacks cache, ownerless container and dangling image items with a
-total-bytes helper. Registry matching normalizes registry hosts and ports and
-accepts a release's repository tag, manifest digest or image config digest
-(`RegistryArtifact.Tags` and `.ConfigDigest`); removal items are
-repository-qualified (`repo@sha256:…`) and never collapse across repositories.
-If a retained release's reference cannot be resolved to an inventory artifact,
-the planner emits a `registry_skipped` diagnostic and plans no deletion for that
-repository. Node effects, registry deletes/GC and `retention show|set` /
+total-bytes helper. Registry matching normalizes registry hosts and ports.
+A release tag protects whatever manifest it currently points to, but a tag never
+resolves a retained release: resolution requires an immutable manifest digest
+(`Image@sha256` or `Artifacts`), a matching inventory `ConfigDigest`, or an
+`ImageID` mapped to a manifest through local image `RepoDigests`
+(`Input.LocalImages`). Removal items are repository-qualified (`repo@sha256:…`)
+and never collapse across repositories. If a retained release has no resolvable
+immutable identity, the planner emits a `registry_skipped` diagnostic and plans
+no deletion for its repository (or all repositories when none can be
+determined). Node effects, registry deletes/GC and `retention show|set` /
 `prune` commands are not part of this schema work.
 
 ## Migration and external database policy

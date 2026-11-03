@@ -392,7 +392,7 @@ func TestPlanProtectsTaggedReleaseManifest(t *testing.T) {
 		}},
 		Releases: releases,
 		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
-			{Repository: "api", Digest: "sha256:manifest", Tags: []string{"v1"}, CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:manifest", ConfigDigest: "sha256:config", Tags: []string{"v1"}, CreatedAt: daysAgo(30), Bytes: 100},
 			{Repository: "api", Digest: "sha256:old", Tags: []string{"v0"}, CreatedAt: daysAgo(30), Bytes: 50},
 		}},
 		Now: planNow,
@@ -617,6 +617,109 @@ func TestNormalizeRepository(t *testing.T) {
 			t.Fatalf("normalizeRepository(%q) = %q, want %q", test.raw, got, test.want)
 		}
 	}
+}
+
+func TestPlanMovedTagWithoutImmutableIdentitySkipsRepository(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{{
+			ID: "rel_serving", App: "api", Environment: "production",
+			Image:     "registry.example.com:5000/api:v1",
+			ImageID:   "sha256:config-old",
+			CreatedAt: daysAgo(1),
+		}},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:old-manifest", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:new-manifest", Tags: []string{"v1"}, CreatedAt: daysAgo(1), Bytes: 100},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), nil)
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), []string{"api"})
+	if containsReference(items, ItemRegistryArtifact, "api@sha256:old-manifest") {
+		t.Fatal("old manifest was deleted after its tag moved")
+	}
+	for _, item := range items {
+		if item.Kind == ItemRegistrySkipped && !strings.Contains(item.Reason, "immutable") {
+			t.Fatalf("skip reason = %q, want an immutable-identity explanation", item.Reason)
+		}
+	}
+}
+
+func TestPlanMovedTagWithConfigDigestProtectsOldManifest(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{{
+			ID: "rel_serving", App: "api", Environment: "production",
+			Image:     "registry.example.com:5000/api:v1",
+			ImageID:   "sha256:config-old",
+			CreatedAt: daysAgo(1),
+		}},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:old-manifest", ConfigDigest: "sha256:config-old", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:new-manifest", Tags: []string{"v1"}, CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:unrelated", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"api@sha256:unrelated"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+	if containsReference(items, ItemRegistryArtifact, "api@sha256:old-manifest") {
+		t.Fatal("manifest matching the release config digest was planned")
+	}
+}
+
+func TestPlanImageIDResolvesThroughRepoDigests(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{{
+			ID: "rel_serving", App: "api", Environment: "production",
+			Image:     "registry.example.com:5000/api:v1",
+			ImageID:   "sha256:config-old",
+			CreatedAt: daysAgo(1),
+		}},
+		LocalImages: []LocalImageRef{{
+			ID: "sha256:config-old",
+			RepoDigests: []string{
+				"registry.example.com:5000/api@sha256:old-manifest",
+			},
+		}},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:old-manifest", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:unrelated", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"api@sha256:unrelated"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+	if containsReference(items, ItemRegistryArtifact, "api@sha256:old-manifest") {
+		t.Fatal("manifest resolved from RepoDigests was planned")
+	}
+}
+
+func TestPlanOnlyUnresolvedImageIDSkipsAll(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{{
+			ID: "rel_serving", App: "api", Environment: "production",
+			ImageID:   "sha256:config-missing",
+			CreatedAt: daysAgo(1),
+		}},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:old-manifest", CreatedAt: daysAgo(30), Bytes: 100},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), nil)
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), []string{"*"})
 }
 
 func TestPlanIsIdempotentAfterPruning(t *testing.T) {
