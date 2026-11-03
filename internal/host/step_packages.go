@@ -84,12 +84,33 @@ func (s *packagesStep) Check(ctx context.Context, _ engine.Runtime) (engine.Chec
 	return complete("installed packages: " + strings.Join(s.packages(), ", "))
 }
 
+func (s *packagesStep) applyScript() string {
+	quoted := make([]string, 0, len(s.packages()))
+	for _, name := range s.packages() {
+		quoted = append(quoted, shellQuote(name))
+	}
+	return fmt.Sprintf(`set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+missing=()
+for package in %s; do
+  if ! dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null | grep -q '^ii'; then
+    missing+=("$package")
+  fi
+done
+if [ ${#missing[@]} -eq 0 ]; then
+  echo "all requested packages are already installed"
+  exit 0
+fi
+apt-get update -qq
+apt-get install -y --no-upgrade --no-install-recommends "${missing[@]}"
+`, strings.Join(quoted, " "))
+}
+
 func (s *packagesStep) Apply(ctx context.Context, runtime engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
-	script := "set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\napt-get update -qq\napt-get install -y --no-install-recommends " + strings.Join(s.packages(), " ")
-	if err := s.exec.Run(ctx, s.ID(), script, nil, report); err != nil {
+	if err := s.exec.Run(ctx, s.ID(), s.applyScript(), nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	return engine.ApplyResult{Notes: []string{"installed " + strings.Join(s.packages(), ", ")}, Result: map[string]any{"packages": s.packages()}}, nil
+	return engine.ApplyResult{Notes: []string{"installed the missing distribution packages"}, Result: map[string]any{"packages": s.packages()}}, nil
 }
 
 func (s *packagesStep) Diff(context.Context, engine.Runtime) ([]string, error) {

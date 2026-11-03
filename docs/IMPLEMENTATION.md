@@ -732,9 +732,14 @@ root, so the group mode does not affect its writes. This is what lets the
 worker's local retention inventory read manifests and blobs as `eregion`.
 
 `host-packages-v2` adds `polkitd` to the registry role so a minimal image has
-the policy daemon. `host-registry-gc-polkit-v1` writes the narrow rule above;
-the file is root-owned `0644` in a root:polkitd `0750` directory so `polkitd`
-can read it and cannot modify it. A node without the rule reports
+the policy daemon. Its apply computes the missing set with `dpkg-query` and
+passes only those names to
+`apt-get install --no-upgrade --no-install-recommends`, so an
+already-installed package (notably `docker.io`) is never upgraded and Docker is
+not restarted by an unrelated apply. A fresh host has every package missing and
+installs the full list. `host-registry-gc-polkit-v1` writes the narrow rule
+above; the file is root-owned `0644` in a root:polkitd `0750` directory so
+`polkitd` can read it and cannot modify it. A node without the rule reports
 `host-registry-gc-polkit-v1` pending once; a node without `polkitd` installs it
 through `host-packages-v2`. Both steps are part of fresh init, and a second
 plan is a no-op.
