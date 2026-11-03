@@ -457,6 +457,12 @@ class's fix as the step hint, `apply` carries it in the step fault, the existing
 does not change), and `server status` shows it in `schema_error` plus
 `schema_fix`.
 
+`host-journal-access-v1` adds the admin account to the `systemd-journal` group
+so `journalctl` can read the eregion units without sudo. Server init's access
+setup applies the same membership on a fresh host; the versioned step converges
+an existing host. Check is complete when the membership or an absent admin
+account already matches, so a second apply does not run it again.
+
 `ssh` uses the context's pinned host key and identity. Without `--command` it
 needs a terminal and opens an interactive shell; `--command` runs one remote
 command and exits with its status. The command gets a PTY only when stdin and

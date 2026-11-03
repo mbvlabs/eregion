@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
@@ -105,7 +106,11 @@ type Config struct {
 	WorkerConcurrency int    `json:"worker_concurrency"`
 	// Hostname is the main node's public name, as the operator gave it. Caddy serves
 	// it with an ACME certificate and exposes only the CI endpoint.
-	Hostname       string `json:"hostname,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	// AdminUser is the unprivileged operator account server init creates. It is
+	// also the account that reads the node journal, so it must belong to the
+	// systemd-journal group.
+	AdminUser      string `json:"admin_user,omitempty"`
 	RegistryListen string `json:"registry_listen"`
 	// CommitConfirmSeconds bounds how long an access-changing apply may leave
 	// the new access state live before a detached watchdog reverts it.
@@ -135,6 +140,7 @@ func DefaultConfig(role Role, node string) Config {
 		APIListen:            "127.0.0.1:8080",
 		WorkerConcurrency:    2,
 		RegistryListen:       "127.0.0.1:5000",
+		AdminUser:            access.AdminUser,
 		CommitConfirmSeconds: int(DefaultCommitConfirmWindow / time.Second),
 	}
 }
@@ -205,6 +211,14 @@ func (c Config) Validate() error {
 		if c.Hostname != "" {
 			if err := ValidateHostname(c.Hostname); err != nil {
 				return contract.NewFault(contract.ValidationFailed, "invalid hostname "+c.Hostname, err.Error())
+			}
+		}
+		if c.AdminUser != "" {
+			if err := ValidateAccountName(c.AdminUser); err != nil {
+				return contract.NewFault(contract.ValidationFailed, "invalid admin user", err.Error())
+			}
+			if c.AdminUser == "root" {
+				return contract.NewFault(contract.ValidationFailed, "the admin user must not be root", "Use a separate unprivileged operator account.")
 			}
 		}
 		if c.WorkerConcurrency < 1 || c.WorkerConcurrency > 16 {
@@ -303,6 +317,7 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 		APIListen          string `json:"api_listen"`
 		APITLSCert         string `json:"api_tls_cert"`
 		APITLSKey          string `json:"api_tls_key"`
+		AdminUser          string `json:"admin_user"`
 		WorkerConcurrency  int    `json:"worker_concurrency"`
 		RegistryListen     string `json:"registry_listen"`
 		CommitConfirm      int    `json:"commit_confirm_seconds"`
@@ -312,6 +327,7 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 	value := canonical{
 		Node: c.Node, Role: c.Role, Layout: c.Layout, PlatformPath: c.PlatformPath, Arch: c.Arch,
 		APIListen: c.APIListen, APITLSCert: c.APITLSCert, APITLSKey: c.APITLSKey,
+		AdminUser:         c.AdminUser,
 		WorkerConcurrency: c.WorkerConcurrency, RegistryListen: c.RegistryListen,
 		CommitConfirm:      c.CommitConfirmSeconds,
 		BinaryPath:         c.BinaryPath,

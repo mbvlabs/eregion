@@ -197,6 +197,9 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 	// An undetectable platform fails the platform step first; distro is then empty.
 	platform, _ := DetectPlatform(r.Config.PlatformPath, r.Config.Arch)
 	steps := []Step{&platformStep{cfg: r.Config}, &packagesStep{cfg: r.Config, exec: r.Exec, role: role, distro: platform.ID}, &usersStep{cfg: r.Config, exec: r.Exec, role: role}, &directoriesStep{cfg: r.Config, role: role}}
+	if role.ControlPlane {
+		steps = append(steps, &journalAccessStep{cfg: r.Config, exec: r.Exec})
+	}
 	if role.Runtime {
 		steps = append(steps, &dockerStep{exec: r.Exec})
 	}

@@ -43,7 +43,7 @@ if ! id "${ADMIN_USER}" >/dev/null 2>&1; then
   useradd --create-home --shell /bin/bash "${ADMIN_USER}"
   printf 'created user %s\n' "${ADMIN_USER}"
 fi
-usermod --shell /bin/bash --append --groups sudo "${ADMIN_USER}"
+usermod --shell /bin/bash --append --groups sudo,systemd-journal "${ADMIN_USER}"
 printf '%s:%s\n' "${ADMIN_USER}" "${SUDO_PASSWORD}" | chpasswd
 home="$(getent passwd "${ADMIN_USER}" | cut -d: -f6)"
 install -d -m 0700 -o "${ADMIN_USER}" -g "${ADMIN_USER}" "${home}/.ssh"

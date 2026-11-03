@@ -21,6 +21,13 @@ func TestScriptsParse(t *testing.T) {
 	}
 }
 
+func TestSetupAddsTheAdminToTheJournalGroup(t *testing.T) {
+	setup := Setup{AdminUser: "admin", OperatorSSHKey: "ssh-ed25519 AAAA x", SudoPassword: "it's", OperatorPublicKey: "k", SSHPort: 22, APIPort: 8080}
+	if !strings.Contains(Program("setup", setup.Env()), "usermod --shell /bin/bash --append --groups sudo,systemd-journal \"${ADMIN_USER}\"") {
+		t.Fatal("setup does not add the admin user to the systemd-journal group")
+	}
+}
+
 func TestDropInLimitsForwardingToTheAPI(t *testing.T) {
 	d := SSHDropIn("admin", 8080)
 	for _, want := range []string{"PermitRootLogin no", "AllowUsers admin", "AllowTcpForwarding local", "PermitOpen 127.0.0.1:8080", "PasswordAuthentication no"} {

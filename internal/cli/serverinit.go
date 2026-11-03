@@ -940,6 +940,7 @@ func (r *serverInit) hostConfig() (host.Config, error) {
 	cfg := host.DefaultConfig(host.RoleMain, r.answers.Node)
 	cfg.DatabaseURL = r.answers.DatabaseURL
 	cfg.Hostname = r.answers.Hostname
+	cfg.AdminUser = r.answers.AdminUser
 	cfg.BinaryPath = r.binaryPath
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
