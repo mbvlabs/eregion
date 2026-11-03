@@ -74,15 +74,16 @@ type setupAnswers struct {
 	Deploy       bool
 }
 
-// humanInteractive reports whether this invocation may ask questions. JSON
-// output, a non-terminal stdin or a dumb terminal always takes the flag path.
+// humanInteractive reports whether this invocation may ask questions. JSON,
+// NDJSON, a non-terminal stdin or a dumb terminal always takes the flag path.
 func humanInteractive(cmd *cobra.Command) bool {
 	if cmd == nil {
 		return false
 	}
 	jsonMode, _ := cmd.Flags().GetBool("json")
 	outputMode, _ := cmd.Flags().GetString("output")
-	return !jsonMode && outputMode != "json" &&
+	plain := outputMode == "" || outputMode == "plain"
+	return !jsonMode && plain &&
 		term.IsTerminal(int(os.Stdin.Fd())) && ui.Enabled(os.Stderr) //nolint:gosec // G115: file descriptors fit in int.
 }
 

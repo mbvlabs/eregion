@@ -51,7 +51,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer, registry *secrets.Registry, a *app) int {
 	registerEnvironmentSecrets(registry)
 	a.secrets = registry
-	selection := followSelectionFromArgs(args, a.valueFlags())
+	selection := a.followSelection(args)
 	mode, err := output.OptionsFromArgs(args, a.valueFlags()...)
 	followMode := string(output.Plain)
 	if selection.NDJSON {

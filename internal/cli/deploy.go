@@ -20,7 +20,7 @@ import (
 // deliveryMeta is the common metadata for the release pipeline commands. They
 // are node-mode operations: the CLI never opens the database or enqueues work.
 func deliveryMeta(summary, example string) CommandMeta {
-	return platformMutationMeta(summary, example)
+	return followingMeta(platformMutationMeta(summary, example))
 }
 
 func deliveryReadMeta(summary, example string) CommandMeta {
@@ -100,7 +100,7 @@ func (a *app) buildSpec() spec {
 			},
 			{
 				use:  "logs <build-id>",
-				meta: deliveryReadMeta("Read the build's operation events, optionally following new lines", "eregion build logs bld_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --follow --json"),
+				meta: followingMeta(deliveryReadMeta("Read the build's operation events, optionally following new lines", "eregion build logs bld_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --follow --json")),
 				args: buildIDArg,
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().Bool("follow", false, "Follow the build operation until it finishes or the viewer is detached")
@@ -270,10 +270,12 @@ func (a *app) previewLoader(cmd *cobra.Command, client Backend, kind, target str
 
 func (a *app) runDelivery(cmd *cobra.Command, client Backend, action deliveryAction) (result, error) {
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	follow := followsByDefault(cmd)
+	// NDJSON is an explicit streaming request; --detach still means accept and
+	// return, so it wins over the format's default follow.
+	follow := !boolFlag(cmd, "detach") && (followsByDefault(cmd) || streamsNDJSON(cmd))
 	var plain string
 	var raw json.RawMessage
-	if dryRun || follow {
+	if dryRun || (follow && plainOutput(cmd)) {
 		var err error
 		plain, raw, err = action.Load()
 		if err != nil {
@@ -286,7 +288,7 @@ func (a *app) runDelivery(cmd *cobra.Command, client Backend, action deliveryAct
 		}
 		return result{data: raw, plain: plain}, nil
 	}
-	if follow {
+	if follow && plainOutput(cmd) {
 		if _, err := fmt.Fprint(followConfig(cmd).out, a.followCleaner()(plain+"\n")); err != nil {
 			return result{}, contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
 		}
@@ -307,6 +309,9 @@ func (a *app) runDelivery(cmd *cobra.Command, client Backend, action deliveryAct
 // fails or detaches never starts the deploy follow; an absent first-deploy ID
 // is not invented.
 func (a *app) followGuidedCreate(cmd *cobra.Command, client Backend, op contract.Operation, deployTarget string, outcome func(context.Context, Backend, contract.Operation) []string) (result, error) {
+	if streamsNDJSON(cmd) {
+		return a.followGuidedCreateNDJSON(cmd, client, op, deployTarget)
+	}
 	created, err := a.followAccepted(cmd, client, op)
 	if err != nil {
 		if followed, ok := created.data.(followResult); ok && followed.Detached && op.FirstDeployOperationID != "" {
@@ -335,6 +340,31 @@ func (a *app) followGuidedCreate(cmd *cobra.Command, client Backend, op contract
 		ID: op.FirstDeployOperationID, Kind: platform.KindDeploy, Target: deployTarget,
 	}
 	return a.followAccepted(cmd, client, deploy, outcome)
+}
+
+// followGuidedCreateNDJSON streams the create's events, then the first
+// deploy's, and writes one terminal result for the last operation followed.
+// The create's successful terminal state is an intermediate step, not a second
+// command result.
+func (a *app) followGuidedCreateNDJSON(cmd *cobra.Command, client Backend, op contract.Operation, deployTarget string) (result, error) {
+	config := followConfig(cmd)
+	clean := a.followCleaner()
+	interval, err := followPollInterval(cmd)
+	if err != nil {
+		return result{}, err
+	}
+	opts := viewer.FollowOptions{PollInterval: interval, Clean: clean}
+	stream, summary, err := a.followNDJSONSummary(cmd, client, op.ID, opts, config, clean)
+	if err != nil || summary.State != contract.Succeeded || op.FirstDeployOperationID == "" {
+		err = finishNDJSON(stream, cmd, summary, err)
+		return result{data: newFollowResult(summary), streamed: true}, err
+	}
+	deploy := contract.Operation{
+		ID: op.FirstDeployOperationID, Kind: platform.KindDeploy, Target: deployTarget,
+	}
+	stream, summary, err = a.followNDJSONSummary(cmd, client, deploy.ID, opts, config, clean)
+	err = finishNDJSON(stream, cmd, summary, err)
+	return result{data: newFollowResult(summary), streamed: true}, err
 }
 
 func (a *app) deployCommand(cmd *cobra.Command, args []string) (result, error) {
@@ -500,7 +530,7 @@ func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, err
 	}
 	follow, _ := cmd.Flags().GetBool("follow")
-	if follow {
+	if follow || streamsNDJSON(cmd) {
 		return a.followBuildLogs(cmd, client, build)
 	}
 	events, cursor, err := fetchOperationEvents(cmd.Context(), client, build.OperationID)
@@ -532,6 +562,9 @@ func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
 func (a *app) followBuildLogs(cmd *cobra.Command, client Backend, build platform.BuildRecord) (result, error) {
 	clean := a.followCleaner()
 	opts := viewer.FollowOptions{PollInterval: deliveryPollInterval(cmd), Clean: clean}
+	if streamsNDJSON(cmd) {
+		return a.followOperation(cmd, client, build.OperationID)
+	}
 	if !plainOutput(cmd) {
 		summary, err := viewer.Follow(withoutWait(cmd.Context()), client, build.OperationID, opts, nil)
 		err = followError(summary, err)

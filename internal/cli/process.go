@@ -8,6 +8,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/viewer"
 	"github.com/spf13/cobra"
 )
 
@@ -17,7 +18,7 @@ func (a *app) processSpecs() []spec {
 	list := operationMeta("List the environment's desired processes and replicas", "eregion process list api production --json")
 	list.Examples = []string{"eregion process list api production --json"}
 
-	scale := operationMeta("Change one process's replicas in a new revision", "eregion process scale api production worker 2 --json")
+	scale := followingMeta(operationMeta("Change one process's replicas in a new revision", "eregion process scale api production worker 2 --json"))
 	scale.WhenToUse = []string{"Change replicas without touching source, configuration or secrets. A serving environment restarts its release through the blue/green path immediately; otherwise the next deploy applies the new revision."}
 	scale.Mutating, scale.DryRun = true, true
 	scale.Examples = []string{
@@ -54,6 +55,8 @@ func (a *app) processSpecs() []spec {
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().String("idempotency-key", "", "Stable submission key; one is generated when empty")
 					cmd.Flags().Bool("dry-run", false, "Validate and show the new revision without accepting work")
+					cmd.Flags().Bool("detach", false, "Submit and return without following the operation")
+					cmd.Flags().Duration("poll-interval", viewer.DefaultPollInterval, "Follow poll interval")
 				},
 				run: a.processScale,
 			},
@@ -107,6 +110,14 @@ func (a *app) processScale(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, err
 	}
 	data["operation_id"] = op.ID
+	follow := !boolFlag(cmd, "detach") && (followsByDefault(cmd) || streamsNDJSON(cmd))
+	if follow {
+		client, err := a.client(cmd)
+		if err != nil {
+			return result{}, err
+		}
+		return a.followAccepted(cmd, client, op)
+	}
 	plain := fmt.Sprintf("Scaled process %s to %d replica(s) in a new revision.\noperation: %s\na serving environment restarts the release through the blue/green path; otherwise the next deploy applies it.\nnext: eregion env status %s %s --json\n",
 		args[2], replicas, op.ID, args[0], args[1])
 	return result{data: data, plain: plain}, nil

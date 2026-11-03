@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/protect"
 	"github.com/mbvlabs/eregion/internal/viewer"
@@ -25,7 +26,7 @@ func addDeleteFlags(cmd *cobra.Command) {
 // terminal, the same way the export commands declare it. A dry run asks for
 // nothing and stays available to an agent.
 func deleteMeta(summary, example string) CommandMeta {
-	meta := platformDestructiveMeta(summary, example)
+	meta := followingMeta(platformDestructiveMeta(summary, example))
 	meta.DryRun = true
 	meta.Confirmation = "target"
 	meta.Prompts = true
@@ -150,7 +151,7 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 		return result{}, err
 	}
 	data := deleteResult{App: app, Environment: environment, Operation: &op}
-	if humanInteractive(cmd) && !detach {
+	if !detach && (humanInteractive(cmd) || streamsNDJSON(cmd)) {
 		client, err := a.client(cmd)
 		if err != nil {
 			return result{}, err
@@ -162,13 +163,17 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 	return result{data: data, plain: plain}, nil
 }
 
-// followAccepted attaches the existing plain operation presenter after a
-// mutation in a terminal. Ctrl-C detaches; it never cancels the operation. A
-// caller may append command-specific outcome lines after the finish line.
+// followAccepted attaches the shared viewer after a mutation. Ctrl-C detaches;
+// it never cancels the operation. NDJSON streams the same event records as
+// `operations follow --output ndjson`; command-specific outcome lines belong to
+// plain output because they are not part of the event protocol.
 func (a *app) followAccepted(cmd *cobra.Command, client Backend, op contract.Operation, outcome ...func(context.Context, Backend, contract.Operation) []string) (result, error) {
 	config := followConfig(cmd)
 	if config == nil {
 		return result{}, nil
+	}
+	if config.mode == "ndjson" || config.mode == string(output.JSON) {
+		return a.followOperation(cmd, client, op.ID)
 	}
 	clean := a.followCleaner()
 	presenter := viewer.NewPlain(config.out, config.err, clean)

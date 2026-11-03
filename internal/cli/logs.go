@@ -41,8 +41,8 @@ func addTelemetrySourceFlags(cmd *cobra.Command) {
 // required by D25. The workspace graph still uses the telemetry data source for
 // metrics; logs never depend on it.
 func (a *app) logsSpecs() []spec {
-	meta := operationMeta("Read an environment's serving container logs over the operator channel",
-		"eregion logs api production --since 15m --tail 200")
+	meta := followingMeta(operationMeta("Read an environment's serving container logs over the operator channel",
+		"eregion logs api production --since 15m --tail 200"))
 	meta.WhenToUse = []string{
 		"Read Docker container logs from the environment's serving deployment through SSH inside WireGuard.",
 		"Use --follow to stream new lines; Ctrl-C detaches without cancelling or changing the deployment.",

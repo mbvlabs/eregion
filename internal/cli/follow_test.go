@@ -45,7 +45,7 @@ func TestFollowMetadataAndFlags(t *testing.T) {
 }
 
 func TestFollowSelectionRecognizesOnlyFollowCommands(t *testing.T) {
-	flags := []string{"idempotency-key", "poll-interval"}
+	a := newApp()
 	for _, test := range []struct {
 		args   []string
 		active bool
@@ -56,7 +56,7 @@ func TestFollowSelectionRecognizesOnlyFollowCommands(t *testing.T) {
 		{[]string{"operations", "get", "op_x", "--output", "ndjson"}, false, false},
 		{[]string{"operations", "follow", "op_x", "--output", "json"}, true, false},
 	} {
-		selection := followSelectionFromArgs(test.args, flags)
+		selection := a.followSelection(test.args)
 		if selection.Active != test.active || selection.NDJSON != test.ndjson {
 			t.Fatalf("%v: %+v", test.args, selection)
 		}

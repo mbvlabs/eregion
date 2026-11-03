@@ -17,7 +17,7 @@ func (a *app) envSpecs() []spec {
 	parent := operationMeta("Create and inspect application environments", "eregion env list --app api --json")
 	parent.WhenToUse = []string{"Manage the unit of deployment: its source binding, runtime, processes and domains."}
 
-	create := operationMeta("Create an environment with its first desired-state revision", "eregion env create --app api --name production --node main --git-url https://github.com/acme/api --json")
+	create := followingMeta(operationMeta("Create an environment with its first desired-state revision", "eregion env create --app api --name production --node main --git-url https://github.com/acme/api --json"))
 	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup. The first deploy is queued from the new revision unless --no-deploy. JSON and no-TTY take every value from flags and never prompt."}
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
@@ -259,6 +259,16 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 		fmt.Fprintln(os.Stderr, ui.Card("Environment "+ans.App+"/"+ans.Environment+" created", rows, footer))
 		return result{streamed: true}, nil
+	}
+	if streamsNDJSON(cmd) && !boolFlag(cmd, "detach") {
+		client, err := a.client(cmd)
+		if err != nil {
+			return result{}, err
+		}
+		if ans.Deploy && op.FirstDeployOperationID != "" {
+			return a.followGuidedCreate(cmd, client, op, target.String(), a.deployOutcome(ans.App, ans.Environment))
+		}
+		return a.followAccepted(cmd, client, op)
 	}
 	return result{data: summary, plain: summary.plainText()}, nil
 }

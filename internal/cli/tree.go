@@ -45,6 +45,8 @@ type app struct {
 	secrets *secrets.Registry
 	// nodeClients holds one client per context name for the command's life.
 	nodeClients map[string]*nodeClient
+	// backend overrides the node transport in tests; nil uses the saved context.
+	backend Backend
 	// loginSeams replaces the probe and readiness check in tests.
 	loginSeams loginSeams
 }
@@ -53,7 +55,7 @@ func readMeta(summary string, when, examples []string, next ...string) CommandMe
 	return CommandMeta{
 		Summary: summary, WhenToUse: when, Examples: examples, Next: next,
 		Audience: []string{"agent", "human"}, Platforms: []string{"linux", "darwin", "windows"},
-		NeedsRestart: "never", Output: "result",
+		NeedsRestart: "never", Output: "result", OutputModes: []string{"plain", "json"},
 		ErrorCodes: []contract.Code{contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.Internal, contract.Cancelled, contract.Unavailable},
 	}
 }
@@ -75,7 +77,7 @@ func newApp() *app {
 	a.root = a.command(rootSpec)
 	a.root.SilenceErrors, a.root.SilenceUsage = true, true
 	a.root.CompletionOptions.DisableDefaultCmd = true
-	a.root.PersistentFlags().String("output", "plain", "Output mode: plain or json; follow commands also accept ndjson")
+	a.root.PersistentFlags().String("output", "plain", "Output mode: plain or json; commands that follow an operation also accept ndjson")
 	a.root.PersistentFlags().Bool("json", false, "Shorthand for --output json")
 	a.root.PersistentFlags().Bool("auto-upgrade-nodes", false, "Install this CLI's build on a node whose build differs before the command runs")
 	a.root.PersistentFlags().String("context", "", "Context name; overrides EREGION_CONTEXT and the current context")

@@ -16,7 +16,11 @@ metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
   shutdown. Explicit machine mode must never start Charm or prompt.
 - `logs` streams NDJSON only with `--output ndjson`. `--json --follow` is a usage
   error whose fix is `--output ndjson`; `--json` without `--follow` returns one
-  final envelope. `ssh --command` is a passthrough: it writes the remote stdout
+  final envelope. Every command that follows an accepted operation accepts
+  `--output ndjson` and streams the same event records as `operations follow
+  --output ndjson`; `--json` on a submitting command returns the accepted
+  operation without waiting, and NDJSON never prompts. `ssh --command` is a
+  passthrough: it writes the remote stdout
   and stderr unchanged and exits with the remote status, so ordinary failures
   have no envelope. The sudo no-terminal refusal is the exception: the runner
   prints its `input_required` fault and fix on stderr (plain) or as the failure

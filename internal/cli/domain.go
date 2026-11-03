@@ -23,10 +23,10 @@ import (
 // separately.
 func (a *app) domainSpecs() []spec {
 	parent := platformMeta("Route public hostnames to environments through Caddy", "eregion domain list --json")
-	add := platformMutationMeta("Route a public hostname to an environment", "eregion domain add hello production hello.example.com")
+	add := followingMeta(platformMutationMeta("Route a public hostname to an environment", "eregion domain add hello production hello.example.com"))
 	add.WhenToUse = []string{"Give an environment a public HTTPS URL. Create the DNS record it shows; Caddy gets the certificate once it resolves."}
 	add.Next = []string{"eregion domain list"}
-	remove := platformDestructiveMeta("Remove a public hostname's route", "eregion domain remove hello production hello.example.com --confirm hello.example.com")
+	remove := followingMeta(platformDestructiveMeta("Remove a public hostname's route", "eregion domain remove hello production hello.example.com --confirm hello.example.com"))
 	remove.Confirmation = "target"
 	remove.Next = []string{"eregion domain list"}
 	remove.Examples = []string{
@@ -163,10 +163,18 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 		return result{data: data, plain: plain}, nil
 	}
 	config := followConfig(cmd)
-	follow := config != nil && config.mode == "plain" && isTerminal(config.in) && isTerminal(config.out)
+	ndjson := config != nil && config.mode == "ndjson"
+	follow := config != nil && (ndjson || (config.mode == "plain" && isTerminal(config.in) && isTerminal(config.out)))
 	if follow {
 		// Show the record before the worker starts so it can be created while
-		// the operation runs.
+		// the operation runs. NDJSON carries only the event protocol.
+		if ndjson {
+			_, followErr := a.followOperation(cmd, client, op.ID)
+			if followErr != nil {
+				return result{streamed: true}, followErr
+			}
+			return result{streamed: true}, nil
+		}
 		fmt.Fprintln(config.out, domainRecordText(input))
 		_, followErr := a.followOperation(cmd, client, op.ID)
 		if followErr != nil {

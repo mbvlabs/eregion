@@ -122,7 +122,7 @@ func (a *app) nodeServiceSpecs() []spec {
 }
 
 func (a *app) runtimeSpecs() []spec {
-	followMeta := operationMeta("Follow an operation's durable state and events", "eregion operations follow op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output ndjson")
+	followMeta := followingMeta(operationMeta("Follow an operation's durable state and events", "eregion operations follow op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --output ndjson"))
 	followMeta.Output = "events"
 	cancelMeta := operationMeta("Request cancellation at a safe boundary", "eregion operations cancel op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --json")
 	cancelMeta.Mutating = true
@@ -169,6 +169,9 @@ func apiResult(raw json.RawMessage) result {
 }
 
 func (a *app) client(cmd *cobra.Command) (Backend, error) {
+	if a.backend != nil {
+		return a.backend, nil
+	}
 	return a.contextClient(cmd)
 }
 

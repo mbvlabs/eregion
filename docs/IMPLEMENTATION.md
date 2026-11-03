@@ -172,6 +172,15 @@ operation ID and state. Successful follows exit 0; remote cancellation exits
 130 with wording distinct from viewer detach. Guided create and followed deploys
 share these semantics; accepted-only submissions do not claim completion.
 
+Every command that can follow an accepted operation (`deploy`, `rollback`,
+`restart`, `build stop/retry`, `build logs --follow`, `app create`,
+`env create`, `domain add/remove`, `process scale`, `operations follow`)
+accepts `--output ndjson` and streams the same event records as
+`operations follow --output ndjson`, followed by one terminal result record.
+`--json` on a submitting command keeps returning the accepted operation without
+waiting. NDJSON never prompts: a guided command with missing input, or a
+factor-gated delete, refuses instead of asking.
+
 ## Release and local upgrade
 
 `internal/buildinfo` carries `Version`, `Commit`, `Channel` and the public

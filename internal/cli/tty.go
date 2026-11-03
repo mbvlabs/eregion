@@ -5,6 +5,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -15,7 +16,8 @@ import (
 func humanAtTerminal(cmd *cobra.Command) bool {
 	jsonMode, _ := cmd.Flags().GetBool("json")
 	outputMode, _ := cmd.Flags().GetString("output")
-	return !jsonMode && outputMode != "json" &&
+	plain := outputMode == "" || outputMode == string(output.Plain)
+	return !jsonMode && plain &&
 		term.IsTerminal(int(os.Stdin.Fd())) && //nolint:gosec // G115: file descriptors fit in int.
 		term.IsTerminal(int(os.Stderr.Fd())) //nolint:gosec // G115: file descriptors fit in int.
 }

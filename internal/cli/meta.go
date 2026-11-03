@@ -33,6 +33,7 @@ type CommandMeta struct {
 	Environment      []string        `json:"environment,omitempty"`
 	NeedsRestart     string          `json:"needs_restart"`
 	Output           string          `json:"output"`
+	OutputModes      []string        `json:"output_modes"`
 	ErrorCodes       []contract.Code `json:"error_codes"`
 }
 
@@ -101,6 +102,9 @@ func (r registry) validate(root *cobra.Command) error {
 		}
 		if !slices.Contains([]string{"result", "events"}, meta.Output) {
 			add("output must be result or events")
+		}
+		if !allIn(meta.OutputModes, []string{"plain", "json", "ndjson"}) || !slices.Contains(meta.OutputModes, "plain") || !slices.Contains(meta.OutputModes, "json") {
+			add("output_modes must list plain and json, and only additionally ndjson")
 		}
 		if len(meta.ErrorCodes) == 0 {
 			add("error_codes are required")

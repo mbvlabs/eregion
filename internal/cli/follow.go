@@ -49,16 +49,50 @@ func followConfig(cmd *cobra.Command) *followIO {
 	return config
 }
 
-// followSelectionFromArgs recognizes a follow-capable invocation before Cobra
-// parses it. NDJSON is rejected by output.OptionsFromArgs for every ordinary
-// command, so the runner needs to know that this one invocation may stream.
+// streamsNDJSON reports whether this invocation explicitly selected the
+// streaming machine format. It is true only for commands whose metadata lists
+// ndjson and whose arguments asked for it.
+func streamsNDJSON(cmd *cobra.Command) bool {
+	config := followConfig(cmd)
+	return config != nil && config.mode == "ndjson"
+}
+
+// followPollInterval returns the command's poll interval, or the default when
+// the command has no flag. An explicit non-positive value is a usage error so
+// --poll-interval 0 cannot spin the viewer.
+func followPollInterval(cmd *cobra.Command) (time.Duration, error) {
+	if cmd == nil || cmd.Flags().Lookup("poll-interval") == nil {
+		return viewer.DefaultPollInterval, nil
+	}
+	interval, _ := cmd.Flags().GetDuration("poll-interval")
+	if interval <= 0 {
+		return 0, contract.NewFault(contract.ValidationFailed, "poll interval must be positive", "Use --poll-interval 500ms or omit it for the default.")
+	}
+	return interval, nil
+}
+
+// followSelection says whether the invocation names a command that may stream
+// events and whether it asked for NDJSON. The runner needs it before Cobra
+// parses, because output.OptionsFromArgs rejects ndjson for ordinary commands.
 type followSelection struct {
 	Active bool
 	NDJSON bool
 	JSON   bool
 }
 
-func followSelectionFromArgs(args []string, valueFlags []string) followSelection {
+// followingMeta marks a command that follows an accepted operation (or a log
+// stream) as accepting NDJSON. Metadata is the single source of truth: the
+// runner's pre-parse selection and `commands --json` both read it.
+func followingMeta(meta CommandMeta) CommandMeta {
+	meta.OutputModes = []string{"plain", "json", "ndjson"}
+	return meta
+}
+
+func (a *app) followSelection(args []string) followSelection {
+	return followSelectionFor(a.root, a.meta, args, a.valueFlags())
+}
+
+func followSelectionFor(root *cobra.Command, metadata registry, args []string, valueFlags []string) followSelection {
 	var words []string
 	var selected string
 	var outputSet, jsonEnabled bool
@@ -105,13 +139,15 @@ func followSelectionFromArgs(args []string, valueFlags []string) followSelection
 		words = append(words, arg)
 	}
 	selection := followSelection{JSON: jsonEnabled}
-	if len(words) >= 2 && words[0] == "operations" && words[1] == "follow" {
-		selection.Active = true
-	}
-	// logs is a streaming read like operations follow: it opts into NDJSON
-	// without changing the rules for any other command.
-	if len(words) >= 1 && words[0] == "logs" {
-		selection.Active = true
+	if len(words) > 0 {
+		if target, _, err := root.Find(words); err == nil {
+			for _, mode := range metadata[target].OutputModes {
+				if mode == "ndjson" {
+					selection.Active = true
+					break
+				}
+			}
+		}
 	}
 	if selection.Active && outputSet && selected == "ndjson" {
 		selection.NDJSON = true
@@ -144,7 +180,7 @@ func (a *app) followOperation(cmd *cobra.Command, client Backend, id contract.Op
 		return result{}, err
 	}
 	config := followConfig(cmd)
-	interval, _ := cmd.Flags().GetDuration("poll-interval")
+	interval, _ := followPollInterval(cmd)
 	clean := a.followCleaner()
 	opts := viewer.FollowOptions{PollInterval: interval, Clean: clean}
 
@@ -169,9 +205,8 @@ func validateFollow(cmd *cobra.Command) error {
 	if config == nil {
 		return contract.NewFault(contract.Internal, "viewer output is not configured", "Invoke the command through the eregion CLI entry point.")
 	}
-	interval, _ := cmd.Flags().GetDuration("poll-interval")
-	if interval <= 0 {
-		return contract.NewFault(contract.ValidationFailed, "poll interval must be positive", "Use --poll-interval 500ms or omit it for the default.")
+	if _, err := followPollInterval(cmd); err != nil {
+		return err
 	}
 	interactive, _ := cmd.Flags().GetBool("interactive")
 	if config.mode == string(output.Plain) && interactive && (!isTerminal(config.in) || !isTerminal(config.out)) {
@@ -237,7 +272,11 @@ func (a *app) followPlain(cmd *cobra.Command, client Backend, id contract.Operat
 	return result{data: newFollowResult(summary), streamed: true}, err
 }
 
-func (a *app) followNDJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
+// followNDJSONSummary streams the operation's events and returns the still-open
+// stream with the terminal summary. The caller decides when to write the one
+// final record, so a guided create can continue into its first deploy without
+// emitting two terminal results.
+func (a *app) followNDJSONSummary(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (*output.Stream, viewer.Summary, error) {
 	stream := output.NewStream(config.out, a.secrets)
 	var last uint64
 	emit := func(observation viewer.Observation) error {
@@ -257,14 +296,24 @@ func (a *app) followNDJSON(cmd *cobra.Command, client Backend, id contract.Opera
 		return nil
 	}
 	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, emit)
-	err = followError(summary, err)
+	return stream, summary, followError(summary, err)
+}
+
+// finishNDJSON writes the single terminal result record for a streamed follow.
+func finishNDJSON(stream *output.Stream, cmd *cobra.Command, summary viewer.Summary, err error) error {
 	envelope := contract.Success(cmd.CommandPath(), newFollowResult(summary), nil)
 	if err != nil {
 		envelope = contract.Failure(cmd.CommandPath(), err)
 	}
 	if finishErr := stream.Finish(envelope); finishErr != nil && err == nil {
-		err = contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
+		return contract.NewFault(contract.Internal, "could not write command output", "Check the output stream and retry.")
 	}
+	return err
+}
+
+func (a *app) followNDJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
+	stream, summary, err := a.followNDJSONSummary(cmd, client, id, opts, config, clean)
+	err = finishNDJSON(stream, cmd, summary, err)
 	return result{data: newFollowResult(summary), streamed: true}, err
 }
 
