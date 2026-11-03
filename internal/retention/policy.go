@@ -59,6 +59,20 @@ type Policy struct {
 	BuildpackCacheMaxPercent int   `json:"buildpack_cache_max_percent"`
 }
 
+// PolicyView is one retention policy with its per-field source. Scope is
+// "server" for the node-wide default and "environment" when an app/environment
+// and its current revision were read. Sources maps every effective field to
+// "server" or "environment".
+type PolicyView struct {
+	Scope       string            `json:"scope"`
+	App         string            `json:"app,omitempty"`
+	Environment string            `json:"environment,omitempty"`
+	Server      Policy            `json:"server"`
+	Override    Override          `json:"override,omitempty"`
+	Effective   Policy            `json:"effective"`
+	Sources     map[string]string `json:"sources"`
+}
+
 // DefaultPolicy returns the D30 server defaults.
 func DefaultPolicy() Policy {
 	return Policy{

@@ -320,7 +320,8 @@ per-item errors for observability.
 
 `retention.Plan` is the pure planner both the periodic job and `prune
 [--dry-run]` will call. It receives `retention.Input` plain values filled from
-the platform rows and node inventory, keeps each environment's serving release,
+the platform rows and node inventory through `retention.InputFromInventory`,
+keeps each environment's serving release,
 its rollback target (selected with the same rule as
 `previousRollbackRelease`), the newest `keep_releases` and every release newer
 than `keep_newer_than_days`, protects in-flight releases and containers, keeps
@@ -389,6 +390,57 @@ with explicit build and launch cache volumes,
 `a`/`b-c`) and avoids pack's reserved-name rewriting. Inventory also reports
 pre-upgrade `pack-cache-*.<build|launch>` volumes as ownerless caches; pruning
 one is safe under the node host lock because no pack build is running.
+
+### Retention execution and operator surface
+
+`retention.InputFromInventory` is the one adapter from the node wire inventory
+and the platform rows to `retention.Input`. Container ownership comes from the
+same `io.eregion.app`, `io.eregion.environment`, `io.eregion.release` and
+`io.eregion.deployment` labels the deploy path writes. Ownerless legacy pack
+caches stay eligible; the disk used/total figures use statfs total minus free.
+A registry artifact with no reported creation time is treated as new, so an
+unknown age can never authorize deletion. A truncated inventory plans no
+registry deletion at all and emits one `registry_skipped` item naming the
+truncation; inventory warnings are returned beside the plan.
+
+`retentionWorker` runs on the maintenance queue. A daily River periodic job
+submits one `platform.retention.prune` operation per UTC day on
+`node/<server>` with an idempotency key, so a worker restart reuses the accepted
+work instead of creating a second prune. The operation's own River job claims
+the operation and then acquires sorted PostgreSQL advisory locks for
+`platform`, `node/<server>` and every environment target before reading state,
+so accepted deploys, rollbacks, restarts and app/environment deletes serialize
+with it. The plan is evaluated under those locks, but `pruned_at` is still set
+in a separate transaction that re-locks the environment row and re-checks the
+release: a release that became serving, the current rollback target, or part of
+a pending/running deployment or active release operation is removed from that
+run's planned items and is never pruned. The same check protects a deploy
+accepted after the periodic job was scheduled.
+
+A run inserts one `retention_runs` row with its planned items and bytes, then
+executes in order: mark each release row `pruned_at`, dispatch the journaled
+`platform-retention-remove-*` steps for release images, registry artifacts,
+cache volumes, containers and dangling images, then run
+`platform-retention-gc-01-v1` if any registry manifest was actually deleted.
+Every successful item is appended to `removed_items` and its bytes to
+`reclaimed_bytes`; every failed item is recorded in `errors` and the operation
+returns a retryable error, so River retries the unfinished items from the same
+run without repeating completed effects. A permanent node refusal fails the
+operation after recording the run; the next daily run retries it after the host
+is fixed. Operation events carry planned/removal/protection progress. The build
+path records the local image config digest (`image_id`) but has no pushed
+manifest digest in its existing pack/inspect output; planning therefore
+resolves manifests through inventory `ConfigDigest` and local-image
+`RepoDigests`, and no extra registry read is added to every build.
+
+The operator surface is node-mode RPC: `retention.plan` evaluates the shared
+planner read-only, `retention.show` returns the server default or an
+environment's effective policy with per-field `server`/`environment` sources,
+and `retention.set` replaces the server default. Environment overrides submit a
+normal `platform.environment.update` revision, never a direct row edit.
+`prune --dry-run` prints the plan items and bytes; a real `prune` needs
+`--confirm <server>` and submits the operation, following it through the same
+viewer as other mutating commands.
 
 ## Migration and external database policy
 

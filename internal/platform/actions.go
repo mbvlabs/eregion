@@ -282,6 +282,7 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindRestart, Summary: "Reapply the serving release with the current revision", Normalize: normalizeRestart})
 	r.registerBuiltin(Definition{Kind: KindDomainAdd, Summary: "Route a public hostname to an environment through Caddy", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindDomainRemove, Summary: "Remove a public hostname's route", Normalize: normalizeDomain})
+	r.registerBuiltin(Definition{Kind: KindRetentionPrune, Summary: "Prune disk artifacts on one node under the D30 retention policy", Normalize: normalizeRetentionPrune})
 	r.registerBuiltin(Definition{Kind: KindAppDelete, Summary: "Delete an application and every environment it owns", Normalize: normalizeAppDelete})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentDelete, Summary: "Delete an environment after workload cleanup", Normalize: normalizeEnvironmentDelete})
 }
@@ -1424,6 +1425,32 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 			return nil, invalid("confirm", "The confirmation token must name the hostname shown by --dry-run.")
 		}
 	}
+	return &input, nil
+}
+
+// RetentionPruneInput is the accepted disk-retention prune for one node. The
+// target names the node, so the D12 confirmation token is that node name.
+type RetentionPruneInput struct {
+	Node string `json:"node"`
+}
+
+func (in *RetentionPruneInput) Target() Target {
+	return Target{Kind: TargetNode, Node: in.Node}
+}
+func (in *RetentionPruneInput) Preview() any { return in }
+
+func normalizeRetentionPrune(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetNode {
+		return nil, invalid("retention target", "Prune targets one node: node/<server>.")
+	}
+	var input RetentionPruneInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if input.Node != "" && input.Node != target.Node {
+		return nil, invalid("retention node", "The input node must match the canonical target.")
+	}
+	input.Node = target.Node
 	return &input, nil
 }
 

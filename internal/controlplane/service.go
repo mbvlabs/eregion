@@ -34,6 +34,9 @@ type Service struct {
 	// afterNode is a test-only seam between a node effect and its database
 	// acknowledgement. Production leaves it nil.
 	afterNode func(contract.OperationID, string) error
+	// beforeRetentionMark is a test-only seam between planning a retention run
+	// and marking its release rows. Production leaves it nil.
+	beforeRetentionMark func(context.Context, contract.OperationID)
 	// routeSwitch and publicVerify are test-only seams for deployments that
 	// run no Caddy on the test host. Production leaves them nil.
 	routeSwitch  func(context.Context, platform.Environment, []string) error

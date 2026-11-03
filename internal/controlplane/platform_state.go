@@ -16,6 +16,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/retention"
 )
 
 // portAllocationLock serializes host/candidate port allocation across control
@@ -222,6 +223,8 @@ func platformAcceptedMessage(kind string) string {
 		return "Environment deletion accepted durably; containers and routes are removed before platform state."
 	case platform.KindAppDelete:
 		return "Application deletion accepted durably; every environment's containers and routes are removed before platform state."
+	case platform.KindRetentionPrune:
+		return "Disk retention accepted durably; it removes only artifacts outside the effective policy and records a retention run."
 	default:
 		return "Platform action accepted durably."
 	}
@@ -2201,6 +2204,19 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Summary = "Converge host configuration and WireGuard peers on node " + input.Node + "; rerunning changes nothing when the node already matches."
 	case *platform.AppDeleteInput, *platform.EnvironmentDeleteInput:
 		return s.deletionPreview(ctx, normalized)
+	case *platform.RetentionPruneInput:
+		plan, err := s.RetentionPlan(ctx, input.Node, "", "")
+		if err != nil {
+			return preview, err
+		}
+		preview.Steps = retentionPlanSteps(plan)
+		preview.Summary = fmt.Sprintf("Prune %d planned item(s), reclaiming %d byte(s) on node %s.", len(retentionRemovalItems(plan.Items)), plan.PlannedBytes, input.Node)
+		preview.Warnings = append(preview.Warnings, plan.Warnings...)
+		for _, item := range plan.Items {
+			if item.Kind == retention.ItemRegistrySkipped {
+				preview.Warnings = append(preview.Warnings, "registry skipped: "+item.Reason)
+			}
+		}
 	default:
 		if preview.Summary == "" {
 			preview.Summary = "Execute registered platform action " + normalized.Kind + "."

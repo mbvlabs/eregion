@@ -19,6 +19,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
+	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
@@ -257,6 +258,15 @@ type workloadRepairArgs struct{}
 
 func (workloadRepairArgs) Kind() string { return "platform_workload_repair" }
 
+// retentionArgs is one durable disk-retention attempt. The periodic daily job
+// leaves OperationID empty and submits the day's operation; the operation's own
+// job carries its ID on the maintenance queue.
+type retentionArgs struct {
+	OperationID contract.OperationID `json:"operation_id,omitempty"`
+}
+
+func (retentionArgs) Kind() string { return "platform_retention" }
+
 type Runtime struct {
 	Service *Service
 	Jobs    *river.Client[pgx.Tx]
@@ -360,6 +370,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	river.AddWorker(workers, &domainObserveWorker{service: service})
 	river.AddWorker(workers, &containerCleanupWorker{service: service})
 	river.AddWorker(workers, &workloadRepairWorker{service: service})
+	river.AddWorker(workers, &retentionWorker{service: service})
 	riverConfig := &river.Config{
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
@@ -406,6 +417,12 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 			river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
 				return workloadRepairArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
+			// One retention operation per UTC day. The job only submits the
+			// operation; its idempotency key makes a restart return the same
+			// accepted work, and the operation's own River job does the pruning.
+			river.NewPeriodicJob(river.PeriodicInterval(24*time.Hour), func() (river.JobArgs, *river.InsertOpts) {
+				return retentionArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
+			}, &river.PeriodicJobOpts{RunOnStart: false}),
 		}
 	}
 	client, err := river.NewClient(riverpgxv5.New(pool), riverConfig)
@@ -431,6 +448,13 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		return inserted.Job.ID, nil
 	}
 	service.enqueuePlatform = func(ctx context.Context, tx pgx.Tx, op contract.Operation) (int64, error) {
+		if op.Kind == platform.KindRetentionPrune {
+			inserted, err := client.InsertTx(ctx, tx, retentionArgs{OperationID: op.ID}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: platformMaxAttempts})
+			if err != nil {
+				return 0, err
+			}
+			return inserted.Job.ID, nil
+		}
 		inserted, err := client.InsertTx(ctx, tx, platformArgs{OperationID: op.ID, ActionKind: op.Kind}, &river.InsertOpts{Queue: platformQueue, MaxAttempts: platformMaxAttempts})
 		if err != nil {
 			return 0, err

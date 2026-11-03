@@ -29,6 +29,7 @@ const (
 	KindRestart                 = "platform.restart"
 	KindDomainAdd               = "platform.domain.add"
 	KindDomainRemove            = "platform.domain.remove"
+	KindRetentionPrune          = "platform.retention.prune"
 )
 
 // MaxInputBytes bounds one action input. The API enforces the same value at the

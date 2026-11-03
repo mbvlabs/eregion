@@ -29,9 +29,12 @@ const (
 	// release's reference could not be resolved to an inventory artifact.
 	// Executors must not attempt to remove it.
 	ItemRegistrySkipped ItemKind = "registry_skipped"
-	ItemBuildpackCache  ItemKind = "buildpack_cache"
-	ItemContainer       ItemKind = "container"
-	ItemDanglingImage   ItemKind = "dangling_image"
+	// ItemRegistryGC records the registry garbage-collection effect in a run's
+	// removed items. The planner never emits it.
+	ItemRegistryGC     ItemKind = "registry_gc"
+	ItemBuildpackCache ItemKind = "buildpack_cache"
+	ItemContainer      ItemKind = "container"
+	ItemDanglingImage  ItemKind = "dangling_image"
 )
 
 // Item is one planned or removed retention object, or a diagnostic skip. A
