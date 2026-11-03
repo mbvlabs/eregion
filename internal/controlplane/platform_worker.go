@@ -56,6 +56,10 @@ type platformWorker struct {
 	service *Service
 }
 
+// Timeout covers a deployment waiting on detached build and health effects. It
+// is deliberately longer than River's rescue threshold, so a worker started on
+// this host first recovers its predecessor's running platform jobs instead of
+// waiting for this deadline (see Service.rescueHostPlatformJobs).
 func (*platformWorker) Timeout(*river.Job[platformArgs]) time.Duration { return 30 * time.Minute }
 
 func (*platformWorker) NextRetry(job *river.Job[platformArgs]) time.Time {
@@ -497,50 +501,8 @@ func (s *Service) finishPlatformOperation(ctx context.Context, id contract.Opera
 }
 
 func (s *Service) failPlatformOperation(ctx context.Context, id contract.OperationID, attempt uint32, code contract.Code, message string) error {
-	if len(message) > 4096 {
-		message = message[:4096]
-	}
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		if op.State.Terminal() {
-			return nil
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_builds SET state='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
-            WHERE operation_id=$1 AND state IN ('pending','running')`, id, string(code), message); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET status='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
-            WHERE operation_id=$1 AND status='pending'`, id, string(code), message); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
-            SET state='failed',error_code=$2,message=$3,completed_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE operation_id=$1 AND state IN ('pending','running')`, id, string(code), message); err != nil {
-			return err
-		}
-		var action, app, environment, releaseID, previousID, servingID string
-		if err := tx.QueryRow(ctx, `SELECT d.action,a.name,e.name,d.release_id,coalesce(d.previous_release_id,''),coalesce(e.serving_release_id,'')
-            FROM eregion_platform_deployments d
-            JOIN eregion_platform_apps a ON a.id=d.app_id
-            JOIN eregion_platform_environments e ON e.id=d.environment_id
-            WHERE d.operation_id=$1`, id).Scan(&action, &app, &environment, &releaseID, &previousID, &servingID); err == nil {
-			if err := appendEvent(ctx, tx, op, contract.Event{
-				Kind: "log", Stage: "deploy", ReleaseID: releaseID, ServingReleaseID: servingID,
-				Message: "Deployment failed; failed release " + releaseID + " is not recorded as serving" + servingSuffix(servingID) + ".",
-			}); err != nil {
-				return err
-			}
-			unchanged := servingID == "" || servingID == previousID
-			if changeErr := insertPlatformChange(ctx, tx, op, action+".failed", app, environment,
-				"Deployment failed: "+message,
-				map[string]any{"release_id": releaseID},
-				map[string]any{"error_code": code, "serving_release_id": servingID, "serving_unchanged": unchanged}); changeErr != nil {
-				return changeErr
-			}
-		}
-		if err := markIncompleteSteps(ctx, tx, id, code, message); err != nil {
-			return err
-		}
-		return transition(ctx, tx, op, contract.Failed, code, message)
+		return s.failPlatformOperationTx(ctx, tx, op, code, message)
 	})
 	if err != nil {
 		return err
@@ -549,6 +511,55 @@ func (s *Service) failPlatformOperation(ctx context.Context, id contract.Operati
 		return errNotOwned
 	}
 	return nil
+}
+
+// failPlatformOperationTx records the domain half of a platform failure on an
+// already-locked operation. Callers that must commit another change with the
+// failure history, such as worker recovery, run it inside their own transaction.
+func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, code contract.Code, message string) error {
+	if len(message) > 4096 {
+		message = message[:4096]
+	}
+	if op.State.Terminal() {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_builds SET state='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
+        WHERE operation_id=$1 AND state IN ('pending','running')`, op.ID, string(code), message); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET status='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
+        WHERE operation_id=$1 AND status='pending'`, op.ID, string(code), message); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
+        SET state='failed',error_code=$2,message=$3,completed_at=clock_timestamp(),updated_at=clock_timestamp()
+        WHERE operation_id=$1 AND state IN ('pending','running')`, op.ID, string(code), message); err != nil {
+		return err
+	}
+	var action, app, environment, releaseID, previousID, servingID string
+	if err := tx.QueryRow(ctx, `SELECT d.action,a.name,e.name,d.release_id,coalesce(d.previous_release_id,''),coalesce(e.serving_release_id,'')
+        FROM eregion_platform_deployments d
+        JOIN eregion_platform_apps a ON a.id=d.app_id
+        JOIN eregion_platform_environments e ON e.id=d.environment_id
+        WHERE d.operation_id=$1`, op.ID).Scan(&action, &app, &environment, &releaseID, &previousID, &servingID); err == nil {
+		if err := appendEvent(ctx, tx, op, contract.Event{
+			Kind: "log", Stage: "deploy", ReleaseID: releaseID, ServingReleaseID: servingID,
+			Message: "Deployment failed; failed release " + releaseID + " is not recorded as serving" + servingSuffix(servingID) + ".",
+		}); err != nil {
+			return err
+		}
+		unchanged := servingID == "" || servingID == previousID
+		if changeErr := insertPlatformChange(ctx, tx, op, action+".failed", app, environment,
+			"Deployment failed: "+message,
+			map[string]any{"release_id": releaseID},
+			map[string]any{"error_code": code, "serving_release_id": servingID, "serving_unchanged": unchanged}); changeErr != nil {
+			return changeErr
+		}
+	}
+	if err := markIncompleteSteps(ctx, tx, op.ID, code, message); err != nil {
+		return err
+	}
+	return transition(ctx, tx, op, contract.Failed, code, message)
 }
 
 func servingSuffix(releaseID string) string {

@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,195 @@ import (
 
 const diagnosticQueue = "diagnostic"
 const platformQueue = "platform"
+
+// workerClientIDPrefix marks a River client as an eregion worker. Every client
+// started on one host shares the "eregion-<host-hash>-" prefix, which lets a
+// restarted worker recognise jobs its predecessor was running when it died.
+const workerClientIDPrefix = "eregion-"
+
+// workerHostHashLength is the number of SHA-256 hex characters that identify a
+// host. A fixed-length hash cannot make host "web" a prefix of host
+// "web-prod", and it avoids a lossy sanitisation that would conflate "web_a"
+// with "web+a".
+const workerHostHashLength = 16
+
+// workerRescueTimeout bounds the pre-start recovery query. A worker that cannot
+// read its own queue must not begin working as if no predecessor existed.
+const workerRescueTimeout = 15 * time.Second
+
+// workerHostIdentity returns the fixed-length, hash-derived host component of a
+// worker client ID. Hostnames are case-insensitive, so trimming and lowercasing
+// does not merge distinct hosts; every other byte is hashed as-is.
+func workerHostIdentity(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		host = "unknown-host"
+	}
+	sum := sha256.Sum256([]byte(host))
+	return hex.EncodeToString(sum[:])[:workerHostHashLength]
+}
+
+// workerHostPrefix is the deterministic prefix shared by every worker client
+// started on one host. River records the client ID in a job's attempted_by, so
+// a new worker can identify jobs a dead predecessor left running.
+func workerHostPrefix(host string) string {
+	return workerClientIDPrefix + workerHostIdentity(host) + "-"
+}
+
+// newWorkerClientID returns this start's unique River client ID. The timestamp
+// keeps IDs readable; the random suffix keeps restarts and same-host processes
+// distinct. The fixed prefix and suffix stay below River's 100-character limit.
+func newWorkerClientID(host string, startedAt time.Time) string {
+	return workerHostPrefix(host) + startedAt.UTC().Format("20060102T150405") + "-" + newRequestID()
+}
+
+// shouldRescueJob reports whether a running job's last River attempt was made
+// by an earlier client on this host. Earlier entries are history, not the
+// current owner; a job last attempted by another host or by the new client is
+// left alone.
+func shouldRescueJob(attemptedBy []string, hostPrefix, clientID string) bool {
+	if len(attemptedBy) == 0 {
+		return false
+	}
+	last := attemptedBy[len(attemptedBy)-1]
+	return last != "" && last != clientID && strings.HasPrefix(last, hostPrefix)
+}
+
+// orphanedPlatformJob is one running platform job whose last River attempt came
+// from an earlier client on this host.
+type orphanedPlatformJob struct {
+	ID          int64
+	OperationID contract.OperationID
+	Attempt     int32
+	MaxAttempts int32
+	LastClient  string
+}
+
+// rescueHostPlatformJobs moves this host's running platform jobs back to
+// available, or discards an exhausted job. The platform worker's own timeout is
+// 30 minutes, longer than River's two-minute rescue threshold, so without this
+// a SIGKILLed predecessor would hold accepted work until its timeout expired.
+// Only jobs whose last attempt came from this host are moved; another host may
+// still be alive.
+func (s *Service) rescueHostPlatformJobs(ctx context.Context, hostPrefix, clientID string) (requeued, discarded int, err error) {
+	rows, err := s.pool.Query(ctx, `
+        SELECT j.id, j.attempted_by, coalesce(j.args->>'operation_id',''), j.attempt, j.max_attempts
+        FROM river_job j
+        WHERE j.queue=$1 AND j.state='running'`, platformQueue)
+	if err != nil {
+		return 0, 0, unavailable()
+	}
+	var orphaned []orphanedPlatformJob
+	for rows.Next() {
+		var job orphanedPlatformJob
+		var attemptedBy []string
+		var operationID string
+		if err := rows.Scan(&job.ID, &attemptedBy, &operationID, &job.Attempt, &job.MaxAttempts); err != nil {
+			rows.Close()
+			return 0, 0, err
+		}
+		if !shouldRescueJob(attemptedBy, hostPrefix, clientID) {
+			continue
+		}
+		job.OperationID = contract.OperationID(operationID)
+		job.LastClient = attemptedBy[len(attemptedBy)-1]
+		orphaned = append(orphaned, job)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, job := range orphaned {
+		moved, dropped, err := s.recoverOrphanedPlatformJob(ctx, job)
+		if err != nil {
+			return requeued, discarded, err
+		}
+		if moved {
+			requeued++
+		}
+		if dropped {
+			discarded++
+		}
+	}
+	return requeued, discarded, nil
+}
+
+// recoverOrphanedPlatformJob re-queues or discards one observed running job.
+// The conditional update rechecks the observed attempt and last client ID, so a
+// job that changed owner after the scan is left alone. The job change and its
+// operation event commit in one transaction.
+func (s *Service) recoverOrphanedPlatformJob(ctx context.Context, job orphanedPlatformJob) (requeued, discarded bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, false, unavailable()
+	}
+	defer rollback(tx)
+
+	exhausted := job.Attempt >= job.MaxAttempts
+	var affected int64
+	if exhausted {
+		const reason = "Platform job discarded after its final attempt was left running by an earlier worker process on this host."
+		tag, err := tx.Exec(ctx, `UPDATE river_job
+            SET state='discarded', finalized_at=clock_timestamp(),
+                errors=array_append(coalesce(errors,ARRAY[]::jsonb[]),jsonb_build_object(
+                    'at',clock_timestamp(),'attempt',attempt,'error',$5::text,'trace',''))
+            WHERE id=$1 AND queue=$2 AND state='running' AND attempt=$3
+              AND cardinality(attempted_by)>0 AND attempted_by[cardinality(attempted_by)]=$4`,
+			job.ID, platformQueue, job.Attempt, job.LastClient, reason)
+		if err != nil {
+			return false, false, unavailable()
+		}
+		affected = tag.RowsAffected()
+	} else {
+		tag, err := tx.Exec(ctx, `UPDATE river_job
+            SET state='available', scheduled_at=clock_timestamp(), finalized_at=NULL
+            WHERE id=$1 AND queue=$2 AND state='running' AND attempt=$3
+              AND cardinality(attempted_by)>0 AND attempted_by[cardinality(attempted_by)]=$4`,
+			job.ID, platformQueue, job.Attempt, job.LastClient)
+		if err != nil {
+			return false, false, unavailable()
+		}
+		affected = tag.RowsAffected()
+	}
+	if affected == 0 {
+		return false, false, nil
+	}
+	if job.OperationID == "" {
+		return false, false, fmt.Errorf("platform job %d has no operation_id in its River arguments", job.ID)
+	}
+	op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 FOR UPDATE", job.OperationID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, contract.NewFault(contract.Unavailable, "a running platform job has no operation record", "Inspect the operation and River job rows before starting the worker.")
+	}
+	if err != nil {
+		return false, false, unavailable()
+	}
+	// The operation row is locked for this transaction, and the job change is
+	// not visible until commit. No new River attempt can claim the operation
+	// between the state change and this event.
+	if exhausted {
+		message := fmt.Sprintf("Discarded platform job %d: its final River attempt was left running by an earlier worker process on this host.", job.ID)
+		if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "warning", Stage: "worker", Message: message}); err != nil {
+			return false, false, err
+		}
+		if op.Attempt <= uint32(job.Attempt) {
+			failure := fmt.Sprintf("Platform execution stopped after River attempt %d of %d was left running by an earlier worker process on this host; the job was discarded because no attempts remain.", job.Attempt, job.MaxAttempts)
+			if err := s.failPlatformOperationTx(ctx, tx, &op, contract.Unavailable, failure); err != nil {
+				return false, false, err
+			}
+		}
+	} else {
+		message := fmt.Sprintf("Recovered orphaned platform job %d left running by an earlier worker process on this host; durable step records decide which effects still need to run.", job.ID)
+		if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "warning", Stage: "worker", Message: message}); err != nil {
+			return false, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, false, unavailable()
+	}
+	return !exhausted, exhausted, nil
+}
 
 // jobTimeout is the deadline one River job gets. It is the effective bound
 // for a wait on a detached node task: the transport's own wait bound stays
@@ -175,7 +365,14 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
 		SoftStopTimeout: 5 * time.Second, TestOnly: config.TestOnly,
 	}
+	var hostPrefix string
 	if config.Concurrency > 0 {
+		host, err := os.Hostname()
+		if err != nil || strings.TrimSpace(host) == "" {
+			host = "unknown-host"
+		}
+		hostPrefix = workerHostPrefix(host)
+		riverConfig.ID = newWorkerClientID(host, time.Now())
 		riverConfig.Queues = map[string]river.QueueConfig{
 			diagnosticQueue: {MaxWorkers: config.Concurrency},
 			platformQueue:   {MaxWorkers: config.Concurrency},
@@ -214,6 +411,17 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	client, err := river.NewClient(riverpgxv5.New(pool), riverConfig)
 	if err != nil {
 		return nil, err
+	}
+	if config.Concurrency > 0 {
+		rescueCtx, cancel := context.WithTimeout(context.Background(), workerRescueTimeout)
+		requeued, discarded, rescueErr := service.rescueHostPlatformJobs(rescueCtx, hostPrefix, client.ID())
+		cancel()
+		if rescueErr != nil {
+			return nil, contract.NewFault(contract.Unavailable, "could not recover this host's orphaned platform jobs", "Check the control database connection and restart the worker; another host's running jobs are left to River's rescuer.")
+		}
+		if (requeued > 0 || discarded > 0) && logger != nil {
+			logger.Info("Recovered orphaned platform jobs before worker start", "requeued", requeued, "discarded", discarded)
+		}
 	}
 	service.enqueue = func(ctx context.Context, tx pgx.Tx, id contract.OperationID) (int64, error) {
 		inserted, err := client.InsertTx(ctx, tx, testArgs{OperationID: id}, &river.InsertOpts{Queue: diagnosticQueue, MaxAttempts: operations.TestMaxAttempts})

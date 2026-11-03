@@ -50,6 +50,28 @@ Domain intent and queue insertion are atomic. Long remote effects do not hold a
 SQL transaction open. Workers recheck placement and reconcile step
 acknowledgements. An SSH disconnect never owns the lifetime of accepted work.
 
+River worker client IDs use a fixed host identity:
+`eregion-<first 16 hex of SHA-256(hostname)>-` plus a unique suffix per start,
+and River writes the client ID into each job's `attempted_by`. Before it starts,
+a worker recovers `running` jobs on the `platform` queue whose last attempt
+belongs to this host but not to the new client. A conditional update rechecks
+the observed attempt and last `attempted_by` entry, so a job that changed owner
+after the scan is left alone. Jobs with attempts left move back to `available`;
+an exhausted job (`attempt >= max_attempts`) is discarded with `finalized_at`
+set and an error appended, and its operation is failed. The job change and its
+operation events commit in one transaction; a recovery failure fails worker
+startup instead of silently dropping history. Jobs last attempted by another
+host are left to River. This recovers accepted work from a SIGKILLed
+predecessor immediately instead of waiting for the platform worker's 30-minute
+job timeout, which is longer than River's two-minute rescue threshold.
+Diagnostic, maintenance and domain jobs do not override the client's one-minute
+job timeout, so River's rescuer already covers them. The re-queued attempt is
+safe because operation writes are fenced to the River attempt, `claimPlatform`
+transfers ownership to the newer attempt, and node effects are reconciled from
+durable step records before dispatch. This assumes one worker process per host;
+running two workers on one host against one database would let the newer client
+re-queue the older one's live platform jobs.
+
 ## Code map
 
 | Location | Responsibility |
