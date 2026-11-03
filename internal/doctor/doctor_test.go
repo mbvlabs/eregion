@@ -197,6 +197,53 @@ func TestRetentionLastRunWarnsOnFailureAndStaleSuccess(t *testing.T) {
 	}
 }
 
+func TestBuildCacheMeasurementReadsOnlyFreshDurableValues(t *testing.T) {
+	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-time.Hour)
+	stale := now.Add(-49 * time.Hour)
+	zero := int64(0)
+	known := int64(42)
+	for _, test := range []struct {
+		name       string
+		bytes      *int64
+		measuredAt *time.Time
+		wantKnown  bool
+		wantBytes  int64
+	}{
+		{name: "never measured", measuredAt: &fresh},
+		{name: "stale", bytes: &known, measuredAt: &stale},
+		{name: "fresh", bytes: &known, measuredAt: &fresh, wantKnown: true, wantBytes: 42},
+		{name: "healthy empty", bytes: &zero, measuredAt: &fresh, wantKnown: true, wantBytes: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			facts := BuildCacheFacts{}
+			applyBuildCacheMeasurement(&facts, test.bytes, test.measuredAt, "", now)
+			if facts.Known != test.wantKnown || facts.Bytes != test.wantBytes {
+				t.Fatalf("measurement = known=%t bytes=%d, want known=%t bytes=%d (error %q)",
+					facts.Known, facts.Bytes, test.wantKnown, test.wantBytes, facts.Error)
+			}
+			if !test.wantKnown && facts.Error == "" {
+				t.Fatal("an unknown measurement had no explanation")
+			}
+		})
+	}
+}
+
+func TestBuildpackCacheUnknownIsNotZeroHealthy(t *testing.T) {
+	results := Run([]Check{{ID: "host.build_cache", Category: CatHost, Run: buildpackCache}}, Facts{
+		BuildCache: BuildCacheFacts{
+			Applicable: true, Known: false, Error: "the latest Buildpacks cache measurement is older than 48 hours",
+			CapBytes: 10 << 30,
+		},
+	})
+	if len(results) != 1 || results[0].Status != Pass {
+		t.Fatalf("unknown cache measurement = %+v, want pass/unknown", results)
+	}
+	if !strings.Contains(results[0].Detail, "unknown") || strings.Contains(results[0].Detail, "0 B") {
+		t.Fatalf("unknown cache detail = %q", results[0].Detail)
+	}
+}
+
 func TestBuildpackCacheWarnsAboveThePolicyCap(t *testing.T) {
 	results := Run([]Check{{ID: "host.build_cache", Category: CatHost, Run: buildpackCache}}, Facts{
 		BuildCache: BuildCacheFacts{Applicable: true, Known: true, Bytes: 11 << 30, CapBytes: 10 << 30},

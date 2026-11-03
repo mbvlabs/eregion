@@ -1,15 +1,12 @@
 package doctor
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,9 +29,8 @@ type RetentionFacts struct {
 	LastSuccessAt time.Time
 
 	// WorkerAge is how long eregion-worker.service has been continuously
-	// active. It is only read when no run has been recorded yet, so a fresh
-	// installation has two days to produce its first daily run before doctor
-	// warns.
+	// active. It is only read when no run has been recorded yet; the startup
+	// catch-up and daily job get a grace period before doctor warns.
 	WorkerAge      time.Duration
 	WorkerAgeKnown bool
 }
@@ -51,8 +47,10 @@ type RetentionRunFacts struct {
 	Errors         int
 }
 
-// BuildCacheFacts is the measured Buildpacks cache and the server policy's
-// absolute cap. Applicable is false on a role that runs no builds.
+// BuildCacheFacts is the latest durable Buildpacks cache measurement and the
+// server policy's absolute cap. Applicable is false on a role that runs no
+// builds. Known is false when no fresh measurement exists; Bytes is never
+// invented from a synchronous filesystem walk.
 type BuildCacheFacts struct {
 	Applicable bool
 	Known      bool
@@ -61,10 +59,10 @@ type BuildCacheFacts struct {
 	CapBytes   int64
 }
 
-// GatherRetentionFacts observes the retention run history and the Buildpacks
-// cache sizes. It is read-only and never writes a run or a policy. The database
-// part is only attempted on the main role because that is where the daily
-// retention job runs; cache sizes are measured on roles that run builds.
+// GatherRetentionFacts observes the retention run history and the last durable
+// Buildpacks cache measurement. It is read-only and never writes a run or a
+// policy. The database part is only attempted on the main role because that is
+// where the daily retention job records the measurement.
 func GatherRetentionFacts(ctx context.Context, role, dsn string) (RetentionFacts, BuildCacheFacts) {
 	retentionFacts := RetentionFacts{Enabled: role == "main"}
 	cacheFacts := BuildCacheFacts{
@@ -73,14 +71,8 @@ func GatherRetentionFacts(ctx context.Context, role, dsn string) (RetentionFacts
 	}
 	if retentionFacts.Enabled {
 		loadRetentionFacts(ctx, dsn, &retentionFacts, &cacheFacts)
-	}
-	if cacheFacts.Applicable {
-		bytes, err := measureBuildpackCaches(ctx)
-		if err != nil {
-			cacheFacts.Error = err.Error()
-		} else {
-			cacheFacts.Known, cacheFacts.Bytes = true, bytes
-		}
+	} else if cacheFacts.Applicable {
+		cacheFacts.Error = "this role does not read the control database; the main node's retention run records the cache size"
 	}
 	return retentionFacts, cacheFacts
 }
@@ -103,26 +95,34 @@ func loadRetentionFacts(ctx context.Context, dsn string, facts *RetentionFacts, 
 	loadRetentionPolicyCap(queryCtx, pool, cache)
 
 	var finished *time.Time
+	var cacheBytes *int64
+	var cacheMeasuredAt *time.Time
+	var cacheError string
 	err = pool.QueryRow(queryCtx, `SELECT status,started_at,finished_at,
         jsonb_array_length(planned_items),jsonb_array_length(removed_items),
-        planned_bytes,reclaimed_bytes,jsonb_array_length(errors)
+        planned_bytes,reclaimed_bytes,jsonb_array_length(errors),
+        cache_bytes,cache_measured_at,cache_measurement_error
         FROM eregion_retention_runs
         ORDER BY started_at DESC,id DESC LIMIT 1`).
 		Scan(&facts.LastRun.Status, &facts.LastRun.StartedAt, &finished,
 			&facts.LastRun.PlannedItems, &facts.LastRun.RemovedItems,
-			&facts.LastRun.PlannedBytes, &facts.LastRun.ReclaimedBytes, &facts.LastRun.Errors)
+			&facts.LastRun.PlannedBytes, &facts.LastRun.ReclaimedBytes, &facts.LastRun.Errors,
+			&cacheBytes, &cacheMeasuredAt, &cacheError)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		facts.Known = true
 		facts.WorkerAge, facts.WorkerAgeKnown = workerActiveAge(ctx)
+		cache.Error = "no retention run has recorded a Buildpacks cache measurement yet"
 		return
 	case err != nil:
 		facts.Error = "the retention runs could not be read"
+		cache.Error = facts.Error
 		return
 	}
 	facts.HasRun = true
 	facts.LastRun.FinishedAt = finished
 	facts.Known = true
+	applyBuildCacheMeasurement(cache, cacheBytes, cacheMeasuredAt, cacheError, time.Now().UTC())
 
 	var success *time.Time
 	if err := pool.QueryRow(queryCtx, `SELECT coalesce(finished_at,started_at) FROM eregion_retention_runs
@@ -154,6 +154,22 @@ func loadRetentionPolicyCap(ctx context.Context, pool *pgxpool.Pool, cache *Buil
 	}
 }
 
+func applyBuildCacheMeasurement(cache *BuildCacheFacts, bytes *int64, measuredAt *time.Time, measurementError string, now time.Time) {
+	switch {
+	case bytes == nil:
+		cache.Error = measurementError
+		if cache.Error == "" {
+			cache.Error = "the latest retention run could not measure the Buildpacks cache"
+		}
+	case measuredAt == nil:
+		cache.Error = "the latest retention run has no cache measurement time"
+	case now.Sub(measuredAt.UTC()) > 48*time.Hour:
+		cache.Error = "the latest Buildpacks cache measurement is older than 48 hours; the next retention run refreshes it"
+	default:
+		cache.Known, cache.Bytes = true, *bytes
+	}
+}
+
 func buildCacheApplies(role string) bool {
 	switch role {
 	case "main", "application", "builder":
@@ -174,15 +190,15 @@ func retentionLastRun(facts Facts) []Result {
 		return one(Warn, detail, "fix the control database connection, then run eregion doctor")
 	}
 	if !facts.Retention.HasRun {
-		// The daily job first fires 24 hours after the worker starts. A fresh
-		// host therefore has no run for its first day; only warn once the
+		// The daily job also runs at worker start. A fresh host still gets a
+		// queue grace before a missing run is actionable; only warn once the
 		// worker has been active for more than two days.
 		if facts.Retention.WorkerAgeKnown && facts.Retention.WorkerAge > 48*time.Hour {
 			return one(Warn,
 				fmt.Sprintf("no retention run has been recorded since the worker started %s ago", humanDuration(facts.Retention.WorkerAge)),
 				"check the maintenance queue, then run eregion prune --dry-run and eregion prune --confirm <server>")
 		}
-		return one(Pass, "no retention run yet; the first daily run starts within 24 hours of the worker starting", "")
+		return one(Pass, "no retention run yet; the startup catch-up is queued and runs when the maintenance queue is ready", "")
 	}
 
 	run := facts.Retention.LastRun
@@ -229,11 +245,11 @@ func buildpackCache(facts Facts) []Result {
 		return one(Pass, "this role runs no Buildpacks builds", "")
 	}
 	if !facts.BuildCache.Known {
-		detail := "cannot measure the Buildpacks cache"
+		detail := "Buildpacks cache size is unknown"
 		if facts.BuildCache.Error != "" {
 			detail += ": " + facts.BuildCache.Error
 		}
-		return one(Warn, detail, "check that Docker is running and the node can list its volumes")
+		return one(Pass, detail, "the retention run records the cache size on the node; run eregion prune --dry-run to inspect the next plan")
 	}
 	limit := facts.BuildCache.CapBytes
 	if limit <= 0 {
@@ -245,109 +261,6 @@ func buildpackCache(facts Facts) []Result {
 			"run eregion prune --dry-run, then eregion prune --confirm <server>; the daily job also removes the least-recently-used entries")
 	}
 	return one(Pass, detail, "")
-}
-
-func measureBuildpackCaches(ctx context.Context) (int64, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	if _, err := exec.LookPath("docker"); err != nil {
-		return 0, errors.New("docker is not available")
-	}
-	names, err := buildpackCacheVolumeNames(ctx)
-	if err != nil {
-		return 0, err
-	}
-	var total int64
-	for _, name := range names {
-		mountpoint, err := dockerOutput(ctx, "volume", "inspect", "--format", "{{.Mountpoint}}", name)
-		if err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "no such volume") {
-				continue
-			}
-			return 0, err
-		}
-		size, err := directoryBytes(ctx, strings.TrimSpace(mountpoint))
-		if err != nil {
-			return 0, err
-		}
-		total += size
-	}
-	return total, nil
-}
-
-func buildpackCacheVolumeNames(ctx context.Context) ([]string, error) {
-	prefixes := []string{"eregion-build-cache-", "eregion-launch-cache-", "pack-cache-"}
-	seen := map[string]bool{}
-	var names []string
-	for _, prefix := range prefixes {
-		output, err := dockerOutput(ctx, "volume", "ls", "--quiet", "--filter", "name="+prefix)
-		if err != nil {
-			return nil, err
-		}
-		for _, name := range strings.Split(output, "\n") {
-			name = strings.TrimSpace(name)
-			if name == "" || seen[name] {
-				continue
-			}
-			if !isBuildpackCacheVolume(name) {
-				continue
-			}
-			seen[name] = true
-			names = append(names, name)
-		}
-	}
-	sort.Strings(names)
-	return names, nil
-}
-
-func isBuildpackCacheVolume(name string) bool {
-	switch {
-	case strings.HasPrefix(name, "eregion-build-cache-"), strings.HasPrefix(name, "eregion-launch-cache-"):
-		return true
-	case strings.HasPrefix(name, "pack-cache-"):
-		return strings.HasSuffix(name, ".build") || strings.HasSuffix(name, ".launch")
-	}
-	return false
-}
-
-func dockerOutput(ctx context.Context, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, "docker", args...) //nolint:gosec // G204: fixed read-only Docker inspection.
-	var stdout, stderr bytes.Buffer
-	command.Stdout, command.Stderr = &stdout, &stderr
-	if err := command.Run(); err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = err.Error()
-		}
-		return "", fmt.Errorf("docker %s: %s", strings.Join(args, " "), detail)
-	}
-	return stdout.String(), nil
-}
-
-func directoryBytes(ctx context.Context, root string) (int64, error) {
-	root = strings.TrimSpace(root)
-	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) == "/" {
-		return 0, nil
-	}
-	var total int64
-	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return nil //nolint:nilerr // An unreadable subtree is an unknown size, not a fault.
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if entry.Type().IsRegular() {
-			if info, statErr := entry.Info(); statErr == nil {
-				total += info.Size()
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return total, nil
 }
 
 func workerActiveAge(ctx context.Context) (time.Duration, bool) {
