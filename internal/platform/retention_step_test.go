@@ -312,6 +312,22 @@ func TestRetentionRemovalRunsUnderTheHostLock(t *testing.T) {
 	}
 }
 
+func TestRetentionGCPassIDsAreDistinctAndValidated(t *testing.T) {
+	first := RetentionGCStepID(1)
+	second := RetentionGCStepID(2)
+	if first == second || first == RetentionGCStepID(0) || second == RetentionGCStepID(0) {
+		t.Fatalf("GC pass IDs are not distinct: %q %q %q", RetentionGCStepID(0), first, second)
+	}
+	payload, _ := json.Marshal(RetentionGCPayload{Step: second, Generation: 2})
+	if _, err := buildRetentionGCStep(retentionTestExecution(second), payload); err != nil {
+		t.Fatalf("a generated GC pass was refused: %v", err)
+	}
+	payload, _ = json.Marshal(RetentionGCPayload{Step: second, Generation: 1})
+	if _, err := buildRetentionGCStep(retentionTestExecution(second), payload); err == nil {
+		t.Fatal("a GC step with the wrong generation was accepted")
+	}
+}
+
 func TestRetentionRemoveStepDeletesARegistryManifestByDigest(t *testing.T) {
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

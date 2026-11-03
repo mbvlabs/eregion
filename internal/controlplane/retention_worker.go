@@ -213,11 +213,11 @@ func (s *Service) retentionRunForOperation(ctx context.Context, id contract.Oper
 	var finished *time.Time
 	err := s.pool.QueryRow(ctx, `SELECT id,coalesce(operation_id,''),status,planned_items,removed_items,
         planned_bytes,reclaimed_bytes,errors,started_at,finished_at,
-        cache_bytes,cache_measured_at,cache_measurement_error
+        cache_bytes,cache_measured_at,cache_measurement_error,gc_generation
         FROM eregion_retention_runs WHERE operation_id=$1 ORDER BY started_at DESC,id DESC LIMIT 1`, id).
 		Scan(&run.ID, &operationID, &run.Status, &planned, &removed,
 			&run.PlannedBytes, &run.ReclaimedBytes, &runErrors, &run.StartedAt, &finished,
-			&run.CacheBytes, &run.CacheMeasuredAt, &run.CacheError)
+			&run.CacheBytes, &run.CacheMeasuredAt, &run.CacheError, &run.GCGeneration)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return retention.Run{}, false, nil
 	}
@@ -239,11 +239,11 @@ func (s *Service) insertRetentionRun(ctx context.Context, run retention.Run) err
 	}
 	_, err = s.pool.Exec(ctx, `INSERT INTO eregion_retention_runs
         (id,operation_id,status,planned_items,removed_items,planned_bytes,reclaimed_bytes,errors,started_at,finished_at,
-         cache_bytes,cache_measured_at,cache_measurement_error)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+         cache_bytes,cache_measured_at,cache_measurement_error,gc_generation)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		run.ID, nullableOperationID(contract.OperationID(run.OperationID)), run.Status, planned, removed,
 		run.PlannedBytes, run.ReclaimedBytes, runErrors, run.StartedAt, run.FinishedAt,
-		run.CacheBytes, run.CacheMeasuredAt, run.CacheError)
+		run.CacheBytes, run.CacheMeasuredAt, run.CacheError, run.GCGeneration)
 	if err != nil {
 		return unavailable(err)
 	}
@@ -257,9 +257,9 @@ func (s *Service) updateRetentionRun(ctx context.Context, run retention.Run) err
 	}
 	_, err = s.pool.Exec(ctx, `UPDATE eregion_retention_runs
         SET status=$2,planned_items=$3,removed_items=$4,planned_bytes=$5,reclaimed_bytes=$6,errors=$7,finished_at=$8,
-            cache_bytes=$9,cache_measured_at=$10,cache_measurement_error=$11
+            cache_bytes=$9,cache_measured_at=$10,cache_measurement_error=$11,gc_generation=$12
         WHERE id=$1`, run.ID, run.Status, planned, removed, run.PlannedBytes, run.ReclaimedBytes, runErrors, run.FinishedAt,
-		run.CacheBytes, run.CacheMeasuredAt, run.CacheError)
+		run.CacheBytes, run.CacheMeasuredAt, run.CacheError, run.GCGeneration)
 	if err != nil {
 		return unavailable(err)
 	}
@@ -441,12 +441,10 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 	registryRemovedThisAttempt := false
 	registryFailedThisAttempt := false
 	gcPending, err := s.retentionGCPending(ctx)
-	gcPendingBefore := gcPending
 	if err != nil {
 		s.recordRetentionRunError(run, "registry_gc_state", "registry-gc", err)
 		failures = append(failures, err)
 	}
-	pendingSetByThisAttempt := false
 	registryGCStateBlocked := false
 	for _, item := range run.Planned {
 		if item.Kind == retention.ItemRegistryArtifact && !removed[retentionItemKey(item)] {
@@ -458,9 +456,6 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 				registryGCStateBlocked = true
 			} else {
 				gcPending = true
-				if !gcPendingBefore {
-					pendingSetByThisAttempt = true
-				}
 			}
 			break
 		}
@@ -540,17 +535,14 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 			fmt.Sprintf("Removed %s %s (%d bytes).", item.Kind, item.Reference, item.Bytes))
 	}
 
-	if pendingSetByThisAttempt && !registryRemovedThisAttempt {
-		// The durable flag was set only for an effect that never deleted a
-		// manifest. Clear it so a deferred retry does not run GC for nothing.
-		if err := s.setRetentionGCPending(ctx, false); err != nil {
-			s.recordRetentionRunError(run, "registry_gc_state", "registry-gc", err)
-			failures = append(failures, err)
-		} else {
-			gcPending = false
+	registryUnsettled := false
+	for _, item := range run.Planned {
+		if item.Kind == retention.ItemRegistryArtifact && !removed[retentionItemKey(item)] {
+			registryUnsettled = true
+			break
 		}
 	}
-	if registryRemovedThisAttempt || (gcPending && !registryFailedThisAttempt) {
+	if !registryUnsettled && !registryFailedThisAttempt && (registryRemovedThisAttempt || gcPending) {
 		if err := s.setRetentionGCPending(ctx, true); err != nil {
 			s.recordRetentionRunError(run, "registry_gc_state", "registry-gc", err)
 			failures = append(failures, err)
@@ -561,8 +553,22 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 			s.recordRetentionSkip(run, "registry_gc_skipped", "registry-gc", reason)
 			s.appendWorkerEvent(ctx, op.ID, attempt, "retention", "Skipped registry garbage collection: "+reason)
 		} else {
-			stepID := "platform-retention-gc-01-v1"
-			payload := platform.RetentionGCPayload{Step: stepID}
+			generation := run.GCGeneration
+			switch {
+			case generation == 0:
+				generation = 1
+			case registryRemovedThisAttempt:
+				// A completed earlier GC pass must not satisfy this one.
+				generation++
+			}
+			if generation != run.GCGeneration {
+				run.GCGeneration = generation
+				if err := s.updateRetentionRun(ctx, *run); err != nil {
+					return err
+				}
+			}
+			stepID := platform.RetentionGCStepID(generation)
+			payload := platform.RetentionGCPayload{Step: stepID, Generation: generation}
 			if _, err := (&platformWorker{service: s}).runStepOn(ctx, transport, op.ID, attempt, stepID, payload, nil); err != nil {
 				s.recordRetentionRunError(run, "registry_gc", "registry-gc", err)
 				failures = append(failures, err)

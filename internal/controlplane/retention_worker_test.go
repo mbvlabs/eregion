@@ -318,7 +318,7 @@ func TestIntegrationRetentionWorkerMarksRemovesThenGCs(t *testing.T) {
 	if !seenImage || !seenRegistry {
 		t.Fatalf("removal payloads = %+v", fixture.transport.payloads)
 	}
-	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != "platform-retention-gc-01-v1" {
+	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != platform.RetentionGCStepID(1) {
 		t.Fatalf("last step = %s, want the registry garbage collection", got)
 	}
 }
@@ -342,6 +342,13 @@ func TestIntegrationRetentionWorkerRetriesAFailedEffect(t *testing.T) {
 	}
 	if status != string(retention.RunFailed) || !strings.Contains(string(runErrors), "transient node failure") {
 		t.Fatalf("failed run = %s errors=%s", status, runErrors)
+	}
+	var pendingAfterFailure bool
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton`).Scan(&pendingAfterFailure); err != nil {
+		t.Fatal(err)
+	}
+	if !pendingAfterFailure {
+		t.Fatal("an attempted registry delete with an uncertain outcome cleared the GC pending flag")
 	}
 	var state contract.State
 	if err := fixture.pool.QueryRow(context.Background(), `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state); err != nil {
@@ -376,8 +383,15 @@ func TestIntegrationRetentionWorkerRetriesAFailedEffect(t *testing.T) {
 	if dispatches != 2 {
 		t.Fatalf("registry effect dispatched %d times, want the failed attempt plus one retry", dispatches)
 	}
-	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != "platform-retention-gc-01-v1" {
+	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != platform.RetentionGCStepID(1) {
 		t.Fatalf("the retried registry delete was not followed by GC: %s", got)
+	}
+	var pendingAfterSuccess bool
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton`).Scan(&pendingAfterSuccess); err != nil {
+		t.Fatal(err)
+	}
+	if pendingAfterSuccess {
+		t.Fatal("the completed GC did not clear the pending flag")
 	}
 }
 
@@ -495,7 +509,7 @@ func TestIntegrationRetentionWorkerRevalidatesOnRetry(t *testing.T) {
 		if step == orphanStep {
 			dispatches++
 		}
-		if step == "platform-retention-gc-01-v1" {
+		if strings.HasPrefix(step, "platform-retention-gc-01-v1") {
 			t.Fatalf("GC ran after the registry deletion was dropped: %v", fixture.transport.steps)
 		}
 	}
@@ -640,7 +654,7 @@ func TestIntegrationRetentionPendingGCRunsWithoutNewDeletions(t *testing.T) {
         VALUES (true,true) ON CONFLICT (singleton) DO UPDATE SET retention_gc_pending=true`); err != nil {
 		t.Fatal(err)
 	}
-	fixture.transport.failSteps["platform-retention-gc-01-v1"] = 1
+	fixture.transport.failSteps[platform.RetentionGCStepID(1)] = 1
 	first := submitRetentionWorkerPrune(t, s, "retention-worker-gc-pending-1")
 	if err := (&retentionWorker{service: s}).Work(ctx, retentionWorkerJob(first.ID, 1, 8)); err == nil {
 		t.Fatal("the first GC attempt did not fail")
@@ -668,5 +682,50 @@ func TestIntegrationRetentionPendingGCRunsWithoutNewDeletions(t *testing.T) {
 	}
 	if !strings.Contains(string(removedRaw), string(retention.ItemRegistryGC)) {
 		t.Fatalf("the follow-up run did not record GC: %s", removedRaw)
+	}
+}
+
+func TestIntegrationRetentionGCUsesAFreshPassIdentity(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	ctx := context.Background()
+	op := submitRetentionWorkerPrune(t, s, "retention-worker-gc-generation")
+	runID, err := retention.NewRunID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := retention.Run{
+		ID: runID, OperationID: string(op.ID), Status: retention.RunFailed,
+		GCGeneration: 1,
+		Planned: []retention.Item{{
+			Kind: retention.ItemRegistryArtifact, App: fixture.app, Environment: fixture.env,
+			Reference: fixture.orphan, Bytes: 100,
+		}},
+		Removed:   []retention.Item{{Kind: retention.ItemRegistryGC, Reference: "registry-gc"}},
+		StartedAt: time.Now().UTC(),
+	}
+	if err := s.insertRetentionRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&retentionWorker{service: s}).Work(ctx, retentionWorkerJob(op.ID, 1, 8)); err != nil {
+		t.Fatal(err)
+	}
+	wantStep := platform.RetentionGCStepID(2)
+	if got := fixture.transport.steps[len(fixture.transport.steps)-1]; got != wantStep {
+		t.Fatalf("GC step = %s, want a fresh pass %s", got, wantStep)
+	}
+	var generation int
+	var pending bool
+	if err := fixture.pool.QueryRow(ctx, `SELECT gc_generation FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&generation); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 2 {
+		t.Fatalf("persisted GC generation = %d, want 2", generation)
+	}
+	if err := fixture.pool.QueryRow(ctx, `SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending {
+		t.Fatal("the fresh GC pass did not clear the pending flag")
 	}
 }

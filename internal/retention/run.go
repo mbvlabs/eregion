@@ -92,6 +92,10 @@ type Run struct {
 	CacheBytes      *int64     `json:"cache_bytes,omitempty"`
 	CacheMeasuredAt *time.Time `json:"cache_measured_at,omitempty"`
 	CacheError      string     `json:"cache_measurement_error,omitempty"`
+	// GCGeneration is the per-run registry GC pass counter. Every new pass
+	// gets a distinct node-effect step ID so a completed earlier pass cannot
+	// satisfy a later, newly necessary collection.
+	GCGeneration int `json:"gc_generation,omitempty"`
 }
 
 // NewRunID returns a retention run identity in the database's rtr_ format.

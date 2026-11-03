@@ -240,6 +240,7 @@ node protocol version and database migration version are independent.
 | `016_container_cleanup.sql` | Leaked-container retry rows: container name PK, environment/node/deployment, reason, attempts, last error and next attempt. Cascades with the environment. |
 | `017_retention.sql` | D30 retention: the singleton `server_settings` row, the revision `retention` override block, `releases.pruned_at` and `retention_runs` observability. |
 | `018_retention_measurements.sql` | Durable cache measurement (`cache_bytes`, `cache_measured_at`, `cache_measurement_error`) on `retention_runs` and the node-wide `retention_gc_pending` follow-up on `server_settings`. Never rewrites published 017. |
+| `019_retention_gc_generation.sql` | Per-run `gc_generation` so each registry garbage-collection pass has a distinct durable node-effect identity. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -261,7 +262,7 @@ Tables below have the literal `eregion_` prefix:
 | `platform_release_command_runs` | `(release_id, command_digest)` PK; the owning operation, running/succeeded/failed state, error code/message and timestamps. One row per release and command specification; it cascades with its release. |
 | `platform_container_cleanup` | Container name PK; environment/node/deployment, reason, attempts, last error and next attempt. A failed removal is retried with backoff; the row cascades with its environment. |
 | `server_settings` | Singleton row (`singleton` boolean PK); one `retention` jsonb block for the server-level default. An absent row or empty block means the D30 defaults in `internal/retention`. |
-| `retention_runs` | `rtr_…` ID, optional owning operation, pending/running/succeeded/failed/cancelled status, planned/removed item arrays, planned/reclaimed bytes, per-item errors JSON, start/finish timestamps, and the latest Buildpacks cache measurement (`cache_bytes` NULL means unknown, measured-at, error). |
+| `retention_runs` | `rtr_…` ID, optional owning operation, pending/running/succeeded/failed/cancelled status, planned/removed item arrays, planned/reclaimed bytes, per-item errors JSON, start/finish timestamps, the latest Buildpacks cache measurement (`cache_bytes` NULL means unknown, measured-at, error), and the per-run registry GC generation. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
 | `webhook_deliveries` | Hashed delivery ID, exact-body hash, actor/kind/target, pending/submitted state and operation ID. |
@@ -376,7 +377,7 @@ time, requires the `io.eregion.app` ownership label and the payload's app and
 environment, and removes the immutable container ID; the registry container and
 any unowned container are refused. Removal and GC steps run under the node host
 lock, so they cannot race a pack build. A GC effect,
-`platform-retention-gc-01-v1`, stops `eregion-registry.service`, removes an
+`platform-retention-gc-01-v<N>`, stops `eregion-registry.service`, removes an
 orphaned `eregion-registry-gc` container from an interrupted attempt, verifies
 no registry garbage-collect process remains, runs `registry garbage-collect` in
 a one-off container against the same storage, and restarts the unit. If the
@@ -433,7 +434,9 @@ A run inserts one `retention_runs` row with its planned items and bytes, then
 executes in order: mark each release row `pruned_at`, dispatch the journaled
 `platform-retention-remove-*` steps for release images, registry artifacts,
 cache volumes, containers and dangling images, then run
-`platform-retention-gc-01-v1` if any registry manifest was actually deleted.
+`platform-retention-gc-01-v<N>` after all manifest deletions in that attempt
+have settled and none remain failed, if any registry manifest was actually
+deleted.
 Release rows are marked separately from image removal: an `image` item names
 only an immutable image ID, and a release with no `ImageID` is never removed by
 its mutable tag. The planner protects an image shared with any retained,
@@ -449,11 +452,15 @@ before GC, the worker re-runs the planner under its held locks and intersects
 the persisted items with the fresh eligibility set; a registry artifact,
 container, cache or image that became protected or disappeared is dropped with
 a recorded reason and never silently removed. A registry delete sets the
-node-wide `retention_gc_pending` flag before the manifest is touched; a
-successful GC clears it, and any later run drains it even with no new
-deletions. A permanent node refusal fails the operation after recording the
-run; the next daily run retries it after the host is fixed. Operation events
-carry planned/removal/protection progress. The
+node-wide `retention_gc_pending` flag before the manifest is touched; it is
+cleared only by a GC effect that completes successfully in this attempt after
+all manifest deletions have settled, and any later run drains it even with no
+new deletions. Each new GC pass increments the run's persisted
+`gc_generation`, so `platform-retention-gc-01-v<N>` is distinct from an earlier
+completed pass and newly orphaned blobs are collected. A permanent node
+refusal fails the operation after recording the run; the next daily run retries
+it after the host is fixed. Operation events carry planned/removal/protection
+progress. The
 build path records the local image config digest (`image_id`) but has no pushed
 manifest digest in its existing pack/inspect output; planning therefore
 resolves manifests through inventory `ConfigDigest` and local-image
@@ -495,11 +502,13 @@ treating unreadable data as empty. Both rows are `AtInit` checks, so the
 main-node report is 20 results: the previous 18 plus retention and cache.
 
 `retention_gc_pending` in `server_settings` is the durable follow-up for a
-registry manifest delete. The worker sets it before the first delete, clears it
-only after a successful GC, and leaves it set when GC is deferred or fails. Any
-later retention run checks it even when it has no new deletions, runs GC when
-registry protection is resolvable, and clears it. A failed or dropped delete
-that never removed a manifest clears the flag it set for that attempt.
+registry manifest delete. The worker sets it before the first delete, keeps it
+set while any registry delete attempt is unsettled or failed, and clears it
+only after a GC effect completes successfully in that attempt after all
+deletions settled. Any later retention run checks it even when it has no new
+deletions, runs GC when registry protection is resolvable, and clears it. Every
+new GC pass uses the next persisted `gc_generation` in its step ID, so a
+completed earlier pass cannot satisfy a later one.
 
 ## Migration and external database policy
 

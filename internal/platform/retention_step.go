@@ -38,7 +38,7 @@ const (
 
 var (
 	retentionRemoveStepPattern = regexp.MustCompile(`^platform-retention-remove-[0-9a-f]{12}-v1$`)
-	retentionGCStepPattern     = regexp.MustCompile(`^platform-retention-gc-01-v1$`)
+	retentionGCStepPattern     = regexp.MustCompile(`^platform-retention-gc-01-v([0-9]{1,9})$`)
 	registryRepositoryPattern  = regexp.MustCompile(`^[a-z0-9]+([._-][a-z0-9]+)*(/[a-z0-9]+([._-][a-z0-9]+)*)*$`)
 	registryDigestPattern      = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	cacheVolumePattern         = regexp.MustCompile(`^(eregion-(build|launch)-cache-[0-9a-f]{2,80}_[0-9a-f]{2,80}|pack-cache-[a-z0-9][a-z0-9_.-]*\.(build|launch))$`)
@@ -458,13 +458,26 @@ func (s *RetentionRemoveStep) applyRegistryDelete(ctx context.Context, report en
 // ------------------------------------------------------------ garbage collect
 
 // RetentionGCPayload is the registry garbage-collection effect. Empty paths
-// mean the production layout.
+// mean the production layout. Generation distinguishes one GC pass from an
+// earlier completed pass in the same retention run.
 type RetentionGCPayload struct {
 	Step        string `json:"step"`
+	Generation  int    `json:"generation,omitempty"`
 	RegistryDir string `json:"registry_dir,omitempty"`
 	ConfigPath  string `json:"config_path,omitempty"`
 	Unit        string `json:"unit,omitempty"`
 	Image       string `json:"image,omitempty"`
+}
+
+// RetentionGCStepID returns the durable effect identity of one GC pass. Zero
+// means the historical fixed ID (v1); new passes use v2, v3, … so a completed
+// earlier pass cannot satisfy a later one, while every ID still satisfies the
+// operation-step grammar ending in -v<number>.
+func RetentionGCStepID(generation int) string {
+	if generation <= 0 {
+		return "platform-retention-gc-01-v1"
+	}
+	return fmt.Sprintf("platform-retention-gc-01-v%d", generation+1)
 }
 
 func buildRetentionGCStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
@@ -475,6 +488,25 @@ func buildRetentionGCStep(exec engine.Execution, raw json.RawMessage) (engine.St
 	if payload.Step != exec.Step {
 		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
 	}
+	matches := retentionGCStepPattern.FindStringSubmatch(payload.Step)
+	if matches == nil {
+		return nil, errors.New("invalid registry garbage-collect step")
+	}
+	version, err := strconv.Atoi(matches[1])
+	if err != nil || version < 1 {
+		return nil, errors.New("invalid registry garbage-collect step version")
+	}
+	stepGeneration := 0
+	if version > 1 {
+		stepGeneration = version - 1
+	}
+	switch {
+	case payload.Generation < 0:
+		return nil, errors.New("invalid registry garbage-collect generation")
+	case payload.Generation != stepGeneration:
+		return nil, errors.New("the registry garbage-collect step does not match its generation")
+	}
+	payload.Generation = stepGeneration
 	payload.RegistryDir = defaultString(payload.RegistryDir, DefaultRegistryDir)
 	payload.ConfigPath = defaultString(payload.ConfigPath, RegistryConfigPath)
 	payload.Unit = defaultString(payload.Unit, RegistryUnit)
