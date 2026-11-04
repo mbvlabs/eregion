@@ -314,11 +314,11 @@ earlier passes are context, not qualification.
 
 Source state 2026-11-03: rows 1–15 and 17 are implemented in the integrated
 source on `master`. Row 17 (retention) has isolated tests and is an alpha.1
-gate; host qualification is partial, and defect 5 (worker registry inventory
-permissions) is fixed in source but not host-verified. Row 16 (alpha
-qualification) remains in progress. Rows
-11–15 went through isolated implementation lanes and independent review, with
-rework and orchestrator acceptance; the final release-command
+gate; host qualification is partial. Defect 5 (worker registry inventory
+permissions) is fixed and host-verified; defect 6 (local image removal during
+prune) blocks completion. Row 16 (alpha qualification) remains in progress.
+Rows 11–15 went through isolated implementation lanes and independent review,
+with rework and orchestrator acceptance; the final release-command
 evidence-classification correction was made by the orchestrator.
 Combined format, build, vet, darwin/arm64 build and selected isolated package
 tests pass. The PostgreSQL integration suite passes (without the race detector)
@@ -367,7 +367,7 @@ and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resum
 fixture state, evidence locations and unqualified acceptance variants, and its
 run records for operation IDs. Row 16 is in progress; row 17 is implemented at
 source level and is an alpha.1 gate, not yet fully host-qualified (defect 5 is
-fixed in source, not host-verified).
+fixed and host-verified; defect 6 is open).
 
 On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
 switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
@@ -437,11 +437,26 @@ without making the storage writable by `eregion`. The inventory's permission
 failure names the path and the `eregion apply` fix, and `host.retention` points
 at the same step. `host-packages-v2` installs `polkitd` and
 `host-registry-gc-polkit-v1` lets the worker start, stop and restart only
-`eregion-registry.service`; the fail-closed GC script is unchanged. At the run,
-`doctor` was 19 pass / 1 warn (`host.retention`).
-The real prune, registry GC, pruned-rollback refusal, 30-release acceptance and
-the 20/0/0 doctor check therefore remain unqualified; details are in
-MANUAL-TESTING's 2026-11-03 (evening) record.
+`eregion-registry.service`; the fail-closed GC script is unchanged.
+
+The late 2026-11-03/04 run on `main` upgraded `edge-1e541a7fad3e` ->
+`edge-690baafe8c91`. `host-directories-v2` converged the registry to
+`root:eregion 0750` (worker read true), `host-registry-gc-polkit-v1` wrote the
+root-owned rule and a restart as `eregion` succeeded; `host-packages-v2` found
+nothing missing and Docker 29.1.3 / containerd 2.2.2 were not upgraded or
+restarted. The automatic daily run became the real prune: 16 githello release
+rows were marked pruned exactly as planned, serving `rel_b709` and rollback
+`rel_b383` stayed, and monitors saw 2,190/2,190 HTTP 200. **Defect 5 is fixed
+and host-verified.** **New open defect 6:** four images with multiple tags fail
+`docker image rm <id>` ("image is referenced in multiple repositories") and a
+1.3 GB dangling image is held by the unlabeled stopped container
+`ea1e68560301`, which the retention inventory does not see. The run recorded 35
+errors, `op_0f541f120149580a1124893389f720b2` failed `unavailable`, four images
+and the dangling image remain, registry GC was not reached, and `doctor` is
+19 pass / 1 warn (`host.retention`). Rollback to pruned `rel_0170` refuses
+correctly. Real-prune completion, registry GC, deploy-after-GC and the 20/0/0
+doctor check therefore remain unqualified; details are in MANUAL-TESTING's late
+2026-11-03 record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
