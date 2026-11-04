@@ -314,10 +314,10 @@ earlier passes are context, not qualification.
 
 Source state 2026-11-03: rows 1–15 and 17 are implemented in the integrated
 source on `master`. Row 17 (retention) has isolated tests and is an alpha.1
-gate; host qualification is partial. Defect 5 (worker registry inventory
-permissions) is fixed and host-verified; defect 6 (local image removal during
-prune) is fixed in source and awaits a host retest. Row 16 (alpha qualification)
-remains in progress.
+gate; host qualification is partial. Defects 5 (worker registry inventory
+permissions) and 6 (local image removal during prune) are fixed and
+host-verified; the row still needs registry-GC coverage, the 30-release check
+and a fresh-server baseline. Row 16 (alpha qualification) remains in progress.
 Rows 11–15 went through isolated implementation lanes and independent review,
 with rework and orchestrator acceptance; the final release-command
 evidence-classification correction was made by the orchestrator.
@@ -367,8 +367,9 @@ then had zero failures in 6,262 requests. Fresh init, human-factor-positive flow
 and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resume testing” section for the saved target,
 fixture state, evidence locations and unqualified acceptance variants, and its
 run records for operation IDs. Row 16 is in progress; row 17 is implemented at
-source level and is an alpha.1 gate, not yet fully host-qualified (defect 5 is
-fixed and host-verified; defect 6 is fixed in source, not host-verified).
+source level and is an alpha.1 gate, not yet fully host-qualified (defects 5
+and 6 are fixed and host-verified; retention still lacks registry-GC,
+30-release and fresh-server coverage).
 
 On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
 switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
@@ -460,9 +461,26 @@ correctly. The source now re-reads and verifies every current repository tag
 before untagging it (never `--force`), reports every container's immutable image
 ID so an unlabeled container protects its image, and records deterministic
 conflict refusals as per-item skips with a `succeeded_with_skips` run and a
-doctor pass note. Real-prune completion, registry GC, deploy-after-GC and the
-20/0/0 doctor check therefore remain unqualified; details are in
-MANUAL-TESTING's late 2026-11-03 record.
+doctor pass note. Real-prune completion, registry GC and deploy-after-GC
+therefore remain unqualified; details are in MANUAL-TESTING's late 2026-11-03
+record.
+
+The 2026-11-04 run on `main` upgraded `edge-690baafe8c91` ->
+`edge-786fdcfda4a8` and applied migration 020 (schema 20/20). The startup daily
+catch-up did not retry the failed 2026-11-04 operation: its UTC-day idempotency
+key was already bound to that terminal operation, so no new automatic run was
+accepted. A manual prune `op_11f4602b7a2fd234d352779d74f7bd4a` succeeded in one
+attempt: four multi-tagged images were untagged and deleted, the 1.3 GB dangling
+image used by unlabeled stopped container `pedantic_jackson` is now
+`image_skipped` "used by container", both apps stayed serving through
+1,200/1,200 responses, 142,430,208 bytes were freed, and `doctor` reached
+20 pass / 0 warn / 0 fail. **Defect 6 is fixed and host-verified.** Registry GC
+still was not exercised: the dry run's `registry_skipped` names retained failed
+release `rel_53a22cfea2e1f3a2fa9dd523ac4c5510` (no immutable identity), and the
+registry contains only retained andurel artifacts. A doctor query intermittently
+warns "cannot read the retention runs" (2 of 5 runs) on the external control-DB
+path; every successful read is 20/0/0. Details are in MANUAL-TESTING's
+2026-11-04 record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),

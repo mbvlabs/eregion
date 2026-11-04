@@ -106,26 +106,28 @@ checks.
 | Check | Pass means |
 | --- | --- |
 | Retention policy | `eregion retention show --json` returns `scope: server` with `keep_releases 10`, `keep_newer_than_days 14`, `artifact_grace_days 14`, `buildpack_cache_max_bytes 10737418240` and `buildpack_cache_max_percent 80`, every source `server`. `eregion retention set --keep-releases 5 --keep-days 10 --artifact-grace-days 10 --cache-cap-bytes 1073741824 --cache-cap-percent 75 --json` stores that server default and `show` returns it. `eregion retention set --app <app> --env <env> --keep-releases 2 --keep-days 3 --artifact-grace-days 3 --json` commits a new environment revision (accepted operation ID printed); `retention show --app <app> --env <env> --json` marks only the three release fields `environment`, both cache fields stay `server`, and `env status` names the new revision. `--clear-override` restores inheritance; a flagless `set` with `--json` or no TTY refuses with `input_required`. Host status 2026-11-03: pass on main (236–252, 274). |
-| Prune dry run | `eregion prune --dry-run --json` returns `dry_run: true`, one `items` entry per planned kind with `reference` and `bytes` where known, and `planned_bytes`; warnings name unreadable observations. No operation is accepted (`operations list` gains none), and `release list`, Docker images/containers and registry content are unchanged (compare counts and `docker system df` before and after). A second dry run prints the same plan. Host status 2026-11-03: pass on main (253–267); only the dangling images carried bytes, release rows and image items did not. Late run on `edge-690baaf`: the real run's 16 release items exactly matched this plan, and a retry dry run lists the four image and one dangling item left by defect 6 (311). |
+| Prune dry run | `eregion prune --dry-run --json` returns `dry_run: true`, one `items` entry per planned kind with `reference` and `bytes` where known, and `planned_bytes`; warnings name unreadable observations. No operation is accepted (`operations list` gains none), and `release list`, Docker images/containers and registry content are unchanged (compare counts and `docker system df` before and after). A second dry run prints the same plan. Host status 2026-11-03: pass on main (253–267); only the dangling images carried bytes, release rows and image items did not. Late run on `edge-690baaf`: the real run's 16 release items exactly matched this plan, and a retry dry run lists the four image and one dangling item left by defect 6 (311). 2026-11-04 on `edge-786fdcf`: **pass** — 6 items: four `image` items with their verified tag lists (2, 2, 4 and 3 tags), one `image_skipped` "used by container pedantic_jackson", and the `registry_skipped` diagnostic; `planned_bytes` 0; the real run removed all four images with no errors (338–342, 344). |
 | Pruned rollback | After a real `prune --confirm <server>` removes an old release, `release list` shows the row with `pruned_at` and its ID still present. `rollback <app> <env> --to <pruned-id> --dry-run --json` and `rollback … --confirm <app>/<env>` both refuse with `precondition_failed` naming the release and prune time; `deploy --release <pruned-id>` refuses the same way. Rollback to the kept target still succeeds and serves. Host status late 2026-11-03 (`edge-690baaf`): **partial pass** — `rollback --to rel_0170b1be… --dry-run` and the real `--confirm githello/production` both refused exit 5 `precondition_failed`, naming the release and its `2026-11-04T00:06:41Z` prune time (305, 306); rollback to the kept target was not run. |
-| Registry GC | Record `du -sb /var/lib/eregion/registry` and the registry service state before a prune that removes at least one `registry_artifact`. The operation events show the manifest removal, then `Registry garbage collection completed`; `du` falls by at least the removed manifests/layers, `systemctl is-active eregion-registry` is active and `curl -fsS 127.0.0.1:5000/v2/` returns 200. A stale `eregion-registry-gc` container or a running `garbage-collect` process makes the step fail closed with the registry left stopped and its recovery instruction; a collection or restart failure is never suppressed, and `--delete-untagged` is never used. A deploy after GC builds, verifies publicly and serves. Host status late 2026-11-03 (`edge-690baaf`): **not exercised** — the plan had no `registry_artifact` items, and the real run failed on local images before any GC; registry `du` stayed 312,003,409 and no garbage-collection event appeared. The polkit path itself was verified separately: `sudo -u eregion systemctl restart eregion-registry.service` succeeded, the registry returned active with `/v2/` 200 (312); this was not a retention GC. |
+| Registry GC | Record `du -sb /var/lib/eregion/registry` and the registry service state before a prune that removes at least one `registry_artifact`. The operation events show the manifest removal, then `Registry garbage collection completed`; `du` falls by at least the removed manifests/layers, `systemctl is-active eregion-registry` is active and `curl -fsS 127.0.0.1:5000/v2/` returns 200. A stale `eregion-registry-gc` container or a running `garbage-collect` process makes the step fail closed with the registry left stopped and its recovery instruction; a collection or restart failure is never suppressed, and `--delete-untagged` is never used. A deploy after GC builds, verifies publicly and serves. Host status late 2026-11-03 (`edge-690baaf`): **not exercised** — the plan had no `registry_artifact` items, and the real run failed on local images before any GC; registry `du` stayed 312,003,409 and no garbage-collection event appeared. The polkit path itself was verified separately: `sudo -u eregion systemctl restart eregion-registry.service` succeeded, the registry returned active with `/v2/` 200 (312); this was not a retention GC. 2026-11-04 on `edge-786fdcf`: still **not exercised** — the dry run's `registry_skipped` names retained failed release `rel_53a22cfea2e1f3a2fa9dd523ac4c5510` (no `image_id`, tag `eregion/githello-production:d0f76b56af71`, no local image); the planner therefore skips repository `eregion/githello-production` fail-safe. The registry catalog contains only `andurel`, whose 10 releases are all retained, so there was no eligible registry artifact. No GC and no deploy after GC (339, 345). |
 | 30-release retention | On the disposable app run `eregion retention set --app <app> --env <env> --keep-releases 5 --keep-days 1 --json`, deploy 30 distinct releases, then use an authorized SQL update on the disposable control database to backdate all 30 `created_at` values to older than one day and run `prune --confirm <server>`. Exactly the newest five releases remain unpruned (serving release #30 and rollback target #29 are in that set); 25 release items mark rows with `pruned_at` while all 30 release rows remain, and separate `image`/registry items remove their images and manifests. A following `prune --dry-run` lists no release items. Host status 2026-11-03: not run; needs a freshly initialized disposable server. |
 | host-registry-v2 upgrade | On a node whose registry predates `host-registry-v2`, `plan` lists `host-registry-v2` once. `apply` writes `storage.delete.enabled: true` in `/etc/eregion/registry/config.yml`, restarts `eregion-registry.service` with `REGISTRY_STORAGE_DELETE_ENABLED=true`, and a second `plan`/`apply` reports the step skipped. A manifest delete no longer returns 405, and a deploy after the upgrade serves. Host status 2026-11-03: pass on main (230–233, 270–273); the manifest-delete/deploy-after-upgrade variants were not separately run. |
-| Doctor retention | `eregion doctor --json` includes `host.retention`. With no run yet on a fresh install it is `pass` with "no retention run yet"; the startup catch-up or next daily run records one. After a run it names the finish time, status, removed items and reclaimed/planned bytes. A failed last run, a running run older than two days, or a last success older than two days with the worker up is `warn` with a fix. The main-node summary is 20 pass / 0 warn / 0 fail. Host status late 2026-11-03 (`edge-690baaf`): warn (19/1) because the real prune failed on image removal (defect 6), recording 35 errors; the 20/0/0 state is not reached. |
-| Doctor Buildpacks cache | `host.build_cache` reads the latest durable cache measurement from `retention_runs`; it never walks Docker volumes or the filesystem in `doctor`. With no measurement, or one older than 48 hours, it is `pass` with unknown (a fresh host stays healthy), never a zero-byte pass. After a retention run records a measurement under the cap it is `pass` and names used and cap bytes. Set the server cap below the measured cache within the allowed range (`retention set --cache-cap-bytes 1073741824 --json`) or build until the cache exceeds it; `doctor` reports `warn` naming the cap. After `prune --confirm <server>` removes least-recently-used entries the next retention run refreshes the measurement and the row returns to `pass`. Cache volumes are named `eregion-build-cache-<hex app>_<hex env>`, `eregion-launch-cache-<hex app>_<hex env>` or legacy `pack-cache-*.<build\|launch>`. Host status late 2026-11-03 (`edge-690baaf`): **pass with a known measurement** — 4.7 GiB of the 10.0 GiB cap (298). |
+| Doctor retention | `eregion doctor --json` includes `host.retention`. With no run yet on a fresh install it is `pass` with "no retention run yet"; the startup catch-up or next daily run records one. After a run it names the finish time, status, removed items and reclaimed/planned bytes. A failed last run, a running run older than two days, or a last success older than two days with the worker up is `warn` with a fix. The main-node summary is 20 pass / 0 warn / 0 fail. Host status 2026-11-04 (`edge-786fdcf`): **pass (20/0/0)** — the latest run succeeded at 2026-11-04T01:11:20Z, removed 4 items and recorded no errors; the row detail reads "4 item(s) removed, 0 B reclaimed" (343, 347, 352, 353). A transient control-DB read failure produced a 19/1 warn in 2 of 5 repeated doctor runs; every successful read was 20/0/0. |
+| Doctor Buildpacks cache | `host.build_cache` reads the latest durable cache measurement from `retention_runs`; it never walks Docker volumes or the filesystem in `doctor`. With no measurement, or one older than 48 hours, it is `pass` with unknown (a fresh host stays healthy), never a zero-byte pass. After a retention run records a measurement under the cap it is `pass` and names used and cap bytes. Set the server cap below the measured cache within the allowed range (`retention set --cache-cap-bytes 1073741824 --json`) or build until the cache exceeds it; `doctor` reports `warn` naming the cap. After `prune --confirm <server>` removes least-recently-used entries the next retention run refreshes the measurement and the row returns to `pass`. Cache volumes are named `eregion-build-cache-<hex app>_<hex env>`, `eregion-launch-cache-<hex app>_<hex env>` or legacy `pack-cache-*.<build\|launch>`. Host status 2026-11-04 (`edge-786fdcf`): **pass with a known measurement** — 4.7 GiB of the 10.0 GiB cap (350, 352). |
 
-Host status on main (2026-11-03 evening and late, `edge-1e541a7fad3e` ->
-`edge-690baafe8c91`): **policy** show/set and the environment revision pass;
-**prune dry run** passes (items, reasons and known bytes; nothing changed);
-**host-registry-v2** applied once; the late run applied `host-directories-v2`
-and `host-registry-gc-polkit-v1` and verified the worker can read the registry
-and restart it through polkit; **doctor Buildpacks cache** passes with a known
-4.7 GiB. The late real prune removed 16 release rows and two artifacts but
-failed on four multi-tagged images and one dangling image held by an unlabeled
-stopped container (defect 6); **pruned-rollback refusal** passes, **registry
-GC** was not exercised (no eligible registry artifacts), and **30-release
-retention** remains for a freshly initialized server. Evidence in the late
-2026-11-03 run record.
+Host status on main (2026-11-04, `edge-786fdcfda4a8`): **policy** show/set and
+the environment revision pass; **prune dry run** passes (six items, exact
+reasons and tags; planned bytes 0); **pruned-rollback refusal** passes from the
+same pruned releases; **host-directories-v2**, **host-registry-gc-polkit-v1**
+and the worker registry read remain verified; **doctor retention and
+Buildpacks cache both pass at 20/0/0**, with a known 4.7 GiB cache. The manual
+real prune removed the four multi-tagged images and left the 1.3 GB dangling
+image as `image_skipped` "used by container pedantic_jackson"; defect 6 is
+fixed. **Registry GC** was still not exercised: the only skip names retained
+failed release `rel_53a22cfe…`, which has no immutable image identity, and the
+registry contains only protected `andurel` artifacts. **30-release retention**
+and the fresh-server baseline remain. The 2026-11-04 automatic daily run was
+blocked by the already-used UTC-day key; a manual prune was used. Evidence in
+the 2026-11-04 run record.
 
 ## Resume testing — saved session state, updated 2026-11-03
 
@@ -139,11 +141,11 @@ Facts below are the last recorded observations, not a fresh host check.
 
 | Item | Last recorded state |
 | --- | --- |
-| Repository | `/home/mbv/work/eregion`, branch `master`; tested revisions `a77d3bf` (worker rescue), `13fdb25` (control-DB failure classification plus `host-journal-access-v1`), `1e541a7` (retention CLI, migrations 017–019 and `host-registry-v2`) and `690baaf` (worker-readable registry, polkit GC, cache sizing and package convergence), all with green CI and signed edge publication. `42a0541` and earlier builds are context, not qualification. |
-| Tested CLI and main | `edge-690baafe8c91`, source `690baaf`; the late 2026-11-03 run upgraded `edge-1e541a7fad3e` -> `edge-690baafe8c91`. Earlier passes ran on `edge-1e541a7fad3e`, `edge-13fdb2518757`, `edge-a77d3bfa4fe6`, `edge-42a0541c09d4` and `edge-ef91d70f6215`. Do not confuse a newer edge publication with an installed or qualified build. |
+| Repository | `/home/mbv/work/eregion`, branch `master`; tested revisions `a77d3bf` (worker rescue), `13fdb25` (control-DB failure classification plus `host-journal-access-v1`), `1e541a7` (retention CLI, migrations 017–019 and `host-registry-v2`), `690baaf` (worker-readable registry, polkit GC, cache sizing and package convergence) and `786fdcf` (multi-tag image removal, stopped-container protection and `succeeded_with_skips`), all with green CI and signed edge publication. `42a0541` and earlier builds are context, not qualification. |
+| Tested CLI and main | `edge-786fdcfda4a8`, source `786fdcf`; the 2026-11-04 run upgraded `edge-690baafe8c91` -> `edge-786fdcfda4a8`. Earlier passes ran on `edge-690baafe8c91`, `edge-1e541a7fad3e`, `edge-13fdb2518757`, `edge-a77d3bfa4fe6`, `edge-42a0541c09d4` and `edge-ef91d70f6215`. Do not confuse a newer edge publication with an installed or qualified build. |
 | Existing server | Context/node `main`, host `exploration`, Ubuntu 26.04 amd64; public IP `46.224.129.96`; main hostname `db2.mbvlabs.com`; operator `admin@10.78.0.1:22` through embedded WireGuard, endpoint `46.224.129.96:51820`. |
-| Health | Doctor 19 pass / 1 warn / 0 fail at `edge-690baafe8c91`: `host.retention` warns because the real prune failed to remove multi-tagged images and a dangling image held by an unlabeled stopped container (defect 6); `host.build_cache` passes with a known 4.7 GiB of 10.0 GiB; the healthy target remains 20 pass / 0 warn / 0 fail; second apply 0 applied / 20 skipped; schema 19/19, River 7/7; Docker 29.1.3/containerd 2.2.2 were not upgraded or restarted; Caddy 2.11.4 was not restarted; `net.ipv4.tcp_migrate_req=1` from `host-ingress-sysctl-v1`; admin reads the eregion journal without sudo. |
-| Known open defect | **Defect 6:** the real retention prune marks release rows pruned but `docker image rm <id>` fails for images with multiple repository tags ("image is referenced in multiple repositories": 86d86a, 6c6a3f, 1ef45b, 871c4b), and a 1.3 GB dangling image is held by an unlabeled stopped container (`ea1e68560301`, `pedantic_jackson`) that the retention inventory does not see. The run recorded 35 errors and failed `unavailable`; four images and the dangling image remain. **Defect 5 is fixed and host-verified** on `690baaf`: the registry is `root:eregion 0750`, `eregion` can read it, the inventory ran, and the polkit rule lets `eregion` restart the registry. Defects 3 and 4 remain fixed and host-verified. |
+| Health | Doctor **20 pass / 0 warn / 0 fail** at `edge-786fdcfda4a8`: `host.retention` passes with "4 item(s) removed, 0 B reclaimed"; `host.build_cache` passes with a known 4.7 GiB of the 10.0 GiB cap; second apply 0 applied / 20 skipped; schema 20/20, River 7/7; Docker 29.1.3/containerd 2.2.2 were not upgraded or restarted; Caddy 2.11.4 was not restarted; `net.ipv4.tcp_migrate_req=1` from `host-ingress-sysctl-v1`; admin reads the eregion journal without sudo. Intermittent control-DB reads produced a transient `host.retention` warn in 2 of 5 doctor runs; every successful read was 20/0/0 (317, 321, 336, 347, 350–353). |
+| Known open defect | **No open retention defect observed.** Defect 6 is fixed and host-verified on `786fdcf`: the four multi-tagged images were untagged and deleted, and the 1.3 GB dangling image used by unlabeled stopped container `ea1e68560301` (`pedantic_jackson`) is now `image_skipped` "used by container". The manual prune succeeded with 4 items removed and no errors. **Defect 5 remains fixed and host-verified** on `690baaf`; defects 3 and 4 remain fixed and host-verified. The daily automatic run for 2026-11-04 was blocked by the already-used UTC-day key; a manual prune was required. |
 | External database | PostgreSQL 17 on the operator machine, container `eregion-cp-pg`, host port 5433. Main reaches it through TLS-terminated Tailscale Funnel `thelab.tailbbed89.ts.net:10000`. No DSN belongs in this document. |
 | Test app | `githello/production`, `APP_VERSION=v3`; web ×2 (`eregion-hello`, port 8080) and worker ×1 (`eregion-hello worker`, no port); release command `eregion-hello release`; health `/healthz`. |
 | Serving release | `rel_b7099da06361a0bfaa8ee6866e178152`, source commit `3461a87`, deployment `dep_51d61163648e39d6adf4be5cdef005d3`, built and deployed by op_181c9da0f94c37ff6784c08201d366b1 on 2026-11-03 (the defect-4 rescue retest). Rollback target: `rel_b38312bd825f8c7e66ae3fe906148795` (image `5e277f663727`), deployed by op_5e277f6637276de54c3011fc1fc52a0f. Earlier: `rel_0170b1be56a64a747d522a2831cb02d8`, redeployed by op_4dc3431876c9f4f0e5caae4cd22d695f and op_6f4a7968f5823f71cd1003ec33a81293. |
@@ -212,6 +214,7 @@ are under `/home/mbv/.cache/eregion-run/` (operator-local, not Git artifacts):
 | CLI upgrade between two edge builds, signed node upgrades, CI endpoint path, worker-kill rescue, failed-manifest refusal, journal access | `155-*` through `207-*` (monitors `170`, `180`, `195`) |
 | CLI upgrade to `1e541a7`, `host-registry-v2` and migrations 017–019, defect-4 rescue retest, retention policy/dry run and the retention-inventory defect | `208-*` through `277-*` (monitors `228`, `240`; summary `277`) |
 | Late run: `690baaf` CLI/host steps, real prune partial failure (defect 6), pruned-rollback refusal, polkit restart | `278-*` through `314-*` (monitor `287`; prune `295`/`297`; summary `313`; final curls `314`) |
+| 2026-11-04 run: `786fdcf` upgrade, migration 020, daily-key finding, manual prune success (defect 6 fixed), registry-skip evidence, doctor 20/0/0 | `315-*` through `358-*` (monitor `326`; prune follow `342`; registry skip `345`; doctor loop `353`; final curls `354`; summary `355`; final state `356`–`358`) |
 
 The Python alias continuity monitor returned 403 and is **not** passing evidence;
 use the later curl measurements. Saved binding/operation acceptance is not
@@ -233,7 +236,7 @@ do not treat a passed subset as completion of an entire row.
 | Login and contexts | **Not run:** successful second-machine login from the bundle, atomic failed replacement, wrong host key, context selection and `context remove`. Needs the bundle from `secrets export`, then an agent. Preserve the working main context and identity. |
 | Upgrades | **Partial pass:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). `upgrade` between two edge builds passed on 2026-11-03 (`42a0541` -> `a77d3bf` -> `13fdb25`, evening `13fdb25` -> `1e541a7`, late `1e541a7` -> `690baaf`; previous-binary copy kept); a failed manifest download during a node upgrade refused with `unavailable` and no checksum-only fallback (`193-*`). Still **not run:** `install.sh` acceptance on Linux/macOS for these builds. |
 | macOS | **Not run (no Mac available, R10):** `install.sh` on macOS and an installed CLI against the server. CI's macOS CLI job and the darwin/arm64 cross-build are not host acceptance. Required before v1.0.0 final; not an alpha.1 gate. |
-| Disk retention (alpha.1 gate, R9) | **Partial pass (late 2026-11-03, `edge-690baafe8c91`):** policy, prune dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read and polkit restart passed; `host.build_cache` reports a known 4.7 GiB. The automatic real prune marked the planned 16 githello releases `pruned_at`, left both apps' serving/rollback releases untouched, freed 20,180,992 bytes and removed two artifacts, and rollback to pruned `rel_0170b1be…` refused `precondition_failed` naming the release and prune time. **Defect 6 blocks completion:** `docker image rm <id>` failed for four images with multiple repository tags and for a 1.3 GB dangling image held by an unlabeled stopped container (`ea1e68560301`); the run recorded 35 errors, left four images plus the dangling image, never reached registry GC (no eligible registry artifacts), and `doctor` is 19/1. Deploy after GC, disk-freed completion, 30-release retention and the fresh-server baseline remain **not run**. |
+| Disk retention (alpha.1 gate, R9) | **Partial pass (2026-11-04, `edge-786fdcfda4a8`):** policy, dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read, polkit restart, pruned-rollback refusal, doctor retention and a known 4.7 GiB cache all pass. The manual real prune succeeded: four multi-tagged images were untagged and deleted, the 1.3 GB dangling image used by unlabeled stopped container `ea1e68560301` is `image_skipped` "used by container", the 16 release rows stayed pruned, both apps served (1,200/1,200 monitor responses), 142,430,208 bytes were freed, and `doctor` reached 20/0/0. **Registry GC remains not exercised:** the dry-run `registry_skipped` names retained failed release `rel_53a22cfe…` (no image identity), and the registry holds only fully retained andurel artifacts. Deploy after GC, the 30-release row and the fresh-server baseline remain not run. The 2026-11-04 automatic daily run was blocked by the already-used UTC-day key; the manual prune was used. |
 | Fresh host | **Not run:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. Needs an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
 | Release-command recovery | **Not run:** lost or unresolved response recovery variants. Once-per-release skipping, a changed command running again and restart/scale refusal after a failed run passed. Needs a scoped fault; stays an alpha.1 gate (R4). |
 | Repair variants | **Not run:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. Needs a scoped fault. |
@@ -256,20 +259,30 @@ test -r` returned true, the retention inventory succeeded, and
 restart only `eregion-registry.service` (312). The earlier failure was
 op_c90b2c9a9a1e6f0430dd13aec337ab40, attempt 8 at 2026-11-03T21:18:27Z.
 
-**Defect 6 (new, open):** the real prune marks release rows `pruned_at` but
-cannot remove four release images because `docker image rm <id>` refuses an
-image referenced by multiple repository tags:
-`86d86a57796d`, `6c6a3f447152`, `1ef45b4e792c` and `871c4b7859aa` each fail
-with "image is referenced in multiple repositories". A fifth item, the
-1,308,545,594-byte dangling image `bd03726c07e9`, is held by the unlabeled
-stopped container `ea1e68560301` (`pedantic_jackson`, exited 5 days); the
-retention inventory only knows `io.eregion.app`-labeled containers, so it planned
-the removal and Docker refused. op_0f541f120149580a1124893389f720b2 recorded 35
-errors across attempts 2–8 and failed `unavailable` at 00:12:28; four images and
-the dangling image remain, no registry GC was reached, and `doctor` is 19/1.
-The retry dry run still lists those four image and one dangling item (311).
-Missing prerequisites for the remaining alpha.1 rows: a fix for defect 6, an
-authorized fresh server, and human participation for factor-positive
+**Defect 6 is fixed and host-verified on `786fdcf`:** the manual prune
+`op_11f4602b7a2fd234d352779d74f7bd4a` untagged all 11 verified tags and deleted
+`86d86a57796d`, `6c6a3f447152`, `1ef45b4e792c` and `871c4b7859aa` without
+errors. The 1,308,545,594-byte dangling image `bd03726c07e9` is now
+`image_skipped` "used by container pedantic_jackson"; the unlabeled stopped
+container itself remains. The run succeeded in one attempt with 4 items
+removed, and `doctor` is 20/0/0.
+
+**Finding — daily key:** the 2026-11-04 startup catch-up did not retry the
+failed `op_0f541f120149580a1124893389f720b2` and did not create a new run: the
+UTC-day idempotency key `retention-daily:2026-11-04` was already bound to that
+terminal operation. The maintenance jobs ran after worker restart, but the
+operations list gained no daily retention operation. The manual prune used a
+fresh key and converged. This needs a product decision: a terminal failed daily
+run currently blocks the rest of its UTC day.
+
+**Observation — intermittent doctor read:** repeated `doctor` runs after the
+prune alternated between 20/0/0 and a 19/1 `host.retention` warn "cannot read
+the retention runs" (2 of 5 runs; 317, 350, 351, 353). Successful reads were
+consistently 20/0/0. This is the external control database through the
+Tailscale/Funnel path, not retention state; the doctor query has a 5-second
+budget and the runs took 4.9–23.5 seconds. Missing prerequisites for the
+remaining alpha.1 rows: registry GC/deploy-after-GC coverage, the 30-release
+row, an authorized fresh server, and human participation for factor-positive
 operations. macOS is deferred (R10). Other unqualified variants remain **not
 run**, not implementation failures or passes.
 
@@ -311,7 +324,7 @@ run**, not implementation failures or passes.
 ## Current qualification boundary
 
 Real-host evidence spans several published edge builds, recorded below.
-`edge-690baafe8c91` is the latest installed and tested build; earlier passes are
+`edge-786fdcfda4a8` is the latest installed and tested build; earlier passes are
 not automatically a full baseline pass for it. The 2026-10-29/30 runs closed
 release-changing dense switches, symlink-escape rejection, same-key replay after
 the branch was deleted, rollback refusal for a release whose command never
@@ -330,8 +343,14 @@ root-only registry storage). The late run upgraded to `690baaf`, applied
 fix, and ran the automatic real prune: 16 release rows and two artifacts went,
 the serving and rollback releases stayed and 2,190/2,190 curls were HTTP 200,
 but four multi-tagged images and a dangling image held by an unlabeled stopped
-container failed removal (defect 6), so registry GC, deploy-after-GC and the
-20/0/0 doctor result remain unqualified. Source fixes have isolated regressions,
+container failed removal (defect 6). The 2026-11-04 run upgraded to `786fdcf`,
+applied migration 020, worked around the already-used UTC-day key with a manual
+prune, removed the four images by verified untagging, left the dangling image as
+`image_skipped` "used by container", kept both apps serving through
+1,200/1,200 responses, and reached doctor 20/0/0; defect 6 is fixed and
+host-verified. Registry GC and deploy-after-GC remain unexercised because a
+retained failed release has no resolvable image identity and the registry holds
+only retained andurel artifacts. Source fixes have isolated regressions,
 build/vet and darwin/arm64 cross-build evidence; published CI also ran race
 checks. These are distinct from manual acceptance.
 
@@ -1110,6 +1129,95 @@ Remaining: fix defect 6 (force or untag multi-repository image removal and
   disk freed and 20/0/0 doctor; then 30-release retention and the full baseline
   on a freshly initialized server. The fresh githello deploy after GC was not
   run because the prune failed and GC did not run.
+```
+
+```text
+Date / build / commit / channel: 2026-11-04 / edge-786fdcfda4a8 / 786fdcf /
+  edge
+CI and publication: 786fdcf CI and Publish edge pass (runs 41750854190,
+  41750854160).
+Checks: CLI upgrade pass; apply pass (migration 020; 4 of 20 steps); daily
+  automatic run blocked by the used UTC-day key (finding); manual prune pass
+  (4 images removed, defect 6 fixed); registry GC not exercised (no eligible
+  artifacts); second apply pass; doctor 20/0/0, with intermittent control-DB
+  read warnings.
+Operator OS/arch: linux/amd64. CLI upgrade edge-690baafe8c91 ->
+  edge-786fdcfda4a8: pass; previous binary kept at ~/.local/bin/eregion.prev
+  (reports edge-690baafe8c91).
+Server: existing main, Ubuntu 26.04 amd64; before the run CLI/node
+  edge-690baafe8c91, schema 19/19, River 7/7, doctor 19/1 (the failed Nov 4
+  retention run); 19 githello releases with 16 pruned, 10 andurel releases with
+  0 pruned; 26 Docker tags / 9 containers; registry du 312,003,409.
+Apply dry run (327): expected refusal, exit 5 node_version_mismatch; no node
+  binary installed.
+Apply (328): pass, 01:08:12-01:08:35, exit 0, applied 4 of 20:
+  host-database-v1 (schema 19/20 -> 20/20, migration 020), host-api-service-v1,
+  host-worker-service-v1 and host-readiness-v1. Worker startup raced the
+  migration: three restarts logged `precondition_failed: database migrations
+  are pending` (01:08:16-01:08:32), one logged `unavailable: control-plane
+  database is unavailable` (01:08:45), then it became active at 01:08:51 and
+  River started at 01:08:56. Apply still exited 0 after readiness. Schema
+  20/20, River 7/7.
+Daily-key finding: after the restart the maintenance jobs ran (01:09:01-16),
+  but `operations list` gained no 2026-11-04 daily retention operation.
+  op_0f541f120149580a1124893389f720b2 remained failed and was not retried; the
+  UTC-day idempotency key was already bound to that terminal operation. A
+  manual prune was required (320, 332, 335, 337, 357).
+Manual prune: dry run 339 returned 6 items and planned_bytes 0: four `image`
+  items with their verified tag lists (86d86a: 2 tags; 6c6a3f: 2; 1ef45b: 4;
+  871c4b: 3), one `image_skipped` for the 1,308,545,594-byte dangling image
+  bd03726c07e9 with "used by container pedantic_jackson", and the
+  `registry_skipped` diagnostic. No andurel items; serving rel_b709 and
+  rollback rel_b383 were not candidates.
+`prune --confirm main --detach` accepted
+  op_11f4602b7a2fd234d352779d74f7bd4a at 01:10:29. The operation succeeded in
+  one attempt at 01:11:22.982: it planned 4 items, untagged all 11 tags,
+  deleted 86d86a, 6c6a3f, 1ef45b and 871c4b, recorded no errors, and left the
+  dangling image skipped. The run status is succeeded with 4 items removed and
+  0 B reclaimed. The post-run dry run has only the `registry_skipped` and
+  `image_skipped` diagnostics (342, 344).
+Registry GC: none planned, so none ran and no deploy-after-GC was performed.
+  The `registry_skipped` reason is exactly: release
+  rel_53a22cfea2e1f3a2fa9dd523ac4c5510 has no immutable image digest or config
+  digest that resolves to a registry inventory artifact (image
+  "eregion/githello-production:d0f76b56af71"). That release is failed, has
+  `image_id` null and no local image; it is retained as the third-newest
+  release. The registry catalog contains only `andurel`, whose 10 releases are
+  all retained. This is acceptable fail-safe over-skip, not a normal-git-build
+  ConfigDigest/RepoDigests mismatch (339, 345).
+Monitoring (326): 1,200/1,200 HTTP 200 (400 per URL) from 01:08:07 to 01:13:07,
+  covering the apply, both dry runs, the manual prune and the second apply;
+  githello and andurel never failed. Final curls 354 are 200.
+Disk and registry: /var/lib/eregion used 20,568,334,336 -> 20,425,904,128
+  (142,430,208 bytes freed); Docker tags 26 -> 15, unique images 16 -> 10,
+  containers 9. The 1.3 GB dangling image and the stopped container remain by
+  design. Registry stayed active, `/v2/` 200, du 312,003,409 unchanged,
+  ActiveEnterTimestamp 2026-11-04 00:16:03 unchanged, and no garbage-collection
+  event appeared (348).
+Doctor: 347 and 352 are 20 pass / 0 warn / 0 fail. host.retention passes with
+  "last retention run 2026-11-04T01:11:20Z succeeded: 4 item(s) removed, 0 B
+  reclaimed"; host.build_cache passes with a known 4.7 GiB of 10.0 GiB. Five
+  repeated runs (353) took 4.9-23.5s and returned 20/0/0 three times; two runs
+  returned 19/1 with `host.retention` "cannot read the retention runs"
+  (317, 350, 351, 353). The successful reads are the target state; the warning
+  is the external control-DB/Tailscale path, not retention state.
+Second apply (346): pass, 0 applied / 20 skipped, 5.70s, 01:12:18-01:12:23.
+Releases remained 19 githello with 16 pruned (serving rel_b709, rollback
+  rel_b383) and 10 andurel with 0 pruned (serving rel_801). No new prune of
+  serving or rollback targets.
+Defect 6: fixed and host-verified by the manual prune above. Defect 5 remains
+  fixed and host-verified.
+Final state: githello and andurel serve publicly; CLI/node
+  edge-786fdcfda4a8; schema 20/20, River 7/7; doctor 20/0/0 on successful DB
+  reads; Docker, containerd and Caddy were not restarted; no injected fault
+  left.
+Evidence: ~/.cache/eregion-run/315-* through 358-* (monitor 326; prune follow
+  342; registry-skip evidence 345; doctor loop 353; final curls 354; summary
+  355; final environment/app/server state 356–358).
+Remaining: registry GC and deploy-after-GC coverage; the 30-release acceptance;
+  the daily-key behavior needs a product decision; the full baseline on a
+  freshly initialized server. The fresh githello deploy after GC was not run
+  because no registry artifact was eligible for GC.
 ```
 
 ```text
