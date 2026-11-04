@@ -417,12 +417,12 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 			river.NewPeriodicJob(river.PeriodicInterval(5*time.Minute), func() (river.JobArgs, *river.InsertOpts) {
 				return workloadRepairArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
-			// One retention operation per UTC day. The job only submits the
-			// operation; its idempotency key makes a restart return the same
-			// accepted work, and the operation's own River job does the pruning.
-			// RunOnStart catches up after a restart that would otherwise skip a
-			// day's only scheduled run.
-			river.NewPeriodicJob(river.PeriodicInterval(24*time.Hour), func() (river.JobArgs, *river.InsertOpts) {
+			// Check once an hour whether the UTC day still needs a retention
+			// run. The submitter allows at most one successful run per day,
+			// never submits while one is queued/running, and retries a failed
+			// or cancelled day after a one-hour backoff with a new numbered
+			// idempotency key. RunOnStart catches up after a restart.
+			river.NewPeriodicJob(river.PeriodicInterval(retentionDailyCheckInterval), func() (river.JobArgs, *river.InsertOpts) {
 				return retentionArgs{}, &river.InsertOpts{Queue: "maintenance", MaxAttempts: 1}
 			}, &river.PeriodicJobOpts{RunOnStart: true}),
 		}

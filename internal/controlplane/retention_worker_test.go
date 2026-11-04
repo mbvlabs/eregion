@@ -595,6 +595,84 @@ func TestIntegrationRetentionDailySubmissionIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestIntegrationRetentionDailySubmissionHonoursTheDayState proves the daily
+// submitter never duplicates a successful or in-progress run, and gives a
+// failed or cancelled day exactly one new numbered attempt after its backoff.
+func TestIntegrationRetentionDailySubmissionHonoursTheDayState(t *testing.T) {
+	date := time.Now().UTC().Format("2006-01-02")
+	tests := []struct {
+		name       string
+		state      contract.State
+		updatedAt  time.Time
+		want       int
+		wantSuffix string
+	}{
+		{name: "failed after the retry delay", state: contract.Failed, updatedAt: time.Now().Add(-2 * time.Hour), want: 2, wantSuffix: ":2"},
+		{name: "failed within the retry delay", state: contract.Failed, updatedAt: time.Now().Add(-10 * time.Minute), want: 1},
+		{name: "succeeded", state: contract.Succeeded, updatedAt: time.Now().Add(-10 * time.Minute), want: 1},
+		{name: "running", state: contract.Running, updatedAt: time.Now(), want: 1},
+		{name: "cancelled after the retry delay", state: contract.Canceled, updatedAt: time.Now().Add(-2 * time.Hour), want: 2, wantSuffix: ":2"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetentionFixture(t)
+			ctx := context.Background()
+			if err := fixture.service.submitDailyRetention(ctx); err != nil {
+				t.Fatal(err)
+			}
+			operations := dailyRetentionTestOperations(t, fixture.pool)
+			if len(operations) != 1 || operations[0].Key != retentionDailyKeyPrefix+date {
+				t.Fatalf("first daily operations = %+v, want the legacy date key", operations)
+			}
+			if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_operations
+                SET state=$2,attempt=CASE WHEN $2='running' THEN greatest(attempt,1) ELSE attempt END,updated_at=$3
+                WHERE id=$1`, operations[0].ID, string(test.state), test.updatedAt); err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.service.submitDailyRetention(ctx); err != nil {
+				t.Fatal(err)
+			}
+			operations = dailyRetentionTestOperations(t, fixture.pool)
+			if len(operations) != test.want {
+				t.Fatalf("daily operations after %s = %+v, want %d", test.state, operations, test.want)
+			}
+			if test.wantSuffix != "" {
+				want := retentionDailyKeyPrefix + date + test.wantSuffix
+				if last := operations[len(operations)-1]; last.Key != want {
+					t.Fatalf("retry key = %q, want %q", last.Key, want)
+				}
+			}
+		})
+	}
+}
+
+type retentionDailyTestOperation struct {
+	ID  contract.OperationID
+	Key string
+}
+
+func dailyRetentionTestOperations(t *testing.T, pool *pgxpool.Pool) []retentionDailyTestOperation {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `SELECT id,idempotency_key FROM eregion_operations
+        WHERE kind=$1 ORDER BY created_at,id`, platform.KindRetentionPrune)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var operations []retentionDailyTestOperation
+	for rows.Next() {
+		var operation retentionDailyTestOperation
+		if err := rows.Scan(&operation.ID, &operation.Key); err != nil {
+			t.Fatal(err)
+		}
+		operations = append(operations, operation)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return operations
+}
+
 func TestIntegrationRetentionRetryRevalidatesPolicyBeforeMarking(t *testing.T) {
 	fixture := newRetentionFixture(t)
 	s := fixture.service

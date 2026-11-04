@@ -59,13 +59,48 @@ func (w *retentionWorker) Work(ctx context.Context, job *river.Job[retentionArgs
 	return w.service.settleRetentionFailure(ctx, op, attempt, job, runErr)
 }
 
-// submitDailyRetention submits the one retention operation per UTC day. The
-// idempotency key makes a worker restart or a second periodic trigger return
-// the accepted operation instead of creating duplicate work.
+// retentionDailyCheckInterval is how often the maintenance queue checks
+// whether the UTC day still needs a retention run. It is not the retention
+// policy: the submitter itself enforces one successful run per day.
+const retentionDailyCheckInterval = time.Hour
+
+// retentionDailyRetryDelay bounds a deterministic failure to one new daily
+// attempt per hour. A failed or cancelled run younger than this is left alone.
+const retentionDailyRetryDelay = time.Hour
+
+// retentionDailyKeyPrefix is the stable prefix of every automatic daily
+// operation's idempotency key. The first run of a day uses
+// "retention-daily:<date>"; a same-day retry uses
+// "retention-daily:<date>:<n>".
+const retentionDailyKeyPrefix = "retention-daily:"
+
+// submitDailyRetention submits at most one successful retention operation per
+// UTC day. An in-progress or already succeeded operation for the day stops it;
+// a failed or cancelled day gets a new numbered idempotency key, but only after
+// retentionDailyRetryDelay. The check runs hourly and on worker start, so a
+// failed run can be retried the same day without a tight loop.
 func (s *Service) submitDailyRetention(ctx context.Context) error {
 	nodeName, err := s.retentionNodeName("")
 	if err != nil {
 		return err
+	}
+	date := time.Now().UTC().Format("2006-01-02")
+	existing, err := s.dailyRetentionOperations(ctx, nodeName, date)
+	if err != nil {
+		return err
+	}
+	key := retentionDailyKeyPrefix + date
+	if len(existing) > 0 {
+		latest := existing[len(existing)-1]
+		for _, operation := range existing {
+			if operation.State == contract.Succeeded || !operation.State.Terminal() {
+				return nil
+			}
+		}
+		if time.Since(latest.UpdatedAt) < retentionDailyRetryDelay {
+			return nil
+		}
+		key = fmt.Sprintf("%s%s:%d", retentionDailyKeyPrefix, date, len(existing)+1)
 	}
 	input, err := json.Marshal(platform.RetentionPruneInput{Node: nodeName})
 	if err != nil {
@@ -73,9 +108,33 @@ func (s *Service) submitDailyRetention(ctx context.Context) error {
 	}
 	_, err = s.Submit(ctx, operations.Submission{
 		Kind: platform.KindRetentionPrune, Target: "node/" + nodeName, Actor: maintenanceActor,
-		IdempotencyKey: "retention-daily:" + time.Now().UTC().Format("2006-01-02"), Input: input,
+		IdempotencyKey: key, Input: input,
 	})
 	return err
+}
+
+// dailyRetentionOperations returns this UTC day's automatic retention
+// operations in creation order. A same-day retry shares the date prefix, so
+// the legacy first-run key and every numbered retry are both included.
+func (s *Service) dailyRetentionOperations(ctx context.Context, nodeName, date string) ([]contract.Operation, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+columns+` FROM eregion_operations
+        WHERE kind=$1 AND actor_kind=$2 AND actor_subject=$3 AND target=$4 AND idempotency_key LIKE $5
+        ORDER BY created_at,id`,
+		platform.KindRetentionPrune, maintenanceActor.Kind, maintenanceActor.Subject,
+		"node/"+nodeName, retentionDailyKeyPrefix+date+"%")
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	defer rows.Close()
+	var operations []contract.Operation
+	for rows.Next() {
+		operation, err := scanOperation(rows)
+		if err != nil {
+			return nil, unavailable(err)
+		}
+		operations = append(operations, operation)
+	}
+	return operations, rows.Err()
 }
 
 func (s *Service) claimRetention(ctx context.Context, id contract.OperationID, attempt uint32) (contract.Operation, bool, error) {
