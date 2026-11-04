@@ -432,6 +432,20 @@ func (s *RetentionRemoveStep) applyImageRemoval(ctx context.Context, rt engine.R
 	if len(removedTags) == 0 {
 		return s.skipResult("no current tag resolves to image " + target), nil
 	}
+	// Untagging the last repository tag normally deletes the image, but a
+	// digest-only reference or a reference added concurrently can keep it
+	// alive. Report that honestly instead of claiming the bytes were freed.
+	remainingTags, stillPresent, err := s.imageRepoTags(runCtx, rt)
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
+	if stillPresent {
+		reason := "image still referenced by a digest-only local reference"
+		if len(remainingTags) > 0 {
+			reason = "image still referenced by tag(s) " + strings.Join(remainingTags, ", ")
+		}
+		return s.skipResult(reason), nil
+	}
 	return engine.ApplyResult{Result: map[string]any{
 		"kind": s.payload.Kind, "reference": s.payload.Reference, "removed": true, "tags": removedTags,
 	}}, nil

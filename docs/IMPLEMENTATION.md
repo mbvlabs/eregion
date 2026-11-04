@@ -411,16 +411,26 @@ and never by its ID while tags still point at it: the step re-reads the image's
 current `RepoTags`, verifies each tag still resolves to exactly the planned
 immutable image ID, and runs `docker image rm <repo:tag>` for that tag; removing
 the last tag removes the image. A tag that has moved to another image is left
-alone and recorded as a per-item skip. Already-gone is success, so a retried
-prune converges; a registry without deletes enabled fails with `405` naming
-`host-registry-v2`. Container removal re-inspects the container at execution
-time, requires the `io.eregion.app` ownership label and the payload's app and
-environment, and removes the immutable container ID; the registry container and
-any unowned container are refused. A deterministic Docker refusal (an image
-referenced in multiple repositories after tag handling, an image or volume in
-use, a 409 conflict) is a per-item skip with its reason recorded in the run;
-daemon unavailability and timeouts stay retryable. Removal and GC steps run
-under the node host lock, so they cannot race a pack build. A GC effect,
+alone and recorded as a per-item skip. After untagging, the step re-inspects the
+immutable image ID; an image kept alive by a digest-only reference or a
+concurrently added reference is a per-item skip ("image still referenced by …"),
+never a claimed removal. The untag is fenced by the node host lock against every
+eregion image mover: pack builds, deploy pulls, image push (load, tag and push),
+container and release-command runs (`--pull never`), the host-registry apply
+step, and registry garbage collection. A manual operator `docker tag` or
+`docker pull` on the node during a prune is outside that fence and out of scope:
+Docker has no identity-bound untag, so manipulation of the node's Docker state
+by hand while a prune runs is not protected. Already-gone is success, so a
+retried prune converges; a registry without deletes enabled fails with `405`
+naming `host-registry-v2`. Container removal re-inspects the container at
+execution time, requires the `io.eregion.app` ownership label and the payload's
+app and environment, and removes the immutable container ID; the registry
+container and any unowned container are refused. A deterministic Docker refusal
+(an image referenced in multiple repositories after tag handling, an image or
+volume in use, a 409 conflict) is a per-item skip with its reason recorded in
+the run; daemon unavailability and timeouts stay retryable. Removal and GC
+steps run under the node host lock, so they cannot race a pack build. A GC
+effect,
 `platform-retention-gc-01-v<N>`, stops `eregion-registry.service`, removes an
 orphaned `eregion-registry-gc` container from an interrupted attempt, verifies
 no registry garbage-collect process remains, runs `registry garbage-collect` in

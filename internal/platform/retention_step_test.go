@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -242,7 +243,14 @@ func TestRetentionRemoveStepRendersTheRemovalCommands(t *testing.T) {
 // fakeRetentionImageDocker answers an image with the supplied repository tags.
 // One tag can resolve to a different image ID, and image removal can fail with
 // the supplied stderr.
-func fakeRetentionImageDocker(t *testing.T, repoTags []string, movedTag, otherID, removeError string) (string, string) {
+// fakeImageRemovalAfter controls what the fake Docker sees after every observed
+// repository tag has been removed.
+type fakeImageRemovalAfter struct {
+	gone         bool
+	remainingTag []string
+}
+
+func fakeRetentionImageDocker(t *testing.T, repoTags []string, movedTag, otherID, removeError string, after ...fakeImageRemovalAfter) (string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	log := filepath.Join(dir, "calls")
@@ -251,10 +259,39 @@ func fakeRetentionImageDocker(t *testing.T, repoTags []string, movedTag, otherID
 	if err != nil {
 		t.Fatal(err)
 	}
+	afterRemoval := fakeImageRemovalAfter{gone: true}
+	if len(after) > 0 {
+		afterRemoval = after[0]
+	}
+	remaining, err := json.Marshal(afterRemoval.remainingTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tagCount := len(repoTags)
+	if tagCount == 0 {
+		tagCount = 1
+	}
 	script := `#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
+removed() {
+  if [ -f "$FAKE_RM_COUNT" ] && [ "$(cat "$FAKE_RM_COUNT")" -ge "$FAKE_TAG_COUNT" ]; then
+    return 0
+  fi
+  return 1
+}
 case "$1 $2" in
   "image inspect")
+    if removed; then
+      if [ "$FAKE_GONE_AFTER_REMOVAL" = 1 ]; then
+        echo "Error response from daemon: No such image" >&2
+        exit 1
+      fi
+      case "$4" in
+        "{{json .RepoTags}}") printf '%s' "$FAKE_AFTER_TAGS";;
+        "{{.Id}}") printf '%s\n' "$FAKE_IMAGE_ID";;
+      esac
+      exit 0
+    fi
     case "$4" in
       "{{json .RepoTags}}") printf '%s' "$FAKE_TAGS";;
       "{{.Id}}")
@@ -270,6 +307,9 @@ case "$1 $2" in
       printf '%s\n' "$FAKE_REMOVE_ERROR" >&2
       exit 1
     fi
+    count=0
+    if [ -f "$FAKE_RM_COUNT" ]; then count=$(cat "$FAKE_RM_COUNT"); fi
+    echo $((count + 1)) > "$FAKE_RM_COUNT"
     exit 0;;
 esac
 exit 0
@@ -279,6 +319,10 @@ exit 0
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_LOG", log)
+	t.Setenv("FAKE_RM_COUNT", filepath.Join(dir, "removed"))
+	t.Setenv("FAKE_TAG_COUNT", strconv.Itoa(tagCount))
+	t.Setenv("FAKE_GONE_AFTER_REMOVAL", map[bool]string{true: "1", false: "0"}[afterRemoval.gone])
+	t.Setenv("FAKE_AFTER_TAGS", string(remaining))
 	t.Setenv("FAKE_IMAGE_ID", imageID)
 	t.Setenv("FAKE_OTHER_ID", otherID)
 	t.Setenv("FAKE_MOVED_TAG", movedTag)
@@ -360,6 +404,26 @@ func TestRetentionRemoveStepRemovesAllTagsWithoutForce(t *testing.T) {
 		if !strings.Contains(string(raw), "image rm "+tag) {
 			t.Fatalf("tag %s was not removed:\n%s", tag, raw)
 		}
+	}
+}
+
+func TestRetentionRemoveStepSkipsAnImageThatRemainsAfterUntagging(t *testing.T) {
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	_, _ = fakeRetentionImageDocker(t,
+		[]string{"127.0.0.1:5000/api:old"}, "", "",
+		"", fakeImageRemovalAfter{remainingTag: []string{"127.0.0.1:5000/api:new"}})
+	step := retentionRemoveStepFor(t, retention.ItemImage, imageID, nil)
+	result, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(result.Result)
+	if !strings.Contains(string(data), `"skipped":true`) ||
+		!strings.Contains(string(data), "image still referenced by tag(s) 127.0.0.1:5000/api:new") {
+		t.Fatalf("an image that survived untagging was not skipped: %s", data)
+	}
+	if strings.Contains(string(data), `"removed":true`) {
+		t.Fatalf("an image that survived untagging was reported removed: %s", data)
 	}
 }
 
