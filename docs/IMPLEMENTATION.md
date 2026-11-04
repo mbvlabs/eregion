@@ -241,6 +241,7 @@ node protocol version and database migration version are independent.
 | `017_retention.sql` | D30 retention: the singleton `server_settings` row, the revision `retention` override block, `releases.pruned_at` and `retention_runs` observability. |
 | `018_retention_measurements.sql` | Durable cache measurement (`cache_bytes`, `cache_measured_at`, `cache_measurement_error`) on `retention_runs` and the node-wide `retention_gc_pending` follow-up on `server_settings`. Never rewrites published 017. |
 | `019_retention_gc_generation.sql` | Per-run `gc_generation` so each registry garbage-collection pass has a distinct durable node-effect identity. |
+| `020_retention_skipped_status.sql` | The `succeeded_with_skips` retention-run status for a completed run whose only unfinished items were deterministic per-item skips. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -322,6 +323,8 @@ refuses `deploy --release` and `rollback` to such a release with
 `precondition_failed`, naming the release and prune time. `retention_runs`
 stores the operation, status, planned/removed items, planned/reclaimed bytes,
 per-item errors and the latest complete cache measurement for observability.
+Migration 020 adds the `succeeded_with_skips` status a run uses when the only
+unfinished items were deterministic per-item skips.
 
 `retention.Plan` is the pure planner both the periodic job and `prune
 [--dry-run]` call. It receives `retention.Input` plain values filled from
@@ -356,17 +359,20 @@ determined).
 transport) returning `retention.Inventory`: registry manifests keyed by
 `(repository, digest)` with their tags, config digest, created time and the
 bytes of the manifest plus its unique blobs; the Buildpacks cache volumes and
-sizes; `io.eregion.app`-labeled containers with labels and state; dangling
-images; local images with their `RepoDigests`; and statfs total/free bytes for
-the data directory. Cache sizes come from Docker's `GET /system/df` calculation
-over the Docker socket; the worker never walks `/var/lib/docker`. A missing
-entry, `UsageData.Size == -1`, an API error or the five-minute bound is an
-unknown size, never zero. Identical digests in two repositories stay two
-entries, because a registry delete names one repository. Registry storage is
-read in Distribution's layout (`blobs/sha256/<first two hex>/<hex>/data`) and a
-revision is live only while its `_manifests/revisions/.../link` is valid. A
-missing manifest or referenced blob is an inventory warning, not a zero-byte
-artifact.
+sizes; every Docker container with its immutable image ID, ownership state and
+lifecycle state; dangling images; local images with their `RepoTags` and
+`RepoDigests`; and statfs total/free bytes for the data directory. Cache sizes
+come from Docker's `GET /system/df` calculation over the Docker socket; the
+worker never walks `/var/lib/docker`. A missing entry, `UsageData.Size == -1`,
+an API error or the five-minute bound is an unknown size, never zero. Identical
+digests in two repositories stay two entries, because a registry delete names
+one repository. Registry storage is read in Distribution's layout
+(`blobs/sha256/<first two hex>/<hex>/data`) and a revision is live only while
+its `_manifests/revisions/.../link` is valid. A missing manifest or referenced
+blob is an inventory warning, not a zero-byte artifact.
+Every container is reported, labeled or not, so an image used by a stopped
+container the operator created outside eregion is protected. Only a container
+with the `io.eregion.app` label is ever a removal candidate.
 
 The inventory runs on the node transport that serves the target node. An
 enrolled node is read by the root `eregion node rpc` process; the main node's
@@ -397,16 +403,24 @@ the existing script as the single GC implementation.
 
 Removal is one journaled node step per planner item:
 `platform-retention-remove-<12 hex>-v1`, where the suffix hashes the item kind
-and reference. The kinds are `release` and `dangling_image` (local
-`docker image rm`), `registry_artifact` (`DELETE /v2/<repo>/manifests/<digest>`
+and reference. The kinds are `release` and `dangling_image` (local image
+removal), `registry_artifact` (`DELETE /v2/<repo>/manifests/<digest>`
 through the loopback registry API), `buildpack_cache` (`docker volume rm`) and
-`container` (`docker rm --force`). Already-gone is success, so a retried prune
-converges; a registry without deletes enabled fails with `405` naming
+`container` (`docker rm --force`). A local image is never removed by `--force`
+and never by its ID while tags still point at it: the step re-reads the image's
+current `RepoTags`, verifies each tag still resolves to exactly the planned
+immutable image ID, and runs `docker image rm <repo:tag>` for that tag; removing
+the last tag removes the image. A tag that has moved to another image is left
+alone and recorded as a per-item skip. Already-gone is success, so a retried
+prune converges; a registry without deletes enabled fails with `405` naming
 `host-registry-v2`. Container removal re-inspects the container at execution
 time, requires the `io.eregion.app` ownership label and the payload's app and
 environment, and removes the immutable container ID; the registry container and
-any unowned container are refused. Removal and GC steps run under the node host
-lock, so they cannot race a pack build. A GC effect,
+any unowned container are refused. A deterministic Docker refusal (an image
+referenced in multiple repositories after tag handling, an image or volume in
+use, a 409 conflict) is a per-item skip with its reason recorded in the run;
+daemon unavailability and timeouts stay retryable. Removal and GC steps run
+under the node host lock, so they cannot race a pack build. A GC effect,
 `platform-retention-gc-01-v<N>`, stops `eregion-registry.service`, removes an
 orphaned `eregion-registry-gc` container from an interrupted attempt, verifies
 no registry garbage-collect process remains, runs `registry garbage-collect` in
@@ -438,7 +452,9 @@ one is safe under the node host lock because no pack build is running.
 `retention.InputFromInventory` is the one adapter from the node wire inventory
 and the platform rows to `retention.Input`. Container ownership comes from the
 same `io.eregion.app`, `io.eregion.environment`, `io.eregion.release` and
-`io.eregion.deployment` labels the deploy path writes. Ownerless legacy pack
+`io.eregion.deployment` labels the deploy path writes. Every container, labeled
+or not, protects the immutable image it runs; only a container with the
+`io.eregion.app` label can be pruned. Ownerless legacy pack
 caches stay eligible; the disk used/total figures use statfs total minus free.
 A registry artifact with no reported creation time is treated as new, so an
 unknown age can never authorize deletion. A truncated inventory plans no
@@ -471,13 +487,17 @@ Release rows are marked separately from image removal: an `image` item names
 only an immutable image ID, and a release with no `ImageID` is never removed by
 its mutable tag. The planner protects an image shared with any retained,
 serving, rollback or in-flight release and with any existing container (running
-or stopped), reporting an `image_skipped` diagnostic instead. A release already
+or stopped, labeled or not), reporting an `image_skipped` diagnostic instead.
+A release already
 marked `pruned_at` whose image is still present is planned again on later runs,
 so an exhausted removal failure converges instead of becoming invisible.
 Every successful item is appended to `removed_items` and its bytes to
 `reclaimed_bytes`; every failed item is recorded in `errors` and the operation
 returns a retryable error, so River retries the unfinished items from the same
-run without repeating completed effects. Before every remaining effect and
+run without repeating completed effects. A deterministic conflict is recorded
+as a per-item `skipped` diagnostic, leaves the plan, and does not fail the run;
+a run whose only unfinished items were skips finishes `succeeded_with_skips`.
+Before every remaining effect and
 before GC, the worker re-runs the planner under its held locks and intersects
 the persisted items with the fresh eligibility set; a registry artifact,
 container, cache or image that became protected or disappeared is dropped with
@@ -509,7 +529,9 @@ viewer as other mutating commands.
 
 `host.retention` reads the newest `retention_runs` row on the main role and
 reports its finish time, status, removed-item count, reclaimed bytes and the
-run's planned reclaimable bytes. A failed, cancelled or stale running row warns;
+run's planned reclaimable bytes. A `succeeded_with_skips` run passes with an
+informational note naming the skipped items; a failed, cancelled or stale
+running row warns;
 a last success older than 48 hours warns once the daily job has had time to run.
 When the newest failed run's first error names unreadable registry storage, the
 warn points at `eregion apply` and `host-directories-v2` instead of a generic

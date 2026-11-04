@@ -128,6 +128,9 @@ func writeRetentionPlanLines(out *strings.Builder, items []retention.Item) {
 		if item.App != "" || item.Environment != "" {
 			fmt.Fprintf(out, " %s/%s", item.App, item.Environment)
 		}
+		if len(item.Tags) > 0 {
+			fmt.Fprintf(out, " tags=%s", strings.Join(item.Tags, ","))
+		}
 		if item.Reason != "" {
 			fmt.Fprintf(out, " reason=%s", item.Reason)
 		}

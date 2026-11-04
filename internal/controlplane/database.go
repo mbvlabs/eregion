@@ -82,6 +82,9 @@ var migration018 string
 //go:embed migrations/019_retention_gc_generation.sql
 var migration019 string
 
+//go:embed migrations/020_retention_skipped_status.sql
+var migration020 string
+
 type migration struct {
 	version int
 	name    string
@@ -111,6 +114,7 @@ var migrations = []migration{
 	{version: 17, name: "017_retention.sql", sql: migration017},
 	{version: 18, name: "018_retention_measurements.sql", sql: migration018},
 	{version: 19, name: "019_retention_gc_generation.sql", sql: migration019},
+	{version: 20, name: "020_retention_skipped_status.sql", sql: migration020},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.

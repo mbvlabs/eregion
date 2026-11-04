@@ -163,6 +163,27 @@ func TestRetentionLastRunReportsTheLastRun(t *testing.T) {
 	}
 }
 
+func TestRetentionLastRunPassesWithSkipNote(t *testing.T) {
+	finished := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)
+	results := Run([]Check{{ID: "host.retention", Category: CatHost, Run: retentionLastRun}}, Facts{
+		Now: time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
+		Retention: RetentionFacts{
+			Enabled: true, Known: true, HasRun: true,
+			LastSuccessAt: finished,
+			LastRun: RetentionRunFacts{
+				Status: retention.RunSucceededWithSkips, StartedAt: finished.Add(-time.Minute), FinishedAt: &finished,
+				RemovedItems: 3, ReclaimedBytes: 1 << 30, Errors: 1, Skipped: 1,
+			},
+		},
+	})
+	if len(results) != 1 || results[0].Status != Pass {
+		t.Fatalf("succeeded-with-skips retention row = %+v, want pass", results)
+	}
+	if !strings.Contains(results[0].Detail, "1 item(s) skipped") {
+		t.Fatalf("skip note missing from detail: %s", results[0].Detail)
+	}
+}
+
 func TestRetentionLastRunWarnsOnFailureAndStaleSuccess(t *testing.T) {
 	now := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
 	failed := time.Date(2026, 11, 3, 10, 0, 0, 0, time.UTC)

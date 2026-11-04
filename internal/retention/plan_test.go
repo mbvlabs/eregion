@@ -268,7 +268,7 @@ func TestPlanContainersAndDanglingImages(t *testing.T) {
 	})
 
 	assertStrings(t, "container items", sortedStrings(referencesByKind(items, ItemContainer)),
-		[]string{"container-without-name", "no-labels", "stale", "unknown-environment"})
+		[]string{"container-without-name", "stale", "unknown-environment"})
 	assertStrings(t, "dangling image items", referencesByKind(items, ItemDanglingImage), []string{"sha256:dangling"})
 	for _, item := range items {
 		if item.Kind == ItemContainer && item.Reference == "unknown-environment" && !strings.Contains(item.Reason, "known environment") {

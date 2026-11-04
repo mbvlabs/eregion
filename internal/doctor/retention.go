@@ -45,6 +45,9 @@ type RetentionRunFacts struct {
 	PlannedBytes   int64
 	ReclaimedBytes int64
 	Errors         int
+	// Skipped is how many recorded run diagnostics are per-item skips. A
+	// succeeded-with-skips run passes with an info note naming them.
+	Skipped int
 	// Error is the first recorded run error. It lets doctor point at a known
 	// fix instead of a generic retry instruction.
 	Error string
@@ -101,16 +104,17 @@ func loadRetentionFacts(ctx context.Context, dsn string, facts *RetentionFacts, 
 	var cacheBytes *int64
 	var cacheMeasuredAt *time.Time
 	var cacheError string
+	var runErrors []byte
 	err = pool.QueryRow(queryCtx, `SELECT status,started_at,finished_at,
         jsonb_array_length(planned_items),jsonb_array_length(removed_items),
-        planned_bytes,reclaimed_bytes,jsonb_array_length(errors),
+        planned_bytes,reclaimed_bytes,jsonb_array_length(errors),errors,
         coalesce(errors->0->>'message',''),
         cache_bytes,cache_measured_at,cache_measurement_error
         FROM eregion_retention_runs
         ORDER BY started_at DESC,id DESC LIMIT 1`).
 		Scan(&facts.LastRun.Status, &facts.LastRun.StartedAt, &finished,
 			&facts.LastRun.PlannedItems, &facts.LastRun.RemovedItems,
-			&facts.LastRun.PlannedBytes, &facts.LastRun.ReclaimedBytes, &facts.LastRun.Errors,
+			&facts.LastRun.PlannedBytes, &facts.LastRun.ReclaimedBytes, &facts.LastRun.Errors, &runErrors,
 			&facts.LastRun.Error,
 			&cacheBytes, &cacheMeasuredAt, &cacheError)
 	switch {
@@ -126,12 +130,13 @@ func loadRetentionFacts(ctx context.Context, dsn string, facts *RetentionFacts, 
 	}
 	facts.HasRun = true
 	facts.LastRun.FinishedAt = finished
+	facts.LastRun.Skipped = countRetentionSkips(runErrors)
 	facts.Known = true
 	applyBuildCacheMeasurement(cache, cacheBytes, cacheMeasuredAt, cacheError, time.Now().UTC())
 
 	var success *time.Time
 	if err := pool.QueryRow(queryCtx, `SELECT coalesce(finished_at,started_at) FROM eregion_retention_runs
-        WHERE status='succeeded' ORDER BY finished_at DESC NULLS LAST,started_at DESC LIMIT 1`).Scan(&success); err != nil {
+        WHERE status IN ('succeeded','succeeded_with_skips') ORDER BY finished_at DESC NULLS LAST,started_at DESC LIMIT 1`).Scan(&success); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			facts.Known = false
 			facts.Error = "the last successful retention run could not be read"
@@ -157,6 +162,20 @@ func loadRetentionPolicyCap(ctx context.Context, pool *pgxpool.Pool, cache *Buil
 	if policy.BuildpackCacheMaxBytes > 0 {
 		cache.CapBytes = policy.BuildpackCacheMaxBytes
 	}
+}
+
+func countRetentionSkips(raw []byte) int {
+	items := []retention.RunError{}
+	if len(raw) == 0 || json.Unmarshal(raw, &items) != nil {
+		return 0
+	}
+	count := 0
+	for _, item := range items {
+		if item.Stage == "skipped" || item.Stage == "stale_plan" || strings.HasSuffix(item.Stage, "_skipped") {
+			count++
+		}
+	}
+	return count
 }
 
 func applyBuildCacheMeasurement(cache *BuildCacheFacts, bytes *int64, measuredAt *time.Time, measurementError string, now time.Time) {
@@ -219,7 +238,7 @@ func retentionLastRun(facts Facts) []Result {
 				"inspect eregion operations list --json and the worker logs")
 		}
 		return one(Pass, "the retention run started at "+run.StartedAt.UTC().Format(time.RFC3339)+" is still running", "")
-	case retention.RunSucceeded:
+	case retention.RunSucceeded, retention.RunSucceededWithSkips:
 	default:
 		detail := fmt.Sprintf("the last retention run %s at %s", run.Status, finished.UTC().Format(time.RFC3339))
 		if run.Errors > 0 {
@@ -246,6 +265,9 @@ func retentionLastRun(facts Facts) []Result {
 		finished.UTC().Format(time.RFC3339), run.RemovedItems, humanBytes(run.ReclaimedBytes))
 	if run.PlannedBytes > 0 {
 		detail += fmt.Sprintf(" (the plan reclaimable was %s)", humanBytes(run.PlannedBytes))
+	}
+	if run.Skipped > 0 {
+		detail += fmt.Sprintf("; %d item(s) skipped", run.Skipped)
 	}
 	return one(Pass, detail, "")
 }

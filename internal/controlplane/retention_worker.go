@@ -462,6 +462,7 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 	}
 
 	attempted := map[string]bool{}
+	skippedItems := map[string]bool{}
 	for {
 		item, ok := nextRetentionRemoval(run, removed, attempted)
 		if !ok {
@@ -498,6 +499,7 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 				s.recordRetentionSkip(run, "image_skipped", item.Reference, reason)
 				s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
 					"Skipped local image "+item.Reference+" for release "+item.Release+": "+reason)
+				skippedItems[retentionItemKey(item)] = true
 				continue
 			}
 		}
@@ -512,12 +514,36 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 		if item.Kind == retention.ItemRegistryArtifact {
 			payload.Registry = platform.DefaultRegistryAddr
 		}
-		if _, err := (&platformWorker{service: s}).runStepOn(ctx, transport, op.ID, attempt, stepID, payload, nil); err != nil {
+		result, err := (&platformWorker{service: s}).runStepOn(ctx, transport, op.ID, attempt, stepID, payload, nil)
+		if err != nil {
+			// A deterministic conflict is a per-item skip, not a failed run:
+			// retrying cannot make the node accept the same removal.
+			if contract.Classify(err).Code == contract.Conflict {
+				reason := s.cleanupCauseText(err)
+				if reason == "" {
+					reason = "the node refused the removal with a deterministic conflict"
+				}
+				s.recordRetentionSkip(run, "skipped", item.Reference, reason)
+				s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
+					"Skipped "+string(item.Kind)+" "+item.Reference+": "+reason)
+				skippedItems[retentionItemKey(item)] = true
+				continue
+			}
 			if item.Kind == retention.ItemRegistryArtifact {
 				registryFailedThisAttempt = true
 			}
 			s.recordRetentionRunError(run, string(item.Kind), item.Reference, err)
 			failures = append(failures, err)
+			continue
+		}
+		if skipped, reason := retentionStepSkipped(result); skipped {
+			if reason == "" {
+				reason = "the node reported a deterministic skip"
+			}
+			s.recordRetentionSkip(run, "skipped", item.Reference, reason)
+			s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
+				"Skipped "+string(item.Kind)+" "+item.Reference+": "+reason)
+			skippedItems[retentionItemKey(item)] = true
 			continue
 		}
 		run.Removed = append(run.Removed, item)
@@ -533,6 +559,17 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 		}
 		s.appendWorkerEvent(ctx, op.ID, attempt, "retention",
 			fmt.Sprintf("Removed %s %s (%d bytes).", item.Kind, item.Reference, item.Bytes))
+	}
+
+	if len(skippedItems) > 0 {
+		kept := make([]retention.Item, 0, len(run.Planned))
+		for _, item := range run.Planned {
+			if skippedItems[retentionItemKey(item)] {
+				continue
+			}
+			kept = append(kept, item)
+		}
+		run.Planned = kept
 	}
 
 	registryUnsettled := false
@@ -593,6 +630,8 @@ func (s *Service) executeRetentionRun(ctx context.Context, op contract.Operation
 	run.FinishedAt = &finished
 	if len(failures) > 0 {
 		run.Status = retention.RunFailed
+	} else if retentionRunHasSkips(run.Errors) {
+		run.Status = retention.RunSucceededWithSkips
 	} else {
 		run.Status = retention.RunSucceeded
 	}
@@ -613,6 +652,34 @@ const retentionGCMarker = "registry_gc\x00registry-gc"
 
 func retentionItemKey(item retention.Item) string {
 	return string(item.Kind) + "\x00" + item.Reference
+}
+
+// retentionStepSkipped reads the per-item skip result a node effect records when
+// it deterministically refuses a removal. A skip is a completed effect, not an
+// error: the item leaves the plan and its reason stays in the run.
+func retentionStepSkipped(result json.RawMessage) (bool, string) {
+	if len(result) == 0 {
+		return false, ""
+	}
+	var value struct {
+		Skipped bool   `json:"skipped"`
+		Reason  string `json:"reason"`
+	}
+	if json.Unmarshal(result, &value) != nil {
+		return false, ""
+	}
+	return value.Skipped, value.Reason
+}
+
+// retentionRunHasSkips reports whether the run recorded any per-item skip
+// diagnostic. Only skip stages count; a real failure keeps the failed status.
+func retentionRunHasSkips(runErrors []retention.RunError) bool {
+	for _, item := range runErrors {
+		if item.Stage == "skipped" || item.Stage == "stale_plan" || strings.HasSuffix(item.Stage, "_skipped") {
+			return true
+		}
+	}
+	return false
 }
 
 // retentionApplyCacheMeasurement records the node's latest cache observation.
@@ -744,7 +811,7 @@ func (s *Service) retentionImageStillShared(ctx context.Context, imageID, releas
 		return false, "", err
 	}
 	for _, container := range inventory.Containers {
-		if strings.TrimSpace(container.Image) == imageID {
+		if strings.EqualFold(strings.TrimSpace(container.Image), imageID) {
 			return true, "image is still used by container " + container.Name, nil
 		}
 	}

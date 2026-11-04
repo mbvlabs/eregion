@@ -90,11 +90,16 @@ func InputFromInventory(inventory Inventory, state PlatformState, now time.Time)
 	}
 
 	for _, container := range inventory.Containers {
+		owned := container.Owned
+		if _, labeled := container.Labels[ContainerAppLabel]; labeled {
+			owned = true
+		}
 		input.Containers = append(input.Containers, Container{
 			ID:          container.ID,
 			Name:        container.Name,
 			App:         container.Labels[ContainerAppLabel],
 			Environment: container.Labels[ContainerEnvironmentLabel],
+			Owned:       owned,
 			Release:     container.Labels[ContainerReleaseLabel],
 			Deployment:  container.Labels[ContainerDeploymentLabel],
 			Image:       container.Image,
@@ -117,6 +122,7 @@ func InputFromInventory(inventory Inventory, state PlatformState, now time.Time)
 		}
 		input.LocalImages = append(input.LocalImages, LocalImageRef{
 			ID:          image.ID,
+			RepoTags:    append([]string(nil), image.RepoTags...),
 			RepoDigests: append([]string(nil), image.RepoDigests...),
 		})
 	}

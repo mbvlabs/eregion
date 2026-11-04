@@ -240,6 +240,7 @@ func registryStorageFault(registryDir string, err error) error {
 
 type dockerContainerInspect struct {
 	ID      string `json:"Id"`
+	Image   string `json:"Image"`
 	Name    string `json:"Name"`
 	Created string `json:"Created"`
 	State   struct {
@@ -252,10 +253,14 @@ type dockerContainerInspect struct {
 	SizeRw int64 `json:"SizeRw"`
 }
 
+// readRetentionContainers reports every container on the node, labeled or not.
+// An unlabeled container is never a removal candidate, but its immutable image
+// ID must protect that image from deletion. Ownership comes only from a present
+// io.eregion.app label.
 func readRetentionContainers(ctx context.Context, run NodeReadRunner) ([]retention.InventoryContainer, bool, error) {
-	raw, err := run(ctx, "docker", "ps", "--all", "--quiet", "--no-trunc", "--filter", "label=io.eregion.app")
+	raw, err := run(ctx, "docker", "ps", "--all", "--quiet", "--no-trunc")
 	if err != nil {
-		return nil, false, dockerObservationFault("list labeled containers", err)
+		return nil, false, dockerObservationFault("list containers", err)
 	}
 	ids := splitLines(raw)
 	ids, truncated := capRetentionItems(ids)
@@ -267,7 +272,7 @@ func readRetentionContainers(ctx context.Context, run NodeReadRunner) ([]retenti
 		argv := append([]string{"docker", "container", "inspect", "--size"}, chunk...)
 		raw, err := run(ctx, argv...)
 		if err != nil {
-			return nil, false, dockerObservationFault("inspect labeled containers", err)
+			return nil, false, dockerObservationFault("inspect containers", err)
 		}
 		var page []dockerContainerInspect
 		if err := json.Unmarshal(bytes.TrimSpace(raw), &page); err != nil {
@@ -277,9 +282,14 @@ func readRetentionContainers(ctx context.Context, run NodeReadRunner) ([]retenti
 	}
 	containers := make([]retention.InventoryContainer, 0, len(inspected))
 	for _, item := range inspected {
+		_, owned := item.Config.Labels[retention.ContainerAppLabel]
+		image := strings.TrimSpace(item.Image)
+		if image == "" {
+			image = strings.TrimSpace(item.Config.Image)
+		}
 		containers = append(containers, retention.InventoryContainer{
-			ID: item.ID, Name: strings.TrimPrefix(item.Name, "/"), Image: item.Config.Image,
-			State: item.State.Status, Labels: item.Config.Labels, SizeBytes: item.SizeRw,
+			ID: item.ID, Name: strings.TrimPrefix(item.Name, "/"), Image: image,
+			Owned: owned, State: item.State.Status, Labels: item.Config.Labels, SizeBytes: item.SizeRw,
 			CreatedAt: parseDockerTime(item.Created),
 		})
 	}
@@ -850,9 +860,13 @@ func alreadyGone(err error) bool {
 
 func dockerObservationFault(action string, err error) error {
 	message := strings.ToLower(err.Error())
-	if errors.Is(err, exec.ErrNotFound) || strings.Contains(message, "cannot connect to the docker daemon") ||
-		strings.Contains(message, "executable file not found") {
+	if errors.Is(err, exec.ErrNotFound) || strings.Contains(message, "executable file not found") {
 		return contract.NewFault(contract.PreconditionFailed, "Docker is not available on this node", "Install Docker and start it before reading or pruning disk artifacts.")
+	}
+	if strings.Contains(message, "cannot connect to the docker daemon") {
+		// A stopped or restarting daemon is transient: the retention job
+		// retries instead of failing the operation permanently.
+		return contract.NewFault(contract.Unavailable, "the node could not "+action, boundedCommandOutput(err.Error()))
 	}
 	return contract.NewFault(contract.Unavailable, "the node could not "+action, boundedCommandOutput(err.Error()))
 }

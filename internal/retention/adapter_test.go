@@ -24,6 +24,8 @@ func TestInputFromInventoryMapsNodeObservation(t *testing.T) {
 				ContainerAppLabel: "api", ContainerEnvironmentLabel: "production",
 				ContainerReleaseLabel: "rel_1", ContainerDeploymentLabel: "dep_1",
 			},
+		}, {
+			ID: "cid2", Name: "pedantic_jackson", Image: "sha256:unlabeled", State: "exited",
 		}},
 		DanglingImages: []InventoryImage{{ID: "sha256:dangling", SizeBytes: 40}},
 		LocalImages: []LocalImage{{
@@ -57,12 +59,15 @@ func TestInputFromInventoryMapsNodeObservation(t *testing.T) {
 		t.Fatalf("disk = used %d total %d", input.Cache.DiskUsedBytes, input.Cache.DiskTotalBytes)
 	}
 
-	if len(input.Containers) != 1 {
+	if len(input.Containers) != 2 {
 		t.Fatalf("containers = %+v", input.Containers)
 	}
 	container := input.Containers[0]
-	if container.App != "api" || container.Environment != "production" || container.Release != "rel_1" || container.Deployment != "dep_1" {
+	if !container.Owned || container.App != "api" || container.Environment != "production" || container.Release != "rel_1" || container.Deployment != "dep_1" {
 		t.Fatalf("container labels were not mapped: %+v", container)
+	}
+	if input.Containers[1].Owned || input.Containers[1].Image != "sha256:unlabeled" {
+		t.Fatalf("an unlabeled container was mapped as owned or without its image: %+v", input.Containers[1])
 	}
 	if len(input.Images) != 1 || !input.Images[0].Dangling || input.Images[0].ID != "sha256:dangling" {
 		t.Fatalf("dangling images = %+v", input.Images)

@@ -1,6 +1,7 @@
 package retention
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -97,5 +98,83 @@ func TestPlanPrunedReleaseStillRemovesPresentImage(t *testing.T) {
 	}
 	if !containsReference(items, ItemImage, imageID) {
 		t.Fatalf("a pruned release's still-present image was not planned for removal: %+v", items)
+	}
+}
+
+func TestPlanImageItemShowsCurrentRepoTags(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.KeepReleases = 1
+	policy.KeepNewerThanDays = 1
+	imageID := "sha256:" + strings.Repeat("f", 64)
+	items := Plan(Input{
+		Environments: []Environment{{App: "api", Name: "production", ServingRelease: "rel_kept", Policy: policy}},
+		Releases: []Release{
+			{ID: "rel_old", App: "api", Environment: "production", ImageID: imageID, CreatedAt: daysAgo(30)},
+			{ID: "rel_kept", App: "api", Environment: "production", ImageID: "sha256:" + strings.Repeat("d", 64), CreatedAt: daysAgo(1)},
+		},
+		LocalImages: []LocalImageRef{{
+			ID:       imageID,
+			RepoTags: []string{"127.0.0.1:5000/api:old", "127.0.0.1:5000/api:older"},
+		}},
+		Now: planNow,
+	})
+	for _, item := range items {
+		if item.Kind != ItemImage || item.Reference != imageID {
+			continue
+		}
+		want := []string{"127.0.0.1:5000/api:old", "127.0.0.1:5000/api:older"}
+		if !reflect.DeepEqual(item.Tags, want) {
+			t.Fatalf("image item tags = %v, want %v", item.Tags, want)
+		}
+		return
+	}
+	t.Fatalf("the release image was not planned: %+v", items)
+}
+
+func TestPlanProtectsImagesUsedByUnlabeledContainers(t *testing.T) {
+	policy := DefaultPolicy()
+	policy.KeepReleases = 1
+	policy.KeepNewerThanDays = 1
+	releaseImage := "sha256:" + strings.Repeat("a", 64)
+	danglingImage := "sha256:" + strings.Repeat("b", 64)
+	items := Plan(Input{
+		Environments: []Environment{{App: "api", Name: "production", ServingRelease: "rel_kept", Policy: policy}},
+		Releases: []Release{
+			{ID: "rel_old", App: "api", Environment: "production", ImageID: releaseImage, CreatedAt: daysAgo(30)},
+			{ID: "rel_kept", App: "api", Environment: "production", ImageID: "sha256:" + strings.Repeat("d", 64), CreatedAt: daysAgo(1)},
+		},
+		Containers: []Container{
+			{Name: "pedantic_jackson", Image: releaseImage, Owned: false},
+			{Name: "ea1e68560301", Image: danglingImage, Owned: false},
+		},
+		Images: []Image{{ID: danglingImage, Dangling: true, Bytes: 1 << 30}},
+		LocalImages: []LocalImageRef{{
+			ID: releaseImage, RepoTags: []string{"127.0.0.1:5000/api:old"},
+		}},
+		Now: planNow,
+	})
+	if containsReference(items, ItemImage, releaseImage) {
+		t.Fatalf("an image used by an unlabeled container was planned for removal: %+v", items)
+	}
+	if containsReference(items, ItemDanglingImage, danglingImage) {
+		t.Fatalf("a dangling image used by an unlabeled container was planned: %+v", items)
+	}
+	if containsReference(items, ItemContainer, "pedantic_jackson") {
+		t.Fatalf("an unlabeled container was planned for removal: %+v", items)
+	}
+	reasons := []string{}
+	for _, item := range items {
+		if item.Kind == ItemImageSkipped {
+			reasons = append(reasons, item.Reason)
+		}
+	}
+	joined := strings.Join(reasons, "\n")
+	for _, want := range []string{"used by container pedantic_jackson", "used by container ea1e68560301"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("skip diagnostics %q lack %q", joined, want)
+		}
+	}
+	if bytes := TotalBytes(items); bytes != 0 {
+		t.Fatalf("a protected image's bytes counted as reclaimable: %d", bytes)
 	}
 }

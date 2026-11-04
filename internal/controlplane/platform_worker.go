@@ -822,6 +822,12 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 		if failErr := w.service.failStep(ctx, id, attempt, stepID, code, detail); failErr != nil {
 			return nil, failErr
 		}
+		if code == contract.Conflict {
+			// Preserve the machine-readable refusal so a caller that can
+			// classify it (retention) records a per-item skip instead of a
+			// generic permanent failure.
+			return nil, contract.NewFault(contract.Conflict, "node step "+stepID+" conflicted: "+detail, "Inspect the node state; a deterministic conflict is not fixed by retrying.")
+		}
 		if response.Retryable {
 			return nil, fmt.Errorf("node step %s failed: %s", stepID, detail)
 		}

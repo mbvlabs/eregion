@@ -23,11 +23,13 @@ import (
 // retentionFakeTransport answers the retention inventory and records every
 // node effect. It never touches Docker or a real journal.
 type retentionFakeTransport struct {
-	inventory retention.Inventory
-	steps     []string
-	payloads  []platform.RetentionRemovePayload
-	failSteps map[string]int
-	onRun     func(string)
+	inventory     retention.Inventory
+	steps         []string
+	payloads      []platform.RetentionRemovePayload
+	failSteps     map[string]int
+	skipSteps     map[string]string
+	conflictSteps map[string]bool
+	onRun         func(string)
 }
 
 func (*retentionFakeTransport) Name() string         { return "retention-fake" }
@@ -50,6 +52,16 @@ func (f *retentionFakeTransport) Call(_ context.Context, request node.Request, _
 			f.payloads = append(f.payloads, payload)
 		}
 		f.steps = append(f.steps, step)
+		if reason, ok := f.skipSteps[step]; ok {
+			result, _ := json.Marshal(map[string]any{"skipped": true, "reason": reason})
+			return node.Response{Status: engine.StatusCompleted, Result: result}, nil
+		}
+		if f.conflictSteps[step] {
+			return node.Response{
+				Status: engine.StatusFailed, ErrorCode: string(contract.Conflict),
+				Retryable: false, Detail: "image is referenced in multiple repositories",
+			}, nil
+		}
 		if f.failSteps[step] > 0 {
 			f.failSteps[step]--
 			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Unavailable), Retryable: true, Detail: "transient node failure"}, nil
@@ -119,7 +131,9 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 			},
 			Disk: retention.Disk{TotalBytes: 1 << 40, FreeBytes: 1 << 39},
 		},
-		failSteps: map[string]int{},
+		failSteps:     map[string]int{},
+		skipSteps:     map[string]string{},
+		conflictSteps: map[string]bool{},
 	}
 	s.transport = transport
 	return &retentionFixture{
@@ -392,6 +406,40 @@ func TestIntegrationRetentionWorkerRetriesAFailedEffect(t *testing.T) {
 	}
 	if pendingAfterSuccess {
 		t.Fatal("the completed GC did not clear the pending flag")
+	}
+}
+
+func TestIntegrationRetentionWorkerRecordsADeterministicConflictAsSkip(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	s := fixture.service
+	op := submitRetentionWorkerPrune(t, s, "retention-worker-conflict-skip")
+	oldConfig := "sha256:" + strings.Repeat("a", 64)
+	fixture.transport.conflictSteps[platform.RetentionRemoveStepID(retention.ItemImage, oldConfig)] = true
+	if err := (&retentionWorker{service: s}).Work(context.Background(), retentionWorkerJob(op.ID, 1, 8)); err != nil {
+		t.Fatalf("a deterministic conflict failed the retention operation: %v", err)
+	}
+	var status string
+	var errorsRaw, plannedRaw []byte
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT status,errors,planned_items FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).
+		Scan(&status, &errorsRaw, &plannedRaw); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(retention.RunSucceededWithSkips) {
+		t.Fatalf("run status = %s, want %s", status, retention.RunSucceededWithSkips)
+	}
+	if !strings.Contains(string(errorsRaw), `"stage": "skipped"`) ||
+		!strings.Contains(string(errorsRaw), "referenced in multiple repositories") {
+		t.Fatalf("run did not record the conflict skip reason: %s", errorsRaw)
+	}
+	if strings.Contains(string(plannedRaw), oldConfig) {
+		t.Fatalf("a skipped image remained in the retry plan: %s", plannedRaw)
+	}
+	var state contract.State
+	if err := fixture.pool.QueryRow(context.Background(), `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != contract.Succeeded {
+		t.Fatalf("operation state = %s, want succeeded with warnings", state)
 	}
 }
 

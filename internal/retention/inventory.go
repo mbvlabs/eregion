@@ -62,19 +62,24 @@ type CacheVolume struct {
 	SizeUnknown bool `json:"size_unknown,omitempty"`
 }
 
-// InventoryContainer is one eregion-labeled Docker container.
+// InventoryContainer is one Docker container observed on the node. Owned is
+// true only when it carries the io.eregion.app label. Unowned containers are
+// reported so their image can never be removed while the container still uses
+// it; they are never removal candidates.
 type InventoryContainer struct {
 	ID        string            `json:"id"`
 	Name      string            `json:"name"`
 	Image     string            `json:"image"`
+	Owned     bool              `json:"owned,omitempty"`
 	State     string            `json:"state"`
 	Labels    map[string]string `json:"labels,omitempty"`
 	SizeBytes int64             `json:"size_bytes,omitempty"`
 	CreatedAt *time.Time        `json:"created_at,omitempty"`
 }
 
-// InventoryImage is one dangling Docker image: a layer set no tag and no container
-// names. Its ID is the local immutable identifier a removal effect uses.
+// InventoryImage is one dangling Docker image: a layer set no tag names. Its ID
+// is the local immutable identifier a removal effect uses. A container using it,
+// labeled or not, protects it from removal.
 type InventoryImage struct {
 	ID        string     `json:"id"`
 	SizeBytes int64      `json:"size_bytes"`

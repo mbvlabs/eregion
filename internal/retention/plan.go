@@ -31,7 +31,9 @@ type Input struct {
 	Registry RegistryInventory
 	// Cache is the Buildpacks cache and the filesystem state it lives on.
 	Cache CacheInventory
-	// Containers is the eregion-labelled Docker containers on the node.
+	// Containers is every Docker container on the node, labeled or not. Every
+	// entry protects the image it uses; only an eregion-owned container (the
+	// io.eregion.app label) is ever a removal candidate.
 	Containers []Container
 	// Images is the Docker images on the node.
 	Images []Image
@@ -174,19 +176,25 @@ type CacheEntry struct {
 	LastUsedAt time.Time
 }
 
-// Container is one eregion-labelled Docker container from docker ps.
+// Container is one Docker container from docker ps. A container is an eregion
+// workload only when it carries the io.eregion.app label (Owned, or the App
+// value supplied by older callers). Every container's Image protects that image,
+// running or stopped, labeled or not.
 type Container struct {
 	ID          string
 	Name        string
 	App         string
 	Environment string
+	// Owned is true when the container carries the io.eregion.app ownership
+	// label. An unowned container is never removed by retention.
+	Owned bool
 	// Release and Deployment are the io.eregion.release and
 	// io.eregion.deployment ownership labels.
 	Release    string
 	Deployment string
-	// Image is the image reference or immutable image ID Docker reports for
-	// the container. It protects an image that a stopped or running container
-	// still uses from retention removal.
+	// Image is Docker's immutable image ID for the container. It protects an
+	// image that a stopped or running container still uses from retention
+	// removal, no matter who created the container.
 	Image string
 	// State is Docker's container state, kept for operator-readable reasons.
 	State string
@@ -212,12 +220,16 @@ type Image struct {
 }
 
 // LocalImageRef is the planner's minimal view of one Docker image on the node.
-// It is intentionally compatible with a richer inventory LocalImage: only the
-// config ID and RepoDigests are needed to map Release.ImageID to a manifest.
+// It is intentionally compatible with a richer inventory LocalImage: the
+// config ID, repository tags and RepoDigests are enough to map Release.ImageID
+// to a manifest and to show which tags an image removal will untag.
 type LocalImageRef struct {
 	// ID is Docker's local image ID, which is the image config digest
 	// (sha256:…), matching Release.ImageID.
 	ID string
+	// RepoTags are the repository:tag references Docker still points at the
+	// image. They are operator-visible dry-run detail; removal re-reads them.
+	RepoTags []string
 	// RepoDigests are Docker's repository@sha256:… entries for the image. They
 	// are immutable manifest identities even when the release's tag has moved.
 	RepoDigests []string
@@ -413,7 +425,7 @@ func Plan(in Input) []Item {
 		}
 	}
 	items = append(items, imageItems...)
-	items = append(items, planDanglingImages(in.Images, protectedImageDigests, retainedReleaseIDs, plannedImageIDs)...)
+	items = append(items, planDanglingImages(in.Images, protectedImageDigests, retainedReleaseIDs, plannedImageIDs, in.Containers)...)
 	return items
 }
 
@@ -641,6 +653,12 @@ func planContainers(environmentByKey map[environmentKey]Environment, containers 
 
 	items := []Item{}
 	for _, container := range sorted {
+		// Only an eregion-owned container is a removal candidate. Every
+		// container still protects its image through planReleaseImages and
+		// planDanglingImages.
+		if !container.Owned && strings.TrimSpace(container.App) == "" {
+			continue
+		}
 		if inFlightReleases[container.Release] ||
 			inFlightDeployments[container.Deployment] ||
 			inFlightContainers[container.Name] ||
@@ -710,16 +728,8 @@ func planReleaseImages(releases []Release, planned, protected map[string]bool, c
 			retainedImages[imageID] = release.ID
 		}
 	}
-	containerImages := map[string]string{}
-	for _, container := range containers {
-		imageID := normalizeDigest(container.Image)
-		if !validDigest(imageID) {
-			continue
-		}
-		if _, exists := containerImages[imageID]; !exists {
-			containerImages[imageID] = containerReference(container)
-		}
-	}
+	containerImages := containerImageOwners(containers)
+	imageTags := localImageRepoTags(localImages)
 	presentImages := map[string]bool{}
 	for _, image := range localImages {
 		if imageID := normalizeDigest(image.ID); imageID != "" {
@@ -766,7 +776,7 @@ func planReleaseImages(releases []Release, planned, protected map[string]bool, c
 				items = append(items, Item{
 					Kind: ItemImageSkipped, App: release.App, Environment: release.Environment,
 					Release: release.ID, Reference: release.ID,
-					Reason: "image " + imageID + " is still used by container " + container,
+					Reason: "used by container " + container,
 				})
 			}
 			continue
@@ -782,18 +792,70 @@ func planReleaseImages(releases []Release, planned, protected map[string]bool, c
 		plannedImages[imageID] = true
 		items = append(items, Item{
 			Kind: ItemImage, App: release.App, Environment: release.Environment,
-			Release: release.ID, Reference: imageID,
+			Release: release.ID, Reference: imageID, Tags: imageTags[imageID],
 			Reason: "release image is not used by a retained release or container",
 		})
 	}
 	return items
 }
 
-func planDanglingImages(images []Image, protectedArtifacts, retainedReleaseIDs, plannedImageIDs map[string]bool) []Item {
+// containerImageOwners maps every container's immutable image ID to one stable
+// owner name. Both labeled and unlabeled containers protect their image; the
+// lexicographically smallest name keeps the plan deterministic when several
+// containers share an image.
+func containerImageOwners(containers []Container) map[string]string {
+	owners := map[string]string{}
+	for _, container := range containers {
+		imageID := normalizeDigest(container.Image)
+		if imageID == "" {
+			continue
+		}
+		owner := containerReference(container)
+		if existing, found := owners[imageID]; !found || owner < existing {
+			owners[imageID] = owner
+		}
+	}
+	return owners
+}
+
+// localImageRepoTags maps an immutable image ID to its current repository tags.
+// It is dry-run detail: the removal effect re-reads the tags before untagging.
+func localImageRepoTags(localImages []LocalImageRef) map[string][]string {
+	seen := map[string]map[string]bool{}
+	for _, image := range localImages {
+		imageID := normalizeDigest(image.ID)
+		if imageID == "" {
+			continue
+		}
+		for _, tag := range image.RepoTags {
+			tag = strings.TrimSpace(tag)
+			if tag == "" {
+				continue
+			}
+			if seen[imageID] == nil {
+				seen[imageID] = map[string]bool{}
+			}
+			seen[imageID][tag] = true
+		}
+	}
+	tags := make(map[string][]string, len(seen))
+	for imageID, values := range seen {
+		list := make([]string, 0, len(values))
+		for tag := range values {
+			list = append(list, tag)
+		}
+		sort.Strings(list)
+		tags[imageID] = list
+	}
+	return tags
+}
+
+func planDanglingImages(images []Image, protectedArtifacts, retainedReleaseIDs, plannedImageIDs map[string]bool, containers []Container) []Item {
 	sorted := append([]Image(nil), images...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return imageReference(sorted[i]) < imageReference(sorted[j])
 	})
+	containerImages := containerImageOwners(containers)
 
 	items := []Item{}
 	for _, image := range sorted {
@@ -808,6 +870,13 @@ func planDanglingImages(images []Image, protectedArtifacts, retainedReleaseIDs, 
 			continue
 		}
 		if digest := strings.TrimSpace(image.Digest); digest != "" && protectedArtifacts[digest] {
+			continue
+		}
+		if owner, used := containerImages[normalizeDigest(reference)]; used {
+			items = append(items, Item{
+				Kind: ItemImageSkipped, Reference: reference,
+				Reason: "used by container " + owner,
+			})
 			continue
 		}
 		items = append(items, Item{

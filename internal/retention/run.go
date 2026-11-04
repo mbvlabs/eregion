@@ -13,8 +13,13 @@ const (
 	RunPending   RunStatus = "pending"
 	RunRunning   RunStatus = "running"
 	RunSucceeded RunStatus = "succeeded"
-	RunFailed    RunStatus = "failed"
-	RunCancelled RunStatus = "cancelled"
+	// RunSucceededWithSkips is a completed run that left at least one item in
+	// place because the node deterministically refused it or the item became
+	// protected. The run's errors carry the per-item skip reason; doctor treats
+	// it as a pass with an informational note, not a warning.
+	RunSucceededWithSkips RunStatus = "succeeded_with_skips"
+	RunFailed             RunStatus = "failed"
+	RunCancelled          RunStatus = "cancelled"
 )
 
 // ItemKind names one class of retention candidate. The planner and node
@@ -32,9 +37,10 @@ const (
 	// ItemRegistryGC records the registry garbage-collection effect in a run's
 	// removed items. The planner never emits it.
 	ItemRegistryGC ItemKind = "registry_gc"
-	// ItemImage removes one local Docker image by its immutable image ID. It is
-	// planned separately from ItemRelease so marking a release row can never
-	// imply removing a tag or an image another release still needs.
+	// ItemImage removes one local Docker image after verifying every current
+	// repository tag still resolves to its immutable image ID. It is planned
+	// separately from ItemRelease so marking a release row can never imply
+	// removing a tag or an image another release still needs.
 	ItemImage ItemKind = "image"
 	// ItemImageSkipped is a diagnostic, not a removal: it names a release whose
 	// image cannot be removed because the release has no immutable identity, or
@@ -61,12 +67,18 @@ type Item struct {
 	// re-check the right release after a retry without parsing the reason.
 	Release   string `json:"release,omitempty"`
 	Reference string `json:"reference,omitempty"`
-	Bytes     int64  `json:"bytes,omitempty"`
-	Reason    string `json:"reason,omitempty"`
+	// Tags are the repository tags a planned image removal will untag. The
+	// executor re-reads the current tags before removing any of them, so this
+	// is the operator-visible dry-run detail rather than an authorization.
+	Tags   []string `json:"tags,omitempty"`
+	Bytes  int64    `json:"bytes,omitempty"`
+	Reason string   `json:"reason,omitempty"`
 }
 
-// RunError is one per-item retention failure. A failure never hides the rest
-// of the run: the remaining items stay recorded.
+// RunError is one per-item retention failure or skip. A failure never hides the
+// rest of the run: the remaining items stay recorded. Skip stages end in
+// `_skipped`, are `skipped`, or are `stale_plan`; they let a completed run
+// carry warnings without failing.
 type RunError struct {
 	Stage     string `json:"stage,omitempty"`
 	Reference string `json:"reference,omitempty"`

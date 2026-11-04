@@ -148,8 +148,8 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
     ]}`)
 
 	answers := map[string]string{
-		"docker ps --all --quiet --no-trunc --filter label=io.eregion.app":                             "cid1\n",
-		"docker container inspect --size cid1":                                                         `[{"Id":"cid1","Name":"/eregion-api-production-abc","Created":"2026-02-03T04:05:06.123456789Z","State":{"Status":"exited"},"Config":{"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Labels":{"io.eregion.app":"api","io.eregion.environment":"production"}},"SizeRw":1024}]`,
+		"docker ps --all --quiet --no-trunc":                                                           "cid1\ncid2\n",
+		"docker container inspect --size cid1 cid2":                                                    `[{"Id":"cid1","Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Name":"/eregion-api-production-abc","Created":"2026-02-03T04:05:06.123456789Z","State":{"Status":"exited"},"Config":{"Image":"127.0.0.1:5000/api:old","Labels":{"io.eregion.app":"api","io.eregion.environment":"production"}},"SizeRw":1024},{"Id":"cid2","Image":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","Name":"/pedantic_jackson","Created":"2026-02-04T05:06:07Z","State":{"Status":"exited"},"Config":{"Image":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","Labels":{}},"SizeRw":2048}]`,
 		"docker image ls --quiet --no-trunc --filter dangling=true":                                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
 		"docker image inspect sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": `[{"Id":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Created":"2026-02-04T05:06:07Z","Size":2048}]`,
 		"docker volume ls --quiet --filter name=eregion-build-cache-":                                  testBuildCacheVolume + "\n",
@@ -212,18 +212,25 @@ func TestObserveRetentionInventoryReadsRegistryDockerAndDisk(t *testing.T) {
 		t.Fatalf("a missing manifest blob must be an explicit warning: %+v", inventory.Warnings)
 	}
 
-	if len(inventory.Containers) != 1 {
+	if len(inventory.Containers) != 2 {
 		t.Fatalf("containers = %+v", inventory.Containers)
 	}
 	container := inventory.Containers[0]
-	if container.Name != "eregion-api-production-abc" || container.State != "exited" || container.SizeBytes != 1024 {
+	if container.Name != "eregion-api-production-abc" || !container.Owned || container.State != "exited" || container.SizeBytes != 1024 {
 		t.Fatalf("container = %+v", container)
+	}
+	if container.Image != "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("container image identity = %q", container.Image)
 	}
 	if container.Labels["io.eregion.app"] != "api" {
 		t.Fatalf("container labels = %+v", container.Labels)
 	}
 	if container.CreatedAt == nil || container.CreatedAt.UTC().Format(time.RFC3339Nano) != "2026-02-03T04:05:06.123456789Z" {
 		t.Fatalf("container created = %v", container.CreatedAt)
+	}
+	unlabeled := inventory.Containers[1]
+	if unlabeled.Name != "pedantic_jackson" || unlabeled.Owned || unlabeled.Image == "" {
+		t.Fatalf("an unlabeled container must be reported for image protection only: %+v", unlabeled)
 	}
 
 	if len(inventory.DanglingImages) != 1 || inventory.DanglingImages[0].SizeBytes != 2048 {
@@ -283,12 +290,12 @@ func TestObserveRetentionInventoryMarksUnknownCacheSizes(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dockerSocket := dockerAPISocket(t, tc.status, tc.body)
 			answers := map[string]string{
-				"docker ps --all --quiet --no-trunc --filter label=io.eregion.app": "",
-				"docker image ls --quiet --no-trunc --filter dangling=true":        "",
-				"docker image ls --all --quiet --no-trunc":                         "",
-				"docker volume ls --quiet --filter name=eregion-build-cache-":      testBuildCacheVolume + "\n",
-				"docker volume ls --quiet --filter name=eregion-launch-cache-":     "",
-				"docker volume ls --quiet --filter name=pack-cache-":               "",
+				"docker ps --all --quiet --no-trunc":                           "",
+				"docker image ls --quiet --no-trunc --filter dangling=true":    "",
+				"docker image ls --all --quiet --no-trunc":                     "",
+				"docker volume ls --quiet --filter name=eregion-build-cache-":  testBuildCacheVolume + "\n",
+				"docker volume ls --quiet --filter name=eregion-launch-cache-": "",
+				"docker volume ls --quiet --filter name=pack-cache-":           "",
 			}
 			run := func(_ context.Context, argv ...string) ([]byte, error) {
 				return []byte(answers[strings.Join(argv, " ")]), nil

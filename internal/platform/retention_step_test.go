@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,8 +170,8 @@ func TestRetentionRemoveStepTreatsAlreadyGoneAsSuccess(t *testing.T) {
 		reference string
 		want      string
 	}{
-		{retention.ItemRelease, "sha256:" + strings.Repeat("b", 64), "image rm"},
-		{retention.ItemDanglingImage, "eregion/api-production:old", "image rm"},
+		{retention.ItemRelease, "sha256:" + strings.Repeat("b", 64), "image inspect --format {{json .RepoTags}}"},
+		{retention.ItemDanglingImage, "eregion/api-production:old", "image inspect --format {{json .RepoTags}}"},
 		{retention.ItemContainer, "eregion-api-production-abc", "inspect --type=container"},
 		{retention.ItemBuildpackCache, testBuildCacheVolume, "volume rm"},
 		{retention.ItemBuildpackCache, "pack-cache-0123456789abcdef.build", "volume rm"},
@@ -235,6 +236,164 @@ func TestRetentionRemoveStepRendersTheRemovalCommands(t *testing.T) {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("missing command %q in:\n%s", want, raw)
 		}
+	}
+}
+
+// fakeRetentionImageDocker answers an image with the supplied repository tags.
+// One tag can resolve to a different image ID, and image removal can fail with
+// the supplied stderr.
+func fakeRetentionImageDocker(t *testing.T, repoTags []string, movedTag, otherID, removeError string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "calls")
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	encoded, err := json.Marshal(repoTags)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := `#!/bin/sh
+echo "$*" >> "$FAKE_LOG"
+case "$1 $2" in
+  "image inspect")
+    case "$4" in
+      "{{json .RepoTags}}") printf '%s' "$FAKE_TAGS";;
+      "{{.Id}}")
+        if [ "$5" = "$FAKE_MOVED_TAG" ]; then
+          printf '%s\n' "$FAKE_OTHER_ID"
+        else
+          printf '%s\n' "$FAKE_IMAGE_ID"
+        fi;;
+    esac
+    exit 0;;
+  "image rm")
+    if [ -n "$FAKE_REMOVE_ERROR" ]; then
+      printf '%s\n' "$FAKE_REMOVE_ERROR" >&2
+      exit 1
+    fi
+    exit 0;;
+esac
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_LOG", log)
+	t.Setenv("FAKE_IMAGE_ID", imageID)
+	t.Setenv("FAKE_OTHER_ID", otherID)
+	t.Setenv("FAKE_MOVED_TAG", movedTag)
+	t.Setenv("FAKE_TAGS", string(encoded))
+	t.Setenv("FAKE_REMOVE_ERROR", removeError)
+	return log, imageID
+}
+
+func TestRetentionRemoveStepUntagsEveryVerifiedRepoTags(t *testing.T) {
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	movedTag := "127.0.0.1:5000/api:moved"
+	log, _ := fakeRetentionImageDocker(t,
+		[]string{"127.0.0.1:5000/api:old", "127.0.0.1:5000/api:older", movedTag},
+		movedTag, "sha256:"+strings.Repeat("b", 64), "")
+	step := retentionRemoveStepFor(t, retention.ItemImage, imageID, nil)
+	result, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(result.Result)
+	if !strings.Contains(string(data), `"skipped":true`) || !strings.Contains(string(data), movedTag) {
+		t.Fatalf("a moved tag was not reported as a skip: %s", data)
+	}
+	raw, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	for _, want := range []string{
+		"image inspect --format {{json .RepoTags}} " + imageID,
+		"image inspect --format {{.Id}} 127.0.0.1:5000/api:old",
+		"image rm 127.0.0.1:5000/api:old",
+		"image inspect --format {{.Id}} 127.0.0.1:5000/api:older",
+		"image rm 127.0.0.1:5000/api:older",
+		"image inspect --format {{.Id}} " + movedTag,
+	} {
+		found := false
+		for _, line := range lines {
+			if strings.TrimSpace(line) == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("missing command %q in:\n%s", want, raw)
+		}
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "image rm "+movedTag) {
+			t.Fatalf("a tag that moved to another image was removed:\n%s", raw)
+		}
+		if strings.Contains(line, "--force") && strings.Contains(line, "image") {
+			t.Fatalf("image removal used --force:\n%s", raw)
+		}
+	}
+}
+
+func TestRetentionRemoveStepRemovesAllTagsWithoutForce(t *testing.T) {
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	log, _ := fakeRetentionImageDocker(t,
+		[]string{"127.0.0.1:5000/api:old", "127.0.0.1:5000/api:older"}, "", "", "")
+	step := retentionRemoveStepFor(t, retention.ItemImage, imageID, nil)
+	result, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(result.Result)
+	if !strings.Contains(string(data), `"removed":true`) {
+		t.Fatalf("all verified tags were not reported removed: %s", data)
+	}
+	raw, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "--force") {
+		t.Fatalf("image removal used --force:\n%s", raw)
+	}
+	for _, tag := range []string{"127.0.0.1:5000/api:old", "127.0.0.1:5000/api:older"} {
+		if !strings.Contains(string(raw), "image rm "+tag) {
+			t.Fatalf("tag %s was not removed:\n%s", tag, raw)
+		}
+	}
+}
+
+func TestRetentionRemoveStepClassifiesDockerConflictAsSkip(t *testing.T) {
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	_, _ = fakeRetentionImageDocker(t,
+		[]string{"127.0.0.1:5000/api:old"}, "", "",
+		"Error response from daemon: conflict: image is referenced in multiple repositories")
+	step := retentionRemoveStepFor(t, retention.ItemImage, imageID, nil)
+	result, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+	if err != nil {
+		t.Fatalf("a deterministic conflict failed the item: %v", err)
+	}
+	data, _ := json.Marshal(result.Result)
+	if !strings.Contains(string(data), `"skipped":true`) ||
+		!strings.Contains(string(data), "referenced in multiple repositories") {
+		t.Fatalf("conflict result = %s, want a skip with the reason", data)
+	}
+}
+
+func TestRetentionRemoveStepKeepsDaemonUnavailableRetryable(t *testing.T) {
+	imageID := "sha256:" + strings.Repeat("a", 64)
+	_, _ = fakeRetentionImageDocker(t, nil, "", "",
+		"Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
+	step := retentionRemoveStepFor(t, retention.ItemImage, imageID, nil)
+	_, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+	if err == nil {
+		t.Fatal("a daemon connection failure succeeded")
+	}
+	if errors.Is(err, engine.ErrPermanent) {
+		t.Fatalf("a daemon connection failure was marked permanent: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Cannot connect to the Docker daemon") {
+		t.Fatalf("daemon failure = %v", err)
 	}
 }
 

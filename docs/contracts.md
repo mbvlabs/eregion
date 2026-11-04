@@ -172,8 +172,11 @@ sha256}`, and new install inputs are uploaded as files beside the binary.
 `image`, `registry_artifact`, `buildpack_cache`, `container`, `dangling_image`
 and the diagnostics `registry_skipped`, `image_skipped` and `cache_skipped`
 (`reference:"*"` for a whole-registry or whole-cache skip when an incomplete
-observation prevented a deletion). `image` names an immutable local image ID;
-`release` only marks the release row, never a tag. `planned_bytes` counts only
+observation prevented a deletion). `image` names an immutable local image ID and
+carries `tags`, the current repository tags the removal will verify and untag;
+`release` only marks the release row, never a tag. `image_skipped` also reports
+an image (including a dangling image) still used by any container, labeled or
+not, with the reason `used by container <name>`. `planned_bytes` counts only
 real removals.
 `retention.show` takes `{app?,environment?}` and returns
 `{scope:"server"|"environment",server,override,effective,sources}` where
