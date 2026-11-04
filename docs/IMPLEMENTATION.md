@@ -485,7 +485,8 @@ when the day has a queued, running, cancelling or succeeded operation. When
 every operation for the day is failed or cancelled and the newest is at least
 an hour old, it submits one new operation with the next numbered idempotency
 key (`retention-daily:<date>:<n>`); the first run of a day keeps
-`retention-daily:<date>`. Thus at most one run succeeds per UTC day, a failed
+`retention-daily:<date>`. Thus at most one automatic daily run succeeds per
+UTC day (a manual `prune` is separate and does not count toward it), a failed
 or cancelled day can retry the same day, and a deterministic failure is bounded
 to one new attempt per hour instead of a loop. The operation's own River job
 claims the operation and then

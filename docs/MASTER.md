@@ -312,12 +312,14 @@ earlier passes are context, not qualification.
 
 ## 8. Current state
 
-Source state 2026-11-03: rows 1–15 and 17 are implemented in the integrated
+Source state 2026-11-04: rows 1–15 and 17 are implemented in the integrated
 source on `master`. Row 17 (retention) has isolated tests and is an alpha.1
 gate; host qualification is partial. Defects 5 (worker registry inventory
-permissions) and 6 (local image removal during prune) are fixed and
-host-verified; the row still needs registry-GC coverage, the 30-release check
-and a fresh-server baseline. Row 16 (alpha qualification) remains in progress.
+permissions) and 6 (local image removal during prune) and the two 2026-11-04
+retention findings (same-day daily retry and imageless-release resolution) are
+fixed and host-verified; the row still needs registry-GC coverage, the
+30-release check and a fresh-server baseline. Row 16 (alpha qualification)
+remains in progress.
 Rows 11–15 went through isolated implementation lanes and independent review,
 with rework and orchestrator acceptance; the final release-command
 evidence-classification correction was made by the orchestrator.
@@ -368,8 +370,8 @@ and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resum
 fixture state, evidence locations and unqualified acceptance variants, and its
 run records for operation IDs. Row 16 is in progress; row 17 is implemented at
 source level and is an alpha.1 gate, not yet fully host-qualified (defects 5
-and 6 are fixed and host-verified; retention still lacks registry-GC,
-30-release and fresh-server coverage).
+and 6 and the two 2026-11-04 retention findings are fixed and host-verified;
+retention still lacks registry-GC, 30-release and fresh-server coverage).
 
 On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
 switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
@@ -482,18 +484,25 @@ warns "cannot read the retention runs" (2 of 5 runs) on the external control-DB
 path; every successful read is 20/0/0. Details are in MANUAL-TESTING's
 2026-11-04 record.
 
-Both 2026-11-04 retention findings are fixed in source, not host-verified. The
-daily submitter now checks hourly and worker start, retries a failed or
-cancelled UTC-day run after a one-hour backoff with a numbered idempotency key,
-and still allows only one successful run per day and no submission while one is
-queued or running. The planner now treats a failed or pending release with no
-image identity (empty `image_id`, no artifact digest, no digest in `Image`) as
-never having produced an image, so it no longer skips registry pruning for its
-repository; a failed release that pushed an image keeps its image ID and still
-requires resolution. A `registry_skipped` diagnostic is no longer emitted for a
-repository absent from the registry inventory. Isolated regressions cover a
-failed, recent failed, succeeded, running and cancelled daily run, and both
-registry cases.
+Both 2026-11-04 retention findings are **fixed and host-verified on
+`0a1a492`**. The daily submitter checks hourly and worker start and retries a
+failed or cancelled UTC-day run after a one-hour backoff with a numbered
+idempotency key. On the candidate, after the failed 00:06 operation aged past
+one hour, it submitted `op_9b72a9e32c2b5b49351f3ba75edb4664` at 01:47:24 with
+the next numbered key; it planned 0 items and succeeded at 01:48:03. The manual
+prune `op_11f4602b…` was not counted because the submitter only sees
+`maintenance` operations with the `retention-daily:<date>` prefix. This is
+intended: the one-success-per-day rule covers automatic daily runs only, and
+IMPLEMENTATION now says so (two runs succeeded that day: manual at 01:11 and
+automatic at 01:48).
+The planner now treats a failed or pending release with no image identity as
+never having produced an image, and no longer emits `registry_skipped` for a
+repository absent from inventory; the candidate dry run contains only the
+`image_skipped` for `pedantic_jackson`. The candidate apply was 2 of 20, the
+second apply 0 of 20, `doctor` was 20/0/0 in all three runs, a serving-revision
+restart succeeded, and monitors saw 1,212/1,212 HTTP 200. Registry GC remains
+unexercised because the registry holds only retained andurel artifacts. Details
+are in MANUAL-TESTING's 2026-11-04 candidate record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
