@@ -648,6 +648,118 @@ func TestPlanMovedTagWithoutImmutableIdentitySkipsRepository(t *testing.T) {
 	}
 }
 
+func TestPlanFailedReleaseWithoutImageDoesNotSkipItsRepository(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "githello", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{
+			{
+				ID: "rel_serving", App: "githello", Environment: "production",
+				Image:     "registry.example.com:5000/githello:serving",
+				ImageID:   "sha256:serving-config",
+				Status:    ReleaseStateReady,
+				CreatedAt: daysAgo(1),
+			},
+			{
+				ID: "rel_failed", App: "githello", Environment: "production",
+				Image:     "registry.example.com:5000/githello:d0f76b56af71",
+				Status:    ReleaseStateFailed,
+				CreatedAt: daysAgo(2),
+			},
+		},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "githello", Digest: "sha256:serving", ConfigDigest: "sha256:serving-config", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "githello", Digest: "sha256:old", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"githello@sha256:old"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+}
+
+func TestPlanPendingReleaseWithoutImageDoesNotSkipItsRepository(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{
+			{
+				ID: "rel_serving", App: "api", Environment: "production",
+				Image:     "registry.example.com:5000/api:serving",
+				ImageID:   "sha256:serving-config",
+				Status:    ReleaseStateReady,
+				CreatedAt: daysAgo(1),
+			},
+			{
+				ID: "rel_pending", App: "api", Environment: "production",
+				Image:     "registry.example.com:5000/api:pending",
+				Status:    ReleaseStatePending,
+				CreatedAt: daysAgo(2),
+			},
+		},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:serving", ConfigDigest: "sha256:serving-config", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:old", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"api@sha256:old"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+}
+
+func TestPlanFailedReleaseWithImageIdentityStillRequiresResolution(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{
+			{
+				ID: "rel_serving", App: "api", Environment: "production",
+				Image:     "registry.example.com:5000/api:serving",
+				ImageID:   "sha256:serving-config",
+				Status:    ReleaseStateReady,
+				CreatedAt: daysAgo(1),
+			},
+			{
+				ID: "rel_failed", App: "api", Environment: "production",
+				Image:     "registry.example.com:5000/api:d0f76b56af71",
+				ImageID:   "sha256:failed-config",
+				Status:    ReleaseStateFailed,
+				CreatedAt: daysAgo(2),
+			},
+		},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "api", Digest: "sha256:serving", ConfigDigest: "sha256:serving-config", CreatedAt: daysAgo(30), Bytes: 100},
+			{Repository: "api", Digest: "sha256:old", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), nil)
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), []string{"api"})
+}
+
+func TestPlanIgnoresRepositoriesAbsentFromRegistryInventory(t *testing.T) {
+	items := Plan(Input{
+		Environments: []Environment{{
+			App: "api", Name: "production", ServingRelease: "rel_serving", Policy: DefaultPolicy(),
+		}},
+		Releases: []Release{{
+			ID: "rel_serving", App: "api", Environment: "production",
+			Image:     "registry.example.com:5000/team/api:v1",
+			ImageID:   "sha256:missing-config",
+			Status:    ReleaseStateReady,
+			CreatedAt: daysAgo(1),
+		}},
+		Registry: RegistryInventory{Artifacts: []RegistryArtifact{
+			{Repository: "worker", Digest: "sha256:old", CreatedAt: daysAgo(30), Bytes: 50},
+		}},
+		Now: planNow,
+	})
+	assertStrings(t, "artifact items", referencesByKind(items, ItemRegistryArtifact), []string{"worker@sha256:old"})
+	assertStrings(t, "skip items", referencesByKind(items, ItemRegistrySkipped), nil)
+}
+
 func TestPlanMovedTagWithConfigDigestProtectsOldManifest(t *testing.T) {
 	items := Plan(Input{
 		Environments: []Environment{{

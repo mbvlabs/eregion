@@ -482,6 +482,19 @@ warns "cannot read the retention runs" (2 of 5 runs) on the external control-DB
 path; every successful read is 20/0/0. Details are in MANUAL-TESTING's
 2026-11-04 record.
 
+Both 2026-11-04 retention findings are fixed in source, not host-verified. The
+daily submitter now checks hourly and worker start, retries a failed or
+cancelled UTC-day run after a one-hour backoff with a numbered idempotency key,
+and still allows only one successful run per day and no submission while one is
+queued or running. The planner now treats a failed or pending release with no
+image identity (empty `image_id`, no artifact digest, no digest in `Image`) as
+never having produced an image, so it no longer skips registry pruning for its
+repository; a failed release that pushed an image keeps its image ID and still
+requires resolution. A `registry_skipped` diagnostic is no longer emitted for a
+repository absent from the registry inventory. Isolated regressions cover a
+failed, recent failed, succeeded, running and cancelled daily run, and both
+registry cases.
+
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
 including guided creates. Success exits 0; remote cancellation and viewer detach

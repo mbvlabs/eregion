@@ -87,6 +87,11 @@ type Release struct {
 	// It is not a manifest digest. It matches RegistryArtifact.ConfigDigest,
 	// images on the node, and LocalImageRef RepoDigests.
 	ImageID string
+	// Status is the platform release status. A release that never reached
+	// ready has no promise that it produced an image; a failed release that
+	// did push one still records its ImageID. An empty status is unknown and
+	// is treated like ready for registry protection.
+	Status string
 	// Artifacts lists any further registry manifest digests the release needs.
 	// A digest shared with a kept release is never removed.
 	Artifacts []string
@@ -251,6 +256,16 @@ type InFlight struct {
 // rollback history. It is repeated here so the pure planner does not depend on
 // the platform package.
 const DeploymentStateSucceeded = "succeeded"
+
+// Release states repeated from the platform model so the pure planner does not
+// depend on it. Only a release that never reached ready can be treated as
+// never having produced an image, and then only when it records no other image
+// identity.
+const (
+	ReleaseStatePending = "pending"
+	ReleaseStateReady   = "ready"
+	ReleaseStateFailed  = "failed"
+)
 
 // Plan returns the deterministic list of retention items a node would remove
 // for the supplied state. It is pure: it does not read or write anything, does

@@ -351,7 +351,14 @@ resolves a retained release: resolution requires an immutable manifest digest
 and never collapse across repositories. If a retained release has no resolvable
 immutable identity, the planner emits a `registry_skipped` diagnostic and plans
 no deletion for its repository (or all repositories when none can be
-determined).
+determined). A release that never reached ready and records no `ImageID`, no
+`Artifacts` entry and no digest in its `Image` reference is treated as never
+having produced an image: it neither blocks nor contributes to registry
+protection. A failed release that did push an image still records its
+`ImageID`, so it still requires resolution. A skip diagnostic is emitted only
+for a repository the inventory contains; when a retained release names a
+repository with no inventory artifacts, there is nothing to protect or remove
+and no diagnostic is added.
 
 ### Retention node effects
 
@@ -471,11 +478,17 @@ unknown age can never authorize deletion. A truncated inventory plans no
 registry deletion at all and emits one `registry_skipped` item naming the
 truncation; inventory warnings are returned beside the plan.
 
-`retentionWorker` runs on the maintenance queue. A daily River periodic job
-submits one `platform.retention.prune` operation per UTC day on
-`node/<server>` with an idempotency key, so a worker restart reuses the accepted
-work instead of creating a second prune and the startup catch-up cannot create
-two runs in one day. The operation's own River job claims the operation and then
+`retentionWorker` runs on the maintenance queue. An hourly River periodic job
+checks whether the UTC day still needs a `platform.retention.prune` operation
+on `node/<server>`; it also runs on worker start. The submitter does nothing
+when the day has a queued, running, cancelling or succeeded operation. When
+every operation for the day is failed or cancelled and the newest is at least
+an hour old, it submits one new operation with the next numbered idempotency
+key (`retention-daily:<date>:<n>`); the first run of a day keeps
+`retention-daily:<date>`. Thus at most one run succeeds per UTC day, a failed
+or cancelled day can retry the same day, and a deterministic failure is bounded
+to one new attempt per hour instead of a loop. The operation's own River job
+claims the operation and then
 acquires sorted PostgreSQL advisory locks for `platform`, `node/<server>` and
 every environment target before reading state, so accepted deploys, rollbacks,
 restarts and app/environment deletes serialize with it. The plan is evaluated

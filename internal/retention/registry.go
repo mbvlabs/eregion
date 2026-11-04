@@ -219,6 +219,22 @@ func (i registryInventoryIndex) hasConfigDigest(repository, digest string) bool 
 	return false
 }
 
+// hasRepository reports whether the inventory contains any artifact in the
+// release's repository. When it does not, there is nothing to protect or
+// remove, so an unresolved release is not a reason to skip anything.
+func (i registryInventoryIndex) hasRepository(repository string) bool {
+	repository = normalizeRepository(repository)
+	if repository == "" {
+		return false
+	}
+	for key := range i.manifests {
+		if repositoryMatches(key.repository, repository) {
+			return true
+		}
+	}
+	return false
+}
+
 // repositoryMatches compares a release repository with an inventory
 // repository. Registry catalogs often omit a registry host, and the first path
 // component of a reference can be a host in one spelling and a namespace in
@@ -469,6 +485,32 @@ func releaseReferencesRegistry(release Release) bool {
 	return false
 }
 
+// releaseNeverProducedImage reports whether a release row cannot own a registry
+// artifact. A release that never reached ready and records no image identity
+// has nothing to protect or remove. A failed release that did push an image
+// keeps its ImageID, and any artifact digest or digest in Image means the
+// release may own something: those still require immutable resolution. An
+// unknown status is treated like ready so it stays fail-safe.
+func releaseNeverProducedImage(release Release) bool {
+	switch release.Status {
+	case ReleaseStatePending, ReleaseStateFailed:
+	default:
+		return false
+	}
+	if strings.TrimSpace(release.ImageID) != "" {
+		return false
+	}
+	for _, raw := range release.Artifacts {
+		if strings.TrimSpace(raw) != "" {
+			return false
+		}
+	}
+	if reference, parsed := parseImageReference(release.Image); parsed && reference.digest != "" {
+		return false
+	}
+	return true
+}
+
 // releaseHasImmutableIdentity reports whether a retained release can be tied to
 // an inventory artifact through something a moved tag cannot change: a manifest
 // digest or the image config digest. A tag is protection, never resolution.
@@ -497,13 +539,11 @@ func releaseHasImmutableIdentity(release Release, repository string, index regis
 }
 
 // registrySkipReasons implements the fail-safe rule: when a retained release
-// has no immutable identity that resolves to an inventory artifact, its
-// repository plans no deletions. A release without a usable repository skips
-// the whole registry.
-// registrySkipReasons implements the fail-safe rule: when a retained release
 // has no immutable identity that resolves to an inventory artifact, that
 // repository plans no deletions. A release with no usable repository skips the
-// whole registry. A tag is never resolution.
+// whole registry. A tag is never resolution. A release that never produced an
+// image needs no resolution, and a repository the inventory does not contain
+// gets no diagnostic: there is nothing there to protect or remove.
 func registrySkipReasons(releases []Release, planned, protected map[string]bool, environments map[environmentKey]Environment, index registryInventoryIndex, localImages localImageIndex) (map[string]string, bool) {
 	reasons := map[string]string{}
 	skipAll := false
@@ -528,17 +568,30 @@ func registrySkipReasons(releases []Release, planned, protected map[string]bool,
 		if !releaseReferencesRegistry(release) {
 			continue
 		}
+		if releaseNeverProducedImage(release) {
+			continue
+		}
 		repository := releaseRepository(release)
+		if repository == "" {
+			if releaseHasImmutableIdentity(release, repository, index, localImages) {
+				continue
+			}
+			reason := fmt.Sprintf("release %s has no immutable image digest or config digest that resolves to a registry inventory artifact", release.ID)
+			if image := strings.TrimSpace(release.Image); image != "" {
+				reason = fmt.Sprintf("%s (image %q)", reason, image)
+			}
+			skipEverything(reason)
+			continue
+		}
+		if !index.hasRepository(repository) {
+			continue
+		}
 		if releaseHasImmutableIdentity(release, repository, index, localImages) {
 			continue
 		}
 		reason := fmt.Sprintf("release %s has no immutable image digest or config digest that resolves to a registry inventory artifact", release.ID)
 		if image := strings.TrimSpace(release.Image); image != "" {
 			reason = fmt.Sprintf("%s (image %q)", reason, image)
-		}
-		if repository == "" {
-			skipEverything(reason)
-			continue
 		}
 		skipRepository(repository, reason)
 	}

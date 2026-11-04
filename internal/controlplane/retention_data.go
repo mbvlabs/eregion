@@ -295,7 +295,7 @@ func (s *Service) retentionPlatformState(ctx context.Context, nodeName string, e
 		})
 	}
 
-	releases, err := s.pool.Query(ctx, `SELECT r.id,a.name,e.name,r.image,coalesce(r.image_id,''),r.created_at,r.pruned_at
+	releases, err := s.pool.Query(ctx, `SELECT r.id,a.name,e.name,r.image,coalesce(r.image_id,''),r.status,r.created_at,r.pruned_at
         FROM eregion_platform_releases r
         JOIN eregion_platform_apps a ON a.id=r.app_id
         JOIN eregion_platform_environments e ON e.id=r.environment_id
@@ -306,7 +306,7 @@ func (s *Service) retentionPlatformState(ctx context.Context, nodeName string, e
 	}
 	for releases.Next() {
 		var item retention.Release
-		if err := releases.Scan(&item.ID, &item.App, &item.Environment, &item.Image, &item.ImageID, &item.CreatedAt, &item.PrunedAt); err != nil {
+		if err := releases.Scan(&item.ID, &item.App, &item.Environment, &item.Image, &item.ImageID, &item.Status, &item.CreatedAt, &item.PrunedAt); err != nil {
 			releases.Close()
 			return state, unavailable(err)
 		}
