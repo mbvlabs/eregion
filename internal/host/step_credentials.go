@@ -3,7 +3,9 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -126,18 +128,36 @@ func envLine(key, value string) string {
 }
 
 func (s *credentialsStep) Check(_ context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	auth, err := s.credentials.AuthFile(s.cfg.Node)
+	path := s.authPath()
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return incomplete("the API auth file is missing at " + path)
+		}
+		return engine.CheckResult{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return engine.CheckResult{}, fmt.Errorf("%s is not a regular file", path)
+	}
+	if info.Mode().Perm() != 0o600 {
+		return incomplete("the API auth file " + path + " is not mode 0600")
+	}
+	owned, err := ownershipMatches(info, s.cfg.Layout.User, s.cfg.Layout.Group)
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
-	ok, mode, err := sameFileContent(s.authPath(), auth)
+	if !owned {
+		return incomplete("the API auth file " + path + " is not owned by the control-plane account")
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: fixed host configuration path.
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
-	if !ok || mode != 0o600 {
-		return incomplete("the API auth file is missing, differs, or is not mode 0600")
+	if _, err := decodeAuthFile(raw); err != nil {
+		// A malformed store is not drift: rewriting it would destroy tokens.
+		return engine.CheckResult{}, err
 	}
-	ok, mode, err = sameFileContent(s.envPath(), s.env())
+	ok, mode, err := sameFileContent(s.envPath(), s.env())
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -150,32 +170,61 @@ func (s *credentialsStep) Check(_ context.Context, _ engine.Runtime) (engine.Che
 		return incomplete(detail)
 	}
 	if len(preserved) > 0 {
-		return complete("API auth, control-plane environment, and requested credential exports are owner-only; preserved operator keys: " + strings.Join(preserved, ", "))
+		return complete("API token store and control-plane environment are owner-only; preserved operator keys: " + strings.Join(preserved, ", "))
 	}
-	return complete("API auth, control-plane environment, and requested credential exports are owner-only")
+	return complete("API token store and control-plane environment are owner-only")
 }
 
 func (s *credentialsStep) Apply(_ context.Context, _ engine.Runtime, _ engine.Reporter) (engine.ApplyResult, error) {
-	auth, err := s.credentials.AuthFile(s.cfg.Node)
+	path := s.authPath()
+	raw, mode, exists, err := fileState(path)
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writeReplacingSecret(s.authPath(), auth, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
-		return engine.ApplyResult{}, err
+	authNote := "existing API token store preserved"
+	if exists {
+		// Validate before touching the file: a damaged store must fail closed,
+		// never be replaced by bootstrap's empty list.
+		if _, err := decodeAuthFile(raw); err != nil {
+			return engine.ApplyResult{}, err
+		}
+		if mode != 0o600 {
+			if err := os.Chmod(path, 0o600); err != nil {
+				return engine.ApplyResult{}, err
+			}
+		}
+		if err := chownIfRoot(path, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
+			return engine.ApplyResult{}, err
+		}
+	} else {
+		auth, err := s.credentials.AuthFile(s.cfg.Node)
+		if err != nil {
+			return engine.ApplyResult{}, err
+		}
+		if err := writeReplacingSecret(path, auth, s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
+			return engine.ApplyResult{}, err
+		}
+		authNote = "empty API token store created; setup mints no token"
 	}
 	if err := writeReplacingSecret(s.envPath(), s.env(), s.cfg.Layout.User, s.cfg.Layout.Group); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	result := map[string]any{
-		"auth_file": s.authPath(),
+		"auth_file": path,
 		"env_file":  s.envPath(),
 	}
-	return engine.ApplyResult{Notes: []string{"credentials written with owner-only permissions; tokens are not logged"}, Result: result}, nil
+	return engine.ApplyResult{Notes: []string{authNote + "; credentials are owner-only and tokens are not logged"}, Result: result}, nil
 }
 
 func (s *credentialsStep) Diff(context.Context, engine.Runtime) ([]string, error) {
+	authLine := "+ create " + s.authPath() + " (0600; empty token store)"
+	if _, _, exists, err := fileState(s.authPath()); err != nil {
+		return nil, err
+	} else if exists {
+		authLine = "= verify the existing " + s.authPath() + " token store (0600; tokens preserved)"
+	}
 	out := []string{
-		"+ write " + s.authPath() + " (0600; hashed principals only)",
+		authLine,
 		"+ merge " + s.envPath() + " (0600; managed keys replaced, operator lines preserved)",
 	}
 	for _, key := range s.envPreserved() {

@@ -1189,12 +1189,8 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		if err != nil {
 			return nil, true, err
 		}
-		if err := restartAPIService(ctx); err != nil {
-			// The plaintext token was never returned to the operator, so leave
-			// no unusable principal behind.
-			_, _ = tokens.Revoke(authFilePath(), issued.Metadata.Name)
-			return nil, true, err
-		}
+		// The API watches the token store, so the new hash authenticates on
+		// its next request without an eregion-api.service restart.
 		return issued, true, nil
 	case methodTokenList:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
@@ -1217,9 +1213,8 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		if err != nil {
 			return nil, true, err
 		}
-		if err := restartAPIService(ctx); err != nil {
-			return nil, true, err
-		}
+		// The API watches the token store, so the revocation applies on its
+		// next request without an eregion-api.service restart.
 		return metadata, true, nil
 	case methodNodeInfo:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
@@ -1741,17 +1736,6 @@ func nodeBinaryPathDir() string {
 // authFilePath is the owner-only node token store.
 func authFilePath() string {
 	return filepath.Join(host.DefaultLayout().ConfigDir, "auth.json")
-}
-
-// restartAPIService makes a token change effective. api.LoadAuth reads the file
-// once at startup; silently leaving a new token unusable would be a false
-// success.
-func restartAPIService(ctx context.Context) error {
-	command := exec.CommandContext(ctx, "systemctl", "restart", "eregion-api.service")
-	if output, err := command.CombinedOutput(); err != nil {
-		return contract.NewFault(contract.Unavailable, "the token store was written but eregion-api.service did not restart", strings.TrimSpace(string(output)))
-	}
-	return nil
 }
 
 func clearBytes(value []byte) {

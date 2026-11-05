@@ -123,6 +123,13 @@ type Model struct {
 	Serving  ServingRelease
 	Cleanup  CleanupObservation
 
+	// servingOutcome is the serving state stated by the operation's final
+	// deploy event. Unlike Serving, an intermediate traffic-switch observation
+	// never sets it: a candidate switch is not proof that the release will stay
+	// serving when public verification fails.
+	servingOutcome     ServingRelease
+	servingOutcomeSeen bool
+
 	ObservationState ObservationState
 	LastSuccessAt    time.Time
 	LastError        string

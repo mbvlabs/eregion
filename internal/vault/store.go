@@ -482,6 +482,9 @@ func scanEncrypted(row scanner) (encryptedRow, error) {
 	if err != nil {
 		return encryptedRow{}, err
 	}
+	// decryptRow publishes Ref as Metadata.Revision; Metadata.Validate requires
+	// the revision key ID, so the scanned key ID must be part of the ref.
+	out.Ref.KeyID = out.KeyID
 	out.Ref.CreatedAt = revisionCreated.UTC()
 	return out, nil
 }

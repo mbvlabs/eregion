@@ -13,6 +13,18 @@ import (
 // write, chmod, fsync, close, rename, then fsync the directory. Setting the
 // mode before fsync makes the mode durable with the content.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	return writeFileAtomic(path, data, perm, -1, -1)
+}
+
+// WriteFileAtomicOwned is WriteFileAtomic with the temp file's numeric
+// ownership changed before the rename. A service account reading the path
+// therefore never observes the publishing process's owner, which would
+// otherwise make an owner-only file briefly unreadable after a root write.
+func WriteFileAtomicOwned(path string, data []byte, perm os.FileMode, uid, gid int) error {
+	return writeFileAtomic(path, data, perm, uid, gid)
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode, uid, gid int) error {
 	dir := filepath.Dir(path)
 	tmp, f, err := createTemp(dir, filepath.Base(path), perm)
 	if err != nil {
@@ -27,6 +39,12 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	if _, err = f.Write(data); err != nil {
 		_ = f.Close()
 		return err
+	}
+	if uid >= 0 || gid >= 0 {
+		if err = f.Chown(uid, gid); err != nil {
+			_ = f.Close()
+			return err
+		}
 	}
 	if err = f.Chmod(perm); err != nil {
 		_ = f.Close()

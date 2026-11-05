@@ -1,12 +1,14 @@
 package host
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -65,8 +67,8 @@ func principal(actor contract.Actor, token string, scopes []string) api.Principa
 	return api.Principal{Actor: actor, TokenSHA256: tokenHash(token), Scopes: copied}
 }
 
-// AuthPrincipals builds the deterministic auth file contents. Setup writes an
-// empty list; the auth file is only the CI/webhook token path.
+// AuthPrincipals builds the deterministic initial auth file contents. Setup
+// creates it only when absent; later tokens are minted into the same file.
 func (c Credentials) AuthPrincipals(string) ([]api.Principal, error) {
 	principals := []api.Principal{}
 	if _, err := api.NewAuth(principals); err != nil {
@@ -101,8 +103,26 @@ func CredentialFingerprint(token string) string {
 
 func tokenFingerprint(token string) string { return CredentialFingerprint(token) }
 
+// decodeAuthFile applies the API's strict token-store rules without requiring
+// any particular principals. It never rewrites the file.
+func decodeAuthFile(raw []byte) ([]api.Principal, error) {
+	var principals []api.Principal
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&principals); err != nil {
+		return nil, fmt.Errorf("parse the API auth file: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("parse the API auth file: trailing content")
+	}
+	if _, err := api.NewAuth(principals); err != nil {
+		return nil, err
+	}
+	return principals, nil
+}
+
 // ReadAuthFile reads the existing principal list for an additive credential
-// command. It enforces the same owner-only mode as api.LoadAuth.
+// command. It enforces the same owner-only mode and validation as api.LoadAuth.
 func ReadAuthFile(path string) ([]api.Principal, error) {
 	raw, mode, exists, err := fileState(path)
 	if err != nil {
@@ -114,15 +134,9 @@ func ReadAuthFile(path string) ([]api.Principal, error) {
 	if mode&0o077 != 0 {
 		return nil, fmt.Errorf("%s must be readable only by its owner", path)
 	}
-	var principals []api.Principal
-	if err := json.Unmarshal(raw, &principals); err != nil {
+	principals, err := decodeAuthFile(raw)
+	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	if len(principals) == 0 {
-		return principals, nil
-	}
-	if _, err := api.NewAuth(principals); err != nil {
-		return nil, err
 	}
 	return principals, nil
 }

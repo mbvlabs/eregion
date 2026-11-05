@@ -65,9 +65,11 @@ single-use and five wrong codes lock them out for 15 minutes.
 `eregion token create --app api --environment production [--expires 24h]`
 writes only a hash, a name and an expiry to `/etc/eregion/auth.json`, scoped to
 `platform.deploy` on `env/api/production`. `token list` shows metadata;
-`token revoke <name> --confirm <name>` removes the hash. The API process is
-restarted after a change because the auth file is loaded at startup. No token
-is minted by setup or carried in the handoff.
+`token revoke <name> --confirm <name>` removes the hash. The API reloads the
+auth file when it changes, so a new token works and a revoked token stops
+working on the next request without an API restart. No token is minted by
+setup or carried in the handoff; `apply` creates the store only when it is
+absent and otherwise preserves minted and revoked tokens.
 
 `eregion secrets export` rebuilds the server-init record (operator keys,
 hostname, control-plane database URL, vault keyring and break-glass note) with

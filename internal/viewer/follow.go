@@ -302,7 +302,7 @@ func modelSummary(model *Model) Summary {
 			CreatedAt:    model.CreatedAt,
 			UpdatedAt:    model.UpdatedAt,
 		},
-		Serving: model.Serving,
+		Serving: model.summaryServing(),
 		Cleanup: model.Cleanup,
 	}
 }

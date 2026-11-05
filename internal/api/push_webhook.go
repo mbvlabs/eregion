@@ -8,33 +8,54 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 // DefaultWebhookMaxBody bounds GitHub deliveries on every environment route.
 const DefaultWebhookMaxBody = 1 << 20
 
+// DefaultWebhookAdmissionTimeout keeps the resolver, request body read and
+// durable admission comfortably below GitHub's 10 second delivery timeout. The
+// same absolute deadline is applied to the transport read and the database
+// context; a slow body or database returns a bounded retryable 503, and the
+// handler never replies 202 before the admission transaction commits.
+const DefaultWebhookAdmissionTimeout = 8 * time.Second
+
 // PushWebhookTarget is one environment's verified push-to-deploy binding. The
 // secret is the environment's HMAC secret, never a revision or operation input.
+// The environment, revision and secret revision identities are non-secret
+// snapshots used to detect a binding change before admission commits.
 type PushWebhookTarget struct {
 	App         string
 	Environment string
+	// EnvironmentID and RevisionID identify the observed environment row and
+	// current immutable revision.
+	EnvironmentID string
+	RevisionID    string
 	// Repository is the lower-case owner/repository the source binds.
 	Repository string
 	// Branch is the revision's bound branch without refs/heads/.
 	Branch string
 	Secret []byte
+	// SecretRevision and SecretRevisionHash identify the exact vault revision
+	// whose plaintext verified this delivery.
+	SecretRevision     uint64
+	SecretRevisionHash string
 }
 
-// PushWebhookResolver reads the current revision and its vault secret. The
-// boolean is false when the environment exists but auto-deploy is off; then
-// the delivery is ignored without revealing the secret.
+// PushWebhookResolver reads the current revision and its vault secret in one
+// joined database read. The boolean is false when the environment exists but
+// auto-deploy is off; then the delivery is ignored without revealing the
+// secret. Implementations must read the secret per delivery so rotation takes
+// effect immediately; a TTL cache would accept an old secret after rotation.
 type PushWebhookResolver interface {
 	ResolvePushWebhook(context.Context, string, string) (PushWebhookTarget, bool, error)
 }
@@ -42,28 +63,31 @@ type PushWebhookResolver interface {
 // PushWebhookConfig mounts per-environment GitHub push delivery.
 type PushWebhookConfig struct {
 	Resolver   PushWebhookResolver
-	Deliveries WebhookDeliveryStore
+	Admissions WebhookAdmissionStore
 	MaxBody    int64
+	// AdmissionTimeout bounds the resolver, transport body read and durable
+	// admission. Zero uses DefaultWebhookAdmissionTimeout.
+	AdmissionTimeout time.Duration
+	// Logger records admission duration and outcome only. It never receives the
+	// body, signature, secret, sender or raw delivery ID.
+	Logger *slog.Logger
 }
 
 type PushWebhookHandler struct {
-	config    PushWebhookConfig
-	submitter operations.Service
+	config PushWebhookConfig
 }
 
 // NewPushWebhookHandler verifies X-Hub-Signature-256 over the exact body,
-// matches the repository and bound branch, deduplicates by X-GitHub-Delivery,
-// and submits platform.deploy with the pushed commit SHA. It never reads
+// matches the repository and bound branch, durably admits the delivery and its
+// River processing job in one PostgreSQL transaction, and only then replies
+// 202. It never submits the platform operation synchronously and never reads
 // Authorization: the per-environment URL and HMAC secret authenticate GitHub.
-func NewPushWebhookHandler(config PushWebhookConfig, submitter operations.Service) (*PushWebhookHandler, error) {
-	if submitter == nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "push webhook needs an operation service", "Pass the same operations.Service used by the API and worker.")
-	}
+func NewPushWebhookHandler(config PushWebhookConfig) (*PushWebhookHandler, error) {
 	if config.Resolver == nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "push webhook needs an environment resolver", "Mount it with control-plane environment and vault access.")
 	}
-	if config.Deliveries == nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "push webhook needs a durable delivery store", "Share one PostgreSQL delivery store across every control-plane process.")
+	if config.Admissions == nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "push webhook needs a durable admission store", "Share one PostgreSQL admission store across every control-plane process.")
 	}
 	if config.MaxBody == 0 {
 		config.MaxBody = DefaultWebhookMaxBody
@@ -71,17 +95,44 @@ func NewPushWebhookHandler(config PushWebhookConfig, submitter operations.Servic
 	if config.MaxBody < 1024 || config.MaxBody > 5<<20 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid webhook body bound", "Use 1 KiB–5 MiB.")
 	}
-	return &PushWebhookHandler{config: config, submitter: submitter}, nil
+	if config.AdmissionTimeout == 0 {
+		config.AdmissionTimeout = DefaultWebhookAdmissionTimeout
+	}
+	if config.AdmissionTimeout < 100*time.Millisecond || config.AdmissionTimeout > 9*time.Second {
+		return nil, contract.NewFault(contract.ValidationFailed, "invalid webhook admission timeout", "Use 100 ms–9 s; the bound must stay below GitHub's delivery timeout.")
+	}
+	return &PushWebhookHandler{config: config}, nil
 }
 
 func (h *PushWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	started := time.Now()
+	outcome := "rejected"
+	targetLabel := ""
+	bodyConsumed := false
+	deadlineSet := false
+	var controller *http.ResponseController
+	if r.ProtoMajor < 2 {
+		// A response written before the body is fully consumed must not let
+		// net/http drain a stalled body after this handler returns. Closing the
+		// HTTP/1 connection skips that drain; successful full-body reads remove
+		// this header again to preserve keep-alive.
+		w.Header().Set("Connection", "close")
+	}
 	defer func() {
 		if recover() != nil {
 			writeWebhook(w, http.StatusInternalServerError, webhookResponse{Message: "webhook submission failed internally"})
 		}
+		// Clear only after a fully consumed body. An unread body keeps the
+		// transport deadline in place (HTTP/1 also keeps Connection: close), so
+		// no post-handler drain can become unbounded and no completed request
+		// poisons a keep-alive connection with a stale deadline.
+		if deadlineSet && bodyConsumed && controller != nil {
+			_ = controller.SetReadDeadline(time.Time{})
+		}
+		h.logAdmission(targetLabel, outcome, started)
 	}()
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -93,9 +144,25 @@ func (h *PushWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeWebhook(w, http.StatusNotFound, webhookResponse{Message: "webhook endpoint not found"})
 		return
 	}
-	target, enabled, err := h.config.Resolver.ResolvePushWebhook(r.Context(), app, environment)
+	targetLabel = app + "/" + environment
+	// One absolute deadline covers the resolver, the request body read and the
+	// durable admission. The transport read deadline makes a stalled body
+	// interruptible instead of relying on the server's 10 second ReadTimeout.
+	deadline := started.Add(h.config.AdmissionTimeout)
+	ctx, cancel := context.WithDeadline(r.Context(), deadline)
+	defer cancel()
+	controller = http.NewResponseController(w)
+	if err := controller.SetReadDeadline(deadline); err != nil {
+		if !errors.Is(err, http.ErrNotSupported) {
+			writeWebhook(w, http.StatusInternalServerError, webhookResponse{Message: "webhook read deadline is unavailable"})
+			return
+		}
+	} else {
+		deadlineSet = true
+	}
+	target, enabled, err := h.config.Resolver.ResolvePushWebhook(ctx, app, environment)
 	if err != nil {
-		if target.App == "" && contract.Classify(err).Code == contract.NotFound {
+		if contract.Classify(err).Code == contract.NotFound {
 			writeWebhook(w, http.StatusNotFound, webhookResponse{Message: "environment not found"})
 			return
 		}
@@ -103,6 +170,7 @@ func (h *PushWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !enabled {
+		outcome = "ignored"
 		writeWebhook(w, http.StatusOK, webhookResponse{Message: "auto-deploy is not enabled"})
 		return
 	}
@@ -116,6 +184,13 @@ func (h *PushWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, h.config.MaxBody+1))
 	if err != nil {
+		if ctx.Err() != nil || isNetworkTimeout(err) {
+			writeWebhook(w, http.StatusServiceUnavailable, webhookResponse{
+				Message: "webhook admission did not finish within its bound; retry the delivery",
+				Code:    string(contract.Unavailable),
+			})
+			return
+		}
 		writeWebhook(w, http.StatusBadRequest, webhookResponse{Message: "delivery body is unreadable"})
 		return
 	}
@@ -123,22 +198,32 @@ func (h *PushWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeWebhook(w, http.StatusRequestEntityTooLarge, webhookResponse{Message: "delivery is too large"})
 		return
 	}
+	// io.ReadAll reached EOF within the limit, so the body is fully consumed.
+	// HTTP/1 can safely keep this connection alive without a post-handler
+	// drain, and the deadline can be cleared on return.
+	bodyConsumed = true
+	if r.ProtoMajor < 2 {
+		w.Header().Del("Connection")
+	}
 	signatures := r.Header.Values("X-Hub-Signature-256")
 	if len(signatures) != 1 || !validGitHubSignature(target.Secret, body, signatures[0]) {
 		w.Header().Set("WWW-Authenticate", "GitHub-HMAC-SHA256")
 		writeWebhook(w, http.StatusUnauthorized, webhookResponse{Message: "invalid GitHub signature"})
 		return
 	}
+	signature := signatures[0]
 	if len(r.Header.Values("X-GitHub-Event")) != 1 {
 		writeWebhook(w, http.StatusBadRequest, webhookResponse{Message: "exactly one GitHub event header is required"})
 		return
 	}
 	switch eventName := r.Header.Get("X-GitHub-Event"); eventName {
 	case "ping":
+		outcome = "ignored"
 		writeWebhook(w, http.StatusOK, webhookResponse{Message: "pong"})
 		return
 	case "push":
 	default:
+		outcome = "ignored"
 		writeWebhook(w, http.StatusOK, webhookResponse{Message: "event is not handled"})
 		return
 	}
@@ -159,15 +244,18 @@ func (h *PushWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if repository != target.Repository {
+		outcome = "ignored"
 		writeWebhook(w, http.StatusOK, webhookResponse{Message: "repository is not bound to this environment"})
 		return
 	}
 	if payload.Deleted {
+		outcome = "ignored"
 		writeWebhook(w, http.StatusOK, webhookResponse{Message: "branch deletion is not deployed"})
 		return
 	}
 	branch, ok := pushBranch(payload.Ref)
 	if !ok || !PushBranchMatches(target.Branch, branch) {
+		outcome = "ignored"
 		writeWebhook(w, http.StatusOK, webhookResponse{Message: "push is not to the bound branch"})
 		return
 	}
@@ -186,65 +274,189 @@ func (h *PushWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	input, err := json.Marshal(struct {
+	rawInput, err := json.Marshal(struct {
 		Ref string `json:"ref"`
 	}{Ref: sha})
 	if err != nil {
 		h.writeError(w, err)
 		return
 	}
-	idempotencyKey := "ghdelivery-" + deliveryID
-	if err := contract.ValidateIdempotencyKey(idempotencyKey); err != nil {
+	normalized, err := platform.Default().Normalize(platform.KindDeploy, targetName.String(), rawInput)
+	if err != nil {
 		h.writeError(w, err)
 		return
 	}
 	deliveryHash := WebhookDeliveryHash(deliveryID)
 	bodyHash := WebhookBodyHash(body)
-	record, created, err := h.config.Deliveries.Reserve(r.Context(), WebhookDelivery{
-		DeliveryIDHash: deliveryHash, BodySHA256: bodyHash, Actor: actor,
-		Kind: platform.KindDeploy, Target: targetName.String(),
-	})
-	if err != nil {
-		if contract.Classify(err).Code == contract.Conflict {
-			h.writeError(w, err)
-			return
+	// incoming is this request's freshly verified snapshot. record is the
+	// durable row Admit returns, which may be a legacy pending row with empty
+	// snapshot columns; legacy reconciliation must use incoming, never record.
+	var incoming WebhookAdmission
+	var record WebhookAdmission
+	created := false
+	admissionOK := false
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			// The admission transaction observed a changed environment,
+			// revision or secret revision. Re-resolve and verify the same raw
+			// bytes against the current secret before retrying once.
+			target, enabled, err = h.config.Resolver.ResolvePushWebhook(ctx, app, environment)
+			if err != nil {
+				if contract.Classify(err).Code == contract.NotFound {
+					writeWebhook(w, http.StatusNotFound, webhookResponse{Message: "environment not found"})
+					return
+				}
+				h.writeError(w, err)
+				return
+			}
+			if !enabled {
+				outcome = "ignored"
+				writeWebhook(w, http.StatusOK, webhookResponse{Message: "auto-deploy is not enabled"})
+				return
+			}
+			if !validGitHubSignature(target.Secret, body, signature) {
+				w.Header().Set("WWW-Authenticate", "GitHub-HMAC-SHA256")
+				writeWebhook(w, http.StatusUnauthorized, webhookResponse{Message: "invalid GitHub signature"})
+				return
+			}
+			if repository != target.Repository {
+				outcome = "ignored"
+				writeWebhook(w, http.StatusOK, webhookResponse{Message: "repository is not bound to this environment"})
+				return
+			}
+			if !PushBranchMatches(target.Branch, branch) {
+				outcome = "ignored"
+				writeWebhook(w, http.StatusOK, webhookResponse{Message: "push is not to the bound branch"})
+				return
+			}
 		}
+		incoming = WebhookAdmission{
+			DeliveryIDHash: deliveryHash, BodySHA256: bodyHash, Actor: actor,
+			Kind: platform.KindDeploy, Target: targetName.String(),
+			EnvironmentID: target.EnvironmentID, RevisionID: target.RevisionID,
+			SecretRevision: target.SecretRevision, SecretRevisionHash: target.SecretRevisionHash,
+			Repository: target.Repository, Branch: target.Branch, Commit: sha,
+		}
+		record, created, err = h.config.Admissions.Admit(ctx, incoming)
+		if err == nil {
+			admissionOK = true
+			break
+		}
+		if errors.Is(err, ErrWebhookBindingChanged) {
+			continue
+		}
+		outcome = "rejected"
+		h.writeAdmissionError(w, err)
+		return
+	}
+	if !admissionOK {
+		outcome = "stale"
 		writeWebhook(w, http.StatusServiceUnavailable, webhookResponse{
-			Message: "webhook delivery could not be recorded durably", Code: string(contract.Unavailable),
+			Message: "the environment binding changed while the delivery was admitted; retry the delivery",
+			Code:    string(contract.Unavailable),
 		})
 		return
 	}
-	if !created && record.Submitted {
-		// A redelivery returns the originally accepted operation; it never
-		// submits new work even after operation retention purged the row.
+	switch record.State {
+	case WebhookDeliverySubmitted:
+		outcome = "duplicate"
 		writeWebhook(w, http.StatusAccepted, webhookResponse{
 			Accepted: true, OperationID: string(record.OperationID), Kind: record.Kind, Target: record.Target,
 			Message: "duplicate delivery; the original operation was already accepted",
 		})
-		return
-	}
-	op, err := h.submitter.Submit(r.Context(), operations.Submission{
-		Kind: platform.KindDeploy, Target: targetName.String(), Actor: actor,
-		IdempotencyKey: idempotencyKey, Input: input,
-	})
-	if err != nil {
-		h.writeError(w, err)
-		return
-	}
-	if err := h.config.Deliveries.Complete(r.Context(), deliveryHash, op.ID); err != nil {
-		// The operation is already durable; only the replay record failed.
-		// Ask GitHub to retry so the same delivery is completed, never
-		// resubmitted as new work.
+	case WebhookDeliveryAdmitted:
+		if created {
+			outcome = "accepted"
+			writeWebhook(w, http.StatusAccepted, webhookResponse{
+				Accepted: true, Kind: record.Kind, Target: record.Target,
+				Message: "delivery accepted for durable processing",
+			})
+			return
+		}
+		outcome = "duplicate"
+		writeWebhook(w, http.StatusAccepted, webhookResponse{
+			Accepted: true, Kind: record.Kind, Target: record.Target,
+			Message: "duplicate delivery; it is already accepted for durable processing",
+		})
+	case WebhookDeliveryFailed:
+		outcome = "failed"
+		writeWebhook(w, http.StatusAccepted, webhookResponse{
+			Message: "duplicate delivery; its submission previously failed and was not retried",
+			Code:    record.ErrorCode,
+		})
+	case WebhookDeliveryPending:
+		// A row from the synchronous handler has no recorded commit. Reconcile
+		// the operation its old idempotency key may already have created; never
+		// resubmit or invent an operation.
+		updated, found, err := h.config.Admissions.ReconcileLegacy(ctx, incoming, "ghdelivery-"+deliveryID, normalized.Canonical)
+		if err != nil {
+			outcome = "rejected"
+			h.writeAdmissionError(w, err)
+			return
+		}
+		if found {
+			switch updated.State {
+			case WebhookDeliverySubmitted:
+				outcome = "duplicate"
+				writeWebhook(w, http.StatusAccepted, webhookResponse{
+					Accepted: true, OperationID: string(updated.OperationID), Kind: updated.Kind, Target: updated.Target,
+					Message: "duplicate delivery; the original operation was already accepted",
+				})
+			case WebhookDeliveryAdmitted:
+				outcome = "duplicate"
+				writeWebhook(w, http.StatusAccepted, webhookResponse{
+					Accepted: true, Kind: updated.Kind, Target: updated.Target,
+					Message: "duplicate delivery; it is already accepted for durable processing",
+				})
+			case WebhookDeliveryFailed:
+				outcome = "failed"
+				writeWebhook(w, http.StatusAccepted, webhookResponse{
+					Message: "duplicate delivery; its submission previously failed and was not retried",
+					Code:    updated.ErrorCode,
+				})
+			default:
+				outcome = "ambiguous"
+				writeWebhook(w, http.StatusAccepted, webhookResponse{
+					Accepted: true, Ambiguous: true, Kind: updated.Kind, Target: updated.Target,
+					Message: "duplicate delivery; its durable state cannot be interpreted",
+				})
+			}
+			return
+		}
+		outcome = "ambiguous"
+		writeWebhook(w, http.StatusAccepted, webhookResponse{
+			Accepted: true, Ambiguous: true, Kind: record.Kind, Target: record.Target,
+			Message: "duplicate delivery; the original operation is no longer retained, so its acceptance cannot be proven",
+		})
+	default:
+		outcome = "unavailable"
 		writeWebhook(w, http.StatusServiceUnavailable, webhookResponse{
-			Message: "operation was accepted but the delivery replay record is not durable", Code: string(contract.Unavailable),
-			OperationID: string(op.ID),
+			Message: "webhook delivery is in an unknown durable state", Code: string(contract.Unavailable),
+		})
+	}
+}
+
+func isNetworkTimeout(err error) bool {
+	var networkError net.Error
+	return errors.As(err, &networkError) && networkError.Timeout()
+}
+
+func (h *PushWebhookHandler) writeAdmissionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		writeWebhook(w, http.StatusServiceUnavailable, webhookResponse{
+			Message: "webhook admission did not finish within its bound; retry the delivery",
+			Code:    string(contract.Unavailable),
 		})
 		return
 	}
-	writeWebhook(w, http.StatusAccepted, webhookResponse{
-		Accepted: true, OperationID: string(op.ID), Kind: op.Kind, Target: op.Target,
-		Message: "delivery accepted for durable processing",
-	})
+	h.writeError(w, err)
+}
+
+func (h *PushWebhookHandler) logAdmission(target, outcome string, started time.Time) {
+	if h.config.Logger == nil || target == "" {
+		return
+	}
+	h.config.Logger.Info("github webhook admission", "target", target, "outcome", outcome, "duration_ms", time.Since(started).Milliseconds())
 }
 
 func (h *PushWebhookHandler) writeError(w http.ResponseWriter, err error) {
@@ -292,6 +504,7 @@ func PushBranchMatches(bound, pushed string) bool {
 
 type webhookResponse struct {
 	Accepted    bool   `json:"accepted,omitempty"`
+	Ambiguous   bool   `json:"ambiguous,omitempty"`
 	OperationID string `json:"operation_id,omitempty"`
 	Kind        string `json:"kind,omitempty"`
 	Target      string `json:"target,omitempty"`

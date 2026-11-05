@@ -355,27 +355,45 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 		return preview, err
 	}
 	preview.Steps = platform.DeletionSteps(app, environment)
-	preview.Summary = fmt.Sprintf("Delete %s: %d environment(s), %d release(s), %d deployment(s), %d build(s), %d domain(s), %d secret namespace(s).",
-		normalized.Target.String(), counts.environments, counts.releases, counts.deployments, counts.builds, counts.domains, counts.secrets)
+	preview.Summary = deletionSummary(normalized.Target.String(), counts)
 	preview.Warnings = append(preview.Warnings,
 		"Containers selected by ownership labels and their Caddy routes are removed before any database row.",
 		"Durable operation and event history is kept; only platform state and secret values are deleted.",
 	)
-	if environment == "" {
-		preview.Warnings = append(preview.Warnings, "Every environment of the application is deleted.")
-	} else if counts.environments == 1 {
-		preview.Warnings = append(preview.Warnings, "This is the app's last environment; deleting it also deletes the application record.")
-	}
+	preview.Warnings = append(preview.Warnings, deletionWarnings(counts, environment)...)
 	return preview, nil
 }
 
+// deletionSummary names the rows the target deletion removes. Every count is
+// scoped to the target environment when one is named; appEnvironments is only
+// used by the last-environment warning.
+func deletionSummary(target string, counts deletionCounts) string {
+	return fmt.Sprintf("Delete %s: %d environment(s), %d release(s), %d deployment(s), %d build(s), %d domain(s), %d secret namespace(s).",
+		target, counts.environments, counts.releases, counts.deployments, counts.builds, counts.domains, counts.secrets)
+}
+
+// deletionWarnings states the scope of the deletion. counts.environments is
+// target-scoped, so the last-environment warning must use the application-wide
+// count instead; otherwise every named-environment delete would claim to be
+// the last one.
+func deletionWarnings(counts deletionCounts, environment string) []string {
+	if environment == "" {
+		return []string{"Every environment of the application is deleted."}
+	}
+	if counts.appEnvironments == 1 {
+		return []string{"This is the app's last environment; deleting it also deletes the application record."}
+	}
+	return nil
+}
+
 type deletionCounts struct {
-	environments int
-	releases     int
-	deployments  int
-	builds       int
-	domains      int
-	secrets      int
+	environments    int
+	appEnvironments int
+	releases        int
+	deployments     int
+	builds          int
+	domains         int
+	secrets         int
 }
 
 func (s *Service) deletionCounts(ctx context.Context, app, environment string) (deletionCounts, error) {
@@ -386,9 +404,10 @@ func (s *Service) deletionCounts(ctx context.Context, app, environment string) (
         (SELECT count(*) FROM eregion_platform_deployments d JOIN eregion_platform_apps a ON a.id=d.app_id JOIN eregion_platform_environments e ON e.id=d.environment_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
         (SELECT count(*) FROM eregion_platform_builds b JOIN eregion_platform_apps a ON a.id=b.app_id JOIN eregion_platform_environments e ON e.id=b.environment_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
         (SELECT count(*) FROM eregion_platform_domains d JOIN eregion_platform_environments e ON e.id=d.environment_id JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
-        (SELECT count(*) FROM eregion_secrets s WHERE s.app=$1 AND ($2='' OR s.environment=$2))`
+        (SELECT count(*) FROM eregion_secrets s WHERE s.app=$1 AND ($2='' OR s.environment=$2)),
+        (SELECT count(*) FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1)`
 	if err := s.pool.QueryRow(ctx, statement, app, environment).Scan(
-		&counts.environments, &counts.releases, &counts.deployments, &counts.builds, &counts.domains, &counts.secrets,
+		&counts.environments, &counts.releases, &counts.deployments, &counts.builds, &counts.domains, &counts.secrets, &counts.appEnvironments,
 	); err != nil {
 		return counts, unavailable()
 	}

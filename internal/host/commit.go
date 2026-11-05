@@ -136,10 +136,9 @@ func AccessChanges(cfg Config, credentials Credentials) ([]AccessChange, error) 
 		if err := compare("service", filepath.Join(cfg.Layout.SystemdDir, "eregion-worker.service"), workerServiceUnit(cfg), true); err != nil {
 			return nil, err
 		}
-		auth, authErr := credentials.AuthFile(cfg.Node)
-		if err := compare("credential", filepath.Join(cfg.Layout.ConfigDir, "auth.json"), auth, authErr == nil); err != nil {
-			return nil, err
-		}
+		// The token store is initialized only when absent and is otherwise
+		// preserved. Minting or revoking a token is not an access change, so it
+		// must not arm a commit-confirm window or present as credential drift.
 		env := (&credentialsStep{cfg: cfg, credentials: credentials}).env()
 		if err := compare("credential", filepath.Join(cfg.Layout.ConfigDir, "control-plane.env"), env, true); err != nil {
 			return nil, err

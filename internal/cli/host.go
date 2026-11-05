@@ -302,16 +302,24 @@ type sudoPasswordWatch struct {
 }
 
 // sudoNoTTY are the lines sudo prints when it needs a password but has no
-// terminal.
-var sudoNoTTY = [][]byte{[]byte("sudo: a terminal is required"), []byte("sudo: a password is required")}
+// terminal. Classic sudo and sudo-rs (Ubuntu 26.04) both appear; matching is
+// case-insensitive because sudo-rs starts one with "A terminal".
+var sudoNoTTY = [][]byte{
+	[]byte("sudo: a terminal is required"),
+	[]byte("sudo: a password is required"),
+	[]byte("sudo: interactive authentication is required"),
+}
 
 func (s *sudoPasswordWatch) Write(b []byte) (int, error) {
 	if !s.seen {
-		// Keep a short tail so a message split across writes still matches.
+		// Keep a tail longer than the longest message (44 bytes) so a message
+		// split across writes still matches after trimming.
 		s.tail = append(s.tail, b...)
+		lower := bytes.ToLower(s.tail)
 		for _, m := range sudoNoTTY {
-			if bytes.Contains(s.tail, m) {
+			if bytes.Contains(lower, m) {
 				s.seen = true
+				break
 			}
 		}
 		if keep := 64; len(s.tail) > keep {

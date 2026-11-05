@@ -30,7 +30,9 @@ func ensureDir(path string, mode os.FileMode) error {
 }
 
 // writeFile writes atomically and applies ownership when bootstrap runs as
-// root. The mode is always explicit; a zero mode is a programming error.
+// root. Ownership is set on the private temp file before the rename, so the
+// final path never appears owner-only under the wrong user. The mode is always
+// explicit; a zero mode is a programming error.
 func writeFile(path string, data []byte, mode os.FileMode, owner, group string) error {
 	if mode == 0 {
 		return fmt.Errorf("refusing to write %s with mode 0000", path)
@@ -38,10 +40,18 @@ func writeFile(path string, data []byte, mode os.FileMode, owner, group string) 
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
-	if err := engine.WriteFileAtomic(path, data, mode); err != nil {
-		return err
+	uid, gid := -1, -1
+	if os.Geteuid() == 0 && (owner != "" || group != "") {
+		var err error
+		uid, gid, err = resolveIDs(owner, group)
+		if err != nil {
+			return err
+		}
 	}
-	return chownIfRoot(path, owner, group)
+	if uid >= 0 || gid >= 0 {
+		return engine.WriteFileAtomicOwned(path, data, mode, uid, gid)
+	}
+	return engine.WriteFileAtomic(path, data, mode)
 }
 
 func chownIfRoot(path, owner, group string) error {

@@ -63,61 +63,77 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 		return zero, unavailable()
 	}
 	defer rollback(tx)
-	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued')
-        ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`,
-		id, sub.Kind, normalized.Target.String(), sub.Actor.Kind, sub.Actor.Subject, sub.IdempotencyKey, inputHash, canonical)
+	op, _, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, sub.Actor, sub.IdempotencyKey, resolved)
 	if err != nil {
-		return zero, unavailable()
-	}
-	if inserted.RowsAffected() == 0 {
-		var existingID contract.OperationID
-		var existingHash string
-		if err := tx.QueryRow(ctx, `SELECT id,input_hash FROM eregion_operations WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5`,
-			sub.Actor.Kind, sub.Actor.Subject, sub.Kind, normalized.Target.String(), sub.IdempotencyKey).Scan(&existingID, &existingHash); err != nil {
-			return zero, unavailable()
-		}
-		if existingHash != inputHash {
-			return zero, idempotencyInputConflict()
-		}
-		existing, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
-		if err != nil {
-			return zero, err
-		}
-		if err := attachFirstDeployOperation(ctx, tx, &existing); err != nil {
-			return zero, err
-		}
-		return existing, nil
-	}
-	if err := s.preparePlatform(ctx, tx, id, normalized, sub.Actor, resolved); err != nil {
 		return zero, err
-	}
-	if s.enqueuePlatform == nil {
-		return zero, unavailable()
-	}
-	op := contract.Operation{ID: id, Kind: sub.Kind, Target: normalized.Target.String(), Actor: sub.Actor}
-	jobID, err := s.enqueuePlatform(ctx, tx, op)
-	if err != nil {
-		return zero, unavailable()
-	}
-	if _, err := tx.Exec(ctx, "UPDATE eregion_operations SET job_id=$2 WHERE id=$1", id, jobID); err != nil {
-		return zero, unavailable()
-	}
-	op, err = scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
-	if err != nil {
-		return zero, unavailable()
-	}
-	if err := attachFirstDeployOperation(ctx, tx, &op); err != nil {
-		return zero, err
-	}
-	if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: platformAcceptedMessage(sub.Kind)}); err != nil {
-		return zero, unavailable()
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return zero, unavailable()
 	}
 	return op, nil
+}
+
+// recordPlatformSubmissionTx records one ordinary platform submission in the
+// caller's transaction: operation, idempotency replay, domain rows, the one
+// River platform job and the queued event. It is shared by HTTP/CLI submission
+// and by the webhook worker, so a webhook can commit its operation and its
+// delivery link atomically without calling Service.Submit (which opens a
+// transaction) or nesting one.
+func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, key string, resolved *resolvedGitRef) (contract.Operation, bool, error) {
+	var zero contract.Operation
+	inputHash := hashInput(normalized.Canonical)
+	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued')
+        ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`,
+		id, normalized.Kind, normalized.Target.String(), actor.Kind, actor.Subject, key, inputHash, normalized.Canonical)
+	if err != nil {
+		return zero, false, unavailable()
+	}
+	if inserted.RowsAffected() == 0 {
+		var existingID contract.OperationID
+		var existingHash string
+		if err := tx.QueryRow(ctx, `SELECT id,input_hash FROM eregion_operations WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5`,
+			actor.Kind, actor.Subject, normalized.Kind, normalized.Target.String(), key).Scan(&existingID, &existingHash); err != nil {
+			return zero, false, unavailable()
+		}
+		if existingHash != inputHash {
+			return zero, false, idempotencyInputConflict()
+		}
+		existing, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
+		if err != nil {
+			return zero, false, err
+		}
+		if err := attachFirstDeployOperation(ctx, tx, &existing); err != nil {
+			return zero, false, err
+		}
+		return existing, false, nil
+	}
+	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved); err != nil {
+		return zero, false, err
+	}
+	if s.enqueuePlatform == nil {
+		return zero, false, unavailable()
+	}
+	op := contract.Operation{ID: id, Kind: normalized.Kind, Target: normalized.Target.String(), Actor: actor}
+	jobID, err := s.enqueuePlatform(ctx, tx, op)
+	if err != nil {
+		return zero, false, unavailable()
+	}
+	if _, err := tx.Exec(ctx, "UPDATE eregion_operations SET job_id=$2 WHERE id=$1", id, jobID); err != nil {
+		return zero, false, unavailable()
+	}
+	op, err = scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
+	if err != nil {
+		return zero, false, unavailable()
+	}
+	if err := attachFirstDeployOperation(ctx, tx, &op); err != nil {
+		return zero, false, err
+	}
+	if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: platformAcceptedMessage(normalized.Kind)}); err != nil {
+		return zero, false, unavailable()
+	}
+	return op, true, nil
 }
 
 func hashInput(canonical json.RawMessage) string {
@@ -1104,36 +1120,8 @@ func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind
 	if err != nil {
 		return err
 	}
-	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'queued')
-        ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`,
-		id, kind, normalized.Target.String(), actor.Kind, actor.Subject, key, hashInput(normalized.Canonical), normalized.Canonical)
-	if err != nil {
-		return unavailable()
-	}
-	if inserted.RowsAffected() == 0 {
-		return nil
-	}
-	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved); err != nil {
-		return err
-	}
-	if s.enqueuePlatform == nil {
-		return unavailable()
-	}
-	op := contract.Operation{ID: id, Kind: kind, Target: normalized.Target.String(), Actor: actor}
-	jobID, err := s.enqueuePlatform(ctx, tx, op)
-	if err != nil {
-		return unavailable()
-	}
-	if _, err := tx.Exec(ctx, "UPDATE eregion_operations SET job_id=$2 WHERE id=$1", id, jobID); err != nil {
-		return unavailable()
-	}
-	op, err = scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
-	if err != nil {
-		return unavailable()
-	}
-	return appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: platformAcceptedMessage(kind)})
+	_, _, err = s.recordPlatformSubmissionTx(ctx, tx, id, normalized, actor, key, resolved)
+	return err
 }
 
 func nullableReleaseID(id platform.ReleaseID) any {
@@ -1956,6 +1944,20 @@ func environmentByNameTx(ctx context.Context, tx pgx.Tx, app, name string) (plat
 	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE a.name=$1 AND e.name=$2 FOR UPDATE OF e", app, name))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return env, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
+	}
+	if err != nil {
+		return env, unavailable()
+	}
+	return env, nil
+}
+
+// environmentByIDTx locks and reads the exact environment row an admission
+// observed. The opaque ID, not the app/name pair, proves the environment was not
+// deleted and recreated while the push waited in the queue.
+func environmentByIDTx(ctx context.Context, tx pgx.Tx, id platform.EnvironmentID) (platform.Environment, error) {
+	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE e.id=$1 FOR UPDATE OF e", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return env, contract.NewFault(contract.NotFound, "environment not found", "The environment was deleted after the push was admitted.")
 	}
 	if err != nil {
 		return env, unavailable()

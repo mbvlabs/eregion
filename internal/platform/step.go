@@ -702,6 +702,25 @@ func (s *HealthStep) Apply(ctx context.Context, rt engine.Runtime, report engine
 
 // ---------------------------------------------------------------- pack step
 
+const (
+	// A pack build gets a dedicated Docker network so every lifecycle phase
+	// container is attributable to this operation, step and attempt. Cancelling
+	// the build can then remove exactly those containers without touching
+	// serving, concurrent or unrelated containers.
+	buildNetworkOwner          = "pack"
+	buildNetworkOwnerLabel     = "io.eregion.build.owner"
+	buildNetworkOperationLabel = "io.eregion.build.operation"
+	buildNetworkStepLabel      = "io.eregion.build.step"
+	buildNetworkAttemptLabel   = "io.eregion.build.attempt"
+	buildNetworkCreateTimeout  = 30 * time.Second
+	buildNetworkCleanupTimeout = 30 * time.Second
+	buildNetworkLabelsFormat   = "{{json .Labels}}"
+	// packBuildKillGrace lets pack remove its own lifecycle containers and
+	// volumes after cancellation before it is killed. The owned-network
+	// cleanup remains the backstop when pack cannot clean up in time.
+	packBuildKillGrace = 5 * time.Second
+)
+
 type PackPayload struct {
 	Step    string `json:"step"`
 	Image   string `json:"image"`
@@ -816,7 +835,7 @@ func (s *PackStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckRe
 	return engine.CheckResult{Complete: true, Detail: "built image already exists (" + truncate(strings.TrimSpace(stdout), 80) + ")"}, nil
 }
 
-func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
+func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (result engine.ApplyResult, applyErr error) {
 	work := filepath.Join(rt.Root, "builds", string(s.exec.OperationID)+"-"+s.payload.Step)
 	if err := os.RemoveAll(work); err != nil {
 		return engine.ApplyResult{}, err
@@ -903,10 +922,40 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	if err != nil || !info.IsDir() {
 		return engine.ApplyResult{}, fmt.Errorf("%w: build source %s is not a readable directory on the node", engine.ErrPermanent, source)
 	}
-	args := packBuildArgs(s.payload, source)
+	networkCtx, cancelNetwork := context.WithTimeout(buildCtx, buildNetworkCreateTimeout)
+	network, err := createBuildNetwork(networkCtx, rt, isolation, s.exec.OperationID, s.payload.Step, s.exec.Attempt)
+	cancelNetwork()
+	if err != nil {
+		cleanupErr := cleanupAmbiguousBuildNetwork(ctx, rt, isolation, network, s.exec.OperationID, s.payload.Step, s.exec.Attempt)
+		if cleanupErr != nil && report != nil {
+			report(engine.Event{Kind: "warning", Step: s.ID(), Message: cleanupErr.Error()})
+		}
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
+		}
+		if cleanupErr != nil {
+			return engine.ApplyResult{}, fmt.Errorf("%w; cleaning the build network after an ambiguous create failed: %v", err, cleanupErr)
+		}
+		return engine.ApplyResult{}, err
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildNetworkCleanupTimeout)
+		defer cancel()
+		cleanupErr := removeBuildNetwork(cleanupCtx, rt, isolation, network, s.exec.OperationID, s.payload.Step, s.exec.Attempt)
+		if cleanupErr == nil {
+			return
+		}
+		if report != nil {
+			report(engine.Event{Kind: "warning", Step: s.ID(), Message: cleanupErr.Error()})
+		}
+		if applyErr != nil {
+			applyErr = fmt.Errorf("%w; cleaning the build network failed: %v", applyErr, cleanupErr)
+		}
+	}()
+	args := packBuildArgs(s.payload, source, network)
 	buildRunCtx, cancel := context.WithTimeout(buildCtx, time.Duration(s.payload.TimeoutSeconds)*time.Second)
 	defer cancel()
-	_, stderr, err := runArgvClean(buildRunCtx, args, isolation, rt, s.ID(), report)
+	_, stderr, err := runArgvCleanPack(buildRunCtx, args, isolation, rt, s.ID(), report)
 	if err != nil {
 		if buildCtx.Err() != nil {
 			return engine.ApplyResult{}, engine.ErrInterrupted
@@ -914,20 +963,25 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 		if errors.Is(err, exec.ErrNotFound) || strings.Contains(strings.ToLower(err.Error()), "executable file not found") {
 			return engine.ApplyResult{}, fmt.Errorf("%w: pack is not installed on this node; install Buildpacks or use an image release", engine.ErrPermanent)
 		}
-		return engine.ApplyResult{}, fmt.Errorf("%w: pack build failed: %s", engine.ErrPermanent, firstLine(stderr))
+		return engine.ApplyResult{}, fmt.Errorf("%w: pack build failed: %s", engine.ErrPermanent, commandDetail(err, stderr))
 	}
-	result := map[string]any{"image": s.payload.Image}
+	fields := map[string]any{"image": s.payload.Image}
 	if commit != "" {
-		result["commit"] = commit
+		fields["commit"] = commit
 	}
-	return engine.ApplyResult{Result: result}, nil
+	return engine.ApplyResult{Result: fields}, nil
 }
 
 // packBuildArgs renders one Buildpacks build. Explicit volume caches keep the
 // build and launch caches attributable to one environment; pack otherwise
-// creates a randomly keyed launch volume on every build.
-func packBuildArgs(payload PackPayload, source string) []string {
+// creates a randomly keyed launch volume on every build. The dedicated network
+// makes every lifecycle container this build creates identifiable after a
+// cancellation.
+func packBuildArgs(payload PackPayload, source, network string) []string {
 	args := []string{"pack", "build", payload.Image, "--path", source, "--builder", payload.Builder}
+	if network != "" {
+		args = append(args, "--network", network)
+	}
 	if payload.Cache != "" {
 		args = append(args, "--cache", "type=build;format=volume;name="+payload.Cache)
 	}
@@ -940,6 +994,116 @@ func packBuildArgs(payload PackPayload, source string) []string {
 		args = append(args, "--env", key+"="+payload.Env[key])
 	}
 	return args
+}
+
+// buildNetworkName is deterministic for one operation, pack step and attempt.
+// A retry gets a fresh attempt and therefore a fresh network instead of
+// colliding with resources left by the earlier attempt.
+func buildNetworkName(operationID contract.OperationID, step string, attempt uint32) string {
+	sum := sha256.Sum256([]byte(string(operationID) + "\x00" + step + "\x00" + strconv.FormatUint(uint64(attempt), 10)))
+	return "eregion-build-" + hex.EncodeToString(sum[:8])
+}
+
+// buildNetworkLabels are written when the network is created and verified
+// before anything attached to it is removed.
+func buildNetworkLabels(operationID contract.OperationID, step string, attempt uint32) map[string]string {
+	return map[string]string{
+		buildNetworkOwnerLabel:     buildNetworkOwner,
+		buildNetworkOperationLabel: string(operationID),
+		buildNetworkStepLabel:      step,
+		buildNetworkAttemptLabel:   strconv.FormatUint(uint64(attempt), 10),
+	}
+}
+
+func createBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, operationID contract.OperationID, step string, attempt uint32) (string, error) {
+	name := buildNetworkName(operationID, step, attempt)
+	labels := buildNetworkLabels(operationID, step, attempt)
+	args := []string{"docker", "network", "create"}
+	for _, key := range sortedEnvKeys(labels) {
+		args = append(args, "--label", key+"="+labels[key])
+	}
+	args = append(args, name)
+	_, stderr, err := runArgvClean(ctx, args, isolation, rt, step, nil)
+	if err != nil {
+		return name, fmt.Errorf("creating the build network %s failed: %s", name, commandDetail(err, stderr))
+	}
+	return name, nil
+}
+
+// cleanupAmbiguousBuildNetwork handles a docker network create that returned an
+// error after the request may already have reached the daemon. The build
+// context can be cancelled by then, so the ownership check and removal use a
+// fresh bounded context. The deterministic network is removed only after
+// removeBuildNetwork verifies every ownership label; a foreign or pre-existing
+// network is refused and left untouched.
+func cleanupAmbiguousBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, network string, operationID contract.OperationID, step string, attempt uint32) error {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildNetworkCleanupTimeout)
+	defer cancel()
+	return removeBuildNetwork(cleanupCtx, rt, isolation, network, operationID, step, attempt)
+}
+
+// removeBuildNetwork removes only containers attached to the network created
+// for this exact build attempt, then removes the network itself. It verifies
+// the ownership labels first so a name collision or a foreign network is never
+// cleaned. A missing network is already clean.
+func removeBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, name string, operationID contract.OperationID, step string, attempt uint32) error {
+	expected := buildNetworkLabels(operationID, step, attempt)
+	stdout, stderr, err := runArgvClean(ctx, []string{"docker", "network", "inspect", "--format", buildNetworkLabelsFormat, name}, isolation, rt, step, nil)
+	if err != nil {
+		if buildNetworkGone(stderr) {
+			return nil
+		}
+		return fmt.Errorf("inspecting build network %s failed: %s", name, commandDetail(err, stderr))
+	}
+	var labels map[string]string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &labels); err != nil {
+		return fmt.Errorf("build network %s did not report its labels: %v", name, err)
+	}
+	for key, want := range expected {
+		if labels[key] != want {
+			return fmt.Errorf("refusing to clean build network %s: label %s does not have the expected ownership value", name, key)
+		}
+	}
+	removeContainers := func() error {
+		listed, listStderr, listErr := runArgvClean(ctx, []string{"docker", "ps", "-aq", "--filter", "network=" + name, "--filter", "label=author=pack"}, isolation, rt, step, nil)
+		if listErr != nil {
+			return fmt.Errorf("listing containers on build network %s failed: %s", name, commandDetail(listErr, listStderr))
+		}
+		ids := strings.Fields(listed)
+		if len(ids) == 0 {
+			return nil
+		}
+		args := append([]string{"docker", "rm", "-f"}, ids...)
+		_, removeStderr, removeErr := runArgvClean(ctx, args, isolation, rt, step, nil)
+		if removeErr != nil && !containerAlreadyGone(removeStderr) {
+			return fmt.Errorf("removing containers on build network %s failed: %s", name, commandDetail(removeErr, removeStderr))
+		}
+		return nil
+	}
+	for pass := 0; pass < 2; pass++ {
+		if err := removeContainers(); err != nil {
+			return err
+		}
+		_, stderr, err = runArgvClean(ctx, []string{"docker", "network", "rm", name}, isolation, rt, step, nil)
+		if err == nil || buildNetworkGone(stderr) {
+			return nil
+		}
+		if pass == 1 || !buildNetworkInUse(stderr) {
+			return fmt.Errorf("removing build network %s failed: %s", name, commandDetail(err, stderr))
+		}
+	}
+	return nil
+}
+
+func buildNetworkGone(stderr string) bool {
+	lowered := strings.ToLower(stderr)
+	return strings.Contains(lowered, "no such network") ||
+		(strings.Contains(lowered, "network") && strings.Contains(lowered, "not found"))
+}
+
+func buildNetworkInUse(stderr string) bool {
+	lowered := strings.ToLower(stderr)
+	return strings.Contains(lowered, "active endpoint") || strings.Contains(lowered, "connected to network")
 }
 
 // resolveGitContextPath resolves the revision's Buildpacks context inside the
@@ -1242,12 +1406,47 @@ func runArgvClean(ctx context.Context, argv []string, env []string, rt engine.Ru
 	return runArgvWithEnv(ctx, argv, env, rt, step, report)
 }
 
+// runArgvCleanPack gives pack a short grace period after cancellation so it can
+// remove the lifecycle containers and volumes it created. The build network
+// cleanup is the backstop when pack cannot finish in time.
+func runArgvCleanPack(ctx context.Context, argv []string, env []string, rt engine.Runtime, step string, report engine.Reporter) (string, string, error) {
+	return runArgvWithEnvGrace(ctx, argv, env, rt, step, report, packBuildKillGrace)
+}
+
 func runArgvWithEnv(ctx context.Context, argv []string, env []string, rt engine.Runtime, step string, report engine.Reporter) (string, string, error) {
+	return runArgvWithEnvGrace(ctx, argv, env, rt, step, report, 0)
+}
+
+func runArgvWithEnvGrace(ctx context.Context, argv []string, env []string, rt engine.Runtime, step string, report engine.Reporter, grace time.Duration) (string, string, error) {
 	if err := validateArgv(argv); err != nil {
 		return "", "", fmt.Errorf("%w: %s", engine.ErrPermanent, err)
 	}
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: argv is validated and no shell is used.
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if grace > 0 {
+		done := make(chan struct{})
+		var once sync.Once
+		command.Cancel = func() error {
+			once.Do(func() {
+				if command.Process == nil {
+					return
+				}
+				pid := command.Process.Pid
+				_ = syscall.Kill(-pid, syscall.SIGTERM)
+				go func() {
+					timer := time.NewTimer(grace)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						_ = syscall.Kill(-pid, syscall.SIGKILL)
+					case <-done:
+					}
+				}()
+			})
+			return nil
+		}
+		defer close(done)
+	}
 	if len(env) > 0 {
 		command.Env = env
 	}
@@ -1363,6 +1562,18 @@ func firstLine(value string) string {
 		value = value[:index]
 	}
 	return truncate(value, 500)
+}
+
+// commandDetail prefers the child's stderr but never reports an empty detail
+// when the command failed before writing one.
+func commandDetail(err error, stderr string) string {
+	if detail := firstLine(stderr); detail != "" {
+		return detail
+	}
+	if err != nil {
+		return firstLine(err.Error())
+	}
+	return "unknown error"
 }
 
 func truncate(value string, limit int) string {

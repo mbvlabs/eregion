@@ -39,12 +39,15 @@ func TestDeployTokenScopeAndExpiry(t *testing.T) {
 		t.Fatalf("wrong action: %v", err)
 	}
 	past := time.Now().Add(-time.Minute)
-	auth.principals[sum] = Principal{
+	expired, err := NewAuth([]Principal{{
 		Actor: contract.Actor{Kind: "ci", Subject: "expired"}, TokenSHA256: hex.EncodeToString(sum[:]),
 		Scopes: []string{"operations:submit"}, ActionGrants: []ActionGrant{{Kind: "platform.deploy", Target: "env/api/production"}},
 		ExpiresAt: &past,
+	}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := auth.authenticateAction(header, "operations:submit", "platform.deploy", "env/api/production"); contract.Classify(err).Code != contract.Unauthenticated {
+	if _, err := expired.authenticateAction(header, "operations:submit", "platform.deploy", "env/api/production"); contract.Classify(err).Code != contract.Unauthenticated {
 		t.Fatalf("expired token: %v", err)
 	}
 }

@@ -108,11 +108,11 @@ checks.
 | Retention policy | `eregion retention show --json` returns `scope: server` with `keep_releases 10`, `keep_newer_than_days 14`, `artifact_grace_days 14`, `buildpack_cache_max_bytes 10737418240` and `buildpack_cache_max_percent 80`, every source `server`. `eregion retention set --keep-releases 5 --keep-days 10 --artifact-grace-days 10 --cache-cap-bytes 1073741824 --cache-cap-percent 75 --json` stores that server default and `show` returns it. `eregion retention set --app <app> --env <env> --keep-releases 2 --keep-days 3 --artifact-grace-days 3 --json` commits a new environment revision (accepted operation ID printed); `retention show --app <app> --env <env> --json` marks only the three release fields `environment`, both cache fields stay `server`, and `env status` names the new revision. `--clear-override` restores inheritance; a flagless `set` with `--json` or no TTY refuses with `input_required`. Host status 2026-11-03: pass on main (236–252, 274). |
 | Prune dry run | `eregion prune --dry-run --json` returns `dry_run: true`, one `items` entry per planned kind with `reference` and `bytes` where known, and `planned_bytes`; warnings name unreadable observations. No operation is accepted (`operations list` gains none), and `release list`, Docker images/containers and registry content are unchanged (compare counts and `docker system df` before and after). A second dry run prints the same plan. Host status 2026-11-03: pass on main (253–267); only the dangling images carried bytes, release rows and image items did not. Late run on `edge-690baaf`: the real run's 16 release items exactly matched this plan, and a retry dry run lists the four image and one dangling item left by defect 6 (311). 2026-11-04 on `edge-786fdcf`: **pass** — 6 items: four `image` items with their verified tag lists (2, 2, 4 and 3 tags), one `image_skipped` "used by container pedantic_jackson", and the `registry_skipped` diagnostic; `planned_bytes` 0; the real run removed all four images with no errors (338–342, 344). Candidate `edge-0a1a492`: **pass** — only the `image_skipped` remains; `registry_skipped` is gone, `items` is 1 and `planned_bytes` 0 (378, 379). |
 | Pruned rollback | After a real `prune --confirm <server>` removes an old release, `release list` shows the row with `pruned_at` and its ID still present. `rollback <app> <env> --to <pruned-id> --dry-run --json` and `rollback … --confirm <app>/<env>` both refuse with `precondition_failed` naming the release and prune time; `deploy --release <pruned-id>` refuses the same way. Rollback to the kept target still succeeds and serves. Host status late 2026-11-03 (`edge-690baaf`): **partial pass** — `rollback --to rel_0170b1be… --dry-run` and the real `--confirm githello/production` both refused exit 5 `precondition_failed`, naming the release and its `2026-11-04T00:06:41Z` prune time (305, 306); rollback to the kept target was not run. |
-| Registry GC | Record `du -sb /var/lib/eregion/registry` and the registry service state before a prune that removes at least one `registry_artifact`. The operation events show the manifest removal, then `Registry garbage collection completed`; `du` falls by at least the removed manifests/layers, `systemctl is-active eregion-registry` is active and `curl -fsS 127.0.0.1:5000/v2/` returns 200. A stale `eregion-registry-gc` container or a running `garbage-collect` process makes the step fail closed with the registry left stopped and its recovery instruction; a collection or restart failure is never suppressed, and `--delete-untagged` is never used. A deploy after GC builds, verifies publicly and serves. Host status late 2026-11-03 (`edge-690baaf`): **not exercised** — the plan had no `registry_artifact` items, and the real run failed on local images before any GC; registry `du` stayed 312,003,409 and no garbage-collection event appeared. The polkit path itself was verified separately: `sudo -u eregion systemctl restart eregion-registry.service` succeeded, the registry returned active with `/v2/` 200 (312); this was not a retention GC. 2026-11-04 on `edge-786fdcf`: still **not exercised** — the dry run's `registry_skipped` names retained failed release `rel_53a22cfea2e1f3a2fa9dd523ac4c5510` (no `image_id`, tag `eregion/githello-production:d0f76b56af71`, no local image); the planner therefore skips repository `eregion/githello-production` fail-safe. The registry catalog contains only `andurel`, whose 10 releases are all retained, so there was no eligible registry artifact. No GC and no deploy after GC (339, 345). Candidate `edge-0a1a492`: the imageless-release fix removed the `registry_skipped` diagnostic; the dry run is only the `image_skipped`. The registry still holds only retained andurel artifacts, so there is still no `registry_artifact` item and **GC remains not exercised** (378, 379). |
+| Registry GC | Record `du -sb /var/lib/eregion/registry` and the registry service state before a prune that removes at least one `registry_artifact`. The operation events show the manifest removal, then `Registry garbage collection completed`; `du` falls by at least the removed manifests/layers, `systemctl is-active eregion-registry` is active and `curl -fsS 127.0.0.1:5000/v2/` returns 200. A stale `eregion-registry-gc` container or a running `garbage-collect` process makes the step fail closed with the registry left stopped and its recovery instruction; a collection or restart failure is never suppressed, and `--delete-untagged` is never used. A deploy after GC builds, verifies publicly and serves. Host status late 2026-11-03 (`edge-690baaf`): **not exercised** — the plan had no `registry_artifact` items, and the real run failed on local images before any GC; registry `du` stayed 312,003,409 and no garbage-collection event appeared. The polkit path itself was verified separately: `sudo -u eregion systemctl restart eregion-registry.service` succeeded, the registry returned active with `/v2/` 200 (312); this was not a retention GC. 2026-11-04 on `edge-786fdcf`: still **not exercised** — the dry run's `registry_skipped` names retained failed release `rel_53a22cfea2e1f3a2fa9dd523ac4c5510` (no `image_id`, tag `eregion/githello-production:d0f76b56af71`, no local image); the planner therefore skips repository `eregion/githello-production` fail-safe. The registry catalog contains only `andurel`, whose 10 releases are all retained, so there was no eligible registry artifact. No GC and no deploy after GC (339, 345). Candidate `edge-0a1a492`: the imageless-release fix removed the `registry_skipped` diagnostic; the dry run is only the `image_skipped`. The registry still held only retained andurel artifacts, so GC was still not exercised in that candidate run (378, 379). Fresh-server `edge-f447aa3a0d30` 2026-11-05: **pass** — the earlier prune `op_14dacc9e25d8d900752bfd3b0f336bb9` removed a registry manifest and ran GC; the after-GC deploy `op_141d2d0b97cf9da670d5a631c97418d1` then built, passed public verification and served (584). The cache-qualification prune `op_2786073ca510236984f6267b73662cc1` removed registry manifest `img@sha256:67b46713…` (2,408,739 bytes); events show 197 blobs marked, 3 blobs deleted and `Registry garbage collection completed`; the registry stayed active and `/v2/` returned 200 (617, 630). |
 | 30-release retention | On the disposable app run `eregion retention set --app <app> --env <env> --keep-releases 5 --keep-days 1 --json`, deploy 30 distinct releases, then use an authorized SQL update on the disposable control database to backdate all 30 `created_at` values to older than one day and run `prune --confirm <server>`. Exactly the newest five releases remain unpruned (serving release #30 and rollback target #29 are in that set); 25 release items mark rows with `pruned_at` while all 30 release rows remain, and separate `image`/registry items remove their images and manifests. A following `prune --dry-run` lists no release items. Git builds stay local and never reach the registry, so to cover **Registry GC** run this row (or a second app) with releases published by `eregion image push`; only those produce `registry_artifact` items, GC and the deploy-after-GC check. Host status 2026-11-03: not run; needs a freshly initialized disposable server. |
 | host-registry-v2 upgrade | On a node whose registry predates `host-registry-v2`, `plan` lists `host-registry-v2` once. `apply` writes `storage.delete.enabled: true` in `/etc/eregion/registry/config.yml`, restarts `eregion-registry.service` with `REGISTRY_STORAGE_DELETE_ENABLED=true`, and a second `plan`/`apply` reports the step skipped. A manifest delete no longer returns 405, and a deploy after the upgrade serves. Host status 2026-11-03: pass on main (230–233, 270–273); the manifest-delete/deploy-after-upgrade variants were not separately run. |
 | Doctor retention | `eregion doctor --json` includes `host.retention`. With no run yet on a fresh install it is `pass` with "no retention run yet"; the startup catch-up or next daily run records one. After a run it names the finish time, status, removed items and reclaimed/planned bytes. A failed last run, a running run older than two days, or a last success older than two days with the worker up is `warn` with a fix. The main-node summary is 20 pass / 0 warn / 0 fail. Host status 2026-11-04 (`edge-786fdcf`): **pass (20/0/0)** — the latest run succeeded at 2026-11-04T01:11:20Z, removed 4 items and recorded no errors; the row detail reads "4 item(s) removed, 0 B reclaimed" (343, 347, 352, 353). A transient control-DB read failure produced a 19/1 warn in 2 of 5 repeated doctor runs; every successful read was 20/0/0. Candidate `edge-0a1a492`: **pass (20/0/0) in all three runs and after the restart**; the latest daily run succeeded at 01:47:57Z with 0 items removed, and no transient read warning occurred (380–383, 391, 392). |
-| Doctor Buildpacks cache | `host.build_cache` reads the latest durable cache measurement from `retention_runs`; it never walks Docker volumes or the filesystem in `doctor`. With no measurement, or one older than 48 hours, it is `pass` with unknown (a fresh host stays healthy), never a zero-byte pass. After a retention run records a measurement under the cap it is `pass` and names used and cap bytes. Set the server cap below the measured cache within the allowed range (`retention set --cache-cap-bytes 1073741824 --json`) or build until the cache exceeds it; `doctor` reports `warn` naming the cap. After `prune --confirm <server>` removes least-recently-used entries the next retention run refreshes the measurement and the row returns to `pass`. Cache volumes are named `eregion-build-cache-<hex app>_<hex env>`, `eregion-launch-cache-<hex app>_<hex env>` or legacy `pack-cache-*.<build\|launch>`. Host status 2026-11-04 (`edge-786fdcf`): **pass with a known measurement** — 4.7 GiB of the 10.0 GiB cap (350, 352). Candidate `edge-0a1a492`: **pass** — 4.7 GiB of the 10.0 GiB cap (383, 392). |
+| Doctor Buildpacks cache | `host.build_cache` reads the latest durable cache measurement from `retention_runs`; it never walks Docker volumes or the filesystem in `doctor`. With no measurement, or one older than 48 hours, it is `pass` with unknown (a fresh host stays healthy), never a zero-byte pass. After a retention run records a measurement under the cap it is `pass` and names used and cap bytes. Set the server cap below the measured cache within the allowed range (`retention set --cache-cap-bytes 1073741824 --json`) or build until the cache exceeds it; `doctor` reports `warn` naming the cap. After `prune --confirm <server>` removes least-recently-used entries the next retention run refreshes the measurement and the row returns to `pass`. Cache volumes are named `eregion-build-cache-<hex app>_<hex env>`, `eregion-launch-cache-<hex app>_<hex env>` or legacy `pack-cache-*.<build\|launch>`. Host status 2026-11-04 (`edge-786fdcf`): **pass with a known measurement** — 4.7 GiB of the 10.0 GiB cap (350, 352). Candidate `edge-0a1a492`: **pass** — 4.7 GiB of the 10.0 GiB cap (383, 392). Fresh-server `edge-f447aa3a0d30` 2026-11-05: **warn-to-pass qualified** — the 09:06 retention measurement was 1.0 GiB over the 1 GiB/75% test cap, so the row warned; the build-cache volume was held by a stopped pack container from cancelled operation `op_337e60a9fced63a8d8a5b6d8a4c1a959`. Read-only selected-field inspection proved it stale and ownerless; only that disposable container was removed, then real prune `op_2786073ca510236984f6267b73662cc1` removed the 348,112,124-byte build cache and follow-up prune `op_80f9f730b33ec9d2ec5e4b55149fb740` recorded 725.1 MiB. The row passed with a known measurement (586–647). Unknown/stale-measurement and percentage-only variants were not run. |
 
 Host status on main (2026-11-04 candidate, `edge-0a1a492d8207`): **policy**
 show/set and the environment revision pass; **prune dry run** passes with only
@@ -126,6 +126,312 @@ with a known 4.7 GiB cache. A restart of the serving revision succeeded with
 1,212/1,212 HTTP 200. **Registry GC** remains unexercised because the registry
 holds only retained `andurel` artifacts; **30-release retention** and the
 fresh-server baseline remain. Evidence in the 2026-11-04 candidate record.
+
+## Fresh-server session checklist (edge)
+
+The order in which we work through the alpha baseline above during one paired
+session on a freshly rebuilt VPS. The tables above define what each check must
+show to pass. This list only orders them and names who acts. Edge only:
+install and upgrade come from the `edge` channel, and the GitHub `stable`
+environment is not needed until a tag is authorized. The build under test is
+`edge-f447aa3…`, which has the same code as candidate `0a1a492`. Record every
+item as pass, fail, blocked or not run in a new run record. This run's logs
+are under `/home/mbv/eregion-qual/2026-11-04-fresh/` (mode 0700, operator-local,
+not Git artifacts), numbered from 400. Earlier runs stay under
+`/home/mbv/.cache/eregion-run/`.
+
+**You** = the operator at a human terminal, provider console or authenticator.
+**Agent** = me, on the remote box `thelab`, which also hosts the control
+database. Topology: you run `server init` (steps 1–3) from your **laptop**,
+then the agent logs in here with the handoff bundle, so the login is a real
+second machine (decision C closed) and every later step runs here. Capture each
+laptop init run with `script -q -c '<command>' <log>` (or `| tee`), then copy the
+logs here into the evidence directory. They must contain no secrets: stop the
+capture before the handoff output is shown. Placeholders: context `fresh`, `$IP`,
+`$MAIN` (server hostname), `$APP` = `git-test1.mbvlabs.com`, `$ALIAS` =
+`git-test2.mbvlabs.com`, `$GUIDED` = `git-test3`, `$WRONG` = `git-test4` (an
+origin that is not this server), `$IMG` = `git-test5`. App hostnames are
+normally Cloudflare-proxied, which is the expected production setup. Only the
+control database endpoint (connection URLs) must not be proxied. Behind the
+proxy, eregion sees `dns=proxied` and readiness rests on the public check, so
+a wrong origin must stay not ready because its public check fails. Never
+advise turning off the proxy to make a check pass. The old `main` server (46.224.129.96) is torn down for this
+rebuild. andurel and its `eregion-test*` hostnames go with it, and its
+`eregion-cp-pg` database on port 5433 stays untouched until after the session.
+
+### 0. Prerequisites (you)
+
+- [ ] VPS rebuilt with Debian 13 or Ubuntu 26.04. Provide the IP, root SSH key
+      access and provider console access.
+- [x] DNS records: `$MAIN` → `$IP`; `git-test1`, `git-test2`, `git-test3` and
+      `git-test5` → `$IP`; `git-test4` → a different origin. The app hostnames
+      are as configured in Cloudflare and normally proxied.
+- [x] A new, empty control database and role on the workstation PostgreSQL
+      (`eregion-cp-pg`): database `eregion_fresh` owned by the non-superuser
+      role `eregion_fresh`, reached through Funnel at
+      `thelab.tailbbed89.ts.net:10000`. The DSN file is
+      `/home/mbv/.config/eregion-fresh-database-url` (mode 0600, never
+      printed) and carries `sslmode=verify-full&sslnegotiation=direct`, because
+      Funnel terminates TLS itself. Pass the file to init with
+      `--database-url-file`. Checked 2026-11-04: the Funnel certificate
+      verifies and the role logs in over the tailnet to an empty database.
+      psql 18 cannot test the Funnel path (it requires ALPN), so the first
+      real connection through Funnel is init's database step. You copy the
+      file to the laptop (`scp thelab:.config/eregion-fresh-database-url`,
+      mode 0600) and delete the laptop copy after init.
+- [ ] Authenticator ready. GitHub webhook admin access on `mbvlabs/eregion-hello`.
+- [x] Agent: confirm the fixture commits in `/home/mbv/.cache/eregion-hello`
+      (`ea1b225`, `6dc0468`, `034eb82` failing, `b895cb2` monorepo; HEAD
+      `3461a87`), the git read token and the `HELLO_SECRET` files (0600), and
+      Docker 29.8.2 on `thelab` for `image push`. Checked 2026-11-04. The
+      stale local `main` context is left in place until step 6.
+
+### 1. Install and the starting build
+
+- [ ] **Install** (you, on the laptop): run edge `install.sh`. The signature is
+      verified and `eregion version` shows `edge-f447aa3…`. If the laptop is a
+      Mac, this also covers the macOS half (R10).
+- [ ] You, on the laptop: run
+      `eregion upgrade --channel edge --version edge-0a1a492d8207`. The
+      downgrade warning appears. Initialize the server on this older build so
+      that step 5 can upgrade the node across two edge builds.
+- [ ] Agent, here: edge `install.sh` with an isolated `EREGION_INSTALL_DIR`
+      verifies and installs `edge-f447aa3…` (Linux half). The CLI on `PATH`
+      here stays on `edge-0a1a492d8207` until step 5.
+
+### 2. Preflight and plan, before any server change (you on the laptop, agent guiding)
+
+- [ ] **Preflight:** an unreachable host and a missing credential are both
+      refused with the fix, and the server stays unchanged. Testing an
+      unsupported OS/arch needs another host (decision A).
+- [ ] **Init plan:** the plan names every change. Declining starts nothing:
+      there is no admin user and no `/usr/local/bin/eregion`. `--json` without
+      `--confirm fresh` refuses with `input_required`.
+- [ ] **Interrupted init, `--discard`:** interrupt at the plan confirmation, then
+      run `--discard`. The pending state under `pending/fresh/` is removed and the
+      server is unchanged. Discard only here: a fresh init does not adopt a
+      partially initialized server.
+
+### 3. Init apply with faults (you on the laptop and console, agent probing `$IP` from here)
+
+- [ ] **Interrupted init:** interrupt during host bootstrap before the
+      database step, then `--resume`. Interrupt again after the database step,
+      then `--resume`: there is one node identity and no duplicate context.
+- [ ] **Lockdown revert:** kill the CLI after lockdown is armed and before it is
+      confirmed. Within about 120 s public SSH reopens by itself (agent checks
+      `nc $IP 22`, you watch the console). `--resume` then completes the switchover.
+- [ ] **Init apply, doctor gate:** stop a checked service that is off the
+      control path just before the gate. Init stops with `doctor_failed` and the
+      fix commands. Fix it, then `--resume` runs only the remaining phases.
+      `--skip-doctor` needs its own init (decision B).
+- [ ] **Interrupted init, before handoff:** interrupt at the handoff, then
+      `--resume`.
+- [ ] **Handoff:** you get the plain secrets, the bundle and the passphrase.
+      Init waits for "stored", the output has no API token, and
+      `--secrets-out <owner-only path>` is the only way a file gets written. Copy
+      the bundle here (`/tmp/opencode/fresh.bundle`, mode 0600). The
+      passphrase stays in your password manager.
+- [ ] **Init apply, end state:** public 22 is closed and SSH works over
+      WireGuard. Root login and password auth are off and the firewall is
+      active. `curl https://$MAIN` verifies without `-k`. node_exporter answers
+      only over WireGuard. `doctor` reports 20 ok.
+
+### 4. Login here, operator tools and break-glass
+
+- [ ] **Login** (you, in a terminal on this box): `eregion login` with the
+      bundle as context `fresh`, entering the passphrase. It reaches the same
+      server the laptop initialized, and both machines then work.
+      `eregion --context fresh doctor` reports 20 ok here.
+- [ ] **Operator tools:** `server status`, `doctor`, an `eregion ssh` shell (agent).
+- [ ] **SSH command:** piped `ssh --command` keeps stdout and the exit status.
+      A sudo password refusal shows `input_required` (agent).
+- [ ] **Break-glass:** you run `eregion node unlock-ssh --minutes 15` as root
+      from the provider console. Public 22 opens, and SSH locks again when the
+      window ends.
+- [ ] You run `eregion protect init` and enrol the TOTP. `protect status` is
+      configured.
+
+### 5. Upgrades on the build under test (agent)
+
+- [ ] **Install** row, second half: `eregion upgrade --channel edge` moves
+      `0a1a492` → `f447aa3` and keeps `.prev`.
+- [ ] **Version lockstep:** a node command refuses with `node_version_mismatch`.
+      **Dry-run version mismatch:** `apply --dry-run --auto-upgrade-nodes`
+      leaves the node build unchanged.
+- [ ] `apply --auto-upgrade-nodes` upgrades the node. A second `apply` is a
+      no-op and `doctor` reports 20 ok.
+- [ ] **Signed node upgrade:** an unsigned or mismatching upload and a dev CLI
+      are refused. A failed manifest download refuses with no checksum-only
+      fallback, the same method as evidence 193.
+
+### 6. Login variants and contexts (you type passphrases, agent checks)
+
+- [ ] **Login, wrong host key:** a login with a tampered pin fails closed.
+- [ ] **Atomic login:** an unreachable import leaves the context, identity and
+      known_hosts byte-identical. An existing name needs `--replace NAME`.
+- [ ] **Context selection:** log in to the same bundle a second time as
+      `fresh2`. With `fresh` as the current context, `--context fresh2` and
+      `EREGION_CONTEXT=fresh2` target `fresh2`: check the domain/app-create DNS
+      addresses and the protected handoff identity fields. Also check the
+      unknown-name hint.
+- [ ] **Context remove:** run `context remove fresh2` and remove the stale
+      `main` for the torn-down server. Each context, its identity and its
+      known_hosts entries are gone, and `fresh` still works here and on the
+      laptop.
+
+### 7. Application workflow on `fresh`
+
+- [ ] **Deployability:** an environment missing source, domain or DNS (`$WRONG`)
+      reports exactly what is missing and refuses (agent).
+- [ ] **App create**, guided (you at the terminal, or the agent in a PTY): a
+      private repo, `web` + `worker`, config, a secret and `$GUIDED`. It ends at a
+      serving card with the URL. Ctrl-C detaches and names `operations follow`.
+      A guided run with the failing commit ends at a failed operation.
+- [ ] **App create**, flag-only and JSON (agent): the flag-only form produces the
+      same revision, and JSON returns both IDs without waiting. **Create replay**
+      with the same key returns the same IDs.
+- [ ] **Domain and DNS / Alias check path:** `$APP` and `$ALIAS` become ready
+      (`$ALIAS` with `--check-path /users/sign-in`), and the certificate
+      verifies without `-k`. `$WRONG`, proxied to a wrong origin, never becomes
+      ready: it shows `dns=proxied` and its public check fails.
+- [ ] **Second deploy** under continuous curl on `$APP` and `$ALIAS` with zero
+      failures. **Failed candidate.** **Rollback** with pinned secret revisions.
+- [ ] **Environment changes**, **Monorepo build**, **Moved-branch retry**,
+      **Build lifecycle**, **Processes**, **Release command scope**.
+- [ ] **Leaked-container retry**, which also host-tests defect 2 (cleanup is no
+      longer "completed" after a failed removal, and the real error is
+      redacted). **Container repair.**
+- [ ] **JSON contracts**, **Detach and retry**, **Restart**, **Route failure**,
+      **Status and logs**.
+- [ ] **Release command recovery** and the stale/competing **Container repair**
+      variants: best effort, using a timed worker kill. There is no real-host
+      fault hook. Record not run if neither reproduces (decision D).
+
+### 8. CI and push to deploy
+
+- [ ] **Token factor:** you run `token create` with TOTP. `--yes`, `--json` and
+      stdin cannot mint a token, and `token list` shows metadata only. Create
+      tokens for: valid, short-expiry, to-revoke and other-environment.
+- [ ] **CI** (agent): a valid token deploys a ref. Expired, revoked and
+      wrong-environment tokens fail. Every other `/v1` path is unreachable publicly.
+- [ ] **Push to deploy:** you run `env update --auto-deploy` and add the GitHub
+      webhook. A push deploys, a redelivery creates no second deploy, and
+      another branch or a bad signature does nothing. After
+      `--rotate-webhook-secret` the old secret fails.
+
+### 9. Disk retention (agent; SQL backdating authorized only on the new database)
+
+- [ ] **Retention policy** show/set, the server default and the environment
+      override.
+- [ ] Create app `img` on `$IMG` from `eregion image push`. Push and deploy 30
+      distinct images (**30-release retention**: keep 5, keep-days 1), backdate
+      `created_at`, run `prune --dry-run`, then `prune --confirm fresh`.
+- [ ] **Prune dry run** is unchanged across two runs. **Pruned rollback** is
+      refused, and a rollback to the kept target serves.
+- [ ] **Registry GC:** `du` drops, the registry is active and `/v2/` returns 200.
+      A deploy after GC serves.
+- [ ] **Doctor retention** and **Doctor Buildpacks cache** rows, including the
+      cache-cap `warn` and its return to `pass`.
+
+### 10. Factor-gated actions and removal (last)
+
+- [ ] **Secrets export:** you run `secrets export` and `secret export`.
+      `--yes`, `--json` and stdin cannot bypass it.
+- [ ] **Factor-gated removal / Removal:** `domain remove`, `env delete` and
+      `app delete`, including the last environment. Each needs confirmation and
+      TOTP. A direct HTTP delete refuses. Other apps keep serving and the
+      operation history remains.
+- [ ] Agent: a final `doctor` and `server status`, the run record, and updates
+      to the baseline host status and MASTER §8. Stop
+      `eregion-alpha1-test-pg`.
+
+### Findings from the 2026-11-04 fresh-server session (`edge-f447aa3a0d30`)
+
+Defects (fix before the next edge build):
+
+- **Defect 7, sudo-rs refusal not detected.** Ubuntu 26.04 ships sudo-rs
+  0.2.13. Its "A terminal is required to authenticate" / "interactive
+  authentication is required" did not map to `input_required`. Fixed in the
+  working tree with case-insensitive matching plus the sudo-rs line, and
+  regression tests. Not yet published.
+- **Defect 8, follow summary names a failed release as serving.** When a
+  first deploy fails after its route switch (public check failed, nothing
+  served before), the final line reads `serving release <failed id>`.
+  `env status` correctly shows none.
+- **Defect 9, token create/revoke restarts the API.** Both write the token
+  store and run `systemctl restart eregion-api.service`, because the API loads
+  token hashes only at startup (`internal/cli/noderpc.go`,
+  `internal/api/auth.go`). The listener was down for up to ~7 s, and the
+  public CI and webhook endpoints returned 502 (observed on the first request
+  after `token revoke`). Fix in progress: reload the token store in place,
+  with no restart.
+- **Defect 10, the push webhook answers too slowly for GitHub, is fixed in the
+  working tree.** The handler now resolves the environment, revision and exact
+  secret revision in one joined read with the secret read fresh per delivery,
+  verifies the signature over the raw body, and commits a sanitized admission
+  plus its River webhook job in one PostgreSQL transaction; it replies 202 only
+  after that commit. One absolute 8-second budget covers the resolver, body
+  read and admission, so a slow client or database returns a retryable 503
+  rather than an optimistic 202. A worker then submits `platform.deploy` and
+  links the operation to the delivery in another single transaction; a
+  redelivery returns the original operation, and a deleted or rebound
+  environment fails the accepted intent terminally. Offline handler, validation
+  and job-disposition regressions pass; the 16 explicit-DSN PostgreSQL cases
+  **pass** against PostgreSQL 17.11 on 2026-11-05 (820). **Not host-qualified:**
+  the ping and push response times, a successful first delivery, a redelivery
+  that does not deploy twice, a bad-signature delivery and rotation still need
+  the real server and GitHub.
+- **Defect 11, env-delete preview claims the last environment.** Found
+  2026-11-05 on the same fresh build. `env delete guided failing --dry-run`
+  printed "This is the app's last environment; deleting it also deletes the
+  application record." although `guided` has `failing` and `production`. The
+  preview count is target-scoped (`deletionCounts` filters to the named
+  environment), so the warning fires for any single named environment. The
+  actual deletion is safe: `deleteEmptyApplicationTx` re-counts the app's
+  remaining environments after deleting the target and returns when any
+  remain. Verified 2026-11-05: `env delete guided failing` succeeded and
+  `guided/production` was preserved (680-689). Preview-only UX defect. **Fixed
+  in the working tree:** the preview keeps target-scoped row counts but uses the
+  application-wide environment count for the last-environment warning, with
+  unit and explicit-DSN integration regressions; the DB-backed case **passes**
+  against PostgreSQL 17.11 on 2026-11-05 (820). **Not host-qualified:** the
+  post-fix `env delete --dry-run` still needs a real terminal check.
+
+Usability (address before alpha.1; not blocking a pass):
+
+- **Handing secrets from a human to an agent is too much work.** Tokens are
+  shown once on screen and the agent needs them in a protected file. The
+  manual copy/`cat >`/permissions dance is error-prone; a file created with
+  `vi` came out 0644. `token create` should be able to write the token
+  straight to a protected 0600 file (for example `--out FILE`, refusing
+  existing or loose-permission paths) while still requiring the human factor.
+- **Guided secret prompts take only pasted values.** "Repository read token"
+  and "Secret value for X" are masked value fields, and the flag form takes
+  files. Pasting a 93-char PAT into an invisible field failed twice, and the
+  error appeared only at the end. Offer a file path option, or validate the
+  credential right after entry.
+- **The guided create never asks for a release command,** although the
+  flag form has `--release-command`.
+- The `token create` "Use it as" hint leaves `<main-hostname>` unfilled and
+  wraps the URL. It should print the context's hostname and the real
+  endpoint.
+- `protect status` still suggests `eregion protect init` once configured.
+- Plain `process list` shows applied replicas while JSON shows desired.
+- `secret list` takes `--app/--environment` flags where most commands take
+  positionals.
+- A failed first-deploy card still prints `public url:` although nothing
+  serves.
+
+### Open decisions
+
+- **A.** Unsupported OS/arch preflight: use a second throwaway host or a VM
+  with another OS, or record not run.
+- **B.** `--skip-doctor`: rebuild the VPS for a second init or record not run.
+  The alternative, `--resume --skip-doctor` after `doctor_failed`, would replace
+  the resume-after-fix check.
+- **C.** Closed: init runs from the laptop and the login runs on `thelab`.
+- **D.** Whether the recovery and repair race variants stay alpha.1 gates if a
+  timed kill can't reproduce them on a real host.
 
 ## Resume testing — saved session state, updated 2026-11-03
 
@@ -231,11 +537,11 @@ do not treat a passed subset as completion of an entire row.
 | Guided create | **Not run:** guided `app create`/`env create` success and failure, ending at a serving URL or a failed operation; guided vs flag-only revision equivalence. Flag-only create and app-create replay passed. Needs DNS A records git-test3/git-test4 → 46.224.129.96 and an agent in a PTY. |
 | CI endpoint | **Not run:** authenticated CI deploy; expired, revoked and wrong-environment tokens denied; nothing else of `/v1` reachable publicly. Needs defect 1 published and applied, plus a token created at a human terminal. |
 | Push to deploy | **Not run:** signed push deploys; a redelivery does not deploy twice; another branch or a bad signature does nothing; after rotation the old secret fails. Needs `env update --auto-deploy` at a human terminal and a GitHub webhook on `mbvlabs/eregion-hello`. |
-| Factor-gated ops | **Not run:** positive `token create`, `secrets export`, `secret export`, `app delete`, `env delete` (including deleting the last environment); cleanup and history verified. JSON/no-TTY refusals and deletion preview passed. Needs the human authenticator. |
-| Login and contexts | **Not run:** successful second-machine login from the bundle, atomic failed replacement, wrong host key, context selection and `context remove`. Needs the bundle from `secrets export`, then an agent. Preserve the working main context and identity. |
+| Factor-gated ops | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** positive `secrets export` is operator-reported: the human completed the authenticator factor and the `Done`/`stored` gate, and the agent verified only that the `--secrets-out` file is 0600 in a 0700 parent (648). Positive `app delete guidedflags2` was run by the human with a fresh TOTP (`op_44ae1a2d25c010f9e42ec16b4472c6f2`, succeeded in 5.7 s); the agent verified the app, environment, release, deployment, build, domain, secret-namespace and revision rows are gone, durable operation/event history remains, and githello, guided and img still return 200 (660-669). Positive `env delete guided failing` was then run by the human with a fresh factor (`op_62837d11f91ad17e7a28a87846a5b594`, succeeded, 11 events); the agent verified only the failing environment's rows and secrets are gone, `guided` and its `production` environment still serve git-test3, all four monitored hostnames return 200, and operation history remains (680-689). `secret export` was not run; a read-only `secret list` confirms active `HELLO_SECRET` revision 3 in `guided/production` for the next human export (649). Positive last-environment `env delete guidedflags production` also passed (`op_844aaba1c862a0450452be5bd40ac624`, 8 events); the `guidedflags` app and all its rows are gone, history remains, and the other apps still return 200 (690-699). Still **not run:** positive `token create` and positive `secret export`; container/network inventory was not independently inspected because the agent has no Docker socket permission without sudo, so cleanup rests on operation step results and zero platform rows. JSON/no-TTY refusals and deletion preview passed. Needs the human authenticator. |
+| Login and contexts | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** the human's isolated `login --file main-handoff.md --passphrase-file <mktemp 0600>` on this box succeeded under `XDG_CONFIG_HOME=/home/mbv/eregion-qual/private-human-checks/login-profile`; the passphrase was extracted from the handoff inside the operator session and the temporary file was trap-removed. Read-only `context list`, `context show --name main` and `server status` under that profile pass (720, 721, 726; 722 is the concurrent-attempt failure noted below), and the normal `~/.config/eregion` profile still lists its separate `main` and passes `server status` (723–725, 728). Both profiles use the same operator WireGuard peer key from the same bundle, so a second live tunnel can take the node's single peer endpoint and a command may fail with "the WireGuard tunnel was lost"; this is local tunnel contention, not a context/store defect. The interactive pasted-passphrase login is **unresolved**: the real handoff's own passphrase opens its bundle (710), so the failure is likely copy/wrap/entry, not a proven source bug. **Context remove: pass for the isolated disposable profile (operator-run).** The isolated store is now empty and its `servers/main` is gone, while the normal `~/.config/eregion` store and identity are unchanged and `server status` succeeds (730–739). The pasted command showed a blank line, but the unchanged normal store proves the executed removal was scoped to the isolated XDG profile, not a bare default-profile removal. **Wrong host key and atomic unreachable import now pass (agent-run, 2026-11-05, evidence 750–759):** the wrong-pin login failed at SSH host-key verification before authentication, and the network-isolated login failed with no WireGuard handshake; both left the copied context, identity and known_hosts byte-identical, and the normal profile still passes `server status`. **Exact conflict, successful `--replace main` and context selection now pass (agent-run, 2026-11-05, evidence 760–767):** the conflict exits 5 with the exact `--replace main` hint and leaves the profile byte-identical; replacement proves readiness before swapping the identity and keeps the imported files inside the disposable profile; `--context main` and `EREGION_CONTEXT=spare` target the selected context, and JSON/noTTY refuses without prompting. **True second-machine login: pass (operator-reported, 2026-11-05, evidence 768–770).** On the separate laptop, the handoff copied from `thelab` imported into a disposable profile with `login --file … --passphrase-file … --json`, returning context `main` on `mbv@10.78.0.1:22 over WireGuard`; the same scoped `server status --context main --json` returned CLI/node `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, role `main`, schema 20/20, River 7/7 and all five services active. The earlier accidental `thelab` localhost attempt is not counted, and cleanup was operator command-based rather than independently verified. The interactive pasted-passphrase login remains **unresolved** (copy/wrap/entry), not a pass. The normal `main` context and identity are intact; the isolated contexts are removed. |
 | Upgrades | **Partial pass:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). `upgrade` between two edge builds passed on 2026-11-03 (`42a0541` -> `a77d3bf` -> `13fdb25`, evening `13fdb25` -> `1e541a7`, late `1e541a7` -> `690baaf`; previous-binary copy kept); a failed manifest download during a node upgrade refused with `unavailable` and no checksum-only fallback (`193-*`). Still **not run:** `install.sh` acceptance on Linux/macOS for these builds. |
 | macOS | **Not run (no Mac available, R10):** `install.sh` on macOS and an installed CLI against the server. CI's macOS CLI job and the darwin/arm64 cross-build are not host acceptance. Required before v1.0.0 final; not an alpha.1 gate. |
-| Disk retention (alpha.1 gate, R9) | **Partial pass (2026-11-04 candidate, `edge-0a1a492d8207`):** policy, dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read, polkit restart, pruned-rollback refusal, doctor retention and a known 4.7 GiB cache all pass. The real prune removed four multi-tagged images; the 1.3 GB dangling image is `image_skipped` "used by container"; the daily retry submitted a new numbered run after the one-hour backoff and it succeeded with 0 items; `doctor` is 20/0/0 in three runs; a serving-revision restart succeeded with 1,212/1,212 monitor responses. **Registry GC remains not exercised:** the imageless-release fix removed `registry_skipped`, but the registry still holds only fully retained `andurel` artifacts. Deploy after GC, the 30-release row and the fresh-server baseline remain not run. The manual prune is not counted by the daily submitter; docs/IMPLEMENTATION's “one successful run per day” is scoped to automatic daily-key operations (two runs succeeded today: manual at 01:11 and automatic at 01:48). |
+| Disk retention (alpha.1 gate, R9) | **Partial pass (2026-11-04 candidate, `edge-0a1a492d8207`):** policy, dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read, polkit restart, pruned-rollback refusal, doctor retention and a known 4.7 GiB cache all pass. The real prune removed four multi-tagged images; the 1.3 GB dangling image is `image_skipped` "used by container"; the daily retry submitted a new numbered run after the one-hour backoff and it succeeded with 0 items; `doctor` is 20/0/0 in three runs; a serving-revision restart succeeded with 1,212/1,212 monitor responses. **In that candidate run, registry GC remained not exercised:** the imageless-release fix removed `registry_skipped`, but the registry still held only fully retained `andurel` artifacts. Deploy after GC, the 30-release row and the fresh-server baseline were not run then. **Fresh-server 2026-11-05 (`edge-f447aa3a0d30`):** registry GC and deploy-after-GC are now exercised (`op_14dacc…`, `op_141d2d…`), and the Buildpacks-cache warn-to-pass is qualified (`op_2786073…`: the 1.0 GiB measurement over the 1 GiB test cap warned; after removing a proven stale pack container, prune removed the 348,112,124-byte cache and the row passed at 725.1 MiB). The overnight 25-row prune plus aged fixtures partially cover the 30-release row; the complete fresh-server baseline remains not run. The manual prune is not counted by the daily submitter; docs/IMPLEMENTATION's “one successful run per day” is scoped to automatic daily-key operations (two runs succeeded today: manual at 01:11 and automatic at 01:48). |
 | Fresh host | **Not run:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. Needs an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
 | Release-command recovery | **Not run:** lost or unresolved response recovery variants. Once-per-release skipping, a changed command running again and restart/scale refusal after a failed run passed. Needs a scoped fault; stays an alpha.1 gate (R4). |
 | Repair variants | **Not run:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. Needs a scoped fault. |
@@ -329,7 +635,7 @@ run**, not implementation failures or passes.
 ## Current qualification boundary
 
 Real-host evidence spans several published edge builds, recorded below.
-`edge-0a1a492d8207` is the latest installed and tested build; earlier passes are
+`edge-f447aa3a0d30` is the latest installed and tested build; earlier passes are
 not automatically a full baseline pass for it. The 2026-10-29/30 runs closed
 release-changing dense switches, symlink-escape rejection, same-key replay after
 the branch was deleted, rollback refusal for a release whose command never
@@ -358,8 +664,11 @@ race, saw the daily submitter create a new numbered run after the one-hour
 backoff (it succeeded with 0 items), verified that the imageless-release
 `registry_skipped` was gone, reached doctor 20/0/0 in all three runs, and
 restarted the serving revision with 1,212/1,212 HTTP 200. Both 2026-11-04
-findings are fixed and host-verified. Registry GC and deploy-after-GC remain
-unexercised because the registry holds only retained andurel artifacts. Source
+findings are fixed and host-verified. The 2026-11-05 fresh-server run on
+`f447aa3` exercised registry GC and deploy-after-GC (`op_14dacc…`,
+`op_141d2d…`) and qualified the Buildpacks-cache warn-to-pass
+(`op_2786073…`: 725.1 MiB of the 1 GiB test cap after removing a proven stale
+pack container). Source
 fixes have isolated regressions, build/vet and darwin/arm64 cross-build
 evidence; published CI also ran race checks. These are distinct from manual
 acceptance.
@@ -373,6 +682,571 @@ candidate, from a freshly initialized server (R11), before asking the user to
 authorize `1.x` or `v1.0.0-alpha.1`.
 
 ## Run record
+
+### 2026-11-05 — fresh-server registry GC and cache qualification
+
+- Published CLI/node: `edge-f447aa3a0d30`, context `main`, Ubuntu 26.04
+  amd64. Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/558-*` through
+  `647-*`. This does not qualify the uninstalled local fixes.
+- The automatic overnight retention run marked 25 of the original 30 `img`
+  release rows pruned; rows remain. Image config creation timestamps, unlike
+  release timestamps, had not aged past the registry grace period.
+- User authorized aged disposable fixtures. Built six distinct image fixtures
+  with `SOURCE_DATE_EPOCH` (20 days old), pushed each using `image push`,
+  and deployed each successfully. Backdated only those six release rows by
+  two days, preserving their order. No registry blobs were edited.
+- Two identical dry runs planned six release items, six local images, one
+  registry artifact (aged01), and one Buildpacks cache. The newest five aged
+  releases, including serving aged06 and rollback aged05, were protected.
+- Confirmed prune `op_14dacc9e25d8d900752bfd3b0f336bb9` succeeded. Events
+  record manifest removal and `Registry garbage collection completed`.
+  Registry storage fell from 9,596,201 to 9,393,649 bytes; shared layers
+  remain. Registry active, `/v2/` HTTP 200 afterward. Each of git-test1,
+  git-test2, git-test3 and git-test5 returned 98/98 HTTP 200 during prune.
+- Pruned aged01 rollback (dry-run and real) and `deploy --release` all
+  refused with `precondition_failed`, naming the release and prune time.
+  Rollback to kept aged05 succeeded and publicly served `img release aged05`.
+  A new image built and pushed after GC deployed successfully as
+  `op_141d2d0b97cf9da670d5a631c97418d1`, serving `img release aftergc`.
+- Follow-up dry run before the after-GC deploy contained no release or
+  registry-artifact items. The Buildpacks cache remained: removal was skipped
+  because a container held the volume. Cache warn-to-pass qualification was
+  completed later in this session (below); the holder was identified before
+  removal.
+- Doctor is not clean: `host-credentials-v1` drift after token creation is
+  a known source-fixed, uninstalled defect. Do not apply the published build
+  as a workaround: its credentials step may clear minted tokens.
+- Cache warn-to-pass (same session, evidence 586–647): the 09:06 durable
+  measurement was 1.0 GiB, over the server 1 GiB/75% test cap, and
+  `host.build_cache` warned; disk was 84% free, so the absolute cap was the
+  trigger. The dry run planned the githello build cache (348,112,124 bytes),
+  but the 09:06 run had skipped it because container `practical_cori`
+  (`1f79f2eac3b4…`) held the volume. Selected-field `docker inspect` (never
+  Env) showed it stopped since 2026-11-04T10:50:10Z, exit 0, restart policy
+  no, no app ownership labels, and command tag
+  `eregion/githello-production:337e60a9fced`; that tag and build
+  `bld_e4bf86d5…` identify terminal cancelled operation
+  `op_337e60a9fced63a8d8a5b6d8a4c1a959` ("Build stopped by operator"). The
+  pack container outlived cancellation by about 7s and was left holding the
+  cache volume; it carries only builder image labels, not eregion ownership
+  labels, so retention cannot identify it as disposable. **Fixed in the working
+  tree:** each pack build gets a dedicated attempt-scoped network labeled with
+  `io.eregion.build.*`, pack receives `--network`, cancellation sends SIGTERM
+  with a five-second grace before SIGKILL, and a bounded deferred cleanup
+  verifies the ownership labels, removes only `author=pack` containers on that
+  network and removes the network; a foreign or ambiguous network is never
+  touched. Offline fake-Docker regressions pass. **Not host-qualified:** a real
+  cancelled build and the volume holder still need the authorized server.
+- No queued/running/cancelling operation and no pending/running build existed;
+  the container was the only volume user, so it was removed with
+  `docker rm practical_cori` (613). The post-removal plan (614) was
+  re-inspected: serving `rel_584e6c80…` and rollback `rel_4f87faa…` were
+  protected; the only other items were aged02 `rel_4d563a61…` plus its image
+  and registry artifact, which became eligible because the after-GC deploy
+  added a release under the img keep-5 override. Real prune
+  `op_2786073ca510236984f6267b73662cc1` succeeded: planned 4 items; events
+  removed the manifest (2,408,739 bytes), the build cache (348,112,124
+  bytes), the image tags, and ran `platform-retention-gc-01-v2` (197 blobs
+  marked, 3 deleted, "Registry garbage collection completed"). The run
+  recorded 5 removed items / 334.3 MiB reclaimed (the plan had 4 items;
+  release marking and the registry GC are additional recorded effects).
+  Follow-up `op_80f9f730b33ec9d2ec5e4b55149fb740` planned 0 items, confirming
+  the empty plan and recording a second durable measurement.
+- `doctor` after each prune: **19 pass / 0 warn / 1 fail**. `host.build_cache`
+  **pass** with a known durable measurement, "Buildpacks cache uses 725.1 MiB
+  of the 1.0 GiB cap"; `host.retention` pass; the only fail is
+  `drift.pending` host-credentials-v1, the known source-fixed uninstalled
+  defect. This is not a 20/0/0 summary.
+- Four endpoints returned 324/324 HTTP 200 (81/81 each on git-test1,
+  git-test2, git-test3, git-test5) through the container removal and both
+  prunes; no non-200. Serving releases stayed githello `rel_e0e10c35…` and
+  img `rel_584e6c80…` (aftergc); registry active, `/v2/` 200; all seven app
+  containers plus registry remained running; no stale pack container or cache
+  volume user remained. The removed container's anonymous `pack-layers`
+  (346.4MB) and `pack-app` (0B) volumes remain orphaned; they are outside the
+  retention cache prefixes and were not removed under the container-only
+  authorization (646/647).
+- Safe defaults restored: server retention keep 10 / 14 days / 14 days /
+  10 GiB / 80%; img/production override cleared by
+  `op_660d9f977526ddbdbea3da635fd48721` (no deploy queued). Final `doctor`
+  remains 19 pass / 0 warn / 1 fail; `host.build_cache` pass at 725.1 MiB of
+  the 10.0 GiB cap; final dry run is empty. Not exercised (not pass):
+  no-measurement/unknown, >48-hour stale measurement, percentage-only trigger,
+  and unreadable/truncated measurement (`cache_skipped`).
+
+### 2026-11-05 — fresh-server handoff re-export and secret metadata
+
+- Published CLI/node: `edge-f447aa3a0d30`, context `main`, Ubuntu 26.04
+  amd64. Read-only `server status` returned CLI/node
+  `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, schema 20/20, River 7/7,
+  and active Caddy, Docker, API, worker and WireGuard services (650).
+- **`secrets export`: pass (operator-reported, not re-run by the agent).**
+  The operator ran `eregion secrets export --context main --secrets-out
+  /home/mbv/eregion-qual/private-human-checks/main-handoff.md` at the human
+  terminal, entered the authenticator factor, and completed the `Done` /
+  `stored` gate. The agent did not read, print, copy or hash the handoff; it
+  verified only that the path is a regular file with mode 0600, owner
+  `mbv:mbv`, in a parent directory with mode 0700, owner `mbv:mbv` (648). No
+  handoff content, passphrase or secret value is recorded.
+- **`secret export`: not run.** For the next human export, a read-only
+  `eregion secret list --app guided --environment production --context main
+  --json` returned active `HELLO_SECRET` revision 3 (and `GIT_READ_TOKEN`
+  revision 3) (649). Only metadata was captured; no value was read or printed.
+  This confirms the namespace exists and does not satisfy the positive
+  `secret export` check.
+- Not re-run in this evidence step: the `--yes`, `--json` and stdin/non-TTY
+  refusal paths for both exports, positive `secret export` and positive
+  `token create`; positive `app delete` and positive `env delete` were run
+  separately and are recorded below.
+
+### 2026-11-05 — fresh-server `app delete guidedflags2` and env-delete preview safety check
+
+- Published CLI/node: `edge-f447aa3a0d30`, context `main`, Ubuntu 26.04
+  amd64; node commit `f447aa3a0d30`, schema 20/20, River 7/7, all services
+  active. Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/660-*` through
+  `679-*`. All agent checks in this record are read-only.
+- **`app delete guidedflags2`: pass for the verified subset (operator-run).**
+  The human ran `eregion app delete guidedflags2 --context main --confirm
+  guidedflags2` with a fresh TOTP; operation
+  `op_44ae1a2d25c010f9e42ec16b4472c6f2` (`platform.app.delete`,
+  target `app/guidedflags2`) succeeded in 5.7 s. The human reports that the
+  dry-run preview promised container/route/vault/domain/platform-row cleanup
+  and preserved history; that preview was not saved and cannot be replayed now
+  that the app is gone. The agent did not rerun the deletion.
+- Verified absent after deletion: `app list` has no `guidedflags2`;
+  `app status guidedflags2` is `not_found`; `env list --app guidedflags2` and
+  `secret list --app guidedflags2 --environment production` are empty.
+  Read-only `eregion_fresh` counts are 0 for app, environment, release,
+  deployment, build, domain, secret namespace, secret revision, environment
+  revision and change rows (660-663, 668).
+- Verified history retained: `operations get` and `operations follow
+  --output ndjson` replay the terminal operation with 8 events; the final
+  delete event says the app and every environment were deleted after workload
+  and route cleanup and that operation history was kept; the DB has 8 events
+  and 1 step. `operations list --app guidedflags2` returns the operation; the
+  `--app ... --environment production` filter is empty because the operation
+  target is `app/guidedflags2` (664-666, 669).
+- Verified other apps unaffected: `githello/production` (git-test1, body
+  `eregion sample: v2 src3`), its proxied alias (git-test2/users/sign-in,
+  `alias ready`), `guided/production` (git-test3, `eregion sample: guided
+  src3`) and `img/production` (git-test5, `img release aftergc`) all returned
+  HTTP 200 with curl exit 0; env status showed healthy/applied/ok (667).
+- Not verified: independent Docker container/route listing. `eregion ssh
+  --command 'docker ps …'` returned Docker socket permission denied (exit 1)
+  and no sudo was used; cleanup rests on the operation event and zero platform
+  rows, not on a Docker inventory. This subset does not cover positive
+  `env delete`, the last-environment case, `token create` or `secret export`.
+- **Urgent preview finding (not a destructive defect):** the human's next
+  dry-run, `eregion env delete guided failing --context main --dry-run`,
+  printed "This is the app's last environment; deleting it also deletes the
+  application record." even though `guided` has **two** environments. DB/CLI
+  state: `guided` app row 1, environments `failing` and `production`;
+  `production` serves `rel_4c43b3021250ee83d86051ed2aad068f` publicly at
+  git-test3; `guidedflags` has one unused worker-only `production` env; total
+  apps 5 (670-674, 678). The warning is a preview-only false positive:
+  `deletionPreview` calls `deletionCounts` with the environment filter
+  (`internal/controlplane/platform_delete.go:353`), and the count at line 384
+  is restricted to `($2='' OR e.name=$2)`, so it is 1 for any named
+  environment; line 366 then emits the last-environment warning. The CLI only
+  prints preview warnings (`internal/cli/delete.go:118-133`). The actual
+  worker path deletes only the target environment's rows
+  (`deleteEnvironment`, lines 165-207; secrets scoped at lines 265-290), then
+  `deleteEmptyApplicationTx` re-counts remaining environments after that
+  deletion and returns early when `remaining != 0` (lines 293-303). Because
+  `guided/production` remains, the app and production are preserved. The real
+  `guided/failing` deletion was **not run**; no TOTP, confirmation, operation
+  submission or database mutation was performed. Do not turn the warning into
+  `app delete guided`; the next human target check is evidence 676.
+- Prepared but not executed for the next human: `env delete guided failing
+  --confirm guided/failing` (preserve `guided/production`) and the
+  last-environment `env delete guidedflags production --confirm
+  guidedflags/production` (unused worker-only app from the earlier comparison).
+  Exact pre/post conditions and abort criteria are in 676.
+- Skipped/not run in this step: positive `token create`, positive `secret
+  export`, the last-environment deletion, container inventory, and the rest
+  of the alpha baseline. Positive `env delete guided failing` was run later in
+  this session and is recorded below. No apply, publish, commit, install,
+  host/database mutation, fault injection or secret-value read occurred.
+
+### 2026-11-05 — fresh-server `env delete guided failing`
+
+- Published CLI/node: `edge-f447aa3a0d30`, context `main`, Ubuntu 26.04
+  amd64; node commit `f447aa3a0d30`, schema 20/20, River 7/7, all services
+  active. Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/680-*` through
+  `689-*`. All agent checks in this record are read-only.
+- **`env delete guided failing`: pass for the verified subset (operator-run).**
+  The human ran `eregion env delete guided failing --context main --confirm
+  guided/failing` with a fresh factor; operation
+  `op_62837d11f91ad17e7a28a87846a5b594` (`platform.environment.delete`,
+  target `env/guided/failing`) succeeded, attempt 1, 11 events, last sequence
+  11. The operator reports 4.6 s; the DB row spans
+  2026-11-05T10:28:25.450329Z–10:28:32.084685Z. The agent did not rerun it.
+- Only the failing environment was removed: `app status guided` returns the
+  app with one environment, `production`; `env list --app guided` has only
+  `production`; `secret list --app guided --environment failing` is empty.
+  Read-only `eregion_fresh` counts for `guided/failing` are 0 for environment,
+  release, deployment, build, domain, secret namespace, secret revision and
+  environment revision rows; the failed deploy's change rows are gone (only
+  2 production-environment changes and 1 app-level change remain). The
+  `guided` app row remains 1 and total apps remain 5 (680, 682, 685).
+- `guided/production` remains serving: release
+  `rel_4c43b3021250ee83d86051ed2aad068f`, route applied, public ok/200 at
+  git-test3, with 1 release, 1 deployment, 1 build, 1 domain, 2 secret
+  namespaces and 1 revision; both production secret names remain active at
+  revision 3 (681, 685).
+- Operation history remains retrievable: `operations get` and `operations
+  follow --output ndjson` replay the terminal operation with 11 events;
+  `operations list --app guided --environment failing` still returns the
+  deletion plus the earlier failing-environment domain/deploy history, and
+  the DB has 11 events and the completed `platform-delete-01-v1` step with
+  `result={"removed": 0, "networks_removed": 1}` (682-685).
+- All four monitored hostnames returned HTTP 200 with curl exit 0: git-test1
+  (`eregion sample: v2 src3`), git-test2/users/sign-in (`alias ready`),
+  git-test3 (`eregion sample: guided src3`) and git-test5
+  (`img release aftergc`) (686).
+- The two `stdout: a584eb7d7b62` node-delete lines are the environment network
+  ID, not a duplicated container removal. `DeleteStep.Apply` lists containers
+  first (step result `removed: 0`, so no container removal ran), then lists
+  and removes the environment network (`internal/platform/delete_step.go:75,
+  88, 94`); `docker network ls --quiet` and `docker network rm` each print the
+  same ID, and `runArgv` reports each stdout line
+  (`internal/platform/step.go:1258-1263, 1321-1352`). No ownership or cleanup
+  defect. Minor message observation: `Check` says "managed workload containers
+  still exist" when only a network remains (delete_step.go:69).
+- The unused `guidedflags` app still had exactly one environment, `production`
+  (worker-only, no domains, no releases/deployments/builds, 2 secret
+  namespaces) when this step ended. The prepared last-environment deletion was
+  subsequently executed successfully; see the next record (690-699).
+- Not verified: independent Docker container/network inventory. The Docker
+  socket was not readable by the agent without sudo, and no sudo was used; the
+  operation step result and zero platform rows are the cleanup evidence.
+  Not run in this step: positive `token create`, positive `secret export`, the
+  last-environment deletion (executed later in this session; see next record),
+  and the rest of the alpha baseline. No source edits, tests, build/vet,
+  apply/publish/commit/install, host/database mutation, fault injection, TOTP
+  beyond the human's recorded deletion, or secret-value read occurred.
+
+### 2026-11-05 — fresh-server last-environment `env delete guidedflags production`
+
+- Published CLI/node: `edge-f447aa3a0d30`, context `main`, Ubuntu 26.04
+  amd64; node commit `f447aa3a0d30`, schema 20/20, River 7/7, all services
+  active. Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/690-*` through
+  `699-*`. All agent checks in this record are read-only.
+- **`env delete guidedflags production`: pass for the verified subset
+  (operator-run).** The human ran `eregion env delete guidedflags production
+  --context main --confirm guidedflags/production` with a fresh factor; the
+  operator reports the dry run correctly showed that deleting the last
+  environment would also remove the application. Operation
+  `op_844aaba1c862a0450452be5bd40ac624` (`platform.environment.delete`,
+  target `env/guidedflags/production`) succeeded, attempt 1, 8 events, last
+  sequence 8. The operator reports 5.6 s; the DB row spans
+  2026-11-05T10:32:09.626303Z–10:32:15.177262Z. The agent did not rerun it.
+- The `guidedflags` application is gone: `app list` now has exactly deployab,
+  githello, guided and img (4 apps); `app status guidedflags` is `not_found`;
+  `env list --app guidedflags` and `secret list --app guidedflags
+  --environment production` are empty (690, 691, 695).
+- Read-only `eregion_fresh` counts for `guidedflags` are **0** for app,
+  environment, release, deployment, build, domain, secret namespace, secret
+  revision, environment revision and change rows (694).
+- Remaining apps are unaffected: `guided/production` still serves
+  `rel_4c43b3021250ee83d86051ed2aad068f`; githello, guided and img env status
+  all show public ok/200 and route applied; all four monitored hostnames
+  return HTTP 200 (git-test1 `eregion sample: v2 src3`, git-test2/users/sign-in
+  `alias ready`, git-test3 `eregion sample: guided src3`, git-test5
+  `img release aftergc`) (696, 697).
+- Operation history remains retrievable: `operations get` and `operations
+  follow --output ndjson` replay the terminal operation with 8 events;
+  `operations list --app guidedflags --environment production` and
+  `operations list --app guidedflags` still return it after the app row is
+  gone; the DB has 8 events and the completed `platform-delete-01-v1` step.
+  The step result is null and there was no stdout because its check found no
+  managed workload containers or environment networks (guidedflags was never
+  deployed), so Apply had nothing to remove (691-694).
+- Not verified: independent Docker container/network inventory. The Docker
+  socket was not readable by the agent without sudo, and no sudo was used; the
+  step check/result and zero platform rows are the cleanup evidence. Not run
+  in this step: positive `token create`, positive `secret export`, and the
+  rest of the alpha baseline. No source edits, tests, build/vet,
+  apply/publish/commit/install, host/database mutation, fault injection, TOTP
+  beyond the human's recorded deletion, real export, additional deletion or
+  secret-value read occurred.
+
+### 2026-11-05 — fresh-server isolated handoff login, profile verification and removal
+
+- Published CLI/node: `edge-f447aa3a0d30`, context `main` in two separate
+  profiles, Ubuntu 26.04 amd64. Evidence:
+  `/home/mbv/eregion-qual/2026-11-04-fresh/720-*` through `739-*`. The human
+  ran login and the isolated removal; all agent checks in this record are
+  read-only.
+- **Passphrase-file login: pass for the verified subset
+  (operator-reported).** The human ran on this box
+  `XDG_CONFIG_HOME=/home/mbv/eregion-qual/private-human-checks/login-profile
+  eregion login --file /home/mbv/eregion-qual/private-human-checks/main-handoff.md
+  --passphrase-file <mktemp 0600>`; the passphrase was extracted from the
+  handoff inside the operator session and the temporary file was removed by
+  trap. The agent did not read the handoff or any passphrase/key file. This
+  verifies the passphrase-file login path and the isolated profile, not the
+  baseline's second-machine topology.
+  Read-only `context list` and `context show --name main` under that XDG show
+  one current `main` context created at 2026-11-05T11:13:26Z with route
+  `mbv@10.78.0.1:22 over WireGuard via 46.224.129.96:51820`; `server status`
+  returns CLI/node `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, schema
+  20/20, River 7/7 and active Caddy, Docker, API, worker and WireGuard
+  services (720, 721, 726); 722 is the concurrent-attempt failure described
+  below.
+- **Normal profile still works: pass.** The default `~/.config/eregion`
+  profile still lists its separate `main` context (created
+  2026-11-04T09:42:37Z) with the same route, and `server status` succeeds
+  (723–725, 728; 730, 732, 733 after the isolated removal). The two profiles
+  have distinct context files and identity directories; modes are 0700 for
+  the profile/servers directories and 0600 for contexts.json, known_hosts and
+  the identity files. No key or credential file was read.
+- **Tunnel contention observation (not a context defect).** The isolated
+  profile was imported from the handoff that carries the normal profile's
+  operator identity, so both use the same operator WireGuard public key (same
+  tunnel fingerprint and socket basename).
+  Concurrent or rapid profile switching can make one command lose the node's
+  single peer endpoint: isolated `server status` failed while the normal
+  status ran concurrently (722), and the normal recheck failed immediately
+  after a successful isolated status (727); each profile succeeded when run
+  against the idle peer (725, 726). The tunnel daemons are local and exit
+  after 10 minutes idle. Stop or let the unused daemon idle out before
+  switching profiles.
+- **Interactive pasted-passphrase login: unresolved, not a proven source
+  bug.** The real handoff's own passphrase opens its bundle (710), and the
+  synthetic prompt/round-trip tests pass (701); the remaining variable is the
+  value pasted at the masked prompt (copy, soft-wrap or entry), not a
+  demonstrated source defect. The failure is likely copy/wrap/entry, not a
+  proven source bug. Do not retry blindly; use the passphrase-file path or a
+  protected copy.
+- **Context remove: pass for the isolated disposable profile
+  (operator-run).** The scoped command was
+  `env -u EREGION_CONTEXT_FILE XDG_CONFIG_HOME=/home/mbv/eregion-qual/private-human-checks/login-profile eregion context remove main --confirm main --json`;
+  the output was `changed: true, removed: main`. The isolated store is now
+  empty and `servers/main` is gone; the isolated profile-level `known_hosts`
+  remains. The normal `~/.config/eregion` store and identity are unchanged
+  (contexts.json inode/size/mtime and every identity file inode/mtime match
+  the pre-removal values) and `context list/show` plus `server status`
+  succeed; isolated `context show/status` returns `not_found`, not a tunnel
+  error (730–739). The pasted command showed a blank line before `eregion`;
+  the unchanged normal store proves the executed removal was scoped to the
+  isolated XDG profile, not a bare default-profile removal. Do not omit the
+  XDG override: the default store is the working normal profile.
+- **Wrong host key and atomic unreachable import: pass (agent-run, 2026-11-05).**
+  See the next record. Still **not run:** a true second-machine login, the
+  exact `--replace` conflict, a successful replacement swap and context
+  selection. The normal `main` context and identity are intact; the isolated
+  context is removed.
+- No source edits, tests, build/vet, export/decrypt/import, apply/publish/
+  commit/install, host/database mutation, fault injection or secret-value
+  read occurred in this step. Doctor was not run; the known 19-pass/1-fail
+  host-credentials state and the published f447aa3 fix remain untouched.
+  `server status` is read-only; it spawned local tunnel daemons.
+
+### 2026-11-05 — agent-run wrong-host-key and network-isolated login variants
+
+- Published CLI/node: `edge-f447aa3a0d30`, commit `f447aa3a0d30`, Ubuntu
+  26.04 amd64. The agent ran both logins under explicit authorization; the
+  passphrase was extracted from the saved handoff only into a protected 0600
+  file inside a 0700 disposable tree and was never printed, hashed or put on
+  a command line. Evidence:
+  `/home/mbv/eregion-qual/2026-11-04-fresh/750-*` through `759-*`; the
+  private prep records 740-744 are not part of this evidence.
+- **Wrong host key: pass.** A 0700 copy of the real normal `main` context,
+  identity and known_hosts had only its copied top-level ED25519 known_hosts
+  pin replaced with a locally generated wrong key. The noninteractive login
+  with the saved handoff and the protected passphrase used
+  `--replace main --json` with `EREGION_TUNNEL=inprocess`; it exited 6
+  (`unavailable`) with "the host key ... does not match the pinned key".
+  The SSH host-key verification failed during the handshake, before
+  authentication; no node RPC was dispatched and no readiness/swap occurred.
+  The copied context, identity and known_hosts stayed byte-identical (750–752,
+  755). The only remote effect was the pre-auth WireGuard and SSH host-key
+  exchange.
+- **Atomic unreachable import: pass.** A second 0700 copy changed only its
+  known_hosts hostname from 10.78.0.1 to 10.78.0.2 and ran the same login
+  inside `unshare -rn` with zero network routes. It exited 6 (`unavailable`)
+  with "the WireGuard tunnel ... did not come up ... no request was sent";
+  the node was not contacted. The copied context, identity and known_hosts
+  stayed byte-identical (753–755).
+- **Cleanup and normal profile: pass.** The protected passphrase file and the
+  whole qual-740 tree were removed; no copied-profile tunnel daemon or socket
+  remained. Read-only `server status` on the normal profile then passed:
+  CLI/node `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, schema 20/20,
+  River 7/7 and Caddy, Docker, API, worker and WireGuard active. The normal
+  tunnel daemon started by that check was stopped. The normal profile's
+  contexts.json/known_hosts hashes and identity inode/size/mtime and the
+  isolated profile hashes were unchanged (756–758).
+- **Still not run:** a true second-machine login, the exact `--replace`
+  conflict, a successful replacement swap and context selection. This step
+  made no source edits; the only repository edit made by this step is this
+  authorized MANUAL-TESTING.md record. No apply, export, database, DNS,
+  token, protect or host mutation was run.
+
+### 2026-11-05 — agent-run batched login conflict, replacement and context selection
+
+- Published CLI/node: `edge-f447aa3a0d30`, commit `f447aa3a0d30`, Ubuntu
+  26.04 amd64. Agent-run under the existing protected handoff/profile
+  methodology: the handoff was passed read-only to the CLI, its passphrase was
+  extracted by `awk` and piped to `--passphrase-file /dev/stdin`, and was never
+  printed, hashed, written to a passphrase file or placed on a command line.
+  The disposable profile tree was 0700 and every command used
+  `EREGION_TUNNEL=inprocess`; it was removed after the run. Evidence:
+  `/home/mbv/eregion-qual/2026-11-04-fresh/760-*` through `767-*`.
+- **Exact existing-name conflict without `--replace`: pass.** A disposable
+  profile with a synthetic `main` context and identity ran
+  `login --file main-handoff.md --passphrase-file /dev/stdin --json`; it exited
+  5 (`conflict`) with "context main already exists" and the exact
+  `--replace main` hint. The profile (contexts.json, known_hosts and synthetic
+  identity files) was byte-identical before and after, with no
+  `.eregion-login-*`/`main.replace-*` entry and no tunnel daemon. Source
+  `internal/cli/login.go` 187-197 returns this conflict before identityDir,
+  probe or ready, so no node contact occurs (760, 762).
+- **Successful `--replace main`: pass.** The same disposable profile then ran
+  the login with `--replace main`; it exited 0 and returned context `main` on
+  route `mbv@10.78.0.1:22 over WireGuard`. The pre-existing synthetic identity
+  directory was swapped out (stale sentinel gone; `ssh_ed25519` inode changed
+  17435096 -> 17436650), the saved paths stayed inside the disposable profile,
+  known_hosts gained one `10.78.0.1` pin, and no temporary or backup directory
+  remained. The login's WireGuard host-key pin and authenticated version/ready
+  RPC completed before the swap. The normal `~/.config/eregion`
+  contexts.json/known_hosts hashes, identity inode/size/mtime and tunnels
+  metadata were unchanged, and the isolated login-profile hashes were
+  unchanged. The imported identity stayed only in the disposable profile, which
+  was deleted in cleanup (763).
+- **Context selection among disposable contexts: pass.** `context use --name
+  spare` made spare current and `context list`/`show` with no `--name` returned
+  it; `context use --name spare-bad` made a deliberately unusable context
+  current and `show` returned that. With `spare-bad` current,
+  `server status --context main --json` and
+  `EREGION_CONTEXT=spare server status --json` both exited 0 and returned node
+  `edge-f447aa3a0d30`, commit `f447aa3a0d30`, schema 20/20, River 7/7 and
+  active Caddy, Docker, API, worker and WireGuard services. Current was then
+  restored to main (764).
+- **JSON/noTTY never prompts: pass.** With an empty disposable profile and
+  stdin from `/dev/null`, `login --file main-handoff.md --json` and plain
+  `login --file main-handoff.md` both exited 2 (`input_required`) with
+  "--passphrase-file is required without a terminal"; stdout was empty, no
+  bundle-paste or login prompt/header appeared, and neither waited for input
+  (761).
+- **Cleanup and normal profile: pass.** The qual-760 tree (including the
+  CLI-written disposable identity) was removed; no
+  `.eregion-login-*`/`main.replace-*` entry, tunnel daemon or eregion unix
+  socket remained. The normal profile's contexts.json/known_hosts hashes,
+  `servers/main` identity inode/size/mtime and `tunnels` metadata were
+  unchanged, and contexts.json/known_hosts kept their 2026-11-04 09:42
+  creation mtimes (before the run); `context list/show` still show the original
+  current `main`. A read-only `server status` with
+  `EREGION_TUNNEL=inprocess` exited 0: CLI/node
+  `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, schema 20/20, River 7/7 and
+  Caddy, Docker, API, worker and WireGuard active. No daemon was started
+  (765, 766).
+- **Still not run:** a true second-machine login; it is not claimed. No source
+  edits, source test suite, build/vet, export/decrypt/import, apply/publish/
+  commit/install, host/database/DNS mutation, token minting, fault injection or
+  secret-value read occurred. No `--auto-upgrade-nodes` was passed and the
+  disposable context had `auto_upgrade_nodes` false, so the version check could
+  not install or change the node; only read-only version/ready/status RPCs and
+  the pre-auth host-key exchange reached the node. The normal `main` context and
+  identity are intact.
+
+### 2026-11-05 — true second-machine laptop login and status
+
+- Published CLI/node: `edge-f447aa3a0d30`, commit `f447aa3a0d30`, channel
+  `edge`; operator laptop linux/amd64, Go 1.27.1, tree reported clean
+  (`dirtyfalse`). The laptop is a separate machine from `thelab`; the handoff
+  was copied from `thelab` into a mktemp directory on the laptop. Evidence:
+  `/home/mbv/eregion-qual/2026-11-04-fresh/768-*` through `770-*`. The parent
+  session relayed the operator's report; the agent did not run any command
+  against the server, laptop or `thelab`, did not read the handoff or any
+  credential file, and did not independently inspect the laptop profile or
+  its cleanup.
+- **True second-machine login: pass (operator-reported).** On the laptop, the
+  operator copied the handoff from
+  `/home/mbv/eregion-qual/private-human-checks/main-handoff.md` (5235 bytes)
+  into a mktemp directory with `scp`, extracted the paired passphrase there
+  with `sed` under `umask 077`, and ran
+  `env -u EREGION_CONTEXT -u EREGION_CONTEXT_FILE
+  XDG_CONFIG_HOME="$d/profile" EREGION_TUNNEL=inprocess eregion login --file
+  "$d/handoff.md" --passphrase-file "$d/passphrase" --json`. It exited 0 and
+  returned schema `eregion/v1`, ok true, context `main` and route
+  `mbv@10.78.0.1:22 over WireGuard`. No passphrase or secret value was
+  printed, hashed or recorded.
+- **Second-machine `server status`: pass (operator-reported).** The same
+  scoped disposable profile ran
+  `server status --context main --json`; it exited 0 and returned CLI/node
+  `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, role `main`, schema 20/20,
+  River 7/7, Caddy, Docker, API, worker and WireGuard all active, and uptime
+  100265. This is the baseline's second-machine login; the earlier accidental
+  run on `thelab`'s localhost is excluded and is not a pass.
+- **Cleanup: operator command-based, not independently verified.** The
+  login/status commands ran inside a parenthesized shell with `set -eu` and
+  `trap 'rm -rf "$d"' EXIT`; the wrapper returned successfully. The agent did
+  not inspect the laptop profile, temporary directory, tunnel or socket state
+  after the run, so the removal of the disposable profile is reported rather
+  than verified.
+- **Still unresolved:** the interactive pasted-passphrase login remains
+  unresolved (likely copy, soft-wrap or entry, not a proven source bug) and is
+  not a pass. The broader alpha baseline remains incomplete, and the local
+  source fixes in the working tree remain unpublished. This step records only
+  the second-machine login/status sub-check.
+- No source edits, source tests, build/vet, export/decrypt/import,
+  apply/publish/commit/install, host/database/DNS mutation, token minting,
+  fault injection or secret-value read occurred in this step. The agent ran no
+  command against the server, laptop or `thelab`; the only repository edit made
+  in this step is this authorized MANUAL-TESTING record, and the only evidence
+  files written in this step are 768–770.
+
+### 2026-11-05 — reviewed-fix integration (local source only)
+
+- Target: `/home/mbv/work/eregion` on `master`, HEAD `f447aa3a0d30` plus the
+  uncommitted working tree; the three source worktrees were based on the same
+  commit. This is not a published build and not host evidence.
+- Integrated reviewed fixes: defect 11 deletion-preview count; cancelled-pack
+  cleanup (dedicated attempt network, SIGTERM grace, ownership-checked
+  cleanup); durable GitHub webhook admission (migration 021, sanitized receipt
+  and River job before 202, atomic operation link, fresh resolver inside an
+  8-second budget). Pre-existing working-tree fixes were preserved
+  byte-for-byte: auth reload, host credential store, sudo-rs detection, viewer
+  serving summary and export KeyID.
+- Integrated source files are byte-identical to the reviewed worktree copies
+  (22 files); all 28 pre-existing modified/untracked files have the same
+  SHA-256 before and after. No conflicts occurred.
+- Local checks passed: `gofmt -l` on changed Go files (empty), `go build ./...`,
+  `go vet ./...`, `GOOS=darwin GOARCH=arm64 go build ./...`; offline package
+  tests for `internal/api`, `internal/vault`, `internal/platform`,
+  `internal/controlplane`, `internal/viewer`, `internal/engine` and
+  `internal/host`; CLI compile-only plus targeted SSH/sudo/runner/export tests;
+  targeted regressions for the three fixes and the pre-existing auth, host,
+  vault, viewer and engine fixes.
+- Explicit-DSN cases compiled and **skipped** (`EREGION_TEST_DATABASE_URL`
+  unset): the 16 webhook admission/resolver cases and the deletion-preview
+  integration case. No ambient DSN, database or Docker fixture was used.
+- Explicit-DSN PostgreSQL run (2026-11-05): **pass**. All 16 webhook
+  admission/resolver cases and the deletion-preview integration case ran
+  against PostgreSQL 17.11 in disposable databases created under a dedicated
+  `eregion_test_parent_820_…` parent; 17/17 passed, no skips. Migration 021
+  applied in every ephemeral database. Three test-fixture defects found by the
+  run were fixed: the webhook fixture reused hard-coded host ports, two legacy
+  HTTP cases used an `X-GitHub-Delivery` value with an underscore (the handler
+  correctly accepts only `[A-Za-z0-9-]`), and the deletion-preview fixture
+  named a node that did not match the in-process transport identity. Product
+  code was unchanged. The parent database, temporary role and credential file
+  were removed; the contents of the pre-existing `eregion`, `eregion_fresh`,
+  `postgres`, `template0` and `template1` databases were unchanged. This is a
+  local DB integration check, not host qualification.
+- Not run / not qualified: migration 021 was applied only inside the disposable
+  test databases, not to a live control database; no server, DNS, GitHub hook,
+  release, install, commit, push or tag was touched; real webhook
+  latency/first delivery/redelivery/rotation, a real cancelled pack build and
+  the post-fix deletion preview remain host checks. No secret value was
+  printed, logged or stored in evidence, and the protected DSN was not used as
+  the test target.
+- Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/810-integration-*.txt` and
+  `820-postgres-*.txt` (target, selected list, first failing run, passing run,
+  offline regressions, cleanup and sanitizer); source-worktree records
+  `780-delete-preview-last-environment.txt`, `790-pack-cancel-*` and
+  `800-webhook-*`.
 
 Append one record per run. Do not backfill from history; runs before
 2026-10-26 qualified older builds and earlier scope.

@@ -254,6 +254,12 @@ func (m *Model) observeServing(event contract.Event, role TargetRole) {
 		release = event.ReleaseID
 	}
 	if release == "" {
+		if deployOutcomeEvent(event) {
+			// A deploy outcome without a serving release says nothing serves,
+			// such as a first deploy that failed after the candidate switch.
+			m.servingOutcomeSeen = true
+			m.servingOutcome = ServingRelease{}
+		}
 		return
 	}
 	health := m.Serving.Health
@@ -264,10 +270,40 @@ func (m *Model) observeServing(event contract.Event, role TargetRole) {
 			health = "unhealthy"
 		}
 	}
-	m.Serving = ServingRelease{
+	observation := ServingRelease{
 		Observed: true, ReleaseID: release, Image: m.Serving.Image, Container: m.Serving.Container,
 		Health: health, At: event.At, Sequence: event.Sequence, Source: string(role),
 	}
+	m.Serving = observation
+	if deployOutcomeEvent(event) {
+		m.servingOutcomeSeen = true
+		m.servingOutcome = observation
+	}
+}
+
+// deployOutcomeEvent reports whether an event states a deployment result. The
+// worker writes success and failure as deploy-stage log events; a traffic-switch
+// step event names the candidate before verification and is not an outcome.
+func deployOutcomeEvent(event contract.Event) bool {
+	return event.Kind == "log" && strings.EqualFold(strings.TrimSpace(event.Stage), "deploy")
+}
+
+// summaryServing is the serving evidence a follow summary may state. Once the
+// operation is terminal, only a deploy outcome can name a serving release: an
+// intermediate traffic switch is a candidate, not a promise that it still
+// serves after verification fails. A failed or cancelled operation with no
+// deploy outcome proves no release is serving.
+func (m *Model) summaryServing() ServingRelease {
+	if !m.State.Terminal() {
+		return m.Serving
+	}
+	if m.servingOutcomeSeen {
+		return m.servingOutcome
+	}
+	if m.State == contract.Failed || m.State == contract.Canceled {
+		return ServingRelease{}
+	}
+	return m.Serving
 }
 
 func (m *Model) observeContainerLog(event contract.Event, role TargetRole) {

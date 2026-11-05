@@ -98,7 +98,7 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D17 | Traffic switch | deploycrate's blue/green: the candidate runs on a dynamic loopback port, passes health, Caddy switches its backends, the public response is verified, then the previous containers stop. A failed candidate leaves the old release serving. Public verification requests the primary domain at its check path (D29) and records the host, path and status it observed. Failure to remove a previous or candidate container never fails a verified switch, but is recorded and retried, never silently dropped. |
 | D18 | Secret resolution | deploycrate's: the environment revision names its secrets; each deploy resolves their current values and records the exact secret revisions on the deployment, so a rollback reproduces them. No hand-pinned `vault:…@N` refs. |
 | D19 | Databases | eregion does not provision or manage databases. `resources …` and its backup code leave the operator surface. An app gets its database through environment secrets. |
-| D20 | Sources | Alpha: HTTPS git (public, or private with a per-environment read credential) and existing images. GitHub App after v1. |
+| D20 | Sources | HTTPS git (public, or private with a per-environment read credential) and existing images. No GitHub App integration is planned (decided 2026-11-04): a per-environment read credential plus the D28 webhook covers private repositories and push to deploy with far less setup. |
 | D21 | Processes | deploycrate's: an environment declares processes of kind `web` (receives the domains through Caddy), `worker` (no port), `service` (port reachable privately, no domain) and a `release` command, each with a command, arguments and replicas. Caddy balances a `web` process across its replicas. The release command (typically migrations) is **release-scoped**, as in deploycrate: it runs once per release and command, before the release fans out to its deployments (and, after v1, to several nodes); a successful run is recorded, and `restart`, `process scale` and `rollback` to that release never run it again. A failed run blocks that release until a new `deploy`. A forced re-run is a possible later override, not alpha scope. |
 | D22 | Access modes | Public only in the alpha; basic auth and private-network access after v1. |
 | D23 | Promotion | After v1; `deploy --release` of another environment's release covers it by hand. |
@@ -106,10 +106,11 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D25 | Logs | `logs` reads container logs over the operator channel and works without a telemetry node. |
 | D26 | Nodes and DNS automation | `node add` and Cloudflare DNS automation after v1; the alpha uses manual DNS with resolver checks. |
 | D27 | Plaintext secret read | No `secret get`. `secret export` is human-only behind the D7 factor. |
-| D28 | Push to deploy | In the alpha, as in deploycrate: an environment with auto-deploy on deploys every push to its bound branch through a signed GitHub webhook. Each environment has its own webhook URL and generated secret, shown once when auto-deploy is turned on and replaceable by rotation; the signature is checked over the raw body before parsing, deliveries are deduplicated by delivery ID, and pushes to other branches are ignored. The routing lives in the environment revision, not in service environment variables. |
+| D28 | Push to deploy | In the alpha, as in deploycrate: an environment with auto-deploy on deploys every push to its bound branch through a signed GitHub webhook. Each environment has its own webhook URL and generated secret, shown once when auto-deploy is turned on and replaceable by rotation; the HMAC secret is resolved fresh per delivery, the signature is checked over the raw body before parsing, and pushes to other branches are ignored. A verified push is admitted by one PostgreSQL transaction that stores only a sanitized intent (hashes, validated repository/branch/commit and non-secret environment/revision/secret-revision identities) and its River processing job; the handler replies 202 only after that transaction commits, within one 8-second admission budget covering the fresh secret resolution, body read and database work. A worker then submits the ordinary `platform.deploy` operation and links it to the delivery in another single transaction. A redelivery returns the original operation and never deploys twice; a receipt means the push was accepted for processing, not that a deployment completed. If the environment is deleted or its repository/branch binding changes before the worker submits, the accepted intent fails terminally instead of deploying against the new binding. The routing lives in the environment revision, not in service environment variables. This replaces a GitHub App (qualified on a real server 2026-11-04). Possible later convenience, not an alpha.1 gate: when the operator's `gh` CLI is installed and authenticated with `admin:repo_hook`, `env update --auto-deploy` may offer to create or update the repository webhook itself, so the secret never has to be copied by hand. Without `gh` the manual paste stays the path, and JSON/no-TTY use never prompts. |
 | D29 | Domain check path | Each domain binding has an optional check path (`domain add … --check-path PATH`), defaulting to the `web` process health path. The domain observer and the D17 public verification request each host at its own path, so an alias that serves no health route can still be ready. deploycrate has one path per web process; this is an eregion extension found in a real deployment. |
 | D30 | Disk retention | Required for alpha.1 (R9). A retention policy (server default, per-environment override) and one planner used by a periodic River job and by `eregion prune [--dry-run]`. Defaults: keep the newest 10 releases per environment plus any newer than 14 days, always the serving release and its rollback target; registry artifacts no release references after 14 days; Buildpacks caches above 10 GiB or 80% disk; ownerless labeled containers and dangling images always. Release rows are never deleted; a pruned release records `pruned_at` and a rollback to it refuses clearly. Registry deletion needs a new registry host-step version with deletes enabled plus garbage collection. A real `eregion prune` requires `--confirm <server>` and a dry run needs no confirmation. `doctor` reports the last run and warns when the Buildpacks cache exceeds the policy's absolute cap; it reads the run's durable cache measurement, and an absent or stale measurement is unknown rather than a zero-byte healthy cache. |
 | D31 | Workload repair | As deploycrate's `workload_reconciliation`: on worker start the control plane compares each serving deployment's recorded containers with Docker and queues one restart of the serving release for an environment whose serving containers are missing. A restart never re-runs the release command (D21). |
+| D32 | App definition file (after alpha.1) | Adopt a Fly-style `eregion.toml` **as input only**, never as a store: `app create --from FILE`, `env create|update --from FILE` and `app export <app> <env>` (to generate one) turn it into an ordinary environment revision, exactly like the flag form. PostgreSQL stays authoritative, so the "no TOML store" principle holds. The file names processes, health, source and build settings, config, secret **names** (never values) and domains, with per-environment overrides. `--dry-run` shows the difference against the current revision; removing a domain or process needs the usual confirmation. It is applied explicitly at first, not read on every deploy, so a push cannot change processes or domains without an operator; reading it from the deployed commit is a later decision. Neither deploycrate nor vaire has one; the motivation is the 2026-11-04 session (fragile masked-field pastes, long flag lines, agent ergonomics). Not an alpha.1 gate. |
 
 ## 4. The application model
 
@@ -268,8 +269,10 @@ operation is the only other route. Tokens follow D7.
 Push to deploy (D28): `env update --auto-deploy` prints the environment's
 webhook URL (`/v1/webhooks/github/<app>/<env>`) and a generated secret once, to
 paste into the repository's GitHub webhook settings; `--rotate-webhook-secret`
-replaces it. A push to the bound branch runs the same deploy as `eregion deploy`
-at the pushed commit; a redelivery returns the original operation.
+replaces it. A verified push is durably admitted and answered 202, then a worker
+submits the same deploy as `eregion deploy` at the pushed commit and links the
+operation to the delivery atomically; a redelivery returns the original
+operation. The receipt means accepted, not completed.
 
 ### 6.8 Observe and remove
 
@@ -284,8 +287,8 @@ need `--confirm`.
 **v1.0.0 (every alpha and the final) is one main node running applications
 end to end:** sections 6.1–6.8 on the main node, the command tree in section 5
 minus its "after v1" line, node_exporter on the server, and the release model
-in D14–D15. After v1.0.0 final: additional nodes, the telemetry node, GitHub
-App sources, Cloudflare DNS automation, promotion, access modes,
+in D14–D15. After v1.0.0 final: additional nodes, the telemetry node,
+Cloudflare DNS automation, promotion, access modes,
 `server init --local` and HA.
 
 **v1 is an alpha: nothing is frozen.** The `eregion/v1` JSON, the handoff and
@@ -521,6 +524,20 @@ baseline pass: older build, no failed candidate, rollback or zero-downtime
 check. Task-level detail for rows 11–15 lives in the temporary
 [ALPHA-SPEC](ALPHA-SPEC.md), deleted at the alpha.1 tag.
 
+On 2026-11-05 three reviewed source fixes were integrated into the working tree
+at `f447aa3` without commit or publication: the env-delete preview
+last-environment count (defect 11), cancelled-pack cleanup (a dedicated build
+network, graceful pack termination and bounded ownership-checked removal), and
+durable GitHub webhook admission (migration 021; a sanitized receipt and River
+job commit before 202; the worker links the operation atomically; the secret is
+resolved fresh inside one 8-second admission budget). Offline build, vet,
+darwin/arm64 build and affected-package tests pass. These are local
+implementation checks, not host qualification: the 16 new explicit-DSN webhook
+cases and the delete-preview integration case **pass** 17/17 on PostgreSQL
+17.11 in disposable databases, where migration 021 was exercised. Migration 021
+is still unapplied on the published node and host qualification remains unrun;
+no live server, control database, DNS, GitHub or release was changed.
+
 | Area | What exists | Open before the alpha |
 | --- | --- | --- |
 | `server init` | vaire flow: preflight, `--answers`, `--password-stdin`, plan with `--confirm <server>`, binary installed once, vault keyring, node_exporter on WireGuard, guarded handoff with `--secrets-out`, `--resume`/`--discard`, `context remove`. SSH on port 22 only. | Real-host qualification. |
@@ -530,7 +547,7 @@ check. Task-level detail for rows 11–15 lives in the temporary
 | Build, release, deploy | Deploy from the bound source (public or private git) or a release; build lifecycle; per-process containers with replicas; blue/green switch with public verification; rollback with pinned secret revisions; restart. | Real-host qualification. |
 | Domains | Primary and aliases; DNS, route, certificate and public state; serialized atomic Caddy writes; reconciliation and observation. | Real-host qualification. |
 | Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Real-host qualification. |
-| CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy`; `secrets export`/`secret export` behind the factor. | Real-host qualification. |
+| CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy` with durable admission and atomic deploy linking; `secrets export`/`secret export` behind the factor. | Real-host qualification; migration 021 still unapplied on the published node; the 17 explicit-DSN cases pass on PostgreSQL 17.11 in disposable databases. |
 | Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
 | Release | vaire pipeline: cosign keyless, `install.sh`, edge on push to `master`, stable on `v*` tags, origin `eregion.mbvlabs.com`. | First edge publish; `stable` environment secrets before the first tag. |
 
@@ -554,7 +571,7 @@ build; local implementation/review does not qualify it.
 | 5 | **Deploy.** `deploy` from source (public or private git) or release, build lifecycle commands, release command, per-process containers with replicas, blue/green per D17, public verification, rollback, restart. | Two deploys and a rollback verified at the public HTTPS URL with no failed requests during the switch; a failed candidate leaves the old release serving; a worker process runs alongside web. |
 | 6 | **Domains.** Primary/aliases, DNS check, desired/applied/observed route state, serialized atomic Caddy writes, reconciliation on start and retry. | Failed reload and interrupted change recover; removing one domain leaves others intact. |
 | 7 | **Observe and remove.** `app/env status`, `logs`, `operations list`, `app delete`, `env delete` per D13. | Status shows serving release, processes and per-domain state; deletion cleans containers, routes and secrets and keeps history. |
-| 8 | **CI and push to deploy.** Per-environment deploy endpoint through Caddy, `token create|list|revoke`, `protect init`; per-environment GitHub webhook deploying pushes to the bound branch (D28), replacing `EREGION_WEBHOOK_SECRET_FILE` and `EREGION_WEBHOOK_ALLOW`. | CI deploy works; expired, revoked and wrong-target tokens fail; `--yes`, JSON and stdin cannot mint a token; a push deploys, a redelivery does not deploy twice, a bad signature or other branch does nothing. |
+| 8 | **CI and push to deploy.** Per-environment deploy endpoint through Caddy, `token create|list|revoke`, `protect init`; per-environment GitHub webhook deploying pushes to the bound branch (D28), replacing `EREGION_WEBHOOK_SECRET_FILE` and `EREGION_WEBHOOK_ALLOW`. | CI deploy works; expired, revoked and wrong-target tokens fail; `--yes`, JSON and stdin cannot mint a token; a push deploys, a redelivery does not deploy twice, a bad signature or other branch does nothing; a signed push returns 202 only after its durable admission commits, a slow control database returns a bounded retryable 503 rather than an optimistic 202, and a redelivery returns the original operation. |
 | 9 | **Surface cleanup.** Remove the D6 surfaces and the resources/backup code (D19); node-only commands hidden; `guide agents`, `skill install`. | `commands --json` lists only the section 5 tree. |
 | 10 | **Release pipeline.** D14–D15: edge on push, `1.x`, tags, cosign, install script, channel manifests, Linux/macOS only. | An edge build installs on Linux and macOS and `upgrade` moves between two edge builds. |
 | 11 | **Trust boundary (D7, D12).** The factor is verified inside the same request for token create, both exports, `app delete` and `env delete`; dry run never installs a node binary; a node on a release build installs only a cosign-verified release binary. | A direct `vault.export`, `handoff.export` or delete submission without a valid code fails on the node; `--dry-run --auto-upgrade-nodes` leaves the node build unchanged; an unsigned upload to a release-build node is refused. |
@@ -564,6 +581,7 @@ build; local implementation/review does not qualify it.
 | 15 | **Guided finish.** Guided `app create`/`env create` follow build and deploy to serving or failed, Ctrl-C detaches (vaire's flow); `server init` ends with vaire's doctor gate (`doctor_failed`, `--resume`, `--skip-doctor`). | Guided create ends at a serving URL or a failed operation with its error; init on a healthy host ends with a clean doctor summary. |
 | 16 | **Alpha qualification.** MANUAL-TESTING baseline on a real server for the tagged build. | Recorded pass; then the user authorizes `1.x` and `v1.0.0-alpha.1`. |
 | 17 | **Disk retention (D30), alpha.1 gate.** Policy, planner, periodic job, `retention show|set`, `prune [--dry-run]`, registry deletes and GC, `doctor` retention and Buildpacks cache rows. Implemented and tested at source level; host qualification is pending. | A node with 30 releases keeps exactly the policy's set; `prune --dry-run` lists what would go and the bytes; rollback to a pruned release refuses clearly; a second `apply` stays a no-op. |
+| 18 | **App definition file (D32), after alpha.1.** `eregion.toml` input for `app create`, `env create|update` (`--from`), `app export`, with a dry-run diff and confirmation for destructive changes; secret names only. | A file and the equivalent flags save the same revision; `app export` round-trips; a file containing a secret value or an unknown key is refused; a removal needs confirmation. |
 
 ## Reference index
 

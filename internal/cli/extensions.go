@@ -71,7 +71,6 @@ func (a *app) startExtensions(pool *pgxpool.Pool) (extensionRuntime, *vault.Envi
 		return parts, nil, err
 	}
 	parts.Extensions = extensions
-	parts.Deliveries = controlplane.NewWebhookDeliveryStore(pool)
 	parts.Webhooks = controlplane.NewPushWebhookResolver(pool, parts.Vault)
 	return parts, vault.NewEnvironmentResolver(parts.Vault), nil
 }
@@ -157,7 +156,9 @@ func (a *app) buildMux(cmd *cobra.Command, logger *slog.Logger, auth *api.Auth, 
 		logger.Info("secret API disabled", "reason", "EREGION_VAULT_KEY_FILE is not set")
 	}
 	if parts.Webhooks != nil {
-		push, err := api.NewPushWebhookHandler(api.PushWebhookConfig{Resolver: parts.Webhooks, Deliveries: parts.Deliveries}, service)
+		push, err := api.NewPushWebhookHandler(api.PushWebhookConfig{
+			Resolver: parts.Webhooks, Admissions: parts.Deliveries, Logger: logger,
+		})
 		if err != nil {
 			return nil, err
 		}

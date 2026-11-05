@@ -309,6 +309,9 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
+	// The admission store needs the River client New just built so its receipt
+	// and processing job commit in one transaction.
+	parts.Deliveries = run.WebhookDeliveries
 	// A fresh installation must list its local node before the first platform
 	// submission. This is idempotent and a no-op for remote-only workers.
 	if err := run.EnsureLocalNode(cmd.Context()); err != nil {

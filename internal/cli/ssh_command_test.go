@@ -34,36 +34,40 @@ func TestSSHUsesPTYForACommandOnlyAtATerminal(t *testing.T) {
 	}
 }
 
-func TestSudoPasswordWatchDetectsTheNoTerminalMessage(t *testing.T) {
-	var out bytes.Buffer
-	watch := &sudoPasswordWatch{w: &out}
-	if _, err := watch.Write([]byte("starting\n")); err != nil {
-		t.Fatal(err)
-	}
-	if watch.seen {
-		t.Fatal("a normal stderr line was mistaken for a sudo prompt")
-	}
-	if _, err := watch.Write([]byte("sudo: a terminal is required to read the password; either use the -S option\n")); err != nil {
-		t.Fatal(err)
-	}
-	if !watch.seen {
-		t.Fatal("the sudo no-terminal message was not detected")
-	}
-	if !strings.Contains(out.String(), "sudo: a terminal is required") {
-		t.Fatalf("stderr was not passed through: %q", out.String())
-	}
-}
-
-func TestSudoPasswordWatchDetectsASplitMessage(t *testing.T) {
-	var out bytes.Buffer
-	watch := &sudoPasswordWatch{w: &out}
-	for _, part := range []string{"sudo: a ", "password is re", "quired"} {
-		if _, err := watch.Write([]byte(part)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !watch.seen {
-		t.Fatal("a message split across writes was not detected")
+func TestSudoPasswordWatchDetectsNoTerminalMessages(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		parts []string
+		seen  bool
+	}{
+		{name: "classic terminal required", parts: []string{"sudo: a terminal is required to read the password; either use the -S option\n"}, seen: true},
+		{name: "classic password required", parts: []string{"sudo: a password is required\n"}, seen: true},
+		{name: "sudo-rs terminal required", parts: []string{"sudo: A terminal is required to authenticate\n"}, seen: true},
+		{name: "sudo-rs interactive authentication", parts: []string{"sudo: interactive authentication is required\n"}, seen: true},
+		{name: "classic mixed case", parts: []string{"SuDo: A PaSsWoRd Is ReQuIrEd\n"}, seen: true},
+		{name: "sudo-rs mixed case", parts: []string{"SUDO: A TERMINAL IS REQUIRED TO AUTHENTICATE\n"}, seen: true},
+		{name: "classic split across writes", parts: []string{"sudo: a ", "password is re", "quired"}, seen: true},
+		{name: "sudo-rs split across writes", parts: []string{"sudo: interactive authentica", "tion is required\n"}, seen: true},
+		{name: "sudo-rs split after a long write", parts: []string{strings.Repeat("x", 100) + "sudo: interactive authentica", "tion is required\n"}, seen: true},
+		{name: "ordinary stderr", parts: []string{"starting\n", "sudo: unable to resolve host node\n"}, seen: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var out bytes.Buffer
+			watch := &sudoPasswordWatch{w: &out}
+			var want strings.Builder
+			for _, part := range test.parts {
+				if _, err := watch.Write([]byte(part)); err != nil {
+					t.Fatal(err)
+				}
+				want.WriteString(part)
+			}
+			if watch.seen != test.seen {
+				t.Fatalf("seen = %t, want %t", watch.seen, test.seen)
+			}
+			if out.String() != want.String() {
+				t.Fatalf("stderr was not passed through: %q", out.String())
+			}
+		})
 	}
 }
 

@@ -272,6 +272,10 @@ type Runtime struct {
 	Jobs    *river.Client[pgx.Tx]
 	// Nodes resolves the transport of any node for worker dispatch.
 	Nodes NodeTransports
+	// WebhookDeliveries is the durable admission store the API handler uses.
+	// It enqueues the webhook worker's job in the same transaction as the
+	// sanitized receipt.
+	WebhookDeliveries *PostgresWebhookDeliveries
 }
 
 // EnsureLocalNode records the in-process local host as a platform node before
@@ -365,6 +369,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &testWorker{service: service})
 	river.AddWorker(workers, &platformWorker{service: service})
+	river.AddWorker(workers, &webhookWorker{service: service})
 	river.AddWorker(workers, &reconcileWorker{service: service})
 	river.AddWorker(workers, &domainRouteWorker{service: service})
 	river.AddWorker(workers, &domainObserveWorker{service: service})
@@ -387,6 +392,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		riverConfig.Queues = map[string]river.QueueConfig{
 			diagnosticQueue: {MaxWorkers: config.Concurrency},
 			platformQueue:   {MaxWorkers: config.Concurrency},
+			webhookQueue:    {MaxWorkers: config.Concurrency},
 			"maintenance":   {MaxWorkers: 1},
 		}
 		riverConfig.PeriodicJobs = []*river.PeriodicJob{
@@ -463,7 +469,16 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		}
 		return inserted.Job.ID, nil
 	}
-	return &Runtime{Service: service, Jobs: client, Nodes: service.resolver}, nil
+	service.enqueueWebhook = func(ctx context.Context, tx pgx.Tx, deliveryIDHash string) (int64, error) {
+		inserted, err := client.InsertTx(ctx, tx, webhookArgs{DeliveryIDHash: deliveryIDHash}, &river.InsertOpts{Queue: webhookQueue, MaxAttempts: platformMaxAttempts})
+		if err != nil {
+			return 0, err
+		}
+		return inserted.Job.ID, nil
+	}
+	webhookDeliveries := NewWebhookDeliveryStore(pool)
+	webhookDeliveries.enqueue = service.enqueueWebhook
+	return &Runtime{Service: service, Jobs: client, Nodes: service.resolver, WebhookDeliveries: webhookDeliveries}, nil
 }
 
 // registerRuntimeSecrets registers the worker's own secrets so a child process
@@ -826,6 +841,10 @@ func (w *workloadRepairWorker) Work(ctx context.Context, _ *river.Job[workloadRe
 // Reconcile covers exhausted attempts lost to a process crash, not just errors
 // returned by Work. Domain terminal state cannot depend on an in-process callback.
 func (s *Service) Reconcile(ctx context.Context) error {
+	var failures []error
+	if err := s.reconcileWebhookAdmissions(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("reconcile webhook admissions: %w", err))
+	}
 	rows, err := s.pool.Query(ctx, `SELECT o.id FROM eregion_operations o LEFT JOIN river_job j ON j.id=o.job_id
         WHERE o.state IN ('queued','running','cancelling') AND (j.id IS NULL OR j.state IN ('discarded','cancelled','completed')) LIMIT 100`)
 	if err != nil {
@@ -845,7 +864,6 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var failures []error
 	for _, id := range ids {
 		if err := s.reconcileOperation(ctx, id); err != nil {
 			if errors.Is(err, errNotOwned) || errors.Is(err, errOperationTerminal) {

@@ -214,7 +214,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 017
+## Database: embedded schema 021
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -242,6 +242,7 @@ node protocol version and database migration version are independent.
 | `018_retention_measurements.sql` | Durable cache measurement (`cache_bytes`, `cache_measured_at`, `cache_measurement_error`) on `retention_runs` and the node-wide `retention_gc_pending` follow-up on `server_settings`. Never rewrites published 017. |
 | `019_retention_gc_generation.sql` | Per-run `gc_generation` so each registry garbage-collection pass has a distinct durable node-effect identity. |
 | `020_retention_skipped_status.sql` | The `succeeded_with_skips` retention-run status for a completed run whose only unfinished items were deterministic per-item skips. |
+| `021_webhook_admissions.sql` | Durable GitHub push admission: sanitized intent, non-secret environment/revision/secret-revision identities, River webhook job ID, admitted/submitted/failed lifecycle and terminal error code. Preserves legacy pending/submitted replay rows; adds no foreign key from the stored environment/revision identity so a deleted environment remains observable. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -266,7 +267,7 @@ Tables below have the literal `eregion_` prefix:
 | `retention_runs` | `rtr_…` ID, optional owning operation, pending/running/succeeded/failed/cancelled status, planned/removed item arrays, planned/reclaimed bytes, per-item errors JSON, start/finish timestamps, the latest Buildpacks cache measurement (`cache_bytes` NULL means unknown, measured-at, error), and the per-run registry GC generation. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
-| `webhook_deliveries` | Hashed delivery ID, exact-body hash, actor/kind/target, pending/submitted state and operation ID. |
+| `webhook_deliveries` | Hashed delivery ID and exact-body hash, actor/kind/target, sanitized repository/branch/commit, non-secret environment/revision/secret-revision identities, admitted/submitted/failed state, River job ID, operation ID and terminal sanitized error code. Legacy pending/submitted rows remain valid; pending legacy rows are reconciled only on authenticated redelivery. |
 
 Boundaries around the MASTER app-model work (work list rows 4–5):
 
@@ -295,7 +296,10 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
   for retry. Operations and operation events are never deleted; operation
   `--app`/`--environment` history still shows the deletion after the platform
   record is gone. The node validates the target-naming `--confirm` token against
-  the records it loads.
+  the records it loads. The `--dry-run` preview keeps target-scoped row counts,
+  but its last-environment warning uses the application-wide environment count,
+  so a named environment delete never claims it removes the app while a sibling
+  remains; the worker re-counts remaining environments after deleting the target.
 - The deleted resources/backup subsystem had no catalog tables in the
   control-plane migrations. DNS records live at the provider; a domain binding
   is not a DNS record.
@@ -807,7 +811,7 @@ window.
 | --- | --- |
 | `/etc/eregion/control-plane.env` | Service environment incl. DSN, auth/state, vault keyring and transport paths; bootstrap preserves operator-added lines. |
 | `/etc/eregion/vault-keyring.json` | Vault master key, 0600 for the control-plane account; never in PostgreSQL and included in the handoff. Existing key material is never overwritten. |
-| `/etc/eregion/auth.json` | Owner-only deploy-token hashes, names, actors, scopes, grants and expiry. Setup mints no operator token; `token create` restarts the API so a new hash is loaded. |
+| `/etc/eregion/auth.json` | Owner-only deploy-token hashes, names, actors, scopes, grants and expiry. Setup mints no operator token and creates the store only when absent; host convergence validates the existing store and never overwrites minted or revoked tokens. The API rejects token auth if the file becomes unreadable or malformed, and reloads it when it changes so create/revoke need no API restart. |
 | `/etc/eregion/protect.json` | Root-only confirmed/pending TOTP secret and its replay/lockout state. Never in the database, revision, operation, or journal. |
 | `/etc/eregion/node.json` | Node name, state directory, main hostname and optional operator-installed helper configuration. The control-plane role writes it too, so node RPC, CI/push URLs and `secrets export` work on the main node. |
 | `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles, commit-confirm snapshots, the recorded host intent (`intent.json`) and owner-only copies of its TLS/key inputs (`inputs/`). |
@@ -921,6 +925,18 @@ evaluates symlinks, requires the result to stay inside the repository and to be
 a directory, and never falls back to the repository root. A directory/git build on
 a distinct build node is refused before `pack`: registry push/pull and dedicated
 credentials do not exist. Installing a registry alone does not move images.
+
+`PackStep.Apply` gives each build attempt a dedicated Docker network labeled with
+`io.eregion.build.owner=pack` plus the operation, step and attempt, and passes
+`--network` to pack so every lifecycle phase container is attributable to that
+attempt. Cancellation sends SIGTERM with a five-second grace before SIGKILL so
+pack can remove its own containers and volumes, then a bounded deferred cleanup
+verifies the network's ownership labels, removes only `author=pack` containers
+attached to that network and removes the network. A foreign or pre-existing
+network is never touched; an ambiguous `docker network create` error is cleaned
+only after the same label check. A retry has a fresh attempt number and therefore
+a fresh network. This closes the leak where a cancelled pack container kept the
+build-cache volume busy.
 
 `eregion image push <local-image> --app <app> [--tag <tag>]` moves a local image
 into that registry without port forwarding: the request line is followed on the
@@ -1074,12 +1090,25 @@ restart does not rerun the release command. See
   fail. No other `/v1` route is public.
 - `/v1/webhooks/github/<app>/<env>`: per-environment GitHub push delivery. The
   current revision must have auto-deploy on and a `webhook_secret_name`; the
-  HMAC secret is read from that environment's vault namespace per delivery.
-  The signature is checked over the raw body before parsing, the repository and
-  bound branch must match, `X-GitHub-Delivery` is deduplicated in
-  `webhook_deliveries`, and an accepted push submits `platform.deploy` with the
-  pushed commit SHA. A redelivery returns the original operation. The old
-  server-wide secret file, allowlist and release-only webhook are removed.
+  HMAC secret is read fresh per delivery from that environment's vault
+  namespace in one joined environment/revision/secret-ciphertext read, and the
+  signature is checked over the raw body before parsing. The repository and
+  bound branch must match. One PostgreSQL transaction stores a sanitized push
+  intent and its River webhook job; the handler replies 202 only after that
+  commit. One absolute 8-second admission deadline bounds the fresh resolver,
+  transport body read and database work, so a slow client or database returns a
+  retryable 503 instead of waiting for the server timeout. The webhook worker
+  then submits `platform.deploy` with the pushed commit SHA and links the
+  operation to the delivery in the same transaction as the operation, platform
+  state and River platform job. A redelivery returns the original operation; a
+  receipt means accepted, not completed. If the environment was deleted or its
+  repository/branch binding changed before the worker submits, the admission
+  fails terminally rather than deploying against the new binding. An old pending
+  row whose operation is gone is reported as ambiguous and is never blindly
+  resubmitted. The old server-wide secret file, allowlist and release-only
+  webhook are removed. The explicit-DSN PostgreSQL integration cases for this
+  path pass against PostgreSQL 17.11 (2026-11-05); host latency, first delivery,
+  redelivery and rotation remain manual checks.
 - `/private/…`: optional authenticated subject/device-grant proxy, not a VPN
   enrollment implementation.
 

@@ -239,6 +239,29 @@ func TestConcurrentRunAppliesOnce(t *testing.T) {
 	}
 }
 
+func TestWriteFileAtomicOwnedPublishesOnlyAfterOwnership(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root may chown to any uid; the failure ordering is exercised by non-root builds")
+	}
+	path := filepath.Join(t.TempDir(), "owned")
+	// A non-root writer cannot chown to root, so the prepare step fails before
+	// the rename. The destination must not appear with the writer's ownership.
+	if err := WriteFileAtomicOwned(path, []byte("secret"), 0o600, 0, 0); err == nil {
+		t.Fatal("an unprivileged writer changed ownership to root")
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed owned write published a file: %v", err)
+	}
+	// A same-owner write still publishes atomically with the requested mode.
+	if err := WriteFileAtomicOwned(path, []byte("secret"), 0o600, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != "secret" {
+		t.Fatalf("owned write: %q %v", raw, err)
+	}
+}
+
 func TestWriteFileOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "effect")
 	existed, err := WriteFileOnce(path, []byte("first"), 0o600)

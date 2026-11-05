@@ -24,6 +24,9 @@ type Service struct {
 	// enqueuePlatform inserts the one River job for a platform action in the
 	// same transaction as its domain rows.
 	enqueuePlatform func(context.Context, pgx.Tx, contract.Operation) (int64, error)
+	// enqueueWebhook inserts the one River job for a durably admitted GitHub
+	// delivery in the same transaction as its sanitized receipt.
+	enqueueWebhook func(context.Context, pgx.Tx, string) (int64, error)
 	// transport is the node-dispatch boundary. Local today; SSH/WireGuard later.
 	transport node.Transport
 	// localNode is the identity of the in-process local transport, if any.
