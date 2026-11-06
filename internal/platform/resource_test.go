@@ -285,7 +285,7 @@ func TestResourceConfigHashChangesWithSecretRevisionButNeverCarriesValues(t *tes
 }
 
 func TestParseResourceImageInspectRequiresImmutableIdentity(t *testing.T) {
-	id, digests, err := ParseResourceImageInspect("sha256:" + strings.Repeat("a", 64) + "|ghcr.io/acme/db@sha256:" + strings.Repeat("b", 64))
+	id, digests, err := ParseResourceImageInspect("sha256:" + strings.Repeat("a", 64) + "|[\"ghcr.io/acme/db@sha256:" + strings.Repeat("b", 64) + "\"]")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,6 +294,50 @@ func TestParseResourceImageInspectRequiresImmutableIdentity(t *testing.T) {
 	}
 	if _, _, err := ParseResourceImageInspect("postgres:17"); err == nil {
 		t.Fatal("a mutable tag was accepted as an immutable identity")
+	}
+}
+
+func TestParseResourceImageInspectReadsJSONRepoDigests(t *testing.T) {
+	id := "sha256:" + strings.Repeat("a", 64)
+	one := "ghcr.io/acme/db@sha256:" + strings.Repeat("b", 64)
+	two := "mirror.example/db@sha256:" + strings.Repeat("c", 64)
+	cases := []struct {
+		name    string
+		stdout  string
+		digests []string
+	}{
+		{name: "one", stdout: id + "|[\"" + one + "\"]", digests: []string{one}},
+		{name: "several", stdout: id + "|[\"" + one + "\",\"" + two + "\"]", digests: []string{one, two}},
+		{name: "empty", stdout: id + "|[]"},
+		{name: "null", stdout: id + "|null"},
+		{name: "absent", stdout: id + "|"},
+		{name: "no value", stdout: id + "|<no value>"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			gotID, gotDigests, err := ParseResourceImageInspect(test.stdout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotID != id {
+				t.Fatalf("id = %q, want %q", gotID, id)
+			}
+			if strings.Join(gotDigests, ",") != strings.Join(test.digests, ",") {
+				t.Fatalf("digests = %v, want %v", gotDigests, test.digests)
+			}
+		})
+	}
+	if _, _, err := ParseResourceImageInspect(id + `|ghcr.io/acme/db@sha256:` + strings.Repeat("b", 64)); err == nil {
+		t.Fatal("a non-JSON repository digest list was accepted")
+	}
+}
+
+func TestResourceImageInspectFormatUsesJSONRepoDigests(t *testing.T) {
+	if !strings.Contains(ResourceImageInspectFormat, "{{json .RepoDigests}}") {
+		t.Fatalf("image inspect format does not serialize RepoDigests as JSON: %q", ResourceImageInspectFormat)
+	}
+	if strings.Contains(ResourceImageInspectFormat, "join .RepoDigests") {
+		t.Fatalf("image inspect format still joins RepoDigests as []string: %q", ResourceImageInspectFormat)
 	}
 }
 

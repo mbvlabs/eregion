@@ -1137,8 +1137,9 @@ The `host-ingress-v2` bootstrap step pins Caddy 2.11.4 on amd64 and arm64,
 installing its official Debian package only after verifying the embedded SHA-256.
 Checks require the exact version; package installation preserves existing
 configuration and app routes, and apply validates the configuration and restarts
-Caddy so the new executable is active. Fresh-host installation remains a manual
-qualification requirement, distinct from an already-upgraded host passing Check.
+Caddy so the new executable is active. Fresh-host installation is a manual
+acceptance area, distinct from an already-upgraded host passing Check; see
+MANUAL-TESTING.
 The preceding `host-ingress-sysctl-v1` step writes
 `/etc/sysctl.d/60-eregion-ingress.conf` and sets `net.ipv4.tcp_migrate_req=1`
 in the running kernel. Caddy binds a new `SO_REUSEPORT` listener on every config

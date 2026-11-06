@@ -368,7 +368,8 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 		diff = append(diff, runtimeDiff(base.Runtime, desired.Runtime)...)
 	}
 	if !processesEqual(base.Processes, desired.Processes) {
-		processes := append([]platform.ProcessSpec(nil), desired.Processes...)
+		processes := make([]platform.ProcessSpec, len(desired.Processes))
+		copy(processes, desired.Processes)
 		patch.Processes = &processes
 		changed = append(changed, "processes")
 		diff = append(diff, processDiff(base.Processes, desired.Processes)...)
@@ -380,13 +381,13 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 		diff = append(diff, stringMapDiff("config", base.Config, desired.Config)...)
 	}
 	if !stringSliceEqual(base.SecretNames, desired.SecretNames) {
-		names := append([]string(nil), desired.SecretNames...)
+		names := append([]string{}, desired.SecretNames...)
 		patch.SecretNames = &names
 		changed = append(changed, "secret_names")
 		diff = append(diff, stringSliceDiff("secret_names", base.SecretNames, desired.SecretNames)...)
 	}
 	if !stringSliceEqual(base.Resources, desired.Resources) {
-		names := append([]string(nil), desired.Resources...)
+		names := append([]string{}, desired.Resources...)
 		patch.Resources = &names
 		changed = append(changed, "resources")
 		diff = append(diff, stringSliceDiff("resources", base.Resources, desired.Resources)...)

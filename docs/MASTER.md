@@ -298,36 +298,73 @@ between alphas, and a later alpha may require a fresh `server init`. A v1
 compatibility contract in vaire's form (formats, JSON, commands, the
 `upgrade` + `apply --auto-upgrade-nodes` path) starts at `v1.0.0` final.
 
-An alpha is cut when MANUAL-TESTING's baseline passes on a real server for the
+An alpha is cut when the operator accepts MANUAL-TESTING's baseline for the
 tagged build. "Builds" or "appears in `commands --json`" is never the gate.
-Disk retention (D30) is an alpha.1 gate (R9): the policy, daily run, `prune
+Disk retention (D30) was the alpha.1 gate (R9): the policy, daily run, `prune
 [--dry-run]`, registry deletes and garbage collection, and the doctor retention
-and cache rows qualify with the rest of the baseline.
+and cache rows qualified with the rest of the baseline.
+
+**Alpha.1 is qualified.** The operator explicitly confirmed that all alpha.1
+testing is done, including the disk-retention gate, and alpha.1 is recorded as
+qualified by that confirmation. This is not a reconstructed baseline: no build,
+date, operation, individual observation or pass result is invented or
+backfilled. The detailed records in MANUAL-TESTING remain the evidence available
+in this checkout, including their partial and not-run entries; those are
+evidence gaps for those runs, not open alpha.1 blockers.
 
 Exception (R10): the macOS half of the install and upgrade checks is recorded
 as **not run (no Mac available)**. It must be qualified before v1.0.0 final
 and is not an alpha.1 gate; CI's macOS CLI job and the darwin/arm64 cross-build
 remain, but neither is host acceptance.
 
-Final qualification (R3, R11): alpha.1 is qualified by **one complete
+Final qualification for later alphas (R3, R11) remains **one complete
 MANUAL-TESTING baseline run on a freshly initialized server with the candidate
 build**. `main` serves only intermediate testing and the node-upgrade checks;
 earlier passes are context, not qualification.
 
 ## 8. Current state
 
-The operator reported alpha.1 qualified during the alpha.2 review. The older
-run records below describe the evidence available in this checkout and do not
-themselves establish the complete baseline; reconcile the qualification record
-with its evidence rather than treating the historical text as a new blocker.
+**Alpha.1 is qualified.** The operator explicitly confirmed that all alpha.1
+testing is done. That confirmation is the qualification record; no build, date,
+operation, individual observation or pass result is invented or backfilled here.
+The older run records below describe the evidence available in this checkout,
+including partial and not-run checks; they are historical evidence gaps, not
+open alpha.1 blockers.
 
 Alpha.2 is implemented at source level on `master`: strict `eregion.toml`
 input and export, shared/environment overrides, explicit resource declarations,
 generic environment-owned Docker resources with private networking, retained
 data and deployment gating, and optional `gh` webhook assistance. Isolated
-build, vet and package tests pass; real-host qualification, migrations 022–023
-against a live control database, Docker provisioning and GitHub delivery are
-not yet exercised. Alpha.2 is not qualified.
+build, vet and package tests pass.
+
+On 2026-11-06 `edge-ef4a6f879f45` (edge run 42242438039, source `ef4a6f8`)
+published and was installed on the CLI and `main`. The node upgrade applied
+migrations 022–023 (**schema 23/23, River 7/7**), the second `apply --dry-run`
+was 0 of 20, and eleven consecutive `doctor` runs were 20 pass / 0 warn / 0
+fail. Alpha.2 definition-file create, shared+environment merge, deterministic
+export, export/reimport no-op, secret-name-only output and strict validation
+passed on the host without a domain and without a first deploy. A declarative
+resource update was accepted, but both resource applies failed on Docker 29.1.3
+in the image-identity step: `docker image inspect --format '{{.Id}}|{{join
+.RepoDigests ","}}'` returns `wrong type for value; expected []string; got
+[]interface {}`. No resource container or volume was created; the fixture
+network was removed. Resource health, secret injection, deployment gating and
+data retention therefore remain unqualified.
+
+A second alpha.2 defect was found in file-based removal: `env update --from`
+reported the last resource as removed and required exact confirmation, but the
+new revision still listed it. The patch encoded the empty set as JSON `null`,
+which the node treats as "omit and preserve"; `resource detach` removed it
+correctly. The same defect was confirmed for removing the last `secret_names`
+entry, while a non-empty `config` map removal applied correctly. A
+control-database/Funnel outage
+(`thelab.tailbbed89.ts.net:10000`) then produced the generic `host.retention`
+read warning; it recovered on its own, after which a second `apply` was 0 of
+20, `doctor` returned three consecutive 20/0/0 runs, and both degraded resource
+fixtures were destroyed with exact confirmation and no containers, volumes or
+networks left. The fixture app/environment remains because real deletion needs
+the D7 human factor. The four existing public URLs stayed HTTP 200 throughout.
+Alpha.2 is not qualified.
 
 On 2026-11-06 the authorized alpha.1 tag was moved to `37d4f19` and its
 immutable snapshot published through the `edge` GitHub environment. The
@@ -337,16 +374,18 @@ identity and their manifest hashes. Stable and RC pointers remained absent;
 the edge pointer did not change during tag publication. The CLI and `main` run
 `edge-37d4f19bee05`, schema 21/21, River 7/7, doctor 20/0/0, and a second
 apply was a no-op; four serving URLs returned 200. This release publication is
-not a completed alpha baseline qualification; see MANUAL-TESTING.
+separate from the qualification record; alpha.1 qualification rests on the
+operator confirmation above and MANUAL-TESTING.
 
-Source state 2026-11-04: rows 1–15 and 17 are implemented in the integrated
-source on `master`. Row 17 (retention) has isolated tests and is an alpha.1
-gate; host qualification is partial. Defects 5 (worker registry inventory
-permissions) and 6 (local image removal during prune) and the two 2026-11-04
-retention findings (same-day daily retry and imageless-release resolution) are
-fixed and host-verified; the row still needs registry-GC coverage, the
-30-release check and a fresh-server baseline. Row 16 (alpha qualification)
-remains in progress.
+Historical source state 2026-11-04: rows 1–15 and 17 were implemented in the
+integrated source on `master`. Row 17 (retention) had isolated tests and was an
+alpha.1 gate; host qualification was then partial. Defects 5 (worker registry
+inventory permissions) and 6 (local image removal during prune) and the two
+2026-11-04 retention findings (same-day daily retry and imageless-release
+resolution) are fixed and host-verified; at that point the row still needed
+registry-GC coverage, the 30-release check and a fresh-server baseline. Row 16
+(alpha qualification) was then in progress; both rows are now closed for
+alpha.1 by the operator confirmation above.
 Rows 11–15 went through isolated implementation lanes and independent review,
 with rework and orchestrator acceptance; the final release-command
 evidence-classification correction was made by the orchestrator.
@@ -354,8 +393,8 @@ Combined format, build, vet, darwin/arm64 build and selected isolated package
 tests pass. The PostgreSQL integration suite passes (without the race detector)
 against a disposable PostgreSQL 17 after the 2026-10-28 fixture fixes. Schema:
 embedded migrations through 020; applied migrations 001–013 are unchanged.
-**Alpha qualification remains incomplete.** On 2026-10-29 the existing `main`
-node upgraded from edge-8a7179d6d95d through the fixed signed upgrade path;
+**At that point alpha qualification was incomplete.** On 2026-10-29 the existing
+`main` node upgraded from edge-8a7179d6d95d through the fixed signed upgrade path;
 CLI/node now run edge-e344781ced4b, schema 16/16, River 7/7, doctor 18 pass,
 and a second apply is a no-op. Private git cloning and a Buildpacks build were
 verified. The first app deploy exposed a release-command launcher/timeout leak,
@@ -393,12 +432,15 @@ parallel clients) because Caddy rebinds its SO_REUSEPORT listener. A runtime
 fix, a new `host-ingress-sysctl-v1` step, is published as edge-42a0541c09d4
 and installed on main (second apply no-op, doctor 18/0/0); four dense switches
 then had zero failures in 6,262 requests. Fresh init, human-factor-positive flows
-and other baseline variants are not yet qualified. See MANUAL-TESTING's “Resume testing” section for the saved target,
-fixture state, evidence locations and unqualified acceptance variants, and its
-run records for operation IDs. Row 16 is in progress; row 17 is implemented at
-source level and is an alpha.1 gate, not yet fully host-qualified (defects 5
-and 6 and the two 2026-11-04 retention findings are fixed and host-verified;
-retention still lacks registry-GC, 30-release and fresh-server coverage).
+and other baseline variants were not yet qualified then; alpha.1 is now closed
+by the operator confirmation above, without inventing those results. See
+MANUAL-TESTING's “Resume testing” section for the saved target, fixture state,
+evidence locations and historical gaps, and its run records for operation IDs.
+Row 16 was then in progress; row 17 was implemented at source level and an
+alpha.1 gate, not yet fully host-qualified (defects 5 and 6 and the two
+2026-11-04 retention findings are fixed and host-verified; retention still
+lacked registry-GC, 30-release and fresh-server coverage). Both are closed for
+alpha.1 by that confirmation.
 
 On 2026-10-30/31 a further edge-42a0541 session passed release-changing dense
 switches (7,673/7,673 switch-window HTTP 200, 8,235 including the pre-switch
@@ -417,8 +459,8 @@ and a failed container cleanup was summarised as "candidate cleanup completed"
 (4e827aa, now a warning event naming the containers). **Open defect 3:** a
 worker SIGKILL leaves its platform operation running until River's rescue,
 about 30 minutes (30m21s observed on op_f0d20fed6c26eb6bd138c84bd211e170); the
-fix is in progress for alpha.1 by rescuing this host's orphaned platform jobs
-on worker start. Neither fixed defect had been host-retested at that point.
+fix was then in progress for alpha.1 by rescuing this host's orphaned platform
+jobs on worker start. Neither fixed defect had been host-retested at that point.
 
 On 2026-11-03 a further run on `main` upgraded `edge-42a0541c09d4` ->
 `edge-a77d3bfa4fe6` -> `edge-13fdb2518757` (both signed; the previous CLI binary
@@ -491,7 +533,8 @@ before untagging it (never `--force`), reports every container's immutable image
 ID so an unlabeled container protects its image, and records deterministic
 conflict refusals as per-item skips with a `succeeded_with_skips` run and a
 doctor pass note. Real-prune completion, registry GC and deploy-after-GC
-therefore remain unqualified; details are in MANUAL-TESTING's late 2026-11-03
+therefore remained unqualified at that point; later runs in MANUAL-TESTING
+covered them and alpha.1 is operator-confirmed. Details are in its late 2026-11-03
 record.
 
 The 2026-11-04 run on `main` upgraded `edge-690baafe8c91` ->
@@ -527,9 +570,10 @@ never having produced an image, and no longer emits `registry_skipped` for a
 repository absent from inventory; the candidate dry run contains only the
 `image_skipped` for `pedantic_jackson`. The candidate apply was 2 of 20, the
 second apply 0 of 20, `doctor` was 20/0/0 in all three runs, a serving-revision
-restart succeeded, and monitors saw 1,212/1,212 HTTP 200. Registry GC remains
-unexercised because the registry holds only retained andurel artifacts. Details
-are in MANUAL-TESTING's 2026-11-04 candidate record.
+restart succeeded, and monitors saw 1,212/1,212 HTTP 200. Registry GC remained
+unexercised in that candidate because the registry held only retained andurel
+artifacts; later runs exercised it. Details are in MANUAL-TESTING's 2026-11-04
+candidate record.
 
 The failed-follow exit defect is corrected at source level: followed failed
 operations return the recorded error code's nonzero status (fallback exit 5),
@@ -538,7 +582,8 @@ both exit 130 but have distinct messages and state evidence. Isolated regression
 cover plain, JSON and NDJSON. Real-host failed deploy follows returned exit 5,
 success returned 0 and the build-stop retest returned cancellation exit 130;
 terminal Ctrl-C detach/replay and explicit cancel passed (153/154). Guided
-failure and remaining output variants still need manual qualification.
+failure and remaining output variants were not recorded in that step; alpha.1
+is operator-confirmed without backfilling them.
 
 A source re-check on 2026-10-28 (snapshot `a7478c4`) and a real deployment of a
 second app (andurel-site, edge-8a7179d: image push, digest deploy, release
@@ -568,11 +613,11 @@ already named it, so no new revision was written). A real empty push to
 credential, the build and release command passed, the new
 `rel_d231a28c17ce1aa345e6fa3cdfd7ae03` served `59017d6`, and all four URLs
 returned 200. The previous ready release remains for rollback. The earlier
-fixture-token rejection's root cause was not established. Remaining before a
-baseline pass: the operator reports interactive login passed; old-secret
-rejection after rotation was not run (the old secret was not
-available and was not read), and the broader alpha baseline is unrun.
-**The alpha is not complete.**
+fixture-token rejection's root cause was not established. At that point a
+baseline pass still had gaps: old-secret rejection after rotation was not run
+(the old secret was not available and was not read), and the broader alpha
+baseline was unrun. Alpha.1 is now operator-confirmed; these historical gaps are
+not backfilled.
 
 Retention preflight on the same build did not run the 30-release check: no
 unused verified primary hostname was available for a distinct disposable app,
@@ -591,8 +636,9 @@ existing serving URLs remained 200 at the per-deploy checks. Scoped backdating
 produced 25 planned release marks, but also 25 image removals attributed to the
 existing `img` app because the reused images share identities with its old
 releases. No manual prune was authorized for those items and none was run; the
-30-release acceptance remains incomplete. The backdates were reversed, and a
-keep-30 override protected the fixture while the app was held for review.
+30-release acceptance was incomplete at that point. The backdates were
+reversed, and a keep-30 override protected the fixture while the app was held
+for review.
 After explicit authorization to remove the 25 shared historical test images,
 the resumed run pruned exactly 25 of its 30 release rows and 25 local images;
 the newest five stayed, pruned-release rollback/deploy refused, and rollback
@@ -620,8 +666,9 @@ newest five were retained. Synthetic-aged image fixtures and a temporary
 environment-level one-day artifact grace were used, and grace was restored to
 14 days. Pruned-release refusals and rollback to kept release 29 succeeded;
 release 30 served again after GC. Registry storage size was not measured on
-this build, so that separate GC acceptance measurement remains unqualified.
-The alpha baseline remains incomplete. The fixture is held for human-factor
+this build, so that separate GC acceptance measurement remained unqualified on
+this run. At that point the alpha baseline was still incomplete; alpha.1 is now
+operator-confirmed by the record above. The fixture was held for human-factor
 cleanup; see MANUAL-TESTING for operations and evidence. The operator then
 deleted it with `op_777bfba4daf68d989fde2083461ed592`; app, environment,
 release and domain rows are gone, operation history remains, doctor is 20/0/0
@@ -637,32 +684,35 @@ active and returned 200. A locally prebuilt image was first pushed after GC and
 deployed as `rel_c5403a89567eed250689b3192dcb2347`; its new marker and all four
 existing URLs returned 200, and doctor was 20/0/0. The reported decrease is
 smaller than the planner's 12,046,645-byte sum, which counts shared blobs per
-manifest; this measurement and failure-path variants are not a full GC row
-pass. See MANUAL-TESTING for evidence and remaining qualification.
+manifest; this run's measurement and failure-path variants are not a full GC
+row pass. Those are historical evidence limits, not open alpha.1 blockers; see
+MANUAL-TESTING for the evidence.
 
-| Area | What exists | Open before the alpha |
+| Area | What exists | Alpha.1 qualification |
 | --- | --- | --- |
-| `server init` | vaire flow: preflight, `--answers`, `--password-stdin`, plan with `--confirm <server>`, binary installed once, vault keyring, node_exporter on WireGuard, guarded handoff with `--secrets-out`, `--resume`/`--discard`, `context remove`. SSH on port 22 only. | Real-host qualification. |
-| Operator channel | `eregion node rpc` over SSH in WireGuard; token-free contexts and handoff; version lockstep and `--auto-upgrade-nodes`. | Real-host qualification. |
-| Host convergence | `plan`, `apply`, `doctor`, `server status`, `ssh`, `node unlock-ssh`. | Real-host qualification. |
-| Apps and environments | Revisions with source binding, processes, config and secret names; guided and flag-only `app create`, `env create|update`; `process`, `config`; deployability gate. | Real-host qualification. |
-| Build, release, deploy | Deploy from the bound source (public or private git) or a release; build lifecycle; per-process containers with replicas; blue/green switch with public verification; rollback with pinned secret revisions; restart. | Real-host qualification. |
-| Domains | Primary and aliases; DNS, route, certificate and public state; serialized atomic Caddy writes; reconciliation and observation. | Real-host qualification. |
-| Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Real-host qualification. |
-| CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy` with durable admission and atomic deploy linking; `secrets export`/`secret export` behind the factor. | Host checks pass for token reload, secret-export metadata, disposable deletes and webhook-secret recovery; migration 021 is applied on main; a real push deployed `59017d6` as `rel_d231a28c…` with delivery 202 and all four URLs 200. On the same build redelivery returned the original operation without another release, an invalid signature returned 401, and an existing other-branch fixture push was ignored. Old-secret rejection after rotation remains unrun. |
+| `server init` | vaire flow: preflight, `--answers`, `--password-stdin`, plan with `--confirm <server>`, binary installed once, vault keyring, node_exporter on WireGuard, guarded handoff with `--secrets-out`, `--resume`/`--discard`, `context remove`. SSH on port 22 only. | Closed by operator confirmation. |
+| Operator channel | `eregion node rpc` over SSH in WireGuard; token-free contexts and handoff; version lockstep and `--auto-upgrade-nodes`. | Closed by operator confirmation. |
+| Host convergence | `plan`, `apply`, `doctor`, `server status`, `ssh`, `node unlock-ssh`. | Closed by operator confirmation. |
+| Apps and environments | Revisions with source binding, processes, config and secret names; guided and flag-only `app create`, `env create|update`; `process`, `config`; deployability gate. | Closed by operator confirmation. |
+| Build, release, deploy | Deploy from the bound source (public or private git) or a release; build lifecycle; per-process containers with replicas; blue/green switch with public verification; rollback with pinned secret revisions; restart. | Closed by operator confirmation. |
+| Domains | Primary and aliases; DNS, route, certificate and public state; serialized atomic Caddy writes; reconciliation and observation. | Closed by operator confirmation. |
+| Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Closed by operator confirmation. |
+| CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy` with durable admission and atomic deploy linking; `secrets export`/`secret export` behind the factor. | Host checks pass for token reload, secret-export metadata, disposable deletes and webhook-secret recovery; migration 021 is applied on main; a real push deployed `59017d6` as `rel_d231a28c…` with delivery 202 and all four URLs 200. On the same build redelivery returned the original operation without another release, an invalid signature returned 401, and an existing other-branch fixture push was ignored. Old-secret rejection after rotation was not recorded; alpha.1 is operator-confirmed, and no result is backfilled. |
 | Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
-| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publish verified (`527592419f06`). The existing `v1.0.0-alpha.1` tag's publication failed due to a malformed stable environment secret; it remains untouched and unpublished. Recovery requires a separate release decision and authorization. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
+| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06` and `ef4a6f879f45`; the latter installed on CLI and `main` with schema 23/23. The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
 
 ## 9. Work list
 
 One row at a time, in order (D16). A row is done when its user-visible flow
 works with flags, JSON, failure behavior and regression tests. Real-host checks
 are in MANUAL-TESTING. Exception: rows 11–14 touch disjoint behavior and may
-run in parallel per ALPHA-SPEC; row 15 follows them. Rows 1–15 and 17 are
-implemented at source level (section 8); their real-host acceptance criteria
-below are not qualified. Row 17 is an alpha.1 gate. Row 16 uses the existing
-designated test server and still needs a recorded baseline for the candidate
-build; local implementation/review does not qualify it.
+run in parallel per ALPHA-SPEC; row 15 follows them. Rows 1–17 are complete for
+alpha.1 by the operator's confirmation that all alpha.1 testing is done (section
+8). The acceptance criteria below remain the definition of each flow; this
+document does not reconstruct the individual results or backfill evidence. The
+R10 macOS exception remains outside the alpha.1 gate and is still required
+before v1.0.0 final. Rows 18–19 are alpha.2 work: implemented at source level
+and not qualified.
 
 | # | Outcome | Done when |
 | --- | --- | --- |
@@ -681,9 +731,9 @@ build; local implementation/review does not qualify it.
 | 13 | **Workloads and probes (D17, D21, D29, D31).** Release-scoped release command; recorded and retried container cleanup; serving-container repair at worker start; per-domain check path; public verification logs host, path and status; the observer covers every domain. | Scale, restart and rollback do not re-run a succeeded release command; a removed serving container returns after a worker restart; an alias with its own check path becomes ready; a leaked container shows in `env status` and is removed later. |
 | 14 | **Operator contracts.** Atomic `login` with `--replace`; same-key create retry returns the original operation without writing secrets again; `--context`/`EREGION_CONTEXT`; `logs --json` is one envelope (NDJSON only with `--output ndjson`); every operation-following command streams the same NDJSON events; `domain add --json` returns an object; `ssh --command`. | Each has a regression test; a failed import leaves an existing context working. |
 | 15 | **Guided finish.** Guided `app create`/`env create` follow build and deploy to serving or failed, Ctrl-C detaches (vaire's flow); `server init` ends with vaire's doctor gate (`doctor_failed`, `--resume`, `--skip-doctor`). | Guided create ends at a serving URL or a failed operation with its error; init on a healthy host ends with a clean doctor summary. |
-| 16 | **Alpha qualification.** MANUAL-TESTING baseline on a real server for the tagged build. | Recorded pass; then the user authorizes `1.x` and `v1.0.0-alpha.1`. |
-| 17 | **Disk retention (D30), alpha.1 gate.** Policy, planner, periodic job, `retention show|set`, `prune [--dry-run]`, registry deletes and GC, `doctor` retention and Buildpacks cache rows. Implemented and tested at source level; host qualification is pending. | A node with 30 releases keeps exactly the policy's set; `prune --dry-run` lists what would go and the bytes; rollback to a pruned release refuses clearly; a second `apply` stays a no-op. |
-| 18 | **Optional app definitions and managed resources (D19, D32), alpha.2.** Implemented at source level; host qualification pending. `eregion.toml` input for `app create`, `env create|update` (`--from`) and `app export`, with shared defaults and selected environment overrides. Generic Docker resources have environment ownership, private networking, secret references, optional persistent volumes and durable lifecycle; explicit apply provisions them, while ordinary deploys never read the file. Existing file-free workflows remain supported. | File and equivalent flags save equivalent supported desired state; export round-trips without secret values; unknown keys and secret-value fields are refused. Dry-run previews changes; destructive removals require target confirmation; detaching a resource retains its data and destruction is separate. A managed resource can be consumed by the app, and an external dependency still works without one. |
+| 16 | **Alpha qualification.** MANUAL-TESTING baseline on a real server for the tagged build. | Complete: the operator confirmed all alpha.1 testing is done. No baseline record is reconstructed here; release authorization is separate. |
+| 17 | **Disk retention (D30), alpha.1 gate.** Policy, planner, periodic job, `retention show|set`, `prune [--dry-run]`, registry deletes and GC, `doctor` retention and Buildpacks cache rows. Implemented and tested at source level; alpha.1 host qualification is operator-confirmed. | A node with 30 releases keeps exactly the policy's set; `prune --dry-run` lists what would go and the bytes; rollback to a pruned release refuses clearly; a second `apply` stays a no-op. |
+| 18 | **Optional app definitions and managed resources (D19, D32), alpha.2.** Implemented at source level; host qualification partial. `eregion.toml` input for `app create`, `env create|update` (`--from`) and `app export`, with shared defaults and selected environment overrides. Generic Docker resources have environment ownership, private networking, secret references, optional persistent volumes and durable lifecycle; explicit apply provisions them, while ordinary deploys never read the file. Existing file-free workflows remain supported. On 2026-11-06 `edge-ef4a6f879f45` passed definition create/override/export/reimport, secret-name-only storage and strict validation on `main`; resource apply is blocked by the Docker 29.1.3 image-inspect template defect recorded in section 8, and file-based removal of the last resource or last secret name was reported as a change but not applied. Resource health, secret injection, deployment gating and data retention remain unqualified; explicit detach and confirmed destroy worked. | File and equivalent flags save equivalent supported desired state; export round-trips without secret values; unknown keys and secret-value fields are refused. Dry-run previews changes; destructive removals require target confirmation; detaching a resource retains its data and destruction is separate. A managed resource can be consumed by the app, and an external dependency still works without one. |
 | 19 | **Optional `gh`-assisted webhook setup (D28), alpha.2.** Implemented at source level; real GitHub qualification pending. Check authenticated `gh` and repository hook permission; create or update the matching hook, retaining manual setup without `gh` or permission. No GitHub App; no plaintext secrets in ordinary output, events or arguments. | Authenticated, authorized `gh` can create or update the hook; missing `gh` or permission leaves manual setup available; explicit flags cover prompts and JSON/no-TTY never prompts; regression tests cover these paths. |
 
 ## Reference index

@@ -1,6 +1,7 @@
 package appdef
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -520,6 +521,8 @@ version = 1
 app = "api"
 environment = "production"
 node = "main"
+secret_names = []
+resources = []
 
 [source]
 kind = "git"
@@ -552,6 +555,7 @@ release_command = []
 			Processes:   []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
 			Config:      map[string]string{"A": "1"},
 			SecretNames: []string{"DATABASE_URL"},
+			Resources:   []string{"db"},
 		}},
 	}
 	patch, changed, _, err := resolved.UpdatePatch(current, nil)
@@ -576,10 +580,29 @@ release_command = []
 	if patch.SecretNames == nil || len(*patch.SecretNames) != 0 {
 		t.Fatalf("secret names were not cleared: %+v", patch.SecretNames)
 	}
-	for _, want := range []string{"build_node", "source", "runtime", "processes", "config", "secret_names"} {
+	if patch.Resources == nil || len(*patch.Resources) != 0 {
+		t.Fatalf("resources were not cleared: %+v", patch.Resources)
+	}
+	for _, want := range []string{"build_node", "source", "runtime", "processes", "config", "secret_names", "resources"} {
 		if !contains(changed, want) {
 			t.Fatalf("changed %v does not name %s", changed, want)
 		}
+	}
+	wire, err := json.Marshal(patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(wire, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"processes", "secret_names", "resources"} {
+		if got := string(fields[name]); got != "[]" {
+			t.Fatalf("%s wire value = %s, want an explicit empty array; patch = %s", name, got, wire)
+		}
+	}
+	if got := string(fields["config"]); got != "{}" {
+		t.Fatalf("config wire value = %s, want an explicit empty object; patch = %s", got, wire)
 	}
 }
 

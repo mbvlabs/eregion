@@ -458,7 +458,7 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	imageStep := platform.ResourceImageStepID(plan)
 	imageRaw, err := w.runStepOn(ctx, tr, id, attempt, imageStep, platform.ArgvPayload{
 		Step:           imageStep,
-		Argv:           []string{"docker", "image", "inspect", "--format", `{{.Id}}|{{join .RepoDigests ","}}`, plan.Spec.Image},
+		Argv:           []string{"docker", "image", "inspect", "--format", platform.ResourceImageInspectFormat, plan.Spec.Image},
 		TimeoutSeconds: 30,
 	}, nil)
 	if err != nil {

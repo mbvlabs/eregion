@@ -514,19 +514,35 @@ func SortedResourceSecretEnvKeys(values map[string]string) []string {
 	return keys
 }
 
-// ParseResourceImageInspect parses
-// "<image id>|<comma-separated repo digests>" from docker image inspect.
+// ResourceImageInspectFormat renders an image's immutable ID and its
+// repository digests. Docker 29 exposes RepoDigests as []interface{}, which the
+// text/join template functions reject ("expected []string"); json marshals
+// either representation. The format lives here so its parse contract stays
+// beside ParseResourceImageInspect.
+const ResourceImageInspectFormat = `{{.Id}}|{{json .RepoDigests}}`
+
+// ParseResourceImageInspect parses "<image id>|<JSON repo digests>" from docker
+// image inspect. A null, absent or empty repository digest list is valid: the
+// immutable image ID still identifies the local content.
 func ParseResourceImageInspect(stdout string) (imageID string, repoDigests []string, err error) {
 	line := strings.TrimSpace(stdout)
 	if line == "" {
 		return "", nil, errors.New("docker returned no image identity")
 	}
-	id, digests, _ := strings.Cut(line, "|")
+	id, rawDigests, _ := strings.Cut(line, "|")
 	id = strings.TrimSpace(id)
 	if !imageIDPattern.MatchString(id) {
 		return "", nil, fmt.Errorf("docker returned an invalid immutable image ID %q", id)
 	}
-	for _, digest := range strings.Split(digests, ",") {
+	rawDigests = strings.TrimSpace(rawDigests)
+	if rawDigests == "" || rawDigests == "<no value>" {
+		return id, nil, nil
+	}
+	var digests []string
+	if err := json.Unmarshal([]byte(rawDigests), &digests); err != nil {
+		return "", nil, fmt.Errorf("docker returned unreadable repository digests: %w", err)
+	}
+	for _, digest := range digests {
 		digest = strings.TrimSpace(digest)
 		if digest != "" && digest != "<no value>" {
 			repoDigests = append(repoDigests, digest)

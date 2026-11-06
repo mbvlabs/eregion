@@ -139,6 +139,70 @@ func TestEnvironmentRevisionPatchMerge(t *testing.T) {
 	}
 }
 
+func TestEnvironmentUpdateExplicitEmptyCollectionsApply(t *testing.T) {
+	base := RevisionState{
+		Source:      SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+		Runtime:     RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
+		Processes:   []ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}, {Name: "worker", Kind: "worker", Command: "bin/worker", Replicas: 1}},
+		Config:      map[string]string{"APP_ENV": "production"},
+		SecretNames: []string{"DATABASE_URL"},
+		Resources:   []string{"db"},
+	}
+	raw := json.RawMessage(`{"processes":[],"config":{},"secret_names":[],"resources":[]}`)
+	normalized, err := NewRegistry().Normalize(KindEnvironmentUpdate, "env/api/production", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, ok := normalized.Input.(*EnvironmentUpdateInput)
+	if !ok {
+		t.Fatalf("normalized input = %T", normalized.Input)
+	}
+	if patch.Processes == nil || len(*patch.Processes) != 0 ||
+		patch.Config == nil || len(*patch.Config) != 0 ||
+		patch.SecretNames == nil || len(*patch.SecretNames) != 0 ||
+		patch.Resources == nil || len(*patch.Resources) != 0 {
+		t.Fatalf("explicit empty collections were not preserved: %+v", patch)
+	}
+	var canonical map[string]json.RawMessage
+	if err := json.Unmarshal(normalized.Canonical, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"processes", "secret_names", "resources"} {
+		if got := string(canonical[name]); got != "[]" {
+			t.Fatalf("%s canonical value = %s, want an explicit empty array; canonical = %s", name, got, normalized.Canonical)
+		}
+	}
+	if got := string(canonical["config"]); got != "{}" {
+		t.Fatalf("config canonical value = %s, want an explicit empty object; canonical = %s", got, normalized.Canonical)
+	}
+	next := ApplyEnvironmentPatch(base, *patch)
+	if err := NormalizeRevisionState(&next); err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Processes) != 0 || len(next.Config) != 0 || len(next.SecretNames) != 0 || len(next.Resources) != 0 {
+		t.Fatalf("explicit empty collections were not applied: %+v", next)
+	}
+	if next.SecretNames == nil || next.Resources == nil || next.Processes == nil || next.Config == nil {
+		t.Fatalf("an applied empty collection became nil again: %+v", next)
+	}
+	if len(base.Processes) != 2 || len(base.Config) != 1 || len(base.SecretNames) != 1 || len(base.Resources) != 1 {
+		t.Fatalf("the base revision was mutated: %+v", base)
+	}
+
+	nullNormalized, err := NewRegistry().Normalize(KindEnvironmentUpdate, "env/api/production", json.RawMessage(`{"secret_names":null,"resources":null}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nullPatch := nullNormalized.Input.(*EnvironmentUpdateInput)
+	if nullPatch.SecretNames != nil || nullPatch.Resources != nil {
+		t.Fatalf("JSON null should remain an omitted collection: %+v", nullPatch)
+	}
+	preserved := ApplyEnvironmentPatch(base, *nullPatch)
+	if len(preserved.SecretNames) != 1 || len(preserved.Resources) != 1 {
+		t.Fatalf("JSON null did not preserve the current collections: %+v", preserved)
+	}
+}
+
 func TestRetentionOverrideIsCarriedByOtherRevisionChanges(t *testing.T) {
 	keep := 5
 	base := RevisionState{

@@ -890,6 +890,94 @@ A = "1"
 	}
 }
 
+func TestEnvUpdateFromFileRemovingLastCollectionsSubmitsEmptyArrays(t *testing.T) {
+	raw := `version = 1
+app = "api"
+environment = "production"
+node = "main"
+secret_names = []
+resources = []
+
+[source]
+kind = "image"
+image = "ghcr.io/acme/api:1"
+
+[config]
+`
+	path := writeDefinitionFile(t, raw)
+	current := resourceDefinitionEnvironment()
+	current.Revision.Processes = []platform.ProcessSpec{{Name: "worker", Kind: "worker", Command: "./worker", Replicas: 1}}
+	current.Revision.SecretNames = []string{"DATABASE_URL"}
+	current.Revision.Resources = []string{"db"}
+	current.Revision.Config = map[string]string{"A": "1"}
+	backend := definitionBackendForEnvironment(t, current)
+	cmd := &cobra.Command{Use: "update"}
+	addEnvironmentUpdateFlags(cmd)
+	if err := cmd.ParseFlags([]string{"--from", path, "--confirm", "api/production"}); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{secrets: &secrets.Registry{}, backend: backend}
+	res, err := a.envUpdate(cmd, []string{"api", "production"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, ok := res.data.(definitionUpdateResult)
+	if !ok || data.OperationID == "" {
+		t.Fatalf("result = %T %+v", res.data, res.data)
+	}
+	if got := strings.Join(data.Changed, ","); got != "processes,config,secret_names,resources" {
+		t.Fatalf("changed = %s", got)
+	}
+	if data.Patch.Processes == nil || len(*data.Patch.Processes) != 0 ||
+		data.Patch.Config == nil || len(*data.Patch.Config) != 0 ||
+		data.Patch.SecretNames == nil || len(*data.Patch.SecretNames) != 0 ||
+		data.Patch.Resources == nil || len(*data.Patch.Resources) != 0 {
+		t.Fatalf("removal patch = %+v", data.Patch)
+	}
+
+	updates := backend.submissionsOfKind(platform.KindEnvironmentUpdate)
+	if len(updates) != 2 {
+		t.Fatalf("environment update submissions = %+v, want preview and accepted action", updates)
+	}
+	var accepted definitionSubmission
+	for _, submission := range updates {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(submission.Input, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"processes", "secret_names", "resources"} {
+			if got := string(fields[name]); got != "[]" {
+				t.Fatalf("%s on the wire = %s, want an explicit empty array; input = %s", name, got, submission.Input)
+			}
+		}
+		if got := string(fields["config"]); got != "{}" {
+			t.Fatalf("config on the wire = %s, want an explicit empty object; input = %s", got, submission.Input)
+		}
+		if !submission.DryRun {
+			accepted = submission
+		}
+	}
+	if accepted.Input == nil {
+		t.Fatal("the accepted environment update was not captured")
+	}
+
+	normalized, err := platform.Default().Normalize(platform.KindEnvironmentUpdate, "env/api/production", accepted.Input)
+	if err != nil {
+		t.Fatalf("the node refused the CLI's accepted input: %v", err)
+	}
+	patch, ok := normalized.Input.(*platform.EnvironmentUpdateInput)
+	if !ok {
+		t.Fatalf("normalized input = %T", normalized.Input)
+	}
+	next := platform.ApplyEnvironmentPatch(platform.CloneRevisionState(current.Revision.RevisionState), *patch)
+	if err := platform.NormalizeRevisionState(&next); err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Processes) != 0 || len(next.Config) != 0 || len(next.SecretNames) != 0 || len(next.Resources) != 0 {
+		t.Fatalf("the accepted revision retained removed collections: %+v", next)
+	}
+}
+
 func TestDefinitionCreateAttachesOnlyAttachTrueResources(t *testing.T) {
 	path := writeDefinitionFile(t, resourceDefinition)
 	cmd := definitionCommand(t, setupApp)

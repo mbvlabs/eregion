@@ -4,12 +4,27 @@ Acceptance checks for the v1 alpha and the record of real-server runs.
 [MASTER](MASTER.md) owns scope, decisions (D-numbers below) and order; this file
 says what must work on a real server and what has been observed.
 
+## Alpha.1 qualification
+
+The operator explicitly confirmed that all alpha.1 testing is done, including
+the disk-retention gate. Alpha.1 is recorded as qualified by that confirmation,
+not by a reconstructed baseline: no build, date, operation, individual
+observation or pass result is invented or backfilled. The run records below are
+the evidence retained in this checkout; a **partial** or **not run** entry in a
+historical record is an evidence gap for that run, not an open alpha.1 blocker.
+
+Alpha.2 acceptance remains planned and unqualified. macOS acceptance (R10)
+remains required before v1.0.0 final and was not an alpha.1 gate.
+
 ## Evidence rules
 
 - Record the build/commit, date, operator OS/arch, server provider, OS/arch and
   topology, and the outcome. A run from a checkout is not a published-binary run.
 - Use **pass**, **fail**, **blocked** (missing implementation) or **not run**.
   A skipped or absent check is never a pass.
+- Explicit operator confirmation may close an alpha qualification. That records
+  the status; it does not turn an unrecorded check into a pass and does not
+  authorize invented evidence.
 - A submission is acceptance only. Keep the operation ID, wait for its terminal
   state, inspect serving and route state, and check the external response.
 - Never store tokens, DSNs, passwords, handoff plaintext or passphrases, or
@@ -41,8 +56,9 @@ running collector, collection failure and restart failure variants were not run.
 The local isolated `go test ./internal/release ./internal/upgrade` passed; this
 is not host evidence of tampered signed-manifest or artifact rejection. Those
 same-build host variants were not run to avoid changing the live install; an
-actual forward upgrade requires a newer signed edge. The alpha baseline remains
-incomplete.
+actual forward upgrade requires a newer signed edge. This run alone did not
+complete the alpha baseline; alpha.1 is now qualified by the operator
+confirmation above, not by reconstructed evidence.
 
 ### Release-channel publication (2026-11-06)
 
@@ -57,8 +73,138 @@ before and after the tag workflow. Edge workflow 42219795190 passed. CLI and
 main were upgraded to `edge-37d4f19bee05`: schema 21/21, River 7/7, doctor
 20/0/0, second apply 0/20, four serving URLs HTTP 200. The credentials step was
 skipped; authenticated CI-token behavior was not retested. Evidence is in
-`950-*` under the fresh-session evidence directory. This is not a full alpha
-baseline pass.
+`950-*` under the fresh-session evidence directory. This publication record is
+not the alpha baseline pass; alpha.1 qualification rests on the operator
+confirmation above.
+
+### 2026-11-06 alpha.2 definitions and resources on `edge-ef4a6f879f45`
+
+Authorized target: existing context/node `main` (`exploration`, Ubuntu 26.04
+amd64), external control database on `thelab` through Funnel. Operator CLI
+Linux/amd64. No existing app, database, DNS record or GitHub repository was
+mutated; no tag, branch, commit or push was created.
+
+**Release and upgrade.** Edge workflow 42242438039 completed successfully for
+`ef4a6f879f45cbbd6a2d447705dbcfc8a617708d`. The edge manifest resolved to
+`edge-ef4a6f879f45`; `eregion upgrade --channel edge --version
+edge-ef4a6f879f45 --dry-run --json` reported that move and `--yes` replaced
+`/home/mbv/.local/bin/eregion`, keeping `eregion.prev`. On the node, `eregion
+--context main apply --auto-upgrade-nodes --json` produced
+`op_25095a2dcb1b069a00db3e60b4b6f4ed`: 4 applied, 16 skipped, migrations
+022–023 applied, then `server status` reported CLI/node `edge-ef4a6f879f45`,
+**schema 23/23, River 7/7**, and all five services active. A following `apply
+--dry-run --json` was 0 of 20 (generation 9). Before and after the upgrade,
+eleven consecutive `doctor --json` runs were **20 pass / 0 warn / 0 fail**;
+the earlier intermittent doctor warning was not reproduced while the control
+database was reachable.
+
+**Doctor `host.retention` warning diagnosis.** At 2026-11-06T15:50:19Z the
+control database became unreachable from `main` and `doctor` changed to
+`drift.pending` fail, `version.schema` fail, `host.retention` warn ("cannot read
+the retention runs") and `version.river` warn. The node journal then reported
+`failed to write startup message: write failed: EOF` for every resolved
+`thelab.tailbbed89.ts.net:10000` address. `thelab`'s own Tailscale status showed
+the backend Running but `Self.Online=false`; its local Funnel listener existed
+and `openssl s_client` against port 10000 verified the
+`thelab.tailbbed89.ts.net` certificate with return code 0. The `host.retention`
+row is therefore the generic "retention runs could not be read" warning caused
+by the control-database/Funnel outage, not evidence of a retention-data or
+retention-policy defect. The four existing public URLs stayed HTTP 200 during
+the outage. Tailscale was not restarted by the agent; it recovered on its own.
+
+**Definitions.** `app create --from … --dry-run --json` refused an unknown key,
+a `[secrets]` value table and a resource without an exec health command with
+`validation_failed` before mutation; the rejected secret value was not echoed.
+`app create --from create.toml --no-deploy --json` created
+`a2defs1106/production` as `op_0267f357f7b4c9f49e5f33e448d2a519` with revision
+1, merged shared `SHARED=shared` and `[environments.production]` `OVERRIDE=prod`,
+and kept the source image `nginx:1.27-alpine`. `app export` was deterministic
+and emitted source, runtime, processes, config, `secret_names`, domains and
+resources only; reimporting that export with `env update --from … --dry-run
+--json` returned `changed: []`. `secret set DATABASE_PASSWORD` from a generated
+0600 file wrote vault revision 1 and attached the name as
+`op_d7cf21f1ebaa4e81c6ff571f01c5a896`; output carried only name, revision, hash
+and key metadata.
+
+**Resources.** `env update --from update-resources.toml --dry-run --json`
+previewed `resources.cache: added` without mutation (the `db` declaration used
+`attach=false`). The real update `op_4ee1361ab255783580024cc7c350993f` committed
+revision 3 with `resources: ["cache"]` and submitted resource operations
+`op_c1dab79460fef320badab3a0321ea4cc` (cache) and
+`op_9893a1c7537359040eab2d68a54b0083` (db). Both failed after eight attempts in
+`platform-resource-image-…-v1`:
+
+```text
+stderr: template parsing error: template: :1:15: executing "" at <.RepoDigests>: wrong type for value; expected []string; got []interface {}
+```
+
+The commands at `internal/controlplane/resource.go:461` use `docker image
+inspect --format '{{.Id}}|{{join .RepoDigests ","}}'`; Docker client 29.1.3
+exposes `RepoDigests` to that template as `[]interface{}`, so `join` fails.
+On the node, `--format '{{.Id}}|{{json .RepoDigests}}'` succeeded and printed
+the image ID and digest list, confirming the command is the defect rather than
+an absent image. Both resource rows were `degraded` with
+`error_code=unavailable`; no resource container or volume was created. The
+private network `er-env_83bd5eea9dbab1daca6632d430fbc6fa` carried
+`io.eregion.app=a2defs1106` and `io.eregion.environment=production` and was
+removed after inspection. The pulled `redis:7-alpine` (image ID `c5d34a98396a`)
+and `postgres:17-alpine` (`3540c0362c80`) were removed after the run; no
+container referenced them.
+
+**Second defect: file removal of the last resource is not applied.** After the
+control database recovered, `env update --from update-no-resources.toml
+--dry-run --json` reported `resources.cache: removed`, and the real command
+without `--confirm` correctly refused with `confirmation_required`. With
+`--confirm a2defs1106/production` it accepted
+`op_1df96ad438f6ee010308febfc7be850b` (`succeeded`), but revision 4 still
+listed `resources: ["cache"]`; the operation's patch carried `"resources":null`.
+The file-removal path builds a nil slice when the last resource is dropped
+(`append([]string(nil), desired.Resources...)`), JSON encodes the non-nil
+pointer's nil slice as `null`, and the node treats a null pointer as "omit and
+preserve" rather than "replace with empty". `resource detach` then created
+revision 5 with no resources as `op_89ed0a5e2b3d823a2da13469ab7b4f4e`, so the
+resource action itself works. The same defect was then confirmed for the last
+secret name: `env update --from` reported `config.OVERRIDE: unset` and
+`secret_names.DATABASE_PASSWORD: removed`, and `op_766d98cb801e385265912a4ac3067edd`
+(succeeded) actually removed the config key but revision 6 still listed
+`DATABASE_PASSWORD`. A non-empty `config` map applies correctly; a nil slice for
+`secret_names` or `resources` does not clear the existing value.
+
+**Export/status with resources.** Exporting revision 3 included both `[[resources]]`
+blocks, `attach = false` for `db`, `DATABASE_PASSWORD` only as a secret name and
+no value. `env status` reported deployability
+`missing: ["artifact", "domain", "resource:cache"]`, so the unavailable
+resource is reflected in the deployability gate. After detach, export listed
+both destroyed resources with `attach = false`, and reimporting that export was
+a no-op.
+
+**Recovery and cleanup.** The control-database outage recovered on its own:
+`server status` returned schema 23/23 again, a second real `apply` was
+`op_dea65f9e3139fba03629115fa1cae07d` with 0 applied / 20 skipped, and the first
+`doctor` after recovery was 19 pass / 1 warn (`host.retention` still could not
+read the runs), followed by three consecutive 20/0/0 runs. That single
+post-outage warning reproduces the earlier intermittent symptom and confirms
+it tracks a transient control-database read failure rather than retention data.
+Both degraded resources were destroyed with exact confirmation: cache
+`op_25bbbeed0f4ca36399a55ac82817c832`, db
+`op_0829f6c2b1d04f905635ceff9ac7727e`; a further
+`resource destroy cache --delete-data` (`op_03fd23841b5830d51506a464be1e06db`)
+succeeded with no owned volumes and left a foreign volume `a2-foreign-1106`
+untouched; that foreign volume was then removed. Both resource rows are
+`destroyed`, with no fixture container, volume or network left.
+
+`app delete a2defs1106 --dry-run` and `env delete a2defs1106 production
+--dry-run` previewed one environment, one secret namespace, zero releases,
+deployments, builds and domains, with the last-environment warning. Actual
+deletion needs the D7 human factor at a terminal, so it was not performed;
+`a2defs1106/production` remains with revision 6, the still-attached
+`DATABASE_PASSWORD` name and the destroyed resource identities. No DNS or
+GitHub mutation was performed.
+Resource data retention remains unqualified because no resource container or
+volume could be created; the resource apply defect, not host capacity, is the
+alpha.2 blocker on this build. Raw command output and definition files are
+under `/tmp/opencode/alpha2-defs/`; the generated secret-value file was removed
+and no secret value is recorded there.
 
 ### Release-channel source integration (2026-11-06, before publication)
 
@@ -207,15 +353,16 @@ checks.
 Host status on main (2026-11-04 candidate, `edge-0a1a492d8207`): **policy**
 show/set and the environment revision pass; **prune dry run** passes with only
 the `image_skipped` for `pedantic_jackson` (registry_skipped gone, items 1,
-planned bytes 0); **pruned-rollback refusal** remains verified; the daily
+planned bytes 0); **pruned-rollback refusal** remained verified; the daily
 retry fix is host-verified — a new automatic run `op_9b72a9e32c2b5b49351f3ba75edb4664`
 was submitted after the one-hour backoff and succeeded with 0 items; the manual
 prune was not counted, as the submitter only sees its own daily-key operations.
 **doctor retention and Buildpacks cache both pass at 20/0/0 in all three runs**,
 with a known 4.7 GiB cache. A restart of the serving revision succeeded with
-1,212/1,212 HTTP 200. **Registry GC** remains unexercised because the registry
-holds only retained `andurel` artifacts; **30-release retention** and the
-fresh-server baseline remain. Evidence in the 2026-11-04 candidate record.
+1,212/1,212 HTTP 200. **Registry GC** remained unexercised because the registry
+held only retained `andurel` artifacts; the **30-release retention** and
+fresh-server baseline were not recorded then. Later records cover that work;
+alpha.1 is operator-confirmed. Evidence is in the 2026-11-04 candidate record.
 
 ## Fresh-server session checklist (edge)
 
@@ -484,10 +631,11 @@ Defects (fix before the next edge build):
   in the working tree:** the preview keeps target-scoped row counts but uses the
   application-wide environment count for the last-environment warning, with
   unit and explicit-DSN integration regressions; the DB-backed case **passes**
-  against PostgreSQL 17.11 on 2026-11-05 (820). **Not host-qualified:** the
-  post-fix `env delete --dry-run` still needs a real terminal check.
+  against PostgreSQL 17.11 on 2026-11-05 (820). **Not host-qualified at that
+  point:** the post-fix `env delete --dry-run` still needed a real terminal
+  check.
 
-Usability (address before alpha.1; not blocking a pass):
+Usability (not blocking a pass; not part of the alpha.1 qualification):
 
 - **Handing secrets from a human to an agent is too much work.** Tokens are
   shown once on screen and the agent needs them in a protected file. The
@@ -512,7 +660,10 @@ Usability (address before alpha.1; not blocking a pass):
 - A failed first-deploy card still prints `public url:` although nothing
   serves.
 
-### Open decisions
+### Historical open decisions
+
+These were open during the 2026-11-04 session. Alpha.1 is now operator-confirmed
+complete, so they are not current blockers; no outcome is invented here.
 
 - **A.** Unsupported OS/arch preflight: use a second throwaway host or a VM
   with another OS, or record not run.
@@ -520,16 +671,18 @@ Usability (address before alpha.1; not blocking a pass):
   The alternative, `--resume --skip-doctor` after `doctor_failed`, would replace
   the resume-after-fix check.
 - **C.** Closed: init runs from the laptop and the login runs on `thelab`.
-- **D.** Whether the recovery and repair race variants stay alpha.1 gates if a
-  timed kill can't reproduce them on a real host.
+- **D.** Whether the recovery and repair race variants stayed alpha.1 gates if a
+  timed kill could not reproduce them on a real host. Closed by the operator's
+  alpha.1 confirmation; no individual result is reconstructed.
 
 ## Resume testing — saved session state, updated 2026-11-03
 
 Start a fresh session by reading [MASTER](MASTER.md), then
 [IMPLEMENTATION](IMPLEMENTATION.md), then this section and the run records below.
-MASTER row 16 remains in progress; this is a resumption aid for its existing
-acceptance checklist, not a second work list. **Alpha.1 is not qualified.**
-Facts below are the last recorded observations, not a fresh host check.
+MASTER row 16 is complete by operator confirmation; this is retained as
+historical session state, not a second work list or an open checklist.
+**Alpha.1 is qualified.** Facts below are the last recorded observations, not a
+fresh host check.
 
 ### Target and build snapshot
 
@@ -617,25 +770,27 @@ completion. The route-write test failed its operation as expected; periodic
 reconciliation subsequently recovered the routes without rewriting that failure.
 It does **not** qualify rejection of a Caddy reload.
 
-### Remaining acceptance to select next
+### Alpha.1 acceptance evidence and historical gaps
 
-The complete baseline tables above remain authoritative for acceptance details;
-do not treat a passed subset as completion of an entire row.
+Alpha.1 is qualified by the operator confirmation above. The table retains the
+coverage observed in this checkout; a gap listed here is a historical evidence
+gap, not open alpha.1 work, and no individual result is reconstructed. The
+baseline tables above remain authoritative for what each check means.
 
-| Baseline area | Recorded coverage and remaining qualification |
+| Baseline area | Recorded coverage and historical gaps |
 | --- | --- |
-| Guided create | **Not run:** guided `app create`/`env create` success and failure, ending at a serving URL or a failed operation; guided vs flag-only revision equivalence. Flag-only create and app-create replay passed. Needs DNS A records git-test3/git-test4 → 46.224.129.96 and an agent in a PTY. |
-| CI endpoint | **Not run:** authenticated CI deploy; expired, revoked and wrong-environment tokens denied; nothing else of `/v1` reachable publicly. Needs defect 1 published and applied, plus a token created at a human terminal. |
-| Push to deploy | **Partial pass (2026-11-05, `edge-527592419f06`):** a real empty push to `mbvlabs/eregion-hello@main` produced delivery `12b3bc42-d964-11f1-8ff4-80f7dc34db03` 202/OK and `op_232f45c1cd645304e92df57409fb5b83` succeeded, serving `rel_d231a28c17ce1aa345e6fa3cdfd7ae03` at `59017d6`; both githello domains and all four monitored URLs returned 200. The old fixture read credential was replaced with the authenticated `gh` token (`GIT_READ_TOKEN` revision 3) and the clone succeeded; the earlier rejection's root cause was not established. On the same build, redelivery returned the original operation without a second release; an invalid signature returned 401; and a real push to existing branch `qual-rc-never` was ignored. **Still not run:** old-secret rejection after rotation. |
-| Factor-gated ops | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** positive `secrets export` is operator-reported: the human completed the authenticator factor and the `Done`/`stored` gate, and the agent verified only that the `--secrets-out` file is 0600 in a 0700 parent (648). Positive `app delete guidedflags2` was run by the human with a fresh TOTP (`op_44ae1a2d25c010f9e42ec16b4472c6f2`, succeeded in 5.7 s); the agent verified the app, environment, release, deployment, build, domain, secret-namespace and revision rows are gone, durable operation/event history remains, and githello, guided and img still return 200 (660-669). Positive `env delete guided failing` was then run by the human with a fresh factor (`op_62837d11f91ad17e7a28a87846a5b594`, succeeded, 11 events); the agent verified only the failing environment's rows and secrets are gone, `guided` and its `production` environment still serve git-test3, all four monitored hostnames return 200, and operation history remains (680-689). `secret export` was not run; a read-only `secret list` confirms active `HELLO_SECRET` revision 3 in `guided/production` for the next human export (649). Positive last-environment `env delete guidedflags production` also passed (`op_844aaba1c862a0450452be5bd40ac624`, 8 events); the `guidedflags` app and all its rows are gone, history remains, and the other apps still return 200 (690-699). Still **not run:** positive `token create` and positive `secret export`; container/network inventory was not independently inspected because the agent has no Docker socket permission without sudo, so cleanup rests on operation step results and zero platform rows. JSON/no-TTY refusals and deletion preview passed. Needs the human authenticator. |
+| Guided create | **Not run at that point:** guided `app create`/`env create` success and failure, ending at a serving URL or a failed operation; guided vs flag-only revision equivalence. Flag-only create and app-create replay passed. At that point it needed DNS A records git-test3/git-test4 → 46.224.129.96 and an agent in a PTY. |
+| CI endpoint | **Not run at that point:** authenticated CI deploy; expired, revoked and wrong-environment tokens denied; nothing else of `/v1` reachable publicly. At that point it needed defect 1 published and applied, plus a token created at a human terminal. |
+| Push to deploy | **Partial pass at that point (2026-11-05, `edge-527592419f06`):** a real empty push to `mbvlabs/eregion-hello@main` produced delivery `12b3bc42-d964-11f1-8ff4-80f7dc34db03` 202/OK and `op_232f45c1cd645304e92df57409fb5b83` succeeded, serving `rel_d231a28c17ce1aa345e6fa3cdfd7ae03` at `59017d6`; both githello domains and all four monitored URLs returned 200. The old fixture read credential was replaced with the authenticated `gh` token (`GIT_READ_TOKEN` revision 3) and the clone succeeded; the earlier rejection's root cause was not established. On the same build, redelivery returned the original operation without a second release; an invalid signature returned 401; and a real push to existing branch `qual-rc-never` was ignored. **Not run at that point:** old-secret rejection after rotation. |
+| Factor-gated ops | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** positive `secrets export` is operator-reported: the human completed the authenticator factor and the `Done`/`stored` gate, and the agent verified only that the `--secrets-out` file is 0600 in a 0700 parent (648). Positive `app delete guidedflags2` was run by the human with a fresh TOTP (`op_44ae1a2d25c010f9e42ec16b4472c6f2`, succeeded in 5.7 s); the agent verified the app, environment, release, deployment, build, domain, secret-namespace and revision rows are gone, durable operation/event history remains, and githello, guided and img still return 200 (660-669). Positive `env delete guided failing` was then run by the human with a fresh factor (`op_62837d11f91ad17e7a28a87846a5b594`, succeeded, 11 events); the agent verified only the failing environment's rows and secrets are gone, `guided` and its `production` environment still serve git-test3, all four monitored hostnames return 200, and operation history remains (680-689). `secret export` was not run; a read-only `secret list` confirms active `HELLO_SECRET` revision 3 in `guided/production` for the next human export (649). Positive last-environment `env delete guidedflags production` also passed (`op_844aaba1c862a0450452be5bd40ac624`, 8 events); the `guidedflags` app and all its rows are gone, history remains, and the other apps still return 200 (690-699). Still **not run at that point:** positive `token create` and positive `secret export`; container/network inventory was not independently inspected because the agent has no Docker socket permission without sudo, so cleanup rests on operation step results and zero platform rows. JSON/no-TTY refusals and deletion preview passed. The human authenticator was needed then. |
 | Login and contexts | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** the human's isolated `login --file main-handoff.md --passphrase-file <mktemp 0600>` on this box succeeded under `XDG_CONFIG_HOME=/home/mbv/eregion-qual/private-human-checks/login-profile`; the passphrase was extracted from the handoff inside the operator session and the temporary file was trap-removed. Read-only `context list`, `context show --name main` and `server status` under that profile pass (720, 721, 726; 722 is the concurrent-attempt failure noted below), and the normal `~/.config/eregion` profile still lists its separate `main` and passes `server status` (723–725, 728). Both profiles use the same operator WireGuard peer key from the same bundle, so a second live tunnel can take the node's single peer endpoint and a command may fail with "the WireGuard tunnel was lost"; this is local tunnel contention, not a context/store defect. The operator reports interactive login passed; the cause of earlier pasted-passphrase failures was not established. **Context remove: pass for the isolated disposable profile (operator-run).** The isolated store is now empty and its `servers/main` is gone, while the normal `~/.config/eregion` store and identity are unchanged and `server status` succeeds (730–739). The pasted command showed a blank line, but the unchanged normal store proves the executed removal was scoped to the isolated XDG profile, not a bare default-profile removal. **Wrong host key and atomic unreachable import now pass (agent-run, 2026-11-05, evidence 750–759):** the wrong-pin login failed at SSH host-key verification before authentication, and the network-isolated login failed with no WireGuard handshake; both left the copied context, identity and known_hosts byte-identical, and the normal profile still passes `server status`. **Exact conflict, successful `--replace main` and context selection now pass (agent-run, 2026-11-05, evidence 760–767):** the conflict exits 5 with the exact `--replace main` hint and leaves the profile byte-identical; replacement proves readiness before swapping the identity and keeps the imported files inside the disposable profile; `--context main` and `EREGION_CONTEXT=spare` target the selected context, and JSON/noTTY refuses without prompting. **True second-machine login: pass (operator-reported, 2026-11-05, evidence 768–770).** On the separate laptop, the handoff copied from `thelab` imported into a disposable profile with `login --file … --passphrase-file … --json`, returning context `main` on `mbv@10.78.0.1:22 over WireGuard`; the same scoped `server status --context main --json` returned CLI/node `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, role `main`, schema 20/20, River 7/7 and all five services active. The earlier accidental `thelab` localhost attempt is not counted, and cleanup was operator command-based rather than independently verified. The normal `main` context and identity are intact; the isolated contexts are removed. |
-| Upgrades | **Partial pass:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). `upgrade` between two edge builds passed on 2026-11-03 (`42a0541` -> `a77d3bf` -> `13fdb25`, evening `13fdb25` -> `1e541a7`, late `1e541a7` -> `690baaf`; previous-binary copy kept); a failed manifest download during a node upgrade refused with `unavailable` and no checksum-only fallback (`193-*`). Still **not run:** `install.sh` acceptance on Linux/macOS for these builds. |
+| Upgrades | **Partial pass:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). `upgrade` between two edge builds passed on 2026-11-03 (`42a0541` -> `a77d3bf` -> `13fdb25`, evening `13fdb25` -> `1e541a7`, late `1e541a7` -> `690baaf`; previous-binary copy kept); a failed manifest download during a node upgrade refused with `unavailable` and no checksum-only fallback (`193-*`). **Not run at that point:** `install.sh` acceptance on Linux/macOS for these builds. |
 | macOS | **Not run (no Mac available, R10):** `install.sh` on macOS and an installed CLI against the server. CI's macOS CLI job and the darwin/arm64 cross-build are not host acceptance. Required before v1.0.0 final; not an alpha.1 gate. |
-| Disk retention (alpha.1 gate, R9) | **Partial pass (2026-11-04 candidate, `edge-0a1a492d8207`):** policy, dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read, polkit restart, pruned-rollback refusal, doctor retention and a known 4.7 GiB cache all pass. The real prune removed four multi-tagged images; the 1.3 GB dangling image is `image_skipped` "used by container"; the daily retry submitted a new numbered run after the one-hour backoff and it succeeded with 0 items; `doctor` is 20/0/0 in three runs; a serving-revision restart succeeded with 1,212/1,212 monitor responses. **In that candidate run, registry GC remained not exercised:** the imageless-release fix removed `registry_skipped`, but the registry still held only fully retained `andurel` artifacts. Deploy after GC, the 30-release row and the fresh-server baseline were not run then. **Fresh-server 2026-11-05 (`edge-f447aa3a0d30`):** registry GC and deploy-after-GC are now exercised (`op_14dacc…`, `op_141d2d…`), and the Buildpacks-cache warn-to-pass is qualified (`op_2786073…`: the 1.0 GiB measurement over the 1 GiB test cap warned; after removing a proven stale pack container, prune removed the 348,112,124-byte cache and the row passed at 725.1 MiB). The overnight 25-row prune plus aged fixtures partially cover the 30-release row; the complete fresh-server baseline remains not run. The manual prune is not counted by the daily submitter; docs/IMPLEMENTATION's “one successful run per day” is scoped to automatic daily-key operations (two runs succeeded today: manual at 01:11 and automatic at 01:48). |
-| Fresh host | **Not run:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. Needs an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
-| Release-command recovery | **Not run:** lost or unresolved response recovery variants. Once-per-release skipping, a changed command running again and restart/scale refusal after a failed run passed. Needs a scoped fault; stays an alpha.1 gate (R4). |
-| Repair variants | **Not run:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. Needs a scoped fault. |
-| Final pass | **Not run:** the complete baseline (every row, including retention) on the candidate build, starting from a freshly initialized server (R3, R11). Earlier builds' passes are context, not qualification; the user authorizes `1.x` and the tag after the recorded pass. |
+| Disk retention (alpha.1 gate, R9) | **Partial pass (2026-11-04 candidate, `edge-0a1a492d8207`):** policy, dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read, polkit restart, pruned-rollback refusal, doctor retention and a known 4.7 GiB cache all pass. The real prune removed four multi-tagged images; the 1.3 GB dangling image is `image_skipped` "used by container"; the daily retry submitted a new numbered run after the one-hour backoff and it succeeded with 0 items; `doctor` is 20/0/0 in three runs; a serving-revision restart succeeded with 1,212/1,212 monitor responses. **In that candidate run, registry GC remained not exercised:** the imageless-release fix removed `registry_skipped`, but the registry still held only fully retained `andurel` artifacts. Deploy after GC, the 30-release row and the fresh-server baseline were not run then. **Fresh-server 2026-11-05 (`edge-f447aa3a0d30`):** registry GC and deploy-after-GC are now exercised (`op_14dacc…`, `op_141d2d…`), and the Buildpacks-cache warn-to-pass is qualified (`op_2786073…`: the 1.0 GiB measurement over the 1 GiB test cap warned; after removing a proven stale pack container, prune removed the 348,112,124-byte cache and the row passed at 725.1 MiB). The overnight 25-row prune plus aged fixtures partially cover the 30-release row; no single fresh-server baseline was recorded in this checkout, and alpha.1 qualification rests on the operator confirmation above. The manual prune is not counted by the daily submitter; docs/IMPLEMENTATION's “one successful run per day” is scoped to automatic daily-key operations (two runs succeeded today: manual at 01:11 and automatic at 01:48). |
+| Fresh host | **Not run at that point:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. At that point it needed an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
+| Release-command recovery | **Not run in this checkout:** lost or unresolved response recovery variants. Once-per-release skipping, a changed command running again and restart/scale refusal after a failed run passed. The scoped-fault gap is historical; alpha.1 is operator-confirmed complete (R4). |
+| Repair variants | **Not run at that point:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. At that point it needed a scoped fault. |
+| Final pass | **Complete by operator confirmation:** the operator confirmed all alpha.1 testing is done, including the complete baseline and retention. This checkout does not contain a reconstructed complete-run record, and none is invented here. Release authorization remains separate. |
 
 Defect 3 is fixed and host-verified on `a77d3bf`: a worker SIGKILL now rescues
 the operation on worker start (9.0s measured, evidence 183; the earlier
@@ -681,11 +836,12 @@ was skipped.
 runs and the post-restart run were all **20/0/0**, with no transient
 `host.retention` read failure. The earlier 2-of-5 warning (317, 350, 351, 353)
 remains attributable to the external control database through the
-Tailscale/Funnel path, not retention state. Missing prerequisites for the
-remaining alpha.1 rows: registry GC/deploy-after-GC coverage, the 30-release
-row, an authorized fresh server, and human participation for factor-positive
-operations. macOS is deferred (R10). Other unqualified variants remain **not
-run**, not implementation failures or passes.
+Tailscale/Funnel path, not retention state. The prerequisites and gaps listed
+here were open at the time of these records; they are closed for alpha.1 by the
+operator confirmation above and are not a current blocker list. macOS is
+deferred (R10) until before v1.0.0 final. Variants without recorded evidence
+remain evidence gaps, not implementation failures or passes; none is
+backfilled.
 
 ### Safety and local resources
 
@@ -724,9 +880,21 @@ run**, not implementation failures or passes.
 
 ## Current qualification boundary
 
-Real-host evidence spans several published edge builds, recorded below.
-`edge-f447aa3a0d30` is the latest installed and tested build; earlier passes are
-not automatically a full baseline pass for it. The 2026-10-29/30 runs closed
+Alpha.1 is qualified by explicit operator confirmation that all alpha.1 testing
+is done. This checkout does not reconstruct a complete baseline or select a
+qualifying build: the run records below span several published edge builds and
+retain the evidence available, including partial and not-run checks. They are
+history, not open alpha.1 blockers. Alpha.2 is implemented at source level and
+remains unqualified: `edge-ef4a6f879f45` passed the definition-file, export,
+secret-name and validation checks and applied migrations 022–023 on `main`, but
+the Docker 29.1.3 image-inspect template defect blocked resource provisioning,
+health, secret injection, deployment gating and data-retention checks, and
+file-based removal of the last resource and last secret name was not applied. A transient
+control-database/Funnel outage produced the generic `host.retention` warning
+and then recovered; the fixture app/environment remains because deletion needs
+the human factor. See the 2026-11-06 alpha.2 record above and MASTER section 8.
+
+The 2026-10-29/30 runs closed
 release-changing dense switches, symlink-escape rejection, same-key replay after
 the branch was deleted, rollback refusal for a release whose command never
 succeeded, failed-candidate leak recording, interleaved domain changes with
@@ -766,10 +934,10 @@ acceptance.
 Failed deploy follows returned exit 5 on main, successful follows returned 0,
 and the build-stop retest returned 130 with terminal cancellation and the prior
 serving release preserved. Terminal Ctrl-C detach/replay and explicit cancel
-passed (153/154); guided failure and the remaining output-mode variants remain
-not run. Complete and record the remaining baseline for the actual release
-candidate, from a freshly initialized server (R11), before asking the user to
-authorize `1.x` or `v1.0.0-alpha.1`.
+passed (153/154); guided failure and the remaining output-mode variants were not
+run in that record. The operator's confirmation closes alpha.1; no additional
+baseline run is required for this qualification, and no result is invented here.
+Release authorization remains a separate decision.
 
 ## Run record
 
@@ -861,7 +1029,8 @@ This strengthens the **partial** 30-release evidence but is not a single
 been deleted before this separate shortened-grace prune. Registry `du` could
 not be measured without interactive sudo, and no size-drop claim is made for
 this run. The earlier fresh-server GC run has separate measured-size evidence;
-the broader alpha baseline remains incomplete.
+this run alone did not complete the broader alpha baseline, which is now
+operator-confirmed.
 
 ### 2026-11-06 — authorized retention continuation on edge-527592419f06
 
@@ -971,9 +1140,10 @@ read warning; no cause was established here. All four serving URLs returned
 200; queued, running and cancelling operation lists were empty. No fixture,
 credential copy, background task or cleanup was created. Sanitized evidence:
 `/home/mbv/eregion-qual/2026-11-04-fresh/870-retention-preflight.txt`.
-The row still requires an authorized unused, publicly verifiable hostname and
-a safe fixture-only prune plan, followed by 30 actual distinct releases and
-the specified scoped backdate and checks. The broader baseline remains unrun.
+At this point the row still required an authorized unused, publicly verifiable
+hostname and a safe fixture-only prune plan, followed by 30 actual distinct
+releases and the specified scoped backdate and checks. Later records cover that
+work; alpha.1 is now operator-confirmed.
 
 ### 2026-11-05 — fresh-server registry GC and cache qualification
 
@@ -1475,9 +1645,10 @@ the specified scoped backdate and checks. The broader baseline remains unrun.
   after the run, so the removal of the disposable profile is reported rather
   than verified.
 - **Later correction:** the operator reports interactive login passed. The
-  earlier pasted-passphrase failures are not independently explained. The broader alpha baseline remains incomplete, and the local
-  source fixes in the working tree remain unpublished. This step records only
-  the second-machine login/status sub-check.
+  earlier pasted-passphrase failures are not independently explained. At this
+  point the broader alpha baseline was incomplete, and the local source fixes in
+  the working tree remained unpublished. This step records only the
+  second-machine login/status sub-check; alpha.1 is now operator-confirmed.
 - No source edits, source tests, build/vet, export/decrypt/import,
   apply/publish/commit/install, host/database/DNS mutation, token minting,
   fault injection or secret-value read occurred in this step. The agent ran no
@@ -1523,13 +1694,14 @@ the specified scoped backdate and checks. The broader baseline remains unrun.
   were removed; the contents of the pre-existing `eregion`, `eregion_fresh`,
   `postgres`, `template0` and `template1` databases were unchanged. This is a
   local DB integration check, not host qualification.
-- Not run / not qualified: migration 021 was applied only inside the disposable
-  test databases, not to a live control database; no server, DNS, GitHub hook,
-  release, install, commit, push or tag was touched; real webhook
+- Not host-qualified in this step: migration 021 was applied only inside the
+  disposable test databases, not to a live control database; no server, DNS,
+  GitHub hook, release, install, commit, push or tag was touched; real webhook
   latency/first delivery/redelivery/rotation, a real cancelled pack build and
-  the post-fix deletion preview remain host checks. No secret value was
-  printed, logged or stored in evidence, and the protected DSN was not used as
-  the test target.
+  the post-fix deletion preview were then host checks. Alpha.1 is now
+  operator-confirmed; no individual result is backfilled here. No secret value
+  was printed, logged or stored in evidence, and the protected DSN was not used
+  as the test target.
 - Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/810-integration-*.txt` and
   `820-postgres-*.txt` (target, selected list, first failing run, passing run,
   offline regressions, cleanup and sanitizer); source-worktree records
@@ -1800,10 +1972,9 @@ Historical unlabelled release container from pre-fix attempt:
   published ports; removed explicitly after confirming identity. No other app
   containers targeted. NDJSON log snapshot parsed line-by-line successfully.
 Evidence: ~/.cache/eregion-run/71-* through 92-*; latest doctor 18/0/0.
-Remaining: guided terminal/detach, init on a fresh authorized target,
-  factor-positive CI/deletion/export, atomic login, cleanup obstruction,
-  rejected-reload injection and remaining baseline variants are not yet
-  qualified. Alpha is not complete.
+At this point the listed variants were not yet qualified. Alpha was not
+  complete then; alpha.1 is now operator-confirmed without reconstructing these
+  results.
 ```
 
 ```text
@@ -1989,8 +2160,9 @@ Defects:
      (pending_cleanup). Fixed in 4e827aa: cleanup failures are warning events
      naming the containers and failed state is retained; not host-retested.
   3. A worker SIGKILL leaves its platform operation running until River's
-     rescue, about 30 minutes (30m21s observed on op_f0d2...). Fix in progress
-     for alpha.1 (rescue this host's orphaned platform jobs on worker start).
+     rescue, about 30 minutes (30m21s observed on op_f0d2...). The fix was then
+     in progress for alpha.1 (rescue this host's orphaned platform jobs on
+     worker start).
 Final state: rel_0170b1be56a64a747d522a2831cb02d8 serving; git-test3 re-added,
   git-test4 removal accepted without a saved follow; no post-session env status
   was captured. No injected fault, wrapper or guard timer was left; no upgrade
@@ -2521,8 +2693,9 @@ and the failed build are distinct. The next record replaces that credential with
 the authenticated `gh` token and records the successful deployment. The
 operator now reports interactive login passed. Old-secret rejection
 after rotation was not run because the old secret was not available and was not
-read. The broader alpha baseline and the 30-release/registry-GC checks remain
-unrun. **No alpha completion is claimed.** Evidence:
+read. At this point the broader alpha baseline and the 30-release/registry-GC
+checks were unrun. Alpha.1 is now operator-confirmed; no individual result is
+backfilled. Evidence:
 `/home/mbv/eregion-qual/2026-11-04-fresh/830-*` and `840-*`.
 
 ### 2026-11-05 — gh-sourced `GIT_READ_TOKEN` and webhook deploy success
@@ -2578,8 +2751,9 @@ directory were trap-removed; no tunnel or background process was started.
 At this point rejection of the old secret after rotation (the old value was not
 available and was not read), redelivery, another-branch and bad-signature
 variants remained unrun. The following record covers the latter three. The
-operator now reports interactive login passed; the broader alpha baseline remains
-incomplete. **No alpha completion is claimed.**
+operator now reports interactive login passed. At this point the broader alpha
+baseline was incomplete; alpha.1 is now operator-confirmed, with no result
+backfilled here.
 
 ### 2026-11-05 — webhook deduplication and rejection variants
 
@@ -2629,8 +2803,9 @@ host apply, restart, or database mutation was performed. No offline test was
 run: no specific source defect has been established. Next, if the warning
 recurs, capture the sanitized underlying query error and elapsed time with a
 reviewed diagnostic change or authorized read-only instrumentation; do not
-assume network failure. The 30-release check remains blocked by an unused
-verified hostname and the unrelated images in the global prune plan.
+assume network failure. At that point the 30-release check was blocked by an
+unused verified hostname and the unrelated images in the global prune plan;
+later records completed it, and alpha.1 is now operator-confirmed.
 
 ### 2026-11-05 — CI unauthenticated surface follow-up
 
@@ -2666,5 +2841,5 @@ Source commits; release, deployment and operation IDs:
 Checks: pass / fail / blocked / not run, one line each
 Public response markers and TLS result:
 Failures and recovery observations:
-Remaining blocker and next action:
+Remaining qualification gap and next action:
 ```
