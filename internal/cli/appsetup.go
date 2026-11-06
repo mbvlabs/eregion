@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -88,7 +89,17 @@ type setupAnswers struct {
 	// ResourceNames are the declarations attached to the first revision and
 	// therefore gating its deploy.
 	ResourceNames []string
-	Deploy        bool
+	// AdditionalResourceSpecs holds the resource declarations for each
+	// environment resolved by an app-create definition file. env create never
+	// uses it.
+	AdditionalResourceSpecs map[string][]platform.ResourceApplyInput
+	// PrebuiltSpecs is set when a definition file resolves both production and
+	// staging. Otherwise app create derives staging from the flag recipe.
+	PrebuiltSpecs []platform.EnvironmentSpec
+	// Protection forces one protection state for every environment created by
+	// this command. Nil means the name default.
+	Protection *bool
+	Deploy     bool
 	// From is the definition file path, for the plan only.
 	From string
 }
@@ -134,6 +145,32 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	if withDomain {
 		f.String("domain", "", "Public hostname for the environment; empty adds no binding")
 		f.String("domain-check-path", "", "HTTP path to observe on the first domain; empty uses the web health path")
+	}
+}
+
+// addProtectionFlags adds the explicit creation-time protection choice shared
+// by app create and env create. Omitting both uses the name default:
+// production and staging protected, every other name unprotected.
+func addProtectionFlags(cmd *cobra.Command) {
+	cmd.Flags().Bool("protected", false, "Create the environment protected (the default for production and staging)")
+	cmd.Flags().Bool("unprotected", false, "Create the environment unprotected; explicit opt-out from the name default")
+}
+
+func setupProtectionFlag(cmd *cobra.Command) (*bool, error) {
+	protected := flagChanged(cmd, "protected")
+	unprotected := flagChanged(cmd, "unprotected")
+	if protected && unprotected {
+		return nil, contract.NewFault(contract.ValidationFailed, "choose one protection state", "Pass --protected or --unprotected, not both.")
+	}
+	switch {
+	case unprotected:
+		value := false
+		return &value, nil
+	case protected:
+		value := true
+		return &value, nil
+	default:
+		return nil, nil
 	}
 }
 
@@ -267,8 +304,11 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 	if err != nil {
 		return nil, err
 	}
+	protection, err := setupProtectionFlag(cmd)
+	if err != nil {
+		return nil, err
+	}
 
-	selectedEnvironment := definition.Environment
 	appName := definition.App
 	switch mode {
 	case setupApp:
@@ -279,12 +319,6 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 			}
 			appName = flagName
 		}
-		if flagChanged(cmd, "environment") {
-			selectedEnvironment = flagString(cmd, "environment")
-		}
-		if selectedEnvironment == "" {
-			selectedEnvironment = "production"
-		}
 	case setupEnvironment:
 		if flagChanged(cmd, "app") {
 			flagApp := flagString(cmd, "app")
@@ -293,70 +327,104 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 			}
 			appName = flagApp
 		}
-		if flagChanged(cmd, "name") {
-			flagEnvironment := flagString(cmd, "name")
-			if definition.Environment != "" && flagEnvironment != definition.Environment {
-				return nil, contract.NewFault(contract.ValidationFailed, "definition environment disagrees with --name", "Use the file's environment name, or edit the definition.")
-			}
-			selectedEnvironment = flagEnvironment
-		}
-		if selectedEnvironment == "" {
-			return nil, contract.NewFault(contract.InputRequired, "an environment is required", "Set environment in the definition or pass --name.")
-		}
 	}
 	if err := platform.ValidateName(appName); err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "definition app is missing or invalid", "Set app in the definition or pass the command's app flag.")
 	}
-	resolved, err := definition.Resolve(selectedEnvironment)
-	if err != nil {
-		return nil, definitionFault(err)
+	addresses := mainNodeAddresses(cmd)
+	resolve := func(name string) (*appdef.Resolved, platform.EnvironmentSpec, []platform.ResourceApplyInput, error) {
+		resolved, err := definition.Resolve(name)
+		if err != nil {
+			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
+		}
+		resolved.App = appName
+		spec, err := resolved.CreateSpec(addresses)
+		if err != nil {
+			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
+		}
+		resourceSpecs, err := resolved.ResourceApplySpecs()
+		if err != nil {
+			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
+		}
+		attachmentNames, attachmentsSet := resolved.ResourceAttachments()
+		if attachmentsSet {
+			spec.Resources = attachmentNames
+		}
+		if protection != nil {
+			spec.Protected = protection
+		} else {
+			value := platform.DefaultEnvironmentProtection(spec.Name)
+			spec.Protected = &value
+		}
+		return resolved, spec, resourceSpecs, nil
 	}
-	resolved.App = appName
-	spec, err := resolved.CreateSpec(mainNodeAddresses(cmd))
-	if err != nil {
-		return nil, definitionFault(err)
+
+	var specs []platform.EnvironmentSpec
+	var resourceByEnvironment = map[string][]platform.ResourceApplyInput{}
+	switch mode {
+	case setupApp:
+		for _, name := range []string{"production", "staging"} {
+			_, spec, resourceSpecs, err := resolve(name)
+			if err != nil {
+				return nil, err
+			}
+			specs = append(specs, spec)
+			resourceByEnvironment[name] = resourceSpecs
+		}
+		if err := validateUniqueEnvironmentDomains(specs); err != nil {
+			return nil, err
+		}
+	case setupEnvironment:
+		selected := flagString(cmd, "name")
+		if selected == "" {
+			return nil, contract.NewFault(contract.InputRequired, "an environment is required", "Pass --name; the shared recipe applies to any environment without adding it to the definition.")
+		}
+		if err := platform.ValidateName(selected); err != nil {
+			return nil, contract.NewFault(contract.ValidationFailed, "definition environment is invalid", err.Error())
+		}
+		_, spec, resourceSpecs, err := resolve(selected)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
+		resourceByEnvironment[selected] = resourceSpecs
 	}
-	resourceSpecs, err := resolved.ResourceApplySpecs()
-	if err != nil {
-		return nil, definitionFault(err)
-	}
-	attachmentNames, attachmentsSet := resolved.ResourceAttachments()
-	if attachmentsSet {
-		spec.Resources = attachmentNames
-	}
+
+	primary := specs[0]
 	ans := &setupAnswers{
-		App: appName, Environment: selectedEnvironment, Node: spec.Node, BuildNode: spec.BuildNode,
-		SourceKind: spec.Source.Kind, GitURL: spec.Source.URL, GitRef: spec.Source.Ref,
-		CredentialName: spec.Source.CredentialSecretName, Image: spec.Source.Image,
-		Builder: spec.Source.Builder, ContextPath: spec.Source.ContextPath,
-		ContainerPort: spec.ContainerPort, HealthType: spec.Runtime.HealthType,
-		HealthPath: spec.Runtime.HealthPath, HealthTimeout: spec.Runtime.HealthTimeoutSeconds,
-		Processes: spec.Processes, Config: cloneStringMap(spec.Config),
-		SecretValues: map[string][]byte{}, SecretNames: append([]string(nil), spec.SecretNames...),
-		Domains: append([]platform.DomainDeclaration(nil), spec.Domains...), From: path,
-		ResourceSpecs: resourceSpecs, ResourceNames: append([]string(nil), spec.Resources...),
+		App: appName, Environment: primary.Name, Node: primary.Node, BuildNode: primary.BuildNode,
+		SourceKind: primary.Source.Kind, GitURL: primary.Source.URL, GitRef: primary.Source.Ref,
+		CredentialName: primary.Source.CredentialSecretName, Image: primary.Source.Image,
+		Builder: primary.Source.Builder, ContextPath: primary.Source.ContextPath,
+		ContainerPort: primary.ContainerPort, HealthType: primary.Runtime.HealthType,
+		HealthPath: primary.Runtime.HealthPath, HealthTimeout: primary.Runtime.HealthTimeoutSeconds,
+		Processes: primary.Processes, Config: cloneStringMap(primary.Config),
+		SecretValues: map[string][]byte{}, SecretNames: append([]string(nil), primary.SecretNames...),
+		Domains: append([]platform.DomainDeclaration(nil), primary.Domains...), From: path,
+		ResourceSpecs: resourceByEnvironment[primary.Name], ResourceNames: append([]string(nil), primary.Resources...),
+		Protection: protection, PrebuiltSpecs: specs, AdditionalResourceSpecs: resourceByEnvironment,
 	}
-	for _, domain := range spec.Domains {
+	for _, domain := range primary.Domains {
 		if domain.Primary {
 			ans.Domain, ans.DomainCheckPath = domain.Domain, domain.CheckPath
 			break
 		}
 	}
-	if len(spec.Domains) == 0 {
-		ans.Domain, ans.DomainCheckPath = spec.Domain, spec.DomainCheckPath
+	if len(primary.Domains) == 0 {
+		ans.Domain, ans.DomainCheckPath = primary.Domain, primary.DomainCheckPath
 	}
-	if spec.Source.BuildEnv != nil {
-		ans.BuildEnv = cloneStringMap(spec.Source.BuildEnv)
+	if primary.Source.BuildEnv != nil {
+		ans.BuildEnv = cloneStringMap(primary.Source.BuildEnv)
 	}
-	if spec.Runtime.ReleaseCommand != nil {
-		ans.ReleaseArgv = append([]string(nil), spec.Runtime.ReleaseCommand.Argv...)
+	if primary.Runtime.ReleaseCommand != nil {
+		ans.ReleaseArgv = append([]string(nil), primary.Runtime.ReleaseCommand.Argv...)
 	}
 	interactive := humanInteractive(cmd)
 	switch {
 	case boolFlag(cmd, "no-deploy"):
 		ans.Deploy = false
 	case interactive && !flagChanged(cmd, "no-deploy"):
-		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from the new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
+		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from production's new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
 		if err != nil {
 			return nil, err
 		}
@@ -364,17 +432,43 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 	default:
 		ans.Deploy = true
 	}
-	if len(ans.ResourceSpecs) > 0 {
+	if len(ans.ResourceSpecs) > 0 || len(ans.AdditionalResourceSpecs["staging"]) > 0 {
 		// Resources are provisioned only after the environment exists. Queuing
 		// a first deploy in the same submission would race an absent resource,
 		// so it is deliberately deferred; the operator deploys once health is
 		// ready.
 		ans.Deploy = false
 	}
-	if _, err := ans.environmentSpec(cmd); err != nil {
-		return nil, err
-	}
 	return ans, nil
+}
+
+// validateUniqueEnvironmentDomains refuses a recipe that resolves the same
+// hostname for two environments before any transaction is opened. Staging may
+// legitimately have no domain until one is configured.
+func validateUniqueEnvironmentDomains(specs []platform.EnvironmentSpec) error {
+	seen := map[string]string{}
+	for _, spec := range specs {
+		for _, domain := range environmentSpecDomains(spec) {
+			if other, exists := seen[domain]; exists {
+				return contract.NewFault(contract.ValidationFailed,
+					"domain "+domain+" is declared for both "+other+" and "+spec.Name,
+					"Each hostname can route to one environment; put distinct domains in [environments.<name>] overrides.")
+			}
+			seen[domain] = spec.Name
+		}
+	}
+	return nil
+}
+
+func environmentSpecDomains(spec platform.EnvironmentSpec) []string {
+	names := make([]string, 0, len(spec.Domains)+1)
+	if spec.Domain != "" {
+		names = append(names, spec.Domain)
+	}
+	for _, domain := range spec.Domains {
+		names = append(names, domain.Domain)
+	}
+	return names
 }
 
 func readDefinitionFile(path string) (appdef.Definition, error) {
@@ -459,13 +553,16 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 	}()
 
+	protection, err := setupProtectionFlag(cmd)
+	if err != nil {
+		return nil, err
+	}
+	ans.Protection = protection
 	switch mode {
 	case setupApp:
 		ans.App = flagString(cmd, "name")
-		ans.Environment = flagString(cmd, "environment")
-		if ans.Environment == "" {
-			ans.Environment = "production"
-		}
+		// app create always materialises production and staging from one recipe.
+		ans.Environment = "production"
 	case setupEnvironment:
 		ans.App = flagString(cmd, "app")
 		ans.Environment = flagString(cmd, "name")
@@ -495,12 +592,8 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 		ans.Environment = value
 	}
-	if interactive && !flagChanged(cmd, "environment") && mode == setupApp {
-		value, err := askValidated("First environment", "The unit of deployment", ans.Environment, platform.ValidateName)
-		if err != nil {
-			return nil, err
-		}
-		ans.Environment = value
+	if interactive && mode == setupApp {
+		fmt.Fprintln(os.Stderr, ui.Note("app create will also create staging from this recipe; both start protected."))
 	}
 	if interactive && !flagChanged(cmd, "node") {
 		value, err := a.askNode(cmd, "Application node", "Runs the containers", ans.Node, platform.RoleApplication, platform.CapabilityDocker, "", "")
@@ -1010,6 +1103,7 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 	}
 	spec := platform.EnvironmentSpec{
 		Name: ans.Environment, Node: ans.Node, BuildNode: ans.BuildNode,
+		Protected:     ans.Protection,
 		ContainerPort: containerPort, Bind: platform.DefaultBind,
 		Health: platform.HealthInput{Type: ans.HealthType, Path: ans.HealthPath, TimeoutSeconds: ans.HealthTimeout},
 		Source: source,
@@ -1026,6 +1120,10 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 	}
 	if len(domains) > 0 {
 		spec.Domains = domains
+	}
+	if spec.Protected == nil {
+		value := platform.DefaultEnvironmentProtection(spec.Name)
+		spec.Protected = &value
 	}
 	return spec, nil
 }
@@ -1200,7 +1298,20 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 		fmt.Fprintf(&out, "definition: %s\n", ans.From)
 	}
 	fmt.Fprintf(&out, "app: %s\n", ans.App)
-	fmt.Fprintf(&out, "environment: %s\n", ans.Environment)
+	specs := append([]platform.EnvironmentSpec(nil), ans.PrebuiltSpecs...)
+	if len(specs) > 1 {
+		labels := make([]string, 0, len(specs))
+		for _, spec := range specs {
+			state := "unprotected"
+			if protectedSpec(spec) {
+				state = "protected"
+			}
+			labels = append(labels, spec.Name+" ("+state+")")
+		}
+		fmt.Fprintf(&out, "environments: %s\n", strings.Join(labels, ", "))
+	} else {
+		fmt.Fprintf(&out, "environment: %s (%s)\n", ans.Environment, protectionLabel(ans.Protection, ans.Environment))
+	}
 	fmt.Fprintf(&out, "node: %s\n", ans.Node)
 	if ans.BuildNode != "" {
 		fmt.Fprintf(&out, "builder node: %s\n", ans.BuildNode)
@@ -1456,30 +1567,49 @@ func setupSecretNames(ans *setupAnswers) []string {
 	return names
 }
 
-// writeSetupSecrets stores the read credential and the environment secrets
-// before the app/environment submission. Only names enter the operation input.
-func (a *app) writeSetupSecrets(cmd *cobra.Command, ans *setupAnswers) ([]string, error) {
-	names := make([]string, 0, len(ans.SecretValues)+1)
-	if ans.CredentialName != "" && len(ans.CredentialValue) > 0 {
-		namespace, err := vault.NewNamespace(ans.App, ans.Environment, ans.CredentialName)
-		if err != nil {
-			return nil, err
+// writeSetupSecrets stores the read credential and the environment secrets for
+// one environment before its submission. Only names enter the operation input.
+func (a *app) writeSetupSecrets(cmd *cobra.Command, ans *setupAnswers, spec platform.EnvironmentSpec) ([]string, error) {
+	return a.writeSetupSecretsForEnvironments(cmd, ans, []platform.EnvironmentSpec{spec})
+}
+
+// writeSetupSecretsForEnvironments materialises one supplied value into each
+// environment namespace whose spec names it. A shared app recipe therefore
+// writes the same value to production and staging, while an environment-specific
+// name never leaks into another namespace. The Git read credential follows the
+// same rule and is written only when the spec's source names that credential.
+func (a *app) writeSetupSecretsForEnvironments(cmd *cobra.Command, ans *setupAnswers, specs []platform.EnvironmentSpec) ([]string, error) {
+	written := make([]string, 0, len(ans.SecretValues)+1)
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		if ans.CredentialName != "" && len(ans.CredentialValue) > 0 && spec.Source.CredentialSecretName == ans.CredentialName {
+			namespace, err := vault.NewNamespace(ans.App, spec.Name, ans.CredentialName)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := a.putSecret(cmd, namespace, ans.CredentialValue); err != nil {
+				return nil, err
+			}
 		}
-		if _, err := a.putSecret(cmd, namespace, ans.CredentialValue); err != nil {
-			return nil, err
+		for _, name := range sortedKeysBytes(ans.SecretValues) {
+			if !slices.Contains(spec.SecretNames, name) {
+				continue
+			}
+			namespace, err := vault.NewNamespace(ans.App, spec.Name, name)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := a.putSecret(cmd, namespace, ans.SecretValues[name]); err != nil {
+				return nil, err
+			}
+			key := spec.Name + "\x00" + name
+			if !seen[key] {
+				seen[key] = true
+				written = append(written, name)
+			}
 		}
 	}
-	for _, name := range sortedKeysBytes(ans.SecretValues) {
-		namespace, err := vault.NewNamespace(ans.App, ans.Environment, name)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := a.putSecret(cmd, namespace, ans.SecretValues[name]); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, nil
+	return written, nil
 }
 
 // appExists and environmentExists let the create flows refuse an existing
@@ -1607,6 +1737,11 @@ func writeEnvironmentStatus(env platform.Environment) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "Environment %s/%s\n", env.App, env.Name)
 	fmt.Fprintf(&out, "  node: %s\n", env.Node)
+	protection := "unprotected"
+	if env.Protected {
+		protection = "protected (deletion requires the human factor)"
+	}
+	fmt.Fprintf(&out, "  protection: %s\n", protection)
 	if env.Revision != nil {
 		fmt.Fprintf(&out, "  revision: %d (%s)\n", env.Revision.Number, env.Revision.ID)
 		fmt.Fprintf(&out, "  deployable: %s\n", environmentDeployability(env))
@@ -1648,10 +1783,21 @@ func writeEnvironmentStatus(env platform.Environment) string {
 	return out.String()
 }
 
+// setupEnvironmentResult is the secret-free summary of one environment created
+// by app create or env create.
+type setupEnvironmentResult struct {
+	Name      string `json:"name"`
+	Node      string `json:"node"`
+	Protected bool   `json:"protected"`
+	Domain    string `json:"domain,omitempty"`
+}
+
 // setupResult is the secret-free result of app create or env create.
 type setupResult struct {
 	App                    string                       `json:"app"`
 	Environment            string                       `json:"environment"`
+	Protected              bool                         `json:"protected"`
+	Environments           []setupEnvironmentResult     `json:"environments,omitempty"`
 	Node                   string                       `json:"node"`
 	Source                 platform.SourceBinding       `json:"source"`
 	Processes              []platform.ProcessSpec       `json:"processes"`
@@ -1678,7 +1824,19 @@ func (r setupResult) plainText() string {
 	if r.DryRun {
 		var out strings.Builder
 		if r.created == "app" {
-			fmt.Fprintf(&out, "Dry run: create app %s with environment %s\n", r.App, r.Environment)
+			if len(r.Environments) > 0 {
+				labels := make([]string, 0, len(r.Environments))
+				for _, environment := range r.Environments {
+					state := "unprotected"
+					if environment.Protected {
+						state = "protected"
+					}
+					labels = append(labels, environment.Name+" ("+state+")")
+				}
+				fmt.Fprintf(&out, "Dry run: create app %s with environments %s\n", r.App, strings.Join(labels, ", "))
+			} else {
+				fmt.Fprintf(&out, "Dry run: create app %s with environment %s\n", r.App, r.Environment)
+			}
 		} else {
 			fmt.Fprintf(&out, "Dry run: create environment %s/%s\n", r.App, r.Environment)
 		}
@@ -1687,9 +1845,25 @@ func (r setupResult) plainText() string {
 	}
 	var out strings.Builder
 	if r.created == "app" {
-		fmt.Fprintf(&out, "Created app %s with environment %s on %s.\n", r.App, r.Environment, r.Node)
+		if len(r.Environments) > 0 {
+			labels := make([]string, 0, len(r.Environments))
+			for _, environment := range r.Environments {
+				state := "unprotected"
+				if environment.Protected {
+					state = "protected"
+				}
+				labels = append(labels, environment.Name+" ("+state+")")
+			}
+			fmt.Fprintf(&out, "Created app %s with environments %s on %s.\n", r.App, strings.Join(labels, ", "), r.Node)
+		} else {
+			fmt.Fprintf(&out, "Created app %s with environment %s on %s.\n", r.App, r.Environment, r.Node)
+		}
 	} else {
-		fmt.Fprintf(&out, "Created environment %s/%s on %s.\n", r.App, r.Environment, r.Node)
+		state := "unprotected"
+		if r.Protected {
+			state = "protected"
+		}
+		fmt.Fprintf(&out, "Created environment %s/%s on %s (%s).\n", r.App, r.Environment, r.Node, state)
 	}
 	fmt.Fprintf(&out, "operation: %s\n", r.OperationID)
 	if r.FirstDeployOperationID != "" {

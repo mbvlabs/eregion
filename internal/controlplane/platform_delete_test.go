@@ -99,10 +99,10 @@ func TestIntegrationDeletionPreviewScopesTargetCountsAndWarnsOnlyForTheLastEnvir
 	})
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "delete-preview-create", map[string]any{
 		"name": "deletepreview",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"domain": "deletepreview-production.example.com",
-		},
+		}},
 	})
 	platformSubmit(t, s, platform.KindEnvironmentCreate, "app/deletepreview", "delete-preview-staging", map[string]any{
 		"name": "staging", "node": "local",
@@ -140,9 +140,9 @@ func TestIntegrationDeletionPreviewScopesTargetCountsAndWarnsOnlyForTheLastEnvir
 
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "delete-preview-single-create", map[string]any{
 		"name": "deletepreviewsingle",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-		},
+		}},
 	})
 	single, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/deletepreviewsingle/production", map[string]any{})
 	if err != nil {

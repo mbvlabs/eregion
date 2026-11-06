@@ -29,10 +29,12 @@ var (
 
 type AppCreateInput struct {
 	Name string `json:"name"`
-	// Environment optionally creates the first environment and its first
-	// desired-state revision in the same submission transaction.
-	Environment *EnvironmentSpec `json:"environment,omitempty"`
-	// Deploy queues the first build-and-deploy of the new revision in the same
+	// Environments optionally creates environments and their first
+	// desired-state revisions in the same submission transaction. The CLI
+	// creates production and staging here; direct API callers may create an
+	// application with no environment.
+	Environments []EnvironmentSpec `json:"environments,omitempty"`
+	// Deploy queues the first environment's first build-and-deploy in the same
 	// submission transaction.
 	Deploy bool `json:"deploy,omitempty"`
 }
@@ -50,6 +52,11 @@ type HealthInput struct {
 // platform.app.create. It intentionally has no target of its own.
 type EnvironmentSpec struct {
 	Name string `json:"name"`
+	// Protected gates a real environment deletion behind the human factor.
+	// Omitted uses the name default: production and staging are protected, any
+	// other environment is unprotected. Creation itself never asks for a TOTP
+	// code; changing protected to unprotected on an existing environment does.
+	Protected *bool `json:"protected,omitempty"`
 	// Node runs application containers. It must have application + docker.
 	Node string `json:"node"`
 	// BuildNode optionally runs Buildpacks for releases of this environment. It
@@ -150,6 +157,20 @@ func (in *EnvironmentUpdateInput) Target() Target {
 	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
 }
 func (in *EnvironmentUpdateInput) Preview() any { return in }
+
+// EnvironmentProtectInput changes one environment's persistent protection
+// state without creating a desired-state revision. Turning protection off on a
+// protected environment requires the human factor; turning it on does not.
+type EnvironmentProtectInput struct {
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+	Protected   bool   `json:"protected"`
+}
+
+func (in *EnvironmentProtectInput) Target() Target {
+	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
+}
+func (in *EnvironmentProtectInput) Preview() any { return in }
 
 type ProcessScaleInput struct {
 	App         string `json:"app,omitempty"`
@@ -312,6 +333,7 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindNodeReconcile, Summary: "Reconcile a node's WireGuard peers and role configuration", Normalize: normalizeNodeReconcile})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentCreate, Summary: "Create an application environment", Normalize: normalizeEnvironmentCreate})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentUpdate, Summary: "Change an environment as a new desired-state revision", Normalize: normalizeEnvironmentUpdate})
+	r.registerBuiltin(Definition{Kind: KindEnvironmentProtect, Summary: "Change an environment's deletion protection", Normalize: normalizeEnvironmentProtect})
 	r.registerBuiltin(Definition{Kind: KindProcessScale, Summary: "Scale one environment process in a new revision", Normalize: normalizeProcessScale})
 	r.registerBuiltin(Definition{Kind: KindConfigSet, Summary: "Set plain environment configuration in a new revision", Normalize: normalizeConfigSet})
 	r.registerBuiltin(Definition{Kind: KindConfigUnset, Summary: "Unset plain environment configuration in a new revision", Normalize: normalizeConfigUnset})
@@ -344,22 +366,41 @@ func normalizeAppCreate(target Target, raw json.RawMessage) (ActionInput, error)
 	if err := ValidateName(input.Name); err != nil {
 		return nil, err
 	}
-	if input.Environment != nil {
-		if err := normalizeEnvironmentSpec(input.Environment); err != nil {
+	seen := map[string]bool{}
+	for index := range input.Environments {
+		spec := &input.Environments[index]
+		if err := normalizeEnvironmentSpec(spec); err != nil {
 			return nil, err
 		}
-		if input.Deploy && input.Environment.Source.Kind == "" {
+		if seen[spec.Name] {
+			return nil, invalid("environments", "Use each environment name once.")
+		}
+		seen[spec.Name] = true
+	}
+	if input.Deploy {
+		if len(input.Environments) == 0 {
+			return nil, invalid("deploy", "A first deploy needs an environment specification.")
+		}
+		if input.Environments[0].Source.Kind == "" {
 			return nil, invalid("deploy", "A first deploy needs a source binding.")
 		}
-	} else if input.Deploy {
-		return nil, invalid("deploy", "A first deploy needs an environment specification.")
 	}
 	return &input, nil
+}
+
+// DefaultEnvironmentProtection is the creation default for one environment
+// name. Production and staging are protected; any other name is unprotected.
+func DefaultEnvironmentProtection(name string) bool {
+	return name == "production" || name == "staging"
 }
 
 func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 	if err := ValidateName(spec.Name); err != nil {
 		return err
+	}
+	if spec.Protected == nil {
+		value := DefaultEnvironmentProtection(spec.Name)
+		spec.Protected = &value
 	}
 	if err := ValidateName(spec.Node); err != nil {
 		return err

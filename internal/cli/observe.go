@@ -182,6 +182,11 @@ func writeEnvironmentObservation(observation platform.EnvironmentObservation) st
 		fmt.Fprintf(&out, "  %s %s\n", ui.Dim(fmt.Sprintf("%-17s", name+":")), value)
 	}
 	field("node", env.Node)
+	protection := "unprotected"
+	if env.Protected {
+		protection = "protected (deletion requires the human factor)"
+	}
+	field("protection", protection)
 	if env.Revision != nil {
 		field("desired revision", fmt.Sprintf("%d (%s)", env.Revision.Number, env.Revision.ID))
 		field("source", describeSource(env.Revision.Source))

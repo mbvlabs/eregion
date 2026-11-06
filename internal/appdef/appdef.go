@@ -26,7 +26,6 @@ const Version = 1
 type Definition struct {
 	Version      *int                   `toml:"version"`
 	App          string                 `toml:"app"`
-	Environment  string                 `toml:"environment"`
 	Node         *string                `toml:"node"`
 	BuildNode    *string                `toml:"build_node"`
 	Source       *Source                `toml:"source"`
@@ -318,17 +317,11 @@ func tableValue(table map[string]any, key string) map[string]any {
 
 func ptrValue[T any](value T) *T { return &value }
 
-// Resolve applies the shared fields first and the selected environment
-// override second. The selected environment is the command target when set, or
-// the document's environment when the command did not name one.
-func (d Definition) Resolve(selected string) (*Resolved, error) {
-	if d.Environment != "" && selected != "" && d.Environment != selected {
-		return nil, fmt.Errorf("environment: document selects %q, command targets %q", d.Environment, selected)
-	}
-	environment := selected
-	if environment == "" {
-		environment = d.Environment
-	}
+// Resolve applies the shared recipe first and the selected environment
+// override second. The selected environment is the command target. A named
+// override is optional: a PR or any other environment can be created from the
+// shared recipe without first adding its name to the document.
+func (d Definition) Resolve(environment string) (*Resolved, error) {
 	if d.App != "" {
 		if err := platform.ValidateName(d.App); err != nil {
 			return nil, fmt.Errorf("app: %w", err)

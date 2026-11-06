@@ -11,6 +11,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/protect"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -26,11 +27,12 @@ func (a *app) envSpecs() []spec {
 		"app", "name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
 		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
+		"protected", "unprotected",
 	}
 	create.Examples = []string{
 		"eregion env create",
 		"eregion env create --app api --name staging --node main --git-url https://github.com/acme/api --git-ref next --domain staging.example.com --json",
-		"eregion env create --from ./eregion.toml --no-deploy --json",
+		"eregion env create --from ./eregion.toml --name pr-42 --no-deploy --json",
 	}
 	create.Next = []string{"eregion env status <app> <environment> --json", "eregion domain add <app> <environment> <hostname>"}
 
@@ -73,6 +75,7 @@ func (a *app) envSpecs() []spec {
 					cmd.Flags().String("name", "", "Environment name")
 					cmd.Flags().Bool("no-deploy", false, "Do not queue the first deploy")
 					cmd.Flags().Bool("detach", false, "Submit and return without following the create and first deploy")
+					addProtectionFlags(cmd)
 					addSetupFlags(cmd, true)
 				},
 				run: a.envCreate,
@@ -101,9 +104,114 @@ func (a *app) envSpecs() []spec {
 					return a.envStatus(cmd, args[0], args[1])
 				},
 			},
+			a.envProtectionSpec(true),
+			a.envProtectionSpec(false),
 			a.envDeleteSpec(),
 		},
 	}}
+}
+
+// envProtectionSpec builds env protect (protected=true) and env unprotect
+// (protected=false). Lowering protection is the only direction that needs the
+// human factor; the node/control plane verifies it against locked state.
+func (a *app) envProtectionSpec(protected bool) spec {
+	use := "protect <app> <environment>"
+	summary := "Protect an environment so a real deletion needs the human factor"
+	example := "eregion env protect api production --json"
+	when := []string{
+		"Protection is durable environment state, not a desired-state revision.",
+		"Protecting is agent-safe and never asks for a code. Unprotecting asks for a TOTP code at a human terminal and refuses JSON/no-TTY without one.",
+	}
+	if !protected {
+		use = "unprotect <app> <environment>"
+		summary = "Lower an environment's deletion protection; requires the human factor"
+		example = "eregion env unprotect api pr-42"
+		when = []string{
+			"Turning protection off on a protected environment requires the D7 TOTP human factor at a human terminal.",
+			"An already-unprotected environment is unchanged without a code. An unprotected, non-last environment can then be deleted by an agent with exact target confirmation.",
+		}
+	}
+	meta := followingMeta(operationMeta(summary, example))
+	meta.Mutating, meta.DryRun = true, true
+	meta.Prompts = !protected
+	meta.InputFlags = []string{"detach"}
+	meta.WhenToUse = when
+	meta.Next = []string{"eregion env status <app> <environment> --json", "eregion env delete <app> <environment> --confirm <app>/<environment>"}
+	return spec{
+		use:  use,
+		meta: meta,
+		args: platformTwoNames("app", "environment"),
+		flags: func(cmd *cobra.Command) {
+			cmd.Flags().Bool("dry-run", false, "Validate and show the protection change without accepting work")
+			cmd.Flags().Bool("detach", false, "Return immediately after acceptance instead of following in a terminal")
+			cmd.Flags().String("idempotency-key", "", "Stable submission key; one is generated when empty")
+		},
+		run: func(cmd *cobra.Command, args []string) (result, error) {
+			return a.runEnvProtection(cmd, args[0], args[1], protected)
+		},
+	}
+}
+
+type envProtectionResult struct {
+	App         string              `json:"app"`
+	Environment string              `json:"environment"`
+	Protected   bool                `json:"protected"`
+	Dropped     bool                `json:"dropped,omitempty"`
+	Operation   *contract.Operation `json:"operation,omitempty"`
+	DryRun      bool                `json:"dry_run,omitempty"`
+	Preview     *platform.Preview   `json:"preview,omitempty"`
+}
+
+func (a *app) runEnvProtection(cmd *cobra.Command, app, environment string, protected bool) (result, error) {
+	env, _, err := a.readEnvironment(cmd, app, environment)
+	if err != nil {
+		return result{}, err
+	}
+	target, err := platform.NewEnvironmentTarget(app, environment)
+	if err != nil {
+		return result{}, err
+	}
+	input := platform.EnvironmentProtectInput{App: app, Environment: environment, Protected: protected}
+	if dryRun(cmd) {
+		preview, err := a.previewAction(cmd, platform.KindEnvironmentProtect, target.String(), input)
+		if err != nil {
+			return result{}, err
+		}
+		state := "protected"
+		if !protected {
+			state = "unprotected"
+		}
+		plain := fmt.Sprintf("Dry run: set %s %s\n%s\n", target.String(), state, preview.Summary)
+		return result{data: envProtectionResult{App: app, Environment: environment, Protected: protected, DryRun: true, Preview: &preview}, plain: plain}, nil
+	}
+	var code string
+	if !protected && env.Protected {
+		if err := requireHuman(cmd, "eregion env unprotect"); err != nil {
+			return result{}, err
+		}
+		code, err = readProtectCode(cmd, "Code from the authenticator app")
+		if err != nil {
+			return result{}, err
+		}
+	}
+	op, err := a.submitAcceptedWithSecrets(cmd, platform.KindEnvironmentProtect, target.String(), input, "", map[string]string{protect.CodeSecret: code})
+	if err != nil {
+		return result{}, err
+	}
+	data := envProtectionResult{App: app, Environment: environment, Protected: protected, Operation: &op}
+	if !boolFlag(cmd, "detach") && (humanInteractive(cmd) || streamsNDJSON(cmd)) {
+		client, err := a.client(cmd)
+		if err != nil {
+			return result{}, err
+		}
+		return a.followAccepted(cmd, client, op)
+	}
+	state := "protected"
+	if !protected {
+		state = "unprotected"
+	}
+	plain := fmt.Sprintf("Environment %s/%s is now %s\noperation: %s\nstate: %s\n", app, environment, state, op.ID, op.State)
+	return result{data: data, plain: plain}, nil
 }
 
 func addEnvironmentUpdateFlags(cmd *cobra.Command) {
@@ -198,7 +306,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 	}
 	summary := setupResult{
-		App: ans.App, Environment: ans.Environment, Node: ans.Node,
+		App: ans.App, Environment: ans.Environment, Protected: protectedSpec(spec), Node: ans.Node,
 		Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
 		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, DomainCheckPath: ans.DomainCheckPath, Domains: ans.Domains, Deploy: ans.Deploy,
 		Warnings: preview.Warnings, created: "environment",
@@ -226,7 +334,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
 	} else {
-		if _, err := a.writeSetupSecrets(cmd, ans); err != nil {
+		if _, err := a.writeSetupSecrets(cmd, ans, spec); err != nil {
 			return result{}, err
 		}
 		summary.SecretNames = setupSecretNames(ans)
@@ -1062,12 +1170,16 @@ func (a *app) envList(cmd *cobra.Command, _ []string) (result, error) {
 			if serving == "" {
 				serving = "-"
 			}
+			protection := "unprotected"
+			if environment.Protected {
+				protection = "protected"
+			}
 			rows = append(rows, []string{
 				environment.App, environment.Name, environment.Node, revisionLabel(environment),
-				boolLabel(environment.Deployability.Deployable), strings.Join(environment.Deployability.Missing, ","), serving,
+				protection, boolLabel(environment.Deployability.Deployable), strings.Join(environment.Deployability.Missing, ","), serving,
 			})
 		}
-		plain = ui.Header("Environments", 72) + "\n" + writeTable([]string{"APP", "ENVIRONMENT", "NODE", "REVISION", "DEPLOYABLE", "MISSING", "SERVING RELEASE"}, rows)
+		plain = ui.Header("Environments", 72) + "\n" + writeTable([]string{"APP", "ENVIRONMENT", "NODE", "REVISION", "PROTECTION", "DEPLOYABLE", "MISSING", "SERVING RELEASE"}, rows)
 	}
 	return result{data: raw, plain: plain}, nil
 }

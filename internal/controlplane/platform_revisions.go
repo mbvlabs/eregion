@@ -97,11 +97,15 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 			break
 		}
 	}
+	protected := platform.DefaultEnvironmentProtection(spec.Name)
+	if spec.Protected != nil {
+		protected = *spec.Protected
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environments
-        (id,app_id,name,node_name,build_node,host_port,candidate_port,container_port,bind_address,health_type,health_path,health_timeout_seconds,env,secret_refs)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        (id,app_id,name,node_name,build_node,host_port,candidate_port,container_port,bind_address,health_type,health_path,health_timeout_seconds,env,secret_refs,protected)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 		envID, app.ID, spec.Name, node.Name, buildNode, hostPort, candidatePort, containerPort, spec.Bind,
-		state.Runtime.HealthType, state.Runtime.HealthPath, state.Runtime.HealthTimeoutSeconds, config, refs); err != nil {
+		state.Runtime.HealthType, state.Runtime.HealthPath, state.Runtime.HealthTimeoutSeconds, config, refs, protected); err != nil {
 		return "", platformWriteError(err, "environment name or port already exists")
 	}
 	revisionID, _, err := insertEnvironmentRevisionTx(ctx, tx, envID, opID, actor, operation, summary, state)

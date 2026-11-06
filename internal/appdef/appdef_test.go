@@ -13,12 +13,12 @@ import (
 func ptr[T any](value T) *T { return &value }
 
 func TestParseIsStrictAndVersioned(t *testing.T) {
-	valid := []byte("version = 1\napp = \"api\"\nenvironment = \"production\"\n")
+	valid := []byte("version = 1\napp = \"api\"\n")
 	definition, err := Parse(valid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if definition.App != "api" || definition.Environment != "production" {
+	if definition.App != "api" {
 		t.Fatalf("definition = %+v", definition)
 	}
 	for name, raw := range map[string]string{
@@ -47,7 +47,6 @@ func TestResourceDeclarationValidation(t *testing.T) {
 	definition, err := Parse([]byte(`
 version = 1
 app = "api"
-environment = "production"
 
 [[resources]]
 name = "db"
@@ -88,7 +87,6 @@ func TestResolveMergesSharedFieldsAndSelectedOverride(t *testing.T) {
 	definition, err := Parse([]byte(`
 version = 1
 app = "api"
-environment = "staging"
 node = "main"
 secret_names = ["DATABASE_URL", "API_KEY"]
 
@@ -165,27 +163,30 @@ C = "4"
 	if !resolved.ProcessesSet || len(resolved.Processes) != 0 {
 		t.Fatalf("explicit empty processes did not clear: %+v", resolved.Processes)
 	}
-	if _, err := definition.Resolve("production"); err == nil {
-		t.Fatal("accepted a command environment that disagrees with the document")
-	}
-	if _, err := definition.Resolve("staging"); err != nil {
+	if _, err := definition.Resolve("production"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Parse([]byte("version = 1\nenvironment = \"production\"\n")); err != nil {
+	// The command selects the environment; a name without an override gets
+	// the shared recipe. This is what makes a PR environment work without
+	// editing the file.
+	if _, err := definition.Resolve("pr-42"); err != nil {
+		t.Fatalf("shared recipe was not reusable for an arbitrary environment: %v", err)
+	}
+	if _, err := Parse([]byte("version = 1\n")); err != nil {
 		t.Fatal(err)
 	}
-	disagree, err := Parse([]byte("version = 1\nenvironment = \"production\"\n"))
+	disagree, err := Parse([]byte("version = 1\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := disagree.Resolve("staging"); err == nil {
-		t.Fatal("accepted a command environment that disagrees with the document")
+	if _, err := disagree.Resolve("staging"); err != nil {
+		t.Fatalf("shared recipe did not apply to a differently named environment: %v", err)
 	}
 }
 
 func TestDefinitionCollectionLimits(t *testing.T) {
 	processes := strings.Builder{}
-	processes.WriteString("version = 1\napp = \"api\"\nenvironment = \"production\"\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n")
+	processes.WriteString("version = 1\napp = \"api\"\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n")
 	for index := 0; index < 33; index++ {
 		fmt.Fprintf(&processes, "\n[[processes]]\nname = \"p%d\"\nkind = \"worker\"\ncommand = \"./worker\"\n", index)
 	}
@@ -204,7 +205,7 @@ func TestDefinitionCollectionLimits(t *testing.T) {
 	for index := 0; index < 129; index++ {
 		names = append(names, fmt.Sprintf("SECRET_%d", index))
 	}
-	raw := "version = 1\napp = \"api\"\nenvironment = \"production\"\nsecret_names = [\"" + strings.Join(names, `", "`) + "\"]\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"
+	raw := "version = 1\napp = \"api\"\nsecret_names = [\"" + strings.Join(names, `", "`) + "\"]\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"
 	definition, err = Parse([]byte(raw))
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +216,7 @@ func TestDefinitionCollectionLimits(t *testing.T) {
 }
 
 func TestResolveDistinguishesAbsentFromEmpty(t *testing.T) {
-	absent, err := Parse([]byte("version = 1\napp = \"api\"\nenvironment = \"production\"\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"))
+	absent, err := Parse([]byte("version = 1\napp = \"api\"\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +229,6 @@ func TestResolveDistinguishesAbsentFromEmpty(t *testing.T) {
 	}
 	empty, err := Parse([]byte(`version = 1
 app = "api"
-environment = "production"
 secret_names = []
 processes = []
 domains = []
@@ -256,7 +256,6 @@ func TestCreateSpecMapsTheSupportedDefinition(t *testing.T) {
 	raw := []byte(`
 version = 1
 app = "api"
-environment = "production"
 node = "main"
 build_node = "builder"
 secret_names = ["DATABASE_URL"]
@@ -337,7 +336,6 @@ check_path = "/custom"
 func TestCreateSpecRefusesUnrepresentableCollections(t *testing.T) {
 	base := `version = 1
 app = "api"
-environment = "production"
 [source]
 kind = "image"
 image = "ghcr.io/acme/api:1"
@@ -351,11 +349,10 @@ image = "ghcr.io/acme/api:1"
 			raw := base + extra
 			switch name {
 			case "empty processes":
-				raw = "version = 1\napp = \"api\"\nenvironment = \"production\"\nprocesses = []\n" + base[len("version = 1\napp = \"api\"\nenvironment = \"production\"\n"):]
+				raw = "version = 1\napp = \"api\"\nprocesses = []\n" + base[len("version = 1\napp = \"api\"\n"):]
 			case "credential in app":
 				raw = `version = 1
 app = "api"
-environment = "production"
 secret_names = ["GIT_READ_TOKEN"]
 [source]
 kind = "git"
@@ -382,7 +379,6 @@ func TestCreateSpecCarriesMultipleDomains(t *testing.T) {
 	raw := []byte(`
 version = 1
 app = "api"
-environment = "production"
 [source]
 kind = "image"
 image = "ghcr.io/acme/api:1"
@@ -423,7 +419,6 @@ func TestUpdatePatchChangesOnlySupportedFields(t *testing.T) {
 	raw := []byte(`
 version = 1
 app = "api"
-environment = "production"
 node = "main2"
 secret_names = []
 processes = []
@@ -519,7 +514,6 @@ func TestUpdatePatchClearsExplicitEmptyCollections(t *testing.T) {
 	raw := []byte(`
 version = 1
 app = "api"
-environment = "production"
 node = "main"
 secret_names = []
 resources = []
@@ -607,7 +601,7 @@ release_command = []
 }
 
 func TestUpdatePatchRequiresNodeAndSource(t *testing.T) {
-	base := "version = 1\napp = \"api\"\nenvironment = \"production\"\n"
+	base := "version = 1\napp = \"api\"\n"
 	for name, raw := range map[string]string{
 		"missing node":   base + "[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n",
 		"missing source": base + "node = \"main\"\n",
@@ -633,7 +627,6 @@ func TestUpdatePatchDetectsAnOmittedDomainRemoval(t *testing.T) {
 	raw := []byte(`
 version = 1
 app = "api"
-environment = "production"
 node = "main"
 [source]
 kind = "image"
@@ -666,7 +659,6 @@ func TestUpdatePatchLeavesDomainChangesToTheDomainPlan(t *testing.T) {
 	raw := []byte(`
 version = 1
 app = "api"
-environment = "production"
 node = "main"
 [source]
 kind = "image"
@@ -818,7 +810,6 @@ func TestResourceAttachmentsHonorAttachFalse(t *testing.T) {
 	definition, err := Parse([]byte(`
 version = 1
 app = "api"
-environment = "production"
 [source]
 kind = "image"
 image = "ghcr.io/acme/api:1"
@@ -873,7 +864,6 @@ func TestResourceDeclarationRejectsDuplicateMountDestination(t *testing.T) {
 	_, err := Parse([]byte(`
 version = 1
 app = "api"
-environment = "production"
 [source]
 kind = "image"
 image = "ghcr.io/acme/api:1"
@@ -1003,7 +993,6 @@ func TestUpdatePatchRefusesWhenCurrentBindingsAreMissing(t *testing.T) {
 	raw := []byte(`
 version = 1
 app = "api"
-environment = "production"
 node = "main"
 [source]
 kind = "image"

@@ -44,7 +44,7 @@ func (s *Server) submitPlatformAction(r *http.Request, raw []byte) (any, int, er
 	if err != nil {
 		return nil, 0, err
 	}
-	if err := refuseHTTPFactorAction(normalized.Kind, request.DryRun); err != nil {
+	if err := s.refuseHTTPFactorAction(r.Context(), normalized, request.DryRun); err != nil {
 		return nil, 0, err
 	}
 	if len(r.Header.Values("Idempotency-Key")) > 1 {
@@ -58,16 +58,36 @@ func (s *Server) submitPlatformAction(r *http.Request, raw []byte) (any, int, er
 	return data, status, err
 }
 
-// refuseHTTPFactorAction rejects a real submission of a D7 factor-gated
-// deletion. The HTTP API has no channel for the human code, so no grant may
-// perform one; a dry run changes nothing and stays a preview.
-func refuseHTTPFactorAction(kind string, dryRun bool) error {
-	if dryRun || !platform.RequiresHumanFactor(kind) {
+// factorRequirement is implemented by the control plane so the HTTP transport
+// can refuse a real factor-gated action before submitting it. The authoritative
+// check remains inside the submission transaction.
+type factorRequirement interface {
+	RequiresHumanFactor(context.Context, platform.Normalized) (bool, error)
+}
+
+// refuseHTTPFactorAction rejects a real submission that currently needs the D7
+// human factor. The HTTP API has no channel for the TOTP code, so no grant may
+// perform one; a dry run changes nothing and stays a preview. An unprotected,
+// non-last environment deletion needs no factor and remains available to an
+// agent through the token API as well as the node CLI.
+func (s *Server) refuseHTTPFactorAction(ctx context.Context, normalized platform.Normalized, dryRun bool) error {
+	if dryRun {
+		return nil
+	}
+	if service, ok := s.service.(factorRequirement); ok {
+		required, err := service.RequiresHumanFactor(ctx, normalized)
+		if err != nil {
+			return err
+		}
+		if !required {
+			return nil
+		}
+	} else if !platform.RequiresHumanFactor(normalized.Kind) {
 		return nil
 	}
 	return contract.NewFault(contract.Forbidden,
-		"deletions cannot be submitted over the HTTP API",
-		"A deletion needs the D7 human factor inside the request, and the HTTP API cannot carry it. Run eregion app delete or eregion env delete from a human terminal.")
+		"this action needs the D7 human factor and cannot be submitted over the HTTP API",
+		"Run it from a human terminal through the node CLI. An unprotected non-last environment deletion does not require the factor.")
 }
 
 func (s *Server) platformInventory(r *http.Request) (any, int, error) {

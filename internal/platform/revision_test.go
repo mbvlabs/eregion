@@ -16,7 +16,7 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 	}
 	app, err := normalize(KindAppCreate, "platform", map[string]any{
 		"name": "api", "deploy": true,
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "app-1",
 			"source":  map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
 			"runtime": map[string]any{"health_path": "/healthz"},
@@ -25,23 +25,37 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 			}},
 			"config":       map[string]string{"APP_ENV": "production"},
 			"secret_names": []string{"DATABASE_URL"},
-		},
+		}, {
+			"name": "staging", "node": "app-1",
+			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	created := app.Input.(*AppCreateInput)
-	if created.Environment == nil || created.Environment.Processes[0].ContainerPort != 3000 {
-		t.Fatalf("first environment was not normalized: %+v", created.Environment)
+	if len(created.Environments) != 2 || created.Environments[0].Processes[0].ContainerPort != 3000 {
+		t.Fatalf("first environment was not normalized: %+v", created.Environments)
 	}
-	if created.Environment.Source.Builder != DefaultBuilder || created.Environment.Runtime.HealthTimeoutSeconds != DefaultHealthTimeout {
-		t.Fatalf("revision defaults were not applied: %+v", created.Environment)
+	if created.Environments[0].Source.Builder != DefaultBuilder || created.Environments[0].Runtime.HealthTimeoutSeconds != DefaultHealthTimeout {
+		t.Fatalf("revision defaults were not applied: %+v", created.Environments[0])
+	}
+	if created.Environments[0].Protected == nil || !*created.Environments[0].Protected {
+		t.Fatal("production was not protected by default")
+	}
+	if created.Environments[1].Protected == nil || !*created.Environments[1].Protected {
+		t.Fatal("staging was not protected by default")
+	}
+	if _, err := normalize(KindEnvironmentCreate, "app/api", map[string]any{
+		"name": "pr-42", "node": "app-1",
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := normalize(KindAppCreate, "platform", map[string]any{"name": "api", "deploy": true}); err == nil {
 		t.Fatal("deploy without an environment must be refused")
 	}
 	if _, err := normalize(KindAppCreate, "platform", map[string]any{
-		"name": "api", "environment": map[string]any{"name": "production", "node": "app-1", "unknown": true},
+		"name": "api", "environments": []map[string]any{{"name": "production", "node": "app-1", "unknown": true}},
 	}); err == nil {
 		t.Fatal("unknown nested environment field must be refused")
 	}

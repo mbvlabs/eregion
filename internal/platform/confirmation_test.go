@@ -7,16 +7,37 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 )
 
-func TestRequiresHumanFactorCoversTheDeleteKinds(t *testing.T) {
+func TestRequiresHumanFactorIsUnconditionalOnlyForAppDelete(t *testing.T) {
 	for kind, want := range map[string]bool{
-		KindAppDelete:         true,
-		KindEnvironmentDelete: true,
-		KindDeploy:            false,
-		KindRollback:          false,
+		KindAppDelete:          true,
+		KindEnvironmentDelete:  false,
+		KindEnvironmentProtect: false,
+		KindDeploy:             false,
+		KindRollback:           false,
 	} {
 		if got := RequiresHumanFactor(kind); got != want {
 			t.Fatalf("RequiresHumanFactor(%s) = %v, want %v", kind, got, want)
 		}
+	}
+	for _, tc := range []struct {
+		name      string
+		protected bool
+		last      bool
+		want      bool
+	}{
+		{name: "protected", protected: true, want: true},
+		{name: "unprotected non-last", want: false},
+		{name: "last unprotected still deletes the app", last: true, want: true},
+	} {
+		if got := EnvironmentDeleteRequiresHumanFactor(tc.protected, tc.last); got != tc.want {
+			t.Fatalf("%s: got %t, want %t", tc.name, got, tc.want)
+		}
+	}
+	if !ProtectionChangeRequiresHumanFactor(true, false) {
+		t.Fatal("unprotect did not require the factor")
+	}
+	if ProtectionChangeRequiresHumanFactor(false, true) || ProtectionChangeRequiresHumanFactor(true, true) {
+		t.Fatal("protect or no-op incorrectly required the factor")
 	}
 }
 

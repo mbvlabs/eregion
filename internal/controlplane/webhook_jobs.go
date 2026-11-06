@@ -113,7 +113,7 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, deliveryIDHash str
 	if err != nil {
 		return err
 	}
-	op, _, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.DeliveryIDHash, resolved)
+	op, _, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.DeliveryIDHash, resolved, "")
 	if err != nil {
 		code, detail, retry := webhookAdmissionFailure(err)
 		if retry {

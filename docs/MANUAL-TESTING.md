@@ -13,8 +13,13 @@ observation or pass result is invented or backfilled. The run records below are
 the evidence retained in this checkout; a **partial** or **not run** entry in a
 historical record is an evidence gap for that run, not an open alpha.1 blocker.
 
-Alpha.2 acceptance remains planned and unqualified. macOS acceptance (R10)
-remains required before v1.0.0 final and was not an alpha.1 gate.
+Alpha.2 acceptance is **incremental**: it is qualified against its own
+acceptance criteria on the explicitly authorized existing main node, disposable
+fixture app, authorized hostname and authorized GitHub repository. A complete
+fresh-server baseline is not required for each alpha; a fresh-server
+v1.0.0-final rehearsal remains a separate final decision. Alpha.1 stays
+operator-qualified. macOS acceptance (R10) remains required before v1.0.0 final
+and was not an alpha.1 gate. No evidence is reconstructed or backfilled.
 
 ## Evidence rules
 
@@ -206,6 +211,539 @@ alpha.2 blocker on this build. Raw command output and definition files are
 under `/tmp/opencode/alpha2-defs/`; the generated secret-value file was removed
 and no secret value is recorded there.
 
+### 2026-11-06 alpha.2 retest on `edge-ba175353f00a`
+
+Authorized target: same `main` context/node. Commit `ba17535` (edge run
+42250484640, `success`) published `edge-ba175353f00a`; the edge manifest
+matched that version and the expected `ba175353f00a` prefix. CLI and node were
+upgraded from `edge-ef4a6f879f45`: node apply
+`op_3c4bebbf8dd7dc6b80bdd3439b24c66c` applied 3 steps and skipped 17, schema
+stayed **23/23, River 7/7**; a second apply
+`op_3d5f33c2aff06f9dded7820451693ddd` was 0 of 20; initial `doctor` was 20/0/0.
+
+**Docker 29 resource provisioning.** The previously failing image-inspect step
+now passes. `resource apply a2defs1106 production cache` with
+`redis:7-alpine` succeeded as `op_9b733fa42899a21ea588202e1a6fd969`; status was
+`ready`/`healthy`, image ID `sha256:c5d34a98396a…` and volume
+`er-res-18bea038bf92f11da1420cc577d221c4-cache-data`. A file-based update
+`op_ef31e9cbf700a70226bd62a5bc4fdd1c` accepted revision 11 with secret name
+`DATABASE_PASSWORD` and resource `cache`, then provisioned cache and db as
+`op_e72ab30ac09ed1b8e493c78d21f197d6` and
+`op_82678348f7c0b6040a5f4ba6d026e881`; both succeeded and reported `ready` with
+healthy exec checks. The db container reported `POSTGRES_PASSWORD` as set
+without its value and the `io.eregion.*` ownership labels.
+
+**Empty file removals.** With revision 11 holding a secret name and an attached
+resource, `env update --from` a file with `secret_names = []` and no resources
+previewed `secret_names.DATABASE_PASSWORD: removed` and `resources.cache:
+removed`, with the patch carrying explicit `[]` for both. The confirmed update
+`op_a71963be8e1b0534253233851cf08bb0` created revision 12 with
+`secret_names: []` and no resources, so both prior defects are fixed on the
+host.
+
+**Lifecycle and retention.** `resource attach cache` created revision 7 as
+`op_c00fc0a9c4d6b7a20d7d058c0e9a57fc`; db attach/detach created revisions 9 and
+10 as `op_16f52d08d1f9088ed8552a6df41cbb10` and
+`op_119994c874076bab49ced971683e66ce`. Redis data written as
+`alpha2:key=ba17535-retained` and flushed with `redis-cli SAVE` survived a
+default `resource destroy` (`op_ce23ea8eb8ad27be6152eea687b332ec`) and re-apply
+(`op_dda1e9aca1f10799431e1a11f0f50fdd`) under the same volume. A first write
+without `SAVE` was lost on forced removal, which is Redis' own durability
+behaviour, not a product defect; the saved write persisted. A PostgreSQL
+marker row survived default destroy `op_60cd328490fee0880220fcfece3c6d16` and
+re-apply `op_6169837233808600bea4b18297d8bc7c`.
+
+**Cleanup.** `resource destroy cache --delete-data`
+(`op_4b1674f75b45ae6a640700c1d549d73c`) and the db equivalent
+(`op_a00b454e157341cb93927872996a00a8`) succeeded. A separately created foreign
+volume `a2-foreign-1106b` was untouched by delete-data and was removed by hand;
+the fixture network `er-env_83bd5eea9dbab1daca6632d430fbc6fa` was removed after
+confirming its ownership labels. No fixture container, volume or network
+remains, and the pulled Redis/Postgres images were removed; both resource rows
+are `destroyed`. `a2defs1106/production` remains at
+revision 12 with no secret name or attached resource. `app delete --confirm
+a2defs1106 --json` correctly refused with `input_required` and the app remains,
+so a human-terminal factor-gated delete is still required.
+
+**Doctor warning.** `host.retention` remained intermittent after the retest:
+runs at 16:47 were 20/0/0 and then 19/1 with “cannot read the retention runs”
+while `version.schema` stayed pass; the next runs returned to 20/0/0. The same
+pattern occurred after the earlier control-database outage. The retention
+check opens its own pool and shares one 5-second deadline across the policy and
+two run queries, and the underlying error is not surfaced; this is consistent
+with a transient connection/read over the Funnel, not a retention-data fault.
+No retention data or policy was changed.
+
+The four existing public URLs stayed HTTP 200. No DNS, GitHub, existing app or
+existing resource was mutated; no commit, push, tag or branch was created.
+Raw output and definition files are under `/tmp/opencode/ba17535-*` and
+`/tmp/opencode/alpha2-defs/`; no secret value is recorded.
+
+### 2026-11-06 alpha.2 deploy gate and resource consumption (`edge-ba175353f00a`)
+
+After the fix retest, the same `a2defs1106/production` fixture was prepared for
+a real deploy without DNS or GitHub changes. A small static Go application was
+built from local source under `/tmp/opencode/alpha2-app` with no external
+modules: `/healthz` returns `ok`, and `/` reads a Redis key over the managed
+resource's private network. The image was built for `linux/amd64`
+(`sha256:2c7b048fe342b68a54ab3065185512619a385d76991776a7d6fff1756d1f970f`)
+and pushed with `eregion image push` as
+`127.0.0.1:5000/a2defs1106@sha256:2c7b048fe342b68a54ab3065185512619a385d76991776a7d6fff1756d1f970f`
+(2,524,160 bytes).
+
+Revision 14 (`op_e0410dda297832a5e982582cdf088535`) bound that image, the web
+process on 8080, health `/healthz`, and plain config `REDIS_ADDR=cache:6379`
+and `REDIS_KEY=alpha2:key`. The Redis resource was applied
+(`op_f7ecdfcd8c1e8ad5d2ae1c7243f07e33`) and attached
+(`op_2f1a515c837a1da5692a1edb50e0bef4`) as revision 14. `env status` reported
+`missing: ["artifact", "domain"]` and did **not** list `resource:cache`, so the
+ready resource gate passed.
+
+`deploy --dry-run --json` returned the blue/green plan. The real
+`deploy a2defs1106 production --json` then refused before any operation:
+
+```text
+error [precondition_failed]: environment is not deployable: domain
+hint: Fix the listed desired state before deploying; eregion env status shows the same report.
+details: {"missing":["domain"]}
+```
+
+No operation was accepted, no container was started and no Caddy route was
+written. A successful public deploy requires a disposable fully-qualified
+hostname resolving to `main`'s public IPv4 `46.224.129.96` (directly or through
+a Cloudflare-proxied record whose origin is `main`). No spare existing app
+hostname is available; `git-test1`–`git-test5` are bound to existing apps and
+must not be changed. No DNS record was created or modified.
+
+Because the public check could not be reached without that domain, the app's
+resource consumption was exercised directly on the private environment network
+with the same image, network and alias a deployment uses. Redis key
+`alpha2:key` was set to `ba17535-app`; a temporary
+`a2defs1106-app-test` container joined
+`er-env_83bd5eea9dbab1daca6632d430fbc6fa` with
+`REDIS_ADDR=cache:6379`, `REDIS_KEY=alpha2:key` and `--network-alias web`.
+From the node, `/healthz` returned `ok` and `/` returned
+`a2defs1106 app; alpha2:key=ba17535-app`, proving the app image consumes the
+managed Redis over the private network. The temporary container was removed;
+this is not a deploy-pipeline serving result.
+
+Cleanup then detached the resource (`op_e605e5bef70e886022dd1ebeb4442fcf`),
+destroyed it with `--delete-data`
+(`op_f263b93ae264137eb5f0bd9e4b90bab4`), removed the network and deleted the
+temporary app image locally and from the registry (manifest delete returned
+`202`). The environment was returned to revision 16
+(`op_c6f9cfe8596e7e0bf86af280d79b0119`) with the public `nginx:1.27-alpine`
+image, `SHARED=shared`, no secret names and no resources. No fixture container,
+volume, network or image remains; both resource rows are `destroyed`. The app
+row remains only because real deletion needs the human TOTP factor. The four
+existing public URLs stayed HTTP 200 and `doctor` was 20/0/0.
+
+**Blocker at that point:** the remaining deploy-gating/consumption acceptance
+needed an authorized disposable hostname for `a2defs1106` resolving to
+`46.224.129.96` (or a proxied equivalent). It was later authorized as
+`eregion-alpha-two.mbvlabs.com`; see the serving-deploy record below.
+
+### 2026-11-06 alpha.2 serving deploy, resource consumption and webhook (`edge-ba175353f00a`)
+
+DNS for the authorized `eregion-alpha-two.mbvlabs.com` already resolved to
+Cloudflare addresses (`104.21.27.128`, `172.67.142.154` and IPv6) before this
+run; no DNS record was created or changed by the agent. Direct port 443 to
+`46.224.129.96` with that SNI initially returned a TLS internal error and
+Cloudflare returned `525`, consistent with main being the origin but having no
+route or certificate yet.
+
+**Unhealthy resource gate.** Revision 17 bound the local app image from
+`a2defs1106-app:alpha2` (`127.0.0.1:5000/a2defs1106@sha256:2c7b048f…`), the
+configured `eregion-alpha-two.mbvlabs.com` primary domain, and a Redis resource
+whose exec health was deliberately `["false"]`. The resource apply
+`op_f4a999224394e1a50b012b0d0c9bb5c2` failed and left the row degraded.
+`deploy a2defs1106 production --json` refused before submitting work:
+
+```text
+error [precondition_failed]: environment is not deployable: resource:cache
+details: {"missing":["resource:cache"]}
+```
+
+**Healthy resource and serving deployment.** Re-applying Redis with
+`redis-cli ping` succeeded as `op_9f72ef1048b5016a9f71db9f884c1a44`; the
+resource was healthy and attached. The deploy `op_a8229010e7641e5a2fa433cf542b6e86`
+succeeded: candidate health passed at `http://127.0.0.1:32908/healthz`, Caddy
+switched release `rel_08ca95568fe2fb174f926b8c6ef7b2b3` across one web replica,
+and public verification initially hit the same TLS error then returned HTTP
+200. Caddy's certificate and the domain observer then reached route `applied`,
+certificate `valid` (expires 2027-02-04) and public `ok`/200. From the public
+HTTPS hostname:
+
+```text
+https://eregion-alpha-two.mbvlabs.com/healthz → 200, "ok"
+https://eregion-alpha-two.mbvlabs.com/         → 200, "a2defs1106 app; alpha2:key=alpha2-serving"
+```
+
+The response marker proves the serving application read the managed Redis over
+the private environment network. `env status` reported
+`serving_release_id=rel_08ca95568fe2fb174f926b8c6ef7b2b3`,
+`health_state=healthy`, and deployability `dns=proxied, missing=[]`.
+
+**Failed candidate isolation.** A later cleanup deploy of the public
+`nginx:1.27-alpine` image with the wrong container port 80
+(`op_24e22c64db1a13508abb6fa485a0a480`) failed candidate health and left the
+previous release serving; no serving pointer moved. A corrected revision with
+container port 80 deployed successfully as
+`op_29a00bceee740a9c117f19613b10f29e`, release
+`rel_de6d93651d6e26bde3900c5e90fd2377`, and the hostname then served nginx
+HTTP 200. This is also a real failed-candidate/old-release-kept observation.
+
+**Webhook.** With the fixture switched to the authorized private
+`https://github.com/mbvlabs/eregion-hello.git` source, branch `main`,
+`--auto-deploy --github-webhook` created hook id `708267694` at
+`https://db2.mbvlabs.com/v1/webhooks/github/a2defs1106/production`
+(`status=created`) without printing the secret. A second
+`--auto-deploy --github-webhook --json` reported the same id and
+`status=unchanged`, so no duplicate was created. `--rotate-webhook-secret
+--github-webhook` PATCHed the same hook (updated timestamp) and advanced
+`EREGION_WEBHOOK_SECRET` to revision 2; a following check again returned
+`unchanged`. The existing `githello/production` hook was not touched. The
+manual fallback's already-enabled path returned the URL and secret name without
+a secret value. At that point a real push delivery had not been sent because
+commits/pushes were outside the run's authorization, and one-time manual secret
+display was not captured; both were later authorized and passed in the
+end-to-end webhook record below.
+
+**Cleanup and residual state.** Auto-deploy was disabled
+(`op_25c7fb39e51e58a89c2d0c6675973427`), hook `708267694` was deleted through
+`gh`, and the repository now has only its pre-existing `githello` hook.
+`a2defs1106/production` was returned to revision 21 with the public nginx
+image, `SHARED=shared`, no secret names, no resources and no auto-deploy; the
+domain remains. The Redis resource was destroyed with `--delete-data`
+(`op_e733d0973e02d3167679a3ca2100f9f6`); no resource container or volume
+remains. At that point the environment network and the serving nginx container
+`a2defs1106-production-web-1-fd4729b3d716` remained because they were owned by
+the serving fixture; the primary domain cannot be removed while it is the only
+binding (`domain remove` refused with `precondition_failed`, “the primary
+domain cannot be removed”), and DNS at Cloudflare was pre-existing and was not
+changed.
+
+**Confirmed cleanup after user TOTP delete.** The user ran the factor-gated
+`app delete` as `op_90e6c3530ef81a575bba1542a70cda0b` (13 events; succeeded).
+Its workload step removed the managed containers and its completion event
+recorded that the app and every environment were deleted after workload and
+route cleanup. Read-only verification after deletion:
+
+- `app list` no longer contains `a2defs1106`; `app status` and `env status`
+  return `not_found`.
+- `resource list --app a2defs1106`, `domain list --app a2defs1106`,
+  `release list a2defs1106 production` and `secret list --app a2defs1106
+  --environment production` are all empty.
+- `operations list --app a2defs1106` still shows the deletion and earlier
+  operation history.
+- Docker has no `a2defs1106` container, network or volume; the only registry
+  residue is the non-platform image
+  `127.0.0.1:5000/a2defs1106:alpha2`.
+- `https://eregion-alpha-two.mbvlabs.com/` now returns Cloudflare `525`
+  because Caddy no longer has a route or certificate for it. The pre-existing
+  Cloudflare DNS record still resolves to the proxy addresses and was not
+  changed.
+- The four pre-existing public URLs return HTTP 200 and `doctor` is 20/0/0 on
+  the final run after the known intermittent retention read warning.
+
+The remaining alpha.2 webhook qualification gaps are a real push-triggered
+delivery and one-time manual secret display; the `gh`-assisted create,
+unchanged/no-duplicate and rotation checks passed and the fixture hook was
+deleted.
+
+### 2026-11-06 alpha.2 end-to-end GitHub push delivery (`edge-ba175353f00a`)
+
+After the earlier fixture deletion, the user authorized recreating it and
+pushing a test commit to `mbvlabs/eregion-hello`. Repository inspection first:
+default branch `main` at `59017d6`, no GitHub Actions workflows, no deployments,
+and one pre-existing hook for `githello/production` (id `707317891`). The test
+used a separate branch `alpha2-webhook-20261106`, created from `main`; `main`
+was never pushed or changed.
+
+The branch commit `c768e75` added `apps/web/alpha2_marker.go` and a `GET /marker`
+handler returning `alpha2-webhook-20261106`; the existing tests passed. The
+branch was pushed. `a2defs1106/production` was recreated from that branch with
+`context_path=apps/web`, `GIT_READ_TOKEN` (the authenticated `gh` token was
+written through a 0600 temporary file and never printed), `APP_VERSION=
+alpha2-webhook`, `FAIL_HEALTH=0`, primary domain `eregion-alpha-two.mbvlabs.com`
+with check path `/marker`, and no first deploy. `--auto-deploy --github-webhook`
+created hook id **708277604** for
+`https://db2.mbvlabs.com/v1/webhooks/github/a2defs1106/production`; the
+pre-existing `githello` hook was left untouched.
+
+**Real delivery (gh-assisted setup).** Empty commit `f6bbfa7` was pushed. GitHub
+recorded delivery GUID `2a29a758-da0c-11f1-9784-272044788f84` for event `push`
+at 2026-11-06T18:02:03Z with status `OK`, HTTP **202**. It admitted operation
+`op_1380428ab35058512af820f5d7807a61` with actor
+`webhook:github:mbvlabs/eregion-hello`; the build cloned `HEAD is now at
+f6bbfa7 test: trigger alpha2 webhook delivery`, produced release
+`rel_29c45e28eafd36da697c6b67e3906fa8`, passed candidate health, published the
+Caddy route, and the public check `https://eregion-alpha-two.mbvlabs.com/marker`
+returned 200. The operation succeeded. HTTPS after the switch returned
+`alpha2-webhook-20261106` from `/marker` and
+`eregion sample: alpha2-webhook src3` from `/`.
+
+**Manual one-time secret setup.** To exercise the manual path rather than the
+`gh` helper, `--rotate-webhook-secret` was run in a PTY and the
+`Create the GitHub webhook with gh?` prompt was declined. The one-time secret
+was written only to a mode-0600 temporary typescript, extracted to another
+mode-0600 file, and sent to the existing hook through `gh api --input -` on
+stdin; it was never printed in ordinary output or logs and both temporary
+files were shredded. The hook was PATCHed successfully and
+`EREGION_WEBHOOK_SECRET` advanced to revision 3. Empty commit `c4507c1` was
+pushed; GitHub delivery GUID
+`c68a318a-da0c-11f1-81ba-3eb292c14f72` recorded status `OK`/HTTP **202** at
+18:06:28Z. Operation `op_b4dc5f8b225d318510c10293aff9ebaf` (actor webhook)
+cloned `HEAD is now at c4507c1 test: verify manual alpha2 webhook secret`,
+built release `rel_df70f2bf15a82d6cc0204635460c5e92`, passed the public
+`/marker` check, and succeeded. The manual secret therefore authenticates real
+deliveries.
+
+**Missing-`gh` fallback.** With `gh` removed from `PATH`, the same
+`--auto-deploy --github-webhook --json` returned
+`github_webhook.status=skipped`, message `the GitHub CLI (gh) is not installed`,
+and the manual webhook URL; JSON did not prompt. The missing-admin-permission
+variant was not exercised at that point; a later simulated permission response
+covered it.
+
+**Cleanup.** Auto-deploy was disabled
+(`op_7e56873f9ef33922e9c8d96df63d14a8`), hook `708277604` was deleted through
+`gh`, and the repository again has only its pre-existing `githello` hook. The
+remote and local test branch `alpha2-webhook-20261106` were deleted; `main`
+remains at `59017d6`. The fixture source ref was returned to `main`
+(`op_56e5cdb20b6fc931ccaa95b56bafd6e7`), auto-deploy is off, and
+`EREGION_WEBHOOK_SECRET` is no longer named by the revision.
+
+**Confirmed final cleanup (user TOTP delete).** At the handoff above,
+`a2defs1106/production` still served `rel_df70f2bf15a82d6cc0204635460c5e92`
+(commit `c4507c1`) and retained its container, environment network, primary
+domain and secret namespaces. The user then ran the factor-gated app deletion
+as `op_362bea6789b9617855c43b37a093e16e`; it succeeded with 13 events and
+recorded that the app and every environment were deleted after workload and
+route cleanup.
+
+Read-only verification after deletion:
+
+- `app list` no longer contains `a2defs1106`; `app status` and `env status`
+  return `not_found`.
+- `resource list --app a2defs1106`, `domain list --app a2defs1106`,
+  `release list a2defs1106 production` and `secret list --app a2defs1106
+  --environment production` are empty.
+- `operations list --app a2defs1106` retains the deletion and earlier
+  operation history.
+- Docker has no `a2defs1106` container, network or volume. Reference checks
+  found no container using the three identified fixture images. The registry
+  manifest `127.0.0.1:5000/a2defs1106@sha256:2c7b048f…` was deleted (HTTP 202),
+  and local tags `127.0.0.1:5000/a2defs1106:alpha2`,
+  `eregion/a2defs1106-production:1380428ab350` and
+  `eregion/a2defs1106-production:b4dc5f8b225d` were removed; no `a2defs1106`
+  image remains.
+- `https://eregion-alpha-two.mbvlabs.com/` returns Cloudflare `525` because
+  Caddy no longer has a route or certificate. The pre-existing Cloudflare DNS
+  record still resolves and was not changed.
+- DNS cleanup is blocked: no Cloudflare CLI, configuration or authorized API
+  access was available without reading a secret. The exact record is
+  `eregion-alpha-two.mbvlabs.com` in zone `mbvlabs.com`; it currently resolves
+  to proxied Cloudflare addresses. Remove that record in the Cloudflare
+  dashboard or with a scoped API token
+  (`GET /zones?name=mbvlabs.com`, then
+  `GET`/`DELETE /zones/{zone_id}/dns_records?name=eregion-alpha-two.mbvlabs.com`).
+  Do not remove any other record.
+- The test repository has only its pre-existing `githello` hook and its
+  original branches; `main` is unchanged at `59017d6`.
+- Four pre-existing public URLs return HTTP 200.
+
+**Remaining alpha.2 evidence boundaries at that point.** The real
+push-delivery and manual-secret webhook gaps were closed. Not yet recorded
+then:
+
+- A direct file-vs-flags desired-state comparison and distinct staging/production
+  overrides in one file.
+- A stale-plan refusal and the `env update --from` domain-removal
+  `--confirm-domain` path.
+- App consumption of managed PostgreSQL through vault secret names, and
+  managed-resource data persistence across application restart/redeploy.
+- An explicit external-dependency-without-managed-resource variant, and the
+  app/environment-deletion-after-resource-destroy volume ledger outcome.
+- A real non-admin `gh` account for the permission fallback.
+
+The later remaining-case record covers file-vs-flags/staging overrides,
+stale-plan refusal, PostgreSQL app consumption and restart/redeploy
+persistence, a simulated missing-admin response, and the post-destroy deletion
+volume outcome (the retained volume persisted untracked and was then removed).
+Fresh baseline, `--confirm-domain`, explicit external dependency, a real
+non-admin account and DNS record cleanup remain open.
+
+The known intermittent `host.retention` read warning is not a retention-data
+fault. Non-destructive checks on existing apps passed: `app export img` and its
+dry-run reimport reported no changes; `app export githello` correctly refused
+because auto-deploy is not representable; `commands --json` contains the alpha.2
+surface; `resource list` is empty; the four existing URLs return 200; `doctor`
+returned 20/0/0 after the known 19/1 retention-read warning.
+
+### 2026-11-06 alpha.2 remaining-case pass on `edge-ba175353f00a`
+
+**File versus flags and overrides.** The disposable `a2defs1106` app was
+recreated from `pg-create.toml`: shared image source, process, health and
+runtime; distinct `[environments.production]` overrides (DB config, secret name,
+authorized domain and later the `db` resource) and `[environments.staging]`
+overrides (`APP_VERSION=staging`, `APP_BUILD=staging`, no domain/resource).
+Production was created as `op_f302032a9cb5575118714553aedc71b7`; staging from
+the same definition as `op_37897e295e2910f552ab88319a2ea428`; `flags` was
+created flag-only as `op_3abfe963f8a96454e87a82266a24c7df` with the same visible
+state as staging. `app export` of staging and flags was identical after
+normalising only the environment name (`diff` produced zero lines), and
+`env update flags --from` that export previewed `changed: []`. Production and
+staging revisions held the expected different configs.
+
+**Managed PostgreSQL consumption and persistence.** The app image connects to
+the managed `db` resource using `PGHOST=db`, `PGUSER=postgres`,
+`PGDATABASE=alpha2`, `PGSSLMODE=disable`, and the vault secret name
+`POSTGRES_PASSWORD`. The PostgreSQL resource was applied as
+`op_2430a37a4b9b00cfd07082e7b35ed2a3` with `pg_isready` health and a mounted
+`db-data` volume.
+
+A first deploy (`op_0e2c35b672e4891668f4664276b17ba3`) failed the public `/db`
+check with 502; PostgreSQL logged repeated password-authentication failures.
+This was a test-app defect: the app passed `POSTGRES_PASSWORD` to the container
+but `pgx` read `PGPASSWORD`. The test image was corrected to copy
+`POSTGRES_PASSWORD` into `PGPASSWORD`, pushed as digest
+`sha256:50c05454…` (`pgv2`), and revision 3 bound it. Deploy
+`op_8fbe3cd57b1f574919d7129b3b3218d0` succeeded with `/db` returning
+`pg-persist`, `/build` returning `v1`, and `/healthz` returning `ok`; the app
+container showed `POSTGRES_PASSWORD=<set>` and the expected PG variables.
+
+`restart` (`op_31a636774fab00bfeced11078541e86c`) succeeded and `/db` still
+returned `pg-persist`. `config set APP_BUILD=v2`
+(`op_3639955b4a9d2465ce48407363ac6ac4`) followed by deploy
+`op_a6e1c1d21e6caeffe1e29628bf7825f5` succeeded; `/build` returned `v2` while
+`/db` still returned `pg-persist`. This is app consumption of managed
+PostgreSQL with the same secret name and persistence across restart and
+redeploy.
+
+**Stale plan.** With the `flags` environment at revision 2, a direct
+`eregion node rpc` `operations.submit` carried the old revision 1
+(`erv_8ce39d21…`) and the same config. The node refused with `conflict`: “the
+environment changed since the definition was read”; no revision was written
+(the environment remained revision 2 at that point). The flag-only path has no
+user-facing expected-revision option, so this guard was exercised through the
+same node request the CLI uses.
+
+**Missing-admin `gh` fallback.** A temporary `gh` shim returned the real
+`auth status` success but `false` for `permissions.admin`; no repository
+permission or credential was changed. The `flags` environment had a temporary
+gh-assisted hook (`708290796`). With the shim on `PATH`,
+`env update flags --auto-deploy --github-webhook --json` returned
+`github_webhook.status=skipped` with “the gh account does not have repository
+admin permission for mbvlabs/eregion-hello” and the manual webhook URL, without
+changing the hook. The hook was then deleted and auto-deploy disabled
+(`op_f12a90fa9d098442647ff04567f2bccd`). This is a simulated permission
+response, not a second real GitHub account.
+
+**Blocked cases.** `--confirm-domain` was not exercised: the only authorized
+hostname is the production primary, and `domain remove` correctly refused to
+remove the last primary domain. A second authorized disposable hostname is
+needed for an alias-removal test. The explicit external-dependency-without-a-
+managed-resource case was not run because no authorized external dependency
+endpoint exists and new server/database targets are prohibited. Under the
+updated incremental policy, a fresh-server alpha.2 baseline is not required;
+no fresh-server run was made.
+
+**Post-destroy state and cleanup.** After the Postgres tests the environment
+was moved to public nginx for cleanup
+(`op_b4e6adc5679765b5026a37c541f08ae5`, deploy
+`op_4847dbdc1d9359677396db1c7e0ff6b8`), and the `db` resource was destroyed
+with the default retain-data path (`op_48ade4262610759fa1baaf453f56b507`).
+The owned volume
+`er-res-2d99b1ef6d8ddc69b01e2271e5a071a2-db-data` remains with its
+`io.eregion.*` labels; the resource row is `destroyed`. The three identified
+app images/registry manifests were deleted after reference checks, with
+registry deletes returning 202 and no containers referencing them. The test
+hook and branch are gone; only the pre-existing `githello` hook and original
+branches remain.
+
+**Confirmed app deletion and volume-ledger outcome.** At that point
+`a2defs1106` had production (nginx, serving the authorized domain), staging and
+flags environments; the container/network, primary domain and the retained
+PostgreSQL volume remained. The user then completed the TOTP-gated app deletion
+as `op_c113f640932b31df52c4a92117f3d105` (13 events, succeeded), which removed
+the workload containers and routes before platform rows.
+
+Read-only verification after deletion: `app status` and `env status` returned
+`not_found`; app/environment/resource/domain/release/secret lists were empty;
+Docker had no `a2defs1106` container, network or image. The retained volume
+`er-res-2d99b1ef6d8ddc69b01e2271e5a071a2-db-data` **did persist**, with labels
+`io.eregion.app=a2defs1106`, `io.eregion.environment=production`,
+`io.eregion.kind=resource`, `io.eregion.managed=true`,
+`io.eregion.resource=db` and `io.eregion.resource-id=res_2d99b1ef…`; no
+container referenced it. This confirms the documented post-destroy
+app-deletion volume-ledger outcome: deleting the app does not delete a
+default-retained resource volume.
+
+The authorized test-owned volume was then removed explicitly with
+`docker volume rm er-res-2d99b1ef6d8ddc69b01e2271e5a071a2-db-data`; it is gone
+and no fixture container, network, volume or image remains. The app,
+environments and domain binding are gone; `https://eregion-alpha-two.mbvlabs.com/`
+returns Cloudflare `525` because Caddy has no route/certificate. The
+pre-existing Cloudflare DNS record still resolves and was not changed. Only the
+pre-existing `githello` hook and original repository branches remain. The four
+pre-existing URLs return HTTP 200 and `doctor` is 20/0/0.
+
+### 2026-11-06 alpha.2 audited pass halted by policy change
+
+The operator changed the qualification policy during this audited pass: no
+fresh-server baseline is required for every alpha, alpha.1 stays
+operator-qualified, alpha.2 is qualified incrementally against its own
+acceptance criteria, and macOS acceptance (R10) remains required before
+v1.0.0 final. The policy is codified in MASTER section 7 and at the top of this
+document. The operator then directed an immediate stop to new mutating tests.
+
+Completed before the stop:
+
+- **Guided file-free create — pass.** The fixture app `a2defs1106/production`
+  was created through the guided plan and confirmation path without a
+  definition file (`op_29b5ffe04dbda9e724960853e8aef430`), with the authorized
+  `eregion-alpha-two.mbvlabs.com` primary domain and image
+  `sha256:b472757e…`.
+- **Interrupted provisioning retry — pass.** A PostgreSQL resource apply with
+  exec health deliberately set to `false` failed and left the resource
+  degraded (`op_8ef5af49dd1538e5d130801f8400a8df`), with volume
+  `er-res-bbbb6c658dff7163ecb31da66ff4d6e9-db-data`. The retry with
+  `pg_isready -U postgres` succeeded (`op_8c6283fba697d32cfd66791073895178`),
+  state `ready`/`healthy`, and reused the same volume identity. The resource
+  was not attached to a revision and no deployment was started.
+
+No further audited cases were started after the stop directive. In
+particular, the following were not executed in this pass: file-driven alias
+removal with `--confirm-domain`; data retention after detach/declaration
+removal on this fixture; destroy-active-dependent refusal; explicit
+`--delete-data` refusal of a foreign volume; external dependency without a
+managed resource; unhealthy-dependency deploy refusal with an existing serving
+release; failed `gh` setup then successful retry; and deploy/webhook no implicit
+definition. Earlier records cover some of these on prior fixtures; this pass
+does not claim them.
+
+**Cleanup.** The ready-but-unattached PostgreSQL resource was destroyed with
+`--delete-data` as `op_40b47b8f8d0d242c802c4d6509bb450e`; the fixture network
+`er-env_edb8b65f3647c29181255c4feec19a00` was removed; registry manifest
+`127.0.0.1:5000/a2defs1106@sha256:b472757e…` was deleted (HTTP 202); local
+`a2defs1106-pgapp:v3` and registry `a2defs1106:pgv3` tags were removed. No
+`a2defs1106` container, network, volume or image remains.
+
+Residual: `a2defs1106/production` still has revision 1 (image source, config and
+`POSTGRES_PASSWORD` name), the primary domain binding
+`eregion-alpha-two.mbvlabs.com` (route pending with no serving upstream), no
+serving release, and no containers. The app/environment/domain/secret rows
+remain because deletion needs the D7 human factor:
+
+```sh
+eregion --context main app delete a2defs1106 --confirm a2defs1106
+```
+
+The Cloudflare DNS record remains pre-existing and unchanged; it was not
+removed because no safe Cloudflare access is available. Only the pre-existing
+`githello` hook and original repository branches exist.
+
 ### Release-channel source integration (2026-11-06, before publication)
 
 The existing `v1.0.0-alpha.1` tag predates this change; its release publication
@@ -237,11 +775,13 @@ them at `EREGION_DATABASE_URL` or a shared database. Record them as not run unle
 explicitly selected. The `postgres`, `ssh-fixture`, `transport` and `wireguard`
 recipes are legacy fixtures, not the qualification policy.
 
-## Alpha.2 acceptance — planned
+## Alpha.2 acceptance — incremental
 
-These are acceptance targets, not a record of a completed run. Run mutating
-checks only on an authorized disposable app, server, control database and
-GitHub repository; record the candidate build and sanitized operation evidence.
+These are alpha.2 acceptance targets, qualified incrementally on the authorized
+existing target; a complete fresh-server baseline is not required for every
+alpha. Run mutating checks only on an authorized disposable app, server,
+control database and GitHub repository; record the candidate build and
+sanitized operation evidence. Alpha.1 remains operator-qualified.
 
 - Existing guided and flag-only app creation works without an app file. A file
   is never implicitly applied by a deploy or webhook push.
@@ -274,6 +814,11 @@ GitHub repository; record the candidate build and sanitized operation evidence.
   and retry behavior, JSON/no-TTY operation, and secret-safe output.
 
 ## Alpha baseline — one main node
+
+This is the historical alpha.1/final-rehearsal baseline guidance. Under the
+current incremental policy it is **not required for every alpha**; alpha.2 is
+qualified on its own criteria. It remains available for a v1.0.0-final
+fresh-server rehearsal if the operator requires one.
 
 Run on an authorized fresh server (Debian 13 or Ubuntu 26.04) with a Go test app
 that prints its version, a second commit of it, and a commit whose health check
@@ -885,14 +1430,58 @@ is done. This checkout does not reconstruct a complete baseline or select a
 qualifying build: the run records below span several published edge builds and
 retain the evidence available, including partial and not-run checks. They are
 history, not open alpha.1 blockers. Alpha.2 is implemented at source level and
-remains unqualified: `edge-ef4a6f879f45` passed the definition-file, export,
+remains unqualified. `edge-ef4a6f879f45` passed the definition-file, export,
 secret-name and validation checks and applied migrations 022–023 on `main`, but
-the Docker 29.1.3 image-inspect template defect blocked resource provisioning,
-health, secret injection, deployment gating and data-retention checks, and
-file-based removal of the last resource and last secret name was not applied. A transient
-control-database/Funnel outage produced the generic `host.retention` warning
-and then recovered; the fixture app/environment remains because deletion needs
-the human factor. See the 2026-11-06 alpha.2 record above and MASTER section 8.
+found the Docker 29.1.3 image-inspect and empty-slice removal defects. Both
+fixes were retested on `edge-ba175353f00a`: resource provisioning, healthy exec
+checks, secret injection, file-based resource provisioning, explicit empty
+resource/secret removal, attach/detach and data retention across
+destroy/re-apply all passed for own Redis and PostgreSQL fixtures, and
+delete-data cleanup left no owned container, volume or network. An unhealthy
+managed resource was refused at the deploy gate; after it was healthy, a real
+deployment served over HTTPS at the authorized `eregion-alpha-two.mbvlabs.com`
+and its response read the managed Redis (`alpha2:key=alpha2-serving`). A
+wrong-port candidate failed health and left the previous release serving. The
+authorized `gh`-assisted webhook created, verified-unchanged and rotated one
+hook without duplicates. The user then completed the first TOTP-gated app
+deletion (`op_90e6c3530ef81a575bba1542a70cda0b`); read-only checks found no
+fixture rows, containers, network or volumes.
+
+The user then authorized recreating the fixture for an end-to-end push test.
+A separate `alpha2-webhook-20261106` branch was used and `main` was unchanged.
+The gh-assisted hook delivered a real push with HTTP 202 and operation
+`op_1380428ab35058512af820f5d7807a61`, building `rel_29c45e28…` and serving
+`/marker` 200. The manual one-time secret was handled only in 0600 temporary
+files and on `gh api` stdin, never printed and shredded; a second push delivered
+HTTP 202 and operation `op_b4dc5f8b225d318510c10293aff9ebaf`, building
+`rel_df70f2bf…` and serving `/marker` 200. The missing-`gh` fallback reported
+`skipped` with manual setup available; missing admin permission was not tested
+at that point (later simulated). The hook and test branch were deleted and the
+desired source ref returned to
+`main`. The user then completed the recreated fixture's TOTP-gated app deletion
+(`op_362bea6789b9617855c43b37a093e16e`); read-only checks found no fixture
+app/environment/domain/resource/release/secret rows, containers, network or
+volumes. The three identified fixture image artifacts were then removed after
+reference checks; the pre-existing Cloudflare DNS record remains because no safe
+Cloudflare access was available. The hostname returns Cloudflare `525` because
+its route/certificate is gone.
+
+A further disposable pass on `edge-ba175353f00a` then covered file-vs-flags
+desired state, distinct staging/production overrides, managed PostgreSQL app
+consumption and persistence across restart/redeploy, stale-plan refusal, and a
+simulated missing-admin `gh` fallback. `--confirm-domain` and an explicit
+external dependency remain blocked. The user then deleted the recreated fixture
+(`op_c113f640932b31df52c4a92117f3d105`); read-only checks confirmed the
+default-retained PostgreSQL volume persisted untracked with its ownership
+labels and no container references, and that authorized test volume was then
+removed. The app, environments, domain binding, containers, network and images
+are gone; only the pre-existing DNS record remains.
+
+Alpha.2 remains unqualified pending the remaining incremental acceptance
+criteria; a fresh-server baseline is not required by the updated policy.
+`host.retention` remains intermittently 19/1 with healthy data, consistent with
+a transient control-database read. See the 2026-11-06 alpha.2 records above and
+MASTER section 8.
 
 The 2026-10-29/30 runs closed
 release-changing dense switches, symlink-escape rejection, same-key replay after
@@ -2830,6 +3419,49 @@ items. All four serving URLs returned 200. Sanitized evidence:
 `890-ci-after.json`, and `890-ci-final.json` under the fresh-server evidence
 directory. No tunnel, header file, deployment or server configuration change
 was made.
+
+### 2026-11-06 — alpha.2 protection redesign (source-only, host not run)
+
+The agreed alpha.2 redesign was implemented on the working tree without a
+commit, push, server, database, Docker daemon or ambient DSN. **No row below is
+host-qualified and no operation ID exists.** Migration 024 has not been applied;
+the last host build remains `edge-ba175353f00a` at schema 23/23. The existing
+alpha.2 host records above are evidence for the earlier build, not for this
+working tree.
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| `app create` builds production and staging from one recipe, both protected, production domain only, staging no invented domain | Isolated CLI test passes (in-memory backend) | `TestAppCreateBuildsProtectedProductionAndStagingAtomically` |
+| App + both environments + revisions commit atomically; failure on the second environment rolls back the app; same-key replay returns the original; a different key is a conflict | Integration test added; **not run** without an isolated PostgreSQL DSN | `TestIntegrationAppCreateMaterialisesProductionAndStaging` |
+| Other environment names default unprotected; production/staging default protected; migration 024 backfills every existing environment protected | Unit and migration-order/checksum tests pass; migration itself **not applied** | `TestRequiresHumanFactorIsUnconditionalOnlyForAppDelete`, `TestIntegration...` (not run), `internal/controlplane/database_test.go` |
+| App delete always needs TOTP, including direct service submission | Platform policy test passes; integration test added; **not run** | `TestDeleteFactorPolicyUsesDurableTargetState`, `TestIntegrationDeleteFactorIsDecidedServerSide` |
+| Protected env delete needs TOTP; unprotected non-last env delete works with exact confirm and no TOTP in JSON/no-TTY | CLI policy and in-memory command tests pass; integration test added; **not run** | `TestEnvironmentDeleteFactorFollowsDurableProtection`, `TestIntegrationDeleteFactorIsDecidedServerSide` |
+| Last-environment delete cannot bypass app-deletion TOTP | Policy test and integration test added; **not run** | `TestDeleteFactorPolicyUsesDurableTargetState`, `TestIntegrationDeleteFactorIsDecidedServerSide` |
+| `env protect` is agent-safe; `env unprotect` without a terminal refuses; server verifies the code in the locked submission transaction | CLI in-memory tests pass; integration test added; **not run** | `TestEnvProtectionRequiresFactorOnlyToLowerProtection`, `TestIntegrationUnprotectRequiresFactorAndProtectDoesNot` |
+| HTTP refuses only actions whose current locked state needs the factor; direct service with no verifier fails closed | API tests pass for app delete refusal and preview; no host HTTP test | `internal/api/factor_test.go` |
+| `env create --from` for `pr-42` uses the shared recipe with no `pr-42` override; app create resolves production/staging overrides; export puts domains under the environment override | Isolated appdef/CLI tests pass | `TestEnvironmentCreateFromSharedRecipeNeedsNoNamedOverride`, `TestDefinitionFileAndFlagsBuildTheSameFirstRevision`, `internal/appdef` tests |
+| Secret values never enter operation input, events or River arguments; only names and ephemeral request factor data | Source review and redaction tests; no host submission | package tests |
+| `app create` supplied secret values and Git read credential materialize in **both** production and staging namespaces when shared; an environment-specific name/credential never leaks into the other namespace | Isolated CLI tests with an in-memory vault recording namespaces and payloads pass | `TestAppCreateWritesSharedSecretsToBothEnvironmentNamespaces`, `TestSetupSecretWritesRespectEnvironmentSpecificNames` |
+| TOTP protect store read-modify-write mutations are serialized across independent processes: one replay succeeds, one confirmation succeeds, one rotation succeeds, and concurrent wrong codes reach lockout | Multiprocess helper-process tests pass | `TestMultiprocessVerifyAcceptsOneReplay`, `TestMultiprocessConfirmAcceptsOneConfirmation`, `TestMultiprocessRotateAcceptsOneRotation`, `TestMultiprocessFailuresReachLockout` |
+
+Checks run on the working tree only: `go build ./...`, `go vet ./...`,
+`GOOS=darwin GOARCH=arm64 go build ./...`, `go test ./...`, the selected
+`go test ./internal/platform ./internal/appdef ./internal/cli ./internal/api ./internal/controlplane`
+run, and the protect multiprocess suite. `go test -race` was not run because
+this environment lacks cgo.
+The PostgreSQL integration tests above skip when `EREGION_TEST_DATABASE_URL` is
+unset. Remaining host qualification (not authorized or available in this
+task): apply migration 024 on an authorized disposable database, create an app
+and confirm two protected environments, exercise protected and last deletions
+with a real TOTP and unprotected deletion without one, apply policy over HTTP,
+and confirm an unprotected non-last `env delete --json` and `pr-42` recipe
+creation against the existing node. Host qualification must also verify that
+shared creation secrets exist in both environment vault namespaces and that
+concurrent node RPC code use cannot replay a TOTP step or lose lockout counts;
+the multiprocess evidence here is from separate test-binary processes on this
+workstation, not node RPC over SSH. Existing environments become protected by
+migration 024; the operator must unprotect any older disposable environment
+with the factor before an agent may delete it.
 
 ```text
 Date / build / commit / channel:

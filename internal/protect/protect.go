@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -139,6 +140,36 @@ func (s *Store) save(st State) error {
 	return nil
 }
 
+// lockPath is stable across save's rename of the state file. The lock serializes
+// read-modify-write mutations across independent node RPC processes; Status
+// remains lock-free because save publishes a complete file with rename.
+func (s *Store) lockPath() string {
+	return s.Path + ".lock"
+}
+
+// withMutationLock runs one state mutation under an exclusive process-safe
+// lock. The lock file is never renamed or removed, so every process locks the
+// same inode. A process death releases the kernel lock automatically.
+func (s *Store) withMutationLock(change func() error) error {
+	dir := filepath.Dir(s.Path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return contract.NewFault(contract.Unavailable, "could not create the two-factor state directory", err.Error())
+	}
+	lock, err := os.OpenFile(s.lockPath(), os.O_CREATE|os.O_RDWR, 0o600) //nolint:gosec // fixed root-only state path beside the 0600 state file.
+	if err != nil {
+		return contract.NewFault(contract.Unavailable, "could not open the two-factor state lock", err.Error())
+	}
+	defer lock.Close()
+	if err := lock.Chmod(0o600); err != nil {
+		return contract.NewFault(contract.Unavailable, "could not protect the two-factor state lock", err.Error())
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return contract.NewFault(contract.Unavailable, "could not lock the two-factor state", err.Error())
+	}
+	defer func() { _ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN) }()
+	return change()
+}
+
 // Status reports the gate without accepting a code.
 func (s *Store) Status() (Status, error) {
 	st, err := s.load()
@@ -158,6 +189,16 @@ func (s *Store) Status() (Status, error) {
 // Init makes a new pending secret. With a confirmed secret it refuses unless
 // rotate, and rotating needs a current code from the confirmed one.
 func (s *Store) Init(rotate bool, label, code string) (Setup, error) {
+	var setup Setup
+	err := s.withMutationLock(func() error {
+		var err error
+		setup, err = s.initLocked(rotate, label, code)
+		return err
+	})
+	return setup, err
+}
+
+func (s *Store) initLocked(rotate bool, label, code string) (Setup, error) {
 	st, err := s.load()
 	if err != nil {
 		return Setup{}, err
@@ -190,6 +231,16 @@ func (s *Store) Init(rotate bool, label, code string) (Setup, error) {
 // Confirm checks a code from the pending secret and makes it the confirmed
 // one.
 func (s *Store) Confirm(code string) (Status, error) {
+	var status Status
+	err := s.withMutationLock(func() error {
+		var err error
+		status, err = s.confirmLocked(code)
+		return err
+	})
+	return status, err
+}
+
+func (s *Store) confirmLocked(code string) (Status, error) {
 	st, err := s.load()
 	if err != nil {
 		return Status{}, err
@@ -197,8 +248,7 @@ func (s *Store) Confirm(code string) (Status, error) {
 	if st.Pending == "" {
 		return Status{}, contract.NewFault(contract.PreconditionFailed, "there is no pending two-factor setup to confirm", "Run eregion protect init first.")
 	}
-	st, err = s.verify(st, code, true)
-	if err != nil {
+	if _, err = s.verify(st, code, true); err != nil {
 		return Status{}, err
 	}
 	return s.Status()
@@ -207,15 +257,17 @@ func (s *Store) Confirm(code string) (Status, error) {
 // Verify checks a current code against the confirmed secret without changing
 // the setup. The accepted step is recorded, so a code works once.
 func (s *Store) Verify(code string) error {
-	st, err := s.load()
-	if err != nil {
+	return s.withMutationLock(func() error {
+		st, err := s.load()
+		if err != nil {
+			return err
+		}
+		if st.Secret == "" {
+			return contract.NewFault(contract.PreconditionFailed, "this node has no two-factor protection set up", "A human runs eregion protect init at a terminal first.")
+		}
+		_, err = s.verify(st, code, false)
 		return err
-	}
-	if st.Secret == "" {
-		return contract.NewFault(contract.PreconditionFailed, "this node has no two-factor protection set up", "A human runs eregion protect init at a terminal first.")
-	}
-	_, err = s.verify(st, code, false)
-	return err
+	})
 }
 
 func (s *Store) verify(st State, code string, pending bool) (State, error) {

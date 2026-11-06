@@ -59,6 +59,10 @@ type Service struct {
 	// material and the secret values handed to one node step). Node events are
 	// redacted with it before they are persisted.
 	redaction *secrets.Registry
+	// humanFactor verifies a transient TOTP code from protect.Store inside the
+	// submission transaction. A nil verifier fails every factor-gated action
+	// closed; HTTP submissions therefore cannot perform one.
+	humanFactor func(string) error
 }
 
 // SecretResolver resolves opaque environment secret references without

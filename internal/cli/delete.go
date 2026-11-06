@@ -68,9 +68,9 @@ func (a *app) envDeleteSpec() spec {
 	meta := deleteMeta("Delete one environment after workload cleanup",
 		"eregion env delete api production --confirm api/production --json")
 	meta.WhenToUse = []string{
-		"Remove one environment after its containers, routes and secrets are cleaned up. Deleting the last environment also deletes the app.",
+		"Remove one environment after its containers, routes and secrets are cleaned up. Deleting the last environment also deletes the app, so it needs the app-deletion human factor.",
 		"The confirmation token must name the current environment as app/environment; --yes is never accepted.",
-		"A real deletion also needs a TOTP code typed at a human terminal (D7). A dry run needs neither the code nor a terminal.",
+		"A protected or last environment needs a TOTP code typed at a human terminal (D7, D33). An unprotected non-last environment needs only --confirm, including with --json and no TTY. A dry run needs neither the code nor a terminal.",
 	}
 	meta.Examples = []string{
 		"eregion env delete api production --dry-run --json",
@@ -136,17 +136,26 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 		return result{}, err
 	}
 	action := "eregion app delete"
+	needsFactor := true
 	if environment != "" {
 		action = "eregion env delete"
+		needsFactor, err = a.environmentDeleteNeedsHumanFactor(cmd, app, environment)
+		if err != nil {
+			return result{}, err
+		}
 	}
-	if err := requireHuman(cmd, action); err != nil {
-		return result{}, err
+	var secretValues map[string]string
+	if needsFactor {
+		if err := requireHuman(cmd, action); err != nil {
+			return result{}, err
+		}
+		code, err := readProtectCode(cmd, "Code from the authenticator app")
+		if err != nil {
+			return result{}, err
+		}
+		secretValues = map[string]string{protect.CodeSecret: code}
 	}
-	code, err := readProtectCode(cmd, "Code from the authenticator app")
-	if err != nil {
-		return result{}, err
-	}
-	op, err := a.submitAcceptedWithSecrets(cmd, kind, target.String(), input, confirm, map[string]string{protect.CodeSecret: code})
+	op, err := a.submitAcceptedWithSecrets(cmd, kind, target.String(), input, confirm, secretValues)
 	if err != nil {
 		return result{}, err
 	}
@@ -161,6 +170,26 @@ func (a *app) runDelete(cmd *cobra.Command, kind string, target platform.Target,
 	plain := fmt.Sprintf("Deletion accepted for %s\noperation: %s\nstate: %s\nnext: eregion operations follow %s --json\n",
 		target.String(), op.ID, op.State, op.ID)
 	return result{data: data, plain: plain}, nil
+}
+
+// environmentDeleteNeedsHumanFactor reads the target's durable protection and
+// the application-wide environment count. The control plane re-checks both in
+// the submission transaction, so a concurrent protection or sibling change
+// can never turn this client read into a bypass.
+func (a *app) environmentDeleteNeedsHumanFactor(cmd *cobra.Command, app, environment string) (bool, error) {
+	env, _, err := a.readEnvironment(cmd, app, environment)
+	if err != nil {
+		return false, err
+	}
+	raw, err := a.platformReadInventoryWith(cmd, "environments", urlValues("app", app, "limit", "200"))
+	if err != nil {
+		return false, err
+	}
+	environments, err := decodeInventoryItems[platform.Environment](raw)
+	if err != nil {
+		return false, err
+	}
+	return platform.EnvironmentDeleteRequiresHumanFactor(env.Protected, len(environments) <= 1), nil
 }
 
 // followAccepted attaches the shared viewer after a mutation. Ctrl-C detaches;

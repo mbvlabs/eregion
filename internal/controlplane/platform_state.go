@@ -63,7 +63,7 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 		return zero, unavailable()
 	}
 	defer rollback(tx)
-	op, _, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, sub.Actor, sub.IdempotencyKey, resolved)
+	op, _, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, sub.Actor, sub.IdempotencyKey, resolved, sub.HumanFactor)
 	if err != nil {
 		return zero, err
 	}
@@ -79,7 +79,7 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 // and by the webhook worker, so a webhook can commit its operation and its
 // delivery link atomically without calling Service.Submit (which opens a
 // transaction) or nesting one.
-func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, key string, resolved *resolvedGitRef) (contract.Operation, bool, error) {
+func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, key string, resolved *resolvedGitRef, humanFactor string) (contract.Operation, bool, error) {
 	var zero contract.Operation
 	inputHash := hashInput(normalized.Canonical)
 	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
@@ -109,7 +109,7 @@ func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id 
 		}
 		return existing, false, nil
 	}
-	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved); err != nil {
+	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved, humanFactor); err != nil {
 		return zero, false, err
 	}
 	if s.enqueuePlatform == nil {
@@ -214,6 +214,8 @@ func platformAcceptedMessage(kind string) string {
 		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach,
 		platform.KindEnvironmentResourceAttach, platform.KindEnvironmentResourceDetach:
 		return "Environment desired state accepted durably as a new revision; no deploy was queued."
+	case platform.KindEnvironmentProtect:
+		return "Environment protection change accepted durably."
 	case platform.KindReleaseCreate:
 		return "Release accepted durably; the image is verified or built before it becomes ready."
 	case platform.KindBuildStop:
@@ -251,7 +253,7 @@ func platformAcceptedMessage(kind string) string {
 	}
 }
 
-func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef) error {
+func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef, humanFactor string) error {
 	switch input := normalized.Input.(type) {
 	case *platform.AppCreateInput:
 		appID, err := platform.NewAppID()
@@ -261,17 +263,19 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name) VALUES($1,$2)`, appID, input.Name); err != nil {
 			return platformWriteError(err, "application name already exists")
 		}
-		if input.Environment != nil {
-			app := platform.App{ID: appID, Name: input.Name}
-			summary := "Created environment " + input.Environment.Name + " with its first desired-state revision."
-			if input.Deploy {
+		app := platform.App{ID: appID, Name: input.Name}
+		for index := range input.Environments {
+			spec := &input.Environments[index]
+			deployIntent := input.Deploy && index == 0
+			summary := "Created environment " + spec.Name + " with its first desired-state revision."
+			if deployIntent {
 				summary += " The first deploy was queued from that revision."
 			}
-			envID, err := s.insertEnvironmentTx(ctx, tx, app, input.Environment, id, actor, "environment.created", summary, input.Deploy)
+			envID, err := s.insertEnvironmentTx(ctx, tx, app, spec, id, actor, "environment.created", summary, deployIntent)
 			if err != nil {
 				return err
 			}
-			if input.Deploy {
+			if deployIntent {
 				if err := s.queueFirstDeployTx(ctx, tx, envID, actor, resolved); err != nil {
 					return err
 				}
@@ -293,7 +297,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return contract.NewFault(contract.Conflict, "node is enrolling or enrolled; declared facts cannot overwrite verified ones", "An enrolled node's verified facts cannot be replaced by declared facts.")
 		}
 	case *platform.EnvironmentCreateInput:
-		app, err := appByNameTx(ctx, tx, input.App)
+		app, err := appByNameForUpdateTx(ctx, tx, input.App)
 		if err != nil {
 			return err
 		}
@@ -681,12 +685,31 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		return s.prepareResourceApply(ctx, tx, id, input)
 	case *platform.ResourceDestroyInput:
 		return s.prepareResourceDestroy(ctx, tx, id, input)
+	case *platform.EnvironmentProtectInput:
+		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
+		if err != nil {
+			return err
+		}
+		if env.Protected == input.Protected {
+			return nil
+		}
+		if platform.ProtectionChangeRequiresHumanFactor(env.Protected, input.Protected) {
+			if err := s.requireHumanFactorTx(humanFactor); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET protected=$2,updated_at=clock_timestamp() WHERE id=$1`, env.ID, input.Protected); err != nil {
+			return unavailable()
+		}
 	case *platform.AppDeleteInput:
-		app, err := appByNameTx(ctx, tx, input.App)
+		app, err := appByNameForUpdateTx(ctx, tx, input.App)
 		if err != nil {
 			return err
 		}
 		if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
+			return err
+		}
+		if err := s.requireHumanFactorTx(humanFactor); err != nil {
 			return err
 		}
 		if err := s.ensureNoLiveResourcesTx(ctx, tx, input.App, "", string(app.ID), ""); err != nil {
@@ -696,12 +719,25 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 	case *platform.EnvironmentDeleteInput:
+		app, err := appByNameForUpdateTx(ctx, tx, input.App)
+		if err != nil {
+			return err
+		}
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
 			return err
 		}
 		if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
 			return err
+		}
+		last, err := lastEnvironmentTx(ctx, tx, string(app.ID), string(env.ID))
+		if err != nil {
+			return err
+		}
+		if platform.EnvironmentDeleteRequiresHumanFactor(env.Protected, last) {
+			if err := s.requireHumanFactorTx(humanFactor); err != nil {
+				return err
+			}
 		}
 		if err := s.ensureNoLiveResourcesTx(ctx, tx, env.App, env.Name, string(envAppID(ctx, tx, env.App)), string(env.ID)); err != nil {
 			return err
@@ -724,6 +760,52 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		// River job, event history, and target lock remain shared.
 	}
 	return nil
+}
+
+// environmentSpecDomains lists every hostname a first-environment declaration
+// would bind, including the legacy single-domain field.
+func environmentSpecDomains(spec *platform.EnvironmentSpec) []string {
+	names := make([]string, 0, len(spec.Domains)+1)
+	if spec.Domain != "" {
+		names = append(names, spec.Domain)
+	}
+	for _, domain := range spec.Domains {
+		names = append(names, domain.Domain)
+	}
+	return names
+}
+
+// requireHumanFactorTx verifies the D7 TOTP code inside the submission
+// transaction. A process with no verifier fails closed, so HTTP and direct
+// service callers cannot perform a factor-gated action by omitting the code.
+func (s *Service) requireHumanFactorTx(code string) error {
+	if s.humanFactor == nil {
+		return contract.NewFault(contract.PreconditionFailed,
+			"this server cannot verify the human factor",
+			"Run the deletion or unprotection through the node RPC transport, where the TOTP code is verified inside the request.")
+	}
+	return s.humanFactor(code)
+}
+
+// lastEnvironmentTx reports whether envID is the application's only remaining
+// environment. The application row is locked by the caller, so a concurrent
+// environment create or delete cannot change the answer mid-submission.
+func lastEnvironmentTx(ctx context.Context, tx pgx.Tx, appID, envID string) (bool, error) {
+	var count int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_environments WHERE app_id=$1`, appID).Scan(&count); err != nil {
+		return false, unavailable()
+	}
+	if count != 1 {
+		return false, nil
+	}
+	var found string
+	if err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_environments WHERE app_id=$1 AND id=$2`, appID, envID).Scan(&found); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, unavailable()
+	}
+	return true, nil
 }
 
 // insertDomainTx writes or promotes one domain binding. It is shared by
@@ -903,13 +985,14 @@ func (s *Service) resolveSubmissionGitRef(ctx context.Context, normalized platfo
 		}
 		return s.resolveGitSourceRef(ctx, env.App, env.Name, env.Revision.Source, ref)
 	case *platform.AppCreateInput:
-		if !input.Deploy || input.Environment == nil {
+		if !input.Deploy || len(input.Environments) == 0 {
 			return nil, nil
 		}
-		if input.Environment.Source.Kind != "git" {
-			return &resolvedGitRef{Kind: input.Environment.Source.Kind, URL: input.Environment.Source.URL}, nil
+		first := &input.Environments[0]
+		if first.Source.Kind != "git" {
+			return &resolvedGitRef{Kind: first.Source.Kind, URL: first.Source.URL}, nil
 		}
-		return s.resolveGitSourceRef(ctx, input.Name, input.Environment.Name, input.Environment.Source, input.Environment.Source.Ref)
+		return s.resolveGitSourceRef(ctx, input.Name, first.Name, first.Source, first.Source.Ref)
 	case *platform.EnvironmentCreateInput:
 		if !input.Deploy {
 			return nil, nil
@@ -1182,7 +1265,7 @@ func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind
 	if err != nil {
 		return err
 	}
-	_, _, err = s.recordPlatformSubmissionTx(ctx, tx, id, normalized, actor, key, resolved)
+	_, _, err = s.recordPlatformSubmissionTx(ctx, tx, id, normalized, actor, key, resolved, "")
 	return err
 }
 
@@ -1471,7 +1554,7 @@ func (s *Service) inventoryApps(ctx context.Context, query platform.InventoryQue
 	return items, rows.Err()
 }
 
-const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.build_node,''),e.host_port,e.candidate_port,e.container_port,
+const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,e.protected,coalesce(e.build_node,''),e.host_port,e.candidate_port,e.container_port,
     e.bind_address,e.health_type,e.health_path,e.health_timeout_seconds,e.env,e.secret_refs,e.secret_revision,
     coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,''),coalesce(e.serving_release_id,''),coalesce(e.serving_deployment_id,''),
     e.health_state,e.health_detail,e.health_checked_at,
@@ -1500,7 +1583,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var autoDeploy, deployIntent bool
 	var secretNames, resourceNames []string
 	var revisionCreated *time.Time
-	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
+	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.Protected, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
 		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
 		&env.PrimaryDomain, &primaryDNS, &env.PendingCleanup, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
@@ -2003,8 +2086,23 @@ func (s *Service) previousRollbackRelease(ctx context.Context, env platform.Envi
 // --------------------------------------------------------------- tx lookups
 
 func appByNameTx(ctx context.Context, tx pgx.Tx, name string) (platform.App, error) {
+	return appByNameQueryTx(ctx, tx, name, false)
+}
+
+// appByNameForUpdateTx serializes environment creation and deletion against
+// the application row, so "the last environment" is decided against a stable
+// set and an application deletion cannot race a sibling environment creation.
+func appByNameForUpdateTx(ctx context.Context, tx pgx.Tx, name string) (platform.App, error) {
+	return appByNameQueryTx(ctx, tx, name, true)
+}
+
+func appByNameQueryTx(ctx context.Context, tx pgx.Tx, name string, forUpdate bool) (platform.App, error) {
 	var app platform.App
-	err := tx.QueryRow(ctx, `SELECT id,name,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`, name).
+	statement := `SELECT id,name,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`
+	if forUpdate {
+		statement += " FOR UPDATE"
+	}
+	err := tx.QueryRow(ctx, statement, name).
 		Scan(&app.ID, &app.Name, &app.CreatedAt, &app.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return app, contract.NewFault(contract.NotFound, "application not found", "Create the application first.")
@@ -2152,31 +2250,61 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		if err := s.checkPreviewAppAvailable(ctx, input.Name); err != nil {
 			return preview, err
 		}
-		if input.Environment == nil {
+		if len(input.Environments) == 0 {
 			preview.Summary = "Create application " + input.Name + " without an environment."
 			break
 		}
-		if err := s.checkPreviewPlacement(ctx, input.Environment.Node, input.Environment.BuildNode); err != nil {
-			return preview, err
+		preview.Steps = []string{"record application"}
+		preview.Summary = "Create application " + input.Name + " with environments"
+		domains := map[string]string{}
+		for index := range input.Environments {
+			spec := &input.Environments[index]
+			if err := s.checkPreviewPlacement(ctx, spec.Node, spec.BuildNode); err != nil {
+				return preview, err
+			}
+			if index == 0 {
+				if err := checkPreviewDeploySource(spec, input.Deploy); err != nil {
+					return preview, err
+				}
+			}
+			for _, name := range environmentSpecDomains(spec) {
+				if other, exists := domains[name]; exists {
+					return preview, contract.NewFault(contract.Conflict,
+						name+" is declared for both "+other+" and "+spec.Name,
+						"Each hostname can route to one environment; put distinct domains in each environment override.")
+				}
+				domains[name] = spec.Name
+				if err := s.checkPreviewDomainAvailable(ctx, name); err != nil {
+					return preview, err
+				}
+			}
+			preview.Steps = append(preview.Steps, "record environment "+spec.Name+" and its first revision", "allocate ports for "+spec.Name)
+			preview.Summary += " " + spec.Name
+			if spec.Domain != "" {
+				preview.Steps = append(preview.Steps, "record the primary domain binding for "+spec.Name+" before any first deploy")
+			}
+			if spec.BuildNode != "" && spec.BuildNode != spec.Node && spec.Source.Kind == "git" {
+				preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
+			}
 		}
-		if err := checkPreviewDeploySource(input.Environment, input.Deploy); err != nil {
-			return preview, err
-		}
-		if err := s.checkPreviewDomainAvailable(ctx, input.Environment.Domain); err != nil {
-			return preview, err
-		}
-		preview.Steps = []string{"record application", "record first environment and revision", "allocate ports"}
-		preview.Summary = "Create application " + input.Name + " with environment " + input.Environment.Name + " on node " + input.Environment.Node + "."
-		if input.Environment.Domain != "" {
-			preview.Steps = append(preview.Steps, "record the primary domain binding before any first deploy")
-			preview.Summary += " Domain " + input.Environment.Domain + " is bound in the same submission."
-		}
-		if input.Environment.BuildNode != "" && input.Environment.BuildNode != input.Environment.Node && input.Environment.Source.Kind == "git" {
-			preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
-		}
+		preview.Summary += "."
 		if input.Deploy {
-			preview.Steps = append(preview.Steps, "queue the first deploy from the new revision")
-			preview.Summary += " A first deploy is queued from the new revision."
+			preview.Steps = append(preview.Steps, "queue the first deploy from the first environment's new revision")
+			preview.Summary += " A first deploy is queued from " + input.Environments[0].Name + "'s new revision."
+		}
+	case *platform.EnvironmentProtectInput:
+		env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
+		if err != nil {
+			return preview, err
+		}
+		state := "protected"
+		if !input.Protected {
+			state = "unprotected"
+		}
+		preview.Steps = []string{"record the environment protection state"}
+		preview.Summary = "Set " + input.App + "/" + input.Environment + " to " + state + "."
+		if platform.ProtectionChangeRequiresHumanFactor(env.Protected, input.Protected) {
+			preview.Warnings = append(preview.Warnings, "Lowering protection requires the D7 TOTP human factor at a human terminal.")
 		}
 	case *platform.EnvironmentCreateInput:
 		if err := s.checkPreviewApp(ctx, input.App); err != nil {

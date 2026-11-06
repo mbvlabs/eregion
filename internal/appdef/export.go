@@ -97,16 +97,13 @@ func Export(app, environment, buildNode string, revision *platform.EnvironmentRe
 	var out strings.Builder
 	fmt.Fprintf(&out, "version = %d\n", Version)
 	fmt.Fprintf(&out, "app = %s\n", quote(app))
-	fmt.Fprintf(&out, "environment = %s\n", quote(environment))
 	fmt.Fprintf(&out, "node = %s\n", quote(state.Runtime.Node))
 	fmt.Fprintf(&out, "build_node = %s\n", quote(buildNode))
 	fmt.Fprintf(&out, "secret_names = %s\n", stringArray(state.SecretNames))
 	if len(processes) == 0 {
 		out.WriteString("processes = []\n")
 	}
-	if len(sortedDomains) == 0 {
-		out.WriteString("domains = []\n")
-	}
+	out.WriteString("domains = []\n")
 
 	out.WriteString("\n[source]\n")
 	out.WriteString("kind = " + quote(state.Source.Kind) + "\n")
@@ -223,17 +220,20 @@ func Export(app, environment, buildNode string, revision *platform.EnvironmentRe
 		out.WriteString("\n")
 	}
 
-	for index, binding := range sortedDomains {
-		if index == 0 {
-			out.WriteString("\n")
+	// Domains are environment-specific: one hostname cannot route to two
+	// environments. Exporting them under the selected environment's optional
+	// override keeps the shared recipe reusable for staging, PR environments and
+	// arbitrary names without duplicating a hostname.
+	if len(sortedDomains) > 0 {
+		fmt.Fprintf(&out, "\n[environments.%s]\n", tomlKey(environment))
+		for _, binding := range sortedDomains {
+			fmt.Fprintf(&out, "\n[[environments.%s.domains]]\n", tomlKey(environment))
+			fmt.Fprintf(&out, "name = %s\n", quote(binding.Domain))
+			fmt.Fprintf(&out, "primary = %t\n", binding.Primary)
+			if binding.CheckPath != "" {
+				fmt.Fprintf(&out, "check_path = %s\n", quote(binding.CheckPath))
+			}
 		}
-		out.WriteString("[[domains]]\n")
-		fmt.Fprintf(&out, "name = %s\n", quote(binding.Domain))
-		fmt.Fprintf(&out, "primary = %t\n", binding.Primary)
-		if binding.CheckPath != "" {
-			fmt.Fprintf(&out, "check_path = %s\n", quote(binding.CheckPath))
-		}
-		out.WriteString("\n")
 	}
 	return strings.TrimRight(out.String(), "\n") + "\n", nil
 }

@@ -243,6 +243,10 @@ type Environment struct {
 	App  string        `json:"app"`
 	Name string        `json:"name"`
 	Node string        `json:"node"`
+	// Protected gates a real environment deletion behind the human factor.
+	// production and staging are created protected by default; other names are
+	// unprotected by default. An application deletion always needs the factor.
+	Protected bool `json:"protected"`
 	// BuildNode optionally places Buildpacks execution on a distinct builder
 	// node. When empty, builds run on Node. It must have builder + buildpacks,
 	// and it is always authenticated through the node transport, never a name.

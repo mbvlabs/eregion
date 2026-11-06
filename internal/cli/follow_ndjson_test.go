@@ -34,10 +34,12 @@ var followingCommands = []struct {
 	{name: "build stop", path: "eregion build stop", args: []string{"build", "stop", "bld_" + strings.Repeat("a", 32)}},
 	{name: "build retry", path: "eregion build retry", args: []string{"build", "retry", "bld_" + strings.Repeat("a", 32)}},
 	{name: "build logs", path: "eregion build logs", args: []string{"build", "logs", "bld_" + strings.Repeat("a", 32)}},
-	{name: "app create", path: "eregion app create", args: []string{"app", "create", "--name", "api", "--environment", "production", "--node", "main", "--git-url", "https://github.com/acme/api"}},
+	{name: "app create", path: "eregion app create", args: []string{"app", "create", "--name", "api", "--node", "main", "--git-url", "https://github.com/acme/api"}},
 	{name: "app delete", path: "eregion app delete", args: []string{"app", "delete", "api", "--confirm", "api"}},
 	{name: "env create", path: "eregion env create", args: []string{"env", "create", "--app", "api", "--name", "production", "--node", "main", "--git-url", "https://github.com/acme/api"}},
 	{name: "env delete", path: "eregion env delete", args: []string{"env", "delete", "api", "production", "--confirm", "api/production"}},
+	{name: "env protect", path: "eregion env protect", args: []string{"env", "protect", "api", "production"}},
+	{name: "env unprotect", path: "eregion env unprotect", args: []string{"env", "unprotect", "api", "production"}},
 	{name: "domain add", path: "eregion domain add", args: []string{"domain", "add", "api", "production", "hello.example.com"}},
 	{name: "domain remove", path: "eregion domain remove", args: []string{"domain", "remove", "api", "production", "hello.example.com", "--confirm", "hello.example.com"}},
 	{name: "process scale", path: "eregion process scale", args: []string{"process", "scale", "api", "production", "web", "2"}},
@@ -149,7 +151,6 @@ func TestNDJSONGuidedCommandsNeverPrompt(t *testing.T) {
 		{"app", "create", "--output", "ndjson"},
 		{"env", "create", "--output", "ndjson"},
 		{"app", "delete", "api", "--confirm", "api", "--output", "ndjson"},
-		{"env", "delete", "api", "production", "--confirm", "api/production", "--output", "ndjson"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			// invoke uses a stdin reader that panics if a prompt reads it.
@@ -255,13 +256,25 @@ func prepareFollowingBackend(name string, backend *ndjsonFollowBackend) {
 			App: "api", Name: "production", ServingDeploymentID: platform.DeploymentID("dep_" + strings.Repeat("a", 32)),
 		}}})
 		backend.inventory["environments"] = raw
+	case "env delete":
+		raw, _ := json.Marshal(map[string]any{"items": []platform.Environment{{
+			App: "api", Name: "production", Node: "main", Protected: true,
+		}, {
+			App: "api", Name: "staging", Node: "main", Protected: true,
+		}}})
+		backend.inventory["environments"] = raw
+	case "env protect", "env unprotect":
+		raw, _ := json.Marshal(map[string]any{"items": []platform.Environment{{
+			App: "api", Name: "production", Node: "main", Protected: false,
+		}}})
+		backend.inventory["environments"] = raw
 	}
 }
 
 func followingSubmits(name string) bool {
 	switch name {
 	case "deploy", "rollback", "restart", "build stop", "build retry",
-		"app create", "env create", "domain add", "domain remove", "process scale", "prune",
+		"app create", "env create", "env protect", "env unprotect", "domain add", "domain remove", "process scale", "prune",
 		"resource apply", "resource attach", "resource detach", "resource destroy":
 		return true
 	}
@@ -554,7 +567,7 @@ func TestGuidedCreateNDJSONDetachNamesFirstDeploy(t *testing.T) {
 		name string
 		args []string
 	}{
-		{name: "app create", args: []string{"app", "create", "--name", "api", "--environment", "production", "--node", "main", "--git-url", "https://github.com/acme/api"}},
+		{name: "app create", args: []string{"app", "create", "--name", "api", "--node", "main", "--git-url", "https://github.com/acme/api"}},
 		{name: "env create", args: []string{"env", "create", "--app", "api", "--name", "production", "--node", "main", "--git-url", "https://github.com/acme/api"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -624,7 +637,7 @@ func TestGuidedCreateNDJSONIdempotentReplay(t *testing.T) {
 		guidedStateEvent(replay, 2, contract.Succeeded, at),
 	}
 	args := []string{
-		"app", "create", "--name", "api", "--environment", "production", "--node", "main",
+		"app", "create", "--name", "api", "--node", "main",
 		"--git-url", "https://github.com/acme/api", "--idempotency-key", "stable-replay-key", "--output", "ndjson",
 	}
 	exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)

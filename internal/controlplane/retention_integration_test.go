@@ -26,13 +26,13 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 	})
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "retention-create", map[string]any{
 		"name": "retention",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-11-03"},
 			"domain":           "retention.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
 			"retention":        map[string]any{"keep_releases": 3},
-		},
+		}},
 	})
 
 	server, err := s.ServerRetentionPolicy(ctx)
@@ -131,12 +131,12 @@ func TestIntegrationPrunedReleaseRefusesDeployAndRollback(t *testing.T) {
 	})
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "pruned-create", map[string]any{
 		"name": "pruned",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/pruned:2026-11-03"},
 			"domain":           "pruned.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
-		},
+		}},
 	})
 	prunedAt := time.Date(2026, 11, 3, 10, 30, 0, 0, time.UTC)
 	releaseID := insertRetentionRelease(t, pool, "pruned", "production", &prunedAt)
@@ -231,12 +231,12 @@ func TestIntegrationPrunedReleasePreviewsRefuse(t *testing.T) {
 	})
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "preview-create", map[string]any{
 		"name": "preview",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/preview:2026-11-03"},
 			"domain":           "preview.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
-		},
+		}},
 	})
 	prunedAt := time.Date(2026, 11, 3, 10, 30, 0, 0, time.UTC)
 	releaseID := insertRetentionRelease(t, pool, "preview", "production", &prunedAt)

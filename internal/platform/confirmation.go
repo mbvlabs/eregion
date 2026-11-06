@@ -20,16 +20,20 @@ var targetConfirmedKinds = map[string]bool{
 // confirmation token.
 func RequiresTargetConfirmation(kind string) bool { return targetConfirmedKinds[kind] }
 
-// factorGatedKinds are the platform action kinds the D7 human factor gates
-// inside the performing request. Their dry run is factor-free. Token creation
-// and the exports are node RPC methods, not platform action kinds.
+// factorGatedKinds are the platform actions whose every real submission needs
+// the D7 human factor. Application deletion is unconditional: every app
+// deletion needs the factor, regardless of environment protection. Environment
+// deletion is decided per target from durable state; it is not listed here.
+// Dry runs are always factor-free. Token creation and the exports are node RPC
+// methods, not platform action kinds.
 var factorGatedKinds = map[string]bool{
-	KindAppDelete:         true,
-	KindEnvironmentDelete: true,
+	KindAppDelete: true,
 }
 
-// RequiresHumanFactor reports whether kind needs the D7 factor in the same
-// request that performs it.
+// RequiresHumanFactor reports whether kind always needs the D7 factor in the
+// same request that performs it. Environment deletion and unprotection are
+// conditional and are decided by EnvironmentDeleteRequiresHumanFactor and
+// ProtectionChangeRequiresHumanFactor against locked state.
 func RequiresHumanFactor(kind string) bool { return factorGatedKinds[kind] }
 
 // ConfirmationToken is the D12 token for one target: <app> for an application

@@ -78,10 +78,10 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 	}), contract.Succeeded)
 	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "resource-app", map[string]any{
 		"name": "api",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local", "container_port": 8080,
 			"health": map[string]any{"timeout_seconds": 5},
-		},
+		}},
 	}), contract.Succeeded)
 
 	apply := platformSubmit(t, s, platform.KindResourceApply, "resource/api/production/db", "resource-apply", map[string]any{

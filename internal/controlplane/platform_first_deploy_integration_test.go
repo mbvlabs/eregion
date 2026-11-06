@@ -23,12 +23,12 @@ func TestIntegrationCreateExposesTheFirstDeployAtAcceptance(t *testing.T) {
 	const createKey = "cli:guided:create"
 	op := platformSubmit(t, s, platform.KindAppCreate, "platform", createKey, map[string]any{
 		"name": "guided",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
 			"domain":           "guided.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
-		},
+		}},
 		"deploy": true,
 	})
 	if op.FirstDeployOperationID == "" {
@@ -55,12 +55,12 @@ func TestIntegrationCreateExposesTheFirstDeployAtAcceptance(t *testing.T) {
 
 	replayed, err := s.Submit(ctx, platformSubmission(platform.KindAppCreate, platform.PlatformTarget().String(), createKey, map[string]any{
 		"name": "guided",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
 			"domain":           "guided.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
-		},
+		}},
 		"deploy": true,
 	}))
 	if err != nil {
@@ -80,10 +80,10 @@ func TestIntegrationCreateWithoutDeployHasNoFirstDeployOperation(t *testing.T) {
 	})
 	op := platformSubmit(t, s, platform.KindAppCreate, "platform", "cli:plain:create", map[string]any{
 		"name": "plain",
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
-		},
+		}},
 	})
 	if op.FirstDeployOperationID != "" {
 		t.Fatalf("a create without deploy exposed %s", op.FirstDeployOperationID)

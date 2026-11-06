@@ -64,26 +64,33 @@ func TestVaultExportVerifiesTheFactorInsideItsRequest(t *testing.T) {
 	}
 }
 
-func TestDeleteSubmissionsCarryTheFactorOnlyWhenTheyPerform(t *testing.T) {
-	store, code := configuredProtectStore(t)
-	request := rpc.Request{Method: methodSubmit, Confirm: "api"}
-	for _, kind := range []string{platform.KindAppDelete, platform.KindEnvironmentDelete} {
-		if err := submitFactor(store, request, kind); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
-			t.Fatalf("%s without a code = %v, want precondition_failed", kind, err)
+func TestDeleteFactorPolicyUsesDurableTargetState(t *testing.T) {
+	if !platform.RequiresHumanFactor(platform.KindAppDelete) {
+		t.Fatal("app delete must always require the human factor")
+	}
+	if platform.RequiresHumanFactor(platform.KindEnvironmentDelete) {
+		t.Fatal("environment delete is conditional, not an unconditional factor kind")
+	}
+	for _, tc := range []struct {
+		name      string
+		protected bool
+		last      bool
+		want      bool
+	}{
+		{name: "protected non-last", protected: true, want: true},
+		{name: "unprotected non-last", want: false},
+		{name: "protected last", protected: true, last: true, want: true},
+		{name: "unprotected last deletes the app", last: true, want: true},
+	} {
+		if got := platform.EnvironmentDeleteRequiresHumanFactor(tc.protected, tc.last); got != tc.want {
+			t.Fatalf("%s: factor = %t, want %t", tc.name, got, tc.want)
 		}
 	}
-	if err := submitFactor(store, rpc.Request{Method: methodSubmit, DryRun: true}, platform.KindAppDelete); err != nil {
-		t.Fatalf("a delete dry run asked for the factor: %v", err)
+	if !platform.ProtectionChangeRequiresHumanFactor(true, false) {
+		t.Fatal("protected -> unprotected must require the factor")
 	}
-	if err := submitFactor(store, request, platform.KindDeploy); err != nil {
-		t.Fatalf("deploy asked for the factor: %v", err)
-	}
-	withCode := rpc.Request{Method: methodSubmit, Secrets: factorCode(code)}
-	if err := submitFactor(store, withCode, platform.KindEnvironmentDelete); err != nil {
-		t.Fatalf("valid delete code rejected: %v", err)
-	}
-	if err := submitFactor(store, withCode, platform.KindEnvironmentDelete); err == nil {
-		t.Fatal("one code was accepted for two delete submissions")
+	if platform.ProtectionChangeRequiresHumanFactor(false, true) || platform.ProtectionChangeRequiresHumanFactor(true, true) || platform.ProtectionChangeRequiresHumanFactor(false, false) {
+		t.Fatal("only protected -> unprotected may require the factor")
 	}
 }
 

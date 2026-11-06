@@ -22,7 +22,6 @@ import (
 
 const testDefinition = `version = 1
 app = "api"
-environment = "production"
 node = "main"
 secret_names = ["DATABASE_URL"]
 
@@ -54,7 +53,8 @@ args = ["serve"]
 container_port = 3000
 replicas = 1
 
-[[domains]]
+[environments.production]
+[[environments.production.domains]]
 name = "api.example.com"
 primary = true
 check_path = "/healthz"
@@ -101,6 +101,15 @@ func TestDefinitionFileAndFlagsBuildTheSameFirstRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(fileAnswers.PrebuiltSpecs) != 2 || fileAnswers.PrebuiltSpecs[0].Name != "production" || fileAnswers.PrebuiltSpecs[1].Name != "staging" {
+		t.Fatalf("app definition did not resolve production and staging: %+v", fileAnswers.PrebuiltSpecs)
+	}
+	if !protectedSpec(fileAnswers.PrebuiltSpecs[0]) || !protectedSpec(fileAnswers.PrebuiltSpecs[1]) {
+		t.Fatalf("definition environments were not protected by default: %+v", fileAnswers.PrebuiltSpecs)
+	}
+	if len(fileAnswers.PrebuiltSpecs[1].Domains) != 0 {
+		t.Fatalf("staging inherited production's domain: %+v", fileAnswers.PrebuiltSpecs[1].Domains)
+	}
 
 	flagCmd := definitionCommand(t, setupApp)
 	if err := flagCmd.ParseFlags([]string{
@@ -144,16 +153,16 @@ func TestDefinitionFileCarriesMultipleDomains(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "eregion.toml")
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 [source]
 kind = "image"
 image = "ghcr.io/acme/api:1"
-[[domains]]
+[environments.production]
+[[environments.production.domains]]
 name = "api.example.com"
 primary = true
 check_path = "/healthz"
-[[domains]]
+[[environments.production.domains]]
 name = "www.example.com"
 check_path = "/readyz"
 `
@@ -179,6 +188,48 @@ check_path = "/readyz"
 	}
 	if len(spec.Domains) != 2 || spec.Domains[1].Domain != "www.example.com" || spec.Domains[1].CheckPath != "/readyz" {
 		t.Fatalf("spec domains = %+v", spec.Domains)
+	}
+}
+
+// TestEnvironmentCreateFromSharedRecipeNeedsNoNamedOverride is the PR
+// environment case: the shared recipe applies to a name that is not listed in
+// the document, and the new environment is unprotected by default.
+func TestEnvironmentCreateFromSharedRecipeNeedsNoNamedOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "eregion.toml")
+	raw := `version = 1
+app = "api"
+node = "main"
+
+[source]
+kind = "git"
+url = "https://github.com/acme/api"
+ref = "main"
+
+[config]
+APP_ENV = "shared"
+`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := definitionCommand(t, setupEnvironment)
+	if err := cmd.ParseFlags([]string{"--app", "api", "--name", "pr-42", "--from", path, "--no-deploy"}); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{secrets: &secrets.Registry{}}
+	ans, err := a.readSetup(cmd, setupEnvironment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ans.clearSecrets()
+	spec, err := ans.environmentSpec(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Name != "pr-42" || spec.Source.URL != "https://github.com/acme/api" || spec.Config["APP_ENV"] != "shared" {
+		t.Fatalf("PR environment did not use the shared recipe: %+v", spec)
+	}
+	if spec.Protected == nil || *spec.Protected {
+		t.Fatalf("PR environment protection = %+v, want unprotected by default", spec.Protected)
 	}
 }
 
@@ -252,12 +303,14 @@ type definitionSubmission struct {
 // submissions for the definition CLI tests.
 type definitionInventoryBackend struct {
 	Backend
-	inventory   map[string]json.RawMessage
-	submitted   string
-	input       json.RawMessage
-	dryRun      bool
-	secretWrite int
-	submissions []definitionSubmission
+	inventory        map[string]json.RawMessage
+	submitted        string
+	input            json.RawMessage
+	dryRun           bool
+	secretWrite      int
+	secretNamespaces []vault.Namespace
+	secretPayloads   map[string]string
+	submissions      []definitionSubmission
 }
 
 func (f *definitionInventoryBackend) PlatformInventory(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
@@ -303,9 +356,18 @@ func (f *definitionInventoryBackend) SubmitActionWithSecrets(_ context.Context, 
 	})
 }
 
-func (f *definitionInventoryBackend) SetSecret(context.Context, vault.Namespace, []byte, uint64) (vault.Metadata, error) {
+func (f *definitionInventoryBackend) SetSecret(_ context.Context, namespace vault.Namespace, value []byte, _ uint64) (vault.Metadata, error) {
 	f.secretWrite++
+	f.secretNamespaces = append(f.secretNamespaces, namespace)
+	if f.secretPayloads == nil {
+		f.secretPayloads = map[string]string{}
+	}
+	f.secretPayloads[namespace.String()] = string(value)
 	return vault.Metadata{}, nil
+}
+
+func (f *definitionInventoryBackend) GetSecretMetadata(context.Context, vault.Namespace) (vault.Metadata, error) {
+	return vault.Metadata{}, contract.NewFault(contract.NotFound, "secret not found", "Set the secret first.")
 }
 
 func (f *definitionInventoryBackend) submissionsOfKind(kind string) []definitionSubmission {
@@ -356,7 +418,6 @@ func TestEnvUpdateFromFileRemovesNonPrimaryDomainWithConfirmation(t *testing.T) 
 	path := filepath.Join(dir, "eregion.toml")
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 
 [source]
@@ -432,7 +493,6 @@ func TestEnvUpdateFromFileDetectsOmittedDomainRemoval(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "eregion.toml")
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 [source]
 kind = "image"
@@ -494,7 +554,6 @@ func TestEnvUpdateFromFileDryRunBuildsTheSupportedPatch(t *testing.T) {
 	path := filepath.Join(dir, "eregion.toml")
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 [config]
 B = "3"
@@ -606,7 +665,6 @@ func resourceDefinitionEnvironment() platform.Environment {
 
 const resourceDefinition = `version = 1
 app = "api"
-environment = "production"
 node = "main"
 
 [source]
@@ -723,7 +781,6 @@ func TestEnvUpdateFromFileDryRunDoesNotProvisionResources(t *testing.T) {
 func TestEnvUpdateFromFileDryRunDoesNotProvisionAttachFalseOnlyResource(t *testing.T) {
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 
 [source]
@@ -768,7 +825,6 @@ command = ["redis-cli", "ping"]
 func TestEnvUpdateFromFileAppliesAttachFalseResourceWithoutRevisionChange(t *testing.T) {
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 
 [source]
@@ -830,7 +886,6 @@ command = ["redis-cli", "ping"]
 func TestEnvUpdateFromFileRequiresConfirmationForResourceRemoval(t *testing.T) {
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 
 [source]
@@ -893,7 +948,6 @@ A = "1"
 func TestEnvUpdateFromFileRemovingLastCollectionsSubmitsEmptyArrays(t *testing.T) {
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 secret_names = []
 resources = []
@@ -1007,7 +1061,6 @@ func TestAppCreateFromFileDryRunDoesNotWriteSecrets(t *testing.T) {
 	path := filepath.Join(dir, "eregion.toml")
 	raw := `version = 1
 app = "api"
-environment = "production"
 node = "main"
 secret_names = ["DATABASE_URL"]
 [source]

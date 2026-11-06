@@ -17,18 +17,19 @@ func (a *app) appSpecs() []spec {
 	parent := operationMeta("Create and inspect applications", "eregion app list --json")
 	parent.WhenToUse = []string{"Discover the application model before creating, inspecting or deploying an app."}
 
-	create := followingMeta(operationMeta("Create an application with its first environment", "eregion app create --name api --environment production --node main --git-url https://github.com/acme/api --json"))
-	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup: app, environment, source, processes, config, secrets and a domain. Agents pass every flag; JSON and no-TTY never prompt."}
+	create := followingMeta(operationMeta("Create an application with production and staging", "eregion app create --name api --node main --git-url https://github.com/acme/api --json"))
+	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup: app, shared source, processes, config, secrets and production's domain. The same recipe creates production and staging atomically. Agents pass every flag; JSON and no-TTY never prompt. Both start protected; creation never asks for a TOTP code."}
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
-		"name", "environment", "node", "build-node", "git-url", "git-ref", "git-credential-file",
+		"name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
 		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
+		"protected", "unprotected",
 	}
 	create.Examples = []string{
 		"eregion app create",
-		"eregion app create --name api --environment production --node main --git-url https://github.com/acme/api --git-ref main --container-port 8080 --health-path /healthz --domain api.example.com --json",
-		"eregion app create --name api --environment production --node main --image ghcr.io/acme/api:2026-10-20 --no-deploy --json",
+		"eregion app create --name api --node main --git-url https://github.com/acme/api --git-ref main --container-port 8080 --health-path /healthz --domain api.example.com --json",
+		"eregion app create --name api --node main --image ghcr.io/acme/api:2026-10-20 --no-deploy --json",
 		"eregion app create --from ./eregion.toml --no-deploy --json",
 	}
 	create.Next = []string{"eregion env status <app> <environment> --json", "eregion app status <app> --json"}
@@ -59,9 +60,9 @@ func (a *app) appSpecs() []spec {
 				meta: create,
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().String("name", "", "Application name")
-					cmd.Flags().String("environment", "production", "Name of the first environment")
 					cmd.Flags().Bool("no-deploy", false, "Do not request the first deploy")
 					cmd.Flags().Bool("detach", false, "Submit and return without following the create and first deploy")
+					addProtectionFlags(cmd)
 					addSetupFlags(cmd, true)
 				},
 				run: a.appCreate,
@@ -98,6 +99,85 @@ func (a *app) appSpecs() []spec {
 	}}
 }
 
+// cloneEnvironmentSpec copies one first-environment declaration deeply enough
+// that staging can be derived from the shared flag recipe without aliasing the
+// production maps or slices.
+func cloneEnvironmentSpec(spec platform.EnvironmentSpec) platform.EnvironmentSpec {
+	out := spec
+	out.Env = cloneStringMap(spec.Env)
+	out.SecretRefs = cloneStringMap(spec.SecretRefs)
+	out.Config = cloneStringMap(spec.Config)
+	out.SecretNames = append([]string(nil), spec.SecretNames...)
+	out.Resources = append([]string(nil), spec.Resources...)
+	out.Domains = append([]platform.DomainDeclaration(nil), spec.Domains...)
+	out.DomainAddresses = append([]string(nil), spec.DomainAddresses...)
+	out.Processes = make([]platform.ProcessSpec, len(spec.Processes))
+	for i, process := range spec.Processes {
+		process.Args = append([]string(nil), process.Args...)
+		out.Processes[i] = process
+	}
+	out.Source.BuildEnv = cloneStringMap(spec.Source.BuildEnv)
+	if spec.Runtime.ReleaseCommand != nil {
+		command := *spec.Runtime.ReleaseCommand
+		command.Argv = append([]string(nil), command.Argv...)
+		out.Runtime.ReleaseCommand = &command
+	}
+	if spec.Protected != nil {
+		value := *spec.Protected
+		out.Protected = &value
+	}
+	return out
+}
+
+func protectionLabel(protection *bool, name string) string {
+	protected := platform.DefaultEnvironmentProtection(name)
+	if protection != nil {
+		protected = *protection
+	}
+	if protected {
+		return "protected"
+	}
+	return "unprotected"
+}
+
+func protectedSpec(spec platform.EnvironmentSpec) bool {
+	if spec.Protected != nil {
+		return *spec.Protected
+	}
+	return platform.DefaultEnvironmentProtection(spec.Name)
+}
+
+// appResourceSpecs returns one declaration per environment in recipe order.
+// The flag path has production-only declarations in ResourceSpecs; the file
+// path stores both under AdditionalResourceSpecs.
+func appResourceSpecs(ans *setupAnswers, specs []platform.EnvironmentSpec) []platform.ResourceApplyInput {
+	if len(ans.AdditionalResourceSpecs) == 0 {
+		return append([]platform.ResourceApplyInput(nil), ans.ResourceSpecs...)
+	}
+	out := make([]platform.ResourceApplyInput, 0, len(ans.ResourceSpecs))
+	for _, spec := range specs {
+		out = append(out, ans.AdditionalResourceSpecs[spec.Name]...)
+	}
+	return out
+}
+
+func summarizeEnvironmentSpecs(specs []platform.EnvironmentSpec) []setupEnvironmentResult {
+	out := make([]setupEnvironmentResult, 0, len(specs))
+	for _, spec := range specs {
+		domain := spec.Domain
+		if domain == "" && len(spec.Domains) > 0 {
+			for _, declaration := range spec.Domains {
+				if declaration.Primary {
+					domain = declaration.Domain
+					break
+				}
+			}
+		}
+		out = append(out, setupEnvironmentResult{Name: spec.Name, Node: spec.Node, Protected: protectedSpec(spec), Domain: domain})
+	}
+	return out
+}
+
 func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) {
 	interactive := humanInteractive(cmd)
 	if interactive {
@@ -109,15 +189,31 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, setupPromptError("app create", err)
 	}
 	defer ans.clearSecrets()
-	spec, err := ans.environmentSpec(cmd)
-	if err != nil {
+	specs := append([]platform.EnvironmentSpec(nil), ans.PrebuiltSpecs...)
+	if len(specs) == 0 {
+		production, err := ans.environmentSpec(cmd)
+		if err != nil {
+			return result{}, err
+		}
+		staging := cloneEnvironmentSpec(production)
+		staging.Name = "staging"
+		staging.Domain, staging.DomainPrimary, staging.DomainCheckPath = "", false, ""
+		staging.Domains, staging.DomainAddresses = nil, nil
+		specs = []platform.EnvironmentSpec{production, staging}
+	}
+	if len(specs) != 2 || specs[0].Name != "production" || specs[1].Name != "staging" {
+		return result{}, contract.NewFault(contract.Internal, "app creation did not resolve production and staging", "Report the command and binary version.")
+	}
+	if err := validateUniqueEnvironmentDomains(specs); err != nil {
 		return result{}, err
 	}
+	ans.PrebuiltSpecs = specs
+	spec := specs[0]
 	follow := !boolFlag(cmd, "detach") && (streamsNDJSON(cmd) || (interactive && ans.Deploy && followsByDefault(cmd)))
 	if err := validateFollowRequest(cmd, follow); err != nil {
 		return result{}, err
 	}
-	input := platform.AppCreateInput{Name: ans.App, Environment: &spec, Deploy: ans.Deploy}
+	input := platform.AppCreateInput{Name: ans.App, Environments: specs, Deploy: ans.Deploy}
 
 	if err := validateIdempotencyFlag(cmd); err != nil {
 		return result{}, err
@@ -153,8 +249,8 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 	}
 	summary := setupResult{
-		App: ans.App, Environment: ans.Environment, Node: ans.Node,
-		Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
+		App: ans.App, Environment: ans.Environment, Protected: protectedSpec(spec), Environments: summarizeEnvironmentSpecs(specs),
+		Node: spec.Node, Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
 		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, DomainCheckPath: ans.DomainCheckPath, Domains: ans.Domains, Deploy: ans.Deploy,
 		Warnings: preview.Warnings, created: "app",
 	}
@@ -181,7 +277,7 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
 	} else {
-		if _, err := a.writeSetupSecrets(cmd, ans); err != nil {
+		if _, err := a.writeSetupSecretsForEnvironments(cmd, ans, specs); err != nil {
 			return result{}, err
 		}
 		summary.SecretNames = setupSecretNames(ans)
@@ -192,10 +288,11 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	}
 	summary.OperationID = op.ID
 	summary.FirstDeployOperationID = op.FirstDeployOperationID
-	if len(ans.ResourceSpecs) > 0 {
-		resourceIDs, err := a.provisionDefinitionResources(cmd, ans.ResourceSpecs)
+	resourceSpecs := appResourceSpecs(ans, specs)
+	if len(resourceSpecs) > 0 {
+		resourceIDs, err := a.provisionDefinitionResources(cmd, resourceSpecs)
 		if err != nil {
-			summary.Warnings = append(summary.Warnings, "The environment was created, but resource provisioning was not accepted: "+err.Error()+". Reapply with `eregion resource apply`.")
+			summary.Warnings = append(summary.Warnings, "The environments were created, but resource provisioning was not accepted: "+err.Error()+". Reapply with `eregion resource apply`.")
 		}
 		summary.ResolvedResourceIDs = resourceIDs
 		if len(resourceIDs) > 0 {

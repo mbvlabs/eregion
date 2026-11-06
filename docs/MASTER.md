@@ -85,13 +85,13 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D4 | Backups | No backup product work before v1. Control-database recovery is the PostgreSQL provider's job. |
 | D5 | Telemetry | Every server runs node_exporter from setup on, bound to its WireGuard address only. The **telemetry node** is a separate self-hosted Grafana with its metrics and log storage, scraping servers over WireGuard; an external backend is the alternative. No ClickHouse. Operation history never depends on telemetry. |
 | D6 | Command tree | [Section 5](#5-command-tree). `platform …`, operator-facing `bootstrap …`, `serve`/`worker`, `platform submit` and bearer-token `context login` are removed from the operator surface; the service, migration and bootstrap entry points live under the hidden Linux-only `node` group. The old resource surface was removed, but alpha.2 adds a new node-mode resource lifecycle under D19. Pre-v1: delete old paths, no aliases or compatibility shims. |
-| D7 | Tokens and the human factor | API tokens are per use, scoped, expiring, listed and revocable, and shown once. Creating one needs a human factor (a TOTP code from `eregion protect init`, or a master password) read without echo at a terminal, so an agent cannot mint its own. No token is minted at setup or handed off. The same factor gates exactly four actions: **token create, secret export (`secret export`, `secrets export`), `app delete` and `env delete`**. The node verifies the code inside the same request that performs the action; a separate pre-check is UX only. `--yes`, `--json`, stdin and pipes never satisfy it. The factor stops an agent operating through `eregion` from reading secrets, minting tokens or deleting apps; it is not a sandbox: an OS account holding a context's files (SSH key, sudo password) is root-equivalent on that server. |
+| D7 | Tokens and the human factor | API tokens are per use, scoped, expiring, listed and revocable, and shown once. Creating one needs a human factor (a TOTP code from `eregion protect init`, or a master password) read without echo at a terminal, so an agent cannot mint its own. No token is minted at setup or handed off. The same factor gates **token create, secret export (`secret export`, `secrets export`), every `app delete`, a protected `env delete`, deletion of the last environment (which deletes the app), and `env unprotect`**. An unprotected non-last environment deletion needs only exact target confirmation (D33). The control plane verifies the code inside the submission transaction that locks the target state; a separate pre-check is UX only. `--yes`, `--json`, stdin and pipes never satisfy it. The factor stops an agent operating through `eregion` from reading secrets, minting tokens or deleting apps; it is not a sandbox: an OS account holding a context's files (SSH key, sudo password) is root-equivalent on that server. |
 | D8 | Hosts and platforms | Servers: Debian 13 and Ubuntu 26.04, amd64 and arm64. Operator CLI: Linux and macOS; no Windows builds. Operator mode pushes the matching verified Linux binary to the node. |
 | D9 | Control database | External PostgreSQL 17+ with `sslmode=verify-full`, never installed on the app server. Its DSN is a server secret and goes in the handoff. |
 | D10 | Workloads | deploycrate's: directly managed Docker containers identified by ownership labels, images by immutable digest, restart `unless-stopped`, ports published only on dynamic loopback ports (or the node's WireGuard address). Docker Compose and per-environment systemd units are never state stores. |
 | D11 | Builds | Cloud Native Buildpacks with a pinned `pack` and Paketo builder, Go apps with `go.mod` first. Builds run on the main node for v1. |
-| D12 | Confirmation | Destructive commands take a token that names the target (`--confirm <app>`, `--confirm <app>/<env>`, `--confirm <server>`); `--yes` alone never suffices. The node validates the token against current state. `app delete` and `env delete` also need the D7 factor; their dry run does not. |
-| D13 | Deletion | deploycrate's policy: deleting an app removes every environment, source, domain, secret, release, deployment and route it owns after workload cleanup succeeds; deleting the last environment deletes the app. Durable operation history is kept. |
+| D12 | Confirmation | Destructive commands take a token that names the target (`--confirm <app>`, `--confirm <app>/<env>`, `--confirm <server>`); `--yes` alone never suffices. The control plane validates the token against current state. `app delete` always needs the D7 factor; `env delete` needs it for a protected or last environment and otherwise needs only the exact target token (D33). Their dry run needs neither. |
+| D13 | Deletion | deploycrate's policy: deleting an app removes every environment, source, domain, secret, release, deployment and route it owns after workload cleanup succeeds; deleting the last environment deletes the app and therefore needs the app-deletion human factor even when that environment is unprotected (D33). Durable operation history is kept. |
 | D14 | Release model | `master` is the combined development and edge stream and publishes on every push; `1.x` is the whole v1 line. Alpha and beta tags publish exact snapshots without a moving channel; RC tags advance an opt-in `rc` channel; stable channels advance only on final tags. An RC client also checks its stable major line for a newer final, without automatically moving the RC pointer. Changes reach `1.x` by pull request and `1.x` merges up into `master`, never cherry-picked. |
 | D15 | Release signing | vaire's pipeline and scripts: cosign keyless signatures bound to the pinned workflow identity, `install.sh` per channel, R2 channel manifests. Replaces the Ed25519 manifests. |
 | D16 | Order of work | Operator channel first (work list rows 1–3), then the app workflow (rows 4–8). New app commands are node-mode commands from the start, never built on the token adapter. |
@@ -110,7 +110,8 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D29 | Domain check path | Each domain binding has an optional check path (`domain add … --check-path PATH`), defaulting to the `web` process health path. The domain observer and the D17 public verification request each host at its own path, so an alias that serves no health route can still be ready. deploycrate has one path per web process; this is an eregion extension found in a real deployment. |
 | D30 | Disk retention | Required for alpha.1 (R9). A retention policy (server default, per-environment override) and one planner used by a periodic River job and by `eregion prune [--dry-run]`. Defaults: keep the newest 10 releases per environment plus any newer than 14 days, always the serving release and its rollback target; registry artifacts no release references after 14 days; Buildpacks caches above 10 GiB or 80% disk; ownerless labeled containers and dangling images always. Release rows are never deleted; a pruned release records `pruned_at` and a rollback to it refuses clearly. Registry deletion needs a new registry host-step version with deletes enabled plus garbage collection. A real `eregion prune` requires `--confirm <server>` and a dry run needs no confirmation. `doctor` reports the last run and warns when the Buildpacks cache exceeds the policy's absolute cap; it reads the run's durable cache measurement, and an absent or stale measurement is unknown rather than a zero-byte healthy cache. |
 | D31 | Workload repair | As deploycrate's `workload_reconciliation`: on worker start the control plane compares each serving deployment's recorded containers with Docker and queues one restart of the serving release for an environment whose serving containers are missing. A restart never re-runs the release command (D21). |
-| D32 | App definition file (planned for alpha.2) | Adopt a Fly-style `eregion.toml` **as input only**, never as a store: `app create --from FILE`, `env create|update --from FILE` and `app export <app> <env>` turn it into ordinary desired state. Existing guided and flag-only workflows remain usable without a file; PostgreSQL stays authoritative. The file names processes, health, source and build settings, non-secret config, secret **names** (never values), domains and optional generic Docker resources (D19), with shared defaults and selected environment overrides. Explicit apply previews and provisions declared resources; an ordinary deploy or push never reads the file. `--dry-run` shows changes, removals require target confirmation, and resource data is retained unless separately destroyed. |
+| D32 | App definition file (planned for alpha.2) | Adopt a Fly-style `eregion.toml` **as input only**, never as a store: `app create --from FILE`, `env create|update --from FILE` and `app export <app> <env>` turn it into ordinary desired state. Existing guided and flag-only workflows remain usable without a file; PostgreSQL stays authoritative. The file is a **shared recipe plus optional overrides**, not an exhaustive environment inventory: `[environments.staging]`, `[environments.production]` and `[environments.<name>]` override the shared fields when present, and `env create --from FILE --name pr-42` applies the shared recipe without adding `pr-42` to the file. The selected name is a command argument, not a document identity. The file names processes, health, source and build settings, non-secret config, secret **names** (never values), domains and optional generic Docker resources (D19). Domains are environment-specific; export places them under the selected environment's override so a shared recipe cannot make production and staging claim the same hostname. Explicit apply previews and provisions declared resources; an ordinary deploy or push never reads the file. `--dry-run` shows changes, removals require target confirmation, and resource data is retained unless separately destroyed. |
+| D33 | Environment protection (alpha.2 redesign) | Every environment has persistent `protected` state. `app create` creates **production and staging atomically from one recipe**; both are protected by default, and creation itself never asks for a TOTP code. Other environment names are unprotected by default; `--protected` / `--unprotected` make one creation-time choice explicit. `app delete` always requires the D7 TOTP factor. `env delete` requires it when the environment is protected or when it is the app's **last** environment (that deletion removes the app); an unprotected non-last environment deletion needs only exact `--confirm <app>/<env>` and works with agents, `--json` and no-TTY. `env protect` is agent-safe; `env unprotect` requires the factor. The decision and TOTP verification run in the control-plane submission transaction against locked environment/application rows, so node RPC, HTTP and direct service callers cannot bypass it; HTTP refuses actions whose current state needs the factor because it cannot carry a code. Migration 024 backfills every pre-existing environment as protected (fail closed); an operator may lower it with the factor. |
 
 ## 4. The application model
 
@@ -119,8 +120,9 @@ The nouns follow deploycrate-ce. Names are lowercase slugs.
 - **Server / node.** A VPS. The first one `server init` sets up is the **main
   node**. A context names a server.
 - **App.** A named group of environments. Owns nothing at runtime by itself.
-- **Environment.** The unit of deployment (`staging`, `production`, …). Its
-  **desired state** is one complete revision containing:
+- **Environment.** The unit of deployment (`staging`, `production`, …). It also
+  carries persistent deletion **protection** (D33), separate from its desired
+  revisions. Its **desired state** is one complete revision containing:
   - **source binding**: an HTTPS git repository, ref and optional read
     credential, or an image reference; Buildpacks context path, builder and
     buildpack settings; auto-deploy on push (D28);
@@ -159,8 +161,8 @@ eregion plan | apply [--auto-upgrade-nodes] | doctor  # converge and check host 
 eregion login [--replace NAME] | context list|show|use|remove
                                                        # every node command: --context NAME / EREGION_CONTEXT
 eregion secrets export                                 # server handoff, human factor
-eregion app create|list|status|delete
-eregion env create|update|list|status|delete
+eregion app create|list|status|delete             # create: production + staging atomically
+eregion env create|update|protect|unprotect|list|status|delete
 eregion process list|scale                             # per environment
 eregion deploy <app> <env> [--ref REF | --release ID] | rollback <app> <env> [--to ID]
 eregion image push <local-image> --app <app> [--tag <tag>]   # local image into the node registry
@@ -223,15 +225,21 @@ retention and versions. `eregion ssh` opens a shell over WireGuard.
 
 ### 6.3 App setup (deploycrate)
 
-`eregion app create` asks for the app name, the first environment, its source
-(HTTPS git repo, ref and optional read credential, or an image), Buildpacks
-settings, processes (a `web` process with its port and health path by
-default), config, secrets and a domain, shows the plan and the DNS record, then
-commits the app, the environment's first revision and — unless `--no-deploy` —
-resolves the ref to an exact commit and queues the first build and deployment
-in one transaction. The flag-only form expresses exactly the same intent.
-`env create` adds an environment the same way; `env update` changes any part of
-its desired state as a new revision; `process scale` changes replicas.
+`eregion app create` asks for the app name, one shared source/runtime/process
+recipe and production's domain, shows the plan and DNS record, then commits the
+app, **production and staging** and each first revision in one transaction.
+Both are protected by default; creation never asks for a TOTP code. The shared
+recipe defaults to production and staging names, and `--unprotected` is the
+explicit creation-time opt-out. Unless `--no-deploy`, the first environment's
+ref is resolved and its first build and deployment are queued in the same
+transaction; staging starts without a domain unless a definition override
+supplies a distinct one. The flag-only form expresses exactly the same intent.
+`env create` adds any environment the same way, defaulting to unprotected
+unless the name is `production` or `staging` or `--protected` is passed; from
+`--from FILE`, an arbitrary name such as `pr-42` uses the shared recipe without
+being listed in the file. `env update` changes any part of desired state as a
+new revision; `process scale` changes replicas; `env protect`/`env unprotect`
+change durable deletion protection (D33).
 
 ### 6.4 Deploy
 
@@ -280,8 +288,11 @@ operation. The receipt means accepted, not completed.
 `app status` and `env status` show the serving release, each process and its
 replicas, the desired revision, domains with their DNS/route/TLS/public state,
 the last operations and the deployability report. `logs` reads container logs
-over the operator channel (D25). `app delete` and `env delete` follow D13 and
-need `--confirm`.
+over the operator channel (D25). `app delete`, `env delete`, `env protect` and
+`env unprotect` follow D13/D33: every deletion names its exact target;
+`app delete` always needs the TOTP factor, `env delete` needs it for a
+protected or last environment and is otherwise available to agents with
+`--confirm` alone. `status` shows the persistent protection state.
 
 ## 7. v1 alpha
 
@@ -298,11 +309,15 @@ between alphas, and a later alpha may require a fresh `server init`. A v1
 compatibility contract in vaire's form (formats, JSON, commands, the
 `upgrade` + `apply --auto-upgrade-nodes` path) starts at `v1.0.0` final.
 
-An alpha is cut when the operator accepts MANUAL-TESTING's baseline for the
-tagged build. "Builds" or "appears in `commands --json`" is never the gate.
-Disk retention (D30) was the alpha.1 gate (R9): the policy, daily run, `prune
-[--dry-run]`, registry deletes and garbage collection, and the doctor retention
-and cache rows qualified with the rest of the baseline.
+An alpha is cut when the operator accepts that alpha's MANUAL-TESTING
+acceptance criteria and the recorded evidence for the candidate build. A
+fresh-server baseline is **not** required for every alpha. Alpha.2 is qualified
+incrementally on its own criteria using the authorized existing main node,
+fixture app, hostname and GitHub repository. "Builds" or "appears in
+`commands --json`" is never the gate. Disk retention (D30) was the alpha.1 gate
+(R9): the policy, daily run, `prune [--dry-run]`, registry deletes and garbage
+collection, and the doctor retention and cache rows qualified with the rest of
+the alpha.1 baseline.
 
 **Alpha.1 is qualified.** The operator explicitly confirmed that all alpha.1
 testing is done, including the disk-retention gate, and alpha.1 is recorded as
@@ -317,10 +332,14 @@ as **not run (no Mac available)**. It must be qualified before v1.0.0 final
 and is not an alpha.1 gate; CI's macOS CLI job and the darwin/arm64 cross-build
 remain, but neither is host acceptance.
 
-Final qualification for later alphas (R3, R11) remains **one complete
-MANUAL-TESTING baseline run on a freshly initialized server with the candidate
-build**. `main` serves only intermediate testing and the node-upgrade checks;
-earlier passes are context, not qualification.
+Final qualification for later alphas (R3, R11) is **incremental against the
+alpha's own acceptance criteria**, on an explicitly authorized existing target
+such as `main`, a disposable fixture app, the authorized hostname and the
+authorized GitHub repository. A complete fresh-server baseline is not required
+for each alpha. A fresh-server v1.0.0-final rehearsal remains a separate final
+decision if the operator requires it. Alpha.1 stays qualified by the operator
+confirmation above; no evidence is reconstructed or backfilled. macOS
+acceptance (R10) remains required before v1.0.0 final.
 
 ## 8. Current state
 
@@ -336,6 +355,30 @@ input and export, shared/environment overrides, explicit resource declarations,
 generic environment-owned Docker resources with private networking, retained
 data and deployment gating, and optional `gh` webhook assistance. Isolated
 build, vet and package tests pass.
+
+The 2026-11-06 alpha.2 protection redesign is implemented at source level on
+the working tree, **not host-qualified and not committed**: migration 024 adds
+persistent `environments.protected` and backfills every existing row protected;
+`app create` submits production and staging from one recipe atomically;
+`env protect|unprotect` manage durable protection; every `app delete`, a
+protected environment delete and a last-environment delete require the TOTP
+factor; an unprotected non-last environment delete works with `--confirm`
+alone in JSON/no-TTY. The factor is checked in the control-plane submission
+transaction against locked state, with HTTP refusing code-requiring actions.
+`eregion.toml` resolves as a shared recipe plus optional
+production/staging/named overrides, and `env create --from --name pr-42` needs
+no override entry. Supplied creation secret values and the Git read credential
+are written to each created environment namespace whose revision names them;
+environment-specific names never leak across namespaces. The protect store's
+read-modify-write mutations now run under a stable process-safe lock file, so
+independent node RPC processes cannot replay a TOTP step, confirm or rotate
+twice, or lose failure counts. Isolated platform, appdef, CLI, API,
+control-plane and protect package tests pass, including multiprocess TOTP
+replay/lockout tests; `go build`, `go vet` and the darwin/arm64 cross-build pass.
+No database, server, Docker or host was used, migration 024 has not been
+applied to the authorized node, and MANUAL-TESTING records the checks as
+**not run on a host**. The existing host evidence above remains the
+alpha.2 record for the earlier build.
 
 On 2026-11-06 `edge-ef4a6f879f45` (edge run 42242438039, source `ef4a6f8`)
 published and was installed on the CLI and `main`. The node upgrade applied
@@ -362,9 +405,133 @@ control-database/Funnel outage
 read warning; it recovered on its own, after which a second `apply` was 0 of
 20, `doctor` returned three consecutive 20/0/0 runs, and both degraded resource
 fixtures were destroyed with exact confirmation and no containers, volumes or
-networks left. The fixture app/environment remains because real deletion needs
-the D7 human factor. The four existing public URLs stayed HTTP 200 throughout.
-Alpha.2 is not qualified.
+networks left. At that point the fixture app/environment remained pending the
+D7 human factor; it was later deleted. The four existing public URLs stayed HTTP
+200 throughout.
+
+Both defects were fixed in `ba17535` and retested on `edge-ba175353f00a` (edge
+run 42250484640): CLI and node upgraded, schema stayed **23/23, River 7/7**, the
+second `apply` was 0 of 20, and Redis and PostgreSQL resources provisioned with
+the Docker 29.1.3 image-inspect fix, healthy exec checks and set secret
+injection. File-based provisioning and explicit empty `resources` /
+`secret_names` removals applied; resource attach/detach and default
+destroy/re-apply preserved Redis and PostgreSQL data; `--delete-data` removed
+only the owned volumes and left a foreign volume untouched. The fixture
+network, containers and volumes were removed, and both resource rows are
+`destroyed`. The fixture app/environment was later deleted with the D7
+factor; the cleanup verification is recorded below.
+
+Deployment gating was exercised on the same fixture. With the managed Redis
+deliberately unhealthy, `deploy` refused `resource:cache`; with it healthy and
+the authorized `eregion-alpha-two.mbvlabs.com` primary domain (pre-existing
+proxied DNS, no record changed), deploy `op_a8229010…` succeeded, Caddy issued
+a valid certificate, and HTTPS `https://eregion-alpha-two.mbvlabs.com/` returned
+`a2defs1106 app; alpha2:key=alpha2-serving`, proving the serving application
+read the managed Redis. A wrong-port nginx candidate failed health and left
+the previous release serving; a corrected nginx revision then served 200.
+
+The authorized `gh`-assisted webhook flow created hook `708267694` for
+`a2defs1106/production`, returned `unchanged` with the same id on repeat,
+rotated/updated the same hook, and never touched the pre-existing
+`githello/production` hook. Auto-deploy was then disabled and the hook deleted;
+the manual already-enabled path returned the URL and secret name without a
+value. At that point a real push delivery had not been sent because
+commits/pushes were outside the authorization; it was later authorized and
+passed in the end-to-end test below.
+
+The user then completed the TOTP-gated app deletion as
+`op_90e6c3530ef81a575bba1542a70cda0b`: workload and route cleanup succeeded,
+and the app, environment, domain, release, deployment, build and secret rows
+are gone. Read-only checks found no fixture container, network or volume; the
+hostname now returns Cloudflare `525` because Caddy no longer has its route or
+certificate, while the pre-existing Cloudflare DNS record still resolves and
+was not changed. At that point the registry image
+`127.0.0.1:5000/a2defs1106:alpha2` remained as a non-platform artifact; the
+identified image artifacts were removed later. The four existing public URLs
+stayed HTTP 200 and `doctor` was 20/0/0.
+
+The user then authorized recreating the fixture and a test push to
+`mbvlabs/eregion-hello`. The existing default branch, absence of workflows or
+deployments, and the single `githello` hook were inspected first. A separate
+`alpha2-webhook-20261106` branch added a `/marker` endpoint and was never merged
+into `main`. `a2defs1106/production` was recreated from that branch with the
+authorized domain and `GIT_READ_TOKEN`; `--auto-deploy --github-webhook` created
+hook `708277604`. Push `f6bbfa7` produced GitHub delivery `2a29a758…` with HTTP
+**202** and operation `op_1380428ab35058512af820f5d7807a61`, which built release
+`rel_29c45e28…` and served `/marker` 200. The manual path was then exercised:
+the one-time secret was captured only in mode-0600 temporary files, sent to the
+hook on `gh api` stdin, never printed, and shredded; hook update succeeded and
+the secret reached revision 3. Push `c4507c1` produced delivery `c68a318a…`
+with HTTP **202** and operation `op_b4dc5f8b225d318510c10293aff9ebaf`, which
+built `rel_df70f2bf15a82d6cc0204635460c5e92` and served `/marker` 200. With
+`gh` absent from `PATH`, the JSON command reported `skipped` and kept manual
+setup available without prompting; the missing-admin-permission variant was
+not tested at that point. A later simulated permission response covered the
+fallback without changing repository permissions or credentials.
+
+Auto-deploy was disabled, hook `708277604` and the test branch were deleted,
+and the desired source ref returned to `main`. The user then completed the
+recreated fixture's TOTP-gated app deletion as
+`op_362bea6789b9617855c43b37a093e16e`: read-only checks found no fixture
+app/environment/domain/resource/release/secret rows, container, network or
+volume; the hook and test branch are gone and `main` is unchanged at `59017d6`.
+The authorized hostname now returns Cloudflare `525` because no route or
+certificate remains, while the pre-existing DNS record still resolves and was
+not changed. The three identified fixture registry/image artifacts were removed
+after confirming no container referenced them: registry manifest delete
+returned 202 for `127.0.0.1:5000/a2defs1106@sha256:2c7b048f…`, and local tags
+`a2defs1106:alpha2`, `eregion/a2defs1106-production:1380428ab350` and
+`eregion/a2defs1106-production:b4dc5f8b225d` are gone. The DNS record cleanup
+remains blocked: no Cloudflare CLI, configuration or authorized API access was
+available without reading a secret. Under the incremental qualification policy,
+alpha.2 does not require a fresh-server baseline; it is not qualified because
+several acceptance criteria remained unrecorded. A later disposable pass
+covered the items below.
+
+A further authorized disposable pass on `edge-ba175353f00a` closed more alpha.2
+evidence. File-created staging and flag-created `flags` desired states exported
+identically after normalising the environment name and reimported with no
+change; production and staging had distinct overrides. A managed PostgreSQL
+resource with the `POSTGRES_PASSWORD` vault name was consumed by a test app
+(`PGHOST=db`, `PGSSLMODE=disable`), served `/db=pg-persist` over HTTPS, and kept
+the same marker across `restart` and a `config set`/redeploy that served
+`/build=v2`. A direct node `operations.submit` carrying an old
+`expected_revision_id` was refused with `conflict` (“the environment changed
+since the definition was read”) and wrote no revision. A simulated `gh`
+permission response made `--github-webhook` report `skipped` with manual setup
+available, without changing repository permissions or credentials.
+
+`--confirm-domain` remains untested because only one authorized hostname exists
+and the last primary domain cannot be removed. An explicit external dependency
+without a managed resource was not tested because no authorized external
+endpoint exists. The Postgres resource was default-destroyed after moving the
+environment to nginx; its owned volume
+`er-res-2d99b1ef6d8ddc69b01e2271e5a071a2-db-data` remained after the user's
+TOTP app deletion `op_c113f640932b31df52c4a92117f3d105`, with its
+`io.eregion.*` ownership labels and no container references. That confirmed the
+untracked-volume outcome; the authorized volume was then deleted and no fixture
+container, network, volume or image remains. The app, environments and domain
+binding are gone, the hostname returns Cloudflare `525`, and the pre-existing
+DNS record still resolves. MANUAL-TESTING has the detailed evidence.
+
+The operator then changed the qualification policy: a fresh-server baseline is
+not required for every alpha; alpha.1 stays operator-qualified; alpha.2 is
+qualified incrementally against its own criteria; macOS acceptance remains
+required before v1.0.0 final. During the next audited pass, guided file-free
+create passed (`op_29b5ffe04dbda9e724960853e8aef430`) and an interrupted
+PostgreSQL provisioning retry preserved the volume identity and reached
+`ready` (`op_8c6283fba697d32cfd66791073895178`). The operator then stopped new
+mutating tests. The unattached resource was destroyed with `--delete-data`
+(`op_40b47b8f8d0d242c802c4d6509bb450e`), its network and test images were
+removed, and no fixture container/network/volume/image remains. The recreated
+`a2defs1106/production` app, domain binding and secret row remain pending the
+TOTP-gated delete; it has no serving release. The audited cases not reached are
+listed in MANUAL-TESTING and are not claimed.
+
+`host.retention` remains intermittently 19/1 while its data is healthy; the
+retention check shares one five-second deadline across three control-database
+reads and hides the underlying error, consistent with a transient Funnel read
+rather than retention state.
 
 On 2026-11-06 the authorized alpha.1 tag was moved to `37d4f19` and its
 immutable snapshot published through the `edge` GitHub environment. The
@@ -699,7 +866,7 @@ MANUAL-TESTING for the evidence.
 | Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Closed by operator confirmation. |
 | CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy` with durable admission and atomic deploy linking; `secrets export`/`secret export` behind the factor. | Host checks pass for token reload, secret-export metadata, disposable deletes and webhook-secret recovery; migration 021 is applied on main; a real push deployed `59017d6` as `rel_d231a28c…` with delivery 202 and all four URLs 200. On the same build redelivery returned the original operation without another release, an invalid signature returned 401, and an existing other-branch fixture push was ignored. Old-secret rejection after rotation was not recorded; alpha.1 is operator-confirmed, and no result is backfilled. |
 | Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
-| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06` and `ef4a6f879f45`; the latter installed on CLI and `main` with schema 23/23. The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
+| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06`, `ef4a6f879f45` and `ba175353f00a`; the latest installed on CLI and `main` with schema 23/23. The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
 
 ## 9. Work list
 
@@ -711,15 +878,16 @@ alpha.1 by the operator's confirmation that all alpha.1 testing is done (section
 8). The acceptance criteria below remain the definition of each flow; this
 document does not reconstruct the individual results or backfill evidence. The
 R10 macOS exception remains outside the alpha.1 gate and is still required
-before v1.0.0 final. Rows 18–19 are alpha.2 work: implemented at source level
-and not qualified.
+before v1.0.0 final. Rows 18–20 are alpha.2 work: implemented at source level
+and not fully host-qualified; row 20 is the protection redesign and is not
+host-qualified at all.
 
 | # | Outcome | Done when |
 | --- | --- | --- |
 | 1 | **Node-mode dispatch.** `eregion node <cmd> --json` over SSH/WireGuard calls the application services; contexts and handoff carry no API token; version lockstep and `--auto-upgrade-nodes`; binary installed once. | Separate-install login works; mismatched version refuses before mutation; no token in context or handoff. |
 | 2 | **`server init` to vaire's shape.** Preflight, `--answers`, `--password-stdin`, `--confirm <server>`, `--resume`/`--discard`, handoff with stored gate and `--secrets-out`, vault keyring, node_exporter on WireGuard, `context remove`, `secrets export` behind the human factor. | Interrupted-init and lockdown-revert checks pass; JSON/no-TTY never prompts. |
 | 3 | **Host convergence.** `plan`, `apply`, `doctor`, `status`, `ssh`, `node unlock-ssh`. | A second `apply` is a no-op; an upgraded node re-runs only changed steps. |
-| 4 | **App and environment model.** Migration for source binding, revisions, processes and deployability; `app create`, `env create|update|list|status`, `process list|scale`, `config`, secrets per D18. | Guided and flag-only paths save the same revision; a new environment can deploy without raw JSON. |
+| 4 | **App and environment model.** Migration for source binding, revisions, processes and deployability; `app create`, `env create|update|protect|unprotect|list|status`, `process list|scale`, `config`, secrets per D18. | Guided and flag-only paths save the same revision; a new environment can deploy without raw JSON. |
 | 5 | **Deploy.** `deploy` from source (public or private git) or release, build lifecycle commands, release command, per-process containers with replicas, blue/green per D17, public verification, rollback, restart. | Two deploys and a rollback verified at the public HTTPS URL with no failed requests during the switch; a failed candidate leaves the old release serving; a worker process runs alongside web. |
 | 6 | **Domains.** Primary/aliases, DNS check, desired/applied/observed route state, serialized atomic Caddy writes, reconciliation on start and retry. | Failed reload and interrupted change recover; removing one domain leaves others intact. |
 | 7 | **Observe and remove.** `app/env status`, `logs`, `operations list`, `app delete`, `env delete` per D13. | Status shows serving release, processes and per-domain state; deletion cleans containers, routes and secrets and keeps history. |
@@ -733,8 +901,9 @@ and not qualified.
 | 15 | **Guided finish.** Guided `app create`/`env create` follow build and deploy to serving or failed, Ctrl-C detaches (vaire's flow); `server init` ends with vaire's doctor gate (`doctor_failed`, `--resume`, `--skip-doctor`). | Guided create ends at a serving URL or a failed operation with its error; init on a healthy host ends with a clean doctor summary. |
 | 16 | **Alpha qualification.** MANUAL-TESTING baseline on a real server for the tagged build. | Complete: the operator confirmed all alpha.1 testing is done. No baseline record is reconstructed here; release authorization is separate. |
 | 17 | **Disk retention (D30), alpha.1 gate.** Policy, planner, periodic job, `retention show|set`, `prune [--dry-run]`, registry deletes and GC, `doctor` retention and Buildpacks cache rows. Implemented and tested at source level; alpha.1 host qualification is operator-confirmed. | A node with 30 releases keeps exactly the policy's set; `prune --dry-run` lists what would go and the bytes; rollback to a pruned release refuses clearly; a second `apply` stays a no-op. |
-| 18 | **Optional app definitions and managed resources (D19, D32), alpha.2.** Implemented at source level; host qualification partial. `eregion.toml` input for `app create`, `env create|update` (`--from`) and `app export`, with shared defaults and selected environment overrides. Generic Docker resources have environment ownership, private networking, secret references, optional persistent volumes and durable lifecycle; explicit apply provisions them, while ordinary deploys never read the file. Existing file-free workflows remain supported. On 2026-11-06 `edge-ef4a6f879f45` passed definition create/override/export/reimport, secret-name-only storage and strict validation on `main`; resource apply is blocked by the Docker 29.1.3 image-inspect template defect recorded in section 8, and file-based removal of the last resource or last secret name was reported as a change but not applied. Resource health, secret injection, deployment gating and data retention remain unqualified; explicit detach and confirmed destroy worked. | File and equivalent flags save equivalent supported desired state; export round-trips without secret values; unknown keys and secret-value fields are refused. Dry-run previews changes; destructive removals require target confirmation; detaching a resource retains its data and destruction is separate. A managed resource can be consumed by the app, and an external dependency still works without one. |
-| 19 | **Optional `gh`-assisted webhook setup (D28), alpha.2.** Implemented at source level; real GitHub qualification pending. Check authenticated `gh` and repository hook permission; create or update the matching hook, retaining manual setup without `gh` or permission. No GitHub App; no plaintext secrets in ordinary output, events or arguments. | Authenticated, authorized `gh` can create or update the hook; missing `gh` or permission leaves manual setup available; explicit flags cover prompts and JSON/no-TTY never prompts; regression tests cover these paths. |
+| 18 | **Optional app definitions and managed resources (D19, D32), alpha.2.** Implemented at source level; host qualification partial. `eregion.toml` input for `app create`, `env create|update` (`--from`) and `app export`, with shared defaults and selected environment overrides. Generic Docker resources have environment ownership, private networking, secret references, optional persistent volumes and durable lifecycle; explicit apply provisions them, while ordinary deploys never read the file. Existing file-free workflows remain supported. On 2026-11-06 `edge-ef4a6f879f45` passed definition create/override/export/reimport, secret-name-only storage and strict validation on `main`. Its first host run found the Docker 29.1.3 image-inspect and empty-slice removal defects; both fixes were retested on `edge-ba175353f00a`: Docker resource provisioning, file-based empty resource/secret removal, attach/detach, default destroy/re-apply data retention and delete-data cleanup passed for own Redis and PostgreSQL fixtures. An unhealthy resource was refused at the gate; after the resource was healthy, a real deployment served `a2defs1106` over HTTPS at the authorized `eregion-alpha-two.mbvlabs.com`, and its root response read the managed Redis (`alpha2:key=alpha2-serving`). A failed candidate left the previous release serving. The user then deleted the fixture with the D7 factor (`op_90e6c3530ef81a575bba1542a70cda0b`); read-only checks found no fixture app/environment/domain/resource rows, containers, networks or volumes. The pre-existing DNS record remains; identified fixture images were later removed too. A later disposable pass covered file-vs-flags/staging overrides, managed PostgreSQL app consumption and restart/redeploy persistence, stale-plan refusal and a simulated missing-admin fallback. The user then deleted the recreated fixture (`op_c113f640932b31df52c4a92117f3d105`); the default-retained PostgreSQL volume persisted untracked with its labels and no container references, then the authorized volume was removed. A later guided file-free fixture and interrupted-provisioning retry passed; after the policy stop its unattached resource, network and images were removed, but that app/domain/secret row remains pending TOTP deletion. Details are in MANUAL-TESTING. | File and equivalent flags save equivalent supported desired state; export round-trips without secret values; unknown keys and secret-value fields are refused. Dry-run previews changes; destructive removals require target confirmation; detaching a resource retains its data and destruction is separate. A managed resource can be consumed by the app, and an external dependency still works without one. |
+| 19 | **Optional `gh`-assisted webhook setup (D28), alpha.2.** Implemented at source level; host-qualified for the main paths. Check authenticated `gh` and repository hook permission; create or update the matching hook, retaining manual setup without `gh` or permission. No GitHub App; no plaintext secrets in ordinary output, events or arguments. | On 2026-11-06 against the authorized private `mbvlabs/eregion-hello`, `--auto-deploy --github-webhook` created hook `708277604` for `a2defs1106/production`, a repeat reported `unchanged`, and rotation updated the same hook. A real push (`f6bbfa7`) produced delivery HTTP 202 and webhook operation `op_1380428…`, which built `rel_29c45e28…` and served `/marker` 200. The manual one-time secret was handled in 0600 temporary files, sent on stdin, never printed and shredded; push `c4507c1` produced delivery 202 and `op_b4dc5f8b…`, serving `rel_df70f2b…`. The missing-`gh` fallback reported `skipped` with manual setup available. A temporary `gh` shim returning `permissions.admin=false` made the fallback report the missing-admin case and keep manual setup available without changing repository permissions or credentials; no real non-admin account was tested. Hook and test branch were deleted. The recreated fixture was later deleted with the D7 factor (`op_c113f640932b31df52c4a92117f3d105`); read-only checks found no fixture rows, container, network or image, and the default-retained PostgreSQL volume was observed untracked with its ownership labels then removed. The three identified image artifacts were removed after reference checks; the pre-existing DNS record remains because no safe Cloudflare access was available. |
+| 20 | **Environment protection and app-create defaults (D33), alpha.2 redesign.** Implemented at source level; isolated tests pass; host qualification not run. `app create` atomically records production and staging from one recipe, both protected by default and without TOTP enrollment. Migration 024 adds persistent protection and backfills existing environments protected. `app delete` always requires TOTP; `env delete` requires it for protected or last environments and otherwise needs exact confirmation only; `env unprotect` requires TOTP. Node, HTTP and direct service paths decide from locked state, not from CLI input. | Create an app and verify two protected environments commit in one transaction and replay idempotently; protected/last deletion refuses without a code over direct node/HTTP paths; unprotected non-last deletion succeeds with `--json`/no-TTY and exact confirmation; unprotect without a terminal refuses; recipe create for `pr-42` needs no file entry; migration 024 backfills safely. |
 
 ## Reference index
 

@@ -327,13 +327,17 @@ type WorkerConfig struct {
 	// Redaction is the process redaction registry. Nil builds one and still
 	// registers the worker's own environment secrets.
 	Redaction *secrets.Registry
+	// HumanFactor verifies a transient TOTP code inside a factor-gated
+	// submission transaction. Node RPC sets it; HTTP and worker-only processes
+	// leave it nil, which fails factor-gated submissions closed.
+	HumanFactor func(string) error
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots}
+	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor}
 	service.redaction = config.Redaction
 	if service.redaction == nil {
 		service.redaction = &secrets.Registry{}

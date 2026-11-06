@@ -104,7 +104,7 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 	}
 	switch normalized.Kind {
 	case platform.KindAppCreate, platform.KindNodeRegister, platform.KindEnvironmentCreate,
-		platform.KindEnvironmentUpdate, platform.KindProcessScale, platform.KindConfigSet,
+		platform.KindEnvironmentUpdate, platform.KindEnvironmentProtect, platform.KindProcessScale, platform.KindConfigSet,
 		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach,
 		platform.KindEnvironmentResourceAttach, platform.KindEnvironmentResourceDetach:
 		return w.runRecordAction(ctx, op.ID, attempt, normalized)
@@ -241,11 +241,20 @@ func (w *platformWorker) runRecordAction(ctx context.Context, id contract.Operat
 				"Created application "+input.Name, map[string]any{"app": input.Name}, nil); err != nil {
 				return err
 			}
-			if input.Environment == nil {
-				return nil
+			for index := range input.Environments {
+				if err := recordRevisionChange(ctx, tx, op, "environment.created", input.Name, input.Environments[index].Name,
+					"Created environment "+input.Environments[index].Name+" and its first desired-state revision."); err != nil {
+					return err
+				}
 			}
-			return recordRevisionChange(ctx, tx, op, "environment.created", input.Name, input.Environment.Name,
-				"Created environment "+input.Environment.Name+" and its first desired-state revision.")
+			return nil
+		case *platform.EnvironmentProtectInput:
+			kind := "environment.protected"
+			if !input.Protected {
+				kind = "environment.unprotected"
+			}
+			return insertPlatformChange(ctx, tx, op, kind, input.App, input.Environment,
+				"Changed environment protection.", map[string]any{"protected": input.Protected}, nil)
 		case *platform.EnvironmentCreateInput:
 			return recordRevisionChange(ctx, tx, op, "environment.created", input.App, input.Name,
 				"Created environment "+input.Name+" on node "+input.Node+" with its first desired-state revision.")
