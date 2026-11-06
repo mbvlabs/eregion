@@ -35,7 +35,7 @@ awk '/^  publish_prerelease:$/ {copy=1; next} copy' "${workflow}" > "${work}/pre
 grep -Fxq "    if: \${{ needs.classify.outputs.kind == 'final' }}" "${work}/final"
 grep -Fxq '    environment: stable' "${work}/final"
 grep -Fxq "    if: \${{ needs.classify.outputs.kind == 'prerelease' }}" "${work}/prerelease"
-grep -Fxq '    environment: prerelease' "${work}/prerelease"
+grep -Fxq '    environment: edge' "${work}/prerelease"
 if grep -Eq 'environment: stable|Promote the major line|Move the root channel' "${work}/prerelease"; then
   echo 'prerelease job can reach stable environment or promotion' >&2; exit 1
 fi
