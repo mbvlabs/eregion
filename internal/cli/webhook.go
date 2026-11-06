@@ -17,7 +17,7 @@ import (
 const defaultWebhookSecretName = "EREGION_WEBHOOK_SECRET"
 
 // webhookUpdate is the push-to-deploy part of env update. The secret is kept
-// out of the revision and shown once at a terminal.
+// out of the revision and shown once at a terminal unless gh installed it.
 type webhookUpdate struct {
 	// Enabled is nil when --auto-deploy was not passed.
 	Enabled        *bool
@@ -28,13 +28,16 @@ type webhookUpdate struct {
 	Repository     string
 	AlreadyEnabled bool
 	Rotated        bool
+	// GitHub opts in to creating or updating the repository webhook with an
+	// authenticated gh CLI. The secret still travels only on stdin.
+	GitHub bool
 }
 
 // readWebhookUpdate validates --auto-deploy/--rotate-webhook-secret against
 // the current revision and the effective source after the other update flags.
 // It generates a secret only for a real (non-dry-run) enable or rotation.
 func (a *app) readWebhookUpdate(cmd *cobra.Command, appName, environment string, current platform.Environment, patch platform.EnvironmentUpdateInput) (webhookUpdate, error) {
-	var update webhookUpdate
+	update := webhookUpdate{GitHub: boolFlag(cmd, "github-webhook")}
 	autoSet := flagChanged(cmd, "auto-deploy")
 	rotate, _ := cmd.Flags().GetBool("rotate-webhook-secret")
 	if !autoSet && !rotate {
@@ -156,7 +159,7 @@ func printWebhookOnce(cmd *cobra.Command, update webhookUpdate) {
 		tail = "The new value is active immediately."
 	}
 	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
-		"\n%s for %s.\nWebhook URL: %s\nWebhook secret: %s\n\n%s\nPaste both into the repository's GitHub webhook settings (content type application/json, push events only). The secret is not shown again; only its encrypted vault revision is stored.\n\n",
+		"\n%s for %s.\nWebhook URL: %s\nWebhook secret: %s\n\n%s\nPaste both into the repository's GitHub webhook settings (content type application/json, push events only). The secret is not shown again; only its encrypted vault revision is stored.\nWith gh installed, signed in, and authorized to administer the repository, add --github-webhook when enabling or rotating to create or update this hook for you.\n\n",
 		action, update.Repository+", branch "+update.Branch, update.URL, string(update.Secret), tail)
 }
 

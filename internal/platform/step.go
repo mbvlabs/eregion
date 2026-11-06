@@ -60,6 +60,27 @@ func StepFamilies() []Family {
 		{Match: deleteStepPattern.MatchString, Build: buildDeleteStep},
 		{Match: retentionRemoveStepPattern.MatchString, Build: buildRetentionRemoveStep},
 		{Match: retentionGCStepPattern.MatchString, Build: buildRetentionGCStep},
+		{Match: resourceStepPattern.MatchString, Build: buildResourceStep},
+		{Match: resourceVolumeRemoveStepPattern.MatchString, Build: buildResourceVolumeRemoveStep},
+	}
+}
+
+func buildResourceStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
+	switch {
+	case strings.HasPrefix(exec.Step, "platform-resource-network-"),
+		strings.HasPrefix(exec.Step, "platform-resource-pull-"),
+		strings.HasPrefix(exec.Step, "platform-resource-image-"):
+		return buildArgvStep(exec, raw)
+	case strings.HasPrefix(exec.Step, "platform-resource-volume-"):
+		return buildResourceVolumeStep(exec, raw)
+	case strings.HasPrefix(exec.Step, "platform-resource-run-"):
+		return buildResourceRunStep(exec, raw)
+	case strings.HasPrefix(exec.Step, "platform-resource-health-"):
+		return buildResourceHealthStep(exec, raw)
+	case strings.HasPrefix(exec.Step, "platform-resource-destroy-"):
+		return buildResourceDestroyStep(exec, raw)
+	default:
+		return nil, fmt.Errorf("resource step %q has no builder", exec.Step)
 	}
 }
 
@@ -1337,25 +1358,41 @@ func validateArgv(argv []string) error {
 			return errors.New("docker command is missing a subcommand")
 		}
 		switch argv[1] {
-		case "version", "pull", "run", "stop", "rm", "inspect", "port", "ps", "network", "restart":
+		case "version", "pull", "run", "stop", "rm", "inspect", "port", "ps", "network", "restart", "exec":
 		case "image":
 			if len(argv) < 3 || (argv[2] != "inspect" && argv[2] != "ls" && argv[2] != "rm") {
 				return errors.New("unsupported docker image command")
 			}
 		case "volume":
-			if len(argv) < 3 || (argv[2] != "ls" && argv[2] != "inspect" && argv[2] != "rm") {
+			if len(argv) < 3 || (argv[2] != "create" && argv[2] != "ls" && argv[2] != "inspect" && argv[2] != "rm") {
 				return errors.New("unsupported docker volume command")
 			}
 		default:
 			return errors.New("unsupported docker command")
 		}
-		for _, arg := range argv[1:] {
+		execCommand := argv[1] == "exec"
+		for index := 1; index < len(argv); index++ {
+			arg := argv[index]
 			switch {
 			case arg == "--privileged", strings.HasPrefix(arg, "--cap-add"), strings.HasPrefix(arg, "--device"),
 				strings.HasPrefix(arg, "--security-opt"), strings.HasPrefix(arg, "--network=host"),
-				strings.HasPrefix(arg, "--pid=host"), strings.HasPrefix(arg, "--mount"),
-				arg == "-v", strings.HasPrefix(arg, "--volume"):
+				strings.HasPrefix(arg, "--pid=host"), arg == "-v", strings.HasPrefix(arg, "--volume"),
+				strings.HasPrefix(arg, "--env-file"):
 				return errors.New("privileged or host-mutating docker option is not allowed")
+			case arg == "--network" && index+1 < len(argv) && argv[index+1] == "host":
+				return errors.New("host networking is not allowed")
+			case execCommand && (arg == "-e" || arg == "--env" || strings.HasPrefix(arg, "--env=")):
+				return errors.New("environment values are not allowed in a docker exec argv")
+			case arg == "--mount":
+				if index+1 >= len(argv) {
+					return errors.New("docker --mount needs a value")
+				}
+				if err := validateVolumeMountOption(argv[index+1]); err != nil {
+					return err
+				}
+				index++
+			case strings.HasPrefix(arg, "--mount="):
+				return errors.New("use --mount with a separate named-volume value")
 			}
 		}
 	case "pack":
@@ -1382,6 +1419,40 @@ func validateArgv(argv []string) error {
 		}
 	default:
 		return fmt.Errorf("unsupported platform command %q", program)
+	}
+	return nil
+}
+
+func validateVolumeMountOption(value string) error {
+	parts := strings.Split(value, ",")
+	seen := map[string]string{}
+	for _, part := range parts {
+		key, text, ok := strings.Cut(part, "=")
+		if !ok || key == "" || text == "" {
+			return errors.New("a resource volume mount needs key=value fields")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return errors.New("a resource volume mount repeats a field")
+		}
+		seen[key] = text
+	}
+	allowed := map[string]bool{"type": true, "source": true, "destination": true, "readonly": true}
+	for key := range seen {
+		if !allowed[key] {
+			return errors.New("a resource volume mount supports only type, source, destination and readonly")
+		}
+	}
+	if seen["type"] != "volume" {
+		return errors.New("only named Docker volumes may be mounted")
+	}
+	if !ResourceVolumeNameValid(seen["source"]) {
+		return errors.New("resource mount source must be an eregion resource volume name")
+	}
+	if _, err := cleanResourceDestination(seen["destination"]); err != nil {
+		return errors.New("invalid resource mount destination")
+	}
+	if readonly, ok := seen["readonly"]; ok && readonly != "true" && readonly != "false" {
+		return errors.New("resource mount readonly must be true or false")
 	}
 	return nil
 }

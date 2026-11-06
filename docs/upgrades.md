@@ -122,9 +122,9 @@ temporarily leave a channel unverifiable. Clients fail closed; this release
 does not claim atomic publication or retry safety. A future single-object
 pointer requires a deliberate transition for installed clients.
 
-The existing `v1.0.0-alpha.1` tag predates this workflow and its publication
-failed. Its recovery is a separate release decision: the tag is not rewritten,
-and this workflow has no manual-dispatch signing exception.
+The original `v1.0.0-alpha.1` publication failed. With explicit authorization,
+the tag was moved to the reviewed release-channel commit and its snapshot was
+published on 2026-11-06; this workflow has no manual-dispatch signing exception.
 
 ## Release configuration
 

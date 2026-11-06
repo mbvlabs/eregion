@@ -32,10 +32,10 @@ func insertEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, envID platform.
 	retentionOverride, _ := json.Marshal(state.Retention)
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
         (id,environment_id,number,operation_id,actor_kind,actor_subject,operation,summary,
-         source,auto_deploy,webhook_secret_name,runtime,processes,config,secret_names,deploy_intent,retention)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+         source,auto_deploy,webhook_secret_name,runtime,processes,config,secret_names,resources,deploy_intent,retention)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 		revisionID, envID, number, nullableOperationID(opID), actor.Kind, actor.Subject, operation, summary,
-		source, state.AutoDeploy, state.WebhookSecretName, runtime, processes, config, state.SecretNames, state.DeployIntent,
+		source, state.AutoDeploy, state.WebhookSecretName, runtime, processes, config, state.SecretNames, state.Resources, state.DeployIntent,
 		retentionOverride); err != nil {
 		return "", 0, platformWriteError(err, "environment revision could not be recorded")
 	}
@@ -111,13 +111,23 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2,updated_at=clock_timestamp() WHERE id=$1`, envID, revisionID); err != nil {
 		return "", unavailable()
 	}
-	// The optional first domain commits before the caller queues a first
-	// deploy, so the deploy's deployability gate sees the primary binding.
-	if spec.Domain != "" {
+	// The optional first domain bindings commit before the caller queues a
+	// first deploy, so the deploy's deployability gate sees the primary binding.
+	if len(spec.Domains) > 0 {
+		env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: node.Name}
+		for _, declaration := range spec.Domains {
+			if err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
+				App: app.Name, Environment: spec.Name, Domain: declaration.Domain,
+				Primary: declaration.Primary, Addresses: spec.DomainAddresses, CheckPath: declaration.CheckPath,
+			}); err != nil {
+				return "", err
+			}
+		}
+	} else if spec.Domain != "" {
 		env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: node.Name}
 		if err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
 			App: app.Name, Environment: spec.Name, Domain: spec.Domain,
-			Primary: spec.DomainPrimary, Addresses: spec.DomainAddresses,
+			Primary: spec.DomainPrimary, Addresses: spec.DomainAddresses, CheckPath: spec.DomainCheckPath,
 		}); err != nil {
 			return "", err
 		}
@@ -134,6 +144,7 @@ func revisionStateFromSpec(spec platform.EnvironmentSpec, node string, deployInt
 		Processes:         spec.Processes,
 		Config:            spec.Config,
 		SecretNames:       spec.SecretNames,
+		Resources:         spec.Resources,
 		Retention:         spec.Retention.Clone(),
 		DeployIntent:      deployIntent,
 	}
@@ -224,7 +235,7 @@ func currentRevisionStateTx(ctx context.Context, tx pgx.Tx, env platform.Environ
 
 const revisionSelect = `SELECT r.id,a.name,e.name,r.number,coalesce(r.operation_id,''),
     r.actor_kind,r.actor_subject,r.operation,r.summary,r.source,r.auto_deploy,r.webhook_secret_name,
-    r.runtime,r.processes,r.config,r.secret_names,r.retention,r.deploy_intent,r.created_at
+    r.runtime,r.processes,r.config,r.secret_names,r.resources,r.retention,r.deploy_intent,r.created_at
     FROM eregion_platform_environment_revisions r
     JOIN eregion_platform_environments e ON e.id=r.environment_id
     JOIN eregion_platform_apps a ON a.id=e.app_id`
@@ -235,7 +246,7 @@ func scanRevisionRow(row pgx.Row) (platform.EnvironmentRevision, error) {
 	err := row.Scan(&revision.ID, &revision.App, &revision.Environment, &revision.Number,
 		&revision.OperationID, &revision.Actor.Kind, &revision.Actor.Subject, &revision.Operation,
 		&revision.Summary, &source, &revision.AutoDeploy, &revision.WebhookSecretName,
-		&runtime, &processes, &config, &revision.SecretNames, &retentionOverride, &revision.DeployIntent, &revision.CreatedAt)
+		&runtime, &processes, &config, &revision.SecretNames, &revision.Resources, &retentionOverride, &revision.DeployIntent, &revision.CreatedAt)
 	if err != nil {
 		return revision, err
 	}
@@ -270,6 +281,9 @@ func scanRevisionRow(row pgx.Row) (platform.EnvironmentRevision, error) {
 	}
 	if revision.SecretNames == nil {
 		revision.SecretNames = []string{}
+	}
+	if revision.Resources == nil {
+		revision.Resources = []string{}
 	}
 	return revision, nil
 }

@@ -13,6 +13,7 @@ var targetConfirmedKinds = map[string]bool{
 	KindAppDelete:         true,
 	KindEnvironmentDelete: true,
 	KindRetentionPrune:    true,
+	KindResourceDestroy:   true,
 }
 
 // RequiresTargetConfirmation reports whether kind is guarded by a target-name
@@ -41,8 +42,10 @@ func ConfirmationToken(target Target) (string, error) {
 		return target.App + "/" + target.Environment, nil
 	case TargetNode:
 		return target.Node, nil
+	case TargetResource:
+		return target.App + "/" + target.Environment + "/" + target.Resource, nil
 	default:
-		return "", contract.NewFault(contract.ValidationFailed, "this target does not take a target confirmation", "Use app/<app>, env/<app>/<env>, or node/<server>.")
+		return "", contract.NewFault(contract.ValidationFailed, "this target does not take a target confirmation", "Use app/<app>, env/<app>/<env>, node/<server>, or resource/<app>/<env>/<name>.")
 	}
 }
 

@@ -197,6 +197,9 @@ type Container struct {
 	// io.eregion.deployment ownership labels.
 	Release    string
 	Deployment string
+	// Kind is io.eregion.kind. A "resource" container is an environment-owned
+	// dependency, not a deployment workload, and retention never removes it.
+	Kind string
 	// Image is Docker's immutable image ID for the container. It protects an
 	// image that a stopped or running container still uses from retention
 	// removal, no matter who created the container.
@@ -672,6 +675,11 @@ func planContainers(environmentByKey map[environmentKey]Environment, containers 
 		// container still protects its image through planReleaseImages and
 		// planDanglingImages.
 		if !container.Owned && strings.TrimSpace(container.App) == "" {
+			continue
+		}
+		// Resources are environment-owned dependencies managed by the resource
+		// lifecycle. Their containers are never deployment candidates.
+		if container.Kind == "resource" {
 			continue
 		}
 		if inFlightReleases[container.Release] ||

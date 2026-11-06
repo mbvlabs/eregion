@@ -365,6 +365,18 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
+	if env.Revision != nil && len(env.Revision.Resources) > 0 {
+		missing, err := w.service.resourceDeployability(ctx, env)
+		if err != nil {
+			return w.settle(ctx, id, attempt, err)
+		}
+		if len(missing) > 0 {
+			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
+				contract.NewFault(contract.PreconditionFailed,
+					"environment dependencies are not ready: "+strings.Join(missing, ", "),
+					"Apply each attached resource and wait for its exec health check before deploying; resource status reports the same state."))
+		}
+	}
 	secretValues, credentialKey, pinnedCredential, secretRefs, err := w.resolveDeploymentSecrets(ctx, env, dep)
 	if err != nil {
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)

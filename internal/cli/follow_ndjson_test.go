@@ -41,6 +41,10 @@ var followingCommands = []struct {
 	{name: "domain add", path: "eregion domain add", args: []string{"domain", "add", "api", "production", "hello.example.com"}},
 	{name: "domain remove", path: "eregion domain remove", args: []string{"domain", "remove", "api", "production", "hello.example.com", "--confirm", "hello.example.com"}},
 	{name: "process scale", path: "eregion process scale", args: []string{"process", "scale", "api", "production", "web", "2"}},
+	{name: "resource apply", path: "eregion resource apply", args: []string{"resource", "apply", "api", "production", "db", "--image", "redis:7", "--health-command", "redis-cli", "--health-command", "ping"}},
+	{name: "resource attach", path: "eregion resource attach", args: []string{"resource", "attach", "api", "production", "db"}},
+	{name: "resource detach", path: "eregion resource detach", args: []string{"resource", "detach", "api", "production", "db"}},
+	{name: "resource destroy", path: "eregion resource destroy", args: []string{"resource", "destroy", "api", "production", "db", "--confirm", "api/production/db"}},
 	{name: "operations follow", path: "eregion operations follow", args: []string{"operations", "follow", "op_" + strings.Repeat("b", 32)}},
 	{name: "logs", path: "eregion logs", args: []string{"logs", "api", "production"}},
 }
@@ -257,7 +261,8 @@ func prepareFollowingBackend(name string, backend *ndjsonFollowBackend) {
 func followingSubmits(name string) bool {
 	switch name {
 	case "deploy", "rollback", "restart", "build stop", "build retry",
-		"app create", "env create", "domain add", "domain remove", "process scale", "prune":
+		"app create", "env create", "domain add", "domain remove", "process scale", "prune",
+		"resource apply", "resource attach", "resource detach", "resource destroy":
 		return true
 	}
 	return false

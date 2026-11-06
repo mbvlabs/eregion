@@ -69,6 +69,21 @@ func platformTwoNames(first, second string) cobra.PositionalArgs {
 	}
 }
 
+func platformThreeNames(first, second, third string) cobra.PositionalArgs {
+	return func(_ *cobra.Command, args []string) error {
+		if len(args) != 3 {
+			return contract.NewFault(contract.InputRequired, first+", "+second+" and "+third+" are required", "Supply exactly three positional names.")
+		}
+		if err := platform.ValidateName(args[0]); err != nil {
+			return err
+		}
+		if err := platform.ValidateName(args[1]); err != nil {
+			return err
+		}
+		return platform.ValidateResourceName(args[2])
+	}
+}
+
 func addInventoryFlags(cmd *cobra.Command) {
 	cmd.Flags().String("app", "", "Filter by app name")
 	cmd.Flags().String("environment", "", "Filter by environment name")

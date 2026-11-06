@@ -125,7 +125,7 @@ func parseInventoryQuery(raw string) (platform.InventoryQuery, error) {
 		}
 	}
 	if query.Collection == "" {
-		return query, contract.NewFault(contract.InputRequired, "inventory collection is required", "Use collection=summary, nodes, apps, environments, releases, deployments, or changes.")
+		return query, contract.NewFault(contract.InputRequired, "inventory collection is required", "Use collection=summary, nodes, apps, environments, releases, deployments, changes, or resources.")
 	}
 	return query, nil
 }
@@ -160,7 +160,7 @@ func (c *Client) SubmitAction(ctx context.Context, kind, target string, input js
 // PlatformInventory reads one inventory collection.
 func (c *Client) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {
 	if strings.TrimSpace(collection) == "" {
-		return nil, contract.NewFault(contract.InputRequired, "inventory collection is required", "Use summary, nodes, apps, environments, releases, deployments, or changes.")
+		return nil, contract.NewFault(contract.InputRequired, "inventory collection is required", "Use summary, nodes, apps, environments, releases, deployments, changes, or resources.")
 	}
 	query := url.Values{}
 	for key, values := range filters {

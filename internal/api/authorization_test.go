@@ -84,6 +84,7 @@ func TestScopedInventoryFailsClosed(t *testing.T) {
 		allowed                      bool
 	}{
 		{"releases", "api", "production", true},
+		{"resources", "api", "production", true},
 		{"environments", "api", "production", true},
 		{"releases", "api", "staging", false},
 		{"releases", "other", "production", false},

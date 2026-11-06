@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -22,12 +23,13 @@ func (a *app) appSpecs() []spec {
 	create.InputFlags = []string{
 		"name", "environment", "node", "build-node", "git-url", "git-ref", "git-credential-file",
 		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
-		"health-path", "process", "config", "secret", "domain", "no-deploy", "detach",
+		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 	}
 	create.Examples = []string{
 		"eregion app create",
 		"eregion app create --name api --environment production --node main --git-url https://github.com/acme/api --git-ref main --container-port 8080 --health-path /healthz --domain api.example.com --json",
 		"eregion app create --name api --environment production --node main --image ghcr.io/acme/api:2026-10-20 --no-deploy --json",
+		"eregion app create --from ./eregion.toml --no-deploy --json",
 	}
 	create.Next = []string{"eregion env status <app> <environment> --json", "eregion app status <app> --json"}
 
@@ -37,6 +39,15 @@ func (a *app) appSpecs() []spec {
 	status := operationMeta("Show one application and its environments", "eregion app status api --json")
 	status.Examples = []string{"eregion app status api --json"}
 	status.Next = []string{"eregion env status <app> <environment> --json"}
+
+	export := operationMeta("Export one environment's desired state as an eregion.toml", "eregion app export api production")
+	export.WhenToUse = []string{"Generate a deterministic app definition from the current revision, process formation, plain config, secret names, domain bindings and managed resource declarations. Secret values, releases, health and TLS observations are never exported."}
+	export.InputFlags = []string{"out"}
+	export.Examples = []string{
+		"eregion app export api production",
+		"eregion app export api production --out ./eregion.toml --json",
+	}
+	export.Next = []string{"eregion env update api production --from ./eregion.toml --dry-run --json"}
 
 	return []spec{{
 		use:  "app",
@@ -72,6 +83,15 @@ func (a *app) appSpecs() []spec {
 				run: func(cmd *cobra.Command, args []string) (result, error) {
 					return a.appStatus(cmd, args[0])
 				},
+			},
+			{
+				use:  "export <app> <environment>",
+				meta: export,
+				args: platformTwoNames("app", "environment"),
+				flags: func(cmd *cobra.Command) {
+					cmd.Flags().String("out", "", "Write the definition to this new file instead of stdout")
+				},
+				run: a.appExport,
 			},
 			a.appDeleteSpec(),
 		},
@@ -135,7 +155,7 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	summary := setupResult{
 		App: ans.App, Environment: ans.Environment, Node: ans.Node,
 		Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
-		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, Deploy: ans.Deploy,
+		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, DomainCheckPath: ans.DomainCheckPath, Domains: ans.Domains, Deploy: ans.Deploy,
 		Warnings: preview.Warnings, created: "app",
 	}
 	if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
@@ -144,6 +164,10 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if ans.Deploy && ans.Domain == "" {
 		summary.Warnings = append(summary.Warnings, "The first deploy has no domain; the deployability gate refuses it until a primary domain is bound.")
 	}
+	if len(ans.ResourceSpecs) > 0 {
+		summary.Warnings = append(summary.Warnings, "A first deploy was not queued because the definition declares managed resources; wait for resource health, then run `eregion deploy "+ans.App+" "+ans.Environment+"`.")
+	}
+	summary.SecretNames = setupSecretNames(ans)
 	if dry {
 		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
 		if interactive {
@@ -157,11 +181,10 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
 	} else {
-		secretNames, err := a.writeSetupSecrets(cmd, ans)
-		if err != nil {
+		if _, err := a.writeSetupSecrets(cmd, ans); err != nil {
 			return result{}, err
 		}
-		summary.SecretNames = secretNames
+		summary.SecretNames = setupSecretNames(ans)
 	}
 	op, err := a.submitAccepted(cmd, platform.KindAppCreate, platform.PlatformTarget().String(), input, "")
 	if err != nil {
@@ -169,6 +192,16 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	}
 	summary.OperationID = op.ID
 	summary.FirstDeployOperationID = op.FirstDeployOperationID
+	if len(ans.ResourceSpecs) > 0 {
+		resourceIDs, err := a.provisionDefinitionResources(cmd, ans.ResourceSpecs)
+		if err != nil {
+			summary.Warnings = append(summary.Warnings, "The environment was created, but resource provisioning was not accepted: "+err.Error()+". Reapply with `eregion resource apply`.")
+		}
+		summary.ResolvedResourceIDs = resourceIDs
+		if len(resourceIDs) > 0 {
+			summary.Warnings = append(summary.Warnings, "Managed resources were accepted for provisioning; they are not ready until their health checks pass, and the first deploy waits for attached resources.")
+		}
+	}
 	if interactive {
 		if ans.Deploy && followsByDefault(cmd) {
 			client, err := a.client(cmd)
@@ -198,6 +231,9 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 			}
 			rows = append(rows, [2]string{"DNS record", dns})
 		}
+		for _, id := range summary.ResolvedResourceIDs {
+			rows = append(rows, [2]string{"resource operation", string(id)})
+		}
 		footer := []string{
 			ui.Dim("the revision is desired state, not a running deployment"),
 			ui.Dim("next:"),
@@ -220,6 +256,82 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return a.followAccepted(cmd, client, op)
 	}
 	return result{data: summary, plain: summary.plainText()}, nil
+}
+
+// definitionDomainState refuses a file export/apply that would omit a domain
+// the environment row says is bound. Domain inventory and the environment row
+// must agree before a self-contained definition can be called faithful.
+func definitionDomainState(current platform.Environment, bindings []platform.DomainBinding) error {
+	seen := map[string]platform.DomainBinding{}
+	for _, binding := range bindings {
+		seen[binding.Domain] = binding
+	}
+	for _, domain := range current.Domains {
+		if _, ok := seen[domain]; !ok {
+			return contract.NewFault(contract.PreconditionFailed, "cannot represent this environment's domain state faithfully", "Domain "+domain+" is in the environment but not in the domain inventory; refresh the environment status and retry.")
+		}
+	}
+	if current.PrimaryDomain != "" {
+		binding, ok := seen[current.PrimaryDomain]
+		if !ok || !binding.Primary {
+			return contract.NewFault(contract.PreconditionFailed, "cannot represent this environment's domain state faithfully", "The primary domain binding is unavailable; refresh the environment status and retry.")
+		}
+	}
+	return nil
+}
+
+func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
+	appName, environment := args[0], args[1]
+	current, _, err := a.readEnvironment(cmd, appName, environment)
+	if err != nil {
+		return result{}, err
+	}
+	if len(current.SecretRefs) > 0 && (current.Revision == nil || len(current.Revision.SecretNames) == 0) {
+		return result{}, contract.NewFault(contract.PreconditionFailed, "this environment uses legacy secret_refs", "Move the environment to secret names with a new revision before exporting a definition.")
+	}
+	domains, err := a.readDomainBindings(cmd, appName, environment)
+	if err != nil {
+		return result{}, err
+	}
+	if err := definitionDomainState(current, domains); err != nil {
+		return result{}, err
+	}
+	_, resources, _, err := a.resourceInventory(cmd, appName, environment)
+	if err != nil {
+		return result{}, err
+	}
+	document, err := appdef.Export(appName, environment, current.BuildNode, current.Revision, domains, resources)
+	if err != nil {
+		return result{}, contract.NewFault(contract.PreconditionFailed, "cannot export this environment faithfully", err.Error())
+	}
+	outPath := flagString(cmd, "out")
+	if outPath != "" {
+		file, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // G304: operator-selected export path; O_EXCL avoids clobbering.
+		if err != nil {
+			return result{}, contract.NewFault(contract.PreconditionFailed, "cannot write the app definition", "Choose a new path; existing files are not overwritten.")
+		}
+		if _, err := file.WriteString(document); err != nil {
+			_ = file.Close()
+			_ = os.Remove(outPath)
+			return result{}, contract.NewFault(contract.Unavailable, "cannot write the app definition", "Check the destination's free space and permissions.")
+		}
+		if err := file.Close(); err != nil {
+			_ = os.Remove(outPath)
+			return result{}, contract.NewFault(contract.Unavailable, "cannot write the app definition", "Check the destination's free space and permissions.")
+		}
+	}
+	data := struct {
+		App         string `json:"app"`
+		Environment string `json:"environment"`
+		Format      string `json:"format"`
+		Document    string `json:"document"`
+		Out         string `json:"out,omitempty"`
+	}{App: appName, Environment: environment, Format: "toml", Document: document, Out: outPath}
+	plain := document
+	if outPath != "" {
+		plain = "Wrote " + outPath + "\n"
+	}
+	return result{data: data, plain: plain}, nil
 }
 
 func (a *app) appList(cmd *cobra.Command, _ []string) (result, error) {

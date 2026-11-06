@@ -88,6 +88,12 @@ var migration020 string
 //go:embed migrations/021_webhook_admissions.sql
 var migration021 string
 
+//go:embed migrations/022_managed_resources.sql
+var migration022 string
+
+//go:embed migrations/023_environment_resources.sql
+var migration023 string
+
 type migration struct {
 	version int
 	name    string
@@ -119,6 +125,8 @@ var migrations = []migration{
 	{version: 19, name: "019_retention_gc_generation.sql", sql: migration019},
 	{version: 20, name: "020_retention_skipped_status.sql", sql: migration020},
 	{version: 21, name: "021_webhook_admissions.sql", sql: migration021},
+	{version: 22, name: "022_managed_resources.sql", sql: migration022},
+	{version: 23, name: "023_environment_resources.sql", sql: migration023},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.

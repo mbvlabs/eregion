@@ -267,7 +267,22 @@ func (a *app) domainStateText(cmd *cobra.Command, input platform.DomainInput) st
 }
 
 func (a *app) domainBinding(cmd *cobra.Command, app, environment, domain string) (*platform.DomainBinding, error) {
-	raw, err := a.platformReadInventoryWith(cmd, "domains", url.Values{"app": {app}, "environment": {environment}})
+	bindings, err := a.readDomainBindings(cmd, app, environment)
+	if err != nil {
+		return nil, err
+	}
+	for index := range bindings {
+		if bindings[index].Domain == domain {
+			return &bindings[index], nil
+		}
+	}
+	return nil, contract.NewFault(contract.NotFound, domain+" is not in the domain inventory", "Refresh with eregion domain list.")
+}
+
+func (a *app) readDomainBindings(cmd *cobra.Command, app, environment string) ([]platform.DomainBinding, error) {
+	raw, err := a.platformReadInventoryWith(cmd, "domains", url.Values{
+		"app": {app}, "environment": {environment}, "limit": {"200"},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -277,12 +292,7 @@ func (a *app) domainBinding(cmd *cobra.Command, app, environment, domain string)
 	if err := json.Unmarshal(raw, &page); err != nil {
 		return nil, contract.NewFault(contract.Unavailable, "the node returned invalid domain state", "Check binary compatibility before assuming the route is absent.")
 	}
-	for index := range page.Items {
-		if page.Items[index].Domain == domain {
-			return &page.Items[index], nil
-		}
-	}
-	return nil, contract.NewFault(contract.NotFound, domain+" is not in the domain inventory", "Refresh with eregion domain list.")
+	return page.Items, nil
 }
 
 func (a *app) domainList(cmd *cobra.Command, _ []string) (result, error) {

@@ -211,7 +211,8 @@ func platformAcceptedMessage(kind string) string {
 	case platform.KindEnvironmentCreate:
 		return "Environment record accepted durably."
 	case platform.KindEnvironmentUpdate, platform.KindProcessScale, platform.KindConfigSet,
-		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach:
+		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach,
+		platform.KindEnvironmentResourceAttach, platform.KindEnvironmentResourceDetach:
 		return "Environment desired state accepted durably as a new revision; no deploy was queued."
 	case platform.KindReleaseCreate:
 		return "Release accepted durably; the image is verified or built before it becomes ready."
@@ -241,6 +242,10 @@ func platformAcceptedMessage(kind string) string {
 		return "Application deletion accepted durably; every environment's containers and routes are removed before platform state."
 	case platform.KindRetentionPrune:
 		return "Disk retention accepted durably; it removes only artifacts outside the effective policy and records a retention run."
+	case platform.KindResourceApply:
+		return "Resource apply accepted durably; the container joins the environment's private network and is not ready until its health check passes."
+	case platform.KindResourceDestroy:
+		return "Resource destroy accepted durably; the container is removed, named volumes and the resource identity are retained."
 	default:
 		return "Platform action accepted durably."
 	}
@@ -310,11 +315,19 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return err
 		}
+		if input.ExpectedRevisionID != "" && env.RevisionID != input.ExpectedRevisionID {
+			return contract.NewFault(contract.Conflict, "the environment changed since the definition was read", "Re-read the environment and re-apply the definition; no revision was written.")
+		}
 		base, err := currentRevisionStateTx(ctx, tx, env)
 		if err != nil {
 			return err
 		}
 		state := platform.ApplyEnvironmentPatch(base, *input)
+		if platform.EnvironmentUpdateRemovesState(base, state) {
+			if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
+				return err
+			}
+		}
 		var buildNode *string
 		if input.BuildNode != nil {
 			value := *input.BuildNode
@@ -414,6 +427,36 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		state := platform.AttachSecret(base, input.Name)
 		if _, err := publishEnvironmentRevisionTx(ctx, tx, env, id, actor, "environment.secret.attached",
 			"Attached vault secret name "+input.Name+" to the environment desired state; no value entered the revision.", state, nil); err != nil {
+			return err
+		}
+	case *platform.EnvironmentResourceInput:
+		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
+		if err != nil {
+			return err
+		}
+		base, err := currentRevisionStateTx(ctx, tx, env)
+		if err != nil {
+			return err
+		}
+		state := platform.AttachResource(base, input.Resource)
+		operation, summary := "environment.resource.attached", "Attached managed resource "+input.Resource+" to the environment desired state; readiness still requires the resource to be healthy."
+		if normalized.Kind == platform.KindEnvironmentResourceDetach {
+			state = platform.DetachResource(base, input.Resource)
+			operation, summary = "environment.resource.detached", "Detached managed resource "+input.Resource+" from the environment desired state; its container and volumes are retained."
+		} else {
+			var stateName string
+			err := tx.QueryRow(ctx, `SELECT state FROM eregion_platform_resources WHERE environment_id=$1 AND name=$2 FOR UPDATE`, env.ID, input.Resource).Scan(&stateName)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return contract.NewFault(contract.NotFound, "resource not found in this environment", "Apply the resource declaration first, then attach it.")
+			}
+			if err != nil {
+				return unavailable()
+			}
+			if stateName == string(platform.ResourceDestroyed) || stateName == string(platform.ResourceDestroying) {
+				return contract.NewFault(contract.PreconditionFailed, "resource is being destroyed", "Apply the resource again before attaching it to an environment revision.")
+			}
+		}
+		if _, err := publishEnvironmentRevisionTx(ctx, tx, env, id, actor, operation, summary, state, nil); err != nil {
 			return err
 		}
 	case *platform.DomainInput:
@@ -634,11 +677,19 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err := s.prepareDeploymentTx(ctx, tx, id, env, release.ID, platform.ActionRestart, env.RevisionID, env.ServingDeploymentID, nil); err != nil {
 			return err
 		}
+	case *platform.ResourceApplyInput:
+		return s.prepareResourceApply(ctx, tx, id, input)
+	case *platform.ResourceDestroyInput:
+		return s.prepareResourceDestroy(ctx, tx, id, input)
 	case *platform.AppDeleteInput:
-		if _, err := appByNameTx(ctx, tx, input.App); err != nil {
+		app, err := appByNameTx(ctx, tx, input.App)
+		if err != nil {
 			return err
 		}
 		if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
+			return err
+		}
+		if err := s.ensureNoLiveResourcesTx(ctx, tx, input.App, "", string(app.ID), ""); err != nil {
 			return err
 		}
 		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, input.App, ""); err != nil {
@@ -650,6 +701,9 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
+			return err
+		}
+		if err := s.ensureNoLiveResourcesTx(ctx, tx, env.App, env.Name, string(envAppID(ctx, tx, env.App)), string(env.ID)); err != nil {
 			return err
 		}
 		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, env.App, env.Name); err != nil {
@@ -759,6 +813,14 @@ func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platf
 	report := platform.EvaluateDeployability(env.Revision, platform.DeployabilityState{
 		ArtifactReady: true, ExplicitRelease: explicitRelease, PrimaryDomain: env.PrimaryDomain, DNS: dns,
 	})
+	if env.Revision != nil && len(env.Revision.Resources) > 0 {
+		missing, err := s.resourceDeployabilityTx(ctx, tx, env)
+		if err != nil {
+			return err
+		}
+		report.Missing = append(report.Missing, missing...)
+		report.Deployable = len(report.Missing) == 0
+	}
 	if report.Deployable {
 		return nil
 	}
@@ -1327,6 +1389,12 @@ func (s *Service) Inventory(ctx context.Context, actor contract.Actor, query pla
 			return inventory, err
 		}
 		inventory.Items = items
+	case "resources":
+		items, err := s.inventoryResources(ctx, query)
+		if err != nil {
+			return inventory, err
+		}
+		inventory.Items = items
 	default:
 		if provider, ok := platform.Default().InventoryProvider(query.Collection); ok {
 			items, err := provider.Read(ctx, query)
@@ -1339,7 +1407,7 @@ func (s *Service) Inventory(ctx context.Context, actor contract.Actor, query pla
 			inventory.Items = items
 			return inventory, nil
 		}
-		return inventory, contract.NewFault(contract.ValidationFailed, "unknown inventory collection", "Use summary, nodes, apps, environments, revisions, deployability, domains, releases, builds, deployments, or changes.")
+		return inventory, contract.NewFault(contract.ValidationFailed, "unknown inventory collection", "Use summary, nodes, apps, environments, revisions, deployability, domains, releases, builds, deployments, changes, or resources.")
 	}
 	return inventory, nil
 }
@@ -1352,6 +1420,7 @@ func (s *Service) inventorySummary(ctx context.Context) (map[string]int64, error
         UNION ALL SELECT 'builds', count(*) FROM eregion_platform_builds
         UNION ALL SELECT 'deployments', count(*) FROM eregion_platform_deployments
         UNION ALL SELECT 'nodes', count(*) FROM eregion_platform_nodes
+        UNION ALL SELECT 'resources', count(*) FROM eregion_platform_resources
         UNION ALL SELECT 'serving', count(*) FROM eregion_platform_environments WHERE serving_release_id IS NOT NULL`)
 	if err != nil {
 		return nil, unavailable()
@@ -1416,7 +1485,7 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,coalesce(e.buil
     coalesce(r.actor_kind,'system'),coalesce(r.actor_subject,''),coalesce(r.operation,''),coalesce(r.summary,''),
     coalesce(r.source,'{}'::jsonb),coalesce(r.auto_deploy,false),coalesce(r.webhook_secret_name,''),
     coalesce(r.runtime,'{}'::jsonb),coalesce(r.processes,'[]'::jsonb),coalesce(r.config,'{}'::jsonb),
-    coalesce(r.secret_names,'{}'),coalesce(r.retention,'{}'::jsonb),coalesce(r.deploy_intent,false),r.created_at,
+    coalesce(r.secret_names,'{}'),coalesce(r.resources,'{}'),coalesce(r.retention,'{}'::jsonb),coalesce(r.deploy_intent,false),r.created_at,
     e.created_at,e.updated_at
     FROM eregion_platform_environments e
     JOIN eregion_platform_apps a ON a.id=e.app_id
@@ -1429,14 +1498,14 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var revisionNumber int
 	var operationID, actorKind, actorSubject, operation, summary, webhookSecretName, primaryDNS string
 	var autoDeploy, deployIntent bool
-	var secretNames []string
+	var secretNames, resourceNames []string
 	var revisionCreated *time.Time
 	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
 		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
 		&env.PrimaryDomain, &primaryDNS, &env.PendingCleanup, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
 		&actorKind, &actorSubject, &operation, &summary, &rawSource, &autoDeploy, &webhookSecretName,
-		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &rawRetention, &deployIntent, &revisionCreated,
+		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &resourceNames, &rawRetention, &deployIntent, &revisionCreated,
 		&env.CreatedAt, &env.UpdatedAt)
 	if err != nil {
 		return env, err
@@ -1486,6 +1555,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 			}
 		}
 		revision.SecretNames = secretNames
+		revision.Resources = resourceNames
 		if len(rawRetention) > 0 {
 			if err := json.Unmarshal(rawRetention, &revision.Retention); err != nil {
 				return env, err
@@ -1500,6 +1570,9 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 		}
 		if revision.SecretNames == nil {
 			revision.SecretNames = []string{}
+		}
+		if revision.Resources == nil {
+			revision.Resources = []string{}
 		}
 		env.RevisionID = revision.ID
 		env.Revision = revision
@@ -1546,6 +1619,12 @@ func (s *Service) inventoryEnvironments(ctx context.Context, query platform.Inve
 		if err != nil {
 			return nil, unavailable()
 		}
+		missing, err := s.resourceDeployability(ctx, env)
+		if err != nil {
+			return nil, err
+		}
+		env.Deployability.Missing = append(env.Deployability.Missing, missing...)
+		env.Deployability.Deployable = len(env.Deployability.Missing) == 0
 		items = append(items, env)
 	}
 	return items, rows.Err()
@@ -2171,6 +2250,20 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		}
 		preview.Steps = []string{"load current revision", "attach the secret name", "append a new revision"}
 		preview.Summary = "Attach vault secret name " + input.Name + " to the environment revision; no value enters the operation."
+	case *platform.EnvironmentResourceInput:
+		env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
+		if err != nil {
+			return preview, err
+		}
+		if _, err := s.resourceByName(ctx, input.App, input.Environment, input.Resource); err != nil {
+			return preview, err
+		}
+		preview.Steps = []string{"load current revision", normalized.Kind + " " + input.Resource, "append a new revision"}
+		if normalized.Kind == platform.KindEnvironmentResourceDetach {
+			preview.Summary = "Detach managed resource " + input.Resource + " from " + env.App + "/" + env.Name + "; its container and named volumes are retained and no deploy is queued."
+		} else {
+			preview.Summary = "Attach managed resource " + input.Resource + " to " + env.App + "/" + env.Name + " as desired state; deployment stays blocked until the resource reports ready."
+		}
 	case *platform.ReleaseCreateInput:
 		preview.Summary = "Record release from " + input.Source.Type + " source."
 		if input.Source.Type == "image" {
@@ -2204,6 +2297,56 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	case *platform.NodeReconcileInput:
 		preview.Steps = []string{"converge role directories", "generate node WireGuard key", "render peer configuration", "apply peers"}
 		preview.Summary = "Converge host configuration and WireGuard peers on node " + input.Node + "; rerunning changes nothing when the node already matches."
+	case *platform.ResourceApplyInput:
+		env, err := s.environment(ctx, input.App, input.Environment)
+		if err != nil {
+			return preview, err
+		}
+		if err := s.checkPreviewNode(ctx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+			return preview, err
+		}
+		preview.Steps = []string{
+			"ensure the environment's private bridge network",
+			"pull the declared image",
+			"resolve and record the immutable image ID",
+			"ensure resource-scoped named volumes",
+			"start one container on the private network with no published host port",
+			"run the declared exec health check",
+		}
+		existing, err := s.resourceByName(ctx, input.App, input.Environment, input.Name)
+		if err != nil {
+			if contract.Classify(err).Code != contract.NotFound {
+				return preview, err
+			}
+			preview.Summary = "Create resource " + input.Name + " for " + input.App + "/" + input.Environment + " from image " + input.Image + " on the environment's private network."
+		} else {
+			preview.Summary = "Apply resource " + input.Name + " for " + input.App + "/" + input.Environment + " from image " + input.Image + "; the same resource identity and named volumes are retained."
+			if existing.Node != env.Node {
+				preview.Warnings = append(preview.Warnings, "This resource is bound to node "+existing.Node+" and cannot be moved implicitly; apply would be refused until it is destroyed on that node.")
+			}
+		}
+		preview.Warnings = append(preview.Warnings, "A tag is resolved to an immutable image ID at apply time. The resource is not ready until its exec health check succeeds, and no host port is published.")
+		if len(input.SecretEnv) > 0 {
+			preview.Warnings = append(preview.Warnings, "Secret values are resolved from the environment vault only inside the worker; this preview and the operation input contain secret names only.")
+		}
+	case *platform.ResourceDestroyInput:
+		resource, err := s.resourceByName(ctx, input.App, input.Environment, input.Name)
+		if err != nil {
+			return preview, err
+		}
+		if resource.State == platform.ResourceDestroyed && !input.DeleteData {
+			preview.Summary = "Resource " + input.Name + " is already destroyed; applying it again reactivates the same identity and retained volumes, or --delete-data deletes the retained data explicitly."
+			preview.Steps = []string{"observe that no container is running"}
+			break
+		}
+		preview.Steps = []string{"verify resource ownership labels", "remove the resource container", "retain named volumes and the resource identity"}
+		preview.Summary = "Destroy resource " + input.Name + " for " + input.App + "/" + input.Environment + "; its container is removed and its named volumes are retained."
+		preview.Warnings = append(preview.Warnings, "Named volumes are not deleted by a default destroy; use resource destroy --delete-data to remove this resource's owned volumes explicitly.")
+		if input.DeleteData {
+			preview.Steps = []string{"verify resource ownership labels", "remove the resource container", "verify and remove each resource-scoped named volume"}
+			preview.Summary = "Destroy resource " + input.Name + " for " + input.App + "/" + input.Environment + " and permanently delete its named volumes."
+			preview.Warnings = []string{"DATA DESTRUCTION: --delete-data permanently removes the resource's named volumes after the container is removed. This cannot be undone and is refused for volumes without this resource's ownership labels."}
+		}
 	case *platform.AppDeleteInput, *platform.EnvironmentDeleteInput:
 		return s.deletionPreview(ctx, normalized)
 	case *platform.RetentionPruneInput:
@@ -2364,6 +2507,12 @@ func (s *Service) environment(ctx context.Context, app, name string) (platform.E
 	if err != nil {
 		return env, unavailable()
 	}
+	missing, err := s.resourceDeployability(ctx, env)
+	if err != nil {
+		return env, err
+	}
+	env.Deployability.Missing = append(env.Deployability.Missing, missing...)
+	env.Deployability.Deployable = len(env.Deployability.Missing) == 0
 	return env, nil
 }
 

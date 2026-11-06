@@ -13,10 +13,12 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// lockPlatformTargets serializes a deletion with every operation that could
-// touch the same records. An app deletion takes the app target (which also
-// serializes environment creation) and every current environment target, so a
-// deploy cannot race the cleanup. Lock order is sorted to avoid deadlocks.
+// lockPlatformTargets serializes a deletion or managed-resource operation with
+// every operation that could touch the same records. An app deletion takes the
+// app target (which also serializes environment creation) and every current
+// environment target, so a deploy cannot race the cleanup. A resource
+// operation also takes its environment target so it cannot race a deployment
+// switch. Lock order is sorted to avoid deadlocks.
 func (s *Service) lockPlatformTargets(ctx context.Context, normalized platform.Normalized) (func(), error) {
 	targets := []string{normalized.Target.String()}
 	switch input := normalized.Input.(type) {
@@ -26,8 +28,27 @@ func (s *Service) lockPlatformTargets(ctx context.Context, normalized platform.N
 			return nil, err
 		}
 		targets = append(targets, envTargets...)
+		resourceTargets, err := s.resourceTargets(ctx, input.App, "")
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, resourceTargets...)
 	case *platform.EnvironmentDeleteInput:
 		targets = append(targets, "app/"+input.App)
+		resourceTargets, err := s.resourceTargets(ctx, input.App, input.Environment)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, resourceTargets...)
+	case *platform.ResourceApplyInput:
+		// A resource container is consumed by the environment's deployments.
+		// Taking the environment target serializes provisioning with a deploy
+		// switch, in addition to the resource's own target.
+		targets = append(targets, "env/"+input.App+"/"+input.Environment)
+	case *platform.ResourceDestroyInput:
+		// The same environment lock keeps destroy out of a deployment switch;
+		// the resource target keeps it out of another resource operation.
+		targets = append(targets, "env/"+input.App+"/"+input.Environment)
 	}
 	return s.lockTargets(ctx, targets)
 }

@@ -121,6 +121,9 @@ type RevisionState struct {
 	Processes         []ProcessSpec     `json:"processes"`
 	Config            map[string]string `json:"config"`
 	SecretNames       []string          `json:"secret_names"`
+	// Resources names environment-owned managed resources this environment
+	// depends on. Names only; readiness is observed separately and gates deploy.
+	Resources []string `json:"resources,omitempty"`
 	// Retention overrides the server default retention policy for this
 	// environment. Nil fields inherit the server value; changing any field
 	// commits a new revision like every other piece of desired state (D30).

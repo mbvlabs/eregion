@@ -24,6 +24,7 @@ const (
 	ContainerEnvironmentLabel = "io.eregion.environment"
 	ContainerReleaseLabel     = "io.eregion.release"
 	ContainerDeploymentLabel  = "io.eregion.deployment"
+	ContainerKindLabel        = "io.eregion.kind"
 )
 
 // InputFromInventory maps one node observation and the platform rows into the
@@ -102,6 +103,7 @@ func InputFromInventory(inventory Inventory, state PlatformState, now time.Time)
 			Owned:       owned,
 			Release:     container.Labels[ContainerReleaseLabel],
 			Deployment:  container.Labels[ContainerDeploymentLabel],
+			Kind:        container.Labels[ContainerKindLabel],
 			Image:       container.Image,
 			State:       container.State,
 			Bytes:       container.SizeBytes,
