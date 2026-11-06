@@ -130,16 +130,23 @@ and this workflow has no manual-dispatch signing exception.
 
 Same setup as vaire. `internal/buildinfo.ReleaseBaseURL` is
 `https://eregion.mbvlabs.com`; both publish workflows refuse to run unless the
-`RELEASE_BASE_URL` variable equals it exactly. The GitHub environments `edge`
-and `stable` each carry:
+`RELEASE_BASE_URL` variable equals it exactly. The GitHub environments `edge`,
+`prerelease` and `stable` each carry their own configuration:
 
 - variables `RELEASE_BASE_URL` = `https://eregion.mbvlabs.com` and
   `RELEASE_BUCKET` = `eregion`;
 - secrets `R2_ENDPOINT`, `R2_ACCESS_KEY_ID` and `R2_SECRET_ACCESS_KEY`.
 
 No endpoint, account ID or bucket credential is recorded in this
-repository. The stable environment must exist before the first tag. Tags and
-the `1.x` branch are created only when the user authorizes them.
+repository. Configure `prerelease` before publishing alpha, beta or RC tags;
+these jobs never reference `stable`. Canonical final tags use `stable` only.
+The workflow classifies the full tag before either environment job is eligible;
+invalid tags fail closed. GitHub environment tag patterns use `File.fnmatch`:
+`v*` (and patterns such as `v*.*.*`) also match prereleases, so that rule alone
+cannot enforce finals-only access. A selected-tag allowlist of exact final tag
+names or a custom deployment protection rule is needed for an independent
+environment-level boundary; review every workflow that can reference `stable`.
+Tags and the `1.x` branch are created only when the user authorizes them.
 
 ## Qualification
 

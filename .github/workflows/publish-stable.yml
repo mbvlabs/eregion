@@ -13,9 +13,139 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    outputs:
+      kind: ${{ steps.tag.outputs.kind }}
+    steps:
+      - id: tag
+        env:
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          test "${REF}" = "refs/tags/${REF_NAME}" || exit 1
+          number='(0|[1-9][0-9]*)'
+          if [[ "${REF_NAME}" =~ ^v${number}\.${number}\.${number}$ ]]; then
+            echo 'kind=final' >> "${GITHUB_OUTPUT}"
+          elif [[ "${REF_NAME}" =~ ^v${number}\.${number}\.${number}-(alpha|beta|rc)\.${number}$ ]]; then
+            echo 'kind=prerelease' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'invalid release tag' >&2
+            exit 1
+          fi
   publish:
+    needs: classify
+    if: ${{ needs.classify.outputs.kind == 'final' }}
     runs-on: ubuntu-24.04
     environment: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: Validate release configuration
+        env:
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          RELEASE_BASE_URL: ${{ vars.RELEASE_BASE_URL }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          test -n "${RELEASE_BUCKET}" || { echo "RELEASE_BUCKET is not configured" >&2; exit 1; }
+          test -n "${RELEASE_BASE_URL}" || { echo "RELEASE_BASE_URL is not configured" >&2; exit 1; }
+          test -n "${R2_ENDPOINT}" || { echo "R2_ENDPOINT is not configured" >&2; exit 1; }
+          [[ "${R2_ENDPOINT}" == https://* ]] || { echo "R2_ENDPOINT must use https://" >&2; exit 1; }
+          test -n "${R2_ACCESS_KEY_ID}" || { echo "R2_ACCESS_KEY_ID is not configured" >&2; exit 1; }
+          test -n "${R2_SECRET_ACCESS_KEY}" || { echo "R2_SECRET_ACCESS_KEY is not configured" >&2; exit 1; }
+          grep -Fq "const ReleaseBaseURL = \"${RELEASE_BASE_URL}\"" internal/buildinfo/buildinfo.go || {
+            echo "RELEASE_BASE_URL must equal buildinfo.ReleaseBaseURL" >&2
+            exit 1
+          }
+      - name: Verify tagged source
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [[ "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || { echo "invalid release tag" >&2; exit 1; }
+          test "${GITHUB_REF}" = "refs/tags/v${version}"
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          major="${version%%.*}"
+          # A stable tag is on its own major line, not on master.
+          git fetch --no-tags origin "${major}.x"
+          git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD
+          test -z "$(gofmt -l cmd internal schema examples)"
+          go vet ./...
+          go build ./...
+      - name: Build the major line release
+        env:
+          RELEASE_BASE_URL: ${{ vars.RELEASE_BASE_URL }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          channel="stable-${version%%.*}.x"
+          [[ "${version}" != *-rc.* ]] || channel=rc
+          scripts/build-release.sh "${version}" "${channel}" "${RELEASE_BASE_URL}"
+      - name: Sign and verify the line release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          channel="stable-${version%%.*}.x"
+          [[ "${version}" != *-rc.* ]] || channel=rc
+          scripts/sign-release.sh "dist/release-${channel}"
+      - name: Upload the immutable artifacts
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          line="stable-${version%%.*}.x"
+          [[ "${version}" != *-rc.* ]] || line=rc
+          existing="$(aws s3api list-objects-v2 \
+            --bucket "${RELEASE_BUCKET}" --prefix "releases/${version}/" --max-keys 1 \
+            --query KeyCount --output text --endpoint-url "${R2_ENDPOINT}")"
+          test "${existing}" = 0 || {
+            echo "Release ${version} already exists and will not be overwritten" >&2
+            exit 1
+          }
+          scripts/upload-release.sh "dist/release-${line}" "${line}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" artifacts
+      - name: Promote the major line only forward
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          line="${version%%.*}.x"
+          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key "${line}/manifest.json" --endpoint "${R2_ENDPOINT}" "${version}")"
+          if [ "${promote}" = yes ]; then
+            scripts/upload-release.sh "dist/release-stable-${line}" "stable-${line}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
+          fi
+      - name: Move the root channel when this is the highest version
+        if: ${{ !contains(github.ref_name, '-') }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key manifest.json --endpoint "${R2_ENDPOINT}" "${version}")"
+          if [ "${promote}" != yes ]; then
+            echo "the root channel stays unchanged: ${version} does not move it"
+            exit 0
+          fi
+          release_root="dist/release-stable-${version%%.*}.x"
+          cp "${release_root}/${version%%.*}.x/manifest.json" "${release_root}/manifest.json"
+          cp "${release_root}/${version%%.*}.x/manifest.json.sigstore.json" "${release_root}/manifest.json.sigstore.json"
+          scripts/upload-release.sh "${release_root}" stable "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
+  publish_prerelease:
+    needs: classify
+    if: ${{ needs.classify.outputs.kind == 'prerelease' }}
+    runs-on: ubuntu-24.04
+    environment: prerelease
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -99,37 +229,3 @@ jobs:
           if [ "${promote}" = yes ]; then
             scripts/upload-release.sh dist/release-rc rc "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
           fi
-      - name: Promote the major line only forward
-        if: ${{ !contains(github.ref_name, '-') }}
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          line="${version%%.*}.x"
-          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key "${line}/manifest.json" --endpoint "${R2_ENDPOINT}" "${version}")"
-          if [ "${promote}" = yes ]; then
-            scripts/upload-release.sh "dist/release-stable-${line}" "stable-${line}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
-          fi
-      - name: Move the root channel when this is the highest version
-        if: ${{ !contains(github.ref_name, '-') }}
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key manifest.json --endpoint "${R2_ENDPOINT}" "${version}")"
-          if [ "${promote}" != yes ]; then
-            echo "the root channel stays unchanged: ${version} does not move it"
-            exit 0
-          fi
-          release_root="dist/release-stable-${version%%.*}.x"
-          cp "${release_root}/${version%%.*}.x/manifest.json" "${release_root}/manifest.json"
-          cp "${release_root}/${version%%.*}.x/manifest.json.sigstore.json" "${release_root}/manifest.json.sigstore.json"
-          scripts/upload-release.sh "${release_root}" stable "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
