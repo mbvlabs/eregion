@@ -194,8 +194,9 @@ Both degraded resources were destroyed with exact confirmation: cache
 `op_25bbbeed0f4ca36399a55ac82817c832`, db
 `op_0829f6c2b1d04f905635ceff9ac7727e`; a further
 `resource destroy cache --delete-data` (`op_03fd23841b5830d51506a464be1e06db`)
-succeeded with no owned volumes and left a foreign volume `a2-foreign-1106`
-untouched; that foreign volume was then removed. Both resource rows are
+succeeded with no owned volumes and left a separately created foreign volume
+`a2-foreign-1106` untouched (not an ownership-refusal test); that foreign
+volume was then removed. Both resource rows are
 `destroyed`, with no fixture container, volume or network left.
 
 `app delete a2defs1106 --dry-run` and `env delete a2defs1106 production
@@ -705,7 +706,7 @@ Completed before the stop:
   definition file (`op_29b5ffe04dbda9e724960853e8aef430`), with the authorized
   `eregion-alpha-two.mbvlabs.com` primary domain and image
   `sha256:b472757e…`.
-- **Interrupted provisioning retry — pass.** A PostgreSQL resource apply with
+- **Failed-health provisioning retry — pass.** A PostgreSQL resource apply with
   exec health deliberately set to `false` failed and left the resource
   degraded (`op_8ef5af49dd1538e5d130801f8400a8df`), with volume
   `er-res-bbbb6c658dff7163ecb31da66ff4d6e9-db-data`. The retry with
@@ -798,6 +799,12 @@ sanitized operation evidence. Alpha.1 remains operator-qualified.
   environment's data is affected. App or environment deletion after destroy
   leaves the resource's Docker volumes on the node untracked; record that
   outcome rather than claiming cleanup.
+- Apply D33 protection: `app create` records production and staging protected
+  without a TOTP prompt; other names are unprotected unless `--protected` is
+  given; `env protect` is agent-safe; `env unprotect`, a protected or
+  last-environment delete and every `app delete` need the D7 factor at a human
+  terminal; an unprotected non-last delete works with `--json` and exact
+  confirmation. Migration 024 backfills existing environments protected.
 - Provision generic PostgreSQL and Redis Docker resources on a private
   environment network, make them healthy, connect the app using vault secret
   names and verify data persists across restart and app redeployment. A failed
@@ -808,7 +815,8 @@ sanitized operation evidence. Alpha.1 remains operator-qualified.
   volume identity results. Destroying a resource with active dependents is
   refused; detachment alone never deletes its persistent data. A separate
   `resource destroy --delete-data` removes only that resource's owned volumes;
-  verify a foreign volume is refused.
+  verify a deletion target with foreign ownership is explicitly refused. A
+  separate pre-created volume merely remaining is not that check.
 - Exercise the optional `gh` webhook setup with an authorized repository and
   manual fallback when it is unavailable or lacks permission. Check failure
   and retry behavior, JSON/no-TTY operation, and secret-safe output.
@@ -3420,48 +3428,185 @@ items. All four serving URLs returned 200. Sanitized evidence:
 directory. No tunnel, header file, deployment or server configuration change
 was made.
 
-### 2026-11-06 — alpha.2 protection redesign (source-only, host not run)
+### 2026-11-06 — alpha.2 protection redesign host run (`edge-6d1ae98b9ac1`)
 
-The agreed alpha.2 redesign was implemented on the working tree without a
-commit, push, server, database, Docker daemon or ambient DSN. **No row below is
-host-qualified and no operation ID exists.** Migration 024 has not been applied;
-the last host build remains `edge-ba175353f00a` at schema 23/23. The existing
-alpha.2 host records above are evidence for the earlier build, not for this
-working tree.
+Build `edge-6d1ae98b9ac1` (commit `6d1ae98`, edge run `42285442054`) was
+published, verified from the signed edge manifest, and installed on the CLI and
+`main`. Node apply `op_fca44c39b625e2216d05d7581de99c18` applied migration 024.
+The node reports schema **24/24** and River 7/7; `doctor` is 20 pass / 0 warn /
+0 fail and the repeat `apply --dry-run` is 0 of 20. During the final checks
+`apply --dry-run` alternated between 0 of 20 and 1 of 20: `host-readiness-v1`
+timed out waiting for `GET /readyz`, while direct measurements of that endpoint
+returned 200 in 0.35–8.1s. `doctor` alternated between 20/0/0 and 19/1 on the
+known intermittent `host.retention` read warning. Immediate repeats passed;
+no configuration was changed, so these are recorded as transient observations
+rather than host failures.
+
+All five pre-existing environments (`deployab`, `githello`, `guided`, `img` and
+production) were inspected and are `protected: true`. None was unprotected and
+no existing row was lowered.
 
 | Check | Result | Evidence |
 | --- | --- | --- |
-| `app create` builds production and staging from one recipe, both protected, production domain only, staging no invented domain | Isolated CLI test passes (in-memory backend) | `TestAppCreateBuildsProtectedProductionAndStagingAtomically` |
-| App + both environments + revisions commit atomically; failure on the second environment rolls back the app; same-key replay returns the original; a different key is a conflict | Integration test added; **not run** without an isolated PostgreSQL DSN | `TestIntegrationAppCreateMaterialisesProductionAndStaging` |
-| Other environment names default unprotected; production/staging default protected; migration 024 backfills every existing environment protected | Unit and migration-order/checksum tests pass; migration itself **not applied** | `TestRequiresHumanFactorIsUnconditionalOnlyForAppDelete`, `TestIntegration...` (not run), `internal/controlplane/database_test.go` |
-| App delete always needs TOTP, including direct service submission | Platform policy test passes; integration test added; **not run** | `TestDeleteFactorPolicyUsesDurableTargetState`, `TestIntegrationDeleteFactorIsDecidedServerSide` |
-| Protected env delete needs TOTP; unprotected non-last env delete works with exact confirm and no TOTP in JSON/no-TTY | CLI policy and in-memory command tests pass; integration test added; **not run** | `TestEnvironmentDeleteFactorFollowsDurableProtection`, `TestIntegrationDeleteFactorIsDecidedServerSide` |
-| Last-environment delete cannot bypass app-deletion TOTP | Policy test and integration test added; **not run** | `TestDeleteFactorPolicyUsesDurableTargetState`, `TestIntegrationDeleteFactorIsDecidedServerSide` |
-| `env protect` is agent-safe; `env unprotect` without a terminal refuses; server verifies the code in the locked submission transaction | CLI in-memory tests pass; integration test added; **not run** | `TestEnvProtectionRequiresFactorOnlyToLowerProtection`, `TestIntegrationUnprotectRequiresFactorAndProtectDoesNot` |
-| HTTP refuses only actions whose current locked state needs the factor; direct service with no verifier fails closed | API tests pass for app delete refusal and preview; no host HTTP test | `internal/api/factor_test.go` |
-| `env create --from` for `pr-42` uses the shared recipe with no `pr-42` override; app create resolves production/staging overrides; export puts domains under the environment override | Isolated appdef/CLI tests pass | `TestEnvironmentCreateFromSharedRecipeNeedsNoNamedOverride`, `TestDefinitionFileAndFlagsBuildTheSameFirstRevision`, `internal/appdef` tests |
-| Secret values never enter operation input, events or River arguments; only names and ephemeral request factor data | Source review and redaction tests; no host submission | package tests |
-| `app create` supplied secret values and Git read credential materialize in **both** production and staging namespaces when shared; an environment-specific name/credential never leaks into the other namespace | Isolated CLI tests with an in-memory vault recording namespaces and payloads pass | `TestAppCreateWritesSharedSecretsToBothEnvironmentNamespaces`, `TestSetupSecretWritesRespectEnvironmentSpecificNames` |
-| TOTP protect store read-modify-write mutations are serialized across independent processes: one replay succeeds, one confirmation succeeds, one rotation succeeds, and concurrent wrong codes reach lockout | Multiprocess helper-process tests pass | `TestMultiprocessVerifyAcceptsOneReplay`, `TestMultiprocessConfirmAcceptsOneConfirmation`, `TestMultiprocessRotateAcceptsOneRotation`, `TestMultiprocessFailuresReachLockout` |
+| `app create` builds production and staging, both protected, production domain only, staging no invented domain | **Pass** on the host. Guided file-free create `op_0e2c1e66043489dc1941825c705a8c1a` created both environments without a TOTP prompt; both read `protected: true`; staging had no domain. | `a2defs1106` env list/status; `SHARED_SECRET` revision 1 in both namespaces |
+| App + both environments + revisions commit atomically; failure on the second environment rolls back the app; same-key replay returns the original; a different key is a conflict | **Pass (disposable PostgreSQL integration, not host).** A forced staging-insert error after production and its current revision already existed rolled back the app, environments, revisions, operation and River job completely. A same-key retry/replay then produced one app, two environments, two revisions, one operation and one River job. The host separately refused a different-key resubmit with `conflict`. | Five selected integration tests on `6d1ae98`; temporary cluster removed; host conflict JSON |
+| Other names default unprotected; production/staging default protected; migration 024 backfills every existing environment protected | **Pass.** Migration 024 applied on `main`; every pre-existing environment is protected. `pr-42`, `hook` and `prot-audit` were created unprotected because their names are not production/staging and no `--protected` was passed. | `op_fca44c39b625e2216d05d7581de99c18`; env rows; migration 024 |
+| App delete always needs TOTP, including direct service submission | **Pass for refusal.** CLI `app delete` returned `input_required`; direct node `platform.app.delete` returned `precondition_failed` with `details.reason=code_required`. The positive TOTP deletion is the residual operator action. | CLI JSON refusal; node RPC request `app/a2defs1106` |
+| Protected env delete needs TOTP; unprotected non-last env delete works with exact confirm and no TOTP in JSON/no-TTY | **Pass.** Protected `env delete` returned `input_required`; direct node `platform.environment.delete` returned `precondition_failed`/`code_required`. Unprotected `pr-42` deleted with `--confirm a2defs1106/pr-42 --json` as `op_9eb5aa06b06766f163adfbe61b2c74bc`. | CLI/API refusals; `op_9eb5…` succeeded; `pr-42` gone |
+| Last-environment delete cannot bypass app-deletion TOTP | **Pass for factor admission (injected verifier, not real TOTP).** On the disposable PostgreSQL test, a last unprotected environment with a missing verifier, wrong code or invalid code was denied and created no operation. A valid injected test verifier was accepted and queued the delete while workers were stopped; the delete was not completed by a worker, and no real authenticator code was used. | Selected integration tests on `6d1ae98`; temporary cluster removed |
+| `env protect` is agent-safe; `env unprotect` without a terminal refuses; server verifies the code in the locked submission transaction | **Pass for the host-visible policy.** `env protect a2defs1106 prot-audit --json` succeeded as `op_e248d36683e6317674fc36b9c5711439` and the row read `protected: true`; its `env delete` and `env unprotect` then returned `input_required`. Locked-transaction verification is covered by source and integration tests, which were not run on the host. | `op_e248…`; status/refusals |
+| HTTP refuses only actions whose current locked state needs the factor; direct service with no verifier fails closed | **Not run over host HTTP.** API tests cover app-delete refusal and preview. | `internal/api/factor_test.go` |
+| `env create --from` for `pr-42` uses the shared recipe with no `pr-42` override | **Pass.** `env create --from` created `pr-42` unprotected as `op_1724f76965e70df26a026cfde545ceb8`; the recipe file has no `pr-42` section. It was then deleted as `op_9eb5…`. | `prot-recipe.toml`; create/delete JSON |
+| Fresh arbitrary-name environment creation uses the name default, not a protected default | **Pass.** `fresh-audit` was created without `--protected` and read `protected: false` (`op_4fa609d1c8502d17ab4e11baa2b4de02`); shared-recipe `recipe-audit` also read `protected: false` (`op_a1505d66121293de4f0c8b9931de94c4`) and took the shared config/secret name with no production domain override. | Create/status JSON |
+| `env create` same-key replay returns the original operation without a second environment | **Pass.** Repeating the `fresh-audit` create with `--idempotency-key alpha2-fresh-audit-20261106` returned the same `op_4fa6…`; the env list still had one `fresh-audit`. | Replay JSON; env list |
+| Unprotected non-last `env delete` works unattended with exact confirmation | **Pass.** `fresh-audit` deleted as `op_d1144d2a44c97b3b8b284f827b6806ba` and `recipe-audit` as `op_17179495fec1805fad3341a51366b0a8`, both with `--confirm <app>/<env> --json` and no TOTP. Their status then returned `not_found`, and their secret namespace lists were empty. | Delete/follow JSON; env/secret lists |
+| Environment-specific secret names do not leak into another namespace | **Pass.** `FRESH_ONLY` existed only in `fresh-audit`; production and staging kept only `SHARED_SECRET`. The 0600 value file was shredded and no value was printed. | `secret list`; create JSON |
+| Secret values never enter operation input, events or River arguments; only names and ephemeral request factor data | **Pass by inspection of the observed outputs.** Create, status, operation and environment output showed only `SHARED_SECRET`/`GIT_READ_TOKEN` names; no value was printed. | CLI JSON outputs; redaction tests |
+| Shared creation secret values materialise in both production and staging namespaces; an environment-specific name never leaks into the other namespace | **Pass.** `SHARED_SECRET` was present in both production and staging at revision 1; `FRESH_ONLY` existed only in `fresh-audit`. The isolated namespace test also passes. | `secret list`; `TestSetupSecretWritesRespectEnvironmentSpecificNames` |
+| TOTP protect-store read-modify-write mutations serialise across independent processes | **Not run on the host.** Multiprocess helper-process tests pass on the workstation; no concurrent node RPC code submission was attempted. | `TestMultiprocessVerifyAcceptsOneReplay` and related tests |
+| `--confirm-domain` removes a bound alias from an environment | **Pass.** With `a2-primary.invalid` added as the primary (`op_e78773b42588dc9b80a3febf9b896e60`), file update with `--confirm-domain eregion-alpha-two.mbvlabs.com` removed the designated hostname as `op_134d51a4d723161563903870b4389275`; only the `.invalid` primary remains. | Domain list; update JSON |
 
-Checks run on the working tree only: `go build ./...`, `go vet ./...`,
-`GOOS=darwin GOARCH=arm64 go build ./...`, `go test ./...`, the selected
-`go test ./internal/platform ./internal/appdef ./internal/cli ./internal/api ./internal/controlplane`
-run, and the protect multiprocess suite. `go test -race` was not run because
-this environment lacks cgo.
-The PostgreSQL integration tests above skip when `EREGION_TEST_DATABASE_URL` is
-unset. Remaining host qualification (not authorized or available in this
-task): apply migration 024 on an authorized disposable database, create an app
-and confirm two protected environments, exercise protected and last deletions
-with a real TOTP and unprotected deletion without one, apply policy over HTTP,
-and confirm an unprotected non-last `env delete --json` and `pr-42` recipe
-creation against the existing node. Host qualification must also verify that
-shared creation secrets exist in both environment vault namespaces and that
-concurrent node RPC code use cannot replay a TOTP step or lose lockout counts;
-the multiprocess evidence here is from separate test-binary processes on this
-workstation, not node RPC over SSH. Existing environments become protected by
-migration 024; the operator must unprotect any older disposable environment
-with the factor before an agent may delete it.
+**Independent disposable PostgreSQL retest (2026-11-06, `6d1ae98`).** A
+separate temporary PostgreSQL cluster ran five selected tests with no ambient
+production DSN. The app-create test forced an error in the staging insert
+after verifying production and its current revision already existed; the
+transaction rolled back the app, both environments, revisions, operation and
+River job completely. A same-key retry/replay then succeeded with one app, two
+environments, two revisions, one operation and one River job. The
+last-unprotected-environment test denied a missing verifier, wrong code and
+invalid code without creating an operation; a valid injected test verifier was
+accepted and queued the delete with workers stopped. That verifier is a test
+injection, not a real TOTP, and the queued delete was not completed by a
+worker. The temporary cluster was removed and no DSN or secret value was
+stored in evidence.
+
+Additional audited alpha.2 cases on the same fixture:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Failed-health resource apply retry preserves volume identity | **Pass.** A deliberately unhealthy `cache` apply degraded as `op_bf3718dfff0d897b0fa305b1d026e08d` with volume `er-res-e8ea4b4fc7468548f507969953efa8e0-cache-data`; the corrected retry `op_452dd3b405d027e46fc6e98fbc0cf6d9` reached ready and reused the same volume. This was a failed health check, not an interrupted operation. | Resource status before/after |
+| Actual interruption: worker SIGKILL during provisioning is recovered and retried | **Pass.** Resource `interrupt2` in disposable `resource-audit3` was applying with a deliberately slow health command. The worker was SIGKILLed while the health step ran (PID changed, `NRestarts=2`). On restart the worker recovered the orphaned platform job (`op_2eee5d4a5320d71203a4bf075288cf58`, attempt 2), the health step then failed, and the resource became degraded with volume `er-res-d81502e434ca7f0ba8db431214eac64a-data`. The corrected retry `op_c457f164e6709764f59cd15c48120e8a` succeeded and reused the same volume with the expected ownership labels. The resource was destroyed with `--delete-data` (`op_649d92412f7ffd3234ca13b0d04b3bea`) and the environment deleted (`op_bf535c24a1a5a8fd4d6cde4c6e3f45b6`). | Worker restart/PID, operation events, resource status/labels |
+| Interrupted-and-cancelled apply cleanup | **Blocked by state handling.** A first interruption attempt requested cancellation while the health step ran, then SIGKILLed the worker. The operation ended `cancelled` as `op_3eded76779595d3f9d9fbf7b6b8f4d55`, but the resource stayed `provisioning`; `resource apply` and `resource destroy` then refused `conflict` and `env delete` refused `precondition_failed` ("resources still exist"). Its container, volume and network were removed by exact name after inspection, but the platform environment/resource rows remain. A source fix or authorized database repair is required; direct database manipulation was not performed. | Operation events; `resource status`; CLI refusals |
+| Deletion target with foreign ownership is explicitly refused | **Pass.** Resource `foreign` in disposable `resource-audit2` was provisioned (`op_3046da8110a17a3129bcaf31120a37c8`), default-destroyed retaining volume `er-res-2805d0c1ae918657dbe48b1fdc11a9f4-data` (`op_a1db98f6f9a408d32af6db1df6ef91eb`). The owned volume was replaced with the exact same name carrying foreign labels (`io.eregion.app=foreign-owner`). `resource destroy --delete-data` `op_6eefcf4cb76445e54433544241fb65cf` failed `precondition_failed` with "volume \"…\" belongs to another owner; refusing to delete data"; the foreign volume remained. After removing that test volume, a second `--delete-data` `op_aab313d6e42aed65888ca7564a742f62` succeeded, and the environment was deleted (`op_77c79ca8d88e60b7bdf8a90da089da04`). | Operation events; volume labels; `docker volume inspect` |
+| Destroying a resource with an active dependent is refused | **Pass.** With `cache` attached to the serving revision, `resource destroy` returned `precondition_failed` and left it untouched. | Destroy refusal; revision 2 `resources: [cache]` |
+| Unhealthy dependency blocks its dependent deploy without disturbing the serving release | **Pass.** The degraded `cache` (`op_c91e0504533cf7975b7abde3e12fe5a7`) made `deploy` refuse `resource:cache`; the serving release `rel_f7dbda77a2a443a1d58c7c9a7196ec05` stayed healthy and `/external` returned 200. | `config set` `op_21c1d789dcc2f6eeade6b3fa26ae8976`; deploy refusal; `/external` |
+| Removing a resource declaration retains its data | **Pass.** `env update --from` removed `cache` as `op_4aebafcf4f3afdce9fc64caccfb3803d`; the container and volume remained and Redis key `audit:key` still read `persist`. A later deploy (`op_14d8ba9c5463d48b8b726c64060c363a`) moved to revision 5 without it. | Update JSON; resource status; Redis read |
+| `resource destroy --delete-data` removes only owned volumes and leaves an unrelated foreign volume | **Pass (unrelated-volume behavior only; actual ownership refusal is tested above).** `op_298de5b1c2fc97cdc4b45c8ca40d6017` removed the owned cache volume; the separately created `a2-foreign-audit` volume was never a deletion target and remained, then was removed explicitly. | Destroy JSON; `docker volume ls` |
+| External dependency without a managed resource | **Pass.** After the final no-resource deploy, `GET /external` returned `external 200` and `/build` returned `beta`. | `op_14d8…`; public responses |
+| An ordinary deploy never reads a working-directory `eregion.toml` | **Pass.** A rogue `/tmp/opencode/rogue/eregion.toml` (`wrongapp`, `wrongnode`, `example.invalid/wrong:1`) was present when deploy `op_ae6e1053f5c84f2045bd68ae62461969` was submitted; the operation pulled `127.0.0.1:5000/a2defs1106@sha256:b472757e…` from the platform revision, not the rogue file. That deploy then failed its public check because the test image lacked CA certificates; the rebuilt image with `ca-certificates` passed as `op_2ae2a4bedcd7d16f574ca4006f37dcf0`. | `op_ae6e…` pull events; `op_2ae2…` success |
+| Failed `gh` setup then successful retry | **Pass.** A temporary `gh` shim that reported admin permission but failed `/hooks` enabled auto-deploy without creating a hook. After disabling that attempt and deleting the earlier stale hook `708329427`, the real `--rotate-webhook-secret --github-webhook` created hook `708330096` and secret revision 3. | `gh api` hook list; secret list; env status |
+| Real push delivery deploys the pushed commit and ignores the rogue file | **Pass.** Push `8fa8c1151b1a4c45115bb9b30474284acb0b1b27` produced GitHub delivery `abf898d0-da24-11f1-972b-eda7107b1a7c`, HTTP **202**, and `op_73c9e2addecfd556686d431b1fd4c916`; it served `rel_c2df6de6c35011f6be98b270c859fc7e` with `/` returning `eregion sample: hello-v1 src3`. | Hook delivery; operation; public response |
+| Hook and branch cleanup | **Pass.** Hook `708330096` was deleted, auto-deploy disabled (`op_200e3cc4e758abf54cd5d24754b9d60b`), branch `alpha2-prot-audit` deleted locally and remotely, and the working tree returned to `main`. Only the pre-existing `githello` hook and the original branches remain. | `gh api` hook/branch lists; git status |
+
+**Cleanup and residual state.** `hook` was deleted as
+`op_7cef2d95874a413696ed97203695ad7c`. `a2defs1106` now has production,
+staging, `prot-audit` and the stuck `resource-audit`; the first three are
+protected and `resource-audit` is unprotected. `resource-audit2` and
+`resource-audit3` are gone. The cancelled interruption experiment left
+`resource-audit/interrupt` at platform state `provisioning`; its container,
+volume and network were removed by exact name after inspection, but
+`resource apply`/`resource destroy` refuse `conflict` and `env delete` refuses
+`precondition_failed`. That residue needs a source fix or an authorized
+database repair; direct database manipulation was not performed. The foreign
+ownership test volume and all other test resource volumes were removed. The
+disposable `fresh-audit` and `recipe-audit` environments were deleted
+unattended as `op_d114…` and `op_1717…`; their secret namespaces are empty.
+Protected delete, unprotect and app-delete refusals were re-confirmed against
+`production` and `prot-audit` with `input_required`. No migration text was
+changed; 024 remains as applied. Production serves
+`rel_b19f552b5afb5a727b7e7b897f59c181` on the placeholder primary
+`a2-primary.invalid`; staging and `prot-audit` have no serving release. The
+designated hostname has no binding and returns Cloudflare `525`; its
+pre-existing DNS record remains because no safe Cloudflare access is available.
+There is no fixture resource container, network or volume; the destroyed cache
+row remains `destroyed`. The fixture registry manifests (`pgv3`, `pgv4`) remain
+referenced by the environment revisions and the serving app, their local image
+tags also remain, and the unused `eregion/a2defs1106-hook` image was removed
+after a reference check. App deletion still needs the operator's TOTP factor:
+
+```sh
+eregion --context main app delete a2defs1106 --confirm a2defs1106
+```
+
+**Remaining evidence boundaries.** The multi-environment app-create same-key
+replay and a last-environment delete were not re-run on the host. The
+independent disposable PostgreSQL test above covers atomic rollback/replay and
+the last-environment factor admission with an injected verifier, but not a real
+TOTP and not a worker-completed delete. Positive real-TOTP authorization was
+not exercised on the host; no authenticator code or seed was accessed. The
+stuck `resource-audit/interrupt` platform state is a cleanup blocker described
+above. A new app fixture was not created because its deletion would add another
+TOTP-gated residual; fresh name-based creation was exercised with the disposable
+environments above instead. The `env create` same-key replay passed. Factor
+policy over public HTTP was not exercised on the host. The `gh`-assisted flow
+has not been tested with a real non-admin account; the permission response was
+simulated. macOS acceptance (R10) remains required before v1.0.0 final, and a
+fresh-server baseline is not required for this alpha under the incremental
+policy. No compatibility alias or shim was added: the create input replaces the
+single `environment` field with `environments`. No migration text was changed.
+
+### 2026-11-06 — resource cancellation settlement (source fix, host not re-run)
+
+During real-host qualification, cancelling a resource provisioning operation and
+then SIGKILLing the worker left the operation terminal `cancelled` while the
+resource row stayed `provisioning`. `resource apply` and `resource destroy`
+then refused `conflict`, and `env delete` refused `precondition_failed`. The
+host fixture was `resource-audit/interrupt` on
+`main` (`op_3eded76779595d3f9d9fbf7b6b8f4d55`); its container, network and
+volume were removed by exact name, but the platform rows were left untouched.
+No direct database edit or ad-hoc repair command was used.
+
+Root cause: cancellation was recorded on the operation (`cancelPlatform`) but
+did not settle the resource row it owned. The failure transition already marked
+an active apply/destroy `degraded`, but the cancellation path deliberately
+skipped that and left `provisioning`/`destroying` behind. A pre-existing terminal
+operation had no reconciliation path either.
+
+Source fix, no migration:
+- `cancelPlatform` and `failPlatformOperationTx` now settle a
+  `provisioning`/`destroying` resource row to `degraded` in the same transaction
+  that makes the operation terminal. The update is fenced by
+  `eregion_platform_resources.operation_id`, so a newer apply/destroy is never
+  clobbered.
+- The cumulative volume ledger, image/container/network identity and spec are
+  preserved. Retrying apply reuses the same identity and volumes; destroy still
+  finds every owned volume.
+- The ordinary maintenance `Reconcile` path now sweeps rows in those transient
+  states whose owning operation is already `cancelled` or `failed`. A fixed
+  worker therefore repairs the existing stuck row on its normal startup
+  reconciliation, without a repair command, migration or direct database edit.
+- A degraded resource remains non-destroyed, so environment/app deletion still
+  requires the normal explicit resource destroy first; that guard was already
+  intended and is unchanged.
+
+Tests run against a **local disposable PostgreSQL 18** database with a fake
+node transport (no main host, Docker used only to run the disposable database):
+
+| Check | Result |
+| --- | --- |
+| Cancel an apply during its run step while the resource is `provisioning`; operation becomes `cancelled`, resource becomes `degraded` with `error_code=cancelled`; ledger preserved; retry apply and then destroy succeed | Pass: `TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy` |
+| Existing rows left `provisioning`/`destroying` by an already `cancelled`/`failed` operation converge on normal `Reconcile`, preserving the ledger and using the correct apply/destroy detail | Pass: `TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows` |
+| Existing full resource lifecycle, secret redaction and retained-volume behavior unchanged | Pass: `TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets` |
+| Package build/vet and all non-DB tests | Pass: `go build ./...`, `go vet ./...`, `go test ./...`, darwin/arm64 cross-build |
+
+How the existing host fixture recovers after this source build is deployed:
+normal worker startup/periodic `Reconcile` sees
+`resource-audit/interrupt`'s terminal cancelled operation and the
+`provisioning` row, and moves the row to `degraded` while keeping its identity
+and ledger. The operator can then run an ordinary
+`eregion resource apply resource-audit/interrupt ...` to reuse the retained
+identity/volume, or `eregion resource destroy resource-audit/interrupt
+--confirm resource-audit/interrupt` (with `--delete-data` only if intended).
+No ad-hoc command or SQL is needed.
+
+Limitations: this fix was not deployed to or exercised on the main host in this
+task. Only `provisioning`/`destroying` rows whose operation is already
+`cancelled` or `failed` are swept; an operation still `queued`, `running` or
+`cancelling` must first be completed or cancelled through the normal River
+worker/rescue path. The reconciliation does not infer whether a container still
+exists at the node: a subsequent apply/destroy is the deliberate recovery step,
+and this is why the row is marked `degraded`, not `ready` or `destroyed`.
+No migration was added or edited.
 
 ```text
 Date / build / commit / channel:

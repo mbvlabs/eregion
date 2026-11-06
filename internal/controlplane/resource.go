@@ -656,6 +656,62 @@ func (s *Service) recordResourceFailure(ctx context.Context, id contract.Operati
 		app, environment, name, message, string(fault.Code), id)
 }
 
+// settleResourceForTerminalOperationTx moves a resource out of a transient
+// provisioning/destroying state when its owning operation has become cancelled
+// or failed. It is fenced by operation_id, so a newer resource operation is
+// never clobbered. The container identity, image and cumulative volume ledger
+// are intentionally preserved: a later apply reuses them, while a later
+// destroy can still find every owned volume and the possibly existing container.
+func settleResourceForTerminalOperationTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, kind string, code contract.Code) error {
+	if kind != platform.KindResourceApply && kind != platform.KindResourceDestroy {
+		return nil
+	}
+	detail := "Resource apply was interrupted before a durable ready state; re-apply or destroy the resource explicitly."
+	if kind == platform.KindResourceDestroy {
+		detail = "Resource destroy was interrupted before a durable destroyed state; re-apply or re-destroy the resource explicitly."
+	}
+	errorCode := code
+	if errorCode == "" {
+		errorCode = contract.Unavailable
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
+        SET state='degraded', health_state='unknown', health_detail=$2,
+            health_checked_at=clock_timestamp(), error_code=$3, error=$2,
+            updated_at=clock_timestamp()
+        WHERE operation_id=$1 AND state IN ('provisioning','destroying')`,
+		id, detail, string(errorCode)); err != nil {
+		return unavailable()
+	}
+	return nil
+}
+
+// reconcileTerminalResourceStates repairs rows left in a transient state by an
+// operation that ended cancelled or failed before recording its resource state.
+// It runs on the normal maintenance reconciliation path, so an already-stuck
+// operation from an earlier crash converges without a repair command or a manual
+// database edit. The operation_id predicate is the concurrency fence.
+func (s *Service) reconcileTerminalResourceStates(ctx context.Context) error {
+	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_resources r
+        SET state='degraded', health_state='unknown',
+            health_detail=CASE r.state
+                WHEN 'destroying' THEN 'Resource destroy was interrupted before a durable destroyed state; re-apply or re-destroy the resource explicitly.'
+                ELSE 'Resource apply was interrupted before a durable ready state; re-apply or destroy the resource explicitly.'
+            END,
+            health_checked_at=clock_timestamp(),
+            error_code=CASE WHEN o.error_code<>'' THEN o.error_code ELSE 'cancelled' END,
+            error=CASE r.state
+                WHEN 'destroying' THEN 'Resource destroy was interrupted before a durable destroyed state; re-apply or re-destroy the resource explicitly.'
+                ELSE 'Resource apply was interrupted before a durable ready state; re-apply or destroy the resource explicitly.'
+            END,
+            updated_at=clock_timestamp()
+        FROM eregion_operations o
+        WHERE r.operation_id=o.id AND o.state IN ('cancelled','failed')
+          AND r.state IN ('provisioning','destroying')`); err != nil {
+		return unavailable()
+	}
+	return nil
+}
+
 // persistOwnedResourceVolumes merges newly planned volume identities into the
 // row's cumulative ledger before any Docker volume is created. The operation ID
 // fence rejects a worker that was superseded while preparing the effect.

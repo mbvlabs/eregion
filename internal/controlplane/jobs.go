@@ -849,6 +849,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	if err := s.reconcileWebhookAdmissions(ctx); err != nil {
 		failures = append(failures, fmt.Errorf("reconcile webhook admissions: %w", err))
 	}
+	if err := s.reconcileTerminalResourceStates(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("reconcile terminal resource states: %w", err))
+	}
 	rows, err := s.pool.Query(ctx, `SELECT o.id FROM eregion_operations o LEFT JOIN river_job j ON j.id=o.job_id
         WHERE o.state IN ('queued','running','cancelling') AND (j.id IS NULL OR j.state IN ('discarded','cancelled','completed')) LIMIT 100`)
 	if err != nil {

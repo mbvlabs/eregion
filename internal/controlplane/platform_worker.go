@@ -577,6 +577,9 @@ func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *co
 			return changeErr
 		}
 	}
+	if err := settleResourceForTerminalOperationTx(ctx, tx, op.ID, op.Kind, code); err != nil {
+		return err
+	}
 	if err := markIncompleteSteps(ctx, tx, op.ID, code, message); err != nil {
 		return err
 	}
@@ -608,6 +611,9 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
             SET state='cancelled',message=$2,completed_at=clock_timestamp(),updated_at=clock_timestamp()
             WHERE operation_id=$1 AND state IN ('pending','running')`, id, message); err != nil {
+			return err
+		}
+		if err := settleResourceForTerminalOperationTx(ctx, tx, id, op.Kind, contract.Cancelled); err != nil {
 			return err
 		}
 		var releaseID, servingID string
