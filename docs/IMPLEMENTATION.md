@@ -191,6 +191,16 @@ the pinned publish workflow identity, validates the manifest against the
 channel, and caches the platform binary only after its signed SHA256 matches.
 TUF/sigstore trust material is cached, not pinned in the binary.
 
+Edge combines development and published `master` builds. Tagged alpha and beta
+versions are exact snapshots without moving pointers; RC tags advance the opt-in
+`rc` pointer, and only final tags advance stable pointers. RC clients also check
+their stable major line for a newer final; publication of a final does not move
+the RC pointer. Tagged artifacts retain the existing stable signing family and
+release-tool signing process. Channel manifests and signature bundles are two
+separately published objects, so the existing publication race can temporarily
+fail verification; an interrupted tagged upload can leave a partial prefix that
+blocks retry. These are follow-up risks, not a change to the channel model.
+
 `internal/upgrade` holds the local-only plan/preflight/atomic swap. `upgrade`
 downloads the verified binary, checks its reported version and channel, and
 replaces only the running CLI. `upgrade.FetchNodeBinary` is the verified

@@ -24,7 +24,7 @@ func sampleManifest(t *testing.T) Manifest {
 
 func TestManifestValidate(t *testing.T) {
 	m := sampleManifest(t)
-	if err := Validate(m, ChannelStable, ""); err != nil {
+	if err := Validate(m, ChannelStable, "1.0.0-alpha.2"); err != nil {
 		t.Fatalf("valid manifest refused: %v", err)
 	}
 	if err := Validate(m, "stable-1.x", "1.0.0-alpha.2"); err != nil {
@@ -48,7 +48,7 @@ func TestManifestValidate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			broken := sampleManifest(t)
 			change(&broken)
-			if err := Validate(broken, ChannelStable, ""); err == nil {
+			if err := Validate(broken, ChannelStable, "1.0.0-alpha.2"); err == nil {
 				t.Fatal("invalid manifest accepted")
 			}
 		})
@@ -58,6 +58,26 @@ func TestManifestValidate(t *testing.T) {
 	}
 	if err := Validate(m, "stable-2.x", ""); err == nil {
 		t.Fatal("1.x manifest accepted on the 2.x channel")
+	}
+}
+
+func TestPointerPolicy(t *testing.T) {
+	for _, v := range []string{"1.0.0-alpha.1", "1.0.0-beta.1", "1.0.0-rc.1", "1.0.0"} {
+		m := sampleManifest(t)
+		m.Version = v
+		m.ReleaseBaseURL = versionRoot(v)
+		for _, key := range artifactKeys {
+			m.Artifacts[key] = Artifact{URL: m.ReleaseBaseURL + "/" + key + "/eregion", SHA256: strings.Repeat("a", 64)}
+		}
+		for _, channel := range []string{ChannelStable, "stable-1.x", ChannelRC} {
+			want := (channel == ChannelRC && strings.Contains(v, "-rc.")) || (channel != ChannelRC && !strings.Contains(v, "-"))
+			if got := Validate(m, channel, "") == nil; got != want {
+				t.Errorf("pointer %s %s accepted = %v", channel, v, got)
+			}
+		}
+		if err := Validate(m, ChannelStable, v); err != nil {
+			t.Errorf("pinned %s: %v", v, err)
+		}
 	}
 }
 

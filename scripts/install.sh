@@ -3,9 +3,23 @@ set -euo pipefail
 
 channel_root="@@CHANNEL_ROOT@@"
 release_channel="@@CHANNEL@@"
+pointer_channel="@@POINTER_CHANNEL@@"
+origin="@@ORIGIN@@"
+snapshot_version=""
 cosign_version="3.1.3"
 
 fail() { printf 'eregion installer: %s\n' "$1" >&2; exit 1; }
+
+version=""
+if [ "$#" -gt 0 ]; then
+  [ "$#" -eq 2 ] && [ "$1" = --version ] || fail "usage: install.sh [--version VERSION]"
+  version="$2"
+  [ -n "${version}" ] || fail "version must not be empty"
+fi
+if [ -n "${snapshot_version}" ]; then
+  [ -z "${version}" ] || [ "${version}" = "${snapshot_version}" ] || fail "installer is pinned to ${snapshot_version}"
+  version="${snapshot_version}"
+fi
 
 sha256_hex() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -63,31 +77,62 @@ chmod 0755 "${work_dir}/cosign"
 got="$(sha256_hex "${work_dir}/cosign")"
 [ "${got}" = "${cosign_sha256}" ] || fail "cosign checksum verification failed"
 
+manifest_root="${channel_root}"
+resolved_channel="${release_channel}"
+if [ -n "${version}" ]; then
+  if [[ "${version}" =~ ^edge-[0-9a-f]{12}$ ]]; then
+    resolved_channel=edge
+  else
+    [[ "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || fail "invalid version"
+    resolved_channel=stable
+  fi
+  manifest_root="${origin}/releases/${version}"
+fi
 curl -fsSL --proto '=https' --tlsv1.2 \
-  "${channel_root}/manifest.json" -o "${work_dir}/manifest.json"
+  "${manifest_root}/manifest.json" -o "${work_dir}/manifest.json"
 curl -fsSL --proto '=https' --tlsv1.2 \
-  "${channel_root}/manifest.json.sigstore.json" -o "${work_dir}/manifest.json.sigstore.json"
+  "${manifest_root}/manifest.json.sigstore.json" -o "${work_dir}/manifest.json.sigstore.json"
 
-# Trust args are filled by scripts/build-release.sh (the channel's identity regexp).
-# shellcheck disable=SC2086
+manifest_version="$(json_string version "${work_dir}/manifest.json")"
+if [ "${resolved_channel}" = edge ]; then
+  [[ "${manifest_version}" =~ ^edge-[0-9a-f]{12}$ ]] || fail "release manifest version is invalid"
+  identity='https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master'
+else
+  [[ "${manifest_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || fail "release manifest version is invalid"
+  identity="https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v${manifest_version}"
+fi
+[ -z "${version}" ] || [ "${manifest_version}" = "${version}" ] || fail "release manifest version is invalid"
 if ! verify_out="$("${work_dir}/cosign" verify-blob "${work_dir}/manifest.json" \
   --bundle "${work_dir}/manifest.json.sigstore.json" \
-  @@COSIGN_TRUST_ARGS@@ 2>&1)"; then
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity "${identity}" 2>&1)"; then
   fail "release manifest signature verification failed: ${verify_out}"
 fi
 
 manifest_channel="$(json_string channel "${work_dir}/manifest.json")"
-[ "${manifest_channel}" = "${release_channel}" ] || fail "release manifest channel is invalid"
+[ "${manifest_channel}" = "${resolved_channel}" ] || fail "release manifest channel is invalid"
 manifest_version="$(json_string version "${work_dir}/manifest.json")"
+[ -z "${version}" ] || [ "${manifest_version}" = "${version}" ] || fail "release manifest version is invalid"
+if [ "${resolved_channel}" = stable ]; then
+  [[ "${manifest_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || fail "release manifest version is invalid"
+  if [ -z "${version}" ]; then
+    if [ "${pointer_channel}" = rc ]; then
+      [[ "${manifest_version}" =~ -rc\.[0-9]+$ ]] || fail "rc channel requires an rc release"
+    else
+      [[ "${manifest_version}" != *-* ]] || fail "stable channel requires a final release"
+      if [[ "${pointer_channel}" == stable-*.x ]]; then
+        line="${pointer_channel#stable-}"
+        [ "${manifest_version%%.*}.x" = "${line}" ] || fail "release manifest is on the wrong major line"
+      fi
+    fi
+  fi
+else
+  [[ "${manifest_version}" =~ ^edge-[0-9a-f]{12}$ ]] || fail "release manifest version is invalid"
+fi
 release_base_url="$(json_string releaseBaseUrl "${work_dir}/manifest.json")"
 # The site origin holds /releases/<version>/ and every channel directory
 # (the root, /edge and each major line such as /1.x): validate the manifest's
 # release base against it, so a line's install.sh works too.
-origin="${release_base_url%/releases/*}"
-case "${release_base_url}" in
-  "${origin}"/releases/*) ;;
-  *) fail "release manifest is invalid" ;;
-esac
+[ "${release_base_url}" = "${origin}/releases/${manifest_version}" ] || fail "release manifest is invalid"
 case "${channel_root}" in
   "${origin}" | "${origin}"/*) ;;
   *) fail "release manifest is invalid" ;;
@@ -106,10 +151,9 @@ artifact_url="${release_base_url}/${os}/${arch}/eregion"
 curl -fsSL --proto '=https' --tlsv1.2 "${artifact_url}" -o "${work_dir}/eregion"
 curl -fsSL --proto '=https' --tlsv1.2 \
   "${artifact_url}.sigstore.json" -o "${work_dir}/eregion.sigstore.json"
-# shellcheck disable=SC2086
 if ! verify_out="$("${work_dir}/cosign" verify-blob "${work_dir}/eregion" \
   --bundle "${work_dir}/eregion.sigstore.json" \
-  @@COSIGN_TRUST_ARGS@@ 2>&1)"; then
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity "${identity}" 2>&1)"; then
   fail "eregion signature verification failed: ${verify_out}"
 fi
 got="$(sha256_hex "${work_dir}/eregion")"

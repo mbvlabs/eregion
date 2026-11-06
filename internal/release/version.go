@@ -125,6 +125,9 @@ func Promotes(current, candidate string) (bool, error) {
 	if !ok {
 		return false, fmt.Errorf("stable release version %q is invalid", candidate)
 	}
+	if next.Prerelease() {
+		return false, nil
+	}
 	if current == "" {
 		return true, nil
 	}
@@ -134,6 +137,25 @@ func Promotes(current, candidate string) (bool, error) {
 	}
 	if next.Prerelease() && !cur.Prerelease() {
 		return false, nil
+	}
+	return CompareStable(next, cur) > 0, nil
+}
+
+// PromotesRC moves the opt-in RC pointer only to a newer release candidate.
+func PromotesRC(current, candidate string) (bool, error) {
+	next, ok := ParseStable(candidate)
+	if !ok {
+		return false, fmt.Errorf("release version %q is invalid", candidate)
+	}
+	if next.Pre != "rc" {
+		return false, nil
+	}
+	if current == "" {
+		return true, nil
+	}
+	cur, ok := ParseStable(current)
+	if !ok || cur.Pre != "rc" {
+		return false, fmt.Errorf("current rc version %q is invalid", current)
 	}
 	return CompareStable(next, cur) > 0, nil
 }

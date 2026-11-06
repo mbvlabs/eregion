@@ -261,6 +261,9 @@ func TestReleaseNodeInstallsOnlyTheVerifiedReleaseArtifact(t *testing.T) {
 		{name: "dev node keeps the checksum-only path", nodeChannel: "dev", goarch: "amd64", params: releaseParams},
 		{name: "an empty channel is a dev node", nodeChannel: "", goarch: "amd64", params: releaseParams},
 		{name: "release node accepts the manifest artifact", nodeChannel: "stable", goarch: "amd64", params: releaseParams, manifest: matching, wantResolve: true},
+		{name: "old edge node accepts signed tagged artifact", nodeChannel: "edge", goarch: "amd64", params: releaseParams, manifest: matching, wantResolve: true},
+		{name: "old edge node accepts opted-in rc artifact", nodeChannel: "edge", goarch: "amd64", params: `{"version":"1.1.0-rc.1","channel":"stable"}`, manifest: matching, wantResolve: true},
+		{name: "old edge node refuses invalid signature", nodeChannel: "edge", goarch: "amd64", params: releaseParams, resolveErr: contract.NewFault(contract.PreconditionFailed, "signature failed", ""), wantCode: contract.PreconditionFailed, wantResolve: true},
 		{
 			name: "release node refuses another hash", nodeChannel: "stable", goarch: "amd64", params: releaseParams,
 			manifest: release.Manifest{Artifacts: map[string]release.Artifact{"linux/amd64": {SHA256: other}}},

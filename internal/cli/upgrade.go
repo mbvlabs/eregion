@@ -58,7 +58,7 @@ func (a *app) upgradeSpecs() []spec {
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("version", "", "Release version to install; defaults to the channel's current manifest")
-			cmd.Flags().String("channel", "", "Release channel: stable, stable-<major>.x (for example stable-1.x) or edge")
+			cmd.Flags().String("channel", "", "Release channel: stable, stable-<major>.x, rc or edge")
 			cmd.Flags().Bool("yes", false, "Replace the binary without an interactive confirmation")
 			cmd.Flags().Bool("dry-run", false, "Resolve and print the from/to plan without downloading or replacing")
 		},
@@ -76,7 +76,7 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	channel, err := upgrade.SelectChannel(channelFlag)
+	channel, err := upgrade.SelectVersionChannel(channelFlag, version)
 	if err != nil {
 		return result{}, err
 	}
@@ -86,7 +86,7 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 		ctx = context.Background()
 	}
 	client := &release.Client{}
-	manifest, err := client.Resolve(ctx, channel, version)
+	manifest, err := resolveUpgradeManifest(ctx, client, channel, version, channelFlag == "", buildinfo.Version)
 	if err != nil {
 		return result{}, err
 	}
@@ -167,6 +167,42 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 		"Nodes: "+nodesUpgradeCommand,
 	)
 	return result{data: data, plain: strings.Join(lines, "\n") + "\n"}, nil
+}
+
+type upgradeManifestResolver interface {
+	Resolve(context.Context, string, string) (release.Manifest, error)
+}
+
+func resolveUpgradeManifest(ctx context.Context, client upgradeManifestResolver, channel, version string, defaultChannel bool, currentVersion string) (release.Manifest, error) {
+	manifest, err := client.Resolve(ctx, channel, version)
+	followRC := channel == release.ChannelRC && defaultChannel && version == ""
+	if err != nil && (!followRC || contract.Classify(err).Code != contract.NotFound) {
+		return release.Manifest{}, err
+	}
+	if !followRC {
+		return manifest, nil
+	}
+	// Prefer the candidate's major; if the pointer is absent, use the installed
+	// RC's major. Only a genuinely absent pointer permits that fallback.
+	lineVersion := currentVersion
+	if err == nil {
+		lineVersion = manifest.Version
+	}
+	line, ok := release.ParseStable(lineVersion)
+	if !ok {
+		return release.Manifest{}, contract.NewFault(contract.ValidationFailed, "invalid rc release version", "")
+	}
+	final, finalErr := client.Resolve(ctx, line.Channel(), "")
+	if finalErr != nil {
+		if err == nil && contract.Classify(finalErr).Code == contract.NotFound {
+			return manifest, nil
+		}
+		return release.Manifest{}, finalErr
+	}
+	if err != nil {
+		return final, nil
+	}
+	return upgrade.PreferFinal(manifest, final), nil
 }
 
 func upgradeCanPrompt(cmd *cobra.Command) bool {

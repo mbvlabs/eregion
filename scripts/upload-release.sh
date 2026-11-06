@@ -20,6 +20,10 @@ case "${channel}" in
     channel_dir="${release_root}/edge"
     dest_prefix="s3://${bucket}/edge"
     ;;
+  rc)
+    channel_dir="${release_root}/rc"
+    dest_prefix="s3://${bucket}/rc"
+    ;;
   stable-[0-9]*.x)
     line="${channel#stable-}"
     channel_dir="${release_root}/${line}"

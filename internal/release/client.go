@@ -67,6 +67,9 @@ func (c *Client) Resolve(ctx context.Context, channel, version string) (Manifest
 	if status == http.StatusNotFound && version != "" {
 		return Manifest{}, invalidVersion(version)
 	}
+	if status == http.StatusNotFound {
+		return Manifest{}, contract.NewFault(contract.NotFound, "release channel has no published manifest", "Choose another channel or an explicit version.")
+	}
 	if status != http.StatusOK {
 		return Manifest{}, unreachable(manifestURL, fmt.Errorf("status %d", status))
 	}

@@ -18,6 +18,8 @@ if [ -f "${release_root}/manifest.json" ]; then
   channel_manifest="${release_root}/manifest.json"
 elif [ -f "${release_root}/edge/manifest.json" ]; then
   channel_manifest="${release_root}/edge/manifest.json"
+elif [ -f "${release_root}/rc/manifest.json" ]; then
+  channel_manifest="${release_root}/rc/manifest.json"
 else
   channel_manifests=("${release_root}"/[0-9]*.x/manifest.json)
   if [ "${#channel_manifests[@]}" -ne 1 ]; then

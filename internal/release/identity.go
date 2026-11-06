@@ -13,6 +13,7 @@ import (
 const (
 	ChannelStable = "stable"
 	ChannelEdge   = "edge"
+	ChannelRC     = "rc"
 
 	Issuer = "https://token.actions.githubusercontent.com"
 )
@@ -33,6 +34,8 @@ func ChannelRoot(channel string) (string, error) {
 		return base, nil
 	case ChannelEdge:
 		return base + "/edge", nil
+	case ChannelRC:
+		return base + "/rc", nil
 	}
 	if major, ok := lineMajor(channel); ok {
 		return base + "/" + strconv.Itoa(major) + ".x", nil
@@ -44,7 +47,7 @@ func ChannelRoot(channel string) (string, error) {
 // for: a major line is published by the stable workflow, so its manifests
 // say stable.
 func SigningChannel(channel string) string {
-	if _, ok := lineMajor(channel); ok {
+	if _, ok := lineMajor(channel); ok || channel == ChannelRC {
 		return ChannelStable
 	}
 	return channel
@@ -69,6 +72,12 @@ func Identity(channel, version string) (string, error) {
 
 func matchVersion(channel, version string) error {
 	switch channel {
+	case ChannelRC:
+		v, ok := ParseStable(version)
+		if !ok || v.Pre != "rc" {
+			return fmt.Errorf("rc release version %q is invalid", version)
+		}
+		return nil
 	case ChannelStable:
 		if _, ok := ParseStable(version); !ok {
 			return fmt.Errorf("stable release version %q is invalid", version)
@@ -98,7 +107,7 @@ func invalidChannel(channel string) error {
 	return &contract.Fault{
 		Code:    contract.ValidationFailed,
 		Message: "release channel " + channel + " is invalid",
-		Hint:    "Use stable, stable-<major>.x (for example stable-1.x) or edge.",
+		Hint:    "Use stable, stable-<major>.x, rc or edge.",
 		Details: map[string]any{"channel": channel},
 	}
 }

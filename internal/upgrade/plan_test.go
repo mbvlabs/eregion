@@ -41,6 +41,7 @@ func TestSelectChannel(t *testing.T) {
 	}{
 		{"stable release follows its line", "", "stable", "1.4.2", "stable-1.x", false},
 		{"alpha follows its line", "", "stable", "1.0.0-alpha.1", "stable-1.x", false},
+		{"rc follows rc", "", "stable", "1.0.0-rc.1", "rc", false},
 		{"next major follows its line", "", "stable", "2.0.0", "stable-2.x", false},
 		{"flag wins", "stable", "stable", "1.4.2", "stable", false},
 		{"explicit line", "stable-2.x", "stable", "1.4.2", "stable-2.x", false},
@@ -58,6 +59,29 @@ func TestSelectChannel(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+func TestSelectVersionChannel(t *testing.T) {
+	for _, c := range []struct{ flag, version, want string }{
+		{"", "1.0.0-alpha.1", "stable"}, {"", "edge-0123456789ab", "edge"}, {"rc", "1.0.0-rc.1", "rc"},
+	} {
+		got, err := SelectVersionChannel(c.flag, c.version)
+		if err != nil || got != c.want {
+			t.Errorf("SelectVersionChannel(%q,%q) = %q, %v", c.flag, c.version, got, err)
+		}
+	}
+}
+
+func TestPreferFinal(t *testing.T) {
+	for _, c := range []struct{ rc, final, want string }{
+		{"1.0.0-rc.10", "1.0.0", "1.0.0"},
+		{"1.1.0-rc.1", "1.0.9", "1.1.0-rc.1"},
+	} {
+		got := PreferFinal(release.Manifest{Version: c.rc}, release.Manifest{Version: c.final})
+		if got.Version != c.want {
+			t.Errorf("PreferFinal(%s, %s) = %s", c.rc, c.final, got.Version)
+		}
 	}
 }
 
@@ -79,6 +103,7 @@ func TestDecide(t *testing.T) {
 		{"major move warns", Version{"1.4.2", "stable"}, stable("2.0.0"), false, true, []string{"major_line_changed"}},
 		{"pinned major downgrade", Version{"2.0.0", "stable"}, stable("1.4.3"), true, true, []string{"downgrade", "major_line_changed"}},
 		{"edge to stable", Version{"edge-0123456789ab", "edge"}, stable("1.0.0-alpha.1"), false, true, []string{"channel_changed"}},
+		{"explicit rc candidate", Version{"1.0.0", "stable"}, stable("1.1.0-rc.1"), false, true, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

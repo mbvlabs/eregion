@@ -88,10 +88,32 @@ func selectChannel(flag, channel, version string) (string, error) {
 	}
 	if channel == release.ChannelStable {
 		if v, ok := release.ParseStable(version); ok {
+			if v.Pre == "rc" {
+				return release.ChannelRC, nil
+			}
 			return v.Channel(), nil
 		}
 	}
 	return channel, nil
+}
+
+// SelectVersionChannel selects a signing family for an explicitly pinned version.
+func SelectVersionChannel(flag, version string) (string, error) {
+	if flag == "" && version != "" {
+		if strings.HasPrefix(version, "edge-") {
+			return release.ChannelEdge, nil
+		}
+		return release.ChannelStable, nil
+	}
+	return SelectChannel(flag)
+}
+
+// PreferFinal selects a newer verified final without altering the rc pointer.
+func PreferFinal(rc, final release.Manifest) release.Manifest {
+	if release.CompareVersions(final.Version, rc.Version) > 0 {
+		return final
+	}
+	return rc
 }
 
 // Decide compares the running binary with a verified manifest.

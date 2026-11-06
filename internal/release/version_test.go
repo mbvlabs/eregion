@@ -42,8 +42,10 @@ func TestPromotes(t *testing.T) {
 		want               bool
 		err                bool
 	}{
-		{"", "1.0.0-alpha.1", true, false},
-		{"1.0.0-alpha.2", "1.0.0-alpha.10", true, false},
+		{"", "1.0.0-alpha.1", false, false},
+		{"", "1.0.0-beta.1", false, false},
+		{"", "1.0.0-rc.1", false, false},
+		{"1.0.0-alpha.2", "1.0.0-alpha.10", false, false},
 		{"1.0.0-alpha.2", "1.0.0-alpha.2", false, false},
 		{"1.0.0", "1.0.1", true, false},
 		{"1.1.0", "1.0.1", false, false},
@@ -56,6 +58,22 @@ func TestPromotes(t *testing.T) {
 		got, err := Promotes(c.current, c.candidate)
 		if (err != nil) != c.err || got != c.want {
 			t.Fatalf("Promotes(%q, %q) = %v, %v; want %v, error %v", c.current, c.candidate, got, err, c.want, c.err)
+		}
+	}
+}
+
+func TestPromotesRC(t *testing.T) {
+	for _, c := range []struct {
+		current, candidate string
+		want               bool
+	}{
+		{"", "1.0.0-alpha.1", false}, {"", "1.0.0-rc.1", true},
+		{"1.0.0-rc.2", "1.0.0-rc.10", true}, {"1.0.0-rc.10", "1.0.0-rc.2", false},
+		{"1.0.0-rc.1", "1.0.0", false},
+	} {
+		got, err := PromotesRC(c.current, c.candidate)
+		if err != nil || got != c.want {
+			t.Errorf("PromotesRC(%q,%q) = %v, %v", c.current, c.candidate, got, err)
 		}
 	}
 }

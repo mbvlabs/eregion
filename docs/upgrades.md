@@ -10,15 +10,32 @@ the one-host replacement journal and the Windows release matrix.
 | Channel | Published by | Pointer under the release origin | Installer |
 | --- | --- | --- | --- |
 | `edge` | every push to `master` | `/edge/manifest.json` | `/edge/install.sh` |
-| `stable-<major>.x` | tags on the `<major>.x` line | `/<major>.x/manifest.json` | `/<major>.x/install.sh` |
-| `stable` | the same stable tags, highest version only | `/manifest.json` | `/install.sh` |
+| `rc` | `vMAJOR.MINOR.PATCH-rc.N` tags | `/rc/manifest.json` | `/rc/install.sh` |
+| `stable-<major>.x` | final tags on the `<major>.x` line | `/<major>.x/manifest.json` | `/<major>.x/install.sh` |
+| `stable` | final tags, highest version only | `/manifest.json` | `/install.sh` |
 
-A tag `v1.0.0-alpha.N` builds channel `stable-1.x`; its manifest says `stable`
-because the stable workflow signs it, and its binary's `Channel` is `stable`.
+A tag `v1.0.0-alpha.N` or `v1.0.0-beta.N` publishes only an immutable
+snapshot, never a channel pointer. An rc tag moves only the opt-in rc pointer;
+final tags move stable pointers forward. All tagged manifests and binaries say
+`stable`, their signing family, including rc and snapshots. This retains the
+signed-version verification path understood by older published nodes.
 With no `--channel`, `eregion upgrade` follows its own line (`stable-1.x` for a
 1.x binary), so a final release does not move a pinned line by accident.
 `--channel stable` follows the root pointer, and `--channel edge` follows
-`master`. A `dev` build has no channel and must pass `--channel`.
+`master`. A `dev` build has no channel and must pass `--channel` or an exact
+`--version`.
+An rc binary follows `rc` by default and also checks its stable major line; a
+newer final supersedes the rc without changing the rc pointer. Explicit
+`--version 1.0.0-alpha.2` resolves that signed snapshot directly
+without requiring a channel flag. `--channel rc` is explicit consent to move a
+stable installation to an RC; stable and major-line defaults never do so. An
+exact prerelease pin is a separate explicit opt-in. Published nodes verify the
+tagged artifact's signed `stable` family and hash, not a moving channel pointer.
+The versioned installer is pinned to its own version and is available even
+before a stable pointer exists, for example `curl -fsSL
+https://eregion.mbvlabs.com/releases/1.0.0-alpha.2/install.sh | bash`.
+Channel installers also accept `--version`; the requested version determines
+the signing family, independently of the installer channel.
 
 Immutable artifacts live under `/releases/<version>/<os>/<arch>/eregion`, with
 `.sha256` and `.sigstore.json` sidecars. Supported platforms are linux/amd64,
@@ -73,7 +90,7 @@ It never upgrades a node. Nodes are unchanged:
 `eregion apply --auto-upgrade-nodes` is the node path. The verified download
 half exists as `upgrade.FetchNodeBinary(ctx, channel, version, arch)`, which
 returns the linux/amd64 or linux/arm64 binary from the channel manifest. The
-`apply` command itself is work list row 3 and does not exist yet.
+`apply --auto-upgrade-nodes` uses this verified path on a version mismatch.
 
 ## Release scripts and workflows
 
@@ -85,16 +102,29 @@ returns the linux/amd64 or linux/arm64 binary from the channel manifest. The
 | `scripts/install.sh` | Per-channel installer template; verifies cosign, manifest, binary digest and the smoke version/channel, then installs. |
 | `internal/release/cmd/promote` | Prints `yes`/`no` for a stable channel move using the same monotonic prerelease policy; reads the current pointer fail-closed from the bucket. |
 | `.github/workflows/publish-edge.yml` | Every push to `master`: verify, build `edge-<12-hex>`, sign, upload. |
-| `.github/workflows/publish-stable.yml` | Tag `v*`: require the commit on `origin/<major>.x`, verify, build `stable-<major>.x`, sign, refuse an existing version, upload artifacts, promote the line and root pointers forward only. |
+| `.github/workflows/publish-stable.yml` | Tag `v*`: require the commit on `origin/<major>.x`, verify and sign one artifact set, upload it immutably, then promote only the eligible rc or stable pointers forward. |
 
 `just release-local VERSION CHANNEL BASE_URL` builds an unsigned tree under
 `dist/release-<channel>` for inspection. It contacts no bucket. Signing is
 only in the workflow.
 
-The stable workflow publishes a pre-release only while that channel has no
-final release, and never replaces a final with an alpha, beta or rc. Immutable
-artifacts are never overwritten: an existing `/releases/<version>/` prefix
-fails the run.
+The stable workflow never promotes an alpha, beta or rc to stable, even when
+the channel is empty. RC promotion accepts only newer rc versions. Immutable
+tagged artifacts have a prefix-existence guard: an existing
+`/releases/<version>/` prefix fails the run. An interrupted tagged upload can
+leave a partial prefix that blocks retry and requires operator review. The
+check is not an atomic lock against another writer. Edge retains its existing
+upload semantics, including overwrites on a rerun.
+
+Channel manifests and their signature bundles are separate objects. Publishing
+the bundle and manifest is not atomic: a failure or read between writes can
+temporarily leave a channel unverifiable. Clients fail closed; this release
+does not claim atomic publication or retry safety. A future single-object
+pointer requires a deliberate transition for installed clients.
+
+The existing `v1.0.0-alpha.1` tag predates this workflow and its publication
+failed. Its recovery is a separate release decision: the tag is not rewritten,
+and this workflow has no manual-dispatch signing exception.
 
 ## Release configuration
 

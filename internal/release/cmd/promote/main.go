@@ -32,6 +32,7 @@ func run(ctx context.Context, args []string, out io.Writer, aws awsRunner) error
 	bucket := fs.String("bucket", "", "release bucket")
 	key := fs.String("key", "manifest.json", "channel manifest key")
 	endpoint := fs.String("endpoint", "", "S3 endpoint")
+	channel := fs.String("channel", "stable", "promotion channel: stable or rc")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -49,7 +50,16 @@ func run(ctx context.Context, args []string, out io.Writer, aws awsRunner) error
 	default:
 		return fmt.Errorf("usage: promote CURRENT CANDIDATE, or promote --bucket BUCKET --key KEY --endpoint URL CANDIDATE")
 	}
-	ok, err := release.Promotes(current, candidate)
+	var ok bool
+	var err error
+	switch *channel {
+	case "stable":
+		ok, err = release.Promotes(current, candidate)
+	case "rc":
+		ok, err = release.PromotesRC(current, candidate)
+	default:
+		return fmt.Errorf("invalid promotion channel %q", *channel)
+	}
 	if err != nil {
 		return err
 	}

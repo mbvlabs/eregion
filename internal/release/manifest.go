@@ -52,6 +52,12 @@ func Validate(m Manifest, channel, wantVersion string) error {
 	if err := matchVersion(channel, m.Version); err != nil {
 		return verificationFailed("release manifest version is invalid")
 	}
+	if wantVersion == "" && SigningChannel(channel) == ChannelStable && channel != ChannelRC {
+		v, ok := ParseStable(m.Version)
+		if !ok || v.Prerelease() {
+			return verificationFailed("stable channel manifest must name a final release")
+		}
+	}
 	if wantVersion != "" && m.Version != wantVersion {
 		return verificationFailed("release manifest version is invalid")
 	}
