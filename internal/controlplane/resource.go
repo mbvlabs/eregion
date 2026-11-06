@@ -423,6 +423,9 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	if env.ID == "" {
 		return contract.NewFault(contract.NotFound, "environment not found", "Create the environment before applying a resource.")
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
 	plan, err := platform.PlanResource(env.ID, resource.Node, resource.ID, env.App, env.Name, resource.Name, resource.Spec)
 	if err != nil {
 		return err
@@ -448,11 +451,17 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	}, nil); err != nil {
 		return err
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
 
 	pullStep := platform.ResourcePullStepID(plan)
 	if _, err := w.runStepOn(ctx, tr, id, attempt, pullStep, platform.ArgvPayload{
 		Step: pullStep, Argv: []string{"docker", "pull", plan.Spec.Image}, TimeoutSeconds: 600,
 	}, nil); err != nil {
+		return err
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}
 	imageStep := platform.ResourceImageStepID(plan)
@@ -462,6 +471,9 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 		TimeoutSeconds: 30,
 	}, nil)
 	if err != nil {
+		return err
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}
 	imageID, repoDigests, err := platform.ParseResourceImageInspect(stepStdout(imageRaw))
@@ -479,12 +491,18 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 		return err
 	}
 
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
 	for index, volume := range plan.Volumes {
 		step := platform.ResourceVolumeStepID(plan, index)
 		if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.ResourceVolumePayload{
 			Step: step, Volume: volume.Name, App: env.App, Environment: env.Name,
 			Resource: resource.Name, ResourceID: string(resource.ID),
 		}, nil); err != nil {
+			return err
+		}
+		if err := w.service.checkCancelled(ctx, id); err != nil {
 			return err
 		}
 	}
@@ -499,6 +517,9 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	}, secretValues); err != nil {
 		return err
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
 	if err := w.service.recordResourceContainer(ctx, id, resource.ID, plan, imageID, imageDigest, ownedVolumes); err != nil {
 		return err
 	}
@@ -510,12 +531,18 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 	}, secretValues); err != nil {
 		return err
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
 
 	rawVolumes, err := json.Marshal(ownedVolumes)
 	if err != nil {
 		return unavailable()
 	}
-	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
+	return w.service.finishResourceOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		tag, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
             SET state='ready', image=$2, image_id=$3, image_digest=$4, container_name=$5, network_name=$6,
                 volumes=$7, health_state='healthy', health_detail='',
@@ -570,6 +597,9 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 	if err != nil {
 		return err
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
 	step := platform.ResourceDestroyStepID(resource.ID)
 	if _, err := w.runStepOn(ctx, tr, id, attempt, step, platform.ResourceDestroyPayload{
 		Step: step, Container: plan.Container, App: env.App, Environment: env.Name,
@@ -577,9 +607,15 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 	}, nil); err != nil {
 		return err
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
 	ownedVolumes := platform.MergeResourceVolumes(resource.Volumes, nil)
 	deleteVolumes := []platform.ResourceVolumeStatus{}
 	if input.DeleteData {
+		if err := w.service.checkCancelled(ctx, id); err != nil {
+			return err
+		}
 		deleteVolumes = platform.ResourceVolumesForDestroy(resource.Volumes, plan)
 		for index, volume := range deleteVolumes {
 			removeStep := platform.ResourceVolumeRemoveStepID(plan, index)
@@ -589,9 +625,15 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 			}, nil); err != nil {
 				return err
 			}
+			if err := w.service.checkCancelled(ctx, id); err != nil {
+				return err
+			}
 		}
 	}
-	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return err
+	}
+	return w.service.finishResourceOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		volumes := []byte("[]")
 		detail := "Container removed; named volumes were retained."
 		if input.DeleteData {
@@ -622,6 +664,37 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 			Kind: "log", Stage: "resource", Message: "Resource " + resource.Name + ": " + detail,
 		})
 	})
+}
+
+// finishResourceOperation finalizes an apply or destroy under the operation row
+// lock. A cancellation accepted after the last step-boundary check but before
+// this transaction must not be converted into success: return the normal
+// cancellation error so the resource settles to degraded through the normal
+// cancellation path. This is deliberately scoped to resources; other operation
+// completion policy is unchanged.
+func (s *Service) finishResourceOperation(ctx context.Context, id contract.OperationID, attempt uint32, finalize func(pgx.Tx, *contract.Operation) error) error {
+	if s.beforeResourceFinalize != nil {
+		s.beforeResourceFinalize()
+	}
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+		if op.State.Terminal() {
+			return nil
+		}
+		if op.State == contract.Cancelling {
+			return errPlatformCancelled
+		}
+		if err := finalize(tx, op); err != nil {
+			return err
+		}
+		return transition(ctx, tx, op, contract.Succeeded, "", "Platform action succeeded; domain state and history are durable.")
+	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
+	}
+	return nil
 }
 
 func (s *Service) markResourceState(ctx context.Context, id contract.OperationID, target string, state platform.ResourceState) error {

@@ -167,6 +167,206 @@ func TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy(t *testin
 	}
 }
 
+// TestIntegrationResourceCancelAfterSuccessfulStepIsHonored covers a
+// cancellation that arrives while a resource step is in flight and the step
+// then succeeds. The cancellation must be observed before the operation is
+// recorded successful; otherwise the resource silently becomes ready.
+func TestIntegrationResourceCancelAfterSuccessfulStepIsHonored(t *testing.T) {
+	pool, _ := testPool(t, true)
+	ctx := context.Background()
+	fake := newBlockingResourceTransport("-health-")
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
+		SecretResolver: newSnapshotSecretResolver(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWorkers(t, run)
+	s := run.Service
+
+	platformAwait(t, s, platformSubmit(t, s, platform.KindNodeRegister, "platform", "cancel-success-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	}), contract.Succeeded)
+	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "cancel-success-app", map[string]any{
+		"name": "cancelok",
+		"environments": []map[string]any{
+			{"name": "pr", "node": "local", "container_port": 8080, "health": map[string]any{"timeout_seconds": 5}},
+			{"name": "pr2", "node": "local", "container_port": 8080, "health": map[string]any{"timeout_seconds": 5}},
+		},
+	}), contract.Succeeded)
+
+	spec := map[string]any{
+		"image":  "postgres:17",
+		"mounts": []map[string]any{{"name": "data", "destination": "/var/lib/postgresql/data"}},
+		"health": map[string]any{"type": "exec", "command": []string{"pg_isready"}},
+	}
+	apply := platformSubmit(t, s, platform.KindResourceApply, "resource/cancelok/pr/db", "resource-cancel-success", spec)
+	select {
+	case <-fake.started:
+	case <-time.After(20 * time.Second):
+		t.Fatal("resource health step did not start")
+	}
+	if _, err := s.RequestCancel(ctx, testActor, apply.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Let the in-flight step report success. The worker must still observe the
+	// accepted cancellation at the next safe boundary rather than mark the
+	// operation successful.
+	fake.setBlockStep("")
+	fake.release <- nil
+	cancelled := platformAwait(t, s, apply, contract.Canceled)
+	if cancelled.ID != apply.ID {
+		t.Fatalf("cancelled operation = %s", cancelled.ID)
+	}
+	state, volumes, errorCode, _ := resourceState(t, pool, "cancelok", "db")
+	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) {
+		t.Fatalf("after cancellation: state=%s error=%s", state, errorCode)
+	}
+	if !strings.Contains(volumes, "er-res-") {
+		t.Fatalf("cancellation lost the volume ledger: %s", volumes)
+	}
+	retainedVolumes := volumes
+
+	platformAwait(t, s, platformSubmit(t, s, platform.KindResourceApply, "resource/cancelok/pr/db", "resource-cancel-success-retry", spec), contract.Succeeded)
+	if err := pool.QueryRow(ctx, `SELECT state,volumes::text FROM eregion_platform_resources r
+        JOIN eregion_platform_apps a ON a.id=r.app_id
+        WHERE a.name='cancelok' AND r.name='db'`).Scan(&state, &volumes); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(platform.ResourceReady) || volumes != retainedVolumes {
+		t.Fatalf("retry: state=%s volumes=%s want %s", state, volumes, retainedVolumes)
+	}
+}
+
+// TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored covers the
+// final-commit race: cancellation is accepted after the last step-boundary
+// check but before the operation row lock. Finalization must see it under the
+// lock and settle the operation through the normal cancellation path.
+func TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored(t *testing.T) {
+	pool, _ := testPool(t, true)
+	ctx := context.Background()
+	fake := newBlockingResourceTransport("-health-")
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
+		SecretResolver: newSnapshotSecretResolver(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWorkers(t, run)
+	s := run.Service
+
+	platformAwait(t, s, platformSubmit(t, s, platform.KindNodeRegister, "platform", "cancel-finalize-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	}), contract.Succeeded)
+	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "cancel-finalize-app", map[string]any{
+		"name": "cancelfinalize",
+		"environments": []map[string]any{
+			{"name": "pr", "node": "local", "container_port": 8080, "health": map[string]any{"timeout_seconds": 5}},
+		},
+	}), contract.Succeeded)
+
+	spec := map[string]any{
+		"image":  "postgres:17",
+		"mounts": []map[string]any{{"name": "data", "destination": "/var/lib/postgresql/data"}},
+		"health": map[string]any{"type": "exec", "command": []string{"pg_isready"}},
+	}
+	apply := platformSubmit(t, s, platform.KindResourceApply, "resource/cancelfinalize/pr/db", "resource-cancel-finalize-apply", spec)
+	select {
+	case <-fake.started:
+	case <-time.After(20 * time.Second):
+		t.Fatal("resource health step did not start")
+	}
+	cancelResult := make(chan error, 1)
+	s.beforeResourceFinalize = func() {
+		s.beforeResourceFinalize = nil
+		_, err := s.RequestCancel(ctx, testActor, apply.ID)
+		cancelResult <- err
+	}
+	fake.setBlockStep("")
+	fake.release <- nil
+	cancelled := platformAwait(t, s, apply, contract.Canceled)
+	if cancelled.ID != apply.ID {
+		t.Fatalf("cancelled operation = %s", cancelled.ID)
+	}
+	if err := <-cancelResult; err != nil {
+		t.Fatalf("request cancel: %v", err)
+	}
+	state, volumes, errorCode, _ := resourceState(t, pool, "cancelfinalize", "db")
+	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) {
+		t.Fatalf("after finalization cancellation: state=%s error=%s", state, errorCode)
+	}
+	if !strings.Contains(volumes, "er-res-") {
+		t.Fatalf("finalization cancellation lost the volume ledger: %s", volumes)
+	}
+}
+
+// TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored covers the
+// same final-commit race for destroy. The container effect has already
+// completed; cancellation before the locked finalization must leave the
+// resource degraded with its ledger, not destroyed or succeeded.
+func TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored(t *testing.T) {
+	pool, _ := testPool(t, true)
+	ctx := context.Background()
+	fake := newBlockingResourceTransport("")
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
+		SecretResolver: newSnapshotSecretResolver(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startWorkers(t, run)
+	s := run.Service
+
+	platformAwait(t, s, platformSubmit(t, s, platform.KindNodeRegister, "platform", "destroy-cancel-finalize-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	}), contract.Succeeded)
+	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "destroy-cancel-finalize-app", map[string]any{
+		"name": "destroycancelfinalize",
+		"environments": []map[string]any{
+			{"name": "pr", "node": "local", "container_port": 8080, "health": map[string]any{"timeout_seconds": 5}},
+		},
+	}), contract.Succeeded)
+	spec := map[string]any{
+		"image":  "postgres:17",
+		"mounts": []map[string]any{{"name": "data", "destination": "/var/lib/postgresql/data"}},
+		"health": map[string]any{"type": "exec", "command": []string{"pg_isready"}},
+	}
+	platformAwait(t, s, platformSubmit(t, s, platform.KindResourceApply, "resource/destroycancelfinalize/pr/db", "destroy-cancel-finalize-apply", spec), contract.Succeeded)
+
+	fake.setBlockStep("-destroy-")
+	destroy := platformSubmit(t, s, platform.KindResourceDestroy, "resource/destroycancelfinalize/pr/db", "destroy-cancel-finalize-destroy", map[string]any{"confirm": "destroycancelfinalize/pr/db"})
+	select {
+	case <-fake.started:
+	case <-time.After(20 * time.Second):
+		t.Fatal("resource destroy step did not start")
+	}
+	cancelResult := make(chan error, 1)
+	s.beforeResourceFinalize = func() {
+		s.beforeResourceFinalize = nil
+		_, err := s.RequestCancel(ctx, testActor, destroy.ID)
+		cancelResult <- err
+	}
+	fake.setBlockStep("")
+	fake.release <- nil
+	cancelled := platformAwait(t, s, destroy, contract.Canceled)
+	if cancelled.ID != destroy.ID {
+		t.Fatalf("cancelled operation = %s", cancelled.ID)
+	}
+	if err := <-cancelResult; err != nil {
+		t.Fatalf("request cancel: %v", err)
+	}
+	state, volumes, errorCode, _ := resourceState(t, pool, "destroycancelfinalize", "db")
+	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) {
+		t.Fatalf("after destroy finalization cancellation: state=%s error=%s", state, errorCode)
+	}
+	if !strings.Contains(volumes, "er-res-") {
+		t.Fatalf("destroy finalization cancellation lost the volume ledger: %s", volumes)
+	}
+}
+
 // TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows
 // reproduces a row left provisioning/destroying by an operation that was
 // already terminal before this fix, then runs the ordinary maintenance

@@ -37,6 +37,10 @@ type Service struct {
 	// afterNode is a test-only seam between a node effect and its database
 	// acknowledgement. Production leaves it nil.
 	afterNode func(contract.OperationID, string) error
+	// beforeResourceFinalize is a test-only seam between the last resource
+	// step-boundary cancellation check and the operation-row-locked
+	// finalization. Production leaves it nil.
+	beforeResourceFinalize func()
 	// beforeRetentionMark is a test-only seam between planning a retention run
 	// and marking its release rows. Production leaves it nil.
 	beforeRetentionMark func(context.Context, contract.OperationID)

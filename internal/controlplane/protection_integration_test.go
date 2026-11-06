@@ -3,9 +3,11 @@ package controlplane
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/totp"
 )
 
 // TestIntegrationAppCreateMaterialisesProductionAndStaging atomically records
@@ -174,5 +176,61 @@ func TestIntegrationUnprotectRequiresFactorAndProtectDoesNot(t *testing.T) {
 	// Protecting again is agent-safe and needs no code.
 	if _, err := s.Submit(ctx, platformSubmission(platform.KindEnvironmentProtect, "env/unprotect/production", "protect-again", map[string]any{"protected": true})); err != nil {
 		t.Fatalf("protect was refused: %v", err)
+	}
+}
+
+// TestIntegrationDirectDeleteWithRealTOTPCode exercises the direct service
+// submission path with a generated local TOTP secret and a real current code.
+// The verifier is local to the test; no live protect store or code is read.
+func TestIntegrationDirectDeleteWithRealTOTPCode(t *testing.T) {
+	pool, _ := testPool(t, true)
+	run := testRuntime(t, pool, 0)
+	s := run.Service
+	ctx := context.Background()
+	platformSubmit(t, s, platform.KindNodeRegister, "platform", "real-totp-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "real-totp-create", map[string]any{
+		"name": "realtotp",
+		"environments": []map[string]any{
+			{"name": "production", "node": "local", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
+			{"name": "staging", "node": "local", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
+		},
+	})
+
+	secret, err := totp.NewSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := totp.DecodeSecret(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	var last int64
+	s.humanFactor = func(code string) error {
+		step, err := totp.Verify(key, code, now, last)
+		if err != nil {
+			return contract.NewFault(contract.PreconditionFailed, "invalid local TOTP code", "Use the current code.")
+		}
+		last = step
+		return nil
+	}
+	code := totp.Code(key, now)
+
+	delete := platformSubmission(platform.KindEnvironmentDelete, "env/realtotp/production", "real-totp-delete", map[string]any{"confirm": "realtotp/production"})
+	delete.HumanFactor = code
+	op, err := s.Submit(ctx, delete)
+	if err != nil {
+		t.Fatalf("real TOTP delete was refused: %v", err)
+	}
+	if op.State != contract.Queued {
+		t.Fatalf("delete state = %s, want queued with workers stopped", op.State)
+	}
+	// The same TOTP step must not authorize a second deletion.
+	replay := platformSubmission(platform.KindEnvironmentDelete, "env/realtotp/staging", "real-totp-replay", map[string]any{"confirm": "realtotp/staging"})
+	replay.HumanFactor = code
+	if _, err := s.Submit(ctx, replay); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("reused local TOTP = %v, want precondition_failed", err)
 	}
 }

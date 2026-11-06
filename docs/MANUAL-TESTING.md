@@ -3480,13 +3480,26 @@ injection, not a real TOTP, and the queued delete was not completed by a
 worker. The temporary cluster was removed and no DSN or secret value was
 stored in evidence.
 
+**Real TOTP in isolation.** `go test ./internal/protect -count=1` passes with
+an isolated generated local secret and real TOTP codes, including confirm,
+verify, replay refusal, rotation and multiprocess lockout. The CLI factor tests
+and `TestIntegrationDirectDeleteWithRealTOTPCode` also pass: the latter uses a
+generated local secret and a real current TOTP code through the direct service
+submission path, accepts the protected delete as queued with workers stopped,
+and rejects the same TOTP step on replay. The verifier there is local to the
+test, not `protect.Store`; the real store is covered separately by the protect
+tests. The live node protect store, its seed and any live code were never read
+or used. The independent PostgreSQL factor test above used an injected
+verifier, not a real TOTP, and its accepted delete was queued with workers
+stopped rather than completed.
+
 Additional audited alpha.2 cases on the same fixture:
 
 | Check | Result | Evidence |
 | --- | --- | --- |
 | Failed-health resource apply retry preserves volume identity | **Pass.** A deliberately unhealthy `cache` apply degraded as `op_bf3718dfff0d897b0fa305b1d026e08d` with volume `er-res-e8ea4b4fc7468548f507969953efa8e0-cache-data`; the corrected retry `op_452dd3b405d027e46fc6e98fbc0cf6d9` reached ready and reused the same volume. This was a failed health check, not an interrupted operation. | Resource status before/after |
 | Actual interruption: worker SIGKILL during provisioning is recovered and retried | **Pass.** Resource `interrupt2` in disposable `resource-audit3` was applying with a deliberately slow health command. The worker was SIGKILLed while the health step ran (PID changed, `NRestarts=2`). On restart the worker recovered the orphaned platform job (`op_2eee5d4a5320d71203a4bf075288cf58`, attempt 2), the health step then failed, and the resource became degraded with volume `er-res-d81502e434ca7f0ba8db431214eac64a-data`. The corrected retry `op_c457f164e6709764f59cd15c48120e8a` succeeded and reused the same volume with the expected ownership labels. The resource was destroyed with `--delete-data` (`op_649d92412f7ffd3234ca13b0d04b3bea`) and the environment deleted (`op_bf535c24a1a5a8fd4d6cde4c6e3f45b6`). | Worker restart/PID, operation events, resource status/labels |
-| Interrupted-and-cancelled apply cleanup | **Blocked by state handling.** A first interruption attempt requested cancellation while the health step ran, then SIGKILLed the worker. The operation ended `cancelled` as `op_3eded76779595d3f9d9fbf7b6b8f4d55`, but the resource stayed `provisioning`; `resource apply` and `resource destroy` then refused `conflict` and `env delete` refused `precondition_failed` ("resources still exist"). Its container, volume and network were removed by exact name after inspection, but the platform environment/resource rows remain. A source fix or authorized database repair is required; direct database manipulation was not performed. | Operation events; `resource status`; CLI refusals |
+| Interrupted-and-cancelled apply cleanup | **Pass after the `8199864` fix; initially blocked on `6d1ae98`.** The cancelled attempt `op_3eded76779595d3f9d9fbf7b6b8f4d55` left the resource `provisioning`, so apply/destroy refused `conflict` and env delete refused `precondition_failed`. Its container, volume and network were removed by exact name. After upgrading to `edge-81998646916d`, normal reconciliation moved the row to `degraded` without SQL; ordinary destroy `op_8a88…` and noninteractive env delete `op_905f…` succeeded. See the cancellation-recovery section below. | Operation events; `resource status`; CLI refusals; post-upgrade status |
 | Deletion target with foreign ownership is explicitly refused | **Pass.** Resource `foreign` in disposable `resource-audit2` was provisioned (`op_3046da8110a17a3129bcaf31120a37c8`), default-destroyed retaining volume `er-res-2805d0c1ae918657dbe48b1fdc11a9f4-data` (`op_a1db98f6f9a408d32af6db1df6ef91eb`). The owned volume was replaced with the exact same name carrying foreign labels (`io.eregion.app=foreign-owner`). `resource destroy --delete-data` `op_6eefcf4cb76445e54433544241fb65cf` failed `precondition_failed` with "volume \"…\" belongs to another owner; refusing to delete data"; the foreign volume remained. After removing that test volume, a second `--delete-data` `op_aab313d6e42aed65888ca7564a742f62` succeeded, and the environment was deleted (`op_77c79ca8d88e60b7bdf8a90da089da04`). | Operation events; volume labels; `docker volume inspect` |
 | Destroying a resource with an active dependent is refused | **Pass.** With `cache` attached to the serving revision, `resource destroy` returned `precondition_failed` and left it untouched. | Destroy refusal; revision 2 `resources: [cache]` |
 | Unhealthy dependency blocks its dependent deploy without disturbing the serving release | **Pass.** The degraded `cache` (`op_c91e0504533cf7975b7abde3e12fe5a7`) made `deploy` refuse `resource:cache`; the serving release `rel_f7dbda77a2a443a1d58c7c9a7196ec05` stayed healthy and `/external` returned 200. | `config set` `op_21c1d789dcc2f6eeade6b3fa26ae8976`; deploy refusal; `/external` |
@@ -3500,23 +3513,18 @@ Additional audited alpha.2 cases on the same fixture:
 
 **Cleanup and residual state.** `hook` was deleted as
 `op_7cef2d95874a413696ed97203695ad7c`. `a2defs1106` now has production,
-staging, `prot-audit` and the stuck `resource-audit`; the first three are
-protected and `resource-audit` is unprotected. `resource-audit2` and
-`resource-audit3` are gone. The cancelled interruption experiment left
-`resource-audit/interrupt` at platform state `provisioning`; its container,
-volume and network were removed by exact name after inspection, but
-`resource apply`/`resource destroy` refuse `conflict` and `env delete` refuses
-`precondition_failed`. That residue needs a source fix or an authorized
-database repair; direct database manipulation was not performed. The foreign
-ownership test volume and all other test resource volumes were removed. The
-disposable `fresh-audit` and `recipe-audit` environments were deleted
-unattended as `op_d114…` and `op_1717…`; their secret namespaces are empty.
-Protected delete, unprotect and app-delete refusals were re-confirmed against
-`production` and `prot-audit` with `input_required`. No migration text was
-changed; 024 remains as applied. Production serves
-`rel_b19f552b5afb5a727b7e7b897f59c181` on the placeholder primary
-`a2-primary.invalid`; staging and `prot-audit` have no serving release. The
-designated hostname has no binding and returns Cloudflare `525`; its
+staging and `prot-audit`, all protected; no unprotected disposable test
+environment remains (the protected `prot-audit` audit environment stays).
+`resource-audit` was recovered after the `edge-81998646916d` upgrade:
+ordinary destroy `op_8a88…` and noninteractive env delete `op_905f…` succeeded.
+`resource-audit2`, `resource-audit3`, `cancel-audit`, `cancel-ok`,
+`fresh-audit` and `recipe-audit` are gone. The foreign ownership test volume
+and all other test resource volumes were removed. Protected delete, unprotect and app-delete
+refusals were re-confirmed against `production` and `prot-audit` with
+`input_required`. No migration text was changed; 024 remains as applied.
+Production serves `rel_b19f552b5afb5a727b7e7b897f59c181` on the placeholder
+primary `a2-primary.invalid`; staging and `prot-audit` have no serving release.
+The designated hostname has no binding and returns Cloudflare `525`; its
 pre-existing DNS record remains because no safe Cloudflare access is available.
 There is no fixture resource container, network or volume; the destroyed cache
 row remains `destroyed`. The fixture registry manifests (`pgv3`, `pgv4`) remain
@@ -3533,9 +3541,13 @@ replay and a last-environment delete were not re-run on the host. The
 independent disposable PostgreSQL test above covers atomic rollback/replay and
 the last-environment factor admission with an injected verifier, but not a real
 TOTP and not a worker-completed delete. Positive real-TOTP authorization was
-not exercised on the host; no authenticator code or seed was accessed. The
-stuck `resource-audit/interrupt` platform state is a cleanup blocker described
-above. A new app fixture was not created because its deletion would add another
+not exercised against the live host gate; no live authenticator code, live seed
+or live protect store was accessed. The isolated protect-store/CLI tests and the
+direct-service local-verifier test use generated local secrets and real TOTP
+codes. The working-tree cancellation fix adds step-boundary checks and a
+row-locked finalization recheck; its regressions pass, but it is not committed,
+published or host-qualified until the orchestrator integrates it. A new app
+fixture was not created because its deletion would add another
 TOTP-gated residual; fresh name-based creation was exercised with the disposable
 environments above instead. The `env create` same-key replay passed. Factor
 policy over public HTTP was not exercised on the host. The `gh`-assisted flow
@@ -3545,7 +3557,7 @@ fresh-server baseline is not required for this alpha under the incremental
 policy. No compatibility alias or shim was added: the create input replaces the
 single `environment` field with `environments`. No migration text was changed.
 
-### 2026-11-06 — resource cancellation settlement (source fix, host not re-run)
+### 2026-11-06 — resource cancellation recovery (state settlement host-qualified; boundary/finalization fix source-only)
 
 During real-host qualification, cancelling a resource provisioning operation and
 then SIGKILLing the worker left the operation terminal `cancelled` while the
@@ -3579,34 +3591,92 @@ Source fix, no migration:
   requires the normal explicit resource destroy first; that guard was already
   intended and is unchanged.
 
-Tests run against a **local disposable PostgreSQL 18** database with a fake
-node transport (no main host, Docker used only to run the disposable database):
+Tests for the published `8199864` fix ran against a **local disposable
+PostgreSQL 18** database with a fake node transport (no main host, Docker used
+only to run the disposable database). The working-tree regression and
+direct-TOTP test below were also run against the existing disposable
+PostgreSQL test container:
 
 | Check | Result |
 | --- | --- |
 | Cancel an apply during its run step while the resource is `provisioning`; operation becomes `cancelled`, resource becomes `degraded` with `error_code=cancelled`; ledger preserved; retry apply and then destroy succeed | Pass: `TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy` |
+| Cancellation accepted while a step is in flight and that step then succeeds must still cancel the operation, not silently mark the resource ready | Pass: `TestIntegrationResourceCancelAfterSuccessfulStepIsHonored` |
+| Cancellation accepted after the last step check but before the operation-row-locked finalization must cancel an apply | Pass: `TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored` |
+| Cancellation accepted after the last step check but before the operation-row-locked finalization must cancel a destroy | Pass: `TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored` |
 | Existing rows left `provisioning`/`destroying` by an already `cancelled`/`failed` operation converge on normal `Reconcile`, preserving the ledger and using the correct apply/destroy detail | Pass: `TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows` |
 | Existing full resource lifecycle, secret redaction and retained-volume behavior unchanged | Pass: `TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets` |
 | Package build/vet and all non-DB tests | Pass: `go build ./...`, `go vet ./...`, `go test ./...`, darwin/arm64 cross-build |
 
-How the existing host fixture recovers after this source build is deployed:
-normal worker startup/periodic `Reconcile` sees
-`resource-audit/interrupt`'s terminal cancelled operation and the
-`provisioning` row, and moves the row to `degraded` while keeping its identity
-and ledger. The operator can then run an ordinary
-`eregion resource apply resource-audit/interrupt ...` to reuse the retained
-identity/volume, or `eregion resource destroy resource-audit/interrupt
---confirm resource-audit/interrupt` (with `--delete-data` only if intended).
-No ad-hoc command or SQL is needed.
+After the working-tree cancellation fix, the full
+`go test ./internal/controlplane -count=1` passed against the existing
+disposable PostgreSQL test container (`127.0.0.1:55432`; no new container), as
+did `go test ./internal/protect -count=1`,
+`go test ./internal/cli -run 'Factor|Protect' -count=1`, `go build ./...`,
+`go vet ./...` and the darwin/arm64 cross-build.
 
-Limitations: this fix was not deployed to or exercised on the main host in this
-task. Only `provisioning`/`destroying` rows whose operation is already
-`cancelled` or `failed` are swept; an operation still `queued`, `running` or
-`cancelling` must first be completed or cancelled through the normal River
-worker/rescue path. The reconciliation does not infer whether a container still
-exists at the node: a subsequent apply/destroy is the deliberate recovery step,
-and this is why the row is marked `degraded`, not `ready` or `destroyed`.
-No migration was added or edited.
+**Host verification (`edge-81998646916d`).** Publish edge run `42302477645`
+succeeded (`gh run watch`); CI run `42302477691` also succeeded. The channel
+manifest at
+`https://eregion.mbvlabs.com/edge/manifest.json` reported
+`edge-81998646916d`; its sigstore bundle verified with the pinned publish-edge
+identity, the linux/amd64 SHA256 matched
+`c32b41daeafe92391da71499986f5ef6cdf0fcd036b9c53855c90dd779f521b3`, and the
+binary reported `edge-81998646916d` / commit `81998646916d`. The CLI was
+upgraded with the signed release; node apply
+`op_e23e2d114b670c1cb5e192de1db73038` restarted the API and worker. Schema
+stayed **24/24**, River 7/7; `doctor` is 20/0/0 and `apply --dry-run` is 0 of
+20.
+
+**Existing stuck-row recovery — pass.** Without SQL, normal reconciliation
+moved `a2defs1106/resource-audit/interrupt` from `provisioning` to `degraded`
+with `error_code=cancelled` and the interrupted-apply detail. Ordinary
+`resource destroy` `op_8a880ab27ae28ad86b3b88e6a90d4066` succeeded and retained
+the ledger; noninteractive `env delete`
+`op_905fdccf680fbb8c7d8925702e394d64` succeeded. `resource-audit` is gone. Its
+Docker volume had already been removed by exact name during the earlier manual
+cleanup, so this verified the state and ledger path, not physical data
+preservation; the earlier cache default-destroy/re-apply test remains the
+data-retention evidence.
+
+**Fresh cancellation retest — real bug found and source-fixed.** Two no-worker-kill
+retests were run. On `cancel-audit/cancelprobe`, cancellation was accepted while
+the slow health step ran, but the health step failed at its deadline; the
+operation ended `failed` and the resource degraded, so that run did not
+distinguish failure from cancellation. On `cancel-ok/cancelok3`, cancellation
+was accepted while the health step was in flight, the health command then
+succeeded, and the operation still ended **`succeeded`** with the resource
+**`ready`** (`op_80c0f44da0189678f2faeb427ba35e34`). That is a real product
+bug on `edge-81998646916d`: resource apply/destroy had no cancellation check
+between steps, so an accepted cancel could be silently converted into success.
+
+The working tree now checks cancellation at every resource apply/destroy step
+boundary and finalizes both actions under the operation row lock, rechecking
+`cancelling` before the resource finalization callback. A `cancelling` row makes
+the scoped `finishResourceOperation` return `errPlatformCancelled` through the
+normal settlement path; other operation completion policy is unchanged. This
+closes the reviewer P1 race where a cancel could commit between the last step
+check and `finishPlatformOperation`. New regressions
+`TestIntegrationResourceCancelAfterSuccessfulStepIsHonored`,
+`TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored` and
+`TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored` pass. They
+use a test-only seam immediately before the operation-row lock and require
+`cancelled` plus a degraded resource with the ledger preserved. The existing
+cancellation, reconciliation, managed-resource, platform, CLI and control-plane
+package tests also pass; `go build`, `go vet` and the darwin/arm64 cross-build
+pass. This source change is **not committed, pushed or deployed**; current
+`main` still runs `edge-81998646916d` with both cancellation defects. The
+orchestrator must review, commit/publish and deploy a new edge build before this
+fix is host-qualified. All `cancel-audit` and `cancel-ok` resources/environments
+were destroyed and deleted after the retests.
+
+**Limitations.** Current `main` (`edge-81998646916d`) still has the resource
+step-boundary and final-commit cancellation bugs; the working-tree fix has not
+been committed, published or deployed. Only rows whose owning operation is
+already `cancelled` or `failed` are swept by reconciliation; queued, running or
+cancelling operations still need the normal River worker/rescue path.
+Reconciliation does not infer whether a node container exists: a subsequent
+apply/destroy is the deliberate recovery step, which is why the row becomes
+`degraded`, not `ready` or `destroyed`. No migration was added or edited.
 
 ```text
 Date / build / commit / channel:
