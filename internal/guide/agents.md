@@ -45,10 +45,14 @@ Destructive commands take a confirmation token that names the target:
   `--yes` never satisfies a destructive confirmation.
 - Ask the human before passing a destructive `--confirm`, and pass exactly the
   token the command reports.
-- `app delete` and `env delete` also need the D7 human factor: a TOTP code
-  typed at a human's terminal. You may preview a deletion with `--dry-run`,
-  but performing a deletion, exporting secrets and minting a token are
-  human-only. Do not attempt them on the human's behalf.
+- Every `app delete` and every protected `env delete` also needs the D7 human
+  factor: a TOTP code typed at a human's terminal. Deleting an app's last
+  environment counts as an app deletion and always needs that factor, even when
+  the environment is unprotected. An unprotected environment that is not the
+  last one is agent-operable with the exact `--confirm <app>/<env>` alone.
+  `env protect` is agent-safe; `env unprotect`, exporting secrets and minting a
+  token are human-only. You may preview a deletion with `--dry-run`. Do not
+  attempt a human-only action on the human's behalf.
 - `confirmation_required`, a missing token or a mismatched token means nothing
   was changed. It is not a retry signal.
 

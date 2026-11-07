@@ -29,10 +29,12 @@ var (
 
 type AppCreateInput struct {
 	Name string `json:"name"`
-	// Environment optionally creates the first environment and its first
-	// desired-state revision in the same submission transaction.
-	Environment *EnvironmentSpec `json:"environment,omitempty"`
-	// Deploy queues the first build-and-deploy of the new revision in the same
+	// Environments optionally creates environments and their first
+	// desired-state revisions in the same submission transaction. The CLI
+	// creates production and staging here; direct API callers may create an
+	// application with no environment.
+	Environments []EnvironmentSpec `json:"environments,omitempty"`
+	// Deploy queues the first environment's first build-and-deploy in the same
 	// submission transaction.
 	Deploy bool `json:"deploy,omitempty"`
 }
@@ -50,6 +52,11 @@ type HealthInput struct {
 // platform.app.create. It intentionally has no target of its own.
 type EnvironmentSpec struct {
 	Name string `json:"name"`
+	// Protected gates a real environment deletion behind the human factor.
+	// Omitted uses the name default: production and staging are protected, any
+	// other environment is unprotected. Creation itself never asks for a TOTP
+	// code; changing protected to unprotected on an existing environment does.
+	Protected *bool `json:"protected,omitempty"`
 	// Node runs application containers. It must have application + docker.
 	Node string `json:"node"`
 	// BuildNode optionally runs Buildpacks for releases of this environment. It
@@ -71,6 +78,9 @@ type EnvironmentSpec struct {
 	Processes         []ProcessSpec     `json:"processes,omitempty"`
 	Config            map[string]string `json:"config,omitempty"`
 	SecretNames       []string          `json:"secret_names,omitempty"`
+	// Resources attaches existing environment-owned resource names to the
+	// revision. Readiness gates deployment; no secret value enters the revision.
+	Resources []string `json:"resources,omitempty"`
 	// Retention overrides the server retention policy for this environment;
 	// unset fields inherit (D30).
 	Retention retention.Override `json:"retention,omitempty"`
@@ -82,6 +92,20 @@ type EnvironmentSpec struct {
 	Domain          string   `json:"domain,omitempty"`
 	DomainPrimary   bool     `json:"domain_primary,omitempty"`
 	DomainAddresses []string `json:"domain_addresses,omitempty"`
+	// DomainCheckPath is the first binding's optional observation path; empty
+	// uses the environment's web health path (D29).
+	DomainCheckPath string `json:"domain_check_path,omitempty"`
+	// Domains optionally binds several public hostnames, including aliases, in
+	// the same submission transaction. Use either Domain or Domains, not both.
+	// DomainAddresses applies to every declaration.
+	Domains []DomainDeclaration `json:"domains,omitempty"`
+}
+
+// DomainDeclaration is one public hostname created with a new environment.
+type DomainDeclaration struct {
+	Domain    string `json:"domain"`
+	Primary   bool   `json:"primary,omitempty"`
+	CheckPath string `json:"check_path,omitempty"`
 }
 
 type EnvironmentCreateInput struct {
@@ -113,15 +137,40 @@ type EnvironmentUpdateInput struct {
 	Processes         *[]ProcessSpec     `json:"processes,omitempty"`
 	Config            *map[string]string `json:"config,omitempty"`
 	SecretNames       *[]string          `json:"secret_names,omitempty"`
+	// Resources replaces the revision's managed-resource dependency set;
+	// omitted preserves the current set (D32 merge rule).
+	Resources *[]string `json:"resources,omitempty"`
 	// Retention replaces the environment's override block; omitted means keep
 	// the current revision's override unchanged (D30).
 	Retention *retention.Override `json:"retention,omitempty"`
+	// ExpectedRevisionID fences a file-based update against a concurrent
+	// revision. Empty keeps the ordinary flag-path behavior.
+	ExpectedRevisionID RevisionID `json:"expected_revision_id,omitempty"`
+	// Confirm names the environment when this patch removes existing desired
+	// state (processes, config keys, secret names or resource dependencies).
+	// The node validates it against current state; ordinary additions do not
+	// need it.
+	Confirm string `json:"confirm,omitempty"`
 }
 
 func (in *EnvironmentUpdateInput) Target() Target {
 	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
 }
 func (in *EnvironmentUpdateInput) Preview() any { return in }
+
+// EnvironmentProtectInput changes one environment's persistent protection
+// state without creating a desired-state revision. Turning protection off on a
+// protected environment requires the human factor; turning it on does not.
+type EnvironmentProtectInput struct {
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+	Protected   bool   `json:"protected"`
+}
+
+func (in *EnvironmentProtectInput) Target() Target {
+	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
+}
+func (in *EnvironmentProtectInput) Preview() any { return in }
 
 type ProcessScaleInput struct {
 	App         string `json:"app,omitempty"`
@@ -170,6 +219,20 @@ func (in *EnvironmentSecretAttachInput) Target() Target {
 	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
 }
 func (in *EnvironmentSecretAttachInput) Preview() any { return in }
+
+// EnvironmentResourceInput attaches or detaches one existing environment-owned
+// resource name as a new desired-state revision. It never provisions, destroys
+// or claims readiness for the resource.
+type EnvironmentResourceInput struct {
+	App         string `json:"app,omitempty"`
+	Environment string `json:"environment,omitempty"`
+	Resource    string `json:"resource"`
+}
+
+func (in *EnvironmentResourceInput) Target() Target {
+	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
+}
+func (in *EnvironmentResourceInput) Preview() any { return in }
 
 type ReleaseCreateInput struct {
 	App         string       `json:"app,omitempty"`
@@ -270,10 +333,13 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindNodeReconcile, Summary: "Reconcile a node's WireGuard peers and role configuration", Normalize: normalizeNodeReconcile})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentCreate, Summary: "Create an application environment", Normalize: normalizeEnvironmentCreate})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentUpdate, Summary: "Change an environment as a new desired-state revision", Normalize: normalizeEnvironmentUpdate})
+	r.registerBuiltin(Definition{Kind: KindEnvironmentProtect, Summary: "Change an environment's deletion protection", Normalize: normalizeEnvironmentProtect})
 	r.registerBuiltin(Definition{Kind: KindProcessScale, Summary: "Scale one environment process in a new revision", Normalize: normalizeProcessScale})
 	r.registerBuiltin(Definition{Kind: KindConfigSet, Summary: "Set plain environment configuration in a new revision", Normalize: normalizeConfigSet})
 	r.registerBuiltin(Definition{Kind: KindConfigUnset, Summary: "Unset plain environment configuration in a new revision", Normalize: normalizeConfigUnset})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentSecretAttach, Summary: "Attach a vault secret name to the environment's next revision", Normalize: normalizeEnvironmentSecretAttach})
+	r.registerBuiltin(Definition{Kind: KindEnvironmentResourceAttach, Summary: "Attach a managed resource name to the environment's next revision", Normalize: normalizeEnvironmentResource})
+	r.registerBuiltin(Definition{Kind: KindEnvironmentResourceDetach, Summary: "Detach a managed resource name from the environment's next revision", Normalize: normalizeEnvironmentResource})
 	r.registerBuiltin(Definition{Kind: KindReleaseCreate, Summary: "Record or build a release", Normalize: normalizeReleaseCreate})
 	r.registerBuiltin(Definition{Kind: KindBuildStop, Summary: "Stop a running build", Normalize: normalizeBuildStop})
 	r.registerBuiltin(Definition{Kind: KindBuildRetry, Summary: "Retry a build of the same commit", Normalize: normalizeBuildRetry})
@@ -283,6 +349,8 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindDomainAdd, Summary: "Route a public hostname to an environment through Caddy", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindDomainRemove, Summary: "Remove a public hostname's route", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindRetentionPrune, Summary: "Prune disk artifacts on one node under the D30 retention policy", Normalize: normalizeRetentionPrune})
+	r.registerBuiltin(Definition{Kind: KindResourceApply, Summary: "Provision or update one environment-owned generic Docker resource", Normalize: normalizeResourceApply})
+	r.registerBuiltin(Definition{Kind: KindResourceDestroy, Summary: "Remove a resource container while retaining its named data volumes", Normalize: normalizeResourceDestroy})
 	r.registerBuiltin(Definition{Kind: KindAppDelete, Summary: "Delete an application and every environment it owns", Normalize: normalizeAppDelete})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentDelete, Summary: "Delete an environment after workload cleanup", Normalize: normalizeEnvironmentDelete})
 }
@@ -298,22 +366,41 @@ func normalizeAppCreate(target Target, raw json.RawMessage) (ActionInput, error)
 	if err := ValidateName(input.Name); err != nil {
 		return nil, err
 	}
-	if input.Environment != nil {
-		if err := normalizeEnvironmentSpec(input.Environment); err != nil {
+	seen := map[string]bool{}
+	for index := range input.Environments {
+		spec := &input.Environments[index]
+		if err := normalizeEnvironmentSpec(spec); err != nil {
 			return nil, err
 		}
-		if input.Deploy && input.Environment.Source.Kind == "" {
+		if seen[spec.Name] {
+			return nil, invalid("environments", "Use each environment name once.")
+		}
+		seen[spec.Name] = true
+	}
+	if input.Deploy {
+		if len(input.Environments) == 0 {
+			return nil, invalid("deploy", "A first deploy needs an environment specification.")
+		}
+		if input.Environments[0].Source.Kind == "" {
 			return nil, invalid("deploy", "A first deploy needs a source binding.")
 		}
-	} else if input.Deploy {
-		return nil, invalid("deploy", "A first deploy needs an environment specification.")
 	}
 	return &input, nil
+}
+
+// DefaultEnvironmentProtection is the creation default for one environment
+// name. Production and staging are protected; any other name is unprotected.
+func DefaultEnvironmentProtection(name string) bool {
+	return name == "production" || name == "staging"
 }
 
 func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 	if err := ValidateName(spec.Name); err != nil {
 		return err
+	}
+	if spec.Protected == nil {
+		value := DefaultEnvironmentProtection(spec.Name)
+		spec.Protected = &value
 	}
 	if err := ValidateName(spec.Node); err != nil {
 		return err
@@ -366,8 +453,20 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 	if err != nil {
 		return err
 	}
-	if domain == "" && (spec.DomainPrimary || len(addresses) > 0) {
-		return invalid("domain", "A primary flag or addresses need a domain name.")
+	if len(spec.Domains) > 0 {
+		if domain != "" || spec.DomainPrimary || spec.DomainCheckPath != "" {
+			return invalid("domain", "Use either domain/domain_primary/domain_check_path or domains, not both.")
+		}
+		if err := normalizeDomainDeclarations(spec.Domains); err != nil {
+			return err
+		}
+	} else {
+		if domain == "" && (spec.DomainPrimary || len(addresses) > 0 || spec.DomainCheckPath != "") {
+			return invalid("domain", "A primary flag, addresses or check path need a domain name.")
+		}
+		if spec.DomainCheckPath != "" && !validAbsolutePath(spec.DomainCheckPath) {
+			return invalid("domain check path", "Use an absolute path such as /healthz without a scheme, host, whitespace, controls, query, or fragment, up to 256 bytes.")
+		}
 	}
 	spec.Domain, spec.DomainAddresses = domain, addresses
 	state := RevisionState{
@@ -378,6 +477,7 @@ func normalizeEnvironmentSpec(spec *EnvironmentSpec) error {
 		Processes:         spec.Processes,
 		Config:            spec.Config,
 		SecretNames:       spec.SecretNames,
+		Resources:         spec.Resources,
 		Retention:         spec.Retention.Clone(),
 	}
 	if len(state.Config) == 0 && len(spec.Env) > 0 {
@@ -524,7 +624,7 @@ func normalizeEnvironmentUpdate(target Target, raw json.RawMessage) (ActionInput
 		}
 	}
 	if input.Source != nil {
-		if err := normalizeSourceBinding(input.Source); err != nil {
+		if err := normalizeSourceBinding(input.Source, true); err != nil {
 			return nil, err
 		}
 	}
@@ -561,6 +661,11 @@ func normalizeEnvironmentUpdate(target Target, raw json.RawMessage) (ActionInput
 	}
 	if input.Retention != nil {
 		if err := input.Retention.Validate(); err != nil {
+			return nil, err
+		}
+	}
+	if input.ExpectedRevisionID != "" {
+		if err := input.ExpectedRevisionID.Validate(); err != nil {
 			return nil, err
 		}
 	}
@@ -655,6 +760,25 @@ func normalizeEnvironmentSecretAttach(target Target, raw json.RawMessage) (Actio
 	return &input, nil
 }
 
+func normalizeEnvironmentResource(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetEnvironment {
+		return nil, invalid("target", "environment resource attach and detach require target env/<app>/<env>.")
+	}
+	var input EnvironmentResourceInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if (input.App != "" && input.App != target.App) || (input.Environment != "" && input.Environment != target.Environment) {
+		return nil, invalid("environment", "The app and environment fields must match the target, or be omitted.")
+	}
+	input.App, input.Environment = target.App, target.Environment
+	input.Resource = strings.TrimSpace(input.Resource)
+	if err := ValidateResourceName(input.Resource); err != nil {
+		return nil, err
+	}
+	return &input, nil
+}
+
 func validateSecretRefs(refs map[string]string) error {
 	if len(refs) > 64 {
 		return invalid("secret references", "Use at most 64 secret references.")
@@ -673,7 +797,19 @@ func validateSecretRefs(refs map[string]string) error {
 // NormalizeRevisionState applies defaults and validates one complete desired
 // state. It is used both for a new revision and after a patch is merged.
 func NormalizeRevisionState(state *RevisionState) error {
-	if err := normalizeSourceBinding(&state.Source); err != nil {
+	return normalizeRevisionStateWithHosts(state, true)
+}
+
+// NormalizeRevisionStateShape applies the same desired-state normalization as
+// NormalizeRevisionState but does not consult the node's git host allowlist.
+// Definition-file input uses it; the control plane and build path still enforce
+// the allowlist before any build.
+func NormalizeRevisionStateShape(state *RevisionState) error {
+	return normalizeRevisionStateWithHosts(state, false)
+}
+
+func normalizeRevisionStateWithHosts(state *RevisionState, enforceGitHosts bool) error {
+	if err := normalizeSourceBinding(&state.Source, enforceGitHosts); err != nil {
 		return err
 	}
 	if err := normalizeRuntime(&state.Runtime); err != nil {
@@ -695,6 +831,11 @@ func NormalizeRevisionState(state *RevisionState) error {
 		return err
 	}
 	state.SecretNames = names
+	resources, err := normalizeResourceNames(state.Resources)
+	if err != nil {
+		return err
+	}
+	state.Resources = resources
 	name, err := normalizeOptionalSecretName(state.WebhookSecretName)
 	if err != nil {
 		return err
@@ -710,10 +851,10 @@ func NormalizeRevisionState(state *RevisionState) error {
 }
 
 func normalizeRevisionState(state *RevisionState) error {
-	return NormalizeRevisionState(state)
+	return normalizeRevisionStateWithHosts(state, true)
 }
 
-func normalizeSourceBinding(source *SourceBinding) error {
+func normalizeSourceBinding(source *SourceBinding, enforceGitHosts bool) error {
 	source.Kind = strings.ToLower(strings.TrimSpace(source.Kind))
 	source.URL = strings.TrimSpace(source.URL)
 	source.Ref = strings.TrimSpace(source.Ref)
@@ -741,7 +882,13 @@ func normalizeSourceBinding(source *SourceBinding) error {
 		}
 		return nil
 	case "git":
-		if err := ValidateGitSourceURL(source.URL); err != nil {
+		var err error
+		if enforceGitHosts {
+			err = ValidateGitSourceURL(source.URL)
+		} else {
+			err = ValidateGitSourceURLShape(source.URL)
+		}
+		if err != nil {
 			return invalid("source URL", err.Error())
 		}
 		if source.Ref != "" && !validGitRef(source.Ref) {
@@ -932,6 +1079,75 @@ func normalizeOptionalSecretName(name string) (string, error) {
 	return name, nil
 }
 
+func normalizeResourceNames(names []string) ([]string, error) {
+	if len(names) > 32 {
+		return nil, invalid("resource names", "Use at most 32 managed resource names.")
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if err := ValidateResourceName(name); err != nil {
+			return nil, err
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// EnvironmentUpdateRemovesState reports whether a patch drops existing desired
+// state. Additions alone are not destructive and need no target confirmation.
+func EnvironmentUpdateRemovesState(base, next RevisionState) bool {
+	if len(next.Processes) < len(base.Processes) || len(next.Config) < len(base.Config) ||
+		len(next.SecretNames) < len(base.SecretNames) || len(next.Resources) < len(base.Resources) {
+		return true
+	}
+	for _, name := range base.Processes {
+		if !processNamed(next.Processes, name.Name) {
+			return true
+		}
+	}
+	for key := range base.Config {
+		if _, ok := next.Config[key]; !ok {
+			return true
+		}
+	}
+	for _, name := range base.SecretNames {
+		if !containsString(next.SecretNames, name) {
+			return true
+		}
+	}
+	for _, name := range base.Resources {
+		if !containsString(next.Resources, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func processNamed(processes []ProcessSpec, name string) bool {
+	for _, process := range processes {
+		if process.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
 // CloneRevisionState copies maps and slices so a new revision never aliases the
 // previous revision's state.
 func CloneRevisionState(state RevisionState) RevisionState {
@@ -939,6 +1155,7 @@ func CloneRevisionState(state RevisionState) RevisionState {
 	out.Source.BuildEnv = cloneStringMap(state.Source.BuildEnv)
 	out.Config = cloneStringMap(state.Config)
 	out.SecretNames = append([]string(nil), state.SecretNames...)
+	out.Resources = append([]string(nil), state.Resources...)
 	out.Retention = state.Retention.Clone()
 	out.Processes = make([]ProcessSpec, len(state.Processes))
 	for i, process := range state.Processes {
@@ -1002,6 +1219,9 @@ func ApplyEnvironmentPatch(base RevisionState, patch EnvironmentUpdateInput) Rev
 	if patch.SecretNames != nil {
 		out.SecretNames = append([]string(nil), (*patch.SecretNames)...)
 	}
+	if patch.Resources != nil {
+		out.Resources = append([]string(nil), (*patch.Resources)...)
+	}
 	if patch.Retention != nil {
 		out.Retention = patch.Retention.Clone()
 	}
@@ -1054,6 +1274,34 @@ func AttachSecret(base RevisionState, name string) RevisionState {
 	}
 	out.SecretNames = append(out.SecretNames, name)
 	sort.Strings(out.SecretNames)
+	return out
+}
+
+// AttachResource adds one environment-owned resource dependency. It does not
+// create, apply or start the resource and never implies readiness.
+func AttachResource(base RevisionState, name string) RevisionState {
+	out := CloneRevisionState(base)
+	for _, existing := range out.Resources {
+		if existing == name {
+			return out
+		}
+	}
+	out.Resources = append(out.Resources, name)
+	sort.Strings(out.Resources)
+	return out
+}
+
+// DetachResource removes a resource dependency from the desired revision. The
+// resource container and its volumes are untouched; destruction is explicit.
+func DetachResource(base RevisionState, name string) RevisionState {
+	out := CloneRevisionState(base)
+	kept := out.Resources[:0]
+	for _, existing := range out.Resources {
+		if existing != name {
+			kept = append(kept, existing)
+		}
+	}
+	out.Resources = kept
 	return out
 }
 
@@ -1451,6 +1699,83 @@ func normalizeRetentionPrune(target Target, raw json.RawMessage) (ActionInput, e
 		return nil, invalid("retention node", "The input node must match the canonical target.")
 	}
 	input.Node = target.Node
+	return &input, nil
+}
+
+// normalizeDomainDeclarations validates several first-environment bindings and
+// removes duplicate names. Exactly one declaration must be primary.
+func normalizeDomainDeclarations(declarations []DomainDeclaration) error {
+	if len(declarations) > 32 {
+		return invalid("domains", "Use at most 32 domains.")
+	}
+	seen := map[string]bool{}
+	primary := 0
+	for index := range declarations {
+		item := &declarations[index]
+		name := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(item.Domain), "."))
+		if err := ValidateDomain(name); err != nil {
+			return invalid("domain", err.Error())
+		}
+		if seen[name] {
+			return invalid("domain", "Use each domain once.")
+		}
+		seen[name] = true
+		item.Domain = name
+		if item.CheckPath != "" && !validAbsolutePath(item.CheckPath) {
+			return invalid("domain check path", "Use an absolute path such as /healthz without a scheme, host, whitespace, controls, query, or fragment, up to 256 bytes.")
+		}
+		if item.Primary {
+			primary++
+		}
+	}
+	if primary != 1 {
+		return invalid("domains", "Mark exactly one domain as primary.")
+	}
+	return nil
+}
+
+func normalizeResourceApply(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetResource {
+		return nil, invalid("resource target", "resource apply requires target resource/<app>/<env>/<name>.")
+	}
+	var input ResourceApplyInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if (input.App != "" && input.App != target.App) ||
+		(input.Environment != "" && input.Environment != target.Environment) ||
+		(input.Name != "" && input.Name != target.Resource) {
+		return nil, invalid("resource", "The app, environment and name fields must match the target, or be omitted.")
+	}
+	input.App, input.Environment, input.Name = target.App, target.Environment, target.Resource
+	spec, err := NormalizeResourceSpec(input.ResourceSpec)
+	if err != nil {
+		return nil, err
+	}
+	input.ResourceSpec = spec
+	return &input, nil
+}
+
+func normalizeResourceDestroy(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetResource {
+		return nil, invalid("resource target", "resource destroy requires target resource/<app>/<env>/<name>.")
+	}
+	var input ResourceDestroyInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if (input.App != "" && input.App != target.App) ||
+		(input.Environment != "" && input.Environment != target.Environment) ||
+		(input.Name != "" && input.Name != target.Resource) {
+		return nil, invalid("resource", "The app, environment and name fields must match the target, or be omitted.")
+	}
+	input.App, input.Environment, input.Name = target.App, target.Environment, target.Resource
+	if input.Confirm != "" {
+		input.Confirm = strings.TrimSpace(input.Confirm)
+		if input.Confirm != target.App+"/"+target.Environment+"/"+target.Resource {
+			return nil, invalid("confirm", "The confirmation token must name the exact resource as app/environment/name.")
+		}
+	}
 	return &input, nil
 }
 

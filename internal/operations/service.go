@@ -19,6 +19,10 @@ type Submission struct {
 	IdempotencyKey string
 	Input          json.RawMessage
 	Confirmation   string
+	// HumanFactor is a transient TOTP code carried by the node transport into
+	// the submission transaction. It is never persisted in the operation input,
+	// events or River arguments. HTTP submissions leave it empty.
+	HumanFactor string `json:"-"`
 }
 
 type EventPage struct {

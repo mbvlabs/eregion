@@ -64,6 +64,24 @@ func GitHubRepository(raw string) (string, bool) {
 // invoked with redirects disabled, so an allowed host cannot bounce the clone to
 // an internal service.
 func ValidateGitSourceURL(raw string) error {
+	if err := ValidateGitSourceURLShape(raw); err != nil {
+		return err
+	}
+	parsed, _ := url.Parse(strings.TrimSpace(raw))
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	for _, allowed := range GitAllowedHosts() {
+		if host == allowed || strings.HasSuffix(host, "."+allowed) {
+			return nil
+		}
+	}
+	return fmt.Errorf("git host %q is not in EREGION_GIT_ALLOWED_HOSTS", host)
+}
+
+// ValidateGitSourceURLShape checks URL syntax and refused targets without the
+// node's host allowlist. Definition files use it so an operator laptop does
+// not need the node's EREGION_GIT_ALLOWED_HOSTS; the control plane and build
+// execution still apply ValidateGitSourceURL.
+func ValidateGitSourceURLShape(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("use an https:// repository URL without credentials, query, or fragment")
@@ -79,12 +97,7 @@ func ValidateGitSourceURL(raw string) error {
 		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
 		return fmt.Errorf("git build sources cannot target a loopback or internal name")
 	}
-	for _, allowed := range GitAllowedHosts() {
-		if host == allowed || strings.HasSuffix(host, "."+allowed) {
-			return nil
-		}
-	}
-	return fmt.Errorf("git host %q is not in EREGION_GIT_ALLOWED_HOSTS", host)
+	return nil
 }
 
 // gitHostLookup resolves a git source hostname. Tests replace it to exercise

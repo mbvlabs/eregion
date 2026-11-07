@@ -160,6 +160,7 @@ const (
 	TargetEnvironment TargetKind = "env"
 	TargetNode        TargetKind = "node"
 	TargetBuild       TargetKind = "build"
+	TargetResource    TargetKind = "resource"
 )
 
 // Target is a parsed canonical operation target.
@@ -169,6 +170,7 @@ type Target struct {
 	Environment string
 	Node        string
 	Build       BuildID
+	Resource    string
 }
 
 func PlatformTarget() Target { return Target{Kind: TargetPlatform} }
@@ -204,6 +206,19 @@ func NewBuildTarget(build BuildID) (Target, error) {
 	return Target{Kind: TargetBuild, Build: build}, nil
 }
 
+func NewResourceTarget(app, environment, resource string) (Target, error) {
+	if err := ValidateName(app); err != nil {
+		return Target{}, err
+	}
+	if err := ValidateName(environment); err != nil {
+		return Target{}, err
+	}
+	if err := ValidateResourceName(resource); err != nil {
+		return Target{}, err
+	}
+	return Target{Kind: TargetResource, App: app, Environment: environment, Resource: resource}, nil
+}
+
 func (t Target) String() string {
 	switch t.Kind {
 	case TargetPlatform:
@@ -216,6 +231,8 @@ func (t Target) String() string {
 		return "node/" + t.Node
 	case TargetBuild:
 		return "build/" + string(t.Build)
+	case TargetResource:
+		return "resource/" + t.App + "/" + t.Environment + "/" + t.Resource
 	default:
 		return ""
 	}
@@ -240,15 +257,23 @@ func (t Target) Validate() error {
 		return ValidateName(t.Node)
 	case TargetBuild:
 		return t.Build.Validate()
+	case TargetResource:
+		if err := ValidateName(t.App); err != nil {
+			return err
+		}
+		if err := ValidateName(t.Environment); err != nil {
+			return err
+		}
+		return ValidateResourceName(t.Resource)
 	default:
-		return contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, node/<node>, or build/<id>.")
+		return contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, node/<node>, build/<id>, or resource/<app>/<env>/<name>.")
 	}
 }
 
 // ParseTarget parses the canonical target grammar. It does not accept aliases.
 func ParseTarget(raw string) (Target, error) {
 	if raw == "" || len(raw) > 200 || strings.TrimSpace(raw) != raw {
-		return Target{}, contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, or node/<node>.")
+		return Target{}, contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, node/<node>, build/<id>, or resource/<app>/<env>/<name>.")
 	}
 	parts := strings.Split(raw, "/")
 	switch {
@@ -262,8 +287,10 @@ func ParseTarget(raw string) (Target, error) {
 		return NewNodeTarget(parts[1])
 	case len(parts) == 2 && parts[0] == "build":
 		return NewBuildTarget(BuildID(parts[1]))
+	case len(parts) == 4 && parts[0] == "resource":
+		return NewResourceTarget(parts[1], parts[2], parts[3])
 	default:
-		return Target{}, contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, node/<node>, or build/<id>.")
+		return Target{}, contract.NewFault(contract.ValidationFailed, "invalid platform target", "Use platform, app/<app>, env/<app>/<env>, node/<node>, build/<id>, or resource/<app>/<env>/<name>.")
 	}
 }
 

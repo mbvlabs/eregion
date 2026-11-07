@@ -13,10 +13,12 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// lockPlatformTargets serializes a deletion with every operation that could
-// touch the same records. An app deletion takes the app target (which also
-// serializes environment creation) and every current environment target, so a
-// deploy cannot race the cleanup. Lock order is sorted to avoid deadlocks.
+// lockPlatformTargets serializes a deletion or managed-resource operation with
+// every operation that could touch the same records. An app deletion takes the
+// app target (which also serializes environment creation) and every current
+// environment target, so a deploy cannot race the cleanup. A resource
+// operation also takes its environment target so it cannot race a deployment
+// switch. Lock order is sorted to avoid deadlocks.
 func (s *Service) lockPlatformTargets(ctx context.Context, normalized platform.Normalized) (func(), error) {
 	targets := []string{normalized.Target.String()}
 	switch input := normalized.Input.(type) {
@@ -26,8 +28,27 @@ func (s *Service) lockPlatformTargets(ctx context.Context, normalized platform.N
 			return nil, err
 		}
 		targets = append(targets, envTargets...)
+		resourceTargets, err := s.resourceTargets(ctx, input.App, "")
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, resourceTargets...)
 	case *platform.EnvironmentDeleteInput:
 		targets = append(targets, "app/"+input.App)
+		resourceTargets, err := s.resourceTargets(ctx, input.App, input.Environment)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, resourceTargets...)
+	case *platform.ResourceApplyInput:
+		// A resource container is consumed by the environment's deployments.
+		// Taking the environment target serializes provisioning with a deploy
+		// switch, in addition to the resource's own target.
+		targets = append(targets, "env/"+input.App+"/"+input.Environment)
+	case *platform.ResourceDestroyInput:
+		// The same environment lock keeps destroy out of a deployment switch;
+		// the resource target keeps it out of another resource operation.
+		targets = append(targets, "env/"+input.App+"/"+input.Environment)
 	}
 	return s.lockTargets(ctx, targets)
 }
@@ -138,6 +159,13 @@ func (s *Service) ensureNoActiveDeleteTargets(ctx context.Context, tx pgx.Tx, id
 	} else {
 		args = append(args, "env/"+app+"/"+environment)
 		statement += fmt.Sprintf(" OR target=$%d", len(args))
+		// Two sibling environment deletions accepted before either worker ran
+		// could otherwise each look non-last and together remove the app
+		// without the app-deletion factor. Serialize all environment deletes
+		// for one app; after the first finishes, the next submission re-reads
+		// the true remaining count and requires the factor when it is last.
+		args = append(args, platform.KindEnvironmentDelete, "env/"+app+"/%")
+		statement += fmt.Sprintf(" OR (kind=$%d AND target LIKE $%d)", len(args)-1, len(args))
 	}
 	statement += ")"
 	var active int
@@ -149,6 +177,35 @@ func (s *Service) ensureNoActiveDeleteTargets(ctx context.Context, tx pgx.Tx, id
 			"Wait for it to finish or cancel it explicitly, then delete again.")
 	}
 	return nil
+}
+
+// RequiresHumanFactor reports whether a real submission of this normalized
+// action currently needs the D7 factor. Authorization still happens inside the
+// submission transaction against locked state; this read is for transports
+// that must refuse before they can carry a code (the HTTP API).
+func (s *Service) RequiresHumanFactor(ctx context.Context, normalized platform.Normalized) (bool, error) {
+	switch input := normalized.Input.(type) {
+	case *platform.AppDeleteInput:
+		return true, nil
+	case *platform.EnvironmentDeleteInput:
+		env, err := s.environment(ctx, input.App, input.Environment)
+		if err != nil {
+			return false, err
+		}
+		counts, err := s.deletionCounts(ctx, input.App, input.Environment)
+		if err != nil {
+			return false, err
+		}
+		return platform.EnvironmentDeleteRequiresHumanFactor(env.Protected, counts.appEnvironments == 1), nil
+	case *platform.EnvironmentProtectInput:
+		env, err := s.environment(ctx, input.App, input.Environment)
+		if err != nil {
+			return false, err
+		}
+		return platform.ProtectionChangeRequiresHumanFactor(env.Protected, input.Protected), nil
+	default:
+		return false, nil
+	}
 }
 
 func (w *platformWorker) runDelete(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
@@ -336,6 +393,7 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 	input := normalized.Input
 	preview := platform.Preview{Kind: normalized.Kind, Target: normalized.Target.String(), DryRun: true, Input: input.Preview(), Summary: normalized.Summary}
 	var app, environment string
+	protected, lastEnvironment := false, false
 	switch value := input.(type) {
 	case *platform.AppDeleteInput:
 		app = value.App
@@ -344,9 +402,16 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 		}
 	case *platform.EnvironmentDeleteInput:
 		app, environment = value.App, value.Environment
-		if _, err := s.environment(ctx, app, environment); err != nil {
+		env, err := s.environment(ctx, app, environment)
+		if err != nil {
 			return preview, err
 		}
+		protected = env.Protected
+		counts, err := s.deletionCounts(ctx, app, environment)
+		if err != nil {
+			return preview, err
+		}
+		lastEnvironment = counts.appEnvironments == 1
 	default:
 		return preview, contract.NewFault(contract.Internal, "deletion preview input is not recognized", "Do not retry accepted work.")
 	}
@@ -361,6 +426,18 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 		"Durable operation and event history is kept; only platform state and secret values are deleted.",
 	)
 	preview.Warnings = append(preview.Warnings, deletionWarnings(counts, environment)...)
+	switch {
+	case environment == "":
+		preview.Warnings = append(preview.Warnings, "Every application deletion requires the D7 TOTP human factor, regardless of environment protection.")
+	case platform.EnvironmentDeleteRequiresHumanFactor(protected, lastEnvironment):
+		reason := "This environment is protected"
+		if lastEnvironment && !protected {
+			reason = "This is the last environment, so deleting it also deletes the application"
+		}
+		preview.Warnings = append(preview.Warnings, reason+"; the real deletion requires the D7 TOTP human factor at a human terminal.")
+	default:
+		preview.Warnings = append(preview.Warnings, "This environment is unprotected and is not the last one; the real deletion needs only the exact target confirmation and is available to agents, JSON and no-TTY calls.")
+	}
 	return preview, nil
 }
 

@@ -94,7 +94,7 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 	})
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "retention-worker-app", map[string]any{
 		"name": app,
-		"environment": map[string]any{
+		"environments": []map[string]any{{
 			"name": environment, "node": "local",
 			"source":           map[string]any{"kind": "image", "image": "127.0.0.1:5000/api:new"},
 			"domain":           "retention-worker.example.com",
@@ -102,7 +102,7 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 			"retention": map[string]any{
 				"keep_releases": 1, "keep_newer_than_days": 1, "artifact_grace_days": 1,
 			},
-		},
+		}},
 	})
 	now := time.Now().UTC()
 	oldConfig := "sha256:" + strings.Repeat("a", 64)

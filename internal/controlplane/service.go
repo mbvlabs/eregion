@@ -37,6 +37,10 @@ type Service struct {
 	// afterNode is a test-only seam between a node effect and its database
 	// acknowledgement. Production leaves it nil.
 	afterNode func(contract.OperationID, string) error
+	// beforeResourceFinalize is a test-only seam between the last resource
+	// step-boundary cancellation check and the operation-row-locked
+	// finalization. Production leaves it nil.
+	beforeResourceFinalize func()
 	// beforeRetentionMark is a test-only seam between planning a retention run
 	// and marking its release rows. Production leaves it nil.
 	beforeRetentionMark func(context.Context, contract.OperationID)
@@ -59,6 +63,10 @@ type Service struct {
 	// material and the secret values handed to one node step). Node events are
 	// redacted with it before they are persisted.
 	redaction *secrets.Registry
+	// humanFactor verifies a transient TOTP code from protect.Store inside the
+	// submission transaction. A nil verifier fails every factor-gated action
+	// closed; HTTP submissions therefore cannot perform one.
+	humanFactor func(string) error
 }
 
 // SecretResolver resolves opaque environment secret references without

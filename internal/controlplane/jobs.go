@@ -327,13 +327,17 @@ type WorkerConfig struct {
 	// Redaction is the process redaction registry. Nil builds one and still
 	// registers the worker's own environment secrets.
 	Redaction *secrets.Registry
+	// HumanFactor verifies a transient TOTP code inside a factor-gated
+	// submission transaction. Node RPC sets it; HTTP and worker-only processes
+	// leave it nil, which fails factor-gated submissions closed.
+	HumanFactor func(string) error
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots}
+	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor}
 	service.redaction = config.Redaction
 	if service.redaction == nil {
 		service.redaction = &secrets.Registry{}
@@ -844,6 +848,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	var failures []error
 	if err := s.reconcileWebhookAdmissions(ctx); err != nil {
 		failures = append(failures, fmt.Errorf("reconcile webhook admissions: %w", err))
+	}
+	if err := s.reconcileTerminalResourceStates(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("reconcile terminal resource states: %w", err))
 	}
 	rows, err := s.pool.Query(ctx, `SELECT o.id FROM eregion_operations o LEFT JOIN river_job j ON j.id=o.job_id
         WHERE o.state IN ('queued','running','cancelling') AND (j.id IS NULL OR j.state IN ('discarded','cancelled','completed')) LIMIT 100`)

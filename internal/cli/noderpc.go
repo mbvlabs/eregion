@@ -1308,6 +1308,9 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		Redaction: registry,
+		HumanFactor: func(code string) error {
+			return protect.NewStore().Verify(code)
+		},
 	})
 	if err != nil {
 		pool.Close()
@@ -1357,10 +1360,10 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 				return nil, err
 			}
 		}
-		if err := submitFactor(protect.NewStore(), request, params.Kind); err != nil {
-			return nil, err
-		}
-		return app.PreviewOrSubmit(ctx, actor, params.Kind, params.Target, params.Input, request.IdempotencyKey, request.DryRun)
+		// The control plane verifies the factor inside the submission
+		// transaction against locked environment state. The code is transient
+		// request data, never operation input, an event or a River argument.
+		return app.PreviewOrSubmitWithFactor(ctx, actor, params.Kind, params.Target, params.Input, request.IdempotencyKey, request.DryRun, request.Secrets[protect.CodeSecret])
 	case methodGet:
 		var params rpcOperationParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1527,16 +1530,6 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 // separate verify call for the CLI to skip.
 func guardLocalFactor(store *protect.Store, request rpc.Request) error {
 	if request.Method != methodSecretExport {
-		return nil
-	}
-	return requireFactor(store, request)
-}
-
-// submitFactor enforces the D7 factor on a real delete submission, after the
-// D12 target confirmation has been validated. A dry run previews the plan and
-// never needs the factor.
-func submitFactor(store *protect.Store, request rpc.Request, kind string) error {
-	if request.DryRun || !platform.RequiresHumanFactor(kind) {
 		return nil
 	}
 	return requireFactor(store, request)

@@ -60,15 +60,29 @@ func NormalizeAction(kind, target string, input json.RawMessage) (platform.Norma
 
 // PreviewOrSubmit normalizes a registered action and previews or submits it.
 func (s AppService) PreviewOrSubmit(ctx context.Context, actor contract.Actor, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool) (any, error) {
+	return s.PreviewOrSubmitWithFactor(ctx, actor, kind, target, input, idempotencyKey, dryRun, "")
+}
+
+// PreviewOrSubmitWithFactor is PreviewOrSubmit with a transient human-factor
+// code for the same request. The code never enters operation input, events or
+// River arguments.
+func (s AppService) PreviewOrSubmitWithFactor(ctx context.Context, actor contract.Actor, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool, humanFactor string) (any, error) {
 	normalized, err := NormalizeAction(kind, target, input)
 	if err != nil {
 		return nil, err
 	}
-	return s.SubmitNormalized(ctx, actor, normalized, idempotencyKey, dryRun)
+	return s.SubmitNormalizedWithFactor(ctx, actor, normalized, idempotencyKey, dryRun, humanFactor)
 }
 
 // SubmitNormalized previews or submits an already-normalized platform action.
 func (s AppService) SubmitNormalized(ctx context.Context, actor contract.Actor, normalized platform.Normalized, idempotencyKey string, dryRun bool) (any, error) {
+	return s.SubmitNormalizedWithFactor(ctx, actor, normalized, idempotencyKey, dryRun, "")
+}
+
+// SubmitNormalizedWithFactor is SubmitNormalized with a transient human-factor
+// code. The control plane verifies it inside the submission transaction when
+// the locked target state requires it.
+func (s AppService) SubmitNormalizedWithFactor(ctx context.Context, actor contract.Actor, normalized platform.Normalized, idempotencyKey string, dryRun bool, humanFactor string) (any, error) {
 	if dryRun {
 		if s.Operations != nil {
 			if previewer, ok := s.Operations.(platformPreviewService); ok {
@@ -89,7 +103,7 @@ func (s AppService) SubmitNormalized(ctx context.Context, actor contract.Actor, 
 	}
 	return s.Operations.Submit(ctx, operations.Submission{
 		Kind: normalized.Kind, Target: normalized.Target.String(), Actor: actor,
-		IdempotencyKey: idempotencyKey, Input: normalized.Canonical,
+		IdempotencyKey: idempotencyKey, Input: normalized.Canonical, HumanFactor: humanFactor,
 	})
 }
 

@@ -9,8 +9,9 @@ import (
 // checks it against the records it just loaded, so a stale or wrong name never
 // deletes anything.
 const (
-	KindAppDelete         = "platform.app.delete"
-	KindEnvironmentDelete = "platform.environment.delete"
+	KindAppDelete          = "platform.app.delete"
+	KindEnvironmentDelete  = "platform.environment.delete"
+	KindEnvironmentProtect = "platform.environment.protect"
 )
 
 // AppDeleteInput removes an application and every environment it owns. It is
@@ -35,6 +36,27 @@ func (in *EnvironmentDeleteInput) Target() Target {
 	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
 }
 func (in *EnvironmentDeleteInput) Preview() any { return in }
+
+func normalizeEnvironmentProtect(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetEnvironment {
+		return nil, invalid("target", "platform.environment.protect requires target env/<app>/<env>.")
+	}
+	var input EnvironmentProtectInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if (input.App != "" && input.App != target.App) || (input.Environment != "" && input.Environment != target.Environment) {
+		return nil, invalid("environment", "The app and environment fields must match the target, or be omitted.")
+	}
+	input.App, input.Environment = target.App, target.Environment
+	if err := ValidateName(input.App); err != nil {
+		return nil, err
+	}
+	if err := ValidateName(input.Environment); err != nil {
+		return nil, err
+	}
+	return &input, nil
+}
 
 func normalizeAppDelete(target Target, raw json.RawMessage) (ActionInput, error) {
 	if target.Kind != TargetApp {
@@ -83,6 +105,22 @@ func normalizeEnvironmentDelete(target Target, raw json.RawMessage) (ActionInput
 		}
 	}
 	return &input, nil
+}
+
+// EnvironmentDeleteRequiresHumanFactor decides the human factor for one real
+// environment deletion. A protected environment needs the factor; deleting the
+// last environment also deletes the application, so it needs the factor even
+// when the environment itself is unprotected. An unprotected non-last
+// environment is fully agent-operable after exact target confirmation.
+func EnvironmentDeleteRequiresHumanFactor(protected, lastEnvironment bool) bool {
+	return protected || lastEnvironment
+}
+
+// ProtectionChangeRequiresHumanFactor decides whether a protection change must
+// be authorized by the human factor. Only lowering protection needs it;
+// protecting an environment does not.
+func ProtectionChangeRequiresHumanFactor(current, next bool) bool {
+	return current && !next
 }
 
 // DeletionSteps returns the ordered effects a deletion performs. Workload and

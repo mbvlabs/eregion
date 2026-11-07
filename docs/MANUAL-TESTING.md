@@ -4,12 +4,32 @@ Acceptance checks for the v1 alpha and the record of real-server runs.
 [MASTER](MASTER.md) owns scope, decisions (D-numbers below) and order; this file
 says what must work on a real server and what has been observed.
 
+## Alpha.1 qualification
+
+The operator explicitly confirmed that all alpha.1 testing is done, including
+the disk-retention gate. Alpha.1 is recorded as qualified by that confirmation,
+not by a reconstructed baseline: no build, date, operation, individual
+observation or pass result is invented or backfilled. The run records below are
+the evidence retained in this checkout; a **partial** or **not run** entry in a
+historical record is an evidence gap for that run, not an open alpha.1 blocker.
+
+Alpha.2 acceptance is **incremental**: it is qualified against its own
+acceptance criteria on the explicitly authorized existing main node, disposable
+fixture app, authorized hostname and authorized GitHub repository. A complete
+fresh-server baseline is not required for each alpha; a fresh-server
+v1.0.0-final rehearsal remains a separate final decision. Alpha.1 stays
+operator-qualified. macOS acceptance (R10) remains required before v1.0.0 final
+and was not an alpha.1 gate. No evidence is reconstructed or backfilled.
+
 ## Evidence rules
 
 - Record the build/commit, date, operator OS/arch, server provider, OS/arch and
   topology, and the outcome. A run from a checkout is not a published-binary run.
 - Use **pass**, **fail**, **blocked** (missing implementation) or **not run**.
   A skipped or absent check is never a pass.
+- Explicit operator confirmation may close an alpha qualification. That records
+  the status; it does not turn an unrecorded check into a pass and does not
+  authorize invented evidence.
 - A submission is acceptance only. Keep the operation ID, wait for its terminal
   state, inspect serving and route state, and check the external response.
 - Never store tokens, DSNs, passwords, handoff plaintext or passphrases, or
@@ -17,6 +37,725 @@ says what must work on a real server and what has been observed.
   markers suffice.
 - An existing server is not disposable. Get authorization before mutating a
   host, DNS, a database or a release.
+
+### 2026-11-06 measured GC and post-GC deployment (`edge-527592419f06`)
+
+On authorized test node `main`, prune `op_91ba5356aa14c019b8fb7f5138d31e3c`
+succeeded: the five removed `retention905` registry manifest identities exactly
+match its immediate preview, with no other removed items, followed by the GC
+completion event. The operator transcribed interactive sudo `du -sb` readings
+of 3,517,816 before and 3,303,852 after, a 213,964-byte decrease; the actual
+sudo output was not independently captured. The planner's per-artifact sum was
+12,046,645 bytes, which includes shared blobs, so the stricter stated size
+criterion is not established. Registry service was active and `/v2/` returned
+200. The image was built locally before GC but first pushed after it: digest
+`sha256:97711214ab6a5cb05aef02bbb51434df3c11d229e2bf9cfc254c70beaa877483`.
+Environment update `op_12c38716a2af924d24918ce88df3a197` and deploy
+`op_8867de41ec94dfca732d7b6a75d1cde6` succeeded, serving
+`rel_c5403a89567eed250689b3192dcb2347`; its new public marker and the four
+existing URLs returned 200. Doctor was 20/0/0. Evidence is in the private
+`906-gc-human-*` and `910-upgrade-gc-*` files under the fresh-session evidence
+directory. GC success and post-GC push/deploy are observed, but stale collector,
+running collector, collection failure and restart failure variants were not run.
+
+The local isolated `go test ./internal/release ./internal/upgrade` passed; this
+is not host evidence of tampered signed-manifest or artifact rejection. Those
+same-build host variants were not run to avoid changing the live install; an
+actual forward upgrade requires a newer signed edge. This run alone did not
+complete the alpha baseline; alpha.1 is now qualified by the operator
+confirmation above, not by reconstructed evidence.
+
+### Release-channel publication (2026-11-06)
+
+With explicit authorization, `v1.0.0-alpha.1` was moved from `5275924` to
+`37d4f19bee053c3e51b6c88e6d01bf099de3c0bd` after `1.x` was fast-forwarded.
+Tag workflow 42220478211 passed in the edge environment; its immutable-prefix
+guard passed, the stable job and RC promotion were skipped. Cosign verified
+the snapshot manifest and each of the four platform binaries against the exact
+tag workflow identity, and each binary matched the manifest SHA-256. Root,
+1.x and RC manifests remained HTTP 404; the edge manifest was byte-identical
+before and after the tag workflow. Edge workflow 42219795190 passed. CLI and
+main were upgraded to `edge-37d4f19bee05`: schema 21/21, River 7/7, doctor
+20/0/0, second apply 0/20, four serving URLs HTTP 200. The credentials step was
+skipped; authenticated CI-token behavior was not retested. Evidence is in
+`950-*` under the fresh-session evidence directory. This publication record is
+not the alpha baseline pass; alpha.1 qualification rests on the operator
+confirmation above.
+
+### 2026-11-06 alpha.2 definitions and resources on `edge-ef4a6f879f45`
+
+Authorized target: existing context/node `main` (`exploration`, Ubuntu 26.04
+amd64), external control database on `thelab` through Funnel. Operator CLI
+Linux/amd64. No existing app, database, DNS record or GitHub repository was
+mutated; no tag, branch, commit or push was created.
+
+**Release and upgrade.** Edge workflow 42242438039 completed successfully for
+`ef4a6f879f45cbbd6a2d447705dbcfc8a617708d`. The edge manifest resolved to
+`edge-ef4a6f879f45`; `eregion upgrade --channel edge --version
+edge-ef4a6f879f45 --dry-run --json` reported that move and `--yes` replaced
+`/home/mbv/.local/bin/eregion`, keeping `eregion.prev`. On the node, `eregion
+--context main apply --auto-upgrade-nodes --json` produced
+`op_25095a2dcb1b069a00db3e60b4b6f4ed`: 4 applied, 16 skipped, migrations
+022–023 applied, then `server status` reported CLI/node `edge-ef4a6f879f45`,
+**schema 23/23, River 7/7**, and all five services active. A following `apply
+--dry-run --json` was 0 of 20 (generation 9). Before and after the upgrade,
+eleven consecutive `doctor --json` runs were **20 pass / 0 warn / 0 fail**;
+the earlier intermittent doctor warning was not reproduced while the control
+database was reachable.
+
+**Doctor `host.retention` warning diagnosis.** At 2026-11-06T15:50:19Z the
+control database became unreachable from `main` and `doctor` changed to
+`drift.pending` fail, `version.schema` fail, `host.retention` warn ("cannot read
+the retention runs") and `version.river` warn. The node journal then reported
+`failed to write startup message: write failed: EOF` for every resolved
+`thelab.tailbbed89.ts.net:10000` address. `thelab`'s own Tailscale status showed
+the backend Running but `Self.Online=false`; its local Funnel listener existed
+and `openssl s_client` against port 10000 verified the
+`thelab.tailbbed89.ts.net` certificate with return code 0. The `host.retention`
+row is therefore the generic "retention runs could not be read" warning caused
+by the control-database/Funnel outage, not evidence of a retention-data or
+retention-policy defect. The four existing public URLs stayed HTTP 200 during
+the outage. Tailscale was not restarted by the agent; it recovered on its own.
+
+**Definitions.** `app create --from … --dry-run --json` refused an unknown key,
+a `[secrets]` value table and a resource without an exec health command with
+`validation_failed` before mutation; the rejected secret value was not echoed.
+`app create --from create.toml --no-deploy --json` created
+`a2defs1106/production` as `op_0267f357f7b4c9f49e5f33e448d2a519` with revision
+1, merged shared `SHARED=shared` and `[environments.production]` `OVERRIDE=prod`,
+and kept the source image `nginx:1.27-alpine`. `app export` was deterministic
+and emitted source, runtime, processes, config, `secret_names`, domains and
+resources only; reimporting that export with `env update --from … --dry-run
+--json` returned `changed: []`. `secret set DATABASE_PASSWORD` from a generated
+0600 file wrote vault revision 1 and attached the name as
+`op_d7cf21f1ebaa4e81c6ff571f01c5a896`; output carried only name, revision, hash
+and key metadata.
+
+**Resources.** `env update --from update-resources.toml --dry-run --json`
+previewed `resources.cache: added` without mutation (the `db` declaration used
+`attach=false`). The real update `op_4ee1361ab255783580024cc7c350993f` committed
+revision 3 with `resources: ["cache"]` and submitted resource operations
+`op_c1dab79460fef320badab3a0321ea4cc` (cache) and
+`op_9893a1c7537359040eab2d68a54b0083` (db). Both failed after eight attempts in
+`platform-resource-image-…-v1`:
+
+```text
+stderr: template parsing error: template: :1:15: executing "" at <.RepoDigests>: wrong type for value; expected []string; got []interface {}
+```
+
+The commands at `internal/controlplane/resource.go:461` use `docker image
+inspect --format '{{.Id}}|{{join .RepoDigests ","}}'`; Docker client 29.1.3
+exposes `RepoDigests` to that template as `[]interface{}`, so `join` fails.
+On the node, `--format '{{.Id}}|{{json .RepoDigests}}'` succeeded and printed
+the image ID and digest list, confirming the command is the defect rather than
+an absent image. Both resource rows were `degraded` with
+`error_code=unavailable`; no resource container or volume was created. The
+private network `er-env_83bd5eea9dbab1daca6632d430fbc6fa` carried
+`io.eregion.app=a2defs1106` and `io.eregion.environment=production` and was
+removed after inspection. The pulled `redis:7-alpine` (image ID `c5d34a98396a`)
+and `postgres:17-alpine` (`3540c0362c80`) were removed after the run; no
+container referenced them.
+
+**Second defect: file removal of the last resource is not applied.** After the
+control database recovered, `env update --from update-no-resources.toml
+--dry-run --json` reported `resources.cache: removed`, and the real command
+without `--confirm` correctly refused with `confirmation_required`. With
+`--confirm a2defs1106/production` it accepted
+`op_1df96ad438f6ee010308febfc7be850b` (`succeeded`), but revision 4 still
+listed `resources: ["cache"]`; the operation's patch carried `"resources":null`.
+The file-removal path builds a nil slice when the last resource is dropped
+(`append([]string(nil), desired.Resources...)`), JSON encodes the non-nil
+pointer's nil slice as `null`, and the node treats a null pointer as "omit and
+preserve" rather than "replace with empty". `resource detach` then created
+revision 5 with no resources as `op_89ed0a5e2b3d823a2da13469ab7b4f4e`, so the
+resource action itself works. The same defect was then confirmed for the last
+secret name: `env update --from` reported `config.OVERRIDE: unset` and
+`secret_names.DATABASE_PASSWORD: removed`, and `op_766d98cb801e385265912a4ac3067edd`
+(succeeded) actually removed the config key but revision 6 still listed
+`DATABASE_PASSWORD`. A non-empty `config` map applies correctly; a nil slice for
+`secret_names` or `resources` does not clear the existing value.
+
+**Export/status with resources.** Exporting revision 3 included both `[[resources]]`
+blocks, `attach = false` for `db`, `DATABASE_PASSWORD` only as a secret name and
+no value. `env status` reported deployability
+`missing: ["artifact", "domain", "resource:cache"]`, so the unavailable
+resource is reflected in the deployability gate. After detach, export listed
+both destroyed resources with `attach = false`, and reimporting that export was
+a no-op.
+
+**Recovery and cleanup.** The control-database outage recovered on its own:
+`server status` returned schema 23/23 again, a second real `apply` was
+`op_dea65f9e3139fba03629115fa1cae07d` with 0 applied / 20 skipped, and the first
+`doctor` after recovery was 19 pass / 1 warn (`host.retention` still could not
+read the runs), followed by three consecutive 20/0/0 runs. That single
+post-outage warning reproduces the earlier intermittent symptom and confirms
+it tracks a transient control-database read failure rather than retention data.
+Both degraded resources were destroyed with exact confirmation: cache
+`op_25bbbeed0f4ca36399a55ac82817c832`, db
+`op_0829f6c2b1d04f905635ceff9ac7727e`; a further
+`resource destroy cache --delete-data` (`op_03fd23841b5830d51506a464be1e06db`)
+succeeded with no owned volumes and left a separately created foreign volume
+`a2-foreign-1106` untouched (not an ownership-refusal test); that foreign
+volume was then removed. Both resource rows are
+`destroyed`, with no fixture container, volume or network left.
+
+`app delete a2defs1106 --dry-run` and `env delete a2defs1106 production
+--dry-run` previewed one environment, one secret namespace, zero releases,
+deployments, builds and domains, with the last-environment warning. Actual
+deletion needs the D7 human factor at a terminal, so it was not performed;
+`a2defs1106/production` remains with revision 6, the still-attached
+`DATABASE_PASSWORD` name and the destroyed resource identities. No DNS or
+GitHub mutation was performed.
+Resource data retention remains unqualified because no resource container or
+volume could be created; the resource apply defect, not host capacity, is the
+alpha.2 blocker on this build. Raw command output and definition files are
+under `/tmp/opencode/alpha2-defs/`; the generated secret-value file was removed
+and no secret value is recorded there.
+
+### 2026-11-06 alpha.2 retest on `edge-ba175353f00a`
+
+Authorized target: same `main` context/node. Commit `ba17535` (edge run
+42250484640, `success`) published `edge-ba175353f00a`; the edge manifest
+matched that version and the expected `ba175353f00a` prefix. CLI and node were
+upgraded from `edge-ef4a6f879f45`: node apply
+`op_3c4bebbf8dd7dc6b80bdd3439b24c66c` applied 3 steps and skipped 17, schema
+stayed **23/23, River 7/7**; a second apply
+`op_3d5f33c2aff06f9dded7820451693ddd` was 0 of 20; initial `doctor` was 20/0/0.
+
+**Docker 29 resource provisioning.** The previously failing image-inspect step
+now passes. `resource apply a2defs1106 production cache` with
+`redis:7-alpine` succeeded as `op_9b733fa42899a21ea588202e1a6fd969`; status was
+`ready`/`healthy`, image ID `sha256:c5d34a98396a…` and volume
+`er-res-18bea038bf92f11da1420cc577d221c4-cache-data`. A file-based update
+`op_ef31e9cbf700a70226bd62a5bc4fdd1c` accepted revision 11 with secret name
+`DATABASE_PASSWORD` and resource `cache`, then provisioned cache and db as
+`op_e72ab30ac09ed1b8e493c78d21f197d6` and
+`op_82678348f7c0b6040a5f4ba6d026e881`; both succeeded and reported `ready` with
+healthy exec checks. The db container reported `POSTGRES_PASSWORD` as set
+without its value and the `io.eregion.*` ownership labels.
+
+**Empty file removals.** With revision 11 holding a secret name and an attached
+resource, `env update --from` a file with `secret_names = []` and no resources
+previewed `secret_names.DATABASE_PASSWORD: removed` and `resources.cache:
+removed`, with the patch carrying explicit `[]` for both. The confirmed update
+`op_a71963be8e1b0534253233851cf08bb0` created revision 12 with
+`secret_names: []` and no resources, so both prior defects are fixed on the
+host.
+
+**Lifecycle and retention.** `resource attach cache` created revision 7 as
+`op_c00fc0a9c4d6b7a20d7d058c0e9a57fc`; db attach/detach created revisions 9 and
+10 as `op_16f52d08d1f9088ed8552a6df41cbb10` and
+`op_119994c874076bab49ced971683e66ce`. Redis data written as
+`alpha2:key=ba17535-retained` and flushed with `redis-cli SAVE` survived a
+default `resource destroy` (`op_ce23ea8eb8ad27be6152eea687b332ec`) and re-apply
+(`op_dda1e9aca1f10799431e1a11f0f50fdd`) under the same volume. A first write
+without `SAVE` was lost on forced removal, which is Redis' own durability
+behaviour, not a product defect; the saved write persisted. A PostgreSQL
+marker row survived default destroy `op_60cd328490fee0880220fcfece3c6d16` and
+re-apply `op_6169837233808600bea4b18297d8bc7c`.
+
+**Cleanup.** `resource destroy cache --delete-data`
+(`op_4b1674f75b45ae6a640700c1d549d73c`) and the db equivalent
+(`op_a00b454e157341cb93927872996a00a8`) succeeded. A separately created foreign
+volume `a2-foreign-1106b` was untouched by delete-data and was removed by hand;
+the fixture network `er-env_83bd5eea9dbab1daca6632d430fbc6fa` was removed after
+confirming its ownership labels. No fixture container, volume or network
+remains, and the pulled Redis/Postgres images were removed; both resource rows
+are `destroyed`. `a2defs1106/production` remains at
+revision 12 with no secret name or attached resource. `app delete --confirm
+a2defs1106 --json` correctly refused with `input_required` and the app remains,
+so a human-terminal factor-gated delete is still required.
+
+**Doctor warning.** `host.retention` remained intermittent after the retest:
+runs at 16:47 were 20/0/0 and then 19/1 with “cannot read the retention runs”
+while `version.schema` stayed pass; the next runs returned to 20/0/0. The same
+pattern occurred after the earlier control-database outage. The retention
+check opens its own pool and shares one 5-second deadline across the policy and
+two run queries, and the underlying error is not surfaced; this is consistent
+with a transient connection/read over the Funnel, not a retention-data fault.
+No retention data or policy was changed.
+
+The four existing public URLs stayed HTTP 200. No DNS, GitHub, existing app or
+existing resource was mutated; no commit, push, tag or branch was created.
+Raw output and definition files are under `/tmp/opencode/ba17535-*` and
+`/tmp/opencode/alpha2-defs/`; no secret value is recorded.
+
+### 2026-11-06 alpha.2 deploy gate and resource consumption (`edge-ba175353f00a`)
+
+After the fix retest, the same `a2defs1106/production` fixture was prepared for
+a real deploy without DNS or GitHub changes. A small static Go application was
+built from local source under `/tmp/opencode/alpha2-app` with no external
+modules: `/healthz` returns `ok`, and `/` reads a Redis key over the managed
+resource's private network. The image was built for `linux/amd64`
+(`sha256:2c7b048fe342b68a54ab3065185512619a385d76991776a7d6fff1756d1f970f`)
+and pushed with `eregion image push` as
+`127.0.0.1:5000/a2defs1106@sha256:2c7b048fe342b68a54ab3065185512619a385d76991776a7d6fff1756d1f970f`
+(2,524,160 bytes).
+
+Revision 14 (`op_e0410dda297832a5e982582cdf088535`) bound that image, the web
+process on 8080, health `/healthz`, and plain config `REDIS_ADDR=cache:6379`
+and `REDIS_KEY=alpha2:key`. The Redis resource was applied
+(`op_f7ecdfcd8c1e8ad5d2ae1c7243f07e33`) and attached
+(`op_2f1a515c837a1da5692a1edb50e0bef4`) as revision 14. `env status` reported
+`missing: ["artifact", "domain"]` and did **not** list `resource:cache`, so the
+ready resource gate passed.
+
+`deploy --dry-run --json` returned the blue/green plan. The real
+`deploy a2defs1106 production --json` then refused before any operation:
+
+```text
+error [precondition_failed]: environment is not deployable: domain
+hint: Fix the listed desired state before deploying; eregion env status shows the same report.
+details: {"missing":["domain"]}
+```
+
+No operation was accepted, no container was started and no Caddy route was
+written. A successful public deploy requires a disposable fully-qualified
+hostname resolving to `main`'s public IPv4 `46.224.129.96` (directly or through
+a Cloudflare-proxied record whose origin is `main`). No spare existing app
+hostname is available; `git-test1`–`git-test5` are bound to existing apps and
+must not be changed. No DNS record was created or modified.
+
+Because the public check could not be reached without that domain, the app's
+resource consumption was exercised directly on the private environment network
+with the same image, network and alias a deployment uses. Redis key
+`alpha2:key` was set to `ba17535-app`; a temporary
+`a2defs1106-app-test` container joined
+`er-env_83bd5eea9dbab1daca6632d430fbc6fa` with
+`REDIS_ADDR=cache:6379`, `REDIS_KEY=alpha2:key` and `--network-alias web`.
+From the node, `/healthz` returned `ok` and `/` returned
+`a2defs1106 app; alpha2:key=ba17535-app`, proving the app image consumes the
+managed Redis over the private network. The temporary container was removed;
+this is not a deploy-pipeline serving result.
+
+Cleanup then detached the resource (`op_e605e5bef70e886022dd1ebeb4442fcf`),
+destroyed it with `--delete-data`
+(`op_f263b93ae264137eb5f0bd9e4b90bab4`), removed the network and deleted the
+temporary app image locally and from the registry (manifest delete returned
+`202`). The environment was returned to revision 16
+(`op_c6f9cfe8596e7e0bf86af280d79b0119`) with the public `nginx:1.27-alpine`
+image, `SHARED=shared`, no secret names and no resources. No fixture container,
+volume, network or image remains; both resource rows are `destroyed`. The app
+row remains only because real deletion needs the human TOTP factor. The four
+existing public URLs stayed HTTP 200 and `doctor` was 20/0/0.
+
+**Blocker at that point:** the remaining deploy-gating/consumption acceptance
+needed an authorized disposable hostname for `a2defs1106` resolving to
+`46.224.129.96` (or a proxied equivalent). It was later authorized as
+`eregion-alpha-two.mbvlabs.com`; see the serving-deploy record below.
+
+### 2026-11-06 alpha.2 serving deploy, resource consumption and webhook (`edge-ba175353f00a`)
+
+DNS for the authorized `eregion-alpha-two.mbvlabs.com` already resolved to
+Cloudflare addresses (`104.21.27.128`, `172.67.142.154` and IPv6) before this
+run; no DNS record was created or changed by the agent. Direct port 443 to
+`46.224.129.96` with that SNI initially returned a TLS internal error and
+Cloudflare returned `525`, consistent with main being the origin but having no
+route or certificate yet.
+
+**Unhealthy resource gate.** Revision 17 bound the local app image from
+`a2defs1106-app:alpha2` (`127.0.0.1:5000/a2defs1106@sha256:2c7b048f…`), the
+configured `eregion-alpha-two.mbvlabs.com` primary domain, and a Redis resource
+whose exec health was deliberately `["false"]`. The resource apply
+`op_f4a999224394e1a50b012b0d0c9bb5c2` failed and left the row degraded.
+`deploy a2defs1106 production --json` refused before submitting work:
+
+```text
+error [precondition_failed]: environment is not deployable: resource:cache
+details: {"missing":["resource:cache"]}
+```
+
+**Healthy resource and serving deployment.** Re-applying Redis with
+`redis-cli ping` succeeded as `op_9f72ef1048b5016a9f71db9f884c1a44`; the
+resource was healthy and attached. The deploy `op_a8229010e7641e5a2fa433cf542b6e86`
+succeeded: candidate health passed at `http://127.0.0.1:32908/healthz`, Caddy
+switched release `rel_08ca95568fe2fb174f926b8c6ef7b2b3` across one web replica,
+and public verification initially hit the same TLS error then returned HTTP
+200. Caddy's certificate and the domain observer then reached route `applied`,
+certificate `valid` (expires 2027-02-04) and public `ok`/200. From the public
+HTTPS hostname:
+
+```text
+https://eregion-alpha-two.mbvlabs.com/healthz → 200, "ok"
+https://eregion-alpha-two.mbvlabs.com/         → 200, "a2defs1106 app; alpha2:key=alpha2-serving"
+```
+
+The response marker proves the serving application read the managed Redis over
+the private environment network. `env status` reported
+`serving_release_id=rel_08ca95568fe2fb174f926b8c6ef7b2b3`,
+`health_state=healthy`, and deployability `dns=proxied, missing=[]`.
+
+**Failed candidate isolation.** A later cleanup deploy of the public
+`nginx:1.27-alpine` image with the wrong container port 80
+(`op_24e22c64db1a13508abb6fa485a0a480`) failed candidate health and left the
+previous release serving; no serving pointer moved. A corrected revision with
+container port 80 deployed successfully as
+`op_29a00bceee740a9c117f19613b10f29e`, release
+`rel_de6d93651d6e26bde3900c5e90fd2377`, and the hostname then served nginx
+HTTP 200. This is also a real failed-candidate/old-release-kept observation.
+
+**Webhook.** With the fixture switched to the authorized private
+`https://github.com/mbvlabs/eregion-hello.git` source, branch `main`,
+`--auto-deploy --github-webhook` created hook id `708267694` at
+`https://db2.mbvlabs.com/v1/webhooks/github/a2defs1106/production`
+(`status=created`) without printing the secret. A second
+`--auto-deploy --github-webhook --json` reported the same id and
+`status=unchanged`, so no duplicate was created. `--rotate-webhook-secret
+--github-webhook` PATCHed the same hook (updated timestamp) and advanced
+`EREGION_WEBHOOK_SECRET` to revision 2; a following check again returned
+`unchanged`. The existing `githello/production` hook was not touched. The
+manual fallback's already-enabled path returned the URL and secret name without
+a secret value. At that point a real push delivery had not been sent because
+commits/pushes were outside the run's authorization, and one-time manual secret
+display was not captured; both were later authorized and passed in the
+end-to-end webhook record below.
+
+**Cleanup and residual state.** Auto-deploy was disabled
+(`op_25c7fb39e51e58a89c2d0c6675973427`), hook `708267694` was deleted through
+`gh`, and the repository now has only its pre-existing `githello` hook.
+`a2defs1106/production` was returned to revision 21 with the public nginx
+image, `SHARED=shared`, no secret names, no resources and no auto-deploy; the
+domain remains. The Redis resource was destroyed with `--delete-data`
+(`op_e733d0973e02d3167679a3ca2100f9f6`); no resource container or volume
+remains. At that point the environment network and the serving nginx container
+`a2defs1106-production-web-1-fd4729b3d716` remained because they were owned by
+the serving fixture; the primary domain cannot be removed while it is the only
+binding (`domain remove` refused with `precondition_failed`, “the primary
+domain cannot be removed”), and DNS at Cloudflare was pre-existing and was not
+changed.
+
+**Confirmed cleanup after user TOTP delete.** The user ran the factor-gated
+`app delete` as `op_90e6c3530ef81a575bba1542a70cda0b` (13 events; succeeded).
+Its workload step removed the managed containers and its completion event
+recorded that the app and every environment were deleted after workload and
+route cleanup. Read-only verification after deletion:
+
+- `app list` no longer contains `a2defs1106`; `app status` and `env status`
+  return `not_found`.
+- `resource list --app a2defs1106`, `domain list --app a2defs1106`,
+  `release list a2defs1106 production` and `secret list --app a2defs1106
+  --environment production` are all empty.
+- `operations list --app a2defs1106` still shows the deletion and earlier
+  operation history.
+- Docker has no `a2defs1106` container, network or volume; the only registry
+  residue is the non-platform image
+  `127.0.0.1:5000/a2defs1106:alpha2`.
+- `https://eregion-alpha-two.mbvlabs.com/` now returns Cloudflare `525`
+  because Caddy no longer has a route or certificate for it. The pre-existing
+  Cloudflare DNS record still resolves to the proxy addresses and was not
+  changed.
+- The four pre-existing public URLs return HTTP 200 and `doctor` is 20/0/0 on
+  the final run after the known intermittent retention read warning.
+
+The remaining alpha.2 webhook qualification gaps are a real push-triggered
+delivery and one-time manual secret display; the `gh`-assisted create,
+unchanged/no-duplicate and rotation checks passed and the fixture hook was
+deleted.
+
+### 2026-11-06 alpha.2 end-to-end GitHub push delivery (`edge-ba175353f00a`)
+
+After the earlier fixture deletion, the user authorized recreating it and
+pushing a test commit to `mbvlabs/eregion-hello`. Repository inspection first:
+default branch `main` at `59017d6`, no GitHub Actions workflows, no deployments,
+and one pre-existing hook for `githello/production` (id `707317891`). The test
+used a separate branch `alpha2-webhook-20261106`, created from `main`; `main`
+was never pushed or changed.
+
+The branch commit `c768e75` added `apps/web/alpha2_marker.go` and a `GET /marker`
+handler returning `alpha2-webhook-20261106`; the existing tests passed. The
+branch was pushed. `a2defs1106/production` was recreated from that branch with
+`context_path=apps/web`, `GIT_READ_TOKEN` (the authenticated `gh` token was
+written through a 0600 temporary file and never printed), `APP_VERSION=
+alpha2-webhook`, `FAIL_HEALTH=0`, primary domain `eregion-alpha-two.mbvlabs.com`
+with check path `/marker`, and no first deploy. `--auto-deploy --github-webhook`
+created hook id **708277604** for
+`https://db2.mbvlabs.com/v1/webhooks/github/a2defs1106/production`; the
+pre-existing `githello` hook was left untouched.
+
+**Real delivery (gh-assisted setup).** Empty commit `f6bbfa7` was pushed. GitHub
+recorded delivery GUID `2a29a758-da0c-11f1-9784-272044788f84` for event `push`
+at 2026-11-06T18:02:03Z with status `OK`, HTTP **202**. It admitted operation
+`op_1380428ab35058512af820f5d7807a61` with actor
+`webhook:github:mbvlabs/eregion-hello`; the build cloned `HEAD is now at
+f6bbfa7 test: trigger alpha2 webhook delivery`, produced release
+`rel_29c45e28eafd36da697c6b67e3906fa8`, passed candidate health, published the
+Caddy route, and the public check `https://eregion-alpha-two.mbvlabs.com/marker`
+returned 200. The operation succeeded. HTTPS after the switch returned
+`alpha2-webhook-20261106` from `/marker` and
+`eregion sample: alpha2-webhook src3` from `/`.
+
+**Manual one-time secret setup.** To exercise the manual path rather than the
+`gh` helper, `--rotate-webhook-secret` was run in a PTY and the
+`Create the GitHub webhook with gh?` prompt was declined. The one-time secret
+was written only to a mode-0600 temporary typescript, extracted to another
+mode-0600 file, and sent to the existing hook through `gh api --input -` on
+stdin; it was never printed in ordinary output or logs and both temporary
+files were shredded. The hook was PATCHed successfully and
+`EREGION_WEBHOOK_SECRET` advanced to revision 3. Empty commit `c4507c1` was
+pushed; GitHub delivery GUID
+`c68a318a-da0c-11f1-81ba-3eb292c14f72` recorded status `OK`/HTTP **202** at
+18:06:28Z. Operation `op_b4dc5f8b225d318510c10293aff9ebaf` (actor webhook)
+cloned `HEAD is now at c4507c1 test: verify manual alpha2 webhook secret`,
+built release `rel_df70f2bf15a82d6cc0204635460c5e92`, passed the public
+`/marker` check, and succeeded. The manual secret therefore authenticates real
+deliveries.
+
+**Missing-`gh` fallback.** With `gh` removed from `PATH`, the same
+`--auto-deploy --github-webhook --json` returned
+`github_webhook.status=skipped`, message `the GitHub CLI (gh) is not installed`,
+and the manual webhook URL; JSON did not prompt. The missing-admin-permission
+variant was not exercised at that point; a later simulated permission response
+covered it.
+
+**Cleanup.** Auto-deploy was disabled
+(`op_7e56873f9ef33922e9c8d96df63d14a8`), hook `708277604` was deleted through
+`gh`, and the repository again has only its pre-existing `githello` hook. The
+remote and local test branch `alpha2-webhook-20261106` were deleted; `main`
+remains at `59017d6`. The fixture source ref was returned to `main`
+(`op_56e5cdb20b6fc931ccaa95b56bafd6e7`), auto-deploy is off, and
+`EREGION_WEBHOOK_SECRET` is no longer named by the revision.
+
+**Confirmed final cleanup (user TOTP delete).** At the handoff above,
+`a2defs1106/production` still served `rel_df70f2bf15a82d6cc0204635460c5e92`
+(commit `c4507c1`) and retained its container, environment network, primary
+domain and secret namespaces. The user then ran the factor-gated app deletion
+as `op_362bea6789b9617855c43b37a093e16e`; it succeeded with 13 events and
+recorded that the app and every environment were deleted after workload and
+route cleanup.
+
+Read-only verification after deletion:
+
+- `app list` no longer contains `a2defs1106`; `app status` and `env status`
+  return `not_found`.
+- `resource list --app a2defs1106`, `domain list --app a2defs1106`,
+  `release list a2defs1106 production` and `secret list --app a2defs1106
+  --environment production` are empty.
+- `operations list --app a2defs1106` retains the deletion and earlier
+  operation history.
+- Docker has no `a2defs1106` container, network or volume. Reference checks
+  found no container using the three identified fixture images. The registry
+  manifest `127.0.0.1:5000/a2defs1106@sha256:2c7b048f…` was deleted (HTTP 202),
+  and local tags `127.0.0.1:5000/a2defs1106:alpha2`,
+  `eregion/a2defs1106-production:1380428ab350` and
+  `eregion/a2defs1106-production:b4dc5f8b225d` were removed; no `a2defs1106`
+  image remains.
+- `https://eregion-alpha-two.mbvlabs.com/` returns Cloudflare `525` because
+  Caddy no longer has a route or certificate. The pre-existing Cloudflare DNS
+  record still resolves and was not changed.
+- DNS cleanup is blocked: no Cloudflare CLI, configuration or authorized API
+  access was available without reading a secret. The exact record is
+  `eregion-alpha-two.mbvlabs.com` in zone `mbvlabs.com`; it currently resolves
+  to proxied Cloudflare addresses. Remove that record in the Cloudflare
+  dashboard or with a scoped API token
+  (`GET /zones?name=mbvlabs.com`, then
+  `GET`/`DELETE /zones/{zone_id}/dns_records?name=eregion-alpha-two.mbvlabs.com`).
+  Do not remove any other record.
+- The test repository has only its pre-existing `githello` hook and its
+  original branches; `main` is unchanged at `59017d6`.
+- Four pre-existing public URLs return HTTP 200.
+
+**Remaining alpha.2 evidence boundaries at that point.** The real
+push-delivery and manual-secret webhook gaps were closed. Not yet recorded
+then:
+
+- A direct file-vs-flags desired-state comparison and distinct staging/production
+  overrides in one file.
+- A stale-plan refusal and the `env update --from` domain-removal
+  `--confirm-domain` path.
+- App consumption of managed PostgreSQL through vault secret names, and
+  managed-resource data persistence across application restart/redeploy.
+- An explicit external-dependency-without-managed-resource variant, and the
+  app/environment-deletion-after-resource-destroy volume ledger outcome.
+- A real non-admin `gh` account for the permission fallback.
+
+The later remaining-case record covers file-vs-flags/staging overrides,
+stale-plan refusal, PostgreSQL app consumption and restart/redeploy
+persistence, a simulated missing-admin response, and the post-destroy deletion
+volume outcome (the retained volume persisted untracked and was then removed).
+Fresh baseline, `--confirm-domain`, explicit external dependency, a real
+non-admin account and DNS record cleanup remain open.
+
+The known intermittent `host.retention` read warning is not a retention-data
+fault. Non-destructive checks on existing apps passed: `app export img` and its
+dry-run reimport reported no changes; `app export githello` correctly refused
+because auto-deploy is not representable; `commands --json` contains the alpha.2
+surface; `resource list` is empty; the four existing URLs return 200; `doctor`
+returned 20/0/0 after the known 19/1 retention-read warning.
+
+### 2026-11-06 alpha.2 remaining-case pass on `edge-ba175353f00a`
+
+**File versus flags and overrides.** The disposable `a2defs1106` app was
+recreated from `pg-create.toml`: shared image source, process, health and
+runtime; distinct `[environments.production]` overrides (DB config, secret name,
+authorized domain and later the `db` resource) and `[environments.staging]`
+overrides (`APP_VERSION=staging`, `APP_BUILD=staging`, no domain/resource).
+Production was created as `op_f302032a9cb5575118714553aedc71b7`; staging from
+the same definition as `op_37897e295e2910f552ab88319a2ea428`; `flags` was
+created flag-only as `op_3abfe963f8a96454e87a82266a24c7df` with the same visible
+state as staging. `app export` of staging and flags was identical after
+normalising only the environment name (`diff` produced zero lines), and
+`env update flags --from` that export previewed `changed: []`. Production and
+staging revisions held the expected different configs.
+
+**Managed PostgreSQL consumption and persistence.** The app image connects to
+the managed `db` resource using `PGHOST=db`, `PGUSER=postgres`,
+`PGDATABASE=alpha2`, `PGSSLMODE=disable`, and the vault secret name
+`POSTGRES_PASSWORD`. The PostgreSQL resource was applied as
+`op_2430a37a4b9b00cfd07082e7b35ed2a3` with `pg_isready` health and a mounted
+`db-data` volume.
+
+A first deploy (`op_0e2c35b672e4891668f4664276b17ba3`) failed the public `/db`
+check with 502; PostgreSQL logged repeated password-authentication failures.
+This was a test-app defect: the app passed `POSTGRES_PASSWORD` to the container
+but `pgx` read `PGPASSWORD`. The test image was corrected to copy
+`POSTGRES_PASSWORD` into `PGPASSWORD`, pushed as digest
+`sha256:50c05454…` (`pgv2`), and revision 3 bound it. Deploy
+`op_8fbe3cd57b1f574919d7129b3b3218d0` succeeded with `/db` returning
+`pg-persist`, `/build` returning `v1`, and `/healthz` returning `ok`; the app
+container showed `POSTGRES_PASSWORD=<set>` and the expected PG variables.
+
+`restart` (`op_31a636774fab00bfeced11078541e86c`) succeeded and `/db` still
+returned `pg-persist`. `config set APP_BUILD=v2`
+(`op_3639955b4a9d2465ce48407363ac6ac4`) followed by deploy
+`op_a6e1c1d21e6caeffe1e29628bf7825f5` succeeded; `/build` returned `v2` while
+`/db` still returned `pg-persist`. This is app consumption of managed
+PostgreSQL with the same secret name and persistence across restart and
+redeploy.
+
+**Stale plan.** With the `flags` environment at revision 2, a direct
+`eregion node rpc` `operations.submit` carried the old revision 1
+(`erv_8ce39d21…`) and the same config. The node refused with `conflict`: “the
+environment changed since the definition was read”; no revision was written
+(the environment remained revision 2 at that point). The flag-only path has no
+user-facing expected-revision option, so this guard was exercised through the
+same node request the CLI uses.
+
+**Missing-admin `gh` fallback.** A temporary `gh` shim returned the real
+`auth status` success but `false` for `permissions.admin`; no repository
+permission or credential was changed. The `flags` environment had a temporary
+gh-assisted hook (`708290796`). With the shim on `PATH`,
+`env update flags --auto-deploy --github-webhook --json` returned
+`github_webhook.status=skipped` with “the gh account does not have repository
+admin permission for mbvlabs/eregion-hello” and the manual webhook URL, without
+changing the hook. The hook was then deleted and auto-deploy disabled
+(`op_f12a90fa9d098442647ff04567f2bccd`). This is a simulated permission
+response, not a second real GitHub account.
+
+**Blocked cases.** `--confirm-domain` was not exercised: the only authorized
+hostname is the production primary, and `domain remove` correctly refused to
+remove the last primary domain. A second authorized disposable hostname is
+needed for an alias-removal test. The explicit external-dependency-without-a-
+managed-resource case was not run because no authorized external dependency
+endpoint exists and new server/database targets are prohibited. Under the
+updated incremental policy, a fresh-server alpha.2 baseline is not required;
+no fresh-server run was made.
+
+**Post-destroy state and cleanup.** After the Postgres tests the environment
+was moved to public nginx for cleanup
+(`op_b4e6adc5679765b5026a37c541f08ae5`, deploy
+`op_4847dbdc1d9359677396db1c7e0ff6b8`), and the `db` resource was destroyed
+with the default retain-data path (`op_48ade4262610759fa1baaf453f56b507`).
+The owned volume
+`er-res-2d99b1ef6d8ddc69b01e2271e5a071a2-db-data` remains with its
+`io.eregion.*` labels; the resource row is `destroyed`. The three identified
+app images/registry manifests were deleted after reference checks, with
+registry deletes returning 202 and no containers referencing them. The test
+hook and branch are gone; only the pre-existing `githello` hook and original
+branches remain.
+
+**Confirmed app deletion and volume-ledger outcome.** At that point
+`a2defs1106` had production (nginx, serving the authorized domain), staging and
+flags environments; the container/network, primary domain and the retained
+PostgreSQL volume remained. The user then completed the TOTP-gated app deletion
+as `op_c113f640932b31df52c4a92117f3d105` (13 events, succeeded), which removed
+the workload containers and routes before platform rows.
+
+Read-only verification after deletion: `app status` and `env status` returned
+`not_found`; app/environment/resource/domain/release/secret lists were empty;
+Docker had no `a2defs1106` container, network or image. The retained volume
+`er-res-2d99b1ef6d8ddc69b01e2271e5a071a2-db-data` **did persist**, with labels
+`io.eregion.app=a2defs1106`, `io.eregion.environment=production`,
+`io.eregion.kind=resource`, `io.eregion.managed=true`,
+`io.eregion.resource=db` and `io.eregion.resource-id=res_2d99b1ef…`; no
+container referenced it. This confirms the documented post-destroy
+app-deletion volume-ledger outcome: deleting the app does not delete a
+default-retained resource volume.
+
+The authorized test-owned volume was then removed explicitly with
+`docker volume rm er-res-2d99b1ef6d8ddc69b01e2271e5a071a2-db-data`; it is gone
+and no fixture container, network, volume or image remains. The app,
+environments and domain binding are gone; `https://eregion-alpha-two.mbvlabs.com/`
+returns Cloudflare `525` because Caddy has no route/certificate. The
+pre-existing Cloudflare DNS record still resolves and was not changed. Only the
+pre-existing `githello` hook and original repository branches remain. The four
+pre-existing URLs return HTTP 200 and `doctor` is 20/0/0.
+
+### 2026-11-06 alpha.2 audited pass halted by policy change
+
+The operator changed the qualification policy during this audited pass: no
+fresh-server baseline is required for every alpha, alpha.1 stays
+operator-qualified, alpha.2 is qualified incrementally against its own
+acceptance criteria, and macOS acceptance (R10) remains required before
+v1.0.0 final. The policy is codified in MASTER section 7 and at the top of this
+document. The operator then directed an immediate stop to new mutating tests.
+
+Completed before the stop:
+
+- **Guided file-free create — pass.** The fixture app `a2defs1106/production`
+  was created through the guided plan and confirmation path without a
+  definition file (`op_29b5ffe04dbda9e724960853e8aef430`), with the authorized
+  `eregion-alpha-two.mbvlabs.com` primary domain and image
+  `sha256:b472757e…`.
+- **Failed-health provisioning retry — pass.** A PostgreSQL resource apply with
+  exec health deliberately set to `false` failed and left the resource
+  degraded (`op_8ef5af49dd1538e5d130801f8400a8df`), with volume
+  `er-res-bbbb6c658dff7163ecb31da66ff4d6e9-db-data`. The retry with
+  `pg_isready -U postgres` succeeded (`op_8c6283fba697d32cfd66791073895178`),
+  state `ready`/`healthy`, and reused the same volume identity. The resource
+  was not attached to a revision and no deployment was started.
+
+No further audited cases were started after the stop directive. In
+particular, the following were not executed in this pass: file-driven alias
+removal with `--confirm-domain`; data retention after detach/declaration
+removal on this fixture; destroy-active-dependent refusal; explicit
+`--delete-data` refusal of a foreign volume; external dependency without a
+managed resource; unhealthy-dependency deploy refusal with an existing serving
+release; failed `gh` setup then successful retry; and deploy/webhook no implicit
+definition. Earlier records cover some of these on prior fixtures; this pass
+does not claim them.
+
+**Cleanup.** The ready-but-unattached PostgreSQL resource was destroyed with
+`--delete-data` as `op_40b47b8f8d0d242c802c4d6509bb450e`; the fixture network
+`er-env_edb8b65f3647c29181255c4feec19a00` was removed; registry manifest
+`127.0.0.1:5000/a2defs1106@sha256:b472757e…` was deleted (HTTP 202); local
+`a2defs1106-pgapp:v3` and registry `a2defs1106:pgv3` tags were removed. No
+`a2defs1106` container, network, volume or image remains.
+
+Residual: `a2defs1106/production` still has revision 1 (image source, config and
+`POSTGRES_PASSWORD` name), the primary domain binding
+`eregion-alpha-two.mbvlabs.com` (route pending with no serving upstream), no
+serving release, and no containers. The app/environment/domain/secret rows
+remain because deletion needs the D7 human factor:
+
+```sh
+eregion --context main app delete a2defs1106 --confirm a2defs1106
+```
+
+The Cloudflare DNS record remains pre-existing and unchanged; it was not
+removed because no safe Cloudflare access is available. Only the pre-existing
+`githello` hook and original repository branches exist.
+
+### Release-channel source integration (2026-11-06, before publication)
+
+The existing `v1.0.0-alpha.1` tag predates this change; its release publication
+failed because a stable environment secret was malformed. At this point the tag
+was still untouched and unpublished; the later publication is recorded above.
+The source model has combined development/edge, opt-in RC, finals-only stable,
+and exact alpha/beta snapshots without moving channels. An RC client checks its
+stable major line for a newer final; publishing a final does not move the RC
+pointer. Channel publication retains the existing two-object manifest/signature
+race and partial-upload retry risk; signing tooling is unchanged. This source
+integration is not a published-build or alpha baseline qualification.
 
 ## Developer checks
 
@@ -37,11 +776,61 @@ them at `EREGION_DATABASE_URL` or a shared database. Record them as not run unle
 explicitly selected. The `postgres`, `ssh-fixture`, `transport` and `wireguard`
 recipes are legacy fixtures, not the qualification policy.
 
+## Alpha.2 acceptance — incremental
+
+These are alpha.2 acceptance targets, qualified incrementally on the authorized
+existing target; a complete fresh-server baseline is not required for every
+alpha. Run mutating checks only on an authorized disposable app, server,
+control database and GitHub repository; record the candidate build and
+sanitized operation evidence. Alpha.1 remains operator-qualified.
+
+- Existing guided and flag-only app creation works without an app file. A file
+  is never implicitly applied by a deploy or webhook push.
+- Create and update from an explicitly selected `eregion.toml`, including
+  shared defaults and distinct staging/production overrides; compare desired
+  state with equivalent flag-based setup. Export and reimport without leaking
+  secrets or changing supported desired state. Refuse unknown fields, invalid
+  definitions and secret-value fields before mutation.
+- Preview revisions, domains and resource changes without mutation. Require
+  target-naming confirmation for destructive changes and refuse a stale plan;
+  a domain removal also requires `--confirm-domain <hostname>`. Removing a
+  resource declaration retains its persistent data. Separately destroy a
+  disposable resource with exact confirmation and verify that no other
+  environment's data is affected. App or environment deletion after destroy
+  leaves the resource's Docker volumes on the node untracked; record that
+  outcome rather than claiming cleanup.
+- Apply D33 protection: `app create` records production and staging protected
+  without a TOTP prompt; other names are unprotected unless `--protected` is
+  given; `env protect` is agent-safe; `env unprotect`, a protected or
+  last-environment delete and every `app delete` need the D7 factor at a human
+  terminal; an unprotected non-last delete works with `--json` and exact
+  confirmation. Migration 024 backfills existing environments protected.
+- Provision generic PostgreSQL and Redis Docker resources on a private
+  environment network, make them healthy, connect the app using vault secret
+  names and verify data persists across restart and app redeployment. A failed
+  dependency visibly blocks its dependent deploy without disturbing the serving
+  app; an external dependency works without a managed resource. Neither the
+  control PostgreSQL nor other apps are modified.
+- Interrupt resource provisioning, then retry: no duplicate resource or lost
+  volume identity results. Destroying a resource with active dependents is
+  refused; detachment alone never deletes its persistent data. A separate
+  `resource destroy --delete-data` removes only that resource's owned volumes;
+  verify a deletion target with foreign ownership is explicitly refused. A
+  separate pre-created volume merely remaining is not that check.
+- Exercise the optional `gh` webhook setup with an authorized repository and
+  manual fallback when it is unavailable or lacks permission. Check failure
+  and retry behavior, JSON/no-TTY operation, and secret-safe output.
+
 ## Alpha baseline — one main node
+
+This is the historical alpha.1/final-rehearsal baseline guidance. Under the
+current incremental policy it is **not required for every alpha**; alpha.2 is
+qualified on its own criteria. It remains available for a v1.0.0-final
+fresh-server rehearsal if the operator requires one.
 
 Run on an authorized fresh server (Debian 13 or Ubuntu 26.04) with a Go test app
 that prints its version, a second commit of it, and a commit whose health check
-fails. Install the CLI from the published edge or alpha channel.
+fails. Install the CLI from published edge or an exact alpha snapshot.
 
 ### Server and operator
 
@@ -109,7 +898,7 @@ checks.
 | Prune dry run | `eregion prune --dry-run --json` returns `dry_run: true`, one `items` entry per planned kind with `reference` and `bytes` where known, and `planned_bytes`; warnings name unreadable observations. No operation is accepted (`operations list` gains none), and `release list`, Docker images/containers and registry content are unchanged (compare counts and `docker system df` before and after). A second dry run prints the same plan. Host status 2026-11-03: pass on main (253–267); only the dangling images carried bytes, release rows and image items did not. Late run on `edge-690baaf`: the real run's 16 release items exactly matched this plan, and a retry dry run lists the four image and one dangling item left by defect 6 (311). 2026-11-04 on `edge-786fdcf`: **pass** — 6 items: four `image` items with their verified tag lists (2, 2, 4 and 3 tags), one `image_skipped` "used by container pedantic_jackson", and the `registry_skipped` diagnostic; `planned_bytes` 0; the real run removed all four images with no errors (338–342, 344). Candidate `edge-0a1a492`: **pass** — only the `image_skipped` remains; `registry_skipped` is gone, `items` is 1 and `planned_bytes` 0 (378, 379). |
 | Pruned rollback | After a real `prune --confirm <server>` removes an old release, `release list` shows the row with `pruned_at` and its ID still present. `rollback <app> <env> --to <pruned-id> --dry-run --json` and `rollback … --confirm <app>/<env>` both refuse with `precondition_failed` naming the release and prune time; `deploy --release <pruned-id>` refuses the same way. Rollback to the kept target still succeeds and serves. Host status late 2026-11-03 (`edge-690baaf`): **partial pass** — `rollback --to rel_0170b1be… --dry-run` and the real `--confirm githello/production` both refused exit 5 `precondition_failed`, naming the release and its `2026-11-04T00:06:41Z` prune time (305, 306); rollback to the kept target was not run. |
 | Registry GC | Record `du -sb /var/lib/eregion/registry` and the registry service state before a prune that removes at least one `registry_artifact`. The operation events show the manifest removal, then `Registry garbage collection completed`; `du` falls by at least the removed manifests/layers, `systemctl is-active eregion-registry` is active and `curl -fsS 127.0.0.1:5000/v2/` returns 200. A stale `eregion-registry-gc` container or a running `garbage-collect` process makes the step fail closed with the registry left stopped and its recovery instruction; a collection or restart failure is never suppressed, and `--delete-untagged` is never used. A deploy after GC builds, verifies publicly and serves. Host status late 2026-11-03 (`edge-690baaf`): **not exercised** — the plan had no `registry_artifact` items, and the real run failed on local images before any GC; registry `du` stayed 312,003,409 and no garbage-collection event appeared. The polkit path itself was verified separately: `sudo -u eregion systemctl restart eregion-registry.service` succeeded, the registry returned active with `/v2/` 200 (312); this was not a retention GC. 2026-11-04 on `edge-786fdcf`: still **not exercised** — the dry run's `registry_skipped` names retained failed release `rel_53a22cfea2e1f3a2fa9dd523ac4c5510` (no `image_id`, tag `eregion/githello-production:d0f76b56af71`, no local image); the planner therefore skips repository `eregion/githello-production` fail-safe. The registry catalog contains only `andurel`, whose 10 releases are all retained, so there was no eligible registry artifact. No GC and no deploy after GC (339, 345). Candidate `edge-0a1a492`: the imageless-release fix removed the `registry_skipped` diagnostic; the dry run is only the `image_skipped`. The registry still held only retained andurel artifacts, so GC was still not exercised in that candidate run (378, 379). Fresh-server `edge-f447aa3a0d30` 2026-11-05: **pass** — the earlier prune `op_14dacc9e25d8d900752bfd3b0f336bb9` removed a registry manifest and ran GC; the after-GC deploy `op_141d2d0b97cf9da670d5a631c97418d1` then built, passed public verification and served (584). The cache-qualification prune `op_2786073ca510236984f6267b73662cc1` removed registry manifest `img@sha256:67b46713…` (2,408,739 bytes); events show 197 blobs marked, 3 blobs deleted and `Registry garbage collection completed`; the registry stayed active and `/v2/` returned 200 (617, 630). |
-| 30-release retention | On the disposable app run `eregion retention set --app <app> --env <env> --keep-releases 5 --keep-days 1 --json`, deploy 30 distinct releases, then use an authorized SQL update on the disposable control database to backdate all 30 `created_at` values to older than one day and run `prune --confirm <server>`. Exactly the newest five releases remain unpruned (serving release #30 and rollback target #29 are in that set); 25 release items mark rows with `pruned_at` while all 30 release rows remain, and separate `image`/registry items remove their images and manifests. A following `prune --dry-run` lists no release items. Git builds stay local and never reach the registry, so to cover **Registry GC** run this row (or a second app) with releases published by `eregion image push`; only those produce `registry_artifact` items, GC and the deploy-after-GC check. Host status 2026-11-03: not run; needs a freshly initialized disposable server. |
+| 30-release retention | On the disposable app run `eregion retention set --app <app> --env <env> --keep-releases 5 --keep-days 1 --json`, deploy 30 distinct releases, then use an authorized SQL update on the disposable control database to backdate all 30 `created_at` values to older than one day and run `prune --confirm <server>`. Exactly the newest five releases remain unpruned (serving release #30 and rollback target #29 are in that set); 25 release items mark rows with `pruned_at` while all 30 release rows remain, and separate `image`/registry items remove their images and manifests. A following `prune --dry-run` lists no release items. Git builds stay local and never reach the registry, so to cover **Registry GC** run this row (or a second app) with releases published by `eregion image push`; only those produce `registry_artifact` items, GC and the deploy-after-GC check. **2026-11-06: pass** on `edge-527592419f06` with 30 distinct genuine deployments and synthetic-aged image fixtures, temporary environment artifact grace one day; 25 marks, images and matching manifests in one successful prune with all 30 rows retained, five newest kept, follow-up plan empty. Details and separate GC measurement limitations in the run record below. |
 | host-registry-v2 upgrade | On a node whose registry predates `host-registry-v2`, `plan` lists `host-registry-v2` once. `apply` writes `storage.delete.enabled: true` in `/etc/eregion/registry/config.yml`, restarts `eregion-registry.service` with `REGISTRY_STORAGE_DELETE_ENABLED=true`, and a second `plan`/`apply` reports the step skipped. A manifest delete no longer returns 405, and a deploy after the upgrade serves. Host status 2026-11-03: pass on main (230–233, 270–273); the manifest-delete/deploy-after-upgrade variants were not separately run. |
 | Doctor retention | `eregion doctor --json` includes `host.retention`. With no run yet on a fresh install it is `pass` with "no retention run yet"; the startup catch-up or next daily run records one. After a run it names the finish time, status, removed items and reclaimed/planned bytes. A failed last run, a running run older than two days, or a last success older than two days with the worker up is `warn` with a fix. The main-node summary is 20 pass / 0 warn / 0 fail. Host status 2026-11-04 (`edge-786fdcf`): **pass (20/0/0)** — the latest run succeeded at 2026-11-04T01:11:20Z, removed 4 items and recorded no errors; the row detail reads "4 item(s) removed, 0 B reclaimed" (343, 347, 352, 353). A transient control-DB read failure produced a 19/1 warn in 2 of 5 repeated doctor runs; every successful read was 20/0/0. Candidate `edge-0a1a492`: **pass (20/0/0) in all three runs and after the restart**; the latest daily run succeeded at 01:47:57Z with 0 items removed, and no transient read warning occurred (380–383, 391, 392). |
 | Doctor Buildpacks cache | `host.build_cache` reads the latest durable cache measurement from `retention_runs`; it never walks Docker volumes or the filesystem in `doctor`. With no measurement, or one older than 48 hours, it is `pass` with unknown (a fresh host stays healthy), never a zero-byte pass. After a retention run records a measurement under the cap it is `pass` and names used and cap bytes. Set the server cap below the measured cache within the allowed range (`retention set --cache-cap-bytes 1073741824 --json`) or build until the cache exceeds it; `doctor` reports `warn` naming the cap. After `prune --confirm <server>` removes least-recently-used entries the next retention run refreshes the measurement and the row returns to `pass`. Cache volumes are named `eregion-build-cache-<hex app>_<hex env>`, `eregion-launch-cache-<hex app>_<hex env>` or legacy `pack-cache-*.<build\|launch>`. Host status 2026-11-04 (`edge-786fdcf`): **pass with a known measurement** — 4.7 GiB of the 10.0 GiB cap (350, 352). Candidate `edge-0a1a492`: **pass** — 4.7 GiB of the 10.0 GiB cap (383, 392). Fresh-server `edge-f447aa3a0d30` 2026-11-05: **warn-to-pass qualified** — the 09:06 retention measurement was 1.0 GiB over the 1 GiB/75% test cap, so the row warned; the build-cache volume was held by a stopped pack container from cancelled operation `op_337e60a9fced63a8d8a5b6d8a4c1a959`. Read-only selected-field inspection proved it stale and ownerless; only that disposable container was removed, then real prune `op_2786073ca510236984f6267b73662cc1` removed the 348,112,124-byte build cache and follow-up prune `op_80f9f730b33ec9d2ec5e4b55149fb740` recorded 725.1 MiB. The row passed with a known measurement (586–647). Unknown/stale-measurement and percentage-only variants were not run. |
@@ -117,15 +906,16 @@ checks.
 Host status on main (2026-11-04 candidate, `edge-0a1a492d8207`): **policy**
 show/set and the environment revision pass; **prune dry run** passes with only
 the `image_skipped` for `pedantic_jackson` (registry_skipped gone, items 1,
-planned bytes 0); **pruned-rollback refusal** remains verified; the daily
+planned bytes 0); **pruned-rollback refusal** remained verified; the daily
 retry fix is host-verified — a new automatic run `op_9b72a9e32c2b5b49351f3ba75edb4664`
 was submitted after the one-hour backoff and succeeded with 0 items; the manual
 prune was not counted, as the submitter only sees its own daily-key operations.
 **doctor retention and Buildpacks cache both pass at 20/0/0 in all three runs**,
 with a known 4.7 GiB cache. A restart of the serving revision succeeded with
-1,212/1,212 HTTP 200. **Registry GC** remains unexercised because the registry
-holds only retained `andurel` artifacts; **30-release retention** and the
-fresh-server baseline remain. Evidence in the 2026-11-04 candidate record.
+1,212/1,212 HTTP 200. **Registry GC** remained unexercised because the registry
+held only retained `andurel` artifacts; the **30-release retention** and
+fresh-server baseline were not recorded then. Later records cover that work;
+alpha.1 is operator-confirmed. Evidence is in the 2026-11-04 candidate record.
 
 ## Fresh-server session checklist (edge)
 
@@ -394,10 +1184,11 @@ Defects (fix before the next edge build):
   in the working tree:** the preview keeps target-scoped row counts but uses the
   application-wide environment count for the last-environment warning, with
   unit and explicit-DSN integration regressions; the DB-backed case **passes**
-  against PostgreSQL 17.11 on 2026-11-05 (820). **Not host-qualified:** the
-  post-fix `env delete --dry-run` still needs a real terminal check.
+  against PostgreSQL 17.11 on 2026-11-05 (820). **Not host-qualified at that
+  point:** the post-fix `env delete --dry-run` still needed a real terminal
+  check.
 
-Usability (address before alpha.1; not blocking a pass):
+Usability (not blocking a pass; not part of the alpha.1 qualification):
 
 - **Handing secrets from a human to an agent is too much work.** Tokens are
   shown once on screen and the agent needs them in a protected file. The
@@ -422,7 +1213,10 @@ Usability (address before alpha.1; not blocking a pass):
 - A failed first-deploy card still prints `public url:` although nothing
   serves.
 
-### Open decisions
+### Historical open decisions
+
+These were open during the 2026-11-04 session. Alpha.1 is now operator-confirmed
+complete, so they are not current blockers; no outcome is invented here.
 
 - **A.** Unsupported OS/arch preflight: use a second throwaway host or a VM
   with another OS, or record not run.
@@ -430,16 +1224,18 @@ Usability (address before alpha.1; not blocking a pass):
   The alternative, `--resume --skip-doctor` after `doctor_failed`, would replace
   the resume-after-fix check.
 - **C.** Closed: init runs from the laptop and the login runs on `thelab`.
-- **D.** Whether the recovery and repair race variants stay alpha.1 gates if a
-  timed kill can't reproduce them on a real host.
+- **D.** Whether the recovery and repair race variants stayed alpha.1 gates if a
+  timed kill could not reproduce them on a real host. Closed by the operator's
+  alpha.1 confirmation; no individual result is reconstructed.
 
 ## Resume testing — saved session state, updated 2026-11-03
 
 Start a fresh session by reading [MASTER](MASTER.md), then
 [IMPLEMENTATION](IMPLEMENTATION.md), then this section and the run records below.
-MASTER row 16 remains in progress; this is a resumption aid for its existing
-acceptance checklist, not a second work list. **Alpha.1 is not qualified.**
-Facts below are the last recorded observations, not a fresh host check.
+MASTER row 16 is complete by operator confirmation; this is retained as
+historical session state, not a second work list or an open checklist.
+**Alpha.1 is qualified.** Facts below are the last recorded observations, not a
+fresh host check.
 
 ### Target and build snapshot
 
@@ -527,25 +1323,27 @@ completion. The route-write test failed its operation as expected; periodic
 reconciliation subsequently recovered the routes without rewriting that failure.
 It does **not** qualify rejection of a Caddy reload.
 
-### Remaining acceptance to select next
+### Alpha.1 acceptance evidence and historical gaps
 
-The complete baseline tables above remain authoritative for acceptance details;
-do not treat a passed subset as completion of an entire row.
+Alpha.1 is qualified by the operator confirmation above. The table retains the
+coverage observed in this checkout; a gap listed here is a historical evidence
+gap, not open alpha.1 work, and no individual result is reconstructed. The
+baseline tables above remain authoritative for what each check means.
 
-| Baseline area | Recorded coverage and remaining qualification |
+| Baseline area | Recorded coverage and historical gaps |
 | --- | --- |
-| Guided create | **Not run:** guided `app create`/`env create` success and failure, ending at a serving URL or a failed operation; guided vs flag-only revision equivalence. Flag-only create and app-create replay passed. Needs DNS A records git-test3/git-test4 → 46.224.129.96 and an agent in a PTY. |
-| CI endpoint | **Not run:** authenticated CI deploy; expired, revoked and wrong-environment tokens denied; nothing else of `/v1` reachable publicly. Needs defect 1 published and applied, plus a token created at a human terminal. |
-| Push to deploy | **Not run:** signed push deploys; a redelivery does not deploy twice; another branch or a bad signature does nothing; after rotation the old secret fails. Needs `env update --auto-deploy` at a human terminal and a GitHub webhook on `mbvlabs/eregion-hello`. |
-| Factor-gated ops | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** positive `secrets export` is operator-reported: the human completed the authenticator factor and the `Done`/`stored` gate, and the agent verified only that the `--secrets-out` file is 0600 in a 0700 parent (648). Positive `app delete guidedflags2` was run by the human with a fresh TOTP (`op_44ae1a2d25c010f9e42ec16b4472c6f2`, succeeded in 5.7 s); the agent verified the app, environment, release, deployment, build, domain, secret-namespace and revision rows are gone, durable operation/event history remains, and githello, guided and img still return 200 (660-669). Positive `env delete guided failing` was then run by the human with a fresh factor (`op_62837d11f91ad17e7a28a87846a5b594`, succeeded, 11 events); the agent verified only the failing environment's rows and secrets are gone, `guided` and its `production` environment still serve git-test3, all four monitored hostnames return 200, and operation history remains (680-689). `secret export` was not run; a read-only `secret list` confirms active `HELLO_SECRET` revision 3 in `guided/production` for the next human export (649). Positive last-environment `env delete guidedflags production` also passed (`op_844aaba1c862a0450452be5bd40ac624`, 8 events); the `guidedflags` app and all its rows are gone, history remains, and the other apps still return 200 (690-699). Still **not run:** positive `token create` and positive `secret export`; container/network inventory was not independently inspected because the agent has no Docker socket permission without sudo, so cleanup rests on operation step results and zero platform rows. JSON/no-TTY refusals and deletion preview passed. Needs the human authenticator. |
-| Login and contexts | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** the human's isolated `login --file main-handoff.md --passphrase-file <mktemp 0600>` on this box succeeded under `XDG_CONFIG_HOME=/home/mbv/eregion-qual/private-human-checks/login-profile`; the passphrase was extracted from the handoff inside the operator session and the temporary file was trap-removed. Read-only `context list`, `context show --name main` and `server status` under that profile pass (720, 721, 726; 722 is the concurrent-attempt failure noted below), and the normal `~/.config/eregion` profile still lists its separate `main` and passes `server status` (723–725, 728). Both profiles use the same operator WireGuard peer key from the same bundle, so a second live tunnel can take the node's single peer endpoint and a command may fail with "the WireGuard tunnel was lost"; this is local tunnel contention, not a context/store defect. The interactive pasted-passphrase login is **unresolved**: the real handoff's own passphrase opens its bundle (710), so the failure is likely copy/wrap/entry, not a proven source bug. **Context remove: pass for the isolated disposable profile (operator-run).** The isolated store is now empty and its `servers/main` is gone, while the normal `~/.config/eregion` store and identity are unchanged and `server status` succeeds (730–739). The pasted command showed a blank line, but the unchanged normal store proves the executed removal was scoped to the isolated XDG profile, not a bare default-profile removal. **Wrong host key and atomic unreachable import now pass (agent-run, 2026-11-05, evidence 750–759):** the wrong-pin login failed at SSH host-key verification before authentication, and the network-isolated login failed with no WireGuard handshake; both left the copied context, identity and known_hosts byte-identical, and the normal profile still passes `server status`. **Exact conflict, successful `--replace main` and context selection now pass (agent-run, 2026-11-05, evidence 760–767):** the conflict exits 5 with the exact `--replace main` hint and leaves the profile byte-identical; replacement proves readiness before swapping the identity and keeps the imported files inside the disposable profile; `--context main` and `EREGION_CONTEXT=spare` target the selected context, and JSON/noTTY refuses without prompting. **True second-machine login: pass (operator-reported, 2026-11-05, evidence 768–770).** On the separate laptop, the handoff copied from `thelab` imported into a disposable profile with `login --file … --passphrase-file … --json`, returning context `main` on `mbv@10.78.0.1:22 over WireGuard`; the same scoped `server status --context main --json` returned CLI/node `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, role `main`, schema 20/20, River 7/7 and all five services active. The earlier accidental `thelab` localhost attempt is not counted, and cleanup was operator command-based rather than independently verified. The interactive pasted-passphrase login remains **unresolved** (copy/wrap/entry), not a pass. The normal `main` context and identity are intact; the isolated contexts are removed. |
-| Upgrades | **Partial pass:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). `upgrade` between two edge builds passed on 2026-11-03 (`42a0541` -> `a77d3bf` -> `13fdb25`, evening `13fdb25` -> `1e541a7`, late `1e541a7` -> `690baaf`; previous-binary copy kept); a failed manifest download during a node upgrade refused with `unavailable` and no checksum-only fallback (`193-*`). Still **not run:** `install.sh` acceptance on Linux/macOS for these builds. |
+| Guided create | **Not run at that point:** guided `app create`/`env create` success and failure, ending at a serving URL or a failed operation; guided vs flag-only revision equivalence. Flag-only create and app-create replay passed. At that point it needed DNS A records git-test3/git-test4 → 46.224.129.96 and an agent in a PTY. |
+| CI endpoint | **Not run at that point:** authenticated CI deploy; expired, revoked and wrong-environment tokens denied; nothing else of `/v1` reachable publicly. At that point it needed defect 1 published and applied, plus a token created at a human terminal. |
+| Push to deploy | **Partial pass at that point (2026-11-05, `edge-527592419f06`):** a real empty push to `mbvlabs/eregion-hello@main` produced delivery `12b3bc42-d964-11f1-8ff4-80f7dc34db03` 202/OK and `op_232f45c1cd645304e92df57409fb5b83` succeeded, serving `rel_d231a28c17ce1aa345e6fa3cdfd7ae03` at `59017d6`; both githello domains and all four monitored URLs returned 200. The old fixture read credential was replaced with the authenticated `gh` token (`GIT_READ_TOKEN` revision 3) and the clone succeeded; the earlier rejection's root cause was not established. On the same build, redelivery returned the original operation without a second release; an invalid signature returned 401; and a real push to existing branch `qual-rc-never` was ignored. **Not run at that point:** old-secret rejection after rotation. |
+| Factor-gated ops | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** positive `secrets export` is operator-reported: the human completed the authenticator factor and the `Done`/`stored` gate, and the agent verified only that the `--secrets-out` file is 0600 in a 0700 parent (648). Positive `app delete guidedflags2` was run by the human with a fresh TOTP (`op_44ae1a2d25c010f9e42ec16b4472c6f2`, succeeded in 5.7 s); the agent verified the app, environment, release, deployment, build, domain, secret-namespace and revision rows are gone, durable operation/event history remains, and githello, guided and img still return 200 (660-669). Positive `env delete guided failing` was then run by the human with a fresh factor (`op_62837d11f91ad17e7a28a87846a5b594`, succeeded, 11 events); the agent verified only the failing environment's rows and secrets are gone, `guided` and its `production` environment still serve git-test3, all four monitored hostnames return 200, and operation history remains (680-689). `secret export` was not run; a read-only `secret list` confirms active `HELLO_SECRET` revision 3 in `guided/production` for the next human export (649). Positive last-environment `env delete guidedflags production` also passed (`op_844aaba1c862a0450452be5bd40ac624`, 8 events); the `guidedflags` app and all its rows are gone, history remains, and the other apps still return 200 (690-699). Still **not run at that point:** positive `token create` and positive `secret export`; container/network inventory was not independently inspected because the agent has no Docker socket permission without sudo, so cleanup rests on operation step results and zero platform rows. JSON/no-TTY refusals and deletion preview passed. The human authenticator was needed then. |
+| Login and contexts | **Partial pass (2026-11-05 fresh `edge-f447aa3a0d30`):** the human's isolated `login --file main-handoff.md --passphrase-file <mktemp 0600>` on this box succeeded under `XDG_CONFIG_HOME=/home/mbv/eregion-qual/private-human-checks/login-profile`; the passphrase was extracted from the handoff inside the operator session and the temporary file was trap-removed. Read-only `context list`, `context show --name main` and `server status` under that profile pass (720, 721, 726; 722 is the concurrent-attempt failure noted below), and the normal `~/.config/eregion` profile still lists its separate `main` and passes `server status` (723–725, 728). Both profiles use the same operator WireGuard peer key from the same bundle, so a second live tunnel can take the node's single peer endpoint and a command may fail with "the WireGuard tunnel was lost"; this is local tunnel contention, not a context/store defect. The operator reports interactive login passed; the cause of earlier pasted-passphrase failures was not established. **Context remove: pass for the isolated disposable profile (operator-run).** The isolated store is now empty and its `servers/main` is gone, while the normal `~/.config/eregion` store and identity are unchanged and `server status` succeeds (730–739). The pasted command showed a blank line, but the unchanged normal store proves the executed removal was scoped to the isolated XDG profile, not a bare default-profile removal. **Wrong host key and atomic unreachable import now pass (agent-run, 2026-11-05, evidence 750–759):** the wrong-pin login failed at SSH host-key verification before authentication, and the network-isolated login failed with no WireGuard handshake; both left the copied context, identity and known_hosts byte-identical, and the normal profile still passes `server status`. **Exact conflict, successful `--replace main` and context selection now pass (agent-run, 2026-11-05, evidence 760–767):** the conflict exits 5 with the exact `--replace main` hint and leaves the profile byte-identical; replacement proves readiness before swapping the identity and keeps the imported files inside the disposable profile; `--context main` and `EREGION_CONTEXT=spare` target the selected context, and JSON/noTTY refuses without prompting. **True second-machine login: pass (operator-reported, 2026-11-05, evidence 768–770).** On the separate laptop, the handoff copied from `thelab` imported into a disposable profile with `login --file … --passphrase-file … --json`, returning context `main` on `mbv@10.78.0.1:22 over WireGuard`; the same scoped `server status --context main --json` returned CLI/node `edge-f447aa3a0d30`, node commit `f447aa3a0d30`, role `main`, schema 20/20, River 7/7 and all five services active. The earlier accidental `thelab` localhost attempt is not counted, and cleanup was operator command-based rather than independently verified. The normal `main` context and identity are intact; the isolated contexts are removed. |
+| Upgrades | **Partial pass:** signed upgrade on main, unsigned/dev rejection and the dev-CLI dry-run version mismatch passed (`152-*`). `upgrade` between two edge builds passed on 2026-11-03 (`42a0541` -> `a77d3bf` -> `13fdb25`, evening `13fdb25` -> `1e541a7`, late `1e541a7` -> `690baaf`; previous-binary copy kept); a failed manifest download during a node upgrade refused with `unavailable` and no checksum-only fallback (`193-*`). **Not run at that point:** `install.sh` acceptance on Linux/macOS for these builds. |
 | macOS | **Not run (no Mac available, R10):** `install.sh` on macOS and an installed CLI against the server. CI's macOS CLI job and the darwin/arm64 cross-build are not host acceptance. Required before v1.0.0 final; not an alpha.1 gate. |
-| Disk retention (alpha.1 gate, R9) | **Partial pass (2026-11-04 candidate, `edge-0a1a492d8207`):** policy, dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read, polkit restart, pruned-rollback refusal, doctor retention and a known 4.7 GiB cache all pass. The real prune removed four multi-tagged images; the 1.3 GB dangling image is `image_skipped` "used by container"; the daily retry submitted a new numbered run after the one-hour backoff and it succeeded with 0 items; `doctor` is 20/0/0 in three runs; a serving-revision restart succeeded with 1,212/1,212 monitor responses. **In that candidate run, registry GC remained not exercised:** the imageless-release fix removed `registry_skipped`, but the registry still held only fully retained `andurel` artifacts. Deploy after GC, the 30-release row and the fresh-server baseline were not run then. **Fresh-server 2026-11-05 (`edge-f447aa3a0d30`):** registry GC and deploy-after-GC are now exercised (`op_14dacc…`, `op_141d2d…`), and the Buildpacks-cache warn-to-pass is qualified (`op_2786073…`: the 1.0 GiB measurement over the 1 GiB test cap warned; after removing a proven stale pack container, prune removed the 348,112,124-byte cache and the row passed at 725.1 MiB). The overnight 25-row prune plus aged fixtures partially cover the 30-release row; the complete fresh-server baseline remains not run. The manual prune is not counted by the daily submitter; docs/IMPLEMENTATION's “one successful run per day” is scoped to automatic daily-key operations (two runs succeeded today: manual at 01:11 and automatic at 01:48). |
-| Fresh host | **Not run:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. Needs an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
-| Release-command recovery | **Not run:** lost or unresolved response recovery variants. Once-per-release skipping, a changed command running again and restart/scale refusal after a failed run passed. Needs a scoped fault; stays an alpha.1 gate (R4). |
-| Repair variants | **Not run:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. Needs a scoped fault. |
-| Final pass | **Not run:** the complete baseline (every row, including retention) on the candidate build, starting from a freshly initialized server (R3, R11). Earlier builds' passes are context, not qualification; the user authorizes `1.x` and the tag after the recorded pass. |
+| Disk retention (alpha.1 gate, R9) | **Partial pass (2026-11-04 candidate, `edge-0a1a492d8207`):** policy, dry run, serving/rollback protection, `host-registry-v2`, `host-directories-v2`, `host-registry-gc-polkit-v1`, worker registry read, polkit restart, pruned-rollback refusal, doctor retention and a known 4.7 GiB cache all pass. The real prune removed four multi-tagged images; the 1.3 GB dangling image is `image_skipped` "used by container"; the daily retry submitted a new numbered run after the one-hour backoff and it succeeded with 0 items; `doctor` is 20/0/0 in three runs; a serving-revision restart succeeded with 1,212/1,212 monitor responses. **In that candidate run, registry GC remained not exercised:** the imageless-release fix removed `registry_skipped`, but the registry still held only fully retained `andurel` artifacts. Deploy after GC, the 30-release row and the fresh-server baseline were not run then. **Fresh-server 2026-11-05 (`edge-f447aa3a0d30`):** registry GC and deploy-after-GC are now exercised (`op_14dacc…`, `op_141d2d…`), and the Buildpacks-cache warn-to-pass is qualified (`op_2786073…`: the 1.0 GiB measurement over the 1 GiB test cap warned; after removing a proven stale pack container, prune removed the 348,112,124-byte cache and the row passed at 725.1 MiB). The overnight 25-row prune plus aged fixtures partially cover the 30-release row; no single fresh-server baseline was recorded in this checkout, and alpha.1 qualification rests on the operator confirmation above. The manual prune is not counted by the daily submitter; docs/IMPLEMENTATION's “one successful run per day” is scoped to automatic daily-key operations (two runs succeeded today: manual at 01:11 and automatic at 01:48). |
+| Fresh host | **Not run at that point:** preflight and plan variants, init apply with the pinned Caddy, doctor gate / `--resume` / `--skip-doctor`, interrupted init and `--discard`, lockdown revert, handoff and break-glass. At that point it needed an authorized fresh Debian 13 or Ubuntu 26.04 server and provider console access. |
+| Release-command recovery | **Not run in this checkout:** lost or unresolved response recovery variants. Once-per-release skipping, a changed command running again and restart/scale refusal after a failed run passed. The scoped-fault gap is historical; alpha.1 is operator-confirmed complete (R4). |
+| Repair variants | **Not run at that point:** competing or stale repair; a repair must never restore an old release when a deploy races it. Basic serving-container repair passed. At that point it needed a scoped fault. |
+| Final pass | **Complete by operator confirmation:** the operator confirmed all alpha.1 testing is done, including the complete baseline and retention. This checkout does not contain a reconstructed complete-run record, and none is invented here. Release authorization remains separate. |
 
 Defect 3 is fixed and host-verified on `a77d3bf`: a worker SIGKILL now rescues
 the operation on worker start (9.0s measured, evidence 183; the earlier
@@ -591,11 +1389,12 @@ was skipped.
 runs and the post-restart run were all **20/0/0**, with no transient
 `host.retention` read failure. The earlier 2-of-5 warning (317, 350, 351, 353)
 remains attributable to the external control database through the
-Tailscale/Funnel path, not retention state. Missing prerequisites for the
-remaining alpha.1 rows: registry GC/deploy-after-GC coverage, the 30-release
-row, an authorized fresh server, and human participation for factor-positive
-operations. macOS is deferred (R10). Other unqualified variants remain **not
-run**, not implementation failures or passes.
+Tailscale/Funnel path, not retention state. The prerequisites and gaps listed
+here were open at the time of these records; they are closed for alpha.1 by the
+operator confirmation above and are not a current blocker list. macOS is
+deferred (R10) until before v1.0.0 final. Variants without recorded evidence
+remain evidence gaps, not implementation failures or passes; none is
+backfilled.
 
 ### Safety and local resources
 
@@ -634,9 +1433,65 @@ run**, not implementation failures or passes.
 
 ## Current qualification boundary
 
-Real-host evidence spans several published edge builds, recorded below.
-`edge-f447aa3a0d30` is the latest installed and tested build; earlier passes are
-not automatically a full baseline pass for it. The 2026-10-29/30 runs closed
+Alpha.1 is qualified by explicit operator confirmation that all alpha.1 testing
+is done. This checkout does not reconstruct a complete baseline or select a
+qualifying build: the run records below span several published edge builds and
+retain the evidence available, including partial and not-run checks. They are
+history, not open alpha.1 blockers. Alpha.2 is implemented at source level and
+remains unqualified. `edge-ef4a6f879f45` passed the definition-file, export,
+secret-name and validation checks and applied migrations 022–023 on `main`, but
+found the Docker 29.1.3 image-inspect and empty-slice removal defects. Both
+fixes were retested on `edge-ba175353f00a`: resource provisioning, healthy exec
+checks, secret injection, file-based resource provisioning, explicit empty
+resource/secret removal, attach/detach and data retention across
+destroy/re-apply all passed for own Redis and PostgreSQL fixtures, and
+delete-data cleanup left no owned container, volume or network. An unhealthy
+managed resource was refused at the deploy gate; after it was healthy, a real
+deployment served over HTTPS at the authorized `eregion-alpha-two.mbvlabs.com`
+and its response read the managed Redis (`alpha2:key=alpha2-serving`). A
+wrong-port candidate failed health and left the previous release serving. The
+authorized `gh`-assisted webhook created, verified-unchanged and rotated one
+hook without duplicates. The user then completed the first TOTP-gated app
+deletion (`op_90e6c3530ef81a575bba1542a70cda0b`); read-only checks found no
+fixture rows, containers, network or volumes.
+
+The user then authorized recreating the fixture for an end-to-end push test.
+A separate `alpha2-webhook-20261106` branch was used and `main` was unchanged.
+The gh-assisted hook delivered a real push with HTTP 202 and operation
+`op_1380428ab35058512af820f5d7807a61`, building `rel_29c45e28…` and serving
+`/marker` 200. The manual one-time secret was handled only in 0600 temporary
+files and on `gh api` stdin, never printed and shredded; a second push delivered
+HTTP 202 and operation `op_b4dc5f8b225d318510c10293aff9ebaf`, building
+`rel_df70f2bf…` and serving `/marker` 200. The missing-`gh` fallback reported
+`skipped` with manual setup available; missing admin permission was not tested
+at that point (later simulated). The hook and test branch were deleted and the
+desired source ref returned to
+`main`. The user then completed the recreated fixture's TOTP-gated app deletion
+(`op_362bea6789b9617855c43b37a093e16e`); read-only checks found no fixture
+app/environment/domain/resource/release/secret rows, containers, network or
+volumes. The three identified fixture image artifacts were then removed after
+reference checks; the pre-existing Cloudflare DNS record remains because no safe
+Cloudflare access was available. The hostname returns Cloudflare `525` because
+its route/certificate is gone.
+
+A further disposable pass on `edge-ba175353f00a` then covered file-vs-flags
+desired state, distinct staging/production overrides, managed PostgreSQL app
+consumption and persistence across restart/redeploy, stale-plan refusal, and a
+simulated missing-admin `gh` fallback. `--confirm-domain` and an explicit
+external dependency remain blocked. The user then deleted the recreated fixture
+(`op_c113f640932b31df52c4a92117f3d105`); read-only checks confirmed the
+default-retained PostgreSQL volume persisted untracked with its ownership
+labels and no container references, and that authorized test volume was then
+removed. The app, environments, domain binding, containers, network and images
+are gone; only the pre-existing DNS record remains.
+
+Alpha.2 remains unqualified pending the remaining incremental acceptance
+criteria; a fresh-server baseline is not required by the updated policy.
+`host.retention` remains intermittently 19/1 with healthy data, consistent with
+a transient control-database read. See the 2026-11-06 alpha.2 records above and
+MASTER section 8.
+
+The 2026-10-29/30 runs closed
 release-changing dense switches, symlink-escape rejection, same-key replay after
 the branch was deleted, rollback refusal for a release whose command never
 succeeded, failed-candidate leak recording, interleaved domain changes with
@@ -676,12 +1531,216 @@ acceptance.
 Failed deploy follows returned exit 5 on main, successful follows returned 0,
 and the build-stop retest returned 130 with terminal cancellation and the prior
 serving release preserved. Terminal Ctrl-C detach/replay and explicit cancel
-passed (153/154); guided failure and the remaining output-mode variants remain
-not run. Complete and record the remaining baseline for the actual release
-candidate, from a freshly initialized server (R11), before asking the user to
-authorize `1.x` or `v1.0.0-alpha.1`.
+passed (153/154); guided failure and the remaining output-mode variants were not
+run in that record. The operator's confirmation closes alpha.1; no additional
+baseline run is required for this qualification, and no result is invented here.
+Release authorization remains a separate decision.
 
 ## Run record
+
+### 2026-11-06 — complete 30-release retention run on edge-527592419f06
+
+The fresh test node `main` and CLI ran published `edge-527592419f06`. On
+disposable `retention905/production` and the already-authorized
+Cloudflare-proxied `eregion-test.masterfullstackgolang.com`, 30 **genuine
+successful deployments** used 30 unique Docker image identities built from a
+test image with distinct content and synthetic 20-day-old `SOURCE_DATE_EPOCH`.
+The node's server artifact grace stayed 14 days; an environment override of
+one day was temporary. A keep-30 hold protected the release set while it was
+populated. All four pre-existing URLs and the fixture health URL returned 200
+after each of deployments 2–30; disk remained over 81% free.
+
+Exactly 30 fixture release `created_at` values were backdated by two days,
+preserving order; the environment policy then became keep 5 / 1 day, artifact
+grace 1 day. The one global dry-run plan contained exactly 25 fixture release
+marks, 25 images and 25 registry manifests. Each of the three identity sets
+matched the oldest 25 fixture releases, and no current serving image was in
+the plan. Prune `op_3dfe489047016719462c59743d9917d0` succeeded: events
+confirm all 25 corresponding images and all 25 corresponding manifests were
+removed, then registry GC completed. All 30 release rows still exist, exactly
+25 show `pruned_at`, and the newest five remain. A following dry run is empty.
+The environment artifact grace was restored to 14 days; server grace was
+unchanged at 14. During the bounded monitor 560/560 requests to the four
+existing URLs returned 200, and all four returned 200 in the final check.
+
+Dry and real rollback to pruned `rel_198d5380bab8f379df6bcd649bbd0d45`, and
+`deploy --release` to it, refused with `precondition_failed` and prune time.
+Rollback `op_7a841a8af401039ee15a952ce0e70521` to kept release 29
+`rel_c13cf979be5c7f6b8c7fcf57d89381c3` succeeded and served
+`retention905-release-29`. After GC, deploy
+`op_15f51d39353a169aad4e8a5e52c72ccd` of kept release 30 succeeded publicly
+and served `retention905-release-30`. This was a retained-image redeploy, not
+a new build. Registry active and `/v2/` 200; doctor 20/0/0. Registry `du` was
+not measured on this build because it needs interactive sudo, and the separate
+GC row's size-drop and fault variants are not established by this run.
+
+The operator then deleted the app with factor-gated operation
+`op_777bfba4daf68d989fde2083461ed592`, succeeded at 11:17:35 UTC. CLI and
+read-only database checks confirm zero app, environment, release and domain
+rows and retained operation history. Five fixture registry manifests from the
+previously kept images are now eligible for a separate GC measurement; the
+server grace remains 14 days, doctor is 20/0/0, and all four existing URLs
+return 200. Nonprivileged `du` of registry storage is denied. A bounded human
+terminal script `906-gc-human-measure.sh` measures first, checks planned local
+image IDs against current serving image IDs and validates the permitted
+test-artifact plan immediately before submission. Registry manifest protection
+relies on the product planner's retained-release manifest, config-digest and
+local RepoDigest matching, with fail-closed handling of unresolved identity;
+the script does not equate manifest digests with image config IDs. It
+then performs prune and sudo-after measurement. It records the byte counts the
+operator transcribes, rejects a non-shrinking result and flags removals absent
+from the preview. The worker rebuilds its plan under locks, so the preview is
+not an atomic binding. The script has not yet been run. A distinct operator-local
+`retention906:aftergc` image was built for the subsequent new-image deploy;
+it has not been pushed or deployed. No registry policy is temporarily changed.
+The earlier 30 operator-local fixture image tags were removed. No DNS change
+or original-database mutation occurred. Evidence:
+`/home/mbv/eregion-qual/2026-11-04-fresh/905-retention-*`. This passes the
+30-release row, not the full alpha baseline; cleanup and continuation evidence
+is in `906-gc-*`.
+
+### 2026-11-06 — historical image and manifest cleanup on edge-527592419f06
+
+After explicit authorization for historical test artifacts, the server
+artifact grace was temporarily changed from 14 to 1 day; release and cache
+policy fields stayed unchanged. The scheduled daily run had already succeeded
+for the day. The global dry run listed five historical `img` images r26–r30
+and 120 registry artifacts, 60 each in `img` and the deleted fixture's
+`retentionqual1106` repository. No current serving image ID intersected the
+image or manifest IDs in the plan; the planner also protects images used by
+containers and retained releases. The images were built on 2026-11-04 and
+were more than one day old. No timestamps or registry storage were edited.
+
+Prune `op_879509b5b613873ed8b444b1845da3b8` succeeded, removing all five
+planned images and 120 planned manifests, then reporting registry GC
+completed. Its events include all 25 immutable manifest identities of the
+fixture releases previously marked pruned by `op_717190293129690f4498466d388b4d64`.
+The 14-day server grace was restored; a final dry run was empty, registry
+active and `/v2/` 200, doctor 20/0/0, and all four existing serving URLs 200.
+A bounded monitor recorded 400/400 HTTP 200 during the first part of the
+prune; it did not cover the entire operation. Evidence is in
+`/home/mbv/eregion-qual/2026-11-04-fresh/904-retention-*`.
+
+This strengthens the **partial** 30-release evidence but is not a single
+30-release pass under the 14-day grace: the fixture app and rows had already
+been deleted before this separate shortened-grace prune. Registry `du` could
+not be measured without interactive sudo, and no size-drop claim is made for
+this run. The earlier fresh-server GC run has separate measured-size evidence;
+this run alone did not complete the broader alpha baseline, which is now
+operator-confirmed.
+
+### 2026-11-06 — authorized retention continuation on edge-527592419f06
+
+The operator authorized removal of the 25 shared historical `img` test image
+identities, but not currently serving images. Before mutation, today's scheduled
+maintenance had already succeeded; SQL and the planner showed no intersection
+between the 25 candidate image IDs and any serving release, and the planner
+protects images used by any existing container. With keep 5 / 1 day, a scoped
+update backdated exactly the 30 `retentionqual1106/production` release rows by
+two days, preserving order. The plan contained exactly 25 fixture release
+items and 25 image items attributed to previously pruned `img` releases, with
+the same immutable identities as fixture releases 1–25 and no other items.
+
+Manual prune `op_717190293129690f4498466d388b4d64` succeeded: all 30 release
+rows remain, exactly 25 have `pruned_at`, and releases 26–30 remain unpruned.
+The 25 shared node-local images and their `qual-img:r01`–`r25` tags were
+removed; the corresponding historical `img` releases were already pruned and
+their artifacts cannot be used as rollbacks. A follow-up dry run was empty.
+Rollback of `rel_7699784c4bf485b5a0df0c6493f17854`, both dry and real, and
+`deploy --release` refused exit 5 with its prune time; rollback to kept
+`rel_8c0aecf812cb8096a93d7b50db95759a` succeeded and served `img release 29`.
+Four serving URLs returned 140/140 HTTP 200 during the first portion of prune,
+and all four returned 200 after it. The **30-release row remains partial**:
+the 25 releases' registry manifests were younger than the 14-day grace and
+were not removed by this prune.
+
+For registry GC on this build, a separate unreferenced fixture-only image was
+built with a 20-day-old `SOURCE_DATE_EPOCH`, pushed to the fixture repository,
+and inspected: its OCI index and child manifest were the only planned registry
+items. Prune `op_603dcc8b04e3bc06421c053ca3c44bfb` removed both and reported
+`Registry garbage collection completed`; the registry returned active and
+`/v2/` HTTP 200. A redeploy of retained release
+`rel_2c9c360c7db9958527f42c5821348a0a` after GC
+(`op_d3a990bcde1c91b2ffd836c61ab79b08`) succeeded publicly and served
+`img release 30`. Four existing URLs returned 120/120 HTTP 200 during the GC
+monitor interval and 200 in the final check. The fixture build's local operator
+image was removed. Registry storage `du` was **not measured**: the operator
+could not read it without an interactive sudo prompt, so this run alone does
+not satisfy the size-drop part of the registry-GC row. The earlier fresh-server
+GC run on `edge-f447aa3a0d30` separately recorded the size drop and a new image
+deploy after GC. Doctor is 20/0/0, and the final global prune dry run is empty.
+
+The operator subsequently completed factor-gated app deletion
+`op_09ea3f338f611ca051543bd1b9d2f28c` at 10:04:27 UTC. CLI and scoped
+read-only database checks show zero fixture app, environment, release and
+domain rows, while its deletion operation remains. The hostname is absent
+from Caddy's active configuration; public HTTPS now returns 525. All four
+existing serving URLs return 200; doctor remains 20/0/0. The post-deletion
+global dry run lists five shared historical `img` images r26–r30, now eligible
+because their fixture releases no longer protect them; no manual prune was
+run. Delete-step source confirms duplicate ID lines in the operation output
+arise from the labeled container/network list and corresponding removal
+commands, not evidence of a second deletion. No DNS change or original-database
+mutation occurred. Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/902-retention-*`
+and `903-retention-cleanup-*`.
+
+### 2026-11-06 — 30-release retention, held before prune
+
+On `edge-527592419f06` / context `main`, Ubuntu amd64, the operator approved
+continuation after reviewing the earlier automatic global deletion of the two
+unknown dangling images. The new hostname
+`eregion-test.masterfullstackgolang.com` remained Cloudflare-proxied; normal
+app creation and deployment produced DNS `proxied`, route `applied`, TLS
+`valid`, public `ok`/200. No DNS change was made. The distinct disposable app
+`retentionqual1106/production` received **30 genuine successful deployments**
+of 30 distinct existing `qual-img:r01`–`r30` images, pushed into its own
+registry repository. Its initial deploy was `op_3f5b3757f2ace0bd651af85878a88af4`,
+the 30th `op_335914c70cbbef7552f6fef9b43e0ff6`. The four existing serving URLs
+and the fixture health URL returned 200 at each of deployments 3–30; disk
+remained above 81% free.
+
+An authorized scoped SQL update aged exactly those 30 release timestamps by
+two days while preserving their order, with keep 5 / 1 day. The dry run planned
+25 fixture release marks **and 25 local image items attributed to `img`**:
+the reused image identities also belonged to that existing app's historical
+releases, and removal would untag their `qual-img:r01`–`r25` node tags as well
+as fixture tags. No unrelated image deletion was approved. Therefore **no
+manual prune was submitted** and the 30-release acceptance is **not run to
+completion**; registry artifacts were not in this plan (14-day grace). The
+scoped timestamp change was reversed for exactly 30 rows, the fixture override
+was changed to keep 30 (`op_d5e3c9ece20bc9969af5182bca8e76d1` succeeded), and
+the subsequent global dry run was empty. All five URLs returned 200 afterward.
+
+The disposable app, domain, 30 releases and image artifacts remain in place.
+Keep the app and its keep-30 override until the shared-image deletion risk is
+reviewed: deleting the app requires human TOTP and could expose those image
+identities to the automatic global retention job. Evidence is in
+`/home/mbv/eregion-qual/2026-11-04-fresh/900-retention-*`. No prune, cleanup,
+registry GC, rollback-after-prune or deploy-after-GC was attempted in this run.
+
+### 2026-11-05 — retention preflight on edge-527592419f06
+
+**30-release retention: not run.** The required distinct disposable app has
+no available verified primary domain: the four healthy test URLs are bound to
+serving apps, and git-test4 is bound to deployab and has failed public/TLS
+observation. Deploy requires a primary domain and public verification; DNS
+changes and disrupting those apps were not authorized. The earlier 30 img rows
+and six aged-image deployments remain partial historical evidence, not a pass
+for this single-app acceptance run. The `eregion_fresh` role has SELECT and
+UPDATE on releases, but no rows were changed. A real prune was not submitted:
+the dry run listed two unrelated dangling images, not this run's fixtures.
+
+Read-only fallback: doctor reported cache 725.1 MiB / 10.0 GiB (pass), but
+`host.retention` warned that the last successful run could not be read, giving
+19 pass / 1 warn / 0 fail. This resembles an earlier intermittent control-DB
+read warning; no cause was established here. All four serving URLs returned
+200; queued, running and cancelling operation lists were empty. No fixture,
+credential copy, background task or cleanup was created. Sanitized evidence:
+`/home/mbv/eregion-qual/2026-11-04-fresh/870-retention-preflight.txt`.
+At this point the row still required an authorized unused, publicly verifiable
+hostname and a safe fixture-only prune plan, followed by 30 actual distinct
+releases and the specified scoped backdate and checks. Later records cover that
+work; alpha.1 is now operator-confirmed.
 
 ### 2026-11-05 — fresh-server registry GC and cache qualification
 
@@ -1012,13 +2071,10 @@ authorize `1.x` or `v1.0.0-alpha.1`.
   against the idle peer (725, 726). The tunnel daemons are local and exit
   after 10 minutes idle. Stop or let the unused daemon idle out before
   switching profiles.
-- **Interactive pasted-passphrase login: unresolved, not a proven source
-  bug.** The real handoff's own passphrase opens its bundle (710), and the
-  synthetic prompt/round-trip tests pass (701); the remaining variable is the
-  value pasted at the masked prompt (copy, soft-wrap or entry), not a
-  demonstrated source defect. The failure is likely copy/wrap/entry, not a
-  proven source bug. Do not retry blindly; use the passphrase-file path or a
-  protected copy.
+- **Interactive login: pass, operator-reported.** Earlier pasted-passphrase
+  attempts failed; their cause was not established. The real handoff's own
+  passphrase opens its bundle (710), and synthetic prompt/round-trip tests pass
+  (701).
 - **Context remove: pass for the isolated disposable profile
   (operator-run).** The scoped command was
   `env -u EREGION_CONTEXT_FILE XDG_CONFIG_HOME=/home/mbv/eregion-qual/private-human-checks/login-profile eregion context remove main --confirm main --json`;
@@ -1185,11 +2241,11 @@ authorize `1.x` or `v1.0.0-alpha.1`.
   not inspect the laptop profile, temporary directory, tunnel or socket state
   after the run, so the removal of the disposable profile is reported rather
   than verified.
-- **Still unresolved:** the interactive pasted-passphrase login remains
-  unresolved (likely copy, soft-wrap or entry, not a proven source bug) and is
-  not a pass. The broader alpha baseline remains incomplete, and the local
-  source fixes in the working tree remain unpublished. This step records only
-  the second-machine login/status sub-check.
+- **Later correction:** the operator reports interactive login passed. The
+  earlier pasted-passphrase failures are not independently explained. At this
+  point the broader alpha baseline was incomplete, and the local source fixes in
+  the working tree remained unpublished. This step records only the
+  second-machine login/status sub-check; alpha.1 is now operator-confirmed.
 - No source edits, source tests, build/vet, export/decrypt/import,
   apply/publish/commit/install, host/database/DNS mutation, token minting,
   fault injection or secret-value read occurred in this step. The agent ran no
@@ -1235,13 +2291,14 @@ authorize `1.x` or `v1.0.0-alpha.1`.
   were removed; the contents of the pre-existing `eregion`, `eregion_fresh`,
   `postgres`, `template0` and `template1` databases were unchanged. This is a
   local DB integration check, not host qualification.
-- Not run / not qualified: migration 021 was applied only inside the disposable
-  test databases, not to a live control database; no server, DNS, GitHub hook,
-  release, install, commit, push or tag was touched; real webhook
+- Not host-qualified in this step: migration 021 was applied only inside the
+  disposable test databases, not to a live control database; no server, DNS,
+  GitHub hook, release, install, commit, push or tag was touched; real webhook
   latency/first delivery/redelivery/rotation, a real cancelled pack build and
-  the post-fix deletion preview remain host checks. No secret value was
-  printed, logged or stored in evidence, and the protected DSN was not used as
-  the test target.
+  the post-fix deletion preview were then host checks. Alpha.1 is now
+  operator-confirmed; no individual result is backfilled here. No secret value
+  was printed, logged or stored in evidence, and the protected DSN was not used
+  as the test target.
 - Evidence: `/home/mbv/eregion-qual/2026-11-04-fresh/810-integration-*.txt` and
   `820-postgres-*.txt` (target, selected list, first failing run, passing run,
   offline regressions, cleanup and sanitizer); source-worktree records
@@ -1512,10 +2569,9 @@ Historical unlabelled release container from pre-fix attempt:
   published ports; removed explicitly after confirming identity. No other app
   containers targeted. NDJSON log snapshot parsed line-by-line successfully.
 Evidence: ~/.cache/eregion-run/71-* through 92-*; latest doctor 18/0/0.
-Remaining: guided terminal/detach, init on a fresh authorized target,
-  factor-positive CI/deletion/export, atomic login, cleanup obstruction,
-  rejected-reload injection and remaining baseline variants are not yet
-  qualified. Alpha is not complete.
+At this point the listed variants were not yet qualified. Alpha was not
+  complete then; alpha.1 is now operator-confirmed without reconstructing these
+  results.
 ```
 
 ```text
@@ -1701,8 +2757,9 @@ Defects:
      (pending_cleanup). Fixed in 4e827aa: cleanup failures are warning events
      naming the containers and failed state is retained; not host-retested.
   3. A worker SIGKILL leaves its platform operation running until River's
-     rescue, about 30 minutes (30m21s observed on op_f0d2...). Fix in progress
-     for alpha.1 (rescue this host's orphaned platform jobs on worker start).
+     rescue, about 30 minutes (30m21s observed on op_f0d2...). The fix was then
+     in progress for alpha.1 (rescue this host's orphaned platform jobs on
+     worker start).
 Final state: rel_0170b1be56a64a747d522a2831cb02d8 serving; git-test3 re-added,
   git-test4 removal accepted without a saved follow; no post-session env status
   was captured. No injected fault, wrapper or guard timer was left; no upgrade
@@ -2084,7 +3141,8 @@ Doctor: 347 and 352 are 20 pass / 0 warn / 0 fail. host.retention passes with
   repeated runs (353) took 4.9-23.5s and returned 20/0/0 three times; two runs
   returned 19/1 with `host.retention` "cannot read the retention runs"
   (317, 350, 351, 353). The successful reads are the target state; the warning
-  is the external control-DB/Tailscale path, not retention state.
+  has an unknown underlying cause; these results do not establish the external
+  control-DB/Tailscale path as the cause.
 Second apply (346): pass, 0 applied / 20 skipped, 5.70s, 01:12:18-01:12:23.
 Releases remained 19 githello with 16 pruned (serving rel_b709, rollback
   rel_b383) and 10 andurel with 0 pruned (serving rel_801). No new prune of
@@ -2172,6 +3230,454 @@ Remaining: registry GC and deploy-after-GC coverage; the 30-release acceptance;
   is observed in this candidate check.
 ```
 
+### 2026-11-05 — edge-527592419f06 release/install and final fresh-server batch
+
+Build `edge-527592419f06` (commit `527592419f06`), published from `5275924`;
+CLI and node both this build; schema 21/21, River 7/7; API `MainPID 157182`,
+`ActiveEnterTimestamp 2026-11-05T15:25:47Z`, `NRestarts=0`; doctor 20/0/0;
+read-only plan 0 of 20 changes. The edge workflow succeeded and the signed
+manifest and linux/amd64 artifact verified with cosign; migration 021 was
+applied by the upgraded node binary. All four serving URLs
+(git-test1, git-test2/users/sign-in, git-test3, git-test5) returned 200
+throughout.
+
+**Step 1, token reload: pass.** A fresh `ci-reload` token for
+`deployab/production` was used against the public CI endpoint: deploy 202,
+same-actor status 200, revoke, same status 401 `unauthenticated`; the
+disposable operation `op_72aae6743ed3b4151b131f3825b78b04` is terminal
+(`failed` at git clone) and its recovery record says `phase=terminal`.
+`ci-reload` is absent; the existing `ci-valid`, `ci-expiring` and
+`ci-otherenv` metadata is unchanged (3 tokens). Evidence `840-host-token-*`,
+`840-host-token-reload-recovery-20261105T204024Z-114225582.json`.
+
+**Step 2, individual secret export metadata: pass (operator-reported).**
+The human exported one secret to a protected file, saw mode 600/size 32, and
+removed it. Only the stat metadata is recorded
+(`840-host-secret-export-metadata.txt`); the destination is absent, so no
+independent post-deletion permission check is claimed.
+
+**Step 3, disposable env delete: pass.** `deployab/previewtwo` delete
+`op_f3532c3264cfaa9ed25540f469efe6b6` succeeded; `deployab/production` and its
+desired state (`erv_57b47993bff9177051a60d53ef4ae97b`) remain; the delete
+history is retained.
+
+**Step 4, disposable app delete: pass.** `packcancel` app delete
+`op_7f003359f6234a00f6a61ade274ed6a2` succeeded; the app is gone, the delete
+history is retained.
+
+**Step 5, webhook recovery: pass after an initial 422.** The first GitHub hook
+PATCH returned 422. The old body sent only `{"config":{"secret":...}}` to
+`/hooks/{id}` and no 422 body was retained, so the incomplete config URL/type/
+SSL fields are the **probable** cause. The recovery helper exported the
+current `EREGION_WEBHOOK_SECRET` revision 3 behind a fresh factor, required
+revision 3 `active` before and after PATCH, PATCHed
+`/hooks/707317891/config` with `url`, `content_type`, `insecure_ssl` and
+`secret`, and required a new same-GUID redelivery attempt. Result: hook
+`updated_at` `2026-11-05T21:22:16Z`; redelivery GUID
+`2e7e4340-d930-11f1-801f-060fc01b8e29`, new attempt
+`2026-11-05T21:22:24.045Z`, 202/OK; vault revision 3 remains active; serving
+200. Evidence `840-host-webhook-recovery-20261105T212102Z-20452552.txt`,
+`840-host-webhook-422-*`.
+
+Cleanup: no human-batch/export/webhook recovery secret or PTY temp remains;
+the local tunnel daemon was stopped and its socket/log removed; no host app,
+database, Docker prune or reset was run.
+
+**Remaining, not a baseline pass:** a post-fix webhook-triggered deployment
+success was blocked at that point because the fixture `GIT_READ_TOKEN` was
+rejected from the node (root cause not established); webhook acceptance (202)
+and the failed build are distinct. The next record replaces that credential with
+the authenticated `gh` token and records the successful deployment. The
+operator now reports interactive login passed. Old-secret rejection
+after rotation was not run because the old secret was not available and was not
+read. At this point the broader alpha baseline and the 30-release/registry-GC
+checks were unrun. Alpha.1 is now operator-confirmed; no individual result is
+backfilled. Evidence:
+`/home/mbv/eregion-qual/2026-11-04-fresh/830-*` and `840-*`.
+
+### 2026-11-05 — gh-sourced `GIT_READ_TOKEN` and webhook deploy success
+
+Build `edge-527592419f06` (commit `527592419f06`), CLI and node both this build;
+schema 21/21, River 7/7; all four serving URLs returned 200 at the start. The
+existing `gh` login was used only as an internal credential source: account
+`MBvisti`, an OAuth token (`gho_` prefix) with `repo`, `read:org`, `gist` and
+`workflow` scopes and admin permission on the private fixture. No token value or
+hash appears in any evidence, output or log. `gh auth token` was piped into a
+0600 regular file inside a 0700 temporary directory held by a cleanup trap; the
+supported command was
+`eregion secret set --app githello --environment production --name GIT_READ_TOKEN --expected-revision 2 --file <path> --json`
+(the flag is `--file`; there is no `--from-file`). `secret set` is not one of the
+D7 factor-gated actions, so no authenticator code was needed and no prompt
+occurred.
+
+The write produced `GIT_READ_TOKEN` revision 3 `active`; the command reported
+`attached: true` and `revision_updated: false`, so the environment revision
+already named the credential and no new revision was written (still
+`erv_7a4a4774ce201e809fc283221258c63e`, number 10). The empty test commit
+`59017d6d93c0b8eae720f51c9b9a9677daecdad4`
+(`test: verify webhook deploy with gh git credential`) was pushed normally to
+`mbvlabs/eregion-hello@main` with no force.
+
+GitHub delivered webhook GUID `12b3bc42-d964-11f1-8ff4-80f7dc34db03` at
+`2026-11-05T21:58:48.004Z`: event `push`, 202/OK, non-redelivery, payload
+`refs/heads/main`, `before 59a8d7e2…`, `after 59017d6d…`. The linked
+`op_232f45c1cd645304e92df57409fb5b83` (`platform.deploy`, webhook actor,
+target `env/githello/production`) succeeded at `21:59:54.913Z` after 151
+events: the clone succeeded (`HEAD is now at 59017d6`), pack built
+`eregion/githello-production:232f45c1cd64`
+(`sha256:9ae6522687df1c3ff9444f32d9e80173186ee0ec1348971ce70d4b185bbf4fe8`),
+the release command ran (`version=v2`), web replicas 1 and 2 and the worker
+started on that image, candidate health passed, Caddy load-balanced
+`rel_d231a28c17ce1aa345e6fa3cdfd7ae03` across two web replicas, the public check
+`https://git-test1.mbvlabs.com/healthz` returned 200, and the previous
+containers were cleaned up. The environment is `healthy` and serving
+`rel_d231a28c…` at commit `59017d6`; both githello domains are route-applied,
+certificate-valid and public 200, with web 2/2 and worker 1/1 running. The
+previous ready release `rel_e0e10c35ff89ed28d5ca4add52340ef9` remains listed
+for rollback; no rollback, destructive reset or database change was needed.
+git-test1, git-test2/users/sign-in, git-test3 and git-test5 all returned 200
+after the switch.
+
+The 151-event log was scanned for token prefixes, URL userinfo and
+credential/password markers: none were present. Evidence is sanitized under
+`850-gh-push-*`, including the baseline, the secret metadata (no hash), the
+fixture commit/push, the GitHub delivery and payload fields, the operation
+event log and the final serving/URL state. The credential temp file and its
+directory were trap-removed; no tunnel or background process was started.
+
+At this point rejection of the old secret after rotation (the old value was not
+available and was not read), redelivery, another-branch and bad-signature
+variants remained unrun. The following record covers the latter three. The
+operator now reports interactive login passed. At this point the broader alpha
+baseline was incomplete; alpha.1 is now operator-confirmed, with no result
+backfilled here.
+
+### 2026-11-05 — webhook deduplication and rejection variants
+
+On the same `edge-527592419f06` CLI and node, a GitHub redelivery of GUID
+`12b3bc42-d964-11f1-8ff4-80f7dc34db03` returned 202 in 0.99 seconds and
+explicitly named the original `op_232f45c1cd645304e92df57409fb5b83` as a
+duplicate. Before and after operation and release lists for githello/production
+were byte-identical. A request with a deliberately invalid SHA-256 signature
+returned 401; it did not alter those lists. An empty commit
+`64677eabfad5e2efae35dfed9e76816ca0ed7ea3` was pushed without force to the
+already-existing disposable fixture branch `qual-rc-never`; GitHub delivery
+`5c5a2fd8-d965-11f1-9b8e-55d968ae9de8` returned 200 in 0.38 seconds with
+`push is not to the bound branch`. The operation and release lists remained
+byte-identical to the baseline. The temporary clone was removed; the existing
+fixture branch retains the empty test commit. Four monitored HTTPS URLs returned
+200 after redelivery, and doctor reported 20 pass / 0 warn / 0 fail after the
+other-branch push. Sanitized evidence is in `860-*` under the fresh-server
+evidence directory. This does not qualify old-secret rejection after rotation,
+the remaining baseline, or tests performed on earlier builds.
+
+### 2026-11-05 — retention doctor read-only follow-up
+
+On context `main`, CLI and node `edge-527592419f06`, the preflight at
+22:10:49 UTC reported 19 pass / 1 warn / 0 fail: `host.retention` could not
+read the last successful run, while the latest-run cache measurement was
+readable. Five sequential doctors, each bounded to 60 seconds, at 22:12:18–
+22:12:50 all exited 0 and reported 20/0/0. Each read the same successful run
+at 09:26:46 UTC (0 items, 0 bytes) and a 725.1 MiB cache measurement. A
+bounded server status exited 0, schema 21/21, River 7/7, all five services
+active; all four serving URLs returned 200.
+
+The warning cleared, but its root cause is **unknown**, not proven to be the
+database route, pool, permissions, or schema. Source inspection shows the
+latest-run query succeeded before the final successful-run query failed; the
+policy and both queries share one five-second context, and the final query's
+underlying error is discarded. Thus deadline exhaustion is possible but not
+established. The same queries subsequently succeeded on this schema and
+identity, making a persistent schema or permission failure unlikely, not
+excluding an intermittent failure. Sanitized counts from API and worker
+journals for 22:09–22:14 found 60 lines, zero matching database, retention,
+timeout/deadline or permission-denied terms; doctor executes on the node and
+these service logs do not expose its suppressed query error.
+
+Evidence: `870-retention-preflight.txt` and `880-doctor-*` under
+`/home/mbv/eregion-qual/2026-11-04-fresh/`. No product code, fixture, prune,
+host apply, restart, or database mutation was performed. No offline test was
+run: no specific source defect has been established. Next, if the warning
+recurs, capture the sanitized underlying query error and elapsed time with a
+reviewed diagnostic change or authorized read-only instrumentation; do not
+assume network failure. At that point the 30-release check was blocked by an
+unused verified hostname and the unrelated images in the global prune plan;
+later records completed it, and alpha.1 is now operator-confirmed.
+
+### 2026-11-05 — CI unauthenticated surface follow-up
+
+On the same `edge-527592419f06` build, the normal token-list metadata showed
+`ci-valid`, `ci-expiring`, and `ci-otherenv` all expired on November 4; the
+first two grant deploy on githello/production and the third on
+guided/production, each with submit and read scopes. No reusable token fixture
+was found by filename in the qualification directories. No token file was
+read, no token was minted, and authenticated valid, expired, revoked and
+wrong-environment variants were not rerun. Earlier results on another build
+are not evidence for those variants on this build.
+
+Public HTTPS: `/readyz` returned 200; apps, operations, tokens, secrets,
+environments and the environment root returned 404; the deploy collection GET
+returned 405, and unauthenticated status GET and deploy POST returned 401.
+Malformed JSON without authorization, an empty bearer and duplicate empty
+authorization headers each returned 401; authentication precedes body parsing,
+so this does not test authenticated JSON validation. Before and after, the
+githello/production operations list (limit 200) contained the same 47 projected
+items. All four serving URLs returned 200. Sanitized evidence:
+`890-ci-before.json`, `890-ci-surface.txt`, `890-ci-malformed.txt`,
+`890-ci-after.json`, and `890-ci-final.json` under the fresh-server evidence
+directory. No tunnel, header file, deployment or server configuration change
+was made.
+
+### 2026-11-06 — alpha.2 protection redesign host run (`edge-6d1ae98b9ac1`)
+
+Build `edge-6d1ae98b9ac1` (commit `6d1ae98`, edge run `42285442054`) was
+published, verified from the signed edge manifest, and installed on the CLI and
+`main`. Node apply `op_fca44c39b625e2216d05d7581de99c18` applied migration 024.
+The node reports schema **24/24** and River 7/7; `doctor` is 20 pass / 0 warn /
+0 fail and the repeat `apply --dry-run` is 0 of 20. During the final checks
+`apply --dry-run` alternated between 0 of 20 and 1 of 20: `host-readiness-v1`
+timed out waiting for `GET /readyz`, while direct measurements of that endpoint
+returned 200 in 0.35–8.1s. `doctor` alternated between 20/0/0 and 19/1 on the
+known intermittent `host.retention` read warning. Immediate repeats passed;
+no configuration was changed, so these are recorded as transient observations
+rather than host failures.
+
+All five pre-existing environments (`deployab`, `githello`, `guided`, `img` and
+production) were inspected and are `protected: true`. None was unprotected and
+no existing row was lowered.
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| `app create` builds production and staging, both protected, production domain only, staging no invented domain | **Pass** on the host. Guided file-free create `op_0e2c1e66043489dc1941825c705a8c1a` created both environments without a TOTP prompt; both read `protected: true`; staging had no domain. | `a2defs1106` env list/status; `SHARED_SECRET` revision 1 in both namespaces |
+| App + both environments + revisions commit atomically; failure on the second environment rolls back the app; same-key replay returns the original; a different key is a conflict | **Pass (disposable PostgreSQL integration, not host).** A forced staging-insert error after production and its current revision already existed rolled back the app, environments, revisions, operation and River job completely. A same-key retry/replay then produced one app, two environments, two revisions, one operation and one River job. The host separately refused a different-key resubmit with `conflict`. | Five selected integration tests on `6d1ae98`; temporary cluster removed; host conflict JSON |
+| Other names default unprotected; production/staging default protected; migration 024 backfills every existing environment protected | **Pass.** Migration 024 applied on `main`; every pre-existing environment is protected. `pr-42`, `hook` and `prot-audit` were created unprotected because their names are not production/staging and no `--protected` was passed. | `op_fca44c39b625e2216d05d7581de99c18`; env rows; migration 024 |
+| App delete always needs TOTP, including direct service submission | **Pass for refusal.** CLI `app delete` returned `input_required`; direct node `platform.app.delete` returned `precondition_failed` with `details.reason=code_required`. The positive TOTP deletion is the residual operator action. | CLI JSON refusal; node RPC request `app/a2defs1106` |
+| Protected env delete needs TOTP; unprotected non-last env delete works with exact confirm and no TOTP in JSON/no-TTY | **Pass.** Protected `env delete` returned `input_required`; direct node `platform.environment.delete` returned `precondition_failed`/`code_required`. Unprotected `pr-42` deleted with `--confirm a2defs1106/pr-42 --json` as `op_9eb5aa06b06766f163adfbe61b2c74bc`. | CLI/API refusals; `op_9eb5…` succeeded; `pr-42` gone |
+| Last-environment delete cannot bypass app-deletion TOTP | **Pass for factor admission (injected verifier, not real TOTP).** On the disposable PostgreSQL test, a last unprotected environment with a missing verifier, wrong code or invalid code was denied and created no operation. A valid injected test verifier was accepted and queued the delete while workers were stopped; the delete was not completed by a worker, and no real authenticator code was used. | Selected integration tests on `6d1ae98`; temporary cluster removed |
+| `env protect` is agent-safe; `env unprotect` without a terminal refuses; server verifies the code in the locked submission transaction | **Pass for the host-visible policy.** `env protect a2defs1106 prot-audit --json` succeeded as `op_e248d36683e6317674fc36b9c5711439` and the row read `protected: true`; its `env delete` and `env unprotect` then returned `input_required`. Locked-transaction verification is covered by source and integration tests, which were not run on the host. | `op_e248…`; status/refusals |
+| HTTP refuses only actions whose current locked state needs the factor; direct service with no verifier fails closed | **Not run over host HTTP.** API tests cover app-delete refusal and preview. | `internal/api/factor_test.go` |
+| `env create --from` for `pr-42` uses the shared recipe with no `pr-42` override | **Pass.** `env create --from` created `pr-42` unprotected as `op_1724f76965e70df26a026cfde545ceb8`; the recipe file has no `pr-42` section. It was then deleted as `op_9eb5…`. | `prot-recipe.toml`; create/delete JSON |
+| Fresh arbitrary-name environment creation uses the name default, not a protected default | **Pass.** `fresh-audit` was created without `--protected` and read `protected: false` (`op_4fa609d1c8502d17ab4e11baa2b4de02`); shared-recipe `recipe-audit` also read `protected: false` (`op_a1505d66121293de4f0c8b9931de94c4`) and took the shared config/secret name with no production domain override. | Create/status JSON |
+| `env create` same-key replay returns the original operation without a second environment | **Pass.** Repeating the `fresh-audit` create with `--idempotency-key alpha2-fresh-audit-20261106` returned the same `op_4fa6…`; the env list still had one `fresh-audit`. | Replay JSON; env list |
+| Unprotected non-last `env delete` works unattended with exact confirmation | **Pass.** `fresh-audit` deleted as `op_d1144d2a44c97b3b8b284f827b6806ba` and `recipe-audit` as `op_17179495fec1805fad3341a51366b0a8`, both with `--confirm <app>/<env> --json` and no TOTP. Their status then returned `not_found`, and their secret namespace lists were empty. | Delete/follow JSON; env/secret lists |
+| Environment-specific secret names do not leak into another namespace | **Pass.** `FRESH_ONLY` existed only in `fresh-audit`; production and staging kept only `SHARED_SECRET`. The 0600 value file was shredded and no value was printed. | `secret list`; create JSON |
+| Secret values never enter operation input, events or River arguments; only names and ephemeral request factor data | **Pass by inspection of the observed outputs.** Create, status, operation and environment output showed only `SHARED_SECRET`/`GIT_READ_TOKEN` names; no value was printed. | CLI JSON outputs; redaction tests |
+| Shared creation secret values materialise in both production and staging namespaces; an environment-specific name never leaks into the other namespace | **Pass.** `SHARED_SECRET` was present in both production and staging at revision 1; `FRESH_ONLY` existed only in `fresh-audit`. The isolated namespace test also passes. | `secret list`; `TestSetupSecretWritesRespectEnvironmentSpecificNames` |
+| TOTP protect-store read-modify-write mutations serialise across independent processes | **Not run on the host.** Multiprocess helper-process tests pass on the workstation; no concurrent node RPC code submission was attempted. | `TestMultiprocessVerifyAcceptsOneReplay` and related tests |
+| `--confirm-domain` removes a bound alias from an environment | **Pass.** With `a2-primary.invalid` added as the primary (`op_e78773b42588dc9b80a3febf9b896e60`), file update with `--confirm-domain eregion-alpha-two.mbvlabs.com` removed the designated hostname as `op_134d51a4d723161563903870b4389275`; only the `.invalid` primary remains. | Domain list; update JSON |
+
+**Independent disposable PostgreSQL retest (2026-11-06, `6d1ae98`).** A
+separate temporary PostgreSQL cluster ran five selected tests with no ambient
+production DSN. The app-create test forced an error in the staging insert
+after verifying production and its current revision already existed; the
+transaction rolled back the app, both environments, revisions, operation and
+River job completely. A same-key retry/replay then succeeded with one app, two
+environments, two revisions, one operation and one River job. The
+last-unprotected-environment test denied a missing verifier, wrong code and
+invalid code without creating an operation; a valid injected test verifier was
+accepted and queued the delete with workers stopped. That verifier is a test
+injection, not a real TOTP, and the queued delete was not completed by a
+worker. The temporary cluster was removed and no DSN or secret value was
+stored in evidence.
+
+**Real TOTP in isolation.** `go test ./internal/protect -count=1` passes with
+an isolated generated local secret and real TOTP codes, including confirm,
+verify, replay refusal, rotation and multiprocess lockout. The CLI factor tests
+and `TestIntegrationDirectDeleteWithRealTOTPCode` also pass: the latter uses a
+generated local secret and a real current TOTP code through the direct service
+submission path, accepts the protected delete as queued with workers stopped,
+and rejects the same TOTP step on replay. The verifier there is local to the
+test, not `protect.Store`; the real store is covered separately by the protect
+tests. The live node protect store, its seed and any live code were never read
+or used. The independent PostgreSQL factor test above used an injected
+verifier, not a real TOTP, and its accepted delete was queued with workers
+stopped rather than completed.
+
+Additional audited alpha.2 cases on the same fixture:
+
+| Check | Result | Evidence |
+| --- | --- | --- |
+| Failed-health resource apply retry preserves volume identity | **Pass.** A deliberately unhealthy `cache` apply degraded as `op_bf3718dfff0d897b0fa305b1d026e08d` with volume `er-res-e8ea4b4fc7468548f507969953efa8e0-cache-data`; the corrected retry `op_452dd3b405d027e46fc6e98fbc0cf6d9` reached ready and reused the same volume. This was a failed health check, not an interrupted operation. | Resource status before/after |
+| Actual interruption: worker SIGKILL during provisioning is recovered and retried | **Pass.** Resource `interrupt2` in disposable `resource-audit3` was applying with a deliberately slow health command. The worker was SIGKILLed while the health step ran (PID changed, `NRestarts=2`). On restart the worker recovered the orphaned platform job (`op_2eee5d4a5320d71203a4bf075288cf58`, attempt 2), the health step then failed, and the resource became degraded with volume `er-res-d81502e434ca7f0ba8db431214eac64a-data`. The corrected retry `op_c457f164e6709764f59cd15c48120e8a` succeeded and reused the same volume with the expected ownership labels. The resource was destroyed with `--delete-data` (`op_649d92412f7ffd3234ca13b0d04b3bea`) and the environment deleted (`op_bf535c24a1a5a8fd4d6cde4c6e3f45b6`). | Worker restart/PID, operation events, resource status/labels |
+| Interrupted-and-cancelled apply cleanup | **Pass after the `8199864` fix; initially blocked on `6d1ae98`.** The cancelled attempt `op_3eded76779595d3f9d9fbf7b6b8f4d55` left the resource `provisioning`, so apply/destroy refused `conflict` and env delete refused `precondition_failed`. Its container, volume and network were removed by exact name. After upgrading to `edge-81998646916d`, normal reconciliation moved the row to `degraded` without SQL; ordinary destroy `op_8a88…` and noninteractive env delete `op_905f…` succeeded. See the cancellation-recovery section below. | Operation events; `resource status`; CLI refusals; post-upgrade status |
+| Deletion target with foreign ownership is explicitly refused | **Pass.** Resource `foreign` in disposable `resource-audit2` was provisioned (`op_3046da8110a17a3129bcaf31120a37c8`), default-destroyed retaining volume `er-res-2805d0c1ae918657dbe48b1fdc11a9f4-data` (`op_a1db98f6f9a408d32af6db1df6ef91eb`). The owned volume was replaced with the exact same name carrying foreign labels (`io.eregion.app=foreign-owner`). `resource destroy --delete-data` `op_6eefcf4cb76445e54433544241fb65cf` failed `precondition_failed` with "volume \"…\" belongs to another owner; refusing to delete data"; the foreign volume remained. After removing that test volume, a second `--delete-data` `op_aab313d6e42aed65888ca7564a742f62` succeeded, and the environment was deleted (`op_77c79ca8d88e60b7bdf8a90da089da04`). | Operation events; volume labels; `docker volume inspect` |
+| Destroying a resource with an active dependent is refused | **Pass.** With `cache` attached to the serving revision, `resource destroy` returned `precondition_failed` and left it untouched. | Destroy refusal; revision 2 `resources: [cache]` |
+| Unhealthy dependency blocks its dependent deploy without disturbing the serving release | **Pass.** The degraded `cache` (`op_c91e0504533cf7975b7abde3e12fe5a7`) made `deploy` refuse `resource:cache`; the serving release `rel_f7dbda77a2a443a1d58c7c9a7196ec05` stayed healthy and `/external` returned 200. | `config set` `op_21c1d789dcc2f6eeade6b3fa26ae8976`; deploy refusal; `/external` |
+| Removing a resource declaration retains its data | **Pass.** `env update --from` removed `cache` as `op_4aebafcf4f3afdce9fc64caccfb3803d`; the container and volume remained and Redis key `audit:key` still read `persist`. A later deploy (`op_14d8ba9c5463d48b8b726c64060c363a`) moved to revision 5 without it. | Update JSON; resource status; Redis read |
+| `resource destroy --delete-data` removes only owned volumes and leaves an unrelated foreign volume | **Pass (unrelated-volume behavior only; actual ownership refusal is tested above).** `op_298de5b1c2fc97cdc4b45c8ca40d6017` removed the owned cache volume; the separately created `a2-foreign-audit` volume was never a deletion target and remained, then was removed explicitly. | Destroy JSON; `docker volume ls` |
+| External dependency without a managed resource | **Pass.** After the final no-resource deploy, `GET /external` returned `external 200` and `/build` returned `beta`. | `op_14d8…`; public responses |
+| An ordinary deploy never reads a working-directory `eregion.toml` | **Pass.** A rogue `/tmp/opencode/rogue/eregion.toml` (`wrongapp`, `wrongnode`, `example.invalid/wrong:1`) was present when deploy `op_ae6e1053f5c84f2045bd68ae62461969` was submitted; the operation pulled `127.0.0.1:5000/a2defs1106@sha256:b472757e…` from the platform revision, not the rogue file. That deploy then failed its public check because the test image lacked CA certificates; the rebuilt image with `ca-certificates` passed as `op_2ae2a4bedcd7d16f574ca4006f37dcf0`. | `op_ae6e…` pull events; `op_2ae2…` success |
+| Failed `gh` setup then successful retry | **Pass.** A temporary `gh` shim that reported admin permission but failed `/hooks` enabled auto-deploy without creating a hook. After disabling that attempt and deleting the earlier stale hook `708329427`, the real `--rotate-webhook-secret --github-webhook` created hook `708330096` and secret revision 3. | `gh api` hook list; secret list; env status |
+| Real push delivery deploys the pushed commit and ignores the rogue file | **Pass.** Push `8fa8c1151b1a4c45115bb9b30474284acb0b1b27` produced GitHub delivery `abf898d0-da24-11f1-972b-eda7107b1a7c`, HTTP **202**, and `op_73c9e2addecfd556686d431b1fd4c916`; it served `rel_c2df6de6c35011f6be98b270c859fc7e` with `/` returning `eregion sample: hello-v1 src3`. | Hook delivery; operation; public response |
+| Hook and branch cleanup | **Pass.** Hook `708330096` was deleted, auto-deploy disabled (`op_200e3cc4e758abf54cd5d24754b9d60b`), branch `alpha2-prot-audit` deleted locally and remotely, and the working tree returned to `main`. Only the pre-existing `githello` hook and the original branches remain. | `gh api` hook/branch lists; git status |
+
+**Cleanup and residual state.** `hook` was deleted as
+`op_7cef2d95874a413696ed97203695ad7c`. `a2defs1106` now has production,
+staging and `prot-audit`, all protected; no unprotected disposable test
+environment remains (the protected `prot-audit` audit environment stays).
+`resource-audit` was recovered after the `edge-81998646916d` upgrade:
+ordinary destroy `op_8a88…` and noninteractive env delete `op_905f…` succeeded.
+`resource-audit2`, `resource-audit3`, `cancel-audit`, `cancel-ok`,
+`fresh-audit` and `recipe-audit` are gone. The foreign ownership test volume
+and all other test resource volumes were removed. Protected delete, unprotect and app-delete
+refusals were re-confirmed against `production` and `prot-audit` with
+`input_required`. No migration text was changed; 024 remains as applied.
+Production serves `rel_b19f552b5afb5a727b7e7b897f59c181` on the placeholder
+primary `a2-primary.invalid`; staging and `prot-audit` have no serving release.
+The designated hostname has no binding and returns Cloudflare `525`; its
+pre-existing DNS record remains because no safe Cloudflare access is available.
+There is no fixture resource container, network or volume; the destroyed cache
+row remains `destroyed`. The fixture registry manifests (`pgv3`, `pgv4`) remain
+referenced by the environment revisions and the serving app, their local image
+tags also remain, and the unused `eregion/a2defs1106-hook` image was removed
+after a reference check. App deletion still needs the operator's TOTP factor:
+
+```sh
+eregion --context main app delete a2defs1106 --confirm a2defs1106
+```
+
+**Remaining evidence boundaries.** The multi-environment app-create same-key
+replay and a last-environment delete were not re-run on the host. The
+independent disposable PostgreSQL test above covers atomic rollback/replay and
+the last-environment factor admission with an injected verifier, but not a real
+TOTP and not a worker-completed delete. Positive real-TOTP authorization was
+not exercised against the live host gate; no live authenticator code, live seed
+or live protect store was accessed. The isolated protect-store/CLI tests and the
+direct-service local-verifier test use generated local secrets and real TOTP
+codes. The working-tree cancellation fix adds step-boundary checks and a
+row-locked finalization recheck; its regressions pass, but it is not committed,
+published or host-qualified until the orchestrator integrates it. A new app
+fixture was not created because its deletion would add another
+TOTP-gated residual; fresh name-based creation was exercised with the disposable
+environments above instead. The `env create` same-key replay passed. Factor
+policy over public HTTP was not exercised on the host. The `gh`-assisted flow
+has not been tested with a real non-admin account; the permission response was
+simulated. macOS acceptance (R10) remains required before v1.0.0 final, and a
+fresh-server baseline is not required for this alpha under the incremental
+policy. No compatibility alias or shim was added: the create input replaces the
+single `environment` field with `environments`. No migration text was changed.
+
+### 2026-11-06 — resource cancellation recovery (state settlement host-qualified; boundary/finalization fix source-only)
+
+During real-host qualification, cancelling a resource provisioning operation and
+then SIGKILLing the worker left the operation terminal `cancelled` while the
+resource row stayed `provisioning`. `resource apply` and `resource destroy`
+then refused `conflict`, and `env delete` refused `precondition_failed`. The
+host fixture was `resource-audit/interrupt` on
+`main` (`op_3eded76779595d3f9d9fbf7b6b8f4d55`); its container, network and
+volume were removed by exact name, but the platform rows were left untouched.
+No direct database edit or ad-hoc repair command was used.
+
+Root cause: cancellation was recorded on the operation (`cancelPlatform`) but
+did not settle the resource row it owned. The failure transition already marked
+an active apply/destroy `degraded`, but the cancellation path deliberately
+skipped that and left `provisioning`/`destroying` behind. A pre-existing terminal
+operation had no reconciliation path either.
+
+Source fix, no migration:
+- `cancelPlatform` and `failPlatformOperationTx` now settle a
+  `provisioning`/`destroying` resource row to `degraded` in the same transaction
+  that makes the operation terminal. The update is fenced by
+  `eregion_platform_resources.operation_id`, so a newer apply/destroy is never
+  clobbered.
+- The cumulative volume ledger, image/container/network identity and spec are
+  preserved. Retrying apply reuses the same identity and volumes; destroy still
+  finds every owned volume.
+- The ordinary maintenance `Reconcile` path now sweeps rows in those transient
+  states whose owning operation is already `cancelled` or `failed`. A fixed
+  worker therefore repairs the existing stuck row on its normal startup
+  reconciliation, without a repair command, migration or direct database edit.
+- A degraded resource remains non-destroyed, so environment/app deletion still
+  requires the normal explicit resource destroy first; that guard was already
+  intended and is unchanged.
+
+Tests for the published `8199864` fix ran against a **local disposable
+PostgreSQL 18** database with a fake node transport (no main host, Docker used
+only to run the disposable database). The working-tree regression and
+direct-TOTP test below were also run against the existing disposable
+PostgreSQL test container:
+
+| Check | Result |
+| --- | --- |
+| Cancel an apply during its run step while the resource is `provisioning`; operation becomes `cancelled`, resource becomes `degraded` with `error_code=cancelled`; ledger preserved; retry apply and then destroy succeed | Pass: `TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy` |
+| Cancellation accepted while a step is in flight and that step then succeeds must still cancel the operation, not silently mark the resource ready | Pass: `TestIntegrationResourceCancelAfterSuccessfulStepIsHonored` |
+| Cancellation accepted after the last step check but before the operation-row-locked finalization must cancel an apply | Pass: `TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored` |
+| Cancellation accepted after the last step check but before the operation-row-locked finalization must cancel a destroy | Pass: `TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored` |
+| Existing rows left `provisioning`/`destroying` by an already `cancelled`/`failed` operation converge on normal `Reconcile`, preserving the ledger and using the correct apply/destroy detail | Pass: `TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows` |
+| Existing full resource lifecycle, secret redaction and retained-volume behavior unchanged | Pass: `TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets` |
+| Package build/vet and all non-DB tests | Pass: `go build ./...`, `go vet ./...`, `go test ./...`, darwin/arm64 cross-build |
+
+After the working-tree cancellation fix, the full
+`go test ./internal/controlplane -count=1` passed against the existing
+disposable PostgreSQL test container (`127.0.0.1:55432`; no new container), as
+did `go test ./internal/protect -count=1`,
+`go test ./internal/cli -run 'Factor|Protect' -count=1`, `go build ./...`,
+`go vet ./...` and the darwin/arm64 cross-build.
+
+**Host verification (`edge-81998646916d`).** Publish edge run `42302477645`
+succeeded (`gh run watch`); CI run `42302477691` also succeeded. The channel
+manifest at
+`https://eregion.mbvlabs.com/edge/manifest.json` reported
+`edge-81998646916d`; its sigstore bundle verified with the pinned publish-edge
+identity, the linux/amd64 SHA256 matched
+`c32b41daeafe92391da71499986f5ef6cdf0fcd036b9c53855c90dd779f521b3`, and the
+binary reported `edge-81998646916d` / commit `81998646916d`. The CLI was
+upgraded with the signed release; node apply
+`op_e23e2d114b670c1cb5e192de1db73038` restarted the API and worker. Schema
+stayed **24/24**, River 7/7; `doctor` is 20/0/0 and `apply --dry-run` is 0 of
+20.
+
+**Existing stuck-row recovery — pass.** Without SQL, normal reconciliation
+moved `a2defs1106/resource-audit/interrupt` from `provisioning` to `degraded`
+with `error_code=cancelled` and the interrupted-apply detail. Ordinary
+`resource destroy` `op_8a880ab27ae28ad86b3b88e6a90d4066` succeeded and retained
+the ledger; noninteractive `env delete`
+`op_905fdccf680fbb8c7d8925702e394d64` succeeded. `resource-audit` is gone. Its
+Docker volume had already been removed by exact name during the earlier manual
+cleanup, so this verified the state and ledger path, not physical data
+preservation; the earlier cache default-destroy/re-apply test remains the
+data-retention evidence.
+
+**Fresh cancellation retest — real bug found and source-fixed.** Two no-worker-kill
+retests were run. On `cancel-audit/cancelprobe`, cancellation was accepted while
+the slow health step ran, but the health step failed at its deadline; the
+operation ended `failed` and the resource degraded, so that run did not
+distinguish failure from cancellation. On `cancel-ok/cancelok3`, cancellation
+was accepted while the health step was in flight, the health command then
+succeeded, and the operation still ended **`succeeded`** with the resource
+**`ready`** (`op_80c0f44da0189678f2faeb427ba35e34`). That is a real product
+bug on `edge-81998646916d`: resource apply/destroy had no cancellation check
+between steps, so an accepted cancel could be silently converted into success.
+
+The working tree now checks cancellation at every resource apply/destroy step
+boundary and finalizes both actions under the operation row lock, rechecking
+`cancelling` before the resource finalization callback. A `cancelling` row makes
+the scoped `finishResourceOperation` return `errPlatformCancelled` through the
+normal settlement path; other operation completion policy is unchanged. This
+closes the reviewer P1 race where a cancel could commit between the last step
+check and `finishPlatformOperation`. New regressions
+`TestIntegrationResourceCancelAfterSuccessfulStepIsHonored`,
+`TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored` and
+`TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored` pass. They
+use a test-only seam immediately before the operation-row lock and require
+`cancelled` plus a degraded resource with the ledger preserved. The existing
+cancellation, reconciliation, managed-resource, platform, CLI and control-plane
+package tests also pass; `go build`, `go vet` and the darwin/arm64 cross-build
+pass. This source change is **not committed, pushed or deployed**; current
+`main` still runs `edge-81998646916d` with both cancellation defects. The
+orchestrator must review, commit/publish and deploy a new edge build before this
+fix is host-qualified. All `cancel-audit` and `cancel-ok` resources/environments
+were destroyed and deleted after the retests.
+
+**Limitations.** Current `main` (`edge-81998646916d`) still has the resource
+step-boundary and final-commit cancellation bugs; the working-tree fix has not
+been committed, published or deployed. Only rows whose owning operation is
+already `cancelled` or `failed` are swept by reconciliation; queued, running or
+cancelling operations still need the normal River worker/rescue path.
+Reconciliation does not infer whether a node container exists: a subsequent
+apply/destroy is the deliberate recovery step, which is why the row becomes
+`degraded`, not `ready` or `destroyed`. No migration was added or edited.
+
 ```text
 Date / build / commit / channel:
 Operator OS/arch:
@@ -2182,5 +3688,5 @@ Source commits; release, deployment and operation IDs:
 Checks: pass / fail / blocked / not run, one line each
 Public response markers and TLS result:
 Failures and recovery observations:
-Remaining blocker and next action:
+Remaining qualification gap and next action:
 ```

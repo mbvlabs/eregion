@@ -253,6 +253,7 @@ func TestPlanContainersAndDanglingImages(t *testing.T) {
 			{Name: "serving-release", App: "api", Environment: "production", Release: "rel_serving"},
 			{Name: "serving-deployment", App: "api", Environment: "production", Deployment: "dep_serving"},
 			{Name: "stale", App: "api", Environment: "production", Release: "rel_old"},
+			{Name: "managed-resource", App: "api", Environment: "production", Kind: "resource"},
 			{Name: "unknown-environment", App: "api", Environment: "ghost", Release: "rel_old"},
 			{Name: "no-labels"},
 			{ID: "container-without-name", App: "api", Environment: "production", Release: "rel_old"},

@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -89,6 +91,161 @@ func TestAppCreateFlagsBuildTheFirstRevision(t *testing.T) {
 	}
 	if spec.ContainerPort != 3000 || spec.Health.Path != "/healthz" || len(spec.Processes) != 2 {
 		t.Fatalf("spec runtime/processes = %+v", spec)
+	}
+}
+
+func TestAppCreateBuildsProtectedProductionAndStagingAtomically(t *testing.T) {
+	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{}}
+	a := newApp()
+	a.backend = backend
+	var stdout, stderr bytes.Buffer
+	exit := runApp(context.Background(), []string{
+		"app", "create", "--name", "api", "--node", "main",
+		"--image", "ghcr.io/acme/api:1", "--domain", "api.example.com", "--detach", "--json",
+	}, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
+	if exit != 0 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
+	}
+	var input platform.AppCreateInput
+	found := false
+	for _, submission := range backend.submissionsOfKind(platform.KindAppCreate) {
+		if submission.DryRun {
+			continue
+		}
+		if err := json.Unmarshal(submission.Input, &input); err != nil {
+			t.Fatal(err)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("app create submissions = %+v", backend.submissions)
+	}
+	if len(input.Environments) != 2 || input.Environments[0].Name != "production" || input.Environments[1].Name != "staging" {
+		t.Fatalf("environments = %+v", input.Environments)
+	}
+	for _, spec := range input.Environments {
+		if spec.Protected == nil || !*spec.Protected {
+			t.Fatalf("%s was not protected by default: %+v", spec.Name, spec.Protected)
+		}
+	}
+	if len(input.Environments[0].Domains) != 1 || input.Environments[0].Domains[0].Domain != "api.example.com" {
+		t.Fatalf("production domains = %+v", input.Environments[0].Domains)
+	}
+	if input.Environments[1].Domain != "" || len(input.Environments[1].Domains) != 0 {
+		t.Fatalf("staging invented a domain: %+v", input.Environments[1])
+	}
+}
+
+func TestAppCreateWritesSharedSecretsToBothEnvironmentNamespaces(t *testing.T) {
+	credentialFile := writeSecretInput(t, "read-token")
+	secretFile := writeSecretInput(t, "db-secret")
+	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{}}
+	a := newApp()
+	a.backend = backend
+	var stdout, stderr bytes.Buffer
+	exit := runApp(context.Background(), []string{
+		"app", "create", "--name", "api", "--node", "main",
+		"--git-url", "https://github.com/acme/api",
+		"--git-credential-file", credentialFile,
+		"--secret", "DATABASE_URL=" + secretFile,
+		"--no-deploy", "--json",
+	}, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
+	if exit != 0 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
+	}
+	want := map[string]string{
+		"api/production/GIT_READ_TOKEN": "read-token",
+		"api/staging/GIT_READ_TOKEN":    "read-token",
+		"api/production/DATABASE_URL":   "db-secret",
+		"api/staging/DATABASE_URL":      "db-secret",
+	}
+	if len(backend.secretNamespaces) != len(want) {
+		t.Fatalf("secret writes = %+v, want %d namespaces", backend.secretNamespaces, len(want))
+	}
+	for namespace, value := range want {
+		if got := backend.secretPayloads[namespace]; got != value {
+			t.Fatalf("secret %s = %q, want %q; all writes=%+v", namespace, got, value, backend.secretPayloads)
+		}
+	}
+}
+
+func TestSetupSecretWritesRespectEnvironmentSpecificNames(t *testing.T) {
+	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{}}
+	a := &app{secrets: &secrets.Registry{}, backend: backend}
+	ans := &setupAnswers{
+		App:             "api",
+		CredentialName:  "PROD_GIT",
+		CredentialValue: []byte("prod-token"),
+		SecretValues:    map[string][]byte{"PROD_ONLY": []byte("prod"), "STAGE_ONLY": []byte("stage")},
+	}
+	prod := platform.EnvironmentSpec{
+		Name: "production", SecretNames: []string{"PROD_ONLY"},
+		Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", CredentialSecretName: "PROD_GIT"},
+	}
+	stage := platform.EnvironmentSpec{
+		Name: "staging", SecretNames: []string{"STAGE_ONLY"},
+		Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", CredentialSecretName: "STAGE_GIT"},
+	}
+	if _, err := a.writeSetupSecretsForEnvironments(&cobra.Command{}, ans, []platform.EnvironmentSpec{prod, stage}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"api/production/PROD_ONLY": "prod",
+		"api/staging/STAGE_ONLY":   "stage",
+		"api/production/PROD_GIT":  "prod-token",
+	}
+	if len(backend.secretNamespaces) != len(want) {
+		t.Fatalf("secret writes = %+v, want only %v", backend.secretNamespaces, want)
+	}
+	for namespace, value := range want {
+		if got := backend.secretPayloads[namespace]; got != value {
+			t.Fatalf("secret %s = %q, want %q", namespace, got, value)
+		}
+	}
+	for _, leaked := range []string{
+		"api/production/STAGE_ONLY", "api/staging/PROD_ONLY",
+		"api/staging/PROD_GIT", "api/production/STAGE_GIT",
+	} {
+		if _, found := backend.secretPayloads[leaked]; found {
+			t.Fatalf("secret leaked into %s", leaked)
+		}
+	}
+}
+
+func TestEnvProtectionRequiresFactorOnlyToLowerProtection(t *testing.T) {
+	environments := func(protected bool) json.RawMessage {
+		raw, _ := json.Marshal(map[string]any{"items": []platform.Environment{{
+			App: "api", Name: "pr-42", Node: "main", Protected: protected,
+		}}})
+		return raw
+	}
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		protected bool
+		wantExit  int
+		wantKind  string
+	}{
+		{name: "protect is agent-safe", args: []string{"env", "protect", "api", "pr-42", "--json"}, protected: false, wantKind: platform.KindEnvironmentProtect},
+		{name: "protected unprotect refuses without a terminal", args: []string{"env", "unprotect", "api", "pr-42", "--json"}, protected: true, wantExit: 2},
+		{name: "already unprotected is a no-op", args: []string{"env", "unprotect", "api", "pr-42", "--json"}, protected: false, wantKind: platform.KindEnvironmentProtect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{"environments": environments(tc.protected)}}
+			a := newApp()
+			a.backend = backend
+			var stdout, stderr bytes.Buffer
+			exit := runApp(context.Background(), tc.args, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
+			if exit != tc.wantExit {
+				t.Fatalf("exit=%d want=%d stdout=%s stderr=%s", exit, tc.wantExit, stdout.String(), stderr.String())
+			}
+			if tc.wantKind != "" && len(backend.submissionsOfKind(tc.wantKind)) != 1 {
+				t.Fatalf("submissions = %+v", backend.submissions)
+			}
+			if tc.wantKind == "" && len(backend.submissions) != 0 {
+				t.Fatalf("protected unprotect submitted: %+v", backend.submissions)
+			}
+		})
 	}
 }
 

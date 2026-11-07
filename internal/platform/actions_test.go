@@ -108,20 +108,67 @@ func TestEnvironmentSpecCarriesItsFirstDomain(t *testing.T) {
 	raw, _ := json.Marshal(map[string]any{
 		"name": "production", "node": "app-1",
 		"domain": "API.Example.com.", "domain_primary": true,
-		"domain_addresses": []string{"203.0.113.10", "203.0.113.10"},
+		"domain_addresses":  []string{"203.0.113.10", "203.0.113.10"},
+		"domain_check_path": "/readyz",
 	})
 	normalized, err := registry.Normalize(KindEnvironmentCreate, "app/api", raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	spec := normalized.Input.(*EnvironmentCreateInput).EnvironmentSpec
-	if spec.Domain != "api.example.com" || !spec.DomainPrimary || len(spec.DomainAddresses) != 1 || spec.DomainAddresses[0] != "203.0.113.10" {
+	if spec.Domain != "api.example.com" || !spec.DomainPrimary || len(spec.DomainAddresses) != 1 || spec.DomainAddresses[0] != "203.0.113.10" || spec.DomainCheckPath != "/readyz" {
 		t.Fatalf("domain binding was not normalized: %+v", spec)
 	}
-	if _, err := registry.Normalize(KindEnvironmentCreate, "app/api", mustJSONInput(map[string]any{
-		"name": "staging", "node": "app-1", "domain_primary": true,
-	})); err == nil {
-		t.Fatal("a primary flag without a domain must be refused")
+	for name, input := range map[string]map[string]any{
+		"primary without domain":    {"name": "staging", "node": "app-1", "domain_primary": true},
+		"check path without domain": {"name": "staging", "node": "app-1", "domain_check_path": "/readyz"},
+		"invalid check path":        {"name": "staging", "node": "app-1", "domain": "staging.example.com", "domain_check_path": "readyz"},
+	} {
+		if _, err := registry.Normalize(KindEnvironmentCreate, "app/api", mustJSONInput(input)); err == nil {
+			t.Fatalf("%s must be refused", name)
+		}
+	}
+}
+
+func TestEnvironmentSpecCarriesMultipleFirstDomains(t *testing.T) {
+	registry := NewRegistry()
+	raw, _ := json.Marshal(map[string]any{
+		"name": "production", "node": "app-1",
+		"domain_addresses": []string{"203.0.113.10"},
+		"domains": []map[string]any{
+			{"domain": "API.Example.com.", "primary": true, "check_path": "/healthz"},
+			{"domain": "www.example.com", "check_path": "/readyz"},
+		},
+	})
+	normalized, err := registry.Normalize(KindEnvironmentCreate, "app/api", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := normalized.Input.(*EnvironmentCreateInput).EnvironmentSpec
+	if len(spec.Domains) != 2 || spec.Domains[0].Domain != "api.example.com" || !spec.Domains[0].Primary ||
+		spec.Domains[0].CheckPath != "/healthz" || spec.Domains[1].Domain != "www.example.com" ||
+		spec.Domains[1].Primary || spec.Domains[1].CheckPath != "/readyz" {
+		t.Fatalf("domains were not normalized: %+v", spec.Domains)
+	}
+	for name, input := range map[string]map[string]any{
+		"no primary": {"name": "staging", "node": "app-1", "domains": []map[string]any{
+			{"domain": "a.example.com"},
+		}},
+		"two primary": {"name": "staging", "node": "app-1", "domains": []map[string]any{
+			{"domain": "a.example.com", "primary": true},
+			{"domain": "b.example.com", "primary": true},
+		}},
+		"single and multiple": {"name": "staging", "node": "app-1", "domain": "a.example.com", "domains": []map[string]any{
+			{"domain": "b.example.com", "primary": true},
+		}},
+		"duplicate": {"name": "staging", "node": "app-1", "domains": []map[string]any{
+			{"domain": "a.example.com", "primary": true},
+			{"domain": "a.example.com"},
+		}},
+	} {
+		if _, err := registry.Normalize(KindEnvironmentCreate, "app/api", mustJSONInput(input)); err == nil {
+			t.Fatalf("%s must be refused", name)
+		}
 	}
 }
 

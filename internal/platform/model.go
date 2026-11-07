@@ -121,6 +121,9 @@ type RevisionState struct {
 	Processes         []ProcessSpec     `json:"processes"`
 	Config            map[string]string `json:"config"`
 	SecretNames       []string          `json:"secret_names"`
+	// Resources names environment-owned managed resources this environment
+	// depends on. Names only; readiness is observed separately and gates deploy.
+	Resources []string `json:"resources,omitempty"`
 	// Retention overrides the server default retention policy for this
 	// environment. Nil fields inherit the server value; changing any field
 	// commits a new revision like every other piece of desired state (D30).
@@ -240,6 +243,10 @@ type Environment struct {
 	App  string        `json:"app"`
 	Name string        `json:"name"`
 	Node string        `json:"node"`
+	// Protected gates a real environment deletion behind the human factor.
+	// production and staging are created protected by default; other names are
+	// unprotected by default. An application deletion always needs the factor.
+	Protected bool `json:"protected"`
 	// BuildNode optionally places Buildpacks execution on a distinct builder
 	// node. When empty, builds run on Node. It must have builder + buildpacks,
 	// and it is always authenticated through the node transport, never a name.

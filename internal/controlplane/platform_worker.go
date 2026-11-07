@@ -24,7 +24,7 @@ const platformMaxAttempts = 8
 // platformStepTotal is the progress denominator. It is deliberately larger than
 // any current pipeline and is informational only; completion depends on the
 // actual step records, never this number.
-const platformStepTotal = 16
+const platformStepTotal = 32
 
 // Deployment step identities are shared by the worker, reconciliation, and the
 // viewer. A restored switch is proven by the completed step record, never by a
@@ -104,8 +104,9 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 	}
 	switch normalized.Kind {
 	case platform.KindAppCreate, platform.KindNodeRegister, platform.KindEnvironmentCreate,
-		platform.KindEnvironmentUpdate, platform.KindProcessScale, platform.KindConfigSet,
-		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach:
+		platform.KindEnvironmentUpdate, platform.KindEnvironmentProtect, platform.KindProcessScale, platform.KindConfigSet,
+		platform.KindConfigUnset, platform.KindEnvironmentSecretAttach,
+		platform.KindEnvironmentResourceAttach, platform.KindEnvironmentResourceDetach:
 		return w.runRecordAction(ctx, op.ID, attempt, normalized)
 	case platform.KindNodeCheck:
 		return w.runNodeCheck(ctx, op.ID, attempt, normalized)
@@ -123,6 +124,10 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runDeployment(ctx, op.ID, attempt, normalized)
 	case platform.KindDomainAdd, platform.KindDomainRemove:
 		return w.runDomain(ctx, op.ID, attempt, normalized)
+	case platform.KindResourceApply:
+		return w.runResourceApply(ctx, op.ID, attempt, normalized.Input.(*platform.ResourceApplyInput))
+	case platform.KindResourceDestroy:
+		return w.runResourceDestroy(ctx, op.ID, attempt, normalized.Input.(*platform.ResourceDestroyInput))
 	case platform.KindAppDelete, platform.KindEnvironmentDelete:
 		return w.runDelete(ctx, op.ID, attempt, normalized)
 	default:
@@ -236,11 +241,20 @@ func (w *platformWorker) runRecordAction(ctx context.Context, id contract.Operat
 				"Created application "+input.Name, map[string]any{"app": input.Name}, nil); err != nil {
 				return err
 			}
-			if input.Environment == nil {
-				return nil
+			for index := range input.Environments {
+				if err := recordRevisionChange(ctx, tx, op, "environment.created", input.Name, input.Environments[index].Name,
+					"Created environment "+input.Environments[index].Name+" and its first desired-state revision."); err != nil {
+					return err
+				}
 			}
-			return recordRevisionChange(ctx, tx, op, "environment.created", input.Name, input.Environment.Name,
-				"Created environment "+input.Environment.Name+" and its first desired-state revision.")
+			return nil
+		case *platform.EnvironmentProtectInput:
+			kind := "environment.protected"
+			if !input.Protected {
+				kind = "environment.unprotected"
+			}
+			return insertPlatformChange(ctx, tx, op, kind, input.App, input.Environment,
+				"Changed environment protection.", map[string]any{"protected": input.Protected}, nil)
 		case *platform.EnvironmentCreateInput:
 			return recordRevisionChange(ctx, tx, op, "environment.created", input.App, input.Name,
 				"Created environment "+input.Name+" on node "+input.Node+" with its first desired-state revision.")
@@ -259,6 +273,13 @@ func (w *platformWorker) runRecordAction(ctx context.Context, id contract.Operat
 		case *platform.EnvironmentSecretAttachInput:
 			return recordRevisionChange(ctx, tx, op, "environment.secret.attached", input.App, input.Environment,
 				"Attached vault secret name "+input.Name+" to the environment revision.")
+		case *platform.EnvironmentResourceInput:
+			kind := "environment.resource.attached"
+			if op.Kind == platform.KindEnvironmentResourceDetach {
+				kind = "environment.resource.detached"
+			}
+			return recordRevisionChange(ctx, tx, op, kind, input.App, input.Environment,
+				"Changed managed resource "+input.Resource+" in the environment revision.")
 		}
 		// Node registration records declared facts only. It is not enrollment or
 		// verification; node.check performs an authenticated transport check.
@@ -556,6 +577,9 @@ func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *co
 			return changeErr
 		}
 	}
+	if err := settleResourceForTerminalOperationTx(ctx, tx, op.ID, op.Kind, code); err != nil {
+		return err
+	}
 	if err := markIncompleteSteps(ctx, tx, op.ID, code, message); err != nil {
 		return err
 	}
@@ -587,6 +611,9 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
             SET state='cancelled',message=$2,completed_at=clock_timestamp(),updated_at=clock_timestamp()
             WHERE operation_id=$1 AND state IN ('pending','running')`, id, message); err != nil {
+			return err
+		}
+		if err := settleResourceForTerminalOperationTx(ctx, tx, id, op.Kind, contract.Cancelled); err != nil {
 			return err
 		}
 		var releaseID, servingID string
@@ -933,9 +960,42 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 			return err
 		}
 		return s.failReconciledPlatform(ctx, op, "environment deletion ended before the platform rows were removed", contract.Unavailable)
+	case platform.KindResourceApply, platform.KindResourceDestroy:
+		var raw []byte
+		if err := s.pool.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {
+			return unavailable()
+		}
+		_, err := platform.Default().Normalize(op.Kind, op.Target, raw)
+		if err != nil {
+			return err
+		}
+		target, err := platform.ParseTarget(op.Target)
+		if err != nil {
+			return err
+		}
+		resource, err := s.resourceByName(ctx, target.App, target.Environment, target.Resource)
+		if err != nil {
+			if contract.Classify(err).Code == contract.NotFound {
+				return s.failReconciledPlatform(ctx, op, "resource execution ended before a durable resource record existed", contract.Unavailable)
+			}
+			return err
+		}
+		if resource.OperationID != op.ID {
+			return s.failReconciledPlatform(ctx, op, "resource operation was superseded by another operation", contract.Conflict)
+		}
+		if op.Kind == platform.KindResourceApply && resource.State == platform.ResourceReady {
+			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+		}
+		if op.Kind == platform.KindResourceDestroy && resource.State == platform.ResourceDestroyed {
+			return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+		}
+		cause := contract.NewFault(contract.Unavailable, "resource execution ended before its durable state was recorded", "Inspect resource status; the container may still exist. Re-apply or re-destroy explicitly after checking the node.")
+		s.recordResourceFailure(ctx, op.ID, resource.App, resource.Environment, resource.Name, cause)
+		return s.failReconciledPlatform(ctx, op, cause.Message, contract.Unavailable)
 	case platform.KindAppCreate, platform.KindEnvironmentCreate, platform.KindEnvironmentUpdate,
 		platform.KindProcessScale, platform.KindConfigSet, platform.KindConfigUnset,
-		platform.KindEnvironmentSecretAttach, platform.KindNodeRegister:
+		platform.KindEnvironmentSecretAttach, platform.KindEnvironmentResourceAttach,
+		platform.KindEnvironmentResourceDetach, platform.KindNodeRegister:
 		exists, err := s.recordActionExists(ctx, op)
 		if err != nil {
 			return err
@@ -984,6 +1044,8 @@ func (s *Service) recordActionExists(ctx context.Context, op contract.Operation)
 	case *platform.ConfigUnsetInput:
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
 	case *platform.EnvironmentSecretAttachInput:
+		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
+	case *platform.EnvironmentResourceInput:
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
 	case *platform.NodeRegisterInput:
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_nodes WHERE name=$1)`, input.Name).Scan(&exists)

@@ -1,14 +1,17 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/protect"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
 )
@@ -23,28 +26,32 @@ func (a *app) envSpecs() []spec {
 	create.InputFlags = []string{
 		"app", "name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
 		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
-		"health-path", "process", "config", "secret", "domain", "no-deploy", "detach",
+		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
+		"protected", "unprotected",
 	}
 	create.Examples = []string{
 		"eregion env create",
 		"eregion env create --app api --name staging --node main --git-url https://github.com/acme/api --git-ref next --domain staging.example.com --json",
+		"eregion env create --from ./eregion.toml --name pr-42 --no-deploy --json",
 	}
 	create.Next = []string{"eregion env status <app> <environment> --json", "eregion domain add <app> <environment> <hostname>"}
 
 	update := operationMeta("Change an environment as a new desired-state revision", "eregion env update api production --git-ref release-2026-10 --json")
-	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued."}
+	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued. With an authenticated gh, --github-webhook creates or updates the repository webhook for --auto-deploy or --rotate-webhook-secret; manual paste remains the fallback."}
 	update.Mutating, update.DryRun, update.Prompts = true, true, true
 	update.InputFlags = []string{
 		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name",
 		"image", "builder", "context-path", "health-type", "health-path", "health-timeout",
-		"release-command", "process",
+		"release-command", "process", "from", "github-webhook",
 	}
 	update.Examples = []string{
 		"eregion env update api production",
 		"eregion env update api production --health-path /readyz --json",
 		"eregion env update api production --process 'web=web:8080:2:' --json",
 		"eregion env update api production --auto-deploy",
+		"eregion env update api production --auto-deploy --github-webhook",
 		"eregion env update api production --rotate-webhook-secret",
+		"eregion env update api production --from ./eregion.toml --dry-run --json",
 	}
 	update.Next = []string{"eregion env status <app> <environment> --json"}
 
@@ -68,6 +75,7 @@ func (a *app) envSpecs() []spec {
 					cmd.Flags().String("name", "", "Environment name")
 					cmd.Flags().Bool("no-deploy", false, "Do not queue the first deploy")
 					cmd.Flags().Bool("detach", false, "Submit and return without following the create and first deploy")
+					addProtectionFlags(cmd)
 					addSetupFlags(cmd, true)
 				},
 				run: a.envCreate,
@@ -96,9 +104,114 @@ func (a *app) envSpecs() []spec {
 					return a.envStatus(cmd, args[0], args[1])
 				},
 			},
+			a.envProtectionSpec(true),
+			a.envProtectionSpec(false),
 			a.envDeleteSpec(),
 		},
 	}}
+}
+
+// envProtectionSpec builds env protect (protected=true) and env unprotect
+// (protected=false). Lowering protection is the only direction that needs the
+// human factor; the node/control plane verifies it against locked state.
+func (a *app) envProtectionSpec(protected bool) spec {
+	use := "protect <app> <environment>"
+	summary := "Protect an environment so a real deletion needs the human factor"
+	example := "eregion env protect api production --json"
+	when := []string{
+		"Protection is durable environment state, not a desired-state revision.",
+		"Protecting is agent-safe and never asks for a code. Unprotecting asks for a TOTP code at a human terminal and refuses JSON/no-TTY without one.",
+	}
+	if !protected {
+		use = "unprotect <app> <environment>"
+		summary = "Lower an environment's deletion protection; requires the human factor"
+		example = "eregion env unprotect api pr-42"
+		when = []string{
+			"Turning protection off on a protected environment requires the D7 TOTP human factor at a human terminal.",
+			"An already-unprotected environment is unchanged without a code. An unprotected, non-last environment can then be deleted by an agent with exact target confirmation.",
+		}
+	}
+	meta := followingMeta(operationMeta(summary, example))
+	meta.Mutating, meta.DryRun = true, true
+	meta.Prompts = !protected
+	meta.InputFlags = []string{"detach"}
+	meta.WhenToUse = when
+	meta.Next = []string{"eregion env status <app> <environment> --json", "eregion env delete <app> <environment> --confirm <app>/<environment>"}
+	return spec{
+		use:  use,
+		meta: meta,
+		args: platformTwoNames("app", "environment"),
+		flags: func(cmd *cobra.Command) {
+			cmd.Flags().Bool("dry-run", false, "Validate and show the protection change without accepting work")
+			cmd.Flags().Bool("detach", false, "Return immediately after acceptance instead of following in a terminal")
+			cmd.Flags().String("idempotency-key", "", "Stable submission key; one is generated when empty")
+		},
+		run: func(cmd *cobra.Command, args []string) (result, error) {
+			return a.runEnvProtection(cmd, args[0], args[1], protected)
+		},
+	}
+}
+
+type envProtectionResult struct {
+	App         string              `json:"app"`
+	Environment string              `json:"environment"`
+	Protected   bool                `json:"protected"`
+	Dropped     bool                `json:"dropped,omitempty"`
+	Operation   *contract.Operation `json:"operation,omitempty"`
+	DryRun      bool                `json:"dry_run,omitempty"`
+	Preview     *platform.Preview   `json:"preview,omitempty"`
+}
+
+func (a *app) runEnvProtection(cmd *cobra.Command, app, environment string, protected bool) (result, error) {
+	env, _, err := a.readEnvironment(cmd, app, environment)
+	if err != nil {
+		return result{}, err
+	}
+	target, err := platform.NewEnvironmentTarget(app, environment)
+	if err != nil {
+		return result{}, err
+	}
+	input := platform.EnvironmentProtectInput{App: app, Environment: environment, Protected: protected}
+	if dryRun(cmd) {
+		preview, err := a.previewAction(cmd, platform.KindEnvironmentProtect, target.String(), input)
+		if err != nil {
+			return result{}, err
+		}
+		state := "protected"
+		if !protected {
+			state = "unprotected"
+		}
+		plain := fmt.Sprintf("Dry run: set %s %s\n%s\n", target.String(), state, preview.Summary)
+		return result{data: envProtectionResult{App: app, Environment: environment, Protected: protected, DryRun: true, Preview: &preview}, plain: plain}, nil
+	}
+	var code string
+	if !protected && env.Protected {
+		if err := requireHuman(cmd, "eregion env unprotect"); err != nil {
+			return result{}, err
+		}
+		code, err = readProtectCode(cmd, "Code from the authenticator app")
+		if err != nil {
+			return result{}, err
+		}
+	}
+	op, err := a.submitAcceptedWithSecrets(cmd, platform.KindEnvironmentProtect, target.String(), input, "", map[string]string{protect.CodeSecret: code})
+	if err != nil {
+		return result{}, err
+	}
+	data := envProtectionResult{App: app, Environment: environment, Protected: protected, Operation: &op}
+	if !boolFlag(cmd, "detach") && (humanInteractive(cmd) || streamsNDJSON(cmd)) {
+		client, err := a.client(cmd)
+		if err != nil {
+			return result{}, err
+		}
+		return a.followAccepted(cmd, client, op)
+	}
+	state := "protected"
+	if !protected {
+		state = "unprotected"
+	}
+	plain := fmt.Sprintf("Environment %s/%s is now %s\noperation: %s\nstate: %s\n", app, environment, state, op.ID, op.State)
+	return result{data: data, plain: plain}, nil
 }
 
 func addEnvironmentUpdateFlags(cmd *cobra.Command) {
@@ -118,8 +231,12 @@ func addEnvironmentUpdateFlags(cmd *cobra.Command) {
 	f.Int("health-timeout", 0, "Health timeout in seconds (1–300)")
 	f.String("release-command", "", "One-off release command line; empty clears it")
 	f.StringArray("process", nil, "Complete process formation entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces all processes)")
+	f.String("from", "", "Read an eregion.toml definition as the complete supported desired state; config is plain, secrets are names only; revision and webhook flags cannot be combined")
 	f.Bool("auto-deploy", false, "Enable push to deploy for a GitHub source; --auto-deploy=false disables it")
 	f.Bool("rotate-webhook-secret", false, "Replace the push-to-deploy secret and show the new one once")
+	f.Bool("github-webhook", false, "Create or update the repository webhook with an authenticated gh; needs --auto-deploy or --rotate-webhook-secret")
+	f.String("confirm", "", "Target-naming confirmation for destructive definition removals: app/environment")
+	f.StringArray("confirm-domain", nil, "Target-naming confirmation for each domain removed by a definition (repeatable)")
 	f.String("idempotency-key", "", "Stable submission key; one is generated when empty")
 	f.Bool("dry-run", false, "Validate and show the new revision without accepting work or writing secrets")
 }
@@ -189,9 +306,9 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 	}
 	summary := setupResult{
-		App: ans.App, Environment: ans.Environment, Node: ans.Node,
+		App: ans.App, Environment: ans.Environment, Protected: protectedSpec(spec), Node: ans.Node,
 		Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
-		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, Deploy: ans.Deploy,
+		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, DomainCheckPath: ans.DomainCheckPath, Domains: ans.Domains, Deploy: ans.Deploy,
 		Warnings: preview.Warnings, created: "environment",
 	}
 	if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
@@ -200,6 +317,10 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if ans.Deploy && ans.Domain == "" {
 		summary.Warnings = append(summary.Warnings, "The first deploy has no domain; the deployability gate refuses it until a primary domain is bound.")
 	}
+	if len(ans.ResourceSpecs) > 0 {
+		summary.Warnings = append(summary.Warnings, "A first deploy was not queued because the definition declares managed resources; wait for resource health, then run `eregion deploy "+ans.App+" "+ans.Environment+"`.")
+	}
+	summary.SecretNames = setupSecretNames(ans)
 	if dry {
 		summary.DryRun, summary.Preview, summary.plan = true, &preview, plan
 		if interactive {
@@ -213,11 +334,10 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
 	} else {
-		secretNames, err := a.writeSetupSecrets(cmd, ans)
-		if err != nil {
+		if _, err := a.writeSetupSecrets(cmd, ans, spec); err != nil {
 			return result{}, err
 		}
-		summary.SecretNames = secretNames
+		summary.SecretNames = setupSecretNames(ans)
 	}
 	op, err := a.submitAccepted(cmd, platform.KindEnvironmentCreate, target.String(), input, "")
 	if err != nil {
@@ -225,6 +345,16 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	}
 	summary.OperationID = op.ID
 	summary.FirstDeployOperationID = op.FirstDeployOperationID
+	if len(ans.ResourceSpecs) > 0 {
+		resourceIDs, err := a.provisionDefinitionResources(cmd, ans.ResourceSpecs)
+		if err != nil {
+			summary.Warnings = append(summary.Warnings, "The environment was created, but resource provisioning was not accepted: "+err.Error()+". Reapply with `eregion resource apply`.")
+		}
+		summary.ResolvedResourceIDs = resourceIDs
+		if len(resourceIDs) > 0 {
+			summary.Warnings = append(summary.Warnings, "Managed resources were accepted for provisioning; they are not ready until their health checks pass, and the first deploy waits for attached resources.")
+		}
+	}
 	if interactive {
 		if ans.Deploy && followsByDefault(cmd) {
 			client, err := a.client(cmd)
@@ -253,6 +383,9 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 			}
 			rows = append(rows, [2]string{"DNS record", dns})
 		}
+		for _, id := range summary.ResolvedResourceIDs {
+			rows = append(rows, [2]string{"resource operation", string(id)})
+		}
 		footer := []string{
 			ui.Dim("the revision is desired state, not a running deployment"),
 			ui.Dim("next:"),
@@ -278,7 +411,13 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 }
 
 func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
+	if from := flagString(cmd, "from"); from != "" {
+		return a.envUpdateFromFile(cmd, args[0], args[1], from)
+	}
 	if err := validateIdempotencyFlag(cmd); err != nil {
+		return result{}, err
+	}
+	if err := validateGitHubWebhookFlags(cmd); err != nil {
 		return result{}, err
 	}
 	appName, environment := args[0], args[1]
@@ -314,6 +453,10 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 			clearBytes(credential)
 			return result{}, err
 		}
+		if err := a.offerGitHubWebhook(cmd, &webhook); err != nil {
+			clearBytes(credential)
+			return result{}, setupPromptError("env update", err)
+		}
 		applyWebhookPatch(&patch, webhook)
 		if webhook.Enabled != nil {
 			changed = append(changed, "auto_deploy")
@@ -347,15 +490,19 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		WebhookURL           string                          `json:"webhook_url,omitempty"`
 		WebhookBranch        string                          `json:"webhook_branch,omitempty"`
 		WebhookRotated       bool                            `json:"webhook_rotated,omitempty"`
+		GitHubWebhook        *githubWebhookReport            `json:"github_webhook,omitempty"`
 		Patch                platform.EnvironmentUpdateInput `json:"patch"`
 		DryRun               bool                            `json:"dry_run,omitempty"`
 	}{App: appName, Environment: environment, Changed: changed, CredentialSecretName: credentialName,
 		WebhookSecretName: webhook.SecretName, WebhookURL: webhook.URL, WebhookBranch: webhook.Branch, WebhookRotated: webhook.Rotated, Patch: patch}
 	if webhook.AlreadyEnabled && len(changed) == 0 {
-		return result{
-			data:  resultData,
-			plain: "Push to deploy is already enabled for " + appName + "/" + environment + " at " + webhook.URL + ".\nUse --rotate-webhook-secret to replace the secret.\n",
-		}, nil
+		report := a.setupWebhookWithGitHub(cmd, webhook)
+		resultData.GitHubWebhook = report
+		plain := "Push to deploy is already enabled for " + appName + "/" + environment + " at " + webhook.URL + ".\nUse --rotate-webhook-secret to replace the secret.\n"
+		if report != nil {
+			plain += report.summary() + "\n"
+		}
+		return result{data: resultData, plain: plain}, nil
 	}
 	if guided {
 		body := strings.Join(diff, "\n")
@@ -391,6 +538,9 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 				fmt.Fprintf(&plain, "Push to deploy: %s (branch %s)\n", webhook.URL, webhook.Branch)
 			}
 		}
+		if webhook.GitHub {
+			plain.WriteString("Would use gh to create or update the repository webhook after the environment change.\n")
+		}
 		return result{data: resultData, plain: plain.String()}, nil
 	}
 
@@ -407,18 +557,27 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, err
 	}
 	if rotateOnly {
-		printWebhookOnce(cmd, webhook)
-		return result{
-			data:  resultData,
-			plain: "Rotated the push-to-deploy secret for " + appName + "/" + environment + "; the new value is active immediately.\n" + webhook.URL + "\n",
-		}, nil
+		report := a.setupWebhookWithGitHub(cmd, webhook)
+		resultData.GitHubWebhook = report
+		if report == nil || !report.configured() {
+			printWebhookOnce(cmd, webhook)
+		}
+		plain := "Rotated the push-to-deploy secret for " + appName + "/" + environment + "; the new value is active immediately.\n" + webhook.URL + "\n"
+		if report != nil {
+			plain += report.summary() + "\n"
+		}
+		return result{data: resultData, plain: plain}, nil
 	}
 	op, err := a.submitAccepted(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch, "")
 	if err != nil {
 		return result{}, err
 	}
 	resultData.OperationID = op.ID
-	printWebhookOnce(cmd, webhook)
+	report := a.setupWebhookWithGitHub(cmd, webhook)
+	resultData.GitHubWebhook = report
+	if report == nil || !report.configured() {
+		printWebhookOnce(cmd, webhook)
+	}
 	if guided {
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, ui.Card("Environment "+appName+"/"+environment+" updated", [][2]string{
@@ -434,9 +593,373 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 	plain := fmt.Sprintf("Updated %s/%s desired state.\noperation: %s\nchanged: %s\nnext: eregion env status %s %s --json\n",
 		appName, environment, op.ID, strings.Join(changed, ", "), appName, environment)
 	if webhook.URL != "" {
-		plain += "push to deploy: " + webhook.URL + " (secret shown once on stderr)\n"
+		if report != nil && report.configured() {
+			plain += "push to deploy: " + webhook.URL + "\n" + report.summary() + "\n"
+		} else {
+			plain += "push to deploy: " + webhook.URL + " (secret shown once on stderr)\n"
+		}
+	}
+	if report != nil && !report.configured() {
+		plain += "warning: " + report.summary() + "\n"
 	}
 	return result{data: resultData, plain: plain}, nil
+}
+
+// domainPlan is the file's explicit domain change set. Primary changes and
+// check-path edits are refused because the existing binding commands cannot
+// update them in place safely; additions and non-primary removals are applied.
+type domainPlan struct {
+	Adds    []appdef.Domain
+	Updates []appdef.Domain
+	Removes []platform.DomainBinding
+}
+
+func planDomainChanges(want []appdef.Domain, current []platform.DomainBinding) (domainPlan, error) {
+	plan := domainPlan{}
+	if len(want) == 0 && len(current) > 0 {
+		return plan, errors.New("domains: a definition cannot remove every binding; keep one primary domain")
+	}
+	currentByName := make(map[string]platform.DomainBinding, len(current))
+	for _, binding := range current {
+		currentByName[binding.Domain] = binding
+	}
+	wantByName := make(map[string]appdef.Domain, len(want))
+	for _, domain := range want {
+		wantByName[domain.Name] = domain
+		binding, exists := currentByName[domain.Name]
+		if exists {
+			if binding.Primary != domain.Primary || binding.CheckPath != domain.CheckPath {
+				plan.Updates = append(plan.Updates, domain)
+			}
+			continue
+		}
+		plan.Adds = append(plan.Adds, domain)
+	}
+	for _, binding := range current {
+		if _, keep := wantByName[binding.Domain]; keep {
+			continue
+		}
+		plan.Removes = append(plan.Removes, binding)
+	}
+	return plan, nil
+}
+
+func (p domainPlan) changes() int { return len(p.Adds) + len(p.Updates) + len(p.Removes) }
+
+// envUpdateFromFile applies one resolved definition to existing desired state.
+// It writes no secret value. Domain additions, promotions and non-final
+// removals use the same explicit domain actions; a definition cannot remove
+// every binding.
+func domainChangeDiff(plan domainPlan) []string {
+	out := make([]string, 0, plan.changes())
+	for _, domain := range plan.Adds {
+		out = append(out, "domain "+domain.Name+": added")
+	}
+	for _, domain := range plan.Updates {
+		mode := "updated"
+		if domain.Primary {
+			mode = "promoted primary"
+		}
+		out = append(out, "domain "+domain.Name+": "+mode)
+	}
+	for _, binding := range plan.Removes {
+		out = append(out, "domain "+binding.Domain+": removed")
+	}
+	return out
+}
+
+func validateDomainRemovalConfirmation(removes []platform.DomainBinding, confirmed []string) error {
+	want := make(map[string]bool, len(removes))
+	for _, binding := range removes {
+		want[binding.Domain] = true
+	}
+	provided := make(map[string]bool, len(confirmed))
+	for _, domain := range confirmed {
+		domain = strings.TrimSpace(domain)
+		if !want[domain] {
+			return contract.NewFault(contract.ValidationFailed, "--confirm-domain names "+domain+", which is not being removed", "Pass --confirm-domain with each hostname shown as removed in the preview.")
+		}
+		provided[domain] = true
+	}
+	for domain := range want {
+		if !provided[domain] {
+			return contract.NewFault(contract.ConfirmationRequired, "removing a domain needs confirmation", "Pass --confirm-domain "+domain+" for each domain the definition removes.")
+		}
+	}
+	return nil
+}
+
+func (a *app) applyDefinitionDomains(cmd *cobra.Command, appName, environment string, plan domainPlan) ([]contract.OperationID, error) {
+	ids := make([]contract.OperationID, 0, plan.changes())
+	for _, domain := range plan.Adds {
+		input := platform.DomainInput{
+			App: appName, Environment: environment, Domain: domain.Name,
+			Primary: domain.Primary, CheckPath: domain.CheckPath, Addresses: mainNodeAddresses(cmd),
+		}
+		op, err := a.submitAccepted(cmd, platform.KindDomainAdd, "env/"+appName+"/"+environment, input, "")
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, op.ID)
+	}
+	for _, domain := range plan.Updates {
+		input := platform.DomainInput{
+			App: appName, Environment: environment, Domain: domain.Name,
+			Primary: domain.Primary, CheckPath: domain.CheckPath, Addresses: mainNodeAddresses(cmd),
+		}
+		op, err := a.submitAccepted(cmd, platform.KindDomainAdd, "env/"+appName+"/"+environment, input, "")
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, op.ID)
+	}
+	for _, binding := range plan.Removes {
+		input := platform.DomainInput{App: appName, Environment: environment, Domain: binding.Domain, Confirm: binding.Domain}
+		op, err := a.submitAccepted(cmd, platform.KindDomainRemove, "env/"+appName+"/"+environment, input, binding.Domain)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, op.ID)
+	}
+	return ids, nil
+}
+
+func (a *app) envUpdateFromFile(cmd *cobra.Command, appName, environment, path string) (result, error) {
+	if err := validateIdempotencyFlag(cmd); err != nil {
+		return result{}, err
+	}
+	for _, name := range definitionRevisionFlags {
+		if flagChanged(cmd, name) {
+			return result{}, contract.NewFault(contract.ValidationFailed, "definition file and revision flags conflict", "Use --from alone for revision fields; keep only identity, output, dry-run and idempotency flags.")
+		}
+	}
+	for _, name := range []string{"auto-deploy", "rotate-webhook-secret", "github-webhook"} {
+		if flagChanged(cmd, name) {
+			return result{}, contract.NewFault(contract.ValidationFailed, "definition file and webhook flags conflict", "Configure push to deploy with env update --auto-deploy without --from.")
+		}
+	}
+	definition, err := readDefinitionFile(path)
+	if err != nil {
+		return result{}, err
+	}
+	if definition.App != "" && definition.App != appName {
+		return result{}, contract.NewFault(contract.ValidationFailed, "definition app disagrees with the command target", "Use the file's app, or edit the definition.")
+	}
+	resolved, err := definition.Resolve(environment)
+	if err != nil {
+		return result{}, definitionFault(err)
+	}
+	resolved.App = appName
+	current, _, err := a.readEnvironment(cmd, appName, environment)
+	if err != nil {
+		return result{}, err
+	}
+	resourceSpecs, err := resolved.ResourceApplySpecs()
+	if err != nil {
+		return result{}, definitionFault(err)
+	}
+	domains, err := a.readDomainBindings(cmd, appName, environment)
+	if err != nil {
+		return result{}, err
+	}
+	if err := definitionDomainState(current, domains); err != nil {
+		return result{}, err
+	}
+	domainChanges, err := planDomainChanges(resolved.Domains, domains)
+	if err != nil {
+		return result{}, contract.NewFault(contract.ValidationFailed, "definition cannot be applied", err.Error())
+	}
+	patch, changed, diff, err := resolved.UpdatePatch(current, domains)
+	if err != nil {
+		return result{}, contract.NewFault(contract.ValidationFailed, "definition cannot be applied", err.Error())
+	}
+	domainDiff := domainChangeDiff(domainChanges)
+	revisionChanged := len(changed) > 0
+	if domainChanges.changes() > 0 {
+		changed = append(changed, "domains")
+		diff = append(diff, domainDiff...)
+	}
+	data := definitionUpdateResult{
+		App: appName, Environment: environment, From: path, Changed: changed, Diff: diff, Patch: patch,
+	}
+	if !revisionChanged && domainChanges.changes() == 0 && len(resourceSpecs) == 0 {
+		data.Plain = "No changes; nothing was submitted."
+		return result{data: data, plain: data.Plain}, nil
+	}
+	var preview platform.Preview
+	if revisionChanged {
+		preview, err = a.previewAction(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch)
+		if err != nil {
+			return result{}, err
+		}
+		data.Warnings = preview.Warnings
+	}
+	if dryRun(cmd) {
+		data.DryRun = true
+		if revisionChanged {
+			data.Preview = &preview
+		}
+		data.Plain = definitionUpdateText(data, true)
+		if humanInteractive(cmd) {
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, ui.PanelFit("Dry run: changes to "+appName+"/"+environment, output.SafeText(data.Plain), 80))
+			return result{streamed: true}, nil
+		}
+		return result{data: data, plain: data.Plain}, nil
+	}
+	var operationID contract.OperationID
+	if revisionChanged || domainChanges.changes() > 0 {
+		if revisionChanged && definitionRemoval(changed, diff) {
+			// Destruction is never implied by a file edit. The node validates the
+			// same target-naming token against current state, so a stale CLI cannot
+			// authorize an unseen removal.
+			if err := platform.ValidateTargetConfirmation(patch.Target(), flagString(cmd, "confirm")); err != nil {
+				return result{}, err
+			}
+			patch.Confirm = strings.TrimSpace(flagString(cmd, "confirm"))
+			data.Patch = patch
+		}
+		if len(domainChanges.Removes) > 0 {
+			confirmed, _ := cmd.Flags().GetStringArray("confirm-domain")
+			if err := validateDomainRemovalConfirmation(domainChanges.Removes, confirmed); err != nil {
+				return result{}, err
+			}
+		}
+		if humanInteractive(cmd) {
+			body := definitionUpdateText(data, true)
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, ui.PanelFit("Changes to "+appName+"/"+environment, output.SafeText(body), 80))
+			ok, err := ui.YesNoDefault("Update "+appName+"/"+environment+" now?", "The change is a new immutable revision; no deploy is queued and no secret value is written.", true)
+			if err != nil {
+				return result{}, setupPromptError("env update", err)
+			}
+			if !ok {
+				return result{}, contract.NewFault(contract.Cancelled, "environment update was not confirmed", "Nothing was submitted.")
+			}
+		}
+		if revisionChanged {
+			op, err := a.submitAccepted(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch, flagString(cmd, "confirm"))
+			if err != nil {
+				return result{}, err
+			}
+			operationID = op.ID
+		}
+	}
+	data.OperationID = operationID
+	domainOperations, err := a.applyDefinitionDomains(cmd, appName, environment, domainChanges)
+	if err != nil {
+		data.Warnings = append(data.Warnings, "The revision was accepted, but domain changes were not fully accepted: "+err.Error()+". Use eregion domain add/remove to retry.")
+	}
+	data.DomainOperations = domainOperations
+	if len(resourceSpecs) > 0 {
+		// A resource declaration is explicit even when the revision itself does
+		// not change, such as an attach = false declaration used only to
+		// provision the container. The applies stay separate accepted actions.
+		operations, err := a.provisionDefinitionResources(cmd, resourceSpecs)
+		if err != nil {
+			data.Warnings = append(data.Warnings, "The revision was accepted, but resource provisioning was not: "+err.Error()+". Use `eregion resource apply` to retry.")
+		}
+		data.ResourceOperations = operations
+	}
+	data.Plain = definitionUpdateText(data, false)
+	if !revisionChanged {
+		data.Plain = "No revision changes.\n"
+		for _, id := range data.DomainOperations {
+			data.Plain += "domain operation: " + string(id) + "\n"
+		}
+		for _, id := range data.ResourceOperations {
+			data.Plain += "resource operation: " + string(id) + "\n"
+		}
+		for _, warning := range data.Warnings {
+			data.Plain += "warning: " + warning + "\n"
+		}
+	}
+	if humanInteractive(cmd) {
+		fmt.Fprintln(os.Stderr, "")
+		if len(changed) > 0 {
+			fmt.Fprintln(os.Stderr, ui.Card("Environment "+appName+"/"+environment+" updated", [][2]string{
+				{"changed", strings.Join(changed, ", ")},
+				{"operation", string(operationID)},
+			}, []string{
+				ui.Dim("no deploy was queued; the next deploy applies the revision"),
+				ui.Dim("next:"),
+				"  " + ui.Code("eregion env status "+appName+" "+environment+" --json"),
+			}))
+		} else {
+			fmt.Fprintln(os.Stderr, output.SafeText(data.Plain))
+		}
+		return result{streamed: true}, nil
+	}
+	return result{data: data, plain: data.Plain}, nil
+}
+
+type definitionUpdateResult struct {
+	App                string                          `json:"app"`
+	Environment        string                          `json:"environment"`
+	From               string                          `json:"from"`
+	Changed            []string                        `json:"changed"`
+	Diff               []string                        `json:"diff,omitempty"`
+	Patch              platform.EnvironmentUpdateInput `json:"patch"`
+	OperationID        contract.OperationID            `json:"operation_id,omitempty"`
+	ResourceOperations []contract.OperationID          `json:"resource_operations,omitempty"`
+	DomainOperations   []contract.OperationID          `json:"domain_operations,omitempty"`
+	DryRun             bool                            `json:"dry_run,omitempty"`
+	Preview            *platform.Preview               `json:"preview,omitempty"`
+	Warnings           []string                        `json:"warnings,omitempty"`
+	Plain              string                          `json:"-"`
+}
+
+func definitionRemoval(changed, diff []string) bool {
+	for _, name := range changed {
+		if name != "processes" && name != "config" && name != "secret_names" && name != "resources" {
+			continue
+		}
+		for _, line := range diff {
+			if (name == "processes" && strings.HasPrefix(line, "process ")) ||
+				(strings.HasPrefix(line, name+".") && (strings.HasSuffix(line, ": removed") || strings.HasSuffix(line, ": unset"))) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func definitionUpdateText(data definitionUpdateResult, dry bool) string {
+	var out strings.Builder
+	if dry {
+		fmt.Fprintf(&out, "Dry run: update %s/%s from %s\n", data.App, data.Environment, data.From)
+	} else {
+		fmt.Fprintf(&out, "Updated %s/%s from %s\noperation: %s\n", data.App, data.Environment, data.From, data.OperationID)
+	}
+	fmt.Fprintf(&out, "changed: %s\n", strings.Join(data.Changed, ", "))
+	for _, line := range data.Diff {
+		fmt.Fprintf(&out, "  %s\n", line)
+	}
+	for _, id := range data.DomainOperations {
+		fmt.Fprintf(&out, "domain operation: %s\n", id)
+	}
+	for _, id := range data.ResourceOperations {
+		fmt.Fprintf(&out, "resource operation: %s\n", id)
+	}
+	for _, step := range previewSteps(data.Preview) {
+		fmt.Fprintf(&out, "  step: %s\n", step)
+	}
+	for _, warning := range data.Warnings {
+		fmt.Fprintf(&out, "warning: %s\n", warning)
+	}
+	if dry {
+		out.WriteString("No work was accepted.\n")
+	} else {
+		out.WriteString("No deploy was queued; the next deploy applies the revision.\n")
+	}
+	return out.String()
+}
+
+func previewSteps(preview *platform.Preview) []string {
+	if preview == nil {
+		return nil
+	}
+	return preview.Steps
 }
 
 // buildEnvironmentUpdate merges only the supplied flags over the current
@@ -647,12 +1170,16 @@ func (a *app) envList(cmd *cobra.Command, _ []string) (result, error) {
 			if serving == "" {
 				serving = "-"
 			}
+			protection := "unprotected"
+			if environment.Protected {
+				protection = "protected"
+			}
 			rows = append(rows, []string{
 				environment.App, environment.Name, environment.Node, revisionLabel(environment),
-				boolLabel(environment.Deployability.Deployable), strings.Join(environment.Deployability.Missing, ","), serving,
+				protection, boolLabel(environment.Deployability.Deployable), strings.Join(environment.Deployability.Missing, ","), serving,
 			})
 		}
-		plain = ui.Header("Environments", 72) + "\n" + writeTable([]string{"APP", "ENVIRONMENT", "NODE", "REVISION", "DEPLOYABLE", "MISSING", "SERVING RELEASE"}, rows)
+		plain = ui.Header("Environments", 72) + "\n" + writeTable([]string{"APP", "ENVIRONMENT", "NODE", "REVISION", "PROTECTION", "DEPLOYABLE", "MISSING", "SERVING RELEASE"}, rows)
 	}
 	return result{data: raw, plain: plain}, nil
 }

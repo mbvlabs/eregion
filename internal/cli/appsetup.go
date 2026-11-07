@@ -8,10 +8,12 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/output"
@@ -70,8 +72,36 @@ type setupAnswers struct {
 	Processes    []platform.ProcessSpec
 	Config       map[string]string
 	SecretValues map[string][]byte
-	Domain       string
-	Deploy       bool
+	// SecretNames are names referenced without a value, as in an app
+	// definition file. They must already exist in the environment vault.
+	SecretNames []string
+	// ReleaseArgv is the exact release command argv when it came from a file.
+	// nil keeps the string-line behavior used by the flags.
+	ReleaseArgv     []string
+	Domain          string
+	DomainCheckPath string
+	// Domains carries a definition file's complete set of first-environment
+	// bindings. When nonempty it replaces the single Domain fields.
+	Domains []platform.DomainDeclaration
+	// ResourceSpecs are managed Docker resources declared in a definition file.
+	// They are provisioned explicitly after creation, never by the deploy path.
+	ResourceSpecs []platform.ResourceApplyInput
+	// ResourceNames are the declarations attached to the first revision and
+	// therefore gating its deploy.
+	ResourceNames []string
+	// AdditionalResourceSpecs holds the resource declarations for each
+	// environment resolved by an app-create definition file. env create never
+	// uses it.
+	AdditionalResourceSpecs map[string][]platform.ResourceApplyInput
+	// PrebuiltSpecs is set when a definition file resolves both production and
+	// staging. Otherwise app create derives staging from the flag recipe.
+	PrebuiltSpecs []platform.EnvironmentSpec
+	// Protection forces one protection state for every environment created by
+	// this command. Nil means the name default.
+	Protection *bool
+	Deploy     bool
+	// From is the definition file path, for the plan only.
+	From string
 }
 
 // humanInteractive reports whether this invocation may ask questions. JSON,
@@ -109,10 +139,38 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	f.StringArray("process", nil, "Complete process entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces the default web process). A worker has no port: queue=worker::1:/app/bin/queue")
 	f.StringArray("config", nil, "Plain configuration KEY=VALUE (repeatable)")
 	f.StringArray("secret", nil, "Vault secret NAME=PATH with a protected 0600 value file (repeatable)")
+	f.String("from", "", "Read an eregion.toml app definition; config is plain, secrets are names only; revision flags cannot be combined")
 	f.String("idempotency-key", "", "Stable submission key; one is generated when empty")
 	f.Bool("dry-run", false, "Validate and show the plan without accepting work or writing secrets")
 	if withDomain {
 		f.String("domain", "", "Public hostname for the environment; empty adds no binding")
+		f.String("domain-check-path", "", "HTTP path to observe on the first domain; empty uses the web health path")
+	}
+}
+
+// addProtectionFlags adds the explicit creation-time protection choice shared
+// by app create and env create. Omitting both uses the name default:
+// production and staging protected, every other name unprotected.
+func addProtectionFlags(cmd *cobra.Command) {
+	cmd.Flags().Bool("protected", false, "Create the environment protected (the default for production and staging)")
+	cmd.Flags().Bool("unprotected", false, "Create the environment unprotected; explicit opt-out from the name default")
+}
+
+func setupProtectionFlag(cmd *cobra.Command) (*bool, error) {
+	protected := flagChanged(cmd, "protected")
+	unprotected := flagChanged(cmd, "unprotected")
+	if protected && unprotected {
+		return nil, contract.NewFault(contract.ValidationFailed, "choose one protection state", "Pass --protected or --unprotected, not both.")
+	}
+	switch {
+	case unprotected:
+		value := false
+		return &value, nil
+	case protected:
+		value := true
+		return &value, nil
+	default:
+		return nil, nil
 	}
 }
 
@@ -227,26 +285,251 @@ func askIntRange(title, description, def string, min, max int) (int, error) {
 	}
 }
 
+// definitionRevisionFlags are the explicit flag inputs that a definition file
+// owns. Combining one with --from would make the requested state ambiguous.
+var definitionRevisionFlags = []string{
+	"node", "build-node", "git-url", "git-ref", "git-credential-file",
+	"git-credential-name", "image", "builder", "context-path", "build-env",
+	"container-port", "health-type", "health-path", "health-timeout",
+	"release-command", "process", "config", "secret", "domain", "domain-check-path",
+}
+
+func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string) (*setupAnswers, error) {
+	for _, name := range definitionRevisionFlags {
+		if flagChanged(cmd, name) {
+			return nil, contract.NewFault(contract.ValidationFailed, "definition file and revision flags conflict", "Use --from alone for revision fields; keep only identity, deploy, output and idempotency flags.")
+		}
+	}
+	definition, err := readDefinitionFile(path)
+	if err != nil {
+		return nil, err
+	}
+	protection, err := setupProtectionFlag(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	appName := definition.App
+	switch mode {
+	case setupApp:
+		if flagChanged(cmd, "name") {
+			flagName := flagString(cmd, "name")
+			if appName != "" && flagName != appName {
+				return nil, contract.NewFault(contract.ValidationFailed, "definition app disagrees with --name", "Use the file's app name, or edit the definition.")
+			}
+			appName = flagName
+		}
+	case setupEnvironment:
+		if flagChanged(cmd, "app") {
+			flagApp := flagString(cmd, "app")
+			if appName != "" && flagApp != appName {
+				return nil, contract.NewFault(contract.ValidationFailed, "definition app disagrees with --app", "Use the file's app name, or edit the definition.")
+			}
+			appName = flagApp
+		}
+	}
+	if err := platform.ValidateName(appName); err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "definition app is missing or invalid", "Set app in the definition or pass the command's app flag.")
+	}
+	addresses := mainNodeAddresses(cmd)
+	resolve := func(name string) (*appdef.Resolved, platform.EnvironmentSpec, []platform.ResourceApplyInput, error) {
+		resolved, err := definition.Resolve(name)
+		if err != nil {
+			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
+		}
+		resolved.App = appName
+		spec, err := resolved.CreateSpec(addresses)
+		if err != nil {
+			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
+		}
+		resourceSpecs, err := resolved.ResourceApplySpecs()
+		if err != nil {
+			return nil, platform.EnvironmentSpec{}, nil, definitionFault(err)
+		}
+		attachmentNames, attachmentsSet := resolved.ResourceAttachments()
+		if attachmentsSet {
+			spec.Resources = attachmentNames
+		}
+		if protection != nil {
+			spec.Protected = protection
+		} else {
+			value := platform.DefaultEnvironmentProtection(spec.Name)
+			spec.Protected = &value
+		}
+		return resolved, spec, resourceSpecs, nil
+	}
+
+	var specs []platform.EnvironmentSpec
+	var resourceByEnvironment = map[string][]platform.ResourceApplyInput{}
+	switch mode {
+	case setupApp:
+		for _, name := range []string{"production", "staging"} {
+			_, spec, resourceSpecs, err := resolve(name)
+			if err != nil {
+				return nil, err
+			}
+			specs = append(specs, spec)
+			resourceByEnvironment[name] = resourceSpecs
+		}
+		if err := validateUniqueEnvironmentDomains(specs); err != nil {
+			return nil, err
+		}
+	case setupEnvironment:
+		selected := flagString(cmd, "name")
+		if selected == "" {
+			return nil, contract.NewFault(contract.InputRequired, "an environment is required", "Pass --name; the shared recipe applies to any environment without adding it to the definition.")
+		}
+		if err := platform.ValidateName(selected); err != nil {
+			return nil, contract.NewFault(contract.ValidationFailed, "definition environment is invalid", err.Error())
+		}
+		_, spec, resourceSpecs, err := resolve(selected)
+		if err != nil {
+			return nil, err
+		}
+		specs = append(specs, spec)
+		resourceByEnvironment[selected] = resourceSpecs
+	}
+
+	primary := specs[0]
+	ans := &setupAnswers{
+		App: appName, Environment: primary.Name, Node: primary.Node, BuildNode: primary.BuildNode,
+		SourceKind: primary.Source.Kind, GitURL: primary.Source.URL, GitRef: primary.Source.Ref,
+		CredentialName: primary.Source.CredentialSecretName, Image: primary.Source.Image,
+		Builder: primary.Source.Builder, ContextPath: primary.Source.ContextPath,
+		ContainerPort: primary.ContainerPort, HealthType: primary.Runtime.HealthType,
+		HealthPath: primary.Runtime.HealthPath, HealthTimeout: primary.Runtime.HealthTimeoutSeconds,
+		Processes: primary.Processes, Config: cloneStringMap(primary.Config),
+		SecretValues: map[string][]byte{}, SecretNames: append([]string(nil), primary.SecretNames...),
+		Domains: append([]platform.DomainDeclaration(nil), primary.Domains...), From: path,
+		ResourceSpecs: resourceByEnvironment[primary.Name], ResourceNames: append([]string(nil), primary.Resources...),
+		Protection: protection, PrebuiltSpecs: specs, AdditionalResourceSpecs: resourceByEnvironment,
+	}
+	for _, domain := range primary.Domains {
+		if domain.Primary {
+			ans.Domain, ans.DomainCheckPath = domain.Domain, domain.CheckPath
+			break
+		}
+	}
+	if len(primary.Domains) == 0 {
+		ans.Domain, ans.DomainCheckPath = primary.Domain, primary.DomainCheckPath
+	}
+	if primary.Source.BuildEnv != nil {
+		ans.BuildEnv = cloneStringMap(primary.Source.BuildEnv)
+	}
+	if primary.Runtime.ReleaseCommand != nil {
+		ans.ReleaseArgv = append([]string(nil), primary.Runtime.ReleaseCommand.Argv...)
+	}
+	interactive := humanInteractive(cmd)
+	switch {
+	case boolFlag(cmd, "no-deploy"):
+		ans.Deploy = false
+	case interactive && !flagChanged(cmd, "no-deploy"):
+		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from production's new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
+		if err != nil {
+			return nil, err
+		}
+		ans.Deploy = deploy
+	default:
+		ans.Deploy = true
+	}
+	if len(ans.ResourceSpecs) > 0 || len(ans.AdditionalResourceSpecs["staging"]) > 0 {
+		// Resources are provisioned only after the environment exists. Queuing
+		// a first deploy in the same submission would race an absent resource,
+		// so it is deliberately deferred; the operator deploys once health is
+		// ready.
+		ans.Deploy = false
+	}
+	return ans, nil
+}
+
+// validateUniqueEnvironmentDomains refuses a recipe that resolves the same
+// hostname for two environments before any transaction is opened. Staging may
+// legitimately have no domain until one is configured.
+func validateUniqueEnvironmentDomains(specs []platform.EnvironmentSpec) error {
+	seen := map[string]string{}
+	for _, spec := range specs {
+		for _, domain := range environmentSpecDomains(spec) {
+			if other, exists := seen[domain]; exists {
+				return contract.NewFault(contract.ValidationFailed,
+					"domain "+domain+" is declared for both "+other+" and "+spec.Name,
+					"Each hostname can route to one environment; put distinct domains in [environments.<name>] overrides.")
+			}
+			seen[domain] = spec.Name
+		}
+	}
+	return nil
+}
+
+func environmentSpecDomains(spec platform.EnvironmentSpec) []string {
+	names := make([]string, 0, len(spec.Domains)+1)
+	if spec.Domain != "" {
+		names = append(names, spec.Domain)
+	}
+	for _, domain := range spec.Domains {
+		names = append(names, domain.Domain)
+	}
+	return names
+}
+
+func readDefinitionFile(path string) (appdef.Definition, error) {
+	const maxDefinitionBytes = 1 << 20
+	info, err := os.Stat(path)
+	if err != nil {
+		return appdef.Definition{}, contract.NewFault(contract.InputRequired, "cannot read the app definition", "Pass --from with a readable regular file.")
+	}
+	if !info.Mode().IsRegular() {
+		return appdef.Definition{}, contract.NewFault(contract.InputRequired, "the app definition is not a regular file", "Pass --from with a readable regular file.")
+	}
+	if info.Size() > maxDefinitionBytes {
+		return appdef.Definition{}, contract.NewFault(contract.ValidationFailed, "the app definition is too large", "Keep the definition under 1 MiB.")
+	}
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator explicitly selected the definition input.
+	if err != nil {
+		return appdef.Definition{}, contract.NewFault(contract.InputRequired, "cannot read the app definition", "Pass --from with a readable regular file.")
+	}
+	definition, err := appdef.Parse(raw)
+	if err != nil {
+		return appdef.Definition{}, definitionFault(err)
+	}
+	return definition, nil
+}
+
+func definitionFault(err error) error {
+	return contract.NewFault(contract.ValidationFailed, "invalid app definition", err.Error())
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
+}
+
 // readSetup reads the flags, asks only for what is still missing in a terminal
 // and returns one validated declaration. Every question has a flag equivalent.
 func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, error) {
+	if from := flagString(cmd, "from"); from != "" {
+		return a.readSetupFromFile(cmd, mode, from)
+	}
 	interactive := humanInteractive(cmd)
 	ans := &setupAnswers{
-		Node:           flagString(cmd, "node"),
-		BuildNode:      flagString(cmd, "build-node"),
-		GitURL:         flagString(cmd, "git-url"),
-		GitRef:         flagString(cmd, "git-ref"),
-		Image:          flagString(cmd, "image"),
-		Builder:        flagString(cmd, "builder"),
-		ContextPath:    flagString(cmd, "context-path"),
-		ContainerPort:  flagInt(cmd, "container-port"),
-		HealthType:     strings.ToLower(flagString(cmd, "health-type")),
-		HealthPath:     flagString(cmd, "health-path"),
-		HealthTimeout:  flagInt(cmd, "health-timeout"),
-		ReleaseCommand: flagString(cmd, "release-command"),
-		Domain:         flagString(cmd, "domain"),
-		Config:         map[string]string{},
-		SecretValues:   map[string][]byte{},
+		Node:            flagString(cmd, "node"),
+		BuildNode:       flagString(cmd, "build-node"),
+		GitURL:          flagString(cmd, "git-url"),
+		GitRef:          flagString(cmd, "git-ref"),
+		Image:           flagString(cmd, "image"),
+		Builder:         flagString(cmd, "builder"),
+		ContextPath:     flagString(cmd, "context-path"),
+		ContainerPort:   flagInt(cmd, "container-port"),
+		HealthType:      strings.ToLower(flagString(cmd, "health-type")),
+		HealthPath:      flagString(cmd, "health-path"),
+		HealthTimeout:   flagInt(cmd, "health-timeout"),
+		ReleaseCommand:  flagString(cmd, "release-command"),
+		Domain:          flagString(cmd, "domain"),
+		DomainCheckPath: flagString(cmd, "domain-check-path"),
+		Config:          map[string]string{},
+		SecretValues:    map[string][]byte{},
 	}
 	if ans.Node == "" {
 		ans.Node = defaultNodeName
@@ -270,13 +553,16 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 	}()
 
+	protection, err := setupProtectionFlag(cmd)
+	if err != nil {
+		return nil, err
+	}
+	ans.Protection = protection
 	switch mode {
 	case setupApp:
 		ans.App = flagString(cmd, "name")
-		ans.Environment = flagString(cmd, "environment")
-		if ans.Environment == "" {
-			ans.Environment = "production"
-		}
+		// app create always materialises production and staging from one recipe.
+		ans.Environment = "production"
 	case setupEnvironment:
 		ans.App = flagString(cmd, "app")
 		ans.Environment = flagString(cmd, "name")
@@ -306,12 +592,8 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 		ans.Environment = value
 	}
-	if interactive && !flagChanged(cmd, "environment") && mode == setupApp {
-		value, err := askValidated("First environment", "The unit of deployment", ans.Environment, platform.ValidateName)
-		if err != nil {
-			return nil, err
-		}
-		ans.Environment = value
+	if interactive && mode == setupApp {
+		fmt.Fprintln(os.Stderr, ui.Note("app create will also create staging from this recipe; both start protected."))
 	}
 	if interactive && !flagChanged(cmd, "node") {
 		value, err := a.askNode(cmd, "Application node", "Runs the containers", ans.Node, platform.RoleApplication, platform.CapabilityDocker, "", "")
@@ -780,36 +1062,70 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 		containerPort = platform.DefaultContainerPort
 	}
 
-	secretNames := make([]string, 0, len(ans.SecretValues))
+	secretNames := make([]string, 0, len(ans.SecretValues)+len(ans.SecretNames))
+	seenSecret := map[string]bool{}
+	for _, name := range ans.SecretNames {
+		if err := vault.ValidateName(name); err != nil {
+			return platform.EnvironmentSpec{}, err
+		}
+		if !seenSecret[name] {
+			seenSecret[name] = true
+			secretNames = append(secretNames, name)
+		}
+	}
 	for name := range ans.SecretValues {
 		if err := vault.ValidateName(name); err != nil {
 			return platform.EnvironmentSpec{}, err
 		}
-		secretNames = append(secretNames, name)
+		if !seenSecret[name] {
+			seenSecret[name] = true
+			secretNames = append(secretNames, name)
+		}
 	}
 	sort.Strings(secretNames)
 
 	var domainAddresses []string
-	if ans.Domain != "" {
+	domains := append([]platform.DomainDeclaration(nil), ans.Domains...)
+	if len(domains) == 0 && ans.Domain != "" {
+		domains = []platform.DomainDeclaration{{
+			Domain: ans.Domain, Primary: true, CheckPath: ans.DomainCheckPath,
+		}}
+	}
+	if len(domains) > 0 {
 		domainAddresses = mainNodeAddresses(cmd)
 	}
-	return platform.EnvironmentSpec{
+	releaseCommand := commandSpecFromLine(ans.ReleaseCommand)
+	if ans.ReleaseArgv != nil {
+		releaseCommand = nil
+		if len(ans.ReleaseArgv) > 0 {
+			releaseCommand = &platform.CommandSpec{Argv: append([]string(nil), ans.ReleaseArgv...)}
+		}
+	}
+	spec := platform.EnvironmentSpec{
 		Name: ans.Environment, Node: ans.Node, BuildNode: ans.BuildNode,
+		Protected:     ans.Protection,
 		ContainerPort: containerPort, Bind: platform.DefaultBind,
 		Health: platform.HealthInput{Type: ans.HealthType, Path: ans.HealthPath, TimeoutSeconds: ans.HealthTimeout},
 		Source: source,
 		Runtime: platform.RuntimeSpec{
 			Node: ans.Node, HealthType: ans.HealthType, HealthPath: ans.HealthPath,
 			HealthTimeoutSeconds: ans.HealthTimeout,
-			ReleaseCommand:       commandSpecFromLine(ans.ReleaseCommand),
+			ReleaseCommand:       releaseCommand,
 		},
 		Processes:       processes,
 		Config:          ans.Config,
 		SecretNames:     secretNames,
-		Domain:          ans.Domain,
-		DomainPrimary:   ans.Domain != "",
+		Resources:       append([]string(nil), ans.ResourceNames...),
 		DomainAddresses: domainAddresses,
-	}, nil
+	}
+	if len(domains) > 0 {
+		spec.Domains = domains
+	}
+	if spec.Protected == nil {
+		value := platform.DefaultEnvironmentProtection(spec.Name)
+		spec.Protected = &value
+	}
+	return spec, nil
 }
 
 func defaultSetupWebProcess(port int) platform.ProcessSpec {
@@ -978,8 +1294,24 @@ func domainDNSRecord(domain string, cmd *cobra.Command) (hostDNSRecord, bool) {
 // --dry-run in every mode.
 func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) string {
 	var out strings.Builder
+	if ans.From != "" {
+		fmt.Fprintf(&out, "definition: %s\n", ans.From)
+	}
 	fmt.Fprintf(&out, "app: %s\n", ans.App)
-	fmt.Fprintf(&out, "environment: %s\n", ans.Environment)
+	specs := append([]platform.EnvironmentSpec(nil), ans.PrebuiltSpecs...)
+	if len(specs) > 1 {
+		labels := make([]string, 0, len(specs))
+		for _, spec := range specs {
+			state := "unprotected"
+			if protectedSpec(spec) {
+				state = "protected"
+			}
+			labels = append(labels, spec.Name+" ("+state+")")
+		}
+		fmt.Fprintf(&out, "environments: %s\n", strings.Join(labels, ", "))
+	} else {
+		fmt.Fprintf(&out, "environment: %s (%s)\n", ans.Environment, protectionLabel(ans.Protection, ans.Environment))
+	}
 	fmt.Fprintf(&out, "node: %s\n", ans.Node)
 	if ans.BuildNode != "" {
 		fmt.Fprintf(&out, "builder node: %s\n", ans.BuildNode)
@@ -1017,11 +1349,31 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 			fmt.Fprintf(&out, "config: %s=%s\n", key, ans.Config[key])
 		}
 	}
-	if len(ans.SecretValues) > 0 {
-		fmt.Fprintf(&out, "secrets: %s\n", strings.Join(sortedKeysBytes(ans.SecretValues), ", "))
+	if len(ans.SecretValues) > 0 || len(ans.SecretNames) > 0 {
+		fmt.Fprintf(&out, "secrets: %s\n", strings.Join(setupSecretNames(ans), ", "))
 	}
-	if ans.Domain != "" {
+	if len(ans.Domains) > 0 {
+		for _, domain := range ans.Domains {
+			label := ""
+			if domain.Primary {
+				label = " (primary)"
+			}
+			fmt.Fprintf(&out, "domain: %s%s\n", domain.Domain, label)
+			if domain.CheckPath != "" {
+				fmt.Fprintf(&out, "domain check path: %s\n", domain.CheckPath)
+			}
+			if record, ok := domainDNSRecord(domain.Domain, cmd); ok {
+				fmt.Fprintf(&out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
+			} else {
+				fmt.Fprintf(&out, "DNS record: point %s at the main node's public IPv4 address\n", domain.Domain)
+			}
+		}
+		fmt.Fprintln(&out, "Create them at the DNS provider; a Cloudflare proxy in front is fine.")
+	} else if ans.Domain != "" {
 		fmt.Fprintf(&out, "domain: %s\n", ans.Domain)
+		if ans.DomainCheckPath != "" {
+			fmt.Fprintf(&out, "domain check path: %s\n", ans.DomainCheckPath)
+		}
 		if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
 			fmt.Fprintf(&out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
 		} else {
@@ -1031,11 +1383,40 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 	} else {
 		fmt.Fprintln(&out, "domain: none; add one later with eregion domain add")
 	}
+	attached := map[string]bool{}
+	for _, name := range ans.ResourceNames {
+		attached[name] = true
+	}
+	for _, resource := range ans.ResourceSpecs {
+		fmt.Fprintf(&out, "resource: %s image %s", resource.Name, resource.Image)
+		if resource.Port > 0 {
+			fmt.Fprintf(&out, " port %d", resource.Port)
+		}
+		if attached[resource.Name] {
+			out.WriteString(" (deployment dependency)")
+		} else {
+			out.WriteString(" (provision only; not attached)")
+		}
+		out.WriteString("\n")
+		if len(resource.SecretEnv) > 0 {
+			names := make([]string, 0, len(resource.SecretEnv))
+			for key, name := range resource.SecretEnv {
+				names = append(names, key+"="+name)
+			}
+			sort.Strings(names)
+			fmt.Fprintf(&out, "  secret references: %s\n", strings.Join(names, ", "))
+		}
+		for _, mount := range resource.Mounts {
+			fmt.Fprintf(&out, "  volume: %s -> %s\n", mount.Name, mount.Destination)
+		}
+	}
 	if ans.Deploy {
 		fmt.Fprintln(&out, "first deploy: queued from the revision")
 		if ans.Domain == "" {
 			fmt.Fprintln(&out, "warning: the first deploy has no domain; the deployability gate refuses it until a primary domain is bound")
 		}
+	} else if len(ans.ResourceSpecs) > 0 {
+		fmt.Fprintln(&out, "first deploy: deferred until declared resources report healthy")
 	} else {
 		fmt.Fprintln(&out, "first deploy: not requested")
 	}
@@ -1168,33 +1549,67 @@ func (a *app) putSecret(cmd *cobra.Command, namespace vault.Namespace, value []b
 // setupSecretNames is the result shape's secret-name list without writing
 // anything. A replay already wrote these values in its original submission.
 func setupSecretNames(ans *setupAnswers) []string {
-	return sortedKeysBytes(ans.SecretValues)
+	seen := map[string]bool{}
+	names := make([]string, 0, len(ans.SecretValues)+len(ans.SecretNames))
+	for _, name := range ans.SecretNames {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for name := range ans.SecretValues {
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
-// writeSetupSecrets stores the read credential and the environment secrets
-// before the app/environment submission. Only names enter the operation input.
-func (a *app) writeSetupSecrets(cmd *cobra.Command, ans *setupAnswers) ([]string, error) {
-	names := make([]string, 0, len(ans.SecretValues)+1)
-	if ans.CredentialName != "" && len(ans.CredentialValue) > 0 {
-		namespace, err := vault.NewNamespace(ans.App, ans.Environment, ans.CredentialName)
-		if err != nil {
-			return nil, err
+// writeSetupSecrets stores the read credential and the environment secrets for
+// one environment before its submission. Only names enter the operation input.
+func (a *app) writeSetupSecrets(cmd *cobra.Command, ans *setupAnswers, spec platform.EnvironmentSpec) ([]string, error) {
+	return a.writeSetupSecretsForEnvironments(cmd, ans, []platform.EnvironmentSpec{spec})
+}
+
+// writeSetupSecretsForEnvironments materialises one supplied value into each
+// environment namespace whose spec names it. A shared app recipe therefore
+// writes the same value to production and staging, while an environment-specific
+// name never leaks into another namespace. The Git read credential follows the
+// same rule and is written only when the spec's source names that credential.
+func (a *app) writeSetupSecretsForEnvironments(cmd *cobra.Command, ans *setupAnswers, specs []platform.EnvironmentSpec) ([]string, error) {
+	written := make([]string, 0, len(ans.SecretValues)+1)
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		if ans.CredentialName != "" && len(ans.CredentialValue) > 0 && spec.Source.CredentialSecretName == ans.CredentialName {
+			namespace, err := vault.NewNamespace(ans.App, spec.Name, ans.CredentialName)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := a.putSecret(cmd, namespace, ans.CredentialValue); err != nil {
+				return nil, err
+			}
 		}
-		if _, err := a.putSecret(cmd, namespace, ans.CredentialValue); err != nil {
-			return nil, err
+		for _, name := range sortedKeysBytes(ans.SecretValues) {
+			if !slices.Contains(spec.SecretNames, name) {
+				continue
+			}
+			namespace, err := vault.NewNamespace(ans.App, spec.Name, name)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := a.putSecret(cmd, namespace, ans.SecretValues[name]); err != nil {
+				return nil, err
+			}
+			key := spec.Name + "\x00" + name
+			if !seen[key] {
+				seen[key] = true
+				written = append(written, name)
+			}
 		}
 	}
-	for _, name := range sortedKeysBytes(ans.SecretValues) {
-		namespace, err := vault.NewNamespace(ans.App, ans.Environment, name)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := a.putSecret(cmd, namespace, ans.SecretValues[name]); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, nil
+	return written, nil
 }
 
 // appExists and environmentExists let the create flows refuse an existing
@@ -1322,6 +1737,11 @@ func writeEnvironmentStatus(env platform.Environment) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "Environment %s/%s\n", env.App, env.Name)
 	fmt.Fprintf(&out, "  node: %s\n", env.Node)
+	protection := "unprotected"
+	if env.Protected {
+		protection = "protected (deletion requires the human factor)"
+	}
+	fmt.Fprintf(&out, "  protection: %s\n", protection)
 	if env.Revision != nil {
 		fmt.Fprintf(&out, "  revision: %d (%s)\n", env.Revision.Number, env.Revision.ID)
 		fmt.Fprintf(&out, "  deployable: %s\n", environmentDeployability(env))
@@ -1363,24 +1783,38 @@ func writeEnvironmentStatus(env platform.Environment) string {
 	return out.String()
 }
 
+// setupEnvironmentResult is the secret-free summary of one environment created
+// by app create or env create.
+type setupEnvironmentResult struct {
+	Name      string `json:"name"`
+	Node      string `json:"node"`
+	Protected bool   `json:"protected"`
+	Domain    string `json:"domain,omitempty"`
+}
+
 // setupResult is the secret-free result of app create or env create.
 type setupResult struct {
-	App                    string                 `json:"app"`
-	Environment            string                 `json:"environment"`
-	Node                   string                 `json:"node"`
-	Source                 platform.SourceBinding `json:"source"`
-	Processes              []platform.ProcessSpec `json:"processes"`
-	ConfigKeys             []string               `json:"config_keys,omitempty"`
-	SecretNames            []string               `json:"secret_names,omitempty"`
-	CredentialSecretName   string                 `json:"credential_secret_name,omitempty"`
-	Domain                 string                 `json:"domain,omitempty"`
-	DNSRecord              *hostDNSRecord         `json:"dns_record,omitempty"`
-	Deploy                 bool                   `json:"deploy"`
-	OperationID            contract.OperationID   `json:"operation_id,omitempty"`
-	FirstDeployOperationID contract.OperationID   `json:"first_deploy_operation_id,omitempty"`
-	DryRun                 bool                   `json:"dry_run,omitempty"`
-	Preview                *platform.Preview      `json:"preview,omitempty"`
-	Warnings               []string               `json:"warnings,omitempty"`
+	App                    string                       `json:"app"`
+	Environment            string                       `json:"environment"`
+	Protected              bool                         `json:"protected"`
+	Environments           []setupEnvironmentResult     `json:"environments,omitempty"`
+	Node                   string                       `json:"node"`
+	Source                 platform.SourceBinding       `json:"source"`
+	Processes              []platform.ProcessSpec       `json:"processes"`
+	ConfigKeys             []string                     `json:"config_keys,omitempty"`
+	SecretNames            []string                     `json:"secret_names,omitempty"`
+	CredentialSecretName   string                       `json:"credential_secret_name,omitempty"`
+	Domain                 string                       `json:"domain,omitempty"`
+	DomainCheckPath        string                       `json:"domain_check_path,omitempty"`
+	Domains                []platform.DomainDeclaration `json:"domains,omitempty"`
+	ResolvedResourceIDs    []contract.OperationID       `json:"resource_operations,omitempty"`
+	DNSRecord              *hostDNSRecord               `json:"dns_record,omitempty"`
+	Deploy                 bool                         `json:"deploy"`
+	OperationID            contract.OperationID         `json:"operation_id,omitempty"`
+	FirstDeployOperationID contract.OperationID         `json:"first_deploy_operation_id,omitempty"`
+	DryRun                 bool                         `json:"dry_run,omitempty"`
+	Preview                *platform.Preview            `json:"preview,omitempty"`
+	Warnings               []string                     `json:"warnings,omitempty"`
 
 	created string
 	plan    string
@@ -1390,7 +1824,19 @@ func (r setupResult) plainText() string {
 	if r.DryRun {
 		var out strings.Builder
 		if r.created == "app" {
-			fmt.Fprintf(&out, "Dry run: create app %s with environment %s\n", r.App, r.Environment)
+			if len(r.Environments) > 0 {
+				labels := make([]string, 0, len(r.Environments))
+				for _, environment := range r.Environments {
+					state := "unprotected"
+					if environment.Protected {
+						state = "protected"
+					}
+					labels = append(labels, environment.Name+" ("+state+")")
+				}
+				fmt.Fprintf(&out, "Dry run: create app %s with environments %s\n", r.App, strings.Join(labels, ", "))
+			} else {
+				fmt.Fprintf(&out, "Dry run: create app %s with environment %s\n", r.App, r.Environment)
+			}
 		} else {
 			fmt.Fprintf(&out, "Dry run: create environment %s/%s\n", r.App, r.Environment)
 		}
@@ -1399,19 +1845,41 @@ func (r setupResult) plainText() string {
 	}
 	var out strings.Builder
 	if r.created == "app" {
-		fmt.Fprintf(&out, "Created app %s with environment %s on %s.\n", r.App, r.Environment, r.Node)
+		if len(r.Environments) > 0 {
+			labels := make([]string, 0, len(r.Environments))
+			for _, environment := range r.Environments {
+				state := "unprotected"
+				if environment.Protected {
+					state = "protected"
+				}
+				labels = append(labels, environment.Name+" ("+state+")")
+			}
+			fmt.Fprintf(&out, "Created app %s with environments %s on %s.\n", r.App, strings.Join(labels, ", "), r.Node)
+		} else {
+			fmt.Fprintf(&out, "Created app %s with environment %s on %s.\n", r.App, r.Environment, r.Node)
+		}
 	} else {
-		fmt.Fprintf(&out, "Created environment %s/%s on %s.\n", r.App, r.Environment, r.Node)
+		state := "unprotected"
+		if r.Protected {
+			state = "protected"
+		}
+		fmt.Fprintf(&out, "Created environment %s/%s on %s (%s).\n", r.App, r.Environment, r.Node, state)
 	}
 	fmt.Fprintf(&out, "operation: %s\n", r.OperationID)
 	if r.FirstDeployOperationID != "" {
 		fmt.Fprintf(&out, "first deploy operation: %s\n", r.FirstDeployOperationID)
+	}
+	for _, id := range r.ResolvedResourceIDs {
+		fmt.Fprintf(&out, "resource operation: %s\n", id)
 	}
 	if r.Deploy {
 		out.WriteString("first deploy: queued from the revision\n")
 	}
 	if r.Domain != "" {
 		fmt.Fprintf(&out, "domain: %s\n", r.Domain)
+		if r.DomainCheckPath != "" {
+			fmt.Fprintf(&out, "domain check path: %s\n", r.DomainCheckPath)
+		}
 		if r.DNSRecord != nil {
 			fmt.Fprintf(&out, "DNS record:\n  %s  %s  %s\n", r.DNSRecord.Type, r.DNSRecord.Name, r.DNSRecord.Value)
 		} else {
@@ -1426,6 +1894,29 @@ func (r setupResult) plainText() string {
 		fmt.Fprintf(&out, "follow: eregion operations follow %s\n", r.FirstDeployOperationID)
 	}
 	return out.String()
+}
+
+// provisionDefinitionResources accepts one explicit resource apply per
+// declaration after the app/environment exists. It never waits for readiness
+// and never writes secret values; existing resource identities are reapplied
+// with their durable volume ownership preserved.
+func (a *app) provisionDefinitionResources(cmd *cobra.Command, specs []platform.ResourceApplyInput) ([]contract.OperationID, error) {
+	if dryRun(cmd) || len(specs) == 0 {
+		return nil, nil
+	}
+	ids := make([]contract.OperationID, 0, len(specs))
+	for _, spec := range specs {
+		target, err := platform.NewResourceTarget(spec.App, spec.Environment, spec.Name)
+		if err != nil {
+			return ids, err
+		}
+		op, err := a.submitAccepted(cmd, platform.KindResourceApply, target.String(), spec, "")
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, op.ID)
+	}
+	return ids, nil
 }
 
 func describeSource(source platform.SourceBinding) string {
