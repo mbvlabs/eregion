@@ -373,21 +373,27 @@ identity, every manifest SHA-256 matched, and linux/amd64 reported commit
 MANUAL-TESTING. The tag annotation is not GPG-signed; authenticity comes from
 the cosign bundles.
 
-Alpha.3 source is implemented on `master` in the current worktree: the shared
-read-only container resolver for bare process/release commands (plain images
-directly; Buildpacks after the launcher) and the schema-1 release safety guards
-(snapshot-only alpha/beta, rc-only pointer, final-only stable/line pointer,
-strict final stable tag). It is **not tagged, published or host-qualified**; the
-orchestrator owns commit, push, PR, tag and release. The existing schema-1
-alpha.2 node/client path remains compatible, so no manifest-schema migration or
-compatibility shim is introduced. Real qualification still requires a published
-alpha.3 snapshot, installer checks, host node upgrade and a Docker/Buildpacks
-resolver run.
+Alpha.3 source is published as `edge-9e71713eeff9` (commit `9e71713`,
+Publish edge `42387096819`, CI `42387096776`) and host-qualified for the shared
+read-only container resolver: a plain Docker image resolved bare `migrate`
+commands from cwd fallback, and a Buildpacks image resolved the same bare
+release/service/worker/web commands through the launcher's launch-layer `bin`
+PATH, with public health and app responses. CLI and `main` were upgraded; node
+apply `op_162c42a9c556258cd7123fd40b06965b`; schema stayed **24/24**, `doctor`
+20/0/0 and `apply --dry-run` 0 of 20. The test environments, domain bindings and
+images were removed and the fixture app was left intact. Alpha.3 is **not
+tagged**; snapshot/installer publication and tag checks remain, and this is a
+targeted host qualification rather than a repeated full manual acceptance. The
+schema-1 release safety guards (snapshot-only alpha/beta, rc-only pointer,
+final-only stable/line pointer, strict final stable tag) remain source-tested;
+the existing schema-1 alpha.2 node/client path is compatible, with no
+manifest-schema migration or compatibility shim.
 The 2026-11-06 alpha.2 protection redesign is host-qualified on `main` at
 `edge-6d1ae98b9ac1` (commit `6d1ae98`, edge run 42285442054); the cancellation
 builds `edge-81998646916d` and `edge-7e74edbed8bc` followed; the tagged
-`1.0.0-alpha.2` snapshot at `85f2a4f` (same tree) is now installed on the CLI
-and `main`; their host verification is recorded below. The CLI and node
+`1.0.0-alpha.2` snapshot at `85f2a4f` (same tree) was installed, and
+`edge-9e71713eeff9` now supersedes it on the CLI and `main`; their host
+verification is recorded below. The CLI and node
 were upgraded; node apply `op_fca44c39b625e2216d05d7581de99c18` applied
 migration 024, the node reports schema **24/24**, River 7/7, `doctor` 20 pass /
 0 warn / 0 fail, and the repeat `apply --dry-run` was 0 of 20. Migration 024
@@ -1019,7 +1025,7 @@ MANUAL-TESTING for the evidence.
 | Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Closed by operator confirmation. |
 | CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy` with durable admission and atomic deploy linking; `secrets export`/`secret export` behind the factor. | Host checks pass for token reload, secret-export metadata, disposable deletes and webhook-secret recovery; migration 021 is applied on main; a real push deployed `59017d6` as `rel_d231a28c…` with delivery 202 and all four URLs 200. On the same build redelivery returned the original operation without another release, an invalid signature returned 401, and an existing other-branch fixture push was ignored. Old-secret rejection after rotation was not recorded; alpha.1 is operator-confirmed, and no result is backfilled. |
 | Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
-| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06`, `ef4a6f879f45`, `ba175353f00a`, `6d1ae98b9ac1`, `81998646916d` and `7e74edbed8bc`; the latest installed edge build is `edge-7e74edbed8bc`, and the tagged `1.0.0-alpha.2` snapshot is also installed on CLI and `main`, both at schema 24/24. The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. The authorized alpha.2 tag was replaced at `85f2a4f` after PR #1; Publish stable `42363078147` and CI `42363078061` passed, and the signed `releases/1.0.0-alpha.2/` manifest and four binaries match the tag identity and manifest hashes. Tag replacement and its unsigned annotation are explicit release caveats; `install.sh` is version-pinned but outside the cosign-signed set. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
+| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06`, `ef4a6f879f45`, `ba175353f00a`, `6d1ae98b9ac1`, `81998646916d`, `7e74edbed8bc` and `9e71713eeff9`; CLI and `main` now run `edge-9e71713eeff9` at schema 24/24, and the tagged `1.0.0-alpha.2` snapshot remains published (it was installed earlier and then superseded by this edge candidate). The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. The authorized alpha.2 tag was replaced at `85f2a4f` after PR #1; Publish stable `42363078147` and CI `42363078061` passed, and the signed `releases/1.0.0-alpha.2/` manifest and four binaries match the tag identity and manifest hashes. Tag replacement and its unsigned annotation are explicit release caveats; `install.sh` is version-pinned but outside the cosign-signed set. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
 
 ## 9. Work list
 

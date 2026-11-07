@@ -757,7 +757,7 @@ pointer. Channel publication retains the existing two-object manifest/signature
 race and partial-upload retry risk; signing tooling is unchanged. This source
 integration is not a published-build or alpha baseline qualification.
 
-### 2026-11-07 — alpha.3 source: resolver and release guards (not published)
+### 2026-11-07 — alpha.3 resolver host qualification (`edge-9e71713eeff9`)
 
 The manifest protocol remains **schema 1**, compatible with the published
 alpha.2 client. Manifest `channel` remains the signing family: every tagged
@@ -770,10 +770,64 @@ accepts only a final tag whose commit is on `origin/<major>.x`. This is a
 safety guard, not a new protocol or stable promotion claim.
 
 The alpha.3 source also adds the shared read-only container resolver for bare
-process/release commands. It is offline-tested and manual direct-process
-tested, but not yet exercised end-to-end through a node deployment, Docker
-image or Buildpacks launcher. The source is not tagged, published or
-host-qualified; the orchestrator owns commit, push, PR, tag and release.
+process/release commands. It is now host-qualified on `edge-9e71713eeff9` for
+the plain-Docker and Buildpacks paths below. Alpha.3 is **not tagged**; a
+snapshot, installer checks and tag publication remain future work.
+
+Candidate `9e71713eeff9e2534452a913b54683e9a45e629c` published as
+`edge-9e71713eeff9`: Publish edge `42387096819` and CI `42387096776` both passed
+via `gh run watch`. The signed manifest verified with the pinned edge identity;
+linux/amd64 SHA256 was
+`164725d24df9582553624fdf2c51ff3c9cf9a5abac1a0cceb440a92dd92595e0`. CLI and
+`main` upgraded; node apply `op_162c42a9c556258cd7123fd40b06965b`, schema
+stayed **24/24**, River 7/7, `doctor` 20/0/0 and `apply --dry-run` 0 of 20.
+
+**Plain Docker image bare commands — pass.** Disposable unprotected
+`a3-bare-docker` was created from prebuilt image digest
+`sha256:f06b2be7670c934543431fe3bbe3c4752821aaaa07b803652ab9b5ca6763df1e`
+(`op_1303b7c1ee6d711e36d6921f28c5f569`) with domain
+`eregion-alpha-two.mbvlabs.com`, release command `migrate`, web process `web`,
+service process `migrate service` on 8081, and worker process
+`migrate worker`. Config `PATH=/usr/bin:/bin` forced the cwd fallback.
+
+Deploy `op_1923ede54d8af0b74aaa6228bfdbe3c8` succeeded; serving release
+`rel_87a9912d61f0b0d7341e37dfc4e3af78`. The release command output was
+`A3MIGRATE mode=release path=/usr/bin:/bin cwd=/app exe=/app/migrate
+argv0=migrate` followed by `release-ok`. Service/worker logs showed the same
+effective PATH/cwd/target and `service-start`/heartbeat markers. Public
+`https://eregion-alpha-two.mbvlabs.com/` returned `plain-web`; `/healthz`
+returned `ok`. The environment was deleted with `op_1c18c691da5c6b8608d0c61595ab9c24`.
+
+**Buildpacks image bare commands — pass.** The fixture branch
+`alpha3-bare-commands` (commit `8258f22`) names its root module binary
+`migrate`; the Buildpacks image exposes it in
+`/layers/paketo-buildpacks_go-build/targets/bin`. Disposable unprotected
+`a3-bare-buildpacks` used the authorized private repo/ref, release command
+`migrate`, web `migrate web`, service `migrate service` on 8081 and worker
+`migrate worker` (create `op_123bd0923195fd03d09d3c446a0d4241`). Deploy
+`op_47192b397f65edec2b11d27a6ea7d3a7` succeeded; serving release
+`rel_787722bb7bcbcd900f5c378ac5b006b8`.
+
+The release command output was `A3BP migrate mode=release
+path=/layers/paketo-buildpacks_go-build/targets/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+cwd=/workspace exe=/layers/paketo-buildpacks_go-build/targets/bin/migrate
+argv0=migrate` followed by `release-ok version=alpha3-bp`. Service, worker and
+web logs showed the same launch-layer PATH and target; worker emitted
+heartbeats. Public `/` returned `eregion sample: alpha3-bp`; `/healthz` returned
+`ok`. Environment delete `op_e61dc00ae8040c05b7165aac13595538` succeeded.
+
+The first Buildpacks fixture attempt used `BP_GO_TARGETS` with a second package;
+pack selected a non-Go detection group and failed before building
+(`op_c22b5eca7f1e685ce979a8148b9dfea7`). This was a fixture configuration
+failure, not an eregion runtime defect; the corrected single-binary fixture
+above passed.
+
+**Cleanup.** Both test environments, their routes and secrets were removed; the
+fixture branch was deleted locally and remotely, `main` restored, the plain
+registry tag deleted (HTTP 202), and the plain/Buildpacks local images removed.
+`a2defs1106` retains only production, staging and protected `prot-audit`; no
+test container/volume remains. The designated hostname returns 525; the four
+pre-existing URLs return 200.
 
 Offline checks for this source change are
 `go test ./cmd/eregion ./internal/containerresolver ./internal/platform
@@ -782,7 +836,9 @@ Offline checks for this source change are
 `scripts/test-release-channels.sh`, `scripts/test-release-environments.sh`,
 `scripts/test-sign-release.sh` and
 `scripts/test-upload-guard.sh`; no tag, upload, bucket write, Docker, VM or
-database was used. This is not a published-build qualification.
+database was used in that source-only pass. This host run is a targeted
+qualification, not a repeated full manual acceptance. Alpha.3 snapshot/tag and
+installer checks remain. No TOTP, secret value or unrelated app was touched.
 
 ## Developer checks
 
@@ -3732,9 +3788,10 @@ step; the finalization race itself is covered deterministically by the
 integration tests, not by timing the host. All `cancel-audit` and `cancel-ok`
 resources/environments were destroyed and deleted after the retests.
 
-**Limitations.** Current `main` (`edge-7e74edbed8bc`) includes the published
-step-boundary and finalization fixes; no known cancellation-state defect remains
-on this build. Only rows whose owning operation is already `cancelled` or
+**Limitations.** At the time of that fix, `main` (`edge-7e74edbed8bc`) included
+the published step-boundary and finalization fixes; no known cancellation-state
+defect remained on that build. Alpha.3 `edge-9e71713eeff9` later superseded it.
+Only rows whose owning operation is already `cancelled` or
 `failed` are swept by reconciliation; queued, running or cancelling operations
 still need the normal River worker/rescue path. Reconciliation does not infer
 whether a node container exists: a subsequent apply/destroy is the deliberate
