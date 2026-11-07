@@ -171,10 +171,16 @@ func withTestResolver(t *testing.T) string {
 	if err := os.WriteFile(source, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	canonical, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		t.Fatal(err)
+	}
 	previous := resolverExecutable
+	// Keep the raw path here so the production canonicalization in
+	// containerResolverSource is exercised, while callers compare its result.
 	resolverExecutable = func() (string, error) { return source, nil }
 	t.Cleanup(func() { resolverExecutable = previous })
-	return source
+	return canonical
 }
 
 func containerStepFor(t *testing.T, command []string, env map[string]string, secretKeys []string) engine.Step {
@@ -336,6 +342,32 @@ func TestValidateResolverMountOption(t *testing.T) {
 		if err := validateResolverMountOption(value); err == nil {
 			t.Errorf("unsafe resolver mount accepted: %q", value)
 		}
+	}
+}
+
+func TestContainerResolverSourceCanonicalizesSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "eregion")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := resolverExecutable
+	resolverExecutable = func() (string, error) { return link, nil }
+	t.Cleanup(func() { resolverExecutable = previous })
+	got, err := containerResolverSource()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("containerResolverSource() = %q, want canonical %q", got, want)
 	}
 }
 
