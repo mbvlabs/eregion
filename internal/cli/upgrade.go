@@ -91,7 +91,8 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	from := upgrade.Version{Version: buildinfo.Version, Channel: buildinfo.Channel}
-	plan := upgrade.Decide(from, manifest, strings.TrimSpace(version) != "")
+	requested := strings.TrimSpace(version) != "" || strings.TrimSpace(channelFlag) != ""
+	plan := upgrade.Decide(from, manifest, requested)
 	plan.Target = target
 
 	data := upgradeResult{

@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/mbvlabs/eregion/internal/containerresolver"
 )
 
 func TestExecutableNoninteractiveContract(t *testing.T) {
@@ -56,5 +58,14 @@ func TestExecutableNoninteractiveContract(t *testing.T) {
 		if !test.json && test.exit != 0 && (stdout.Len() != 0 || stderr.Len() == 0) {
 			t.Fatal("plain errors must go to stderr")
 		}
+	}
+}
+
+func TestHiddenResolverInvocationDoesNotEnterCLI(t *testing.T) {
+	previous := os.Args
+	t.Cleanup(func() { os.Args = previous })
+	os.Args = []string{"eregion", containerresolver.Invocation}
+	if code := run(); code != 2 {
+		t.Fatalf("run() = %d, want resolver usage failure", code)
 	}
 }

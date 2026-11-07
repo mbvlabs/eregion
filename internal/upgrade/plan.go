@@ -116,8 +116,11 @@ func PreferFinal(rc, final release.Manifest) release.Manifest {
 	return rc
 }
 
-// Decide compares the running binary with a verified manifest.
-func Decide(from Version, m release.Manifest, versionSet bool) Plan {
+// Decide compares the running binary with a verified manifest. requested is
+// true when the operator named a version or channel. A default selection never
+// moves a stable/tagged release backward; an explicit selection may downgrade
+// but warns.
+func Decide(from Version, m release.Manifest, requested bool) Plan {
 	plan := Plan{
 		From: from,
 		To:   Version{Version: m.Version, Channel: m.Channel},
@@ -125,17 +128,17 @@ func Decide(from Version, m release.Manifest, versionSet bool) Plan {
 	if from.Version == m.Version && from.Channel == m.Channel {
 		return plan
 	}
-	if from.Channel == release.ChannelStable && m.Channel == release.ChannelStable && !versionSet {
-		if cmpSemver(m.Version, from.Version) < 0 {
-			plan.To = from
-			return plan
-		}
+	tagged := from.Channel == release.ChannelStable && m.Channel == release.ChannelStable
+	older := cmpSemver(m.Version, from.Version) < 0
+	if tagged && !requested && older {
+		plan.To = from
+		return plan
 	}
 	plan.Changed = true
-	if from.Channel == release.ChannelStable && m.Channel == release.ChannelStable && cmpSemver(m.Version, from.Version) < 0 {
-		plan.Warnings = append(plan.Warnings, Warning{Code: "downgrade", Message: "installing an older stable version"})
+	if tagged && older {
+		plan.Warnings = append(plan.Warnings, Warning{Code: "downgrade", Message: "installing an older release"})
 	}
-	if from.Channel == release.ChannelStable && m.Channel == release.ChannelStable {
+	if tagged {
 		fromV, okFrom := release.ParseStable(from.Version)
 		toV, okTo := release.ParseStable(m.Version)
 		if okFrom && okTo && fromV.Major != toV.Major {

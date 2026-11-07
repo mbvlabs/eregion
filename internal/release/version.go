@@ -118,8 +118,8 @@ func CompareVersions(a, b string) int {
 
 // Promotes reports whether publishing candidate moves a stable channel
 // manifest that currently points at current ("" when the channel has none).
-// The channel moves only forward, and a pre-release moves it only while the
-// channel has never had a final release.
+// A stable pointer accepts only final releases, even when it is empty; a
+// pre-release never moves it, and a current pre-release pointer fails closed.
 func Promotes(current, candidate string) (bool, error) {
 	next, ok := ParseStable(candidate)
 	if !ok {
@@ -132,11 +132,8 @@ func Promotes(current, candidate string) (bool, error) {
 		return true, nil
 	}
 	cur, ok := ParseStable(current)
-	if !ok {
-		return false, fmt.Errorf("current channel version %q is invalid", current)
-	}
-	if next.Prerelease() && !cur.Prerelease() {
-		return false, nil
+	if !ok || cur.Prerelease() {
+		return false, fmt.Errorf("current stable channel version %q is not a final release", current)
 	}
 	return CompareStable(next, cur) > 0, nil
 }

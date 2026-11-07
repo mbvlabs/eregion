@@ -4,19 +4,15 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${root}"
 
-if ! command -v jq >/dev/null 2>&1; then
-  echo "jq is required to write release manifests" >&2
-  exit 1
-fi
 
 version="${1:?usage: scripts/build-release.sh VERSION CHANNEL BASE_URL}"
 channel="${2:?usage: scripts/build-release.sh VERSION CHANNEL BASE_URL}"
 base_url="${3:?usage: scripts/build-release.sh VERSION CHANNEL BASE_URL}"
 
 case "${channel}" in
-  stable | edge | rc | stable-[0-9]*.x) ;;
+  stable | snapshot | edge | rc | stable-[0-9]*.x) ;;
   *)
-    echo "channel must be stable, stable-<major>.x (for example stable-1.x) or edge" >&2
+    echo "channel must be stable, snapshot, stable-<major>.x (for example stable-1.x), rc or edge" >&2
     exit 1
     ;;
 esac
@@ -29,38 +25,52 @@ if [ "${channel}" != edge ] && [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0
   exit 1
 fi
 
-# The signing channel: the root and every major line are published by the
-# stable workflow, so a line's manifest says stable. A binary from a line's
-# tag still defaults to its own line (upgrade.SelectChannel reads the version).
-signing_channel="${channel}"
-if [ "${channel}" = rc ]; then
-  [[ "${version}" =~ -rc\.[0-9]+$ ]] || { echo "rc channel requires an rc version" >&2; exit 1; }
-  signing_channel=stable
+# The manifest channel is the signing family, not the moving promotion
+# channel: root, line, RC and immutable alpha/beta snapshots are all signed by
+# the stable workflow and say stable. Edge says edge.
+signing_channel=stable
+if [ "${channel}" = edge ]; then
+  signing_channel=edge
 fi
+out="dist/release-${channel}"
+channel_dir=""
 line_dir=""
-if [[ "${channel}" == stable-[0-9]*.x ]]; then
-  signing_channel=stable
-  major="${channel#stable-}"
-  major="${major%.x}"
-  if [ "${version%%.*}" != "${major}" ]; then
-    echo "version ${version} is not on the ${channel} channel" >&2
-    exit 1
-  fi
-  line_dir="${major}.x"
-fi
+channel_root="${base_url%/}"
+case "${channel}" in
+  edge)
+    channel_dir="${out}/edge"
+    channel_root="${base_url%/}/edge"
+    ;;
+  snapshot)
+    [[ "${version}" =~ -(alpha|beta)\.[0-9]+$ ]] || { echo "snapshot channel requires an alpha or beta version" >&2; exit 1; }
+    # An immutable snapshot has no channel pointer or channel installer.
+    ;;
+  rc)
+    [[ "${version}" =~ -rc\.[0-9]+$ ]] || { echo "rc channel requires an rc version" >&2; exit 1; }
+    channel_dir="${out}/rc"
+    channel_root="${base_url%/}/rc"
+    ;;
+  stable)
+    [[ "${version}" != *-* ]] || { echo "stable channel requires a final release" >&2; exit 1; }
+    channel_dir="${out}"
+    ;;
+  stable-[0-9]*.x)
+    [[ "${version}" != *-* ]] || { echo "stable channel requires a final release" >&2; exit 1; }
+    major="${channel#stable-}"
+    major="${major%.x}"
+    if [ "${version%%.*}" != "${major}" ]; then
+      echo "version ${version} is not on the ${channel} channel" >&2
+      exit 1
+    fi
+    line_dir="${major}.x"
+    channel_dir="${out}/${line_dir}"
+    channel_root="${base_url%/}/${line_dir}"
+    ;;
+esac
 base_url="${base_url%/}"
 if [[ ! "${base_url}" =~ ^https://[^[:space:]\"\\]+$ ]]; then
   echo "base URL must be an HTTPS URL without whitespace, quotes, or backslashes" >&2
   exit 1
-fi
-
-channel_root="${base_url}"
-if [ "${channel}" = edge ]; then
-  channel_root="${base_url}/edge"
-elif [ "${channel}" = rc ]; then
-  channel_root="${base_url}/rc"
-elif [ -n "${line_dir}" ]; then
-  channel_root="${base_url}/${line_dir}"
 fi
 
 sha256_hex() {
@@ -75,7 +85,11 @@ sed_escape() {
   printf '%s' "$1" | sed 's/\\/\\\\/g; s/&/\\&/g; s/|/\\|/g'
 }
 
-out="dist/release-${channel}"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "jq is required to write release manifests" >&2
+  exit 1
+fi
+
 rm -rf "${out}"
 mkdir -p "${out}/releases/${version}"
 
@@ -128,25 +142,21 @@ jq -n \
     }
   }' >"${out}/releases/${version}/manifest.json"
 
-if [ "${channel}" = edge ]; then
-  channel_dir="${out}/edge"
-elif [ "${channel}" = rc ]; then
-  channel_dir="${out}/rc"
-elif [ -n "${line_dir}" ]; then
-  channel_dir="${out}/${line_dir}"
-else
-  channel_dir="${out}"
+if [ -n "${channel_dir}" ]; then
+  mkdir -p "${channel_dir}"
+  cp "${out}/releases/${version}/manifest.json" "${channel_dir}/manifest.json"
+  sed \
+    -e "s|@@CHANNEL_ROOT@@|$(sed_escape "${channel_root}")|g" \
+    -e "s|@@CHANNEL@@|$(sed_escape "${signing_channel}")|g" \
+    -e "s|@@POINTER_CHANNEL@@|$(sed_escape "${channel}")|g" \
+    -e "s|@@ORIGIN@@|$(sed_escape "${base_url}")|g" \
+    scripts/install.sh >"${channel_dir}/install.sh"
+  chmod 0755 "${channel_dir}/install.sh"
+  if grep -q '@@' "${channel_dir}/install.sh"; then
+    echo "install.sh still contains unsubstituted placeholders" >&2
+    exit 1
+  fi
 fi
-mkdir -p "${channel_dir}"
-cp "${out}/releases/${version}/manifest.json" "${channel_dir}/manifest.json"
-
-sed \
-  -e "s|@@CHANNEL_ROOT@@|$(sed_escape "${channel_root}")|g" \
-  -e "s|@@CHANNEL@@|$(sed_escape "${signing_channel}")|g" \
-  -e "s|@@POINTER_CHANNEL@@|$(sed_escape "${channel}")|g" \
-  -e "s|@@ORIGIN@@|$(sed_escape "${base_url}")|g" \
-  scripts/install.sh >"${channel_dir}/install.sh"
-chmod 0755 "${channel_dir}/install.sh"
 
 # A line release may also promote the root pointer. Prepare that installer
 # without rebuilding or overwriting the immutable version's artifacts.
@@ -158,17 +168,32 @@ if [ -n "${line_dir}" ]; then
     -e "s|@@ORIGIN@@|$(sed_escape "${base_url}")|g" \
     scripts/install.sh >"${out}/install.sh"
   chmod 0755 "${out}/install.sh"
-fi
-if grep -q '@@' "${channel_dir}/install.sh"; then
-  echo "install.sh still contains unsubstituted placeholders" >&2
-  exit 1
+  if grep -q '@@' "${out}/install.sh"; then
+    echo "install.sh still contains unsubstituted placeholders" >&2
+    exit 1
+  fi
 fi
 
 # A snapshot must be installable before any moving channel has been published.
-# Its immutable installer still requires --version and performs normal checks.
-sed "s|^snapshot_version=\"\"$|snapshot_version=\"${version}\"|" \
-  "${channel_dir}/install.sh" >"${out}/releases/${version}/install.sh"
+# Its immutable installer is pinned to its own version and still uses the stable
+# signing family that every tagged artifact uses.
+if [ -n "${channel_dir}" ]; then
+  sed "s|^snapshot_version=\"\"$|snapshot_version=\"${version}\"|" \
+    "${channel_dir}/install.sh" >"${out}/releases/${version}/install.sh"
+else
+  sed \
+    -e "s|@@CHANNEL_ROOT@@|$(sed_escape "${base_url}")|g" \
+    -e "s|@@CHANNEL@@|$(sed_escape "${signing_channel}")|g" \
+    -e "s|@@POINTER_CHANNEL@@|stable|g" \
+    -e "s|@@ORIGIN@@|$(sed_escape "${base_url}")|g" \
+    -e "s|^snapshot_version=\"\"$|snapshot_version=\"${version}\"|" \
+    scripts/install.sh >"${out}/releases/${version}/install.sh"
+fi
 chmod 0755 "${out}/releases/${version}/install.sh"
+if grep -q '@@' "${out}/releases/${version}/install.sh"; then
+  echo "version install.sh still contains unsubstituted placeholders" >&2
+  exit 1
+fi
 
 printf 'Built %s %s release in %s\n' "${channel}" "${version}" "${out}"
 find "${out}" -print | sort

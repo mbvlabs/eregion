@@ -40,4 +40,12 @@ if grep -Eq 'environment: stable|Promote the major line|Move the root channel' "
   echo 'prerelease job can reach stable environment or promotion' >&2; exit 1
 fi
 grep -Fq 'Promote the opt-in rc channel' "${work}/prerelease"
+grep -Fq 'invalid final release tag' "${work}/final"
+grep -Fq 'upload-release.sh "dist/release-${line}" "${line}"' "${work}/final"
+grep -Fq 'channel=snapshot' "${work}/prerelease"
+grep -Fq 'upload-release.sh "dist/release-${channel}" "${channel}"' "${work}/prerelease"
+grep -Fq 'channel=rc' "${work}/prerelease"
+if grep -Fq 'stable-${version%%.*}.x' "${work}/prerelease"; then
+  echo 'prerelease job can reach a stable line' >&2; exit 1
+fi
 echo 'release environment classification and gates passed'

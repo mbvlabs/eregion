@@ -1,9 +1,10 @@
 # Implementation reference
 
-Checked against the integrated source on 2026-11-06. This describes **current
-code**, not the target command tree or a real-host certification. Product
-decisions and all work status belong in [MASTER](MASTER.md); run evidence
-belongs in [MANUAL-TESTING](MANUAL-TESTING.md).
+Checked against the integrated source on 2026-11-06; the managed-resource
+comparison with deploycrate-ce was checked on 2026-11-07. This describes
+**current code**, not the target command tree or a real-host certification.
+Product decisions and all work status belong in [MASTER](MASTER.md); run
+evidence belongs in [MANUAL-TESTING](MANUAL-TESTING.md).
 
 ## Execution and control boundaries
 
@@ -139,7 +140,9 @@ All of MASTER section 5's app, environment, deployment and observation surface
 exists. The `platform` command group is deleted: `app`, `env`, `process`,
 `config`, `domain`, `deploy`, `rollback`, `restart`, `build`, `release`, `logs`
 and `operations` are the operator commands. Token/protect commands remain for
-work list row 8. `resources …` and the backup code are deleted (MASTER D19), the
+work list row 8. The old plural `resources …` surface and the backup code are
+deleted (MASTER D19); alpha.2's singular
+`resource apply|attach|detach|list|status|destroy` lifecycle is registered. The
 Docker Compose telemetry stack install is deleted (D5), and `dns …`, `access …`,
 `platform …`, `metrics …` and `operations test` are no longer registered
 (D6, D19, D22, D26). Their internal packages remain for the after-v1 phases
@@ -195,15 +198,29 @@ the pinned publish workflow identity, validates the manifest against the
 channel, and caches the platform binary only after its signed SHA256 matches.
 TUF/sigstore trust material is cached, not pinned in the binary.
 
-Edge combines development and published `master` builds. Tagged alpha and beta
-versions are exact snapshots without moving pointers; RC tags advance the opt-in
-`rc` pointer, and only final tags advance stable pointers. RC clients also check
-their stable major line for a newer final; publication of a final does not move
-the RC pointer. Tagged artifacts retain the existing stable signing family and
-release-tool signing process. Channel manifests and signature bundles are two
-separately published objects, so the existing publication race can temporarily
-fail verification; an interrupted tagged upload can leave a partial prefix that
-blocks retry. These are follow-up risks, not a change to the channel model.
+Edge combines development and published `master` builds. Alpha and beta tags
+are exact immutable snapshots with no moving pointer; RC tags advance the opt-in
+`rc` pointer, and only final tags advance stable pointers. Manifests remain
+schema 1. Their `channel` field is the signing family, not the promotion
+channel: every tagged artifact, including alpha/beta and RC, says `stable` and
+is signed by `publish-stable.yml@refs/tags/v<version>`; edge says `edge`. This
+is the protocol already understood by alpha.2 clients and is not itself proof
+of stable-channel membership. Stable and major-line build, pointer-install,
+upload and promotion paths reject every prerelease by inspecting the version;
+the rc pointer accepts only rc. An explicit `--version` remains the snapshot
+install path. Alpha/beta use the build script's `snapshot` channel,
+which creates no pointer; RC uses `rc`; final tags use their stable line. The
+stable publish job accepts only a final tag whose commit is on
+`origin/<major>.x`, while alpha/beta/RC tags use the `edge` environment. RC
+clients also check their stable major line for a newer final; publishing a
+final does not move the RC pointer. Channel manifests and signature bundles are
+two separately published objects, so the existing publication race can
+temporarily fail verification; an interrupted tagged upload can leave a partial
+prefix that blocks retry. These are follow-up risks, not a change to the
+channel model.
+The alpha.3 worktree adds the container resolver and these schema-1 release
+safety guards. Its source is offline-tested but not tagged, published or
+host-qualified; the orchestrator owns commit, push, PR, tag and release.
 
 `internal/upgrade` holds the local-only plan/preflight/atomic swap. `upgrade`
 downloads the verified binary, checks its reported version and channel, and
@@ -342,9 +359,9 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
   the normal worker maintenance schedule. `resource apply` and `resource
   destroy` then accept the degraded row as an ordinary retry. No resource
   repair command or database edit exists.
-- The deleted resources/backup subsystem had no catalog tables in the
-  control-plane migrations. DNS records live at the provider; a domain binding
-  is not a DNS record.
+- The deleted old `resources`/backup subsystem had no catalog tables in the
+  control-plane migrations; alpha.2's managed-resource tables are 022/023. DNS
+  records live at the provider; a domain binding is not a DNS record.
 - Roles/rows do not prove tools, credentials, services or routes are installed.
 
 ## Disk retention schema (D30)
@@ -662,7 +679,7 @@ history or reset a database to make an upgrade pass. Add the next migration.
 ## External control-state recovery
 
 The control database is the PostgreSQL provider's recovery responsibility (D4,
-D9); eregion has no backup product or `resources backups restore`. A
+D9); eregion has no backup product or resource backup/restore commands. A
 maintenance-window recovery must:
 
 1. Stop every API/worker/writer. Preserve the old DB, sanitized schema/version
@@ -1035,6 +1052,41 @@ Rollback and restart use the same path with the recorded revision/secret
 snapshot and the current revision respectively.
 Explicit retry creates new work; it does not rewrite a terminal failed record.
 
+Command executable resolution is one contract for release commands and process
+containers. For a Buildpacks image a bare command runs through
+`/cnb/lifecycle/launcher -- /run/eregion/eregion __eregion_container_exec ...`,
+so the launcher completes the buildpack launch environment before the resolver
+runs. A plain image uses the same resolver directly as its entrypoint. The
+resolver is the running static Linux `eregion` binary bind-mounted read-only at
+the fixed `/run/eregion/eregion`; the source is canonicalized from
+`os.Executable()`, never from user input, and mounted with
+`type=bind,...,readonly=true`. Node argv validation separately accepts a bind
+mount only when its source equals that canonical executable, its destination is
+the reserved path, and `readonly=true`; other bind mounts are refused. No shell
+or external helper is added. The resolver searches the effective launch-time
+PATH in order, including relative and empty entries, against the container's
+own cwd/filesystem and checks that a candidate is a regular file with execute
+permission; it then falls back to the working directory and uses `exec` with the
+original argv and environment. It does not rewrite PATH, sort or clean entries,
+resolve symlinks lexically, or change the command's environment. Explicit
+relative/absolute commands keep exact argv and receive no resolver mount: a
+plain image uses the direct entrypoint, while a Buildpacks image still runs the
+explicit path through its launcher. A commandless container keeps the image
+entrypoint and Cmd. The hidden invocation performs only this search/exec and
+cannot access node configuration, the control database, host secrets or any
+host path beyond the read-only binary. Its executable must be the node's static
+Linux binary matching the container platform/architecture; a dynamically
+linked or foreign-architecture binary will fail inside the container. Image
+inspection reads only the Buildpacks label, so it is bounded independently of
+PATH, image Env size or working directory. Configured and secret PATH values
+remain ordinary transient Docker client environment entries (`-e PATH` key
+form); no PATH value enters node argv, and the resolver observes exactly the
+environment Docker or the CNB launcher gives the container.
+A missing image, invalid template, invalid reference or permission failure is
+terminal; daemon and transport failures remain retryable. A container step
+prepares the image command before removing an existing container, so an
+inspection or secret failure leaves that container in place.
+
 A source deploy resolves the revision's git ref (or `--ref`) to an exact commit
 before its submission transaction opens, reading a private repository with the
 revision's credential by name from the vault; an unreachable repository creates
@@ -1110,6 +1162,43 @@ active; a stale queued repair refuses without touching workloads. The queued
 restart does not rerun the release command. See
 [network](network.md) before changing this path.
 
+## Managed resources versus deploycrate-ce
+
+Checked against `internal/platform/resource*.go`,
+`internal/controlplane/resource.go`, `internal/cli/resource.go` and
+`../deploycrate-ce`'s `services/resource_management.go`,
+`services/resource_health.go`, `models/resource_engine.go` and the other
+`models/resource*.go`, `models/environment_resource.go`,
+`services/resource_caddy_route.go`, `services/resource_dns.go`,
+`services/resource_private_access.go` and its backup services
+(`services/backup_scheduler.go`, `services/database_backups.go`,
+`services/database_restore_workflow.go`) on 2026-11-07. This is current
+behavior, not a plan for missing features. In short, eregion alpha.2 ships one
+generic Docker container per declaration, while deploycrate ships an
+engine-aware resource subsystem with a typed catalog and managed service
+concerns.
+
+| Concern | eregion alpha.2 | deploycrate-ce |
+| --- | --- | --- |
+| Shape | One environment-owned `eregion_platform_resources` row and one generic Docker container (`er-res-<id>`) on the environment's private bridge network, with the resource name as its alias. There are no installation, endpoint, credential, volume or publication sub-entities, and a resource belongs to exactly one environment. | A `resources` entity with separate installations, endpoints, credentials, volumes/mounts and health checks; an `environment_resources` binding gives one environment an alias, endpoint and optional credential, and one resource can be bound to several environments. |
+| Engine awareness | No engine catalog. The declaration is an image plus optional command, plain environment, vault secret-name environment and named-volume mounts; validation is generic. | `models/resource_engine.go` defines postgresql, mysql, redis, clickhouse, registry, opentelemetry, http and tcp, each with a resource type (database/cache/service), protocols, endpoint roles, TLS modes, credential fields, environment-key projections, health-check kinds and default port/protocol/TLS. |
+| Exposure | No host-published port. Application containers and resources share the per-environment private network, so the alias resolves to the resource container; `port` is declaration/display metadata and is not published, routed or projected. No resource Caddy route, DNS record, TLS or WireGuard private-access endpoint. | Docker host-port mapping plus `resource_endpoints` (primary/wireguard/local), optional managed Caddy publication and Cloudflare DNS, and a WireGuard device-grant private-access path. |
+| Credentials | Only vault secret NAMES in `secret_env`; values are resolved from the environment namespace and passed transiently to `docker run` during apply. The secret revision fingerprint contributes to the container configuration hash, so a rotation takes effect on the next explicit apply. No credential entity, engine administrator/application roles, or credential projection to the application. | Encrypted, engine-validated resource credentials with administrator/application purpose, rotation and dependency checks, plus PostgreSQL role/password reconciliation. Connection values are projected into environment secrets (`*_HOST`, `*_PORT`, `*_USER`, `*_PASSWORD`, optional `*_URL`) with per-binding key overrides. |
+| Health | One generic `docker exec` probe during apply (`timeout_seconds`, `interval_ms`), recording `ready`/`degraded` and a health state. No periodic health job, no engine client and no container repair; an out-of-band container loss is not re-observed until an explicit apply or destroy. | A five-second periodic sweep selects due checks: tcp/http/mysql/redis/postgresql/clickhouse probes with per-check interval, timeout and success/failure thresholds, persisted unknown/healthy/degraded/unhealthy state, latency and message. |
+| Reconciliation and deploy gate | Apply and destroy are journaled operation steps with retries and cancellation boundaries. The maintenance reconciler only settles rows left in `provisioning`/`destroying` by a terminal operation; it does not repair containers or re-probe health. A deploy is refused while any attached resource row is not `ready` and `healthy`. | `DeployResource` runs active installations, and installation observation records Docker state/health with a 30-second expiry. The deploy path attaches the resource container to the environment network and projects connection values; it does not read resource health status as a gate. |
+| Data | Deterministic `er-res-<id>-<mount>` named volumes, a cumulative ownership ledger and label checks before deletion. Destroy retains data by default; `--delete-data` deletes only that resource's owned volumes. Host bind mounts, multiple containers per resource and node moves are not supported. | Separate volume and mount entities, multiple mounts, and archive dependency checks. |
+| Engine management and backups | No database create/drop, engine administrator management, backup destination, policy, schedule, verification or restore. The resource is the image, its container and its data; detach and default destroy retain that data. Control-database recovery remains the PostgreSQL provider's job (D4), and D30 retention is artifact pruning, not backup or resource-data management. | PostgreSQL resource database create/drop and database definitions; server filesystem (restic) and resource PostgreSQL logical (`postgresql`/`tar.age`) backup policies with schedules, retention, verification and restore workflows, plus a ClickHouse backup path. |
+
+The practical alpha.2 consequence is that a managed resource is an explicitly
+declared container, not a managed service catalog. The application gets no
+engine-derived variables and no automatic credential projection or rotation; it
+must use the resource's private name and port through its own `config` and
+`secret` entries. The same image in two environments is two independent
+resources with separate data; neither can move nodes, run more than one
+container or be exposed outside the environment network. Health and data are
+driven by explicit resource operations, not by background convergence; a
+cancelled or failed operation only settles the row to `degraded`.
+
 ## API and extension seams
 
 - `/healthz`: process liveness only; `/readyz`: public, unauthenticated, answers
@@ -1121,8 +1210,8 @@ restart does not rerun the release command. See
 - `/v1/platform?collection=…`: bounded inventory with app/environment/node/state/
   build filters. `build=<build ID>` returns that exact build for `build logs`.
   Base collections: summary, nodes, apps, environments, revisions,
-  deployability, domains, releases, builds, deployments and changes; the
-  internal DNS/access extensions add their own. The removed resources/backups and
+  deployability, domains, releases, builds, deployments, changes and resources;
+  the internal DNS/access extensions add their own. The removed backups and
   telemetry collections are not registered.
 - `/v1/secrets…`: separate authenticated credential API; values are encrypted
   directly, never placed in ordinary action input.
