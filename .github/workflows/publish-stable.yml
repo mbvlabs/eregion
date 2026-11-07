@@ -1,3 +1,6 @@
+# The workflow file path is part of the pinned cosign certificate identity.
+# Do not rename it: installers and release clients pin
+# publish-stable.yml@refs/tags/v<version>.
 name: Publish stable
 
 on:
@@ -64,7 +67,7 @@ jobs:
       - name: Verify tagged source
         run: |
           version="${GITHUB_REF_NAME#v}"
-          [[ "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || { echo "invalid release tag" >&2; exit 1; }
+          [[ "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "invalid final release tag" >&2; exit 1; }
           test "${GITHUB_REF}" = "refs/tags/v${version}"
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           major="${version%%.*}"
@@ -80,13 +83,11 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           channel="stable-${version%%.*}.x"
-          [[ "${version}" != *-rc.* ]] || channel=rc
           scripts/build-release.sh "${version}" "${channel}" "${RELEASE_BASE_URL}"
-      - name: Sign and verify the line release
+      - name: Sign and verify the tagged release
         run: |
           version="${GITHUB_REF_NAME#v}"
           channel="stable-${version%%.*}.x"
-          [[ "${version}" != *-rc.* ]] || channel=rc
           scripts/sign-release.sh "dist/release-${channel}"
       - name: Upload the immutable artifacts
         env:
@@ -98,7 +99,6 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           line="stable-${version%%.*}.x"
-          [[ "${version}" != *-rc.* ]] || line=rc
           existing="$(aws s3api list-objects-v2 \
             --bucket "${RELEASE_BUCKET}" --prefix "releases/${version}/" --max-keys 1 \
             --query KeyCount --output text --endpoint-url "${R2_ENDPOINT}")"
@@ -187,13 +187,13 @@ jobs:
           RELEASE_BASE_URL: ${{ vars.RELEASE_BASE_URL }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          channel="stable-${version%%.*}.x"
+          channel=snapshot
           [[ "${version}" != *-rc.* ]] || channel=rc
           scripts/build-release.sh "${version}" "${channel}" "${RELEASE_BASE_URL}"
-      - name: Sign and verify the line release
+      - name: Sign and verify the tagged release
         run: |
           version="${GITHUB_REF_NAME#v}"
-          channel="stable-${version%%.*}.x"
+          channel=snapshot
           [[ "${version}" != *-rc.* ]] || channel=rc
           scripts/sign-release.sh "dist/release-${channel}"
       - name: Upload the immutable artifacts
@@ -205,8 +205,8 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          line="stable-${version%%.*}.x"
-          [[ "${version}" != *-rc.* ]] || line=rc
+          channel=snapshot
+          [[ "${version}" != *-rc.* ]] || channel=rc
           existing="$(aws s3api list-objects-v2 \
             --bucket "${RELEASE_BUCKET}" --prefix "releases/${version}/" --max-keys 1 \
             --query KeyCount --output text --endpoint-url "${R2_ENDPOINT}")"
@@ -214,7 +214,7 @@ jobs:
             echo "Release ${version} already exists and will not be overwritten" >&2
             exit 1
           }
-          scripts/upload-release.sh "dist/release-${line}" "${line}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" artifacts
+          scripts/upload-release.sh "dist/release-${channel}" "${channel}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" artifacts
       - name: Promote the opt-in rc channel only forward
         if: contains(github.ref_name, '-rc.')
         env:

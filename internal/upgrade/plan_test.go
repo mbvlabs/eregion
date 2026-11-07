@@ -88,18 +88,19 @@ func TestPreferFinal(t *testing.T) {
 func TestDecide(t *testing.T) {
 	stable := func(v string) release.Manifest { return release.Manifest{Channel: "stable", Version: v} }
 	cases := []struct {
-		name       string
-		from       Version
-		m          release.Manifest
-		versionSet bool
-		changed    bool
-		warnings   []string
+		name      string
+		from      Version
+		m         release.Manifest
+		requested bool
+		changed   bool
+		warnings  []string
 	}{
 		{"same version", Version{"1.0.0-alpha.2", "stable"}, stable("1.0.0-alpha.2"), false, false, nil},
 		{"next alpha", Version{"1.0.0-alpha.2", "stable"}, stable("1.0.0-alpha.10"), false, true, nil},
 		{"alpha to final", Version{"1.0.0-rc.1", "stable"}, stable("1.0.0"), false, true, nil},
 		{"never downgrades unasked", Version{"1.0.0", "stable"}, stable("1.0.0-rc.1"), false, false, nil},
 		{"pinned downgrade warns", Version{"1.0.0", "stable"}, stable("1.0.0-rc.1"), true, true, []string{"downgrade"}},
+		{"explicit channel downgrade warns", Version{"1.1.0-rc.5", "stable"}, stable("1.0.0"), true, true, []string{"downgrade"}},
 		{"major move warns", Version{"1.4.2", "stable"}, stable("2.0.0"), false, true, []string{"major_line_changed"}},
 		{"pinned major downgrade", Version{"2.0.0", "stable"}, stable("1.4.3"), true, true, []string{"downgrade", "major_line_changed"}},
 		{"edge to stable", Version{"edge-0123456789ab", "edge"}, stable("1.0.0-alpha.1"), false, true, []string{"channel_changed"}},
@@ -107,7 +108,7 @@ func TestDecide(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			plan := Decide(c.from, c.m, c.versionSet)
+			plan := Decide(c.from, c.m, c.requested)
 			if plan.Changed != c.changed {
 				t.Fatalf("changed = %v, want %v", plan.Changed, c.changed)
 			}

@@ -69,8 +69,17 @@ transport:
 wireguard:
     go test -count=1 ./internal/transport -run 'WireGuard' -v -timeout 600s
 
+# Run offline release-channel installer, workflow and upload-guard checks.
+test-release-scripts:
+    bash scripts/test-install-pins.sh
+    bash scripts/test-install-routing.sh
+    bash scripts/test-release-channels.sh
+    bash scripts/test-release-environments.sh
+    bash scripts/test-sign-release.sh
+    bash scripts/test-upload-guard.sh
+
 # Check formatting, static analysis, and tests.
-check: fmt-check lint test
+check: fmt-check lint test test-release-scripts
 
 # Build an unsigned channel tree under dist/release-<channel>.
 release-local VERSION CHANNEL BASE_URL:

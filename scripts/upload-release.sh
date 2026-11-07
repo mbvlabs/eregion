@@ -16,6 +16,14 @@ case "${channel}" in
     channel_dir="${release_root}"
     dest_prefix="s3://${bucket}"
     ;;
+  snapshot)
+    channel_dir=""
+    dest_prefix=""
+    if [ "${mode}" != artifacts ]; then
+      echo "an immutable snapshot has no channel pointer; use upload mode artifacts" >&2
+      exit 1
+    fi
+    ;;
   edge)
     channel_dir="${release_root}/edge"
     dest_prefix="s3://${bucket}/edge"
@@ -30,21 +38,78 @@ case "${channel}" in
     dest_prefix="s3://${bucket}/${line}"
     ;;
   *)
-    echo "channel must be stable, stable-<major>.x (for example stable-1.x) or edge" >&2
+    echo "channel must be stable, snapshot, stable-<major>.x (for example stable-1.x), rc or edge" >&2
     exit 1
     ;;
 esac
+
+manifest_value() {
+  sed -n "s/.*\"${1}\": *\"\\([^\"]*\\)\".*/\\1/p" "$2" | head -1
+}
+
+# Defense in depth independent of the workflow's promotion step. Alpha/beta
+# snapshots also say channel stable because stable is their signing family, so
+# the pointer guard must inspect the version itself, not the signing family.
+guard_channel_manifest() {
+  local manifest="$1"
+  local want_channel="$2"
+  local version manifest_channel line
+  version="$(manifest_value version "${manifest}")"
+  manifest_channel="$(manifest_value channel "${manifest}")"
+  [ -n "${version}" ] || { echo "channel manifest has no version" >&2; exit 1; }
+  [ "${manifest_channel}" = "${want_channel}" ] || {
+    echo "channel manifest names ${manifest_channel}, expected ${want_channel}" >&2
+    exit 1
+  }
+  case "${want_channel}" in
+    stable)
+      if [ "${channel}" = rc ]; then
+        [[ "${version}" =~ -rc\.[0-9]+$ ]] || {
+          echo "refusing to publish ${version} as the rc pointer" >&2
+          exit 1
+        }
+      else
+        [[ "${version}" != *-* ]] || {
+          echo "refusing to publish prerelease ${version} as a stable pointer" >&2
+          exit 1
+        }
+        if [[ "${channel}" == stable-*.x ]]; then
+          line="${channel#stable-}"
+          line="${line%.x}"
+          [ "${version%%.*}" = "${line}" ] || {
+            echo "refusing to publish ${version} on the ${channel} pointer" >&2
+            exit 1
+          }
+        fi
+      fi
+      ;;
+    edge)
+      [[ "${version}" =~ ^edge-[0-9a-f]{12}$ ]] || {
+        echo "refusing to publish ${version} as the edge pointer" >&2
+        exit 1
+      }
+      ;;
+  esac
+}
 
 [ -d "${release_root}/releases" ] || {
   echo "release tree is missing ${release_root}/releases" >&2
   exit 1
 }
-for name in install.sh manifest.json manifest.json.sigstore.json; do
-  [ -f "${channel_dir}/${name}" ] || {
-    echo "release tree is missing ${channel_dir}/${name}" >&2
-    exit 1
-  }
-done
+if [ "${mode}" != artifacts ]; then
+  for name in install.sh manifest.json manifest.json.sigstore.json; do
+    [ -f "${channel_dir}/${name}" ] || {
+      echo "release tree is missing ${channel_dir}/${name}" >&2
+      exit 1
+    }
+  done
+  case "${channel}" in
+    stable) guard_channel_manifest "${channel_dir}/manifest.json" stable ;;
+    stable-[0-9]*.x) guard_channel_manifest "${channel_dir}/manifest.json" stable ;;
+    rc) guard_channel_manifest "${channel_dir}/manifest.json" stable ;;
+    edge) guard_channel_manifest "${channel_dir}/manifest.json" edge ;;
+  esac
+fi
 
 if [ "${mode}" != channel ]; then
   aws s3 cp "${release_root}/releases" "s3://${bucket}/releases" --recursive \

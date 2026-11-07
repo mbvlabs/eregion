@@ -106,10 +106,13 @@ func TestResourceRunBuilderRejectsMutableImageAndForeignNetwork(t *testing.T) {
 	}
 }
 
-func TestValidateArgvAcceptsOnlyNamedVolumeMounts(t *testing.T) {
+func TestValidateArgvAcceptsOnlyNamedVolumeAndResolverMounts(t *testing.T) {
+	resolverSource := withTestResolver(t)
+	resolverMount := "type=bind,source=" + resolverSource + ",destination=/run/eregion/eregion,readonly=true"
 	volume := "er-res-" + strings.Repeat("0", 32) + "-data"
 	for _, argv := range [][]string{
 		{"docker", "run", "-d", "--name", "res", "--mount", "type=volume,source=" + volume + ",destination=/data", "sha256:" + strings.Repeat("a", 64)},
+		{"docker", "run", "-d", "--name", "res", "--mount", resolverMount, "sha256:" + strings.Repeat("a", 64)},
 		{"docker", "volume", "create", "--label", "io.eregion.app=api", volume},
 		{"docker", "exec", "res", "pg_isready", "-U", "app"},
 	} {
@@ -119,6 +122,7 @@ func TestValidateArgvAcceptsOnlyNamedVolumeMounts(t *testing.T) {
 	}
 	for _, argv := range [][]string{
 		{"docker", "run", "--mount", "type=bind,source=/etc,destination=/data", "image"},
+		{"docker", "run", "--mount", "type=bind,source=/etc,destination=/run/eregion/eregion,readonly=true", "image"},
 		{"docker", "run", "--mount", "type=volume,source=" + volume + ",destination=/etc", "image"},
 		{"docker", "run", "-v", volume + ":/data", "image"},
 		{"docker", "exec", "res", "--env", "PASSWORD=hunter2", "true"},

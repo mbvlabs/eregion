@@ -92,14 +92,14 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D11 | Builds | Cloud Native Buildpacks with a pinned `pack` and Paketo builder, Go apps with `go.mod` first. Builds run on the main node for v1. |
 | D12 | Confirmation | Destructive commands take a token that names the target (`--confirm <app>`, `--confirm <app>/<env>`, `--confirm <server>`); `--yes` alone never suffices. The control plane validates the token against current state. `app delete` always needs the D7 factor; `env delete` needs it for a protected or last environment and otherwise needs only the exact target token (D33). Their dry run needs neither. |
 | D13 | Deletion | deploycrate's policy: deleting an app removes every environment, source, domain, secret, release, deployment and route it owns after workload cleanup succeeds; deleting the last environment deletes the app and therefore needs the app-deletion human factor even when that environment is unprotected (D33). Durable operation history is kept. |
-| D14 | Release model | `master` is the combined development and edge stream and publishes on every push; `1.x` is the whole v1 line. Alpha and beta tags publish exact snapshots without a moving channel; RC tags advance an opt-in `rc` channel; stable channels advance only on final tags. An RC client also checks its stable major line for a newer final, without automatically moving the RC pointer. Changes reach `1.x` by pull request and `1.x` merges up into `master`, never cherry-picked. |
+| D14 | Release model | `master` is the combined development and edge stream and publishes on every push; `1.x` is the whole v1 line. Alpha and beta tags publish exact immutable snapshots without a moving channel; RC tags advance an opt-in `rc` channel; stable channels advance only on final tags. Manifest `channel` is the signing family, not a promotion channel: every tagged artifact, including alpha/beta/RC, says `stable` and is signed by `publish-stable.yml@refs/tags/v<version>`; edge says `edge`. Stable and major-line pointers accept only final versions and the rc pointer accepts only rc versions; the build, upload and promotion paths enforce this independently. An RC client also checks its stable major line for a newer final, without automatically moving the RC pointer. Changes reach `1.x` by pull request and `1.x` merges up into `master`, never cherry-picked. |
 | D15 | Release signing | vaire's pipeline and scripts: cosign keyless signatures bound to the pinned workflow identity, `install.sh` per channel, R2 channel manifests. Replaces the Ed25519 manifests. |
 | D16 | Order of work | Operator channel first (work list rows 1–3), then the app workflow (rows 4–8). New app commands are node-mode commands from the start, never built on the token adapter. |
 | D17 | Traffic switch | deploycrate's blue/green: the candidate runs on a dynamic loopback port, passes health, Caddy switches its backends, the public response is verified, then the previous containers stop. A failed candidate leaves the old release serving. Public verification requests the primary domain at its check path (D29) and records the host, path and status it observed. Failure to remove a previous or candidate container never fails a verified switch, but is recorded and retried, never silently dropped. |
 | D18 | Secret resolution | deploycrate's: the environment revision names its secrets; each deploy resolves their current values and records the exact secret revisions on the deployment, so a rollback reproduces them. No hand-pinned `vault:…@N` refs. |
 | D19 | Application resources | Alpha.2 adds optional, generic Docker resources owned by an environment; an application may instead use external dependencies through secrets. This supersedes the earlier exclusion of managed application databases: a PostgreSQL container is an app resource, never the external control-plane database. Resources use private networking and optional persistent volumes, secret names rather than values in definitions, and retain data when detached; deleting data requires a separate `resource destroy --delete-data` naming the exact resource, which removes only that resource's owned volumes. No backup product is implied. |
 | D20 | Sources | HTTPS git (public, or private with a per-environment read credential) and existing images. No GitHub App integration is planned (decided 2026-11-04): a per-environment read credential plus the D28 webhook covers private repositories and push to deploy with far less setup. |
-| D21 | Processes | deploycrate's: an environment declares processes of kind `web` (receives the domains through Caddy), `worker` (no port), `service` (port reachable privately, no domain) and a `release` command, each with a command, arguments and replicas. Caddy balances a `web` process across its replicas. The release command (typically migrations) is **release-scoped**, as in deploycrate: it runs once per release and command, before the release fans out to its deployments (and, after v1, to several nodes); a successful run is recorded, and `restart`, `process scale` and `rollback` to that release never run it again. A failed run blocks that release until a new `deploy`. A forced re-run is a possible later override, not alpha scope. |
+| D21 | Processes | deploycrate's: an environment declares processes of kind `web` (receives the domains through Caddy), `worker` (no port), `service` (port reachable privately, no domain) and a `release` command, each with a command, arguments and replicas. Caddy balances a `web` process across its replicas. The release command (typically migrations) is **release-scoped**, as in deploycrate: it runs once per release and command, before the release fans out to its deployments (and, after v1, to several nodes); a successful run is recorded, and `restart`, `process scale` and `rollback` to that release never run it again. A failed run blocks that release until a new `deploy`. A forced re-run is a possible later override, not alpha scope. A bare process command runs through the same static Linux `eregion` binary bind-mounted read-only at a fixed container path and execs after searching the effective launch-time PATH (including relative/empty entries, then cwd) with the target container's cwd, filesystem and permissions; the Buildpacks launcher completes its environment first, a plain image uses the resolver directly, and no shell or PATH rewrite is used. Explicit paths keep exact argv (plain image directly, Buildpacks through its launcher); commandless containers keep the native entrypoint. None receives the resolver mount. A configured or secret-valued PATH is applied only through the transient Docker client environment, never argv. |
 | D22 | Access modes | Public only in the alpha; basic auth and private-network access after v1. |
 | D23 | Promotion | After v1; `deploy --release` of another environment's release covers it by hand. |
 | D24 | `server init --local` | After v1; remote bootstrap only in the alpha. |
@@ -355,14 +355,45 @@ strict `eregion.toml` input and export, shared/environment overrides, explicit
 resource declarations, generic environment-owned Docker resources with private
 networking, retained data and deployment gating, optional `gh` webhook
 assistance, and durable environment protection. Isolated build, vet and package
-tests pass; the incremental host record is below. Alpha.2 is **not tagged** in
-this worktree: an uncommitted resource-cancellation finalization fix must be
-reviewed, committed, published and host-retested first.
+tests pass; the incremental host record is below. Alpha.2 is tagged as
+annotated `v1.0.0-alpha.2` at
+`85f2a4f173de61eb86b843ce66ea62850c804a68` (tag object
+`736a5edb332c74645692972cc392a1e96b0b1695`); with explicit authorization the
+earlier tag at `7e74edb` was replaced after Publish stable `42312127636` failed
+its `1.x` ancestry check. PR #1 squash-merged the tested source onto `1.x` as that
+commit; its tree `48fa59d6653247e34c87cb21f13f4c149465c2dc` is identical to
+`7e74edb`, the `edge-7e74edbed8bc` source. The replacement tag's Publish stable
+`42363078147` and CI `42363078061` passed. The immutable snapshot at
+`releases/1.0.0-alpha.2/` reports version `1.0.0-alpha.2` and channel `stable`;
+cosign verified its manifest and all four binaries against the tag workflow
+identity, every manifest SHA-256 matched, and linux/amd64 reported commit
+`85f2a4f173de`. The tagged snapshot was then installed on the authorized
+`main`: CLI and node report `1.0.0-alpha.2` / commit `85f2a4f173de`, schema
+24/24, `doctor` 20/0/0, `apply --dry-run` 0 of 20; the targeted smoke is in
+MANUAL-TESTING. The tag annotation is not GPG-signed; authenticity comes from
+the cosign bundles.
 
+Alpha.3 source is published as `edge-9e71713eeff9` (commit `9e71713`,
+Publish edge `42387096819`, CI `42387096776`) and host-qualified for the shared
+read-only container resolver: a plain Docker image resolved bare `migrate`
+commands from cwd fallback, and a Buildpacks image resolved the same bare
+release/service/worker/web commands through the launcher's launch-layer `bin`
+PATH, with public health and app responses. CLI and `main` were upgraded; node
+apply `op_162c42a9c556258cd7123fd40b06965b`; schema stayed **24/24**, `doctor`
+20/0/0 and `apply --dry-run` 0 of 20. The test environments, domain bindings and
+images were removed and the fixture app was left intact. Alpha.3 is **not
+tagged**; snapshot/installer publication and tag checks remain, and this is a
+targeted host qualification rather than a repeated full manual acceptance. The
+schema-1 release safety guards (snapshot-only alpha/beta, rc-only pointer,
+final-only stable/line pointer, strict final stable tag) remain source-tested;
+the existing schema-1 alpha.2 node/client path is compatible, with no
+manifest-schema migration or compatibility shim.
 The 2026-11-06 alpha.2 protection redesign is host-qualified on `main` at
-`edge-6d1ae98b9ac1` (commit `6d1ae98`, edge run 42285442054); a later
-cancellation-fix build `edge-81998646916d` is now installed on the CLI and
-`main`, and its host verification is recorded below. The CLI and node
+`edge-6d1ae98b9ac1` (commit `6d1ae98`, edge run 42285442054); the cancellation
+builds `edge-81998646916d` and `edge-7e74edbed8bc` followed; the tagged
+`1.0.0-alpha.2` snapshot at `85f2a4f` (same tree) was installed, and
+`edge-9e71713eeff9` now supersedes it on the CLI and `main`; their host
+verification is recorded below. The CLI and node
 were upgraded; node apply `op_fca44c39b625e2216d05d7581de99c18` applied
 migration 024, the node reports schema **24/24**, River 7/7, `doctor` 20 pass /
 0 warn / 0 fail, and the repeat `apply --dry-run` was 0 of 20. Migration 024
@@ -437,40 +468,47 @@ covers physical data retention. A second no-kill retest on
 flight; the step succeeded and the operation still ended `succeeded` with the
 resource `ready` (`op_80c0f44da0189678f2faeb427ba35e34`), proving
 step-boundary and final-commit cancellation bugs on `edge-81998646916d`. The
-working tree adds cancellation checks at every resource apply/destroy step
-boundary and finalizes both actions under the operation row lock with a
-`cancelling` recheck before the resource callback. New regressions cover the
-successful-step case and the reviewer P1 race between the last check and
-transactional finalization for both apply and destroy. The selected platform,
-CLI and control-plane packages pass, but that source change is not committed,
-published or deployed. The earlier `cancel-audit` retest ended failed at the
-health deadline, not cancelled; no worker was killed in these retests and no
-direct SQL was used.
+fix was published in `edge-7e74edbed8bc`: cancellation is checked at every
+resource apply/destroy step boundary, and both actions finalize under the
+operation row lock with a `cancelling` recheck before the resource callback. New
+regressions cover the successful-step case and the reviewer P1 race between the
+last check and transactional finalization for both apply and destroy. The
+selected platform, CLI and control-plane packages pass. A host successful-step
+cancellation test on disposable `cancel-final` ended `cancelled` with the
+resource `degraded`; destroy and environment deletion succeeded. The earlier
+`cancel-audit` retest ended failed at the health deadline, not cancelled; no
+worker was killed in these retests and no direct SQL was used.
 
 The resource-cancellation state-settlement fix was published in
-`edge-81998646916d` (commit `8199864`, Publish edge run `42302477645`). A cancelled or failed resource
-operation that had entered `provisioning` or `destroying` now settles the
-resource row to `degraded` in the same terminal transaction, fenced by the
-row's `operation_id`; image, container, network and the cumulative volume
-ledger are retained. The normal maintenance reconciler also sweeps rows left
-in those transient states by operations that were already `cancelled` or
-`failed`, so the existing `resource-audit/interrupt` stuck row converged after
-the fixed worker started, without a repair command or direct database edit. A
-subsequent `resource destroy` performed a normal destroy and environment
-deletion succeeded. No schema migration was required. The signed edge
-manifest, linux/amd64 hash and binary version were verified; the CLI and
-`main` were upgraded to `edge-81998646916d`, schema stayed **24/24**, `doctor`
-is 20/0/0 and `apply --dry-run` is 0 of 20. A second no-kill retest then proved
-a remaining step-boundary bug: an accepted cancel during a successful health
-step was silently converted into a successful apply and `ready` resource. A
-reviewer P1 then found the same race at finalization. The working tree adds
-step-boundary checks and a scoped `finishResourceOperation` that locks the
-operation row and rechecks `cancelling` before the resource callback; the new
-apply/destroy finalization regressions and the selected platform, CLI and
-control-plane packages pass. That source change is **not committed, published
-or deployed**; current `main` still has both defects, and the orchestrator must
-integrate and publish it before this fix is host-qualified. MANUAL-TESTING
-records the evidence.
+`edge-81998646916d` (commit `8199864`, Publish edge run `42302477645`). A
+cancelled or failed resource operation that had entered `provisioning` or
+`destroying` settles the resource row to `degraded` in the same terminal
+transaction, fenced by the row's `operation_id`; image, container, network and
+the cumulative volume ledger are retained. The normal maintenance reconciler
+also sweeps rows left in those transient states by operations that were already
+`cancelled` or `failed`, so the existing `resource-audit/interrupt` stuck row
+converged after the fixed worker started, without a repair command or direct
+database edit. Ordinary destroy and environment deletion then succeeded. No
+schema migration was required.
+
+The follow-up step-boundary/finalization fix was published in
+`edge-7e74edbed8bc` (commit `7e74edb`, Publish edge run `42309997476`, CI
+`42309997630`). Resource apply/destroy now check cancellation at every step
+boundary and finalize under the operation row lock, rechecking `cancelling`
+before the resource callback through the scoped `finishResourceOperation`.
+Other completion policy is unchanged. The signed manifest, linux/amd64 hash
+`1bee0caf35bb0f1dd6462005ca0b592d18d5915812013c1d13f317594df09284` and binary
+version were verified; CLI and `main` were upgraded with node apply
+`op_fc5bec9e0e40767839fa8f298682fb87`. Schema stayed **24/24**, River 7/7;
+`apply --dry-run` was 0 of 20 and repeated `doctor` runs were 20/0/0 (one
+transient host-readiness drift and one known sporadic retention-read warning
+were recorded and cleared on retry). A host successful-step cancellation test on
+disposable unprotected `cancel-final` ended `cancelled` at a completed network
+step boundary with the resource `degraded`
+(`op_3bc86507be687b2fa91245565942ee91`); destroy and environment deletion
+succeeded. The finalization race is covered deterministically by the new
+apply/destroy integration tests. No known cancellation-state defect remains on
+this build. MANUAL-TESTING records the evidence.
 
 Residual: `a2defs1106` has production, staging and `prot-audit`, all protected,
 and no unprotected disposable test environment. Production serves
@@ -987,7 +1025,7 @@ MANUAL-TESTING for the evidence.
 | Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Closed by operator confirmation. |
 | CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy` with durable admission and atomic deploy linking; `secrets export`/`secret export` behind the factor. | Host checks pass for token reload, secret-export metadata, disposable deletes and webhook-secret recovery; migration 021 is applied on main; a real push deployed `59017d6` as `rel_d231a28c…` with delivery 202 and all four URLs 200. On the same build redelivery returned the original operation without another release, an invalid signature returned 401, and an existing other-branch fixture push was ignored. Old-secret rejection after rotation was not recorded; alpha.1 is operator-confirmed, and no result is backfilled. |
 | Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
-| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06`, `ef4a6f879f45`, `ba175353f00a`, `6d1ae98b9ac1` and `81998646916d`; the latest installed on CLI and `main` with schema 24/24. The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
+| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06`, `ef4a6f879f45`, `ba175353f00a`, `6d1ae98b9ac1`, `81998646916d`, `7e74edbed8bc` and `9e71713eeff9`; CLI and `main` now run `edge-9e71713eeff9` at schema 24/24, and the tagged `1.0.0-alpha.2` snapshot remains published (it was installed earlier and then superseded by this edge candidate). The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. The authorized alpha.2 tag was replaced at `85f2a4f` after PR #1; Publish stable `42363078147` and CI `42363078061` passed, and the signed `releases/1.0.0-alpha.2/` manifest and four binaries match the tag identity and manifest hashes. Tag replacement and its unsigned annotation are explicit release caveats; `install.sh` is version-pinned but outside the cosign-signed set. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
 
 ## 9. Work list
 
@@ -1000,10 +1038,11 @@ alpha.1 by the operator's confirmation that all alpha.1 testing is done (section
 document does not reconstruct the individual results or backfill evidence. The
 R10 macOS exception remains outside the alpha.1 gate and is still required
 before v1.0.0 final. Rows 18–20 are alpha.2 work, implemented and host-qualified
-incrementally on the authorized existing node; one cancellation finalization
-fix remains in the working tree pending review, publication and host retest.
-The evidence boundaries and residual TOTP/DNS items are recorded in
-MANUAL-TESTING.
+incrementally on the authorized existing node; `v1.0.0-alpha.2` is published
+at `85f2a4f` and installed on CLI and `main`, with the recorded evidence
+boundaries and residual TOTP/DNS items in MANUAL-TESTING. The `v1.0.0-alpha.2`
+tag publication succeeded at `85f2a4f` after PR #1; its signed immutable
+snapshot is published.
 
 | # | Outcome | Done when |
 | --- | --- | --- |
@@ -1024,7 +1063,7 @@ MANUAL-TESTING.
 | 15 | **Guided finish.** Guided `app create`/`env create` follow build and deploy to serving or failed, Ctrl-C detaches (vaire's flow); `server init` ends with vaire's doctor gate (`doctor_failed`, `--resume`, `--skip-doctor`). | Guided create ends at a serving URL or a failed operation with its error; init on a healthy host ends with a clean doctor summary. |
 | 16 | **Alpha qualification.** MANUAL-TESTING baseline on a real server for the tagged build. | Complete: the operator confirmed all alpha.1 testing is done. No baseline record is reconstructed here; release authorization is separate. |
 | 17 | **Disk retention (D30), alpha.1 gate.** Policy, planner, periodic job, `retention show|set`, `prune [--dry-run]`, registry deletes and GC, `doctor` retention and Buildpacks cache rows. Implemented and tested at source level; alpha.1 host qualification is operator-confirmed. | A node with 30 releases keeps exactly the policy's set; `prune --dry-run` lists what would go and the bytes; rollback to a pruned release refuses clearly; a second `apply` stays a no-op. |
-| 18 | **Optional app definitions and managed resources (D19, D32), alpha.2.** Implemented and published; host-qualified across `edge-6d1ae98b9ac1` and `edge-81998646916d`. `eregion.toml` input for `app create`, `env create|update` (`--from`) and `app export`, with shared defaults and selected environment overrides. Generic Docker resources have environment ownership, private networking, secret references, optional persistent volumes and durable lifecycle; explicit apply provisions them, while ordinary deploys never read the file. Existing file-free workflows remain supported. On 2026-11-06 `edge-ef4a6f879f45` passed definition create/override/export/reimport, secret-name-only storage and strict validation on `main`. Its first host run found the Docker 29.1.3 image-inspect and empty-slice removal defects; both fixes were retested on `edge-ba175353f00a`: Docker resource provisioning, file-based empty resource/secret removal, attach/detach, default destroy/re-apply data retention and delete-data cleanup passed for own Redis and PostgreSQL fixtures. An unhealthy resource was refused at the gate; after the resource was healthy, a real deployment served `a2defs1106` over HTTPS at the authorized `eregion-alpha-two.mbvlabs.com`, and its root response read the managed Redis (`alpha2:key=alpha2-serving`). A failed candidate left the previous release serving. The user then deleted the fixture with the D7 factor (`op_90e6c3530ef81a575bba1542a70cda0b`); read-only checks found no fixture app/environment/domain/resource rows, containers, networks or volumes. The pre-existing DNS record remains; identified fixture images were later removed too. A later disposable pass covered file-vs-flags/staging overrides, managed PostgreSQL app consumption and restart/redeploy persistence, stale-plan refusal and a simulated missing-admin fallback. The user then deleted the recreated fixture (`op_c113f640932b31df52c4a92117f3d105`); the default-retained PostgreSQL volume persisted untracked with its labels and no container references, then the authorized volume was removed. A later guided file-free fixture and failed-health provisioning retry passed; after the policy stop its unattached resource, network and images were removed, but that app/domain/secret row remained pending TOTP deletion. On `edge-6d1ae98b9ac1`, a failed-health provisioning retry reused its volume and reached ready; an actual worker-SIGKILL interruption was recovered at attempt 2 and a corrected retry reused the same volume and reached ready; destroying a resource with a dependent revision was refused; removing its declaration retained the container, volume and Redis data; `--delete-data` removed only the owned volume while an unrelated pre-created foreign volume remained untouched; a separately named deletion target with foreign ownership was explicitly refused; an external dependency without a managed resource served; a degraded resource blocked its dependent deploy while the serving release stayed up; a rogue `eregion.toml` in the working directory was ignored; and `env update --from` with `--confirm-domain` removed the designated alias, leaving a `.invalid` primary. A cancelled interruption attempt left `resource-audit/interrupt` stuck provisioning; after the `edge-81998646916d` cancellation fix, normal reconciliation moved it to degraded, and ordinary destroy plus noninteractive environment deletion succeeded. A no-kill cancellation retest then proved step-boundary and final-commit bugs: an accepted cancel during a successful health step still ended succeeded with a ready resource, and a cancel could commit between the last check and transactional finalization. The working tree adds cancellation checks at every resource step boundary and a scoped row-locked finalization recheck; its apply/destroy finalization regressions and selected packages pass, but the change is not committed, published or deployed, so `edge-81998646916d` on `main` still has the bugs. Details are in MANUAL-TESTING. | File and equivalent flags save equivalent supported desired state; export round-trips without secret values; unknown keys and secret-value fields are refused. Dry-run previews changes; destructive removals require target confirmation; detaching a resource retains its data and destruction is separate. A managed resource can be consumed by the app, and an external dependency still works without one. |
+| 18 | **Optional app definitions and managed resources (D19, D32), alpha.2.** Implemented and published; host-qualified across `edge-6d1ae98b9ac1`, `edge-81998646916d`, `edge-7e74edbed8bc` and the tagged `1.0.0-alpha.2` snapshot (identical tree). `eregion.toml` input for `app create`, `env create|update` (`--from`) and `app export`, with shared defaults and selected environment overrides. Generic Docker resources have environment ownership, private networking, secret references, optional persistent volumes and durable lifecycle; explicit apply provisions them, while ordinary deploys never read the file. Existing file-free workflows remain supported. On 2026-11-06 `edge-ef4a6f879f45` passed definition create/override/export/reimport, secret-name-only storage and strict validation on `main`. Its first host run found the Docker 29.1.3 image-inspect and empty-slice removal defects; both fixes were retested on `edge-ba175353f00a`: Docker resource provisioning, file-based empty resource/secret removal, attach/detach, default destroy/re-apply data retention and delete-data cleanup passed for own Redis and PostgreSQL fixtures. An unhealthy resource was refused at the gate; after the resource was healthy, a real deployment served `a2defs1106` over HTTPS at the authorized `eregion-alpha-two.mbvlabs.com`, and its root response read the managed Redis (`alpha2:key=alpha2-serving`). A failed candidate left the previous release serving. The user then deleted the fixture with the D7 factor (`op_90e6c3530ef81a575bba1542a70cda0b`); read-only checks found no fixture app/environment/domain/resource rows, containers, networks or volumes. The pre-existing DNS record remains; identified fixture images were later removed too. A later disposable pass covered file-vs-flags/staging overrides, managed PostgreSQL app consumption and restart/redeploy persistence, stale-plan refusal and a simulated missing-admin fallback. The user then deleted the recreated fixture (`op_c113f640932b31df52c4a92117f3d105`); the default-retained PostgreSQL volume persisted untracked with its labels and no container references, then the authorized volume was removed. A later guided file-free fixture and failed-health provisioning retry passed; after the policy stop its unattached resource, network and images were removed, but that app/domain/secret row remained pending TOTP deletion. On `edge-6d1ae98b9ac1`, a failed-health provisioning retry reused its volume and reached ready; an actual worker-SIGKILL interruption was recovered at attempt 2 and a corrected retry reused the same volume and reached ready; destroying a resource with a dependent revision was refused; removing its declaration retained the container, volume and Redis data; `--delete-data` removed only the owned volume while an unrelated pre-created foreign volume remained untouched; a separately named deletion target with foreign ownership was explicitly refused; an external dependency without a managed resource served; a degraded resource blocked its dependent deploy while the serving release stayed up; a rogue `eregion.toml` in the working directory was ignored; and `env update --from` with `--confirm-domain` removed the designated alias, leaving a `.invalid` primary. A cancelled interruption attempt left `resource-audit/interrupt` stuck provisioning; after the `edge-81998646916d` cancellation fix, normal reconciliation moved it to degraded, and ordinary destroy plus noninteractive environment deletion succeeded. A no-kill cancellation retest then proved step-boundary and final-commit bugs: an accepted cancel during a successful health step still ended succeeded with a ready resource, and a cancel could commit between the last check and transactional finalization. The fix was published in `edge-7e74edbed8bc`: cancellation is checked at every resource step boundary and a scoped row-locked finalization rechecks `cancelling` before the resource callback. The apply/destroy finalization regressions pass, and a host successful-step cancellation test ended `cancelled` with the resource `degraded`; destroy and environment deletion succeeded. No known cancellation-state defect remains on this build. Details are in MANUAL-TESTING. | File and equivalent flags save equivalent supported desired state; export round-trips without secret values; unknown keys and secret-value fields are refused. Dry-run previews changes; destructive removals require target confirmation; detaching a resource retains its data and destruction is separate. A managed resource can be consumed by the app, and an external dependency still works without one. |
 | 19 | **Optional `gh`-assisted webhook setup (D28), alpha.2.** Implemented and host-qualified for the main paths; extended on `edge-6d1ae98b9ac1`. Check authenticated `gh` and repository hook permission; create or update the matching hook, retaining manual setup without `gh` or permission. No GitHub App; no plaintext secrets in ordinary output, events or arguments. | On 2026-11-06 against the authorized private `mbvlabs/eregion-hello`, `--auto-deploy --github-webhook` created hook `708277604` for `a2defs1106/production`, a repeat reported `unchanged`, and rotation updated the same hook. A real push (`f6bbfa7`) produced delivery HTTP 202 and webhook operation `op_1380428…`, which built `rel_29c45e28…` and served `/marker` 200. The manual one-time secret was handled in 0600 temporary files, sent on stdin, never printed and shredded; push `c4507c1` produced delivery 202 and `op_b4dc5f8b…`, serving `rel_df70f2b…`. The missing-`gh` fallback reported `skipped` with manual setup available. A temporary `gh` shim returning `permissions.admin=false` made the fallback report the missing-admin case and keep manual setup available without changing repository permissions or credentials; no real non-admin account was tested. Hook and test branch were deleted. The recreated fixture was later deleted with the D7 factor (`op_c113f640932b31df52c4a92117f3d105`); read-only checks found no fixture rows, container, network or image, and the default-retained PostgreSQL volume was observed untracked with its ownership labels then removed. The three identified image artifacts were removed after reference checks; the pre-existing DNS record remains because no safe Cloudflare access was available. On `edge-6d1ae98b9ac1`, a simulated failing hook call enabled auto-deploy without creating a hook; after disabling it, the real `--rotate-webhook-secret --github-webhook` created hook `708330096` (secret revision 3). Push `8fa8c11` produced delivery HTTP 202 and `op_73c9e2addecfd556686d431b1fd4c916`, serving `rel_c2df6de6c35011f6be98b270c859fc7e` with `/` returning `eregion sample: hello-v1 src3`; hook and test branch were then deleted. |
 | 20 | **Environment protection and app-create defaults (D33), alpha.2 redesign.** Published in `edge-6d1ae98b9ac1` (commit `6d1ae98`) and host-qualified on `main` for the main flows. `app create` records production and staging from one recipe, both protected by default and without TOTP enrollment. Migration 024 adds persistent protection and backfills existing environments protected; on 2026-11-06 node apply `op_fca44c39b625e2216d05d7581de99c18` applied it (schema 24/24), and all five pre-existing environments read protected. On `a2defs1106`, guided create `op_0e2c1e66043489dc1941825c705a8c1a` made production and staging protected; shared-recipe `pr-42` `op_1724f76965e70df26a026cfde545ceb8` was unprotected and deleted with `--confirm --json` `op_9eb5aa06b06766f163adfbe61b2c74bc`; protected `env delete`, `env unprotect` and `app delete` refused `input_required`, while direct node app/protected-env delete refused `precondition_failed`/`code_required`; `env protect` raised `prot-audit` agent-safely as `op_e248d36683e6317674fc36b9c5711439`, after which delete and unprotect refused. Fresh arbitrary-name `fresh-audit` (`op_4fa609d1c8502d17ab4e11baa2b4de02`) and shared-recipe `recipe-audit` (`op_a1505d66121293de4f0c8b9931de94c4`) were unprotected by default; a same-key `env create` replay returned the original operation, and both were deleted unattended (`op_d1144d2a44c97b3b8b284f827b6806ba`, `op_17179495fec1805fad3341a51366b0a8`). A separate disposable PostgreSQL test on `6d1ae98` passed atomic app-create rollback/replay and denied a last unprotected environment for missing, wrong and invalid verifier input; its valid injected verifier queued (not completed) a delete with workers stopped and was not a real TOTP; isolated protect-store/CLI tests and a direct-service local-verifier test cover generated local secrets with real TOTP codes. The multi-environment app-create same-key replay and the last-environment positive path were not re-run on the host; the operator must complete the residual app deletion with TOTP. | Create an app and verify two protected environments commit in one transaction and replay idempotently; protected/last deletion refuses without a code over direct node/HTTP paths; unprotected non-last deletion succeeds with `--json`/no-TTY and exact confirmation; unprotect without a terminal refuses; recipe create for `pr-42` needs no file entry; migration 024 backfills safely. |
 

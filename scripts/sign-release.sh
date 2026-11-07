@@ -14,6 +14,23 @@ if [ "${#release_directories[@]}" -ne 1 ] || [ ! -d "${release_directories[0]}" 
 fi
 version_root="${release_directories[0]}"
 
+manifest_value() {
+  sed -n "s/.*\"${1}\": *\"\\([^\"]*\\)\".*/\\1/p" "$2" | head -1
+}
+
+version="$(manifest_value version "${version_root}/manifest.json")"
+[ -n "${version}" ] || { echo "version manifest is missing its version" >&2; exit 1; }
+case "${version}" in
+  edge-*) expected_channel=edge ;;
+  *) expected_channel=stable ;;
+esac
+manifest_channel="$(manifest_value channel "${version_root}/manifest.json")"
+if [ "${manifest_channel}" != "${expected_channel}" ]; then
+  echo "version manifest channel ${manifest_channel} does not match ${expected_channel}" >&2
+  exit 1
+fi
+
+channel_manifest=""
 if [ -f "${release_root}/manifest.json" ]; then
   channel_manifest="${release_root}/manifest.json"
 elif [ -f "${release_root}/edge/manifest.json" ]; then
@@ -22,17 +39,35 @@ elif [ -f "${release_root}/rc/manifest.json" ]; then
   channel_manifest="${release_root}/rc/manifest.json"
 else
   channel_manifests=("${release_root}"/[0-9]*.x/manifest.json)
-  if [ "${#channel_manifests[@]}" -ne 1 ]; then
-    echo "channel manifest is missing under ${release_root}" >&2
+  if [ "${#channel_manifests[@]}" -gt 1 ]; then
+    echo "release root has more than one channel manifest" >&2
     exit 1
   fi
-  channel_manifest="${channel_manifests[0]}"
+  if [ "${#channel_manifests[@]}" -eq 1 ]; then
+    channel_manifest="${channel_manifests[0]}"
+  fi
+fi
+if [ -n "${channel_manifest}" ]; then
+  channel_channel="$(manifest_value channel "${channel_manifest}")"
+  channel_version="$(manifest_value version "${channel_manifest}")"
+  if [ "${channel_channel}" != "${expected_channel}" ] || [ "${channel_version}" != "${version}" ]; then
+    echo "channel manifest does not match the immutable version manifest" >&2
+    exit 1
+  fi
+else
+  case "${version}" in
+    *-alpha.* | *-beta.*) ;;
+    *)
+      echo "channel manifest is missing under ${release_root}" >&2
+      exit 1
+      ;;
+  esac
 fi
 
-artifacts=(
-  "${channel_manifest}"
-  "${version_root}/manifest.json"
-)
+artifacts=("${version_root}/manifest.json")
+if [ -n "${channel_manifest}" ]; then
+  artifacts+=("${channel_manifest}")
+fi
 for os in linux darwin; do
   for arch in amd64 arm64; do
     artifacts+=("${version_root}/${os}/${arch}/eregion")

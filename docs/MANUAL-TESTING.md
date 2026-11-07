@@ -757,7 +757,91 @@ pointer. Channel publication retains the existing two-object manifest/signature
 race and partial-upload retry risk; signing tooling is unchanged. This source
 integration is not a published-build or alpha baseline qualification.
 
+### 2026-11-07 — alpha.3 resolver host qualification (`edge-9e71713eeff9`)
+
+The manifest protocol remains **schema 1**, compatible with the published
+alpha.2 client. Manifest `channel` remains the signing family: every tagged
+artifact, including alpha/beta and RC, says `stable`; edge says `edge`. Alpha
+and beta are immutable snapshots built through the build script's `snapshot`
+channel with no pointer; RC uses the rc pointer; stable and major-line pointers
+accept only final versions. The build script, pointer installer, upload guard and
+promotion code reject prereleases independently, and the stable publish job
+accepts only a final tag whose commit is on `origin/<major>.x`. This is a
+safety guard, not a new protocol or stable promotion claim.
+
+The alpha.3 source also adds the shared read-only container resolver for bare
+process/release commands. It is now host-qualified on `edge-9e71713eeff9` for
+the plain-Docker and Buildpacks paths below. Alpha.3 is **not tagged**; a
+snapshot, installer checks and tag publication remain future work.
+
+Candidate `9e71713eeff9e2534452a913b54683e9a45e629c` published as
+`edge-9e71713eeff9`: Publish edge `42387096819` and CI `42387096776` both passed
+via `gh run watch`. The signed manifest verified with the pinned edge identity;
+linux/amd64 SHA256 was
+`164725d24df9582553624fdf2c51ff3c9cf9a5abac1a0cceb440a92dd92595e0`. CLI and
+`main` upgraded; node apply `op_162c42a9c556258cd7123fd40b06965b`, schema
+stayed **24/24**, River 7/7, `doctor` 20/0/0 and `apply --dry-run` 0 of 20.
+
+**Plain Docker image bare commands — pass.** Disposable unprotected
+`a3-bare-docker` was created from prebuilt image digest
+`sha256:f06b2be7670c934543431fe3bbe3c4752821aaaa07b803652ab9b5ca6763df1e`
+(`op_1303b7c1ee6d711e36d6921f28c5f569`) with domain
+`eregion-alpha-two.mbvlabs.com`, release command `migrate`, web process `web`,
+service process `migrate service` on 8081, and worker process
+`migrate worker`. Config `PATH=/usr/bin:/bin` forced the cwd fallback.
+
+Deploy `op_1923ede54d8af0b74aaa6228bfdbe3c8` succeeded; serving release
+`rel_87a9912d61f0b0d7341e37dfc4e3af78`. The release command output was
+`A3MIGRATE mode=release path=/usr/bin:/bin cwd=/app exe=/app/migrate
+argv0=migrate` followed by `release-ok`. Service/worker logs showed the same
+effective PATH/cwd/target and `service-start`/heartbeat markers. Public
+`https://eregion-alpha-two.mbvlabs.com/` returned `plain-web`; `/healthz`
+returned `ok`. The environment was deleted with `op_1c18c691da5c6b8608d0c61595ab9c24`.
+
+**Buildpacks image bare commands — pass.** The fixture branch
+`alpha3-bare-commands` (commit `8258f22`) names its root module binary
+`migrate`; the Buildpacks image exposes it in
+`/layers/paketo-buildpacks_go-build/targets/bin`. Disposable unprotected
+`a3-bare-buildpacks` used the authorized private repo/ref, release command
+`migrate`, web `migrate web`, service `migrate service` on 8081 and worker
+`migrate worker` (create `op_123bd0923195fd03d09d3c446a0d4241`). Deploy
+`op_47192b397f65edec2b11d27a6ea7d3a7` succeeded; serving release
+`rel_787722bb7bcbcd900f5c378ac5b006b8`.
+
+The release command output was `A3BP migrate mode=release
+path=/layers/paketo-buildpacks_go-build/targets/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+cwd=/workspace exe=/layers/paketo-buildpacks_go-build/targets/bin/migrate
+argv0=migrate` followed by `release-ok version=alpha3-bp`. Service, worker and
+web logs showed the same launch-layer PATH and target; worker emitted
+heartbeats. Public `/` returned `eregion sample: alpha3-bp`; `/healthz` returned
+`ok`. Environment delete `op_e61dc00ae8040c05b7165aac13595538` succeeded.
+
+The first Buildpacks fixture attempt used `BP_GO_TARGETS` with a second package;
+pack selected a non-Go detection group and failed before building
+(`op_c22b5eca7f1e685ce979a8148b9dfea7`). This was a fixture configuration
+failure, not an eregion runtime defect; the corrected single-binary fixture
+above passed.
+
+**Cleanup.** Both test environments, their routes and secrets were removed; the
+fixture branch was deleted locally and remotely, `main` restored, the plain
+registry tag deleted (HTTP 202), and the plain/Buildpacks local images removed.
+`a2defs1106` retains only production, staging and protected `prot-audit`; no
+test container/volume remains. The designated hostname returns 525; the four
+pre-existing URLs return 200.
+
+Offline checks for this source change are
+`go test ./cmd/eregion ./internal/containerresolver ./internal/platform
+./internal/release ./internal/upgrade ./internal/cli`,
+`scripts/test-install-pins.sh`, `scripts/test-install-routing.sh`,
+`scripts/test-release-channels.sh`, `scripts/test-release-environments.sh`,
+`scripts/test-sign-release.sh` and
+`scripts/test-upload-guard.sh`; no tag, upload, bucket write, Docker, VM or
+database was used in that source-only pass. This host run is a targeted
+qualification, not a repeated full manual acceptance. Alpha.3 snapshot/tag and
+installer checks remain. No TOTP, secret value or unrelated app was touched.
+
 ## Developer checks
+
 
 ```sh
 just fmt-check
@@ -871,6 +955,7 @@ fails. Install the CLI from published edge or an exact alpha snapshot.
 | Build lifecycle | `build logs` streams a running build; `build stop` stops it; `build retry` starts a new build of the same commit. |
 | Processes | `process scale web 2` runs two replicas behind Caddy; the worker runs without a port; logs show both. |
 | Release command scope | A release command runs once on deploy; `process scale` and `rollback` skip the succeeded command and run no command container; changing the command runs it again on the next deploy; restart, scale and rollback refuse when its run has not succeeded. |
+| Command resolution | A Buildpacks executable in a launch-layer `bin` directory and a plain Docker executable in the image working directory both run with a bare name (for example `migrate`). The Buildpacks launcher completes its environment and then execs the same mounted resolver; a plain image uses it directly. The resolver is the node's static Linux `eregion` binary bind-mounted read-only at `/run/eregion/eregion`, searches the effective PATH in order including relative and empty entries using the container cwd/filesystem and permissions, then falls back to cwd, and `exec`s the target with unchanged argv/environment and no shell. Explicit paths keep exact argv and receive no resolver mount (plain image directly, Buildpacks through its launcher); commandless containers keep the native entrypoint. Configured or secret `PATH` remains ordinary Docker client environment with no PATH value in argv. |
 | Release command recovery | After a lost command response leaves the run unresolved, making the original operation terminal and deploying again recovers the completed command as succeeded without running it a second time; running, absent or unreachable original effects keep the original owner and defer. Missing/mismatched inputs hashes and status-query failures also preserve ownership and dispatch no command. |
 | Leaked-container retry | A forced previous/candidate-container removal failure creates a named cleanup row visible in `env status` without failing a verified traffic switch; removing the obstruction lets maintenance remove the container and row. |
 | Container repair | Removing a serving web container and restarting the worker queues one `platform.restart`, the container returns, and a second worker start with nothing missing queues no operation. A competing deploy or changed serving-deployment ID causes stale repair to skip/refuse, never restore an old release. |
@@ -1088,6 +1173,17 @@ rebuild. andurel and its `eregion-test*` hostnames go with it, and its
       failures. **Failed candidate.** **Rollback** with pinned secret revisions.
 - [ ] **Environment changes**, **Monorepo build**, **Moved-branch retry**,
       **Build lifecycle**, **Processes**, **Release command scope**.
+- [ ] **Command resolution:** a release command and a worker/service command
+      with the same bare executable name run when the Buildpacks binary is in a
+      launch-layer `bin` directory and the plain Docker binary is in the image
+      working directory. The resolver mount is read-only at the fixed path, the
+      plain image execs it directly, and the Buildpacks launcher execs it after
+      setting the launch environment. A plain-image `PATH` containing
+      `/usr/bin:.` or `bin:/usr/bin` resolves in the same order as the runtime
+      would, including the relative entry, then cwd fallback; target argv and
+      environment are unchanged. `./name` and absolute paths are unchanged and
+      receive no mount. This needs real images and was not run by the
+      fake-Docker source regressions.
 - [ ] **Leaked-container retry**, which also host-tests defect 2 (cleanup is no
       longer "completed" after a failed removal, and the real error is
       redacted). **Container repair.**
@@ -3518,7 +3614,7 @@ environment remains (the protected `prot-audit` audit environment stays).
 `resource-audit` was recovered after the `edge-81998646916d` upgrade:
 ordinary destroy `op_8a88…` and noninteractive env delete `op_905f…` succeeded.
 `resource-audit2`, `resource-audit3`, `cancel-audit`, `cancel-ok`,
-`fresh-audit` and `recipe-audit` are gone. The foreign ownership test volume
+`cancel-final`, `fresh-audit` and `recipe-audit` are gone. The foreign ownership test volume
 and all other test resource volumes were removed. Protected delete, unprotect and app-delete
 refusals were re-confirmed against `production` and `prot-audit` with
 `input_required`. No migration text was changed; 024 remains as applied.
@@ -3544,9 +3640,9 @@ TOTP and not a worker-completed delete. Positive real-TOTP authorization was
 not exercised against the live host gate; no live authenticator code, live seed
 or live protect store was accessed. The isolated protect-store/CLI tests and the
 direct-service local-verifier test use generated local secrets and real TOTP
-codes. The working-tree cancellation fix adds step-boundary checks and a
-row-locked finalization recheck; its regressions pass, but it is not committed,
-published or host-qualified until the orchestrator integrates it. A new app
+codes. The cancellation fix is published in `edge-7e74edbed8bc`; its
+successful-step host cancellation test passed and the finalization race has
+deterministic integration coverage. A new app
 fixture was not created because its deletion would add another
 TOTP-gated residual; fresh name-based creation was exercised with the disposable
 environments above instead. The `env create` same-key replay passed. Factor
@@ -3557,7 +3653,7 @@ fresh-server baseline is not required for this alpha under the incremental
 policy. No compatibility alias or shim was added: the create input replaces the
 single `environment` field with `environments`. No migration text was changed.
 
-### 2026-11-06 — resource cancellation recovery (state settlement host-qualified; boundary/finalization fix source-only)
+### 2026-11-06 — resource cancellation recovery and finalization (host-qualified on `edge-7e74edbed8bc`)
 
 During real-host qualification, cancelling a resource provisioning operation and
 then SIGKILLing the worker left the operation terminal `cancelled` while the
@@ -3593,7 +3689,7 @@ Source fix, no migration:
 
 Tests for the published `8199864` fix ran against a **local disposable
 PostgreSQL 18** database with a fake node transport (no main host, Docker used
-only to run the disposable database). The working-tree regression and
+only to run the disposable database). The follow-up `7e74edb` regressions and
 direct-TOTP test below were also run against the existing disposable
 PostgreSQL test container:
 
@@ -3607,7 +3703,7 @@ PostgreSQL test container:
 | Existing full resource lifecycle, secret redaction and retained-volume behavior unchanged | Pass: `TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets` |
 | Package build/vet and all non-DB tests | Pass: `go build ./...`, `go vet ./...`, `go test ./...`, darwin/arm64 cross-build |
 
-After the working-tree cancellation fix, the full
+After the `edge-7e74edbed8bc` cancellation fix, the full
 `go test ./internal/controlplane -count=1` passed against the existing
 disposable PostgreSQL test container (`127.0.0.1:55432`; no new container), as
 did `go test ./internal/protect -count=1`,
@@ -3627,7 +3723,32 @@ upgraded with the signed release; node apply
 stayed **24/24**, River 7/7; `doctor` is 20/0/0 and `apply --dry-run` is 0 of
 20.
 
-**Existing stuck-row recovery — pass.** Without SQL, normal reconciliation
+**Finalization fix release (`edge-7e74edbed8bc`).** Commit
+`7e74edbed8bcf521ad9e9bf93e67c744e0e0ab45` published through Publish edge
+`42309997476` (CI `42309997630`), both passed via `gh run watch`. The signed
+manifest reports `edge-7e74edbed8bc`; its sigstore bundle verified with the
+pinned publish-edge identity, the linux/amd64 SHA256 matched
+`1bee0caf35bb0f1dd6462005ca0b592d18d5915812013c1d13f317594df09284`, and the
+binary reported `edge-7e74edbed8bc`. The CLI and `main` upgraded to that build;
+node apply `op_fc5bec9e0e40767839fa8f298682fb87` restarted the API and worker.
+Schema stayed **24/24**, River 7/7; no migrations were added or edited. The
+first `doctor` immediately after the upgrade reported a transient
+`drift.pending: host-readiness-v1`; immediate retries were 20/0/0, `apply
+--dry-run` was 0 of 20, and `/readyz` and `/healthz` returned 200 (readyz
+0.63s). One later `doctor` run showed the known intermittent
+`host.retention` read warning; the next runs were 20/0/0. No configuration was
+changed.
+
+**Host successful-step cancellation — pass.** In disposable unprotected
+`cancel-final`, resource `cancelprobe` was submitted with a slow successful
+health command (`op_3bc86507be687b2fa91245565942ee91`). Cancellation was
+accepted while running; the network step then completed and the operation ended
+`cancelled` at the step boundary (not `succeeded`), with resource state
+`degraded`, `error_code=cancelled`, and the documented interrupted-apply
+detail. No worker was killed. Ordinary destroy `op_9cb1f3ec929f2ee64b2480b4f7e435d6`
+(delete-data) and noninteractive env delete
+`op_36df44f8e1da1d446c8eb97bf1a87119` succeeded; `cancel-final` and its resource
+are gone. **Existing stuck-row recovery — pass.** Without SQL, normal reconciliation
 moved `a2defs1106/resource-audit/interrupt` from `provisioning` to `degraded`
 with `error_code=cancelled` and the interrupted-apply detail. Ordinary
 `resource destroy` `op_8a880ab27ae28ad86b3b88e6a90d4066` succeeded and retained
@@ -3649,34 +3770,123 @@ succeeded, and the operation still ended **`succeeded`** with the resource
 bug on `edge-81998646916d`: resource apply/destroy had no cancellation check
 between steps, so an accepted cancel could be silently converted into success.
 
-The working tree now checks cancellation at every resource apply/destroy step
-boundary and finalizes both actions under the operation row lock, rechecking
-`cancelling` before the resource finalization callback. A `cancelling` row makes
-the scoped `finishResourceOperation` return `errPlatformCancelled` through the
-normal settlement path; other operation completion policy is unchanged. This
-closes the reviewer P1 race where a cancel could commit between the last step
-check and `finishPlatformOperation`. New regressions
-`TestIntegrationResourceCancelAfterSuccessfulStepIsHonored`,
+The fix published in `edge-7e74edbed8bc` checks cancellation at every resource
+apply/destroy step boundary and finalizes both actions under the operation row
+lock, rechecking `cancelling` before the resource finalization callback. A
+`cancelling` row makes the scoped `finishResourceOperation` return
+`errPlatformCancelled` through the normal settlement path; other operation
+completion policy is unchanged. This closes the reviewer P1 race where a cancel
+could commit between the last step check and `finishPlatformOperation`. New
+regressions `TestIntegrationResourceCancelAfterSuccessfulStepIsHonored`,
 `TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored` and
 `TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored` pass. They
 use a test-only seam immediately before the operation-row lock and require
-`cancelled` plus a degraded resource with the ledger preserved. The existing
-cancellation, reconciliation, managed-resource, platform, CLI and control-plane
-package tests also pass; `go build`, `go vet` and the darwin/arm64 cross-build
-pass. This source change is **not committed, pushed or deployed**; current
-`main` still runs `edge-81998646916d` with both cancellation defects. The
-orchestrator must review, commit/publish and deploy a new edge build before this
-fix is host-qualified. All `cancel-audit` and `cancel-ok` resources/environments
-were destroyed and deleted after the retests.
+`cancelled` plus a degraded resource with the ledger preserved. The full
+platform/CLI/control-plane tests and builds pass as recorded above. The
+`edge-7e74edbed8bc` host cancellation test above exercised a successful network
+step; the finalization race itself is covered deterministically by the
+integration tests, not by timing the host. All `cancel-audit` and `cancel-ok`
+resources/environments were destroyed and deleted after the retests.
 
-**Limitations.** Current `main` (`edge-81998646916d`) still has the resource
-step-boundary and final-commit cancellation bugs; the working-tree fix has not
-been committed, published or deployed. Only rows whose owning operation is
-already `cancelled` or `failed` are swept by reconciliation; queued, running or
-cancelling operations still need the normal River worker/rescue path.
-Reconciliation does not infer whether a node container exists: a subsequent
-apply/destroy is the deliberate recovery step, which is why the row becomes
-`degraded`, not `ready` or `destroyed`. No migration was added or edited.
+**Limitations.** At the time of that fix, `main` (`edge-7e74edbed8bc`) included
+the published step-boundary and finalization fixes; no known cancellation-state
+defect remained on that build. Alpha.3 `edge-9e71713eeff9` later superseded it.
+Only rows whose owning operation is already `cancelled` or
+`failed` are swept by reconciliation; queued, running or cancelling operations
+still need the normal River worker/rescue path. Reconciliation does not infer
+whether a node container exists: a subsequent apply/destroy is the deliberate
+recovery step, which is why the row becomes `degraded`, not `ready` or
+`destroyed`. The finalization race is covered by deterministic integration
+tests, not a timed host interleaving. No migration was added or edited. The
+tagged publication record is below.
+
+### 2026-11-07 — alpha.2 tag publication (succeeded; signed snapshot verified)
+
+The first attempt, tag `v1.0.0-alpha.2` at `7e74edb`, failed Publish stable
+`42312127636` because that commit was on `master` and not an ancestor of `1.x`.
+With explicit authorization the tag was replaced. PR #1 (`feat: deliver alpha.2
+release`, merged 2026-11-07T10:13:48Z) squash-merged the tested source onto
+`1.x` as `85f2a4f173de61eb86b843ce66ea62850c804a68`; its tree
+`48fa59d6653247e34c87cb21f13f4c149465c2dc` is identical to `7e74edb`, so the
+tagged tree is the previously tested `edge-7e74edbed8bc` source. The new
+annotated tag object `736a5edb332c74645692972cc392a1e96b0b1695` (tagger
+2026-11-07T10:13:58Z) points at that commit; it is not GPG-signed.
+
+Publish stable run `42363078147` (event push, head `85f2a4f`) completed
+**success**; `gh run watch` exited 0. `classify` and `publish_prerelease`
+passed, and the finals-only `publish` job was skipped. CI run `42363078061`
+also passed (`gh run watch` exit 0). The upload step copied fifteen files under
+`s3://eregion/releases/1.0.0-alpha.2/` (manifest, signature, installer, four
+binaries, four `.sha256` files and four binary signatures); the RC promotion
+step was skipped.
+
+The immutable snapshot is published at
+`https://eregion.mbvlabs.com/releases/1.0.0-alpha.2/`:
+`manifest.json` (200), `manifest.json.sigstore.json` (200), `install.sh` (200)
+and all four platform binaries and `.sha256` files returned 200. The manifest
+reports `schemaVersion: 1`, `channel: stable`, `version: 1.0.0-alpha.2`, and
+`releaseBaseUrl: https://eregion.mbvlabs.com/releases/1.0.0-alpha.2`. The
+release layout has no separate `version.json`; the version is the manifest's
+`version` field. Responses carried
+`Cache-Control: public,max-age=31536000,immutable`; last-modified was
+2026-11-07T10:17:51–56Z.
+
+Cosign verified the manifest and each of the four binaries against the exact
+tag identity
+`https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0-alpha.2`
+and issuer `https://token.actions.githubusercontent.com`; all five verifications
+returned `Verified OK`. Each binary and its published `.sha256` matched the
+manifest hash:
+
+| Platform | SHA-256 |
+| --- | --- |
+| linux/amd64 | `bd1da630bb6fc9802935560025b6570f6bd52c0293afad992b004622519bf7c1` |
+| linux/arm64 | `a344e5bbc754a55cb62afd41840b3c68fdb9b1e47217d806830b30f5620fa8c0` |
+| darwin/amd64 | `61190934eff16dae8911dcebc9dd562a51e3eaf015ec3f809215731a50a88a5e` |
+| darwin/arm64 | `abdc10b9181603313b364138b1e829b8d3aa96c5bed5657f578c42d9ee6b771a` |
+
+The downloaded linux/amd64 binary reported `version=1.0.0-alpha.2`,
+`channel=stable`, `commit=85f2a4f173de`, `dirty=false` (`eregion version
+--json`, go1.27.1); the 12-character commit is the tag commit's prefix.
+
+**Caveats.** The tag was deleted and replaced with explicit authorization; the
+earlier tag at `7e74edb` is no longer the published tag. The tag annotation is
+unsigned, so artifact authenticity rests on the cosign bundles. `install.sh`
+is version-pinned (`snapshot_version="1.0.0-alpha.2"`) but is not one of the
+cosign-signed files; the signing script covers the manifest and four binaries.
+No channel pointer moved: root, `1.x` and `rc` manifests remained HTTP 404, and
+the edge manifest still reports `edge-7e74edbed8bc`. The publication
+verification itself did not install the snapshot; a separate targeted smoke
+below installed it on `main`. Publication success is not a new full host
+qualification; the tagged tree is the already host-qualified
+`edge-7e74edbed8bc` source. No server, DNS record, repository branch or tag was
+mutated by the publication verification.
+
+### 2026-11-07 — alpha.2 tagged snapshot install and smoke
+
+The published `1.0.0-alpha.2` snapshot was installed on the authorized `main`
+with the signed release path. The CLI upgraded from `edge-7e74edbed8bc` to
+`1.0.0-alpha.2`; the manifest linux/amd64 SHA256 is
+`bd1da630bb6fc9802935560025b6570f6bd52c0293afad992b004622519bf7c1` and the
+manifest signature was verified against the `v1.0.0-alpha.2` publish-stable tag
+identity in the publication record. Node apply
+`op_a817ab835599be1908ec5dfa88f9fd9a` auto-upgraded the node; `host-database-v1`
+was skipped, schema stayed **24/24** and River 7/7. `server status` reports
+CLI/node `1.0.0-alpha.2`, node commit `85f2a4f173de`; `doctor` is 20/0/0;
+`apply --dry-run` is 0 of 20; `/readyz` and `/healthz` returned 200.
+
+Safe disposable smoke on `a2defs1106`: unprotected `alpha2-smoke-pr` was
+created noninteractively with the existing fixture image, no domain and no
+secrets (`op_ce2468e6a0de1fc12a778d44dcaa4a2d`, `protected:false`); it was
+deleted noninteractively (`op_1189a69ede6b011628124074e7b11a3b`), status
+`not_found`, with no TOTP. The fixture retains only production, staging and
+protected `prot-audit`; no test container, volume or network remains. Four
+existing URLs returned 200; the designated hostname remains unbound at
+Cloudflare 525.
+
+This is a targeted smoke/regression pass, not a repeated full manual acceptance.
+The earlier alpha.2 evidence and known gaps (live TOTP, HTTP factor, macOS R10)
+stand as recorded. No commit, push or tag was made by this smoke.
 
 ```text
 Date / build / commit / channel:

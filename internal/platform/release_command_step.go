@@ -16,10 +16,10 @@ import (
 var releaseCommandStepPattern = regexp.MustCompile(`^platform-command-[0-9]{2}-v1$`)
 
 // ReleaseCommandPayload runs a release's one-off command to completion in a
-// throwaway container of the release image on the environment network. The
-// command runs through the Buildpacks launcher for a Buildpacks image, exactly
-// like a process command, so it gets the buildpack environment instead of the
-// image's default web process.
+// throwaway container of the release image on the environment network. A bare
+// command runs through the same read-only mounted eregion resolver as a process
+// command, after the Buildpacks launcher for a Buildpacks image, so it resolves
+// against the effective launch-time PATH and cwd without changing PATH.
 type ReleaseCommandPayload struct {
 	Step    string            `json:"step"`
 	Name    string            `json:"name"`
@@ -105,7 +105,7 @@ func (s *ReleaseCommandStep) Check(context.Context, engine.Runtime) (engine.Chec
 func (s *ReleaseCommandStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
 	args, env, err := s.runArgs(ctx, rt)
 	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		return engine.ApplyResult{}, err
 	}
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(s.payload.TimeoutSeconds)*time.Second)
 	defer cancel()
@@ -138,6 +138,10 @@ func (s *ReleaseCommandStep) Apply(ctx context.Context, rt engine.Runtime, repor
 }
 
 func (s *ReleaseCommandStep) runArgs(ctx context.Context, rt engine.Runtime) ([]string, []string, error) {
+	prepared, err := prepareImageCommand(ctx, s.payload.Image, s.payload.Command, rt, s.ID())
+	if err != nil {
+		return nil, nil, err
+	}
 	args := []string{"docker", "run", "--rm", "--name", s.payload.Name, "--pull", "never", "--network", s.payload.Network}
 	for _, key := range sortedEnvKeys(s.payload.Labels) {
 		args = append(args, "--label", key+"="+s.payload.Labels[key])
@@ -152,11 +156,14 @@ func (s *ReleaseCommandStep) runArgs(ctx context.Context, rt engine.Runtime) ([]
 	for _, key := range s.payload.SecretEnvKeys {
 		value, ok := rt.SecretValues[key]
 		if !ok || value == "" {
-			return nil, nil, errors.New("secret value for " + key + " is unavailable")
+			return nil, nil, fmt.Errorf("%w: secret value for %s is unavailable", engine.ErrPermanent, key)
 		}
 		args = append(args, "-e", key)
 		env = append(env, key+"="+value)
 	}
-	args = append(args, processCommandArgs(s.payload.Image, s.payload.Command, buildpacksImage(ctx, s.payload.Image, rt, s.ID()))...)
+	for _, mount := range prepared.Mounts {
+		args = append(args, "--mount", mount)
+	}
+	args = append(args, prepared.Arguments...)
 	return args, env, nil
 }

@@ -50,7 +50,7 @@ func TestPromotes(t *testing.T) {
 		{"1.0.0", "1.0.1", true, false},
 		{"1.1.0", "1.0.1", false, false},
 		{"1.1.0", "1.2.0-alpha.1", false, false},
-		{"1.0.0-rc.1", "1.0.0", true, false},
+		{"1.0.0-rc.1", "1.0.0", false, true},
 		{"", "garbage", false, true},
 		{"garbage", "1.0.0", false, true},
 	}

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -710,9 +711,22 @@ func TestPushWebhookHTTP1KeepAliveSurvivesFullyConsumedRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first.Body.Close()
 	if first.StatusCode != http.StatusOK {
 		t.Fatalf("first status = %d", first.StatusCode)
+	}
+	// net/http returns an HTTP/1 connection to the keep-alive pool only after
+	// the response body reaches EOF. Closing an unread body lets the transport
+	// drain it asynchronously, so the next request can race the pool insertion
+	// and open a new connection even though the server reused the connection.
+	// Consume the response before attributing a missing reuse to the server.
+	if _, err := io.Copy(io.Discard, first.Body); err != nil {
+		t.Fatalf("read first response body: %v", err)
+	}
+	if err := first.Body.Close(); err != nil {
+		t.Fatalf("close first response body: %v", err)
+	}
+	if first.Close {
+		t.Fatal("fully consumed webhook request received a connection close")
 	}
 	reused := make(chan bool, 1)
 	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused <- info.Reused }}

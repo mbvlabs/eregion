@@ -107,3 +107,36 @@ func TestDecodeManifestIsStrict(t *testing.T) {
 		t.Fatal("manifest with trailing JSON was accepted")
 	}
 }
+
+func TestStableAndLinePointersRejectPrereleases(t *testing.T) {
+	for _, version := range []string{"1.0.0-alpha.1", "1.0.0-beta.1", "1.0.0-rc.1"} {
+		m := sampleManifest(t)
+		m.Version = version
+		m.ReleaseBaseURL = versionRoot(version)
+		for _, key := range artifactKeys {
+			m.Artifacts[key] = Artifact{URL: m.ReleaseBaseURL + "/" + key + "/eregion", SHA256: strings.Repeat("a", 64)}
+		}
+		for _, channel := range []string{ChannelStable, "stable-1.x"} {
+			if err := Validate(m, channel, ""); err == nil {
+				t.Errorf("%s pointer accepted signing-family-stable prerelease %s", channel, version)
+			}
+		}
+		if err := Validate(m, ChannelStable, version); err != nil {
+			t.Errorf("pinned %s with stable signing family was refused: %v", version, err)
+		}
+	}
+}
+
+func TestRCPointerRejectsNonRCVersion(t *testing.T) {
+	for _, version := range []string{"1.0.0-alpha.1", "1.0.0-beta.1", "1.0.0"} {
+		m := sampleManifest(t)
+		m.Version = version
+		m.ReleaseBaseURL = versionRoot(version)
+		for _, key := range artifactKeys {
+			m.Artifacts[key] = Artifact{URL: m.ReleaseBaseURL + "/" + key + "/eregion", SHA256: strings.Repeat("a", 64)}
+		}
+		if err := Validate(m, ChannelRC, ""); err == nil {
+			t.Errorf("rc pointer accepted %s", version)
+		}
+	}
+}

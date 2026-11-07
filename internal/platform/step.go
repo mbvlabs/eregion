@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/containerresolver"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/output"
@@ -246,6 +247,8 @@ type ContainerPayload struct {
 	SecretEnvKeys []string `json:"secret_env_keys,omitempty"`
 	// Command is the process command: run through the Buildpacks launcher for
 	// a Buildpacks image, as deploycrate does, otherwise as the entrypoint.
+	// A bare command runs through the mounted resolver, which searches the
+	// effective container PATH and cwd without changing either.
 	Command []string          `json:"command,omitempty"`
 	Labels  map[string]string `json:"labels,omitempty"`
 	Restart string            `json:"restart,omitempty"`
@@ -404,13 +407,13 @@ func (s *ContainerStep) Check(ctx context.Context, rt engine.Runtime) (engine.Ch
 }
 
 func (s *ContainerStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
+	args, env, err := s.runArgs(ctx, s.payload.Image, rt)
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
 	removeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	_, _, _ = runArgv(removeCtx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
 	cancel()
-	args, env, err := s.runArgs(ctx, s.payload.Image, rt)
-	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
-	}
 	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	_, stderr, err := runArgv(runCtx, args, env, rt, s.ID(), report)
 	cancel()
@@ -418,7 +421,7 @@ func (s *ContainerStep) Apply(ctx context.Context, rt engine.Runtime, report eng
 		if s.payload.FallbackImage != "" {
 			fallbackArgs, fallbackEnv, fallbackEnvErr := s.runArgs(ctx, s.payload.FallbackImage, rt)
 			if fallbackEnvErr != nil {
-				return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, fallbackEnvErr)
+				return engine.ApplyResult{}, fallbackEnvErr
 			}
 			fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 2*time.Minute)
 			_, _, fallbackErr := runArgv(fallbackCtx, fallbackArgs, fallbackEnv, rt, s.ID(), report)
@@ -501,6 +504,10 @@ func ParsePublishedPort(output string, containerPort int) (int, error) {
 }
 
 func (s *ContainerStep) runArgs(ctx context.Context, image string, rt engine.Runtime) ([]string, []string, error) {
+	prepared, err := prepareImageCommand(ctx, image, s.payload.Command, rt, s.ID())
+	if err != nil {
+		return nil, nil, err
+	}
 	args := []string{"docker", "run", "-d", "--name", s.payload.Name, "--pull", "never", "--restart", s.payload.Restart}
 	if s.payload.Network != "" {
 		args = append(args, "--network", s.payload.Network)
@@ -516,7 +523,7 @@ func (s *ContainerStep) runArgs(ctx context.Context, image string, rt engine.Run
 	for _, key := range keys {
 		args = append(args, "--label", key+"="+s.payload.Labels[key])
 	}
-	env := make([]string, 0, len(s.payload.Env)+len(s.payload.SecretEnvKeys))
+	env := make([]string, 0, len(s.payload.Env)+len(s.payload.SecretEnvKeys)+1)
 	for _, key := range sortedEnvKeys(s.payload.Env) {
 		// The key alone tells Docker to read the value from the client
 		// environment, so configuration values do not appear in the process
@@ -527,33 +534,134 @@ func (s *ContainerStep) runArgs(ctx context.Context, image string, rt engine.Run
 	for _, key := range s.payload.SecretEnvKeys {
 		value, ok := rt.SecretValues[key]
 		if !ok || value == "" {
-			return nil, nil, errors.New("secret value for " + key + " is unavailable")
+			return nil, nil, fmt.Errorf("%w: secret value for %s is unavailable", engine.ErrPermanent, key)
 		}
 		args = append(args, "-e", key)
 		env = append(env, key+"="+value)
 	}
-	args = append(args, processCommandArgs(image, s.payload.Command, buildpacksImage(ctx, image, rt, s.ID()))...)
+	for _, mount := range prepared.Mounts {
+		args = append(args, "--mount", mount)
+	}
+	args = append(args, prepared.Arguments...)
 	return args, env, nil
 }
 
 // buildpacksLabel marks an image built by Cloud Native Buildpacks.
 const buildpacksLabel = "io.buildpacks.lifecycle.metadata"
 
-// buildpacksImage reports whether image was built by Cloud Native Buildpacks,
-// whose process commands run through the CNB launcher. A plain image has no
-// launcher; its process command replaces the entrypoint instead.
-func buildpacksImage(ctx context.Context, image string, rt engine.Runtime, step string) bool {
+// resolverExecutable is replaceable by tests. It must name the running static
+// Linux eregion binary that will be bind-mounted read-only into the container.
+var resolverExecutable = os.Executable
+
+type preparedImageCommand struct {
+	Arguments []string
+	Mounts    []string
+}
+
+// prepareImageCommand keeps the image's normal command semantics. A Buildpacks
+// command runs through the CNB launcher so it observes the completed launch
+// environment. A bare command on either image kind runs through the same
+// eregion binary mounted read-only at a fixed path; the hidden resolver searches
+// the effective PATH in order, including relative and empty entries, then the
+// working directory, and execs the target without a shell. Explicit paths and a
+// commandless container keep their existing behavior and receive no mount.
+func prepareImageCommand(
+	ctx context.Context,
+	image string,
+	command []string,
+	rt engine.Runtime,
+	step string,
+) (preparedImageCommand, error) {
+	if len(command) == 0 {
+		return preparedImageCommand{Arguments: []string{image}}, nil
+	}
+	buildpacks, err := buildpacksImage(ctx, image, rt, step)
+	if err != nil {
+		return preparedImageCommand{}, err
+	}
+	if command[0] == "" || strings.Contains(command[0], "/") {
+		return preparedImageCommand{Arguments: processCommandArgs(image, command, buildpacks)}, nil
+	}
+	source, err := containerResolverSource()
+	if err != nil {
+		return preparedImageCommand{}, err
+	}
+	resolverArgs := make([]string, 0, len(command)+2)
+	resolverArgs = append(resolverArgs, containerresolver.TargetPath, containerresolver.Invocation)
+	resolverArgs = append(resolverArgs, command...)
+	return preparedImageCommand{
+		Arguments: processCommandArgs(image, resolverArgs, buildpacks),
+		Mounts: []string{fmt.Sprintf(
+			"type=bind,source=%s,destination=%s,readonly=true", source, containerresolver.TargetPath)},
+	}, nil
+}
+
+// buildpacksImage reports whether image was built by Cloud Native Buildpacks.
+// The inspect response is one label value, independent of PATH or image size.
+func buildpacksImage(ctx context.Context, image string, rt engine.Runtime, step string) (bool, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	stdout, _, err := runArgv(probeCtx, []string{"docker", "inspect", "--type=image", "--format", "{{index .Config.Labels \"" + buildpacksLabel + "\"}}", image}, nil, rt, step, nil)
+	stdout, stderr, err := runArgv(probeCtx, []string{
+		"docker", "inspect", "--type=image", "--format",
+		"{{index .Config.Labels \"" + buildpacksLabel + "\"}}", image,
+	}, nil, rt, step, nil)
+	if err != nil {
+		return false, classifyImageInspectError(ctx, err, stderr)
+	}
 	value := strings.TrimSpace(stdout)
-	return err == nil && value != "" && value != "<no value>"
+	return value != "" && value != "<no value>", nil
+}
+
+// classifyImageInspectError keeps daemon and transport failures retryable,
+// while a missing image, permission error, template incompatibility or invalid
+// reference is terminal for this attempt.
+func classifyImageInspectError(ctx context.Context, err error, stderr string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return fmt.Errorf("%w: inspect image configuration: %w", engine.ErrPermanent, err)
+	}
+	message := strings.ToLower(stderr + " " + err.Error())
+	switch {
+	case strings.Contains(message, "no such image"),
+		strings.Contains(message, "image not found"),
+		strings.Contains(message, "no such object"),
+		strings.Contains(message, "manifest unknown"),
+		strings.Contains(message, "permission denied"),
+		strings.Contains(message, "template parsing"),
+		strings.Contains(message, "template:"),
+		strings.Contains(message, "invalid reference"):
+		return fmt.Errorf("%w: inspect image configuration: %s", engine.ErrPermanent, firstLine(stderr))
+	default:
+		return fmt.Errorf("inspect image configuration: %w: %s", err, firstLine(stderr))
+	}
+}
+func containerResolverSource() (string, error) {
+	executable, err := resolverExecutable()
+	if err != nil {
+		return "", fmt.Errorf("%w: locate the eregion resolver binary: %v", engine.ErrPermanent, err)
+	}
+	source, err := filepath.EvalSymlinks(executable)
+	if err != nil {
+		return "", fmt.Errorf("%w: resolve the eregion resolver binary: %v", engine.ErrPermanent, err)
+	}
+	if !filepath.IsAbs(source) || strings.ContainsAny(source, ",\x00\r\n") {
+		return "", fmt.Errorf("%w: the eregion resolver binary path cannot be bind-mounted safely", engine.ErrPermanent)
+	}
+	info, err := os.Stat(source)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("%w: the eregion resolver binary is not an executable regular file", engine.ErrPermanent)
+	}
+	return source, nil
 }
 
 // processCommandArgs is the image and command part of docker run. A
 // Buildpacks image runs the command through its launcher, which sets up the
 // buildpack environment; a plain image runs it as the entrypoint. With no
-// command the image's own entrypoint and command run.
+// command the image's own entrypoint and command run. A bare command has
+// already been replaced by the mounted resolver invocation; explicit paths and
+// commandless containers pass through unchanged.
 func processCommandArgs(image string, command []string, buildpacks bool) []string {
 	switch {
 	case len(command) == 0:
@@ -1340,6 +1448,9 @@ func validateLabelKey(key string) error {
 // 128 secrets as -e pairs, 128 process arguments, and the fixed options.
 const maxPlatformArgs = 1024
 
+// platformArgumentLimit is one node command argument's byte limit.
+const platformArgumentLimit = 4096
+
 func validateArgv(argv []string) error {
 	// Each configuration key and secret is one -e argument besides the image,
 	// options and process arguments, so a real environment needs room.
@@ -1347,7 +1458,7 @@ func validateArgv(argv []string) error {
 		return fmt.Errorf("a platform command needs 1–%d arguments", maxPlatformArgs)
 	}
 	for _, arg := range argv {
-		if len(arg) > 4096 || strings.ContainsAny(arg, "\x00\r\n") {
+		if len(arg) > platformArgumentLimit || strings.ContainsAny(arg, "\x00\r\n") {
 			return errors.New("platform command argument is empty, too long, or contains a control character")
 		}
 	}
@@ -1387,7 +1498,7 @@ func validateArgv(argv []string) error {
 				if index+1 >= len(argv) {
 					return errors.New("docker --mount needs a value")
 				}
-				if err := validateVolumeMountOption(argv[index+1]); err != nil {
+				if err := validateMountOption(argv[index+1]); err != nil {
 					return err
 				}
 				index++
@@ -1419,6 +1530,56 @@ func validateArgv(argv []string) error {
 		}
 	default:
 		return fmt.Errorf("unsupported platform command %q", program)
+	}
+	return nil
+}
+
+func validateMountOption(value string) error {
+	if strings.Contains(value, "type=bind") {
+		return validateResolverMountOption(value)
+	}
+	return validateVolumeMountOption(value)
+}
+
+// validateResolverMountOption allows exactly the fixed read-only bind mount of
+// the node's eregion binary. It is a second line of defense: the step itself
+// computes the source from os.Executable, never from user input.
+func validateResolverMountOption(value string) error {
+	parts := strings.Split(value, ",")
+	fields := map[string]string{}
+	for _, part := range parts {
+		key, text, ok := strings.Cut(part, "=")
+		if !ok || key == "" || text == "" {
+			return errors.New("the resolver mount needs key=value fields")
+		}
+		if _, duplicate := fields[key]; duplicate {
+			return errors.New("the resolver mount repeats a field")
+		}
+		fields[key] = text
+	}
+	for key := range fields {
+		switch key {
+		case "type", "source", "destination", "readonly":
+		default:
+			return errors.New("the resolver mount supports only type, source, destination and readonly")
+		}
+	}
+	if fields["type"] != "bind" {
+		return errors.New("the resolver mount must be a bind mount")
+	}
+	source := fields["source"]
+	if !filepath.IsAbs(source) || strings.ContainsAny(source, ",\x00\r\n") {
+		return errors.New("the resolver mount source must be an absolute safe path")
+	}
+	if fields["destination"] != containerresolver.TargetPath {
+		return errors.New("the resolver mount destination is reserved")
+	}
+	if fields["readonly"] != "true" {
+		return errors.New("the resolver mount must be read-only")
+	}
+	expected, err := containerResolverSource()
+	if err != nil || source != expected {
+		return errors.New("the resolver mount source is not this node's eregion binary")
 	}
 	return nil
 }
