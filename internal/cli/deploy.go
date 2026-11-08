@@ -235,7 +235,12 @@ func (a *app) previewDelivery(cmd *cobra.Command, client Backend, kind, target s
 	if err != nil {
 		return platform.Preview{}, nil, contract.NewFault(contract.Internal, "could not encode the action input", "Report the command and binary version.")
 	}
-	out, err := client.SubmitAction(cmd.Context(), kind, target, raw, "", "", true)
+	// A preview must honor the operator's idempotency key. A dry run or an
+	// interactive plan rendered before submission then observes the same replay
+	// the real submit will; dropping the key would hide an existing operation
+	// and repeat conflict checks that a replay is meant to skip.
+	key, _ := cmd.Flags().GetString("idempotency-key")
+	out, err := client.SubmitAction(cmd.Context(), kind, target, raw, key, "", true)
 	if err != nil {
 		return platform.Preview{}, nil, err
 	}

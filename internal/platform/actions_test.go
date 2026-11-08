@@ -103,6 +103,42 @@ func TestDeployNormalizesSourceAndReleaseForms(t *testing.T) {
 	}
 }
 
+func TestPromoteNormalizesFixedProductionTarget(t *testing.T) {
+	registry := NewRegistry()
+	normalize := func(target string, input map[string]any) (Normalized, error) {
+		raw, _ := json.Marshal(input)
+		return registry.Normalize(KindPromote, target, raw)
+	}
+	good, err := normalize("env/api/production", map[string]any{"source_environment": "staging"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := good.Input.(*PromoteInput)
+	if input.App != "api" || input.SourceEnvironment != "staging" {
+		t.Fatalf("promote input = %+v", input)
+	}
+	if input.Target().String() != "env/api/production" {
+		t.Fatalf("target = %s", input.Target())
+	}
+	for name, tc := range map[string]struct {
+		target string
+		input  map[string]any
+	}{
+		"other target":        {target: "env/api/staging", input: map[string]any{"source_environment": "production"}},
+		"missing source":      {target: "env/api/production", input: map[string]any{}},
+		"self promotion":      {target: "env/api/production", input: map[string]any{"source_environment": "production"}},
+		"app mismatch":        {target: "env/api/production", input: map[string]any{"app": "other", "source_environment": "staging"}},
+		"invalid source name": {target: "env/api/production", input: map[string]any{"source_environment": "Staging_1"}},
+		"unknown field":       {target: "env/api/production", input: map[string]any{"source_environment": "staging", "target_environment": "prod"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := normalize(tc.target, tc.input); err == nil {
+				t.Fatal("promotion input was accepted")
+			}
+		})
+	}
+}
+
 func TestEnvironmentSpecCarriesItsFirstDomain(t *testing.T) {
 	registry := NewRegistry()
 	raw, _ := json.Marshal(map[string]any{

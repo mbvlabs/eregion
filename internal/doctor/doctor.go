@@ -124,6 +124,8 @@ type Facts struct {
 	// Buildpacks cache against the server policy's absolute cap.
 	Retention  RetentionFacts
 	BuildCache BuildCacheFacts
+	// Telemetry is the current local node_exporter health read, not history.
+	Telemetry TelemetryFacts
 }
 
 // FreePct is the free share of a filesystem in percent.
@@ -152,6 +154,7 @@ func Checks() []Check {
 		{ID: "version.cli_node", Category: CatVersions, AtInit: true, Run: versionCLINode},
 		{ID: "version.schema", Category: CatVersions, AtInit: true, Run: versionSchema},
 		{ID: "version.river", Category: CatVersions, AtInit: true, Run: versionRiver},
+		{ID: "telemetry.local", Category: CatServices, AtInit: true, Run: telemetryLocal},
 		{ID: "services.running", Category: CatServices, AtInit: true, Run: services},
 	}
 }

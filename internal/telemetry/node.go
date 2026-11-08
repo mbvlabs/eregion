@@ -285,6 +285,117 @@ func defaultNodeExporterClient(timeout time.Duration) *http.Client {
 	}
 }
 
+// LocalProbe is the narrow, current health observation used by doctor. It does
+// not produce a metrics snapshot, store history or replace the operator's
+// two-read metrics command: it only proves the exporter answers and reports
+// whether the textfile and systemd collectors are enabled and successful.
+type LocalProbe struct {
+	Endpoint        string          `json:"endpoint"`
+	Reachable       bool            `json:"reachable"`
+	ExporterVersion string          `json:"exporter_version,omitempty"`
+	Collectors      map[string]bool `json:"collectors,omitempty"`
+	// CollectorsAmbiguous names a collector whose success sample appeared more
+	// than once, was timestamped, or could not be tied to a collector label.
+	// The wildcard "*" means the collector family itself was malformed.
+	CollectorsAmbiguous map[string]bool `json:"collectors_ambiguous,omitempty"`
+	// TextfileScrapeError is node_exporter's textfile scrape error gauge. A nil
+	// pointer means the exporter did not report it; the doctor check treats
+	// that as unobserved, never as a successful zero.
+	TextfileScrapeError *float64 `json:"textfile_scrape_error,omitempty"`
+	// TextfileScrapeErrorAmbiguous is set when the metric appeared more than
+	// once, was malformed or timestamped, had labels, or carried a value other
+	// than the gauge's 0/1 forms. No value from an ambiguous response is used.
+	TextfileScrapeErrorAmbiguous bool `json:"textfile_scrape_error_ambiguous,omitempty"`
+}
+
+// ProbeLocal reads one bounded exporter response. A missing collector family
+// is reported as absent, not as a healthy or failed collector; the doctor check
+// names the missing collector explicitly. node_scrape_collector_success alone
+// does not detect a malformed or unreadable textfile: the textfile scrape-error
+// gauge must also be present exactly once and be zero.
+func ProbeLocal(ctx context.Context, endpoint string) (LocalProbe, error) {
+	probe := LocalProbe{Endpoint: endpoint, Collectors: map[string]bool{}, CollectorsAmbiguous: map[string]bool{}}
+	validated, err := validateNodeExporterURL(endpoint)
+	if err != nil {
+		return probe, err
+	}
+	probe.Endpoint = validated
+	body, err := fetchNodeExporter(ctx, defaultNodeExporterClient(5*time.Second), validated, DefaultNodeMaxBody)
+	if err != nil {
+		return probe, err
+	}
+	probe.Reachable = true
+	found := false
+	seenCollectors := map[string]bool{}
+	textfileError := struct {
+		seen      bool
+		ambiguous bool
+		value     float64
+	}{}
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		name := nodeExporterMetricName(line)
+		if name == "node_textfile_scrape_error" {
+			found = true
+			if textfileError.seen {
+				textfileError.ambiguous = true
+				continue
+			}
+			textfileError.seen = true
+			parsedName, labels, value, timestamped, ok := parsePrometheusLine(line)
+			if !ok || parsedName != name || timestamped || len(labels) != 0 || (value != 0 && value != 1) {
+				textfileError.ambiguous = true
+				continue
+			}
+			textfileError.value = value
+			continue
+		}
+		parsedName, labels, value, timestamped, ok := parsePrometheusLine(line)
+		if !ok {
+			if name == "node_scrape_collector_success" {
+				probe.CollectorsAmbiguous["*"] = true
+				found = true
+			}
+			continue
+		}
+		switch parsedName {
+		case "node_exporter_build_info":
+			probe.ExporterVersion = sanitizeNodeExporterLabel(labels["version"])
+			found = true
+		case "node_scrape_collector_success":
+			found = true
+			collector := sanitizeNodeExporterLabel(labels["collector"])
+			if timestamped || collector == "" {
+				probe.CollectorsAmbiguous["*"] = true
+				continue
+			}
+			if seenCollectors[collector] {
+				probe.CollectorsAmbiguous[collector] = true
+				continue
+			}
+			seenCollectors[collector] = true
+			probe.Collectors[collector] = value == 1
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return probe, contract.NewFault(contract.Unavailable, "node_exporter response is not readable", "Check node-exporter.service and retry.")
+	}
+	if !found {
+		return probe, contract.NewFault(contract.Unavailable, "node_exporter returned no recognized health metrics", "Check that the configured endpoint is node_exporter, not another HTTP service.")
+	}
+	if textfileError.seen {
+		if textfileError.ambiguous {
+			probe.TextfileScrapeErrorAmbiguous = true
+		} else {
+			value := textfileError.value
+			probe.TextfileScrapeError = &value
+		}
+	}
+	return probe, nil
+}
+
 func validateNodeExporterURL(value string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "/metrics" {

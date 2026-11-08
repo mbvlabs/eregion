@@ -80,6 +80,17 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.service.waitForNewerAttempt(ctx, op.ID, attempt)
 	}
 	if op.State == contract.Cancelling {
+		if deploymentLifecycleKind(op.Kind) {
+			release, acquired, lockErr := w.service.tryLockTargets(ctx, []string{op.Target})
+			if lockErr != nil {
+				return lockErr
+			}
+			if !acquired {
+				return river.JobSnooze(deploymentOwnerDefer)
+			}
+			defer release()
+			return w.cancelOwnedDeployment(ctx, op.ID, attempt)
+		}
 		return w.service.cancelPlatform(ctx, op.ID, attempt, "Cancellation requested before execution started.")
 	}
 	normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
@@ -87,16 +98,34 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.settle(ctx, op.ID, attempt, err)
 	}
 
-	releaseLock, err := w.service.lockPlatformTargets(ctx, normalized)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
+	var releaseLock func()
+	if deploymentLifecycleKind(op.Kind) {
+		var acquired bool
+		releaseLock, acquired, err = w.service.tryLockTargets(ctx, []string{normalized.Target.String()})
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
 		}
-		return err
+		if !acquired {
+			return river.JobSnooze(deploymentOwnerDefer)
+		}
+	} else {
+		releaseLock, err = w.service.lockPlatformTargets(ctx, normalized)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return err
+		}
 	}
 	defer releaseLock()
 
 	if err := w.service.checkCancelled(ctx, op.ID); err != nil {
+		if errors.Is(err, errPlatformCancelled) && deploymentLifecycleKind(op.Kind) {
+			return w.cancelOwnedDeployment(ctx, op.ID, attempt)
+		}
 		return w.settle(ctx, op.ID, attempt, err)
 	}
 	if executor := normalized.Executor(); executor != nil {
@@ -120,7 +149,7 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runBuildStop(ctx, op.ID, attempt, normalized)
 	case platform.KindBuildRetry:
 		return w.runBuildRetry(ctx, op.ID, attempt, normalized)
-	case platform.KindDeploy, platform.KindRollback, platform.KindRestart:
+	case platform.KindDeploy, platform.KindRollback, platform.KindRestart, platform.KindPromote:
 		return w.runDeployment(ctx, op.ID, attempt, normalized)
 	case platform.KindDomainAdd, platform.KindDomainRemove:
 		return w.runDomain(ctx, op.ID, attempt, normalized)
@@ -161,10 +190,31 @@ func (s *Service) claimPlatform(ctx context.Context, id contract.OperationID, at
 
 var errPlatformCancelled = errors.New("platform operation cancelled at a safe boundary")
 
+// errDeploymentCancelledAtFinalize is returned from a success callback when the
+// operation row is already cancelling. The callback transaction rolls back, so
+// success is never committed before cancellation restoration.
+var errDeploymentCancelledAtFinalize = errors.New("deployment cancellation was accepted before finalization")
+
 // errNodeStepPermanentFailure marks an effect the node itself reported as
 // permanently failed. Transport, status and acknowledgement errors do not carry
 // it: their outcome is unknown and must be recovered through node status.
 var errNodeStepPermanentFailure = errors.New("node step permanently failed")
+
+// workerInterrupted distinguishes the worker's own canceled context from a
+// durable cancellation request. A job shutdown must not remove candidates or
+// terminalize the operation: River retries, and recovery resumes from the
+// completed container steps. A durable cancelling state still takes the normal
+// cancellation/cleanup path.
+func (s *Service) workerInterrupted(ctx context.Context, id contract.OperationID, cause error) bool {
+	if cause == nil || !errors.Is(cause, context.Canceled) {
+		return false
+	}
+	state, _, err := s.operationState(context.WithoutCancel(ctx), id)
+	if err != nil {
+		return true
+	}
+	return state != contract.Cancelling
+}
 
 func (w *platformWorker) settle(ctx context.Context, id contract.OperationID, attempt uint32, err error) error {
 	if err == nil {
@@ -565,13 +615,13 @@ func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *co
         WHERE d.operation_id=$1`, op.ID).Scan(&action, &app, &environment, &releaseID, &previousID, &servingID); err == nil {
 		if err := appendEvent(ctx, tx, op, contract.Event{
 			Kind: "log", Stage: "deploy", ReleaseID: releaseID, ServingReleaseID: servingID,
-			Message: "Deployment failed; failed release " + releaseID + " is not recorded as serving" + servingSuffix(servingID) + ".",
+			Message: deploymentWord(op.Kind) + " failed; failed release " + releaseID + " is not recorded as serving" + servingSuffix(servingID) + ".",
 		}); err != nil {
 			return err
 		}
 		unchanged := servingID == "" || servingID == previousID
-		if changeErr := insertPlatformChange(ctx, tx, op, action+".failed", app, environment,
-			"Deployment failed: "+message,
+		if changeErr := insertPlatformChange(ctx, tx, op, deploymentChangeKind(op.Kind, platform.DeploymentAction(action), "failed"), app, environment,
+			deploymentWord(op.Kind)+" failed: "+message,
 			map[string]any{"release_id": releaseID},
 			map[string]any{"error_code": code, "serving_release_id": servingID, "serving_unchanged": unchanged}); changeErr != nil {
 			return changeErr
@@ -581,6 +631,9 @@ func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *co
 		return err
 	}
 	if err := markIncompleteSteps(ctx, tx, op.ID, code, message); err != nil {
+		return err
+	}
+	if err := releaseRestoredDeploymentOwnerTx(ctx, tx, op.ID); err != nil {
 		return err
 	}
 	return transition(ctx, tx, op, contract.Failed, code, message)
@@ -629,6 +682,9 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 			}
 		}
 		if err := markIncompleteSteps(ctx, tx, id, contract.Cancelled, message); err != nil {
+			return err
+		}
+		if err := releaseRestoredDeploymentOwnerTx(ctx, tx, id); err != nil {
 			return err
 		}
 		return transition(ctx, tx, op, contract.Canceled, "", message)
@@ -870,7 +926,7 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 // action committed, and otherwise records failure with the serving release that
 // the environment actually had (or a switched release with unknown health).
 func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Operation) error {
-	if op.Kind == platform.KindDeploy || op.Kind == platform.KindRollback || op.Kind == platform.KindRestart {
+	if op.Kind == platform.KindDeploy || op.Kind == platform.KindRollback || op.Kind == platform.KindRestart || op.Kind == platform.KindPromote {
 		return s.reconcileDeployment(ctx, op)
 	}
 	if op.State == contract.Cancelling {
@@ -1054,6 +1110,17 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 	}
 }
 
+func (s *Service) deploymentByID(ctx context.Context, id platform.DeploymentID) (platform.Deployment, error) {
+	dep, err := scanDeploymentRow(s.pool.QueryRow(ctx, deploymentSelect+" WHERE d.id=$1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return dep, contract.NewFault(contract.NotFound, "serving deployment is missing", "Inspect the environment serving deployment before retrying.")
+	}
+	if err != nil {
+		return dep, unavailable(err)
+	}
+	return dep, nil
+}
+
 func (s *Service) deploymentByOperation(ctx context.Context, id contract.OperationID) (platform.Deployment, bool, error) {
 	dep, err := scanDeploymentRow(s.pool.QueryRow(ctx, deploymentSelect+" WHERE d.operation_id=$1", id))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1113,9 +1180,333 @@ func (s *Service) failReconciledPlatform(ctx context.Context, op contract.Operat
 	return nil
 }
 
-// reconcileDeployment never trusts the deployment row's intended release. It
-// inspects completed step records and records the release that the node effects
-// prove is serving, including a completed restore of the previous release.
+// cancelOwnedDeployment acknowledges cancellation only through the durable
+// owner. The caller holds the environment lock. A cancelled operation that never
+// owned the route can end immediately; an owner must restore its exact target
+// before the cancellation becomes terminal.
+func (w *platformWorker) cancelOwnedDeployment(ctx context.Context, id contract.OperationID, attempt uint32) error {
+	dep, has, err := w.service.deploymentByOperation(ctx, id)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if !has {
+		return w.service.cancelPlatform(ctx, id, attempt, "Cancellation acknowledged; no deployment record exists.")
+	}
+	env, err := w.service.environment(ctx, dep.App, dep.Environment)
+	if err != nil {
+		if isNotFound(err) {
+			return w.service.cancelPlatform(ctx, id, attempt, "Cancellation acknowledged; the environment no longer exists.")
+		}
+		return w.settle(ctx, id, attempt, err)
+	}
+	owner, acquired, err := w.service.acquireDeploymentOwner(ctx, dep, env, attempt)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if !acquired {
+		settled, recoverErr := w.service.recoverStaleDeploymentOwner(ctx, owner, env)
+		if recoverErr != nil {
+			return w.settle(ctx, id, attempt, recoverErr)
+		}
+		if settled {
+			if state, _, stateErr := w.service.operationState(ctx, id); stateErr == nil && state.Terminal() {
+				return nil
+			}
+			// The settled owner may have restored a different serving
+			// deployment. Re-read before freezing this owner's predecessor.
+			refreshedEnv, envErr := w.service.environment(ctx, dep.App, dep.Environment)
+			if envErr != nil {
+				return w.finishDeploymentFailure(ctx, nil, id, attempt, env, dep, nil, envErr)
+			}
+			env = refreshedEnv
+			owner, acquired, err = w.service.acquireDeploymentOwner(ctx, dep, env, attempt)
+			if err != nil {
+				return w.settle(ctx, id, attempt, err)
+			}
+		}
+	}
+	if !acquired {
+		return w.service.cancelPlatform(ctx, id, attempt,
+			"Cancellation acknowledged; another deployment owner controls the route and this operation made no route change.")
+	}
+	refreshed, refreshedHas, err := w.service.deploymentByOperation(ctx, id)
+	if err != nil {
+		return w.finishDeploymentFailure(ctx, nil, id, attempt, env, dep, nil, err)
+	}
+	if !refreshedHas {
+		return w.service.cancelPlatform(ctx, id, attempt, "Cancellation acknowledged; no deployment record exists.")
+	}
+	dep = refreshed
+	op, _, err := w.service.operationSnapshot(ctx, id)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	_, err = w.service.recoverOwnedDeployment(ctx, op, dep, env, owner, false)
+	return err
+}
+
+// recoverOwnedDeployment inspects durable proof and the owner's frozen restore
+// target. A running route step is never proof: only a completed route step plus
+// completed public verification is enough to finish success. Everything else
+// that may have touched the route is restored to the exact frozen predecessor
+// before candidates are cleaned or the operation is failed/cancelled.
+func (s *Service) recoverOwnedDeployment(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, owner deploymentOwner, allowResume bool) (bool, error) {
+	if op.State.Terminal() {
+		return true, nil
+	}
+	routeRecord, routeHas, err := s.stepRecord(ctx, op.ID, deploymentRouteStep)
+	if err != nil {
+		return false, err
+	}
+	publicRecord, publicHas, err := s.stepRecord(ctx, op.ID, deploymentPublicStep)
+	if err != nil {
+		return false, err
+	}
+	_, restoreHas, err := s.stepRecord(ctx, op.ID, deploymentRestoreRouteStep)
+	if err != nil {
+		return false, err
+	}
+	routeCompleted := routeHas && routeRecord.State == "completed"
+	publicCompleted := publicHas && publicRecord.State == "completed"
+	evidence := routeHas || publicHas || restoreHas
+	cancelling := op.State == contract.Cancelling
+
+	if !cancelling && dep.State == "succeeded" && ownerAllowsSuccess(owner, dep.ID) {
+		owner, err = s.setDeploymentOwnerRoute(ctx, owner, dep.ID, deploymentOwnerServing, op.Attempt)
+		if err != nil {
+			return false, err
+		}
+		if err := s.syncRoutes(ctx); err != nil {
+			return s.handlePostSwitchRouteFailure(ctx, op, dep, env, owner, err)
+		}
+		if err := s.ensurePreviousDeploymentCleanup(ctx, env, dep); err != nil {
+			s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Previous release cleanup could not be pre-recorded; ownership is retained: "+contract.Classify(err).Message)
+			return false, contract.NewFault(contract.Unavailable,
+				"previous release cleanup could not be recorded durably",
+				"Keep the deployment owner and retry after the control database and previous deployment record are readable.")
+		}
+		if s.beforeDeploymentFinalize != nil {
+			s.beforeDeploymentFinalize()
+		}
+		err := s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(_ pgx.Tx, current *contract.Operation) error {
+			if current.State == contract.Cancelling {
+				return errDeploymentCancelledAtFinalize
+			}
+			return nil
+		})
+		if errors.Is(err, errDeploymentCancelledAtFinalize) {
+			return s.restoreAndCancelOwnedDeployment(ctx, op, dep, env, owner)
+		}
+		if err != nil {
+			return false, err
+		}
+		_ = s.releaseServedDeploymentOwner(ctx, owner)
+		s.removePreviousDeploymentCleanupNow(ctx, env, dep.PreviousDeploymentID)
+		return true, nil
+	}
+
+	if !cancelling && ownerAllowsSuccess(owner, dep.ID) && routeCompleted && publicCompleted && !restoreHas {
+		// The switch and public verification both committed. Reassert the
+		// owner's candidate intent and finish the operation without an
+		// election based on creation time.
+		owner, err = s.setDeploymentOwnerRoute(ctx, owner, dep.ID, deploymentOwnerServing, op.Attempt)
+		if err != nil {
+			return false, err
+		}
+		if err := s.syncRoutes(ctx); err != nil {
+			return s.handlePostSwitchRouteFailure(ctx, op, dep, env, owner, err)
+		}
+		if err := s.ensurePreviousDeploymentCleanup(ctx, env, dep); err != nil {
+			s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Previous release cleanup could not be pre-recorded; ownership is retained: "+contract.Classify(err).Message)
+			return false, contract.NewFault(contract.Unavailable,
+				"previous release cleanup could not be recorded durably",
+				"Keep the deployment owner and retry after the control database and previous deployment record are readable.")
+		}
+		if s.beforeDeploymentFinalize != nil {
+			s.beforeDeploymentFinalize()
+		}
+		err := s.finishDeploymentAfterSwitch(ctx, op, dep, env)
+		if errors.Is(err, errDeploymentCancelledAtFinalize) {
+			return s.restoreAndCancelOwnedDeployment(ctx, op, dep, env, owner)
+		}
+		if err != nil {
+			return false, err
+		}
+		_ = s.releaseServedDeploymentOwner(ctx, owner)
+		s.removePreviousDeploymentCleanupNow(ctx, env, dep.PreviousDeploymentID)
+		return true, nil
+	}
+
+	if !evidence && owner.Phase == deploymentOwnerPrepared {
+		if op.State == contract.Cancelling {
+			if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+				return false, deploymentCleanupIntentFault(err)
+			}
+			if err := s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation acknowledged before the traffic switch; the frozen serving route was unchanged and candidates were cleaned where safe."); err != nil {
+				return false, err
+			}
+			s.removeDeploymentCleanupRowsNow(context.WithoutCancel(ctx), env, dep.ID)
+			return true, nil
+		}
+		if !allowResume {
+			if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+				return false, deploymentCleanupIntentFault(err)
+			}
+			if err := s.failPlatformOperation(ctx, op.ID, op.Attempt, contract.Unavailable,
+				"Execution ended before the traffic switch and cannot resume without a worker lease; the frozen serving route was unchanged and candidates were cleaned where safe."); err != nil {
+				return false, err
+			}
+			s.removeDeploymentCleanupRowsNow(context.WithoutCancel(ctx), env, dep.ID)
+			return true, nil
+		}
+		return false, nil
+	}
+
+	if cancelling {
+		return s.restoreAndCancelOwnedDeployment(ctx, op, dep, env, owner)
+	}
+	if owner.RestoreDeploymentID != "" && owner.RestoreDeploymentID == dep.ID {
+		return false, contract.NewFault(contract.Unavailable,
+			"deployment owner's restore target is the candidate deployment",
+			"Ownership is retained; inspect and repair the owner before retrying, because restoring the candidate would race the live deployment.")
+	}
+	owner, err = s.restoreDeploymentRoute(context.WithoutCancel(ctx), op.ID, op.Attempt, env, owner)
+	if err != nil {
+		s.appendWorkerEventWith(ctx, op.ID, op.Attempt, contract.Event{
+			Kind: "warning", Stage: "reconcile",
+			Message: "The recorded serving route could not be restored; ownership and candidate containers were retained for retry: " + contract.Classify(err).Message,
+		})
+		return false, contract.NewFault(contract.Unavailable,
+			"deployment route state is not safely restored and the operation remains owner",
+			"Keep the candidate containers; retry after the route writer is available.")
+	}
+	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+		return false, deploymentCleanupIntentFault(err)
+	}
+	if err := s.failPlatformOperation(ctx, op.ID, op.Attempt, contract.Unavailable,
+		"Execution ended without a completed route proof; the owner restored the exact recorded serving route and cleaned candidates where safe."); err != nil {
+		return false, err
+	}
+	s.removeDeploymentCleanupRowsNow(context.WithoutCancel(ctx), env, dep.ID)
+	return true, nil
+}
+
+func deploymentCleanupIntentFault(err error) *contract.Fault {
+	return contract.NewFault(contract.Unavailable,
+		"candidate cleanup intent could not be recorded durably: "+contract.Classify(err).Message,
+		"Keep the deployment owner and candidate containers; retry after the control database and cleanup table are available.")
+}
+
+// handlePostSwitchRouteFailure is shared by the live attempt and recovery.
+// Retryable route failures retain the serving-phase owner and operation. A
+// nonretryable failure restores the frozen predecessor before terminalizing;
+// if restoration or cleanup-intent persistence fails, ownership stays
+// retryable and nothing is terminalized.
+func (s *Service) handlePostSwitchRouteFailure(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, owner deploymentOwner, cause error) (bool, error) {
+	if err := s.checkCancelled(ctx, op.ID); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			return s.restoreAndCancelOwnedDeployment(ctx, op, dep, env, owner)
+		}
+		if errors.Is(err, errOperationTerminal) {
+			return true, nil
+		}
+		return false, err
+	}
+	if s.workerInterrupted(ctx, op.ID, cause) {
+		return false, cause
+	}
+	fault := contract.Classify(cause)
+	terminal := errors.Is(cause, engine.ErrPermanent) ||
+		fault.Code == contract.ValidationFailed || fault.Code == contract.PreconditionFailed ||
+		fault.Code == contract.NotFound || fault.Code == contract.Forbidden ||
+		fault.Code == contract.Conflict || fault.Code == contract.Cancelled
+	if !terminal {
+		return false, cause
+	}
+	if owner.RestoreDeploymentID != "" && owner.RestoreDeploymentID == dep.ID {
+		return false, contract.NewFault(contract.Unavailable,
+			"deployment owner's restore target is the candidate deployment",
+			"Ownership is retained; inspect and repair the owner before retrying, because restoring the candidate would race the live deployment.")
+	}
+	if _, err := s.restoreDeploymentRoute(context.WithoutCancel(ctx), op.ID, op.Attempt, env, owner); err != nil {
+		s.appendWorkerEventWith(ctx, op.ID, op.Attempt, contract.Event{
+			Kind: "warning", Stage: "reconcile",
+			Message: "The post-switch route failure could not restore the frozen predecessor; ownership and candidates were retained: " + contract.Classify(err).Message,
+		})
+		return false, contract.NewFault(contract.Unavailable,
+			"post-switch route failure could not restore the previous serving route",
+			"Keep the candidate containers and owner; retry after the route writer is available.")
+	}
+	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+		return false, deploymentCleanupIntentFault(err)
+	}
+	if err := s.checkCancelled(ctx, op.ID); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			if err := s.cancelPlatform(ctx, op.ID, op.Attempt,
+				"Cancellation acknowledged after the post-switch failure restored the frozen predecessor; candidates were cleaned where safe."); err != nil {
+				return false, err
+			}
+			s.removeDeploymentCleanupRowsNow(context.WithoutCancel(ctx), env, dep.ID)
+			return true, nil
+		}
+		if errors.Is(err, errOperationTerminal) {
+			return true, nil
+		}
+		return false, err
+	}
+	code := fault.Code
+	if errors.Is(cause, engine.ErrPermanent) {
+		code = contract.PreconditionFailed
+	}
+	if code == contract.Cancelled {
+		if err := s.cancelPlatform(ctx, op.ID, op.Attempt,
+			"Post-switch route failure cancelled after restoring the frozen predecessor."); err != nil {
+			return false, err
+		}
+		s.removeDeploymentCleanupRowsNow(context.WithoutCancel(ctx), env, dep.ID)
+		return true, nil
+	}
+	if err := s.failPlatformOperation(ctx, op.ID, op.Attempt, code,
+		"Post-switch route failure; the frozen predecessor was restored before terminal failure: "+fault.Message); err != nil {
+		return false, err
+	}
+	s.removeDeploymentCleanupRowsNow(context.WithoutCancel(ctx), env, dep.ID)
+	return true, nil
+}
+
+// restoreAndCancelOwnedDeployment is the single cancellation tail for a
+// verifying or verified owner. It restores the exact frozen target before the
+// cancellation becomes terminal.
+func (s *Service) restoreAndCancelOwnedDeployment(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, owner deploymentOwner) (bool, error) {
+	if owner.RestoreDeploymentID != "" && owner.RestoreDeploymentID == dep.ID {
+		return false, contract.NewFault(contract.Unavailable,
+			"deployment owner's restore target is the candidate deployment",
+			"Ownership is retained; inspect and repair the owner before retrying, because restoring the candidate would race the live deployment.")
+	}
+	owner, err := s.restoreDeploymentRoute(context.WithoutCancel(ctx), op.ID, op.Attempt, env, owner)
+	if err != nil {
+		s.appendWorkerEventWith(ctx, op.ID, op.Attempt, contract.Event{
+			Kind: "warning", Stage: "reconcile",
+			Message: "Cancellation is waiting because the exact serving route could not be restored; ownership and candidate containers were retained: " + contract.Classify(err).Message,
+		})
+		return false, contract.NewFault(contract.Unavailable,
+			"deployment route state is not safely restored and the operation remains owner",
+			"Keep the candidate containers; retry after the route writer is available.")
+	}
+	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+		return false, deploymentCleanupIntentFault(err)
+	}
+	if err := s.cancelPlatform(ctx, op.ID, op.Attempt,
+		"Cancellation acknowledged after the owner restored the exact recorded serving route; candidates were cleaned where safe."); err != nil {
+		return false, err
+	}
+	s.removeDeploymentCleanupRowsNow(context.WithoutCancel(ctx), env, dep.ID)
+	return true, nil
+}
+
+// reconcileDeployment never trusts a deployment row's intended release. It
+// acquires the same durable owner as the live path and recovers only the route
+// intent and proof that owner recorded.
 func (s *Service) reconcileDeployment(ctx context.Context, op contract.Operation) error {
 	dep, has, err := s.deploymentByOperation(ctx, op.ID)
 	if err != nil {
@@ -1124,50 +1515,54 @@ func (s *Service) reconcileDeployment(ctx context.Context, op contract.Operation
 	if !has {
 		return s.failReconciledPlatform(ctx, op, "deployment record is missing", contract.Unavailable)
 	}
-	env, envErr := s.environment(ctx, dep.App, dep.Environment)
-	if dep.State == "succeeded" {
-		return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+	releaseLock, err := s.lockTargets(ctx, []string{"env/" + dep.App + "/" + dep.Environment})
+	if err != nil {
+		return err
 	}
-	restored := s.completedStep(ctx, op.ID, deploymentRestoreRouteStep)
-	switched := s.completedStep(ctx, op.ID, deploymentRouteStep)
-	verified := s.completedStep(ctx, op.ID, deploymentPublicStep)
-	cancelling := op.State == contract.Cancelling
-
-	if restored {
-		// The new release failed verification and the previous upstreams were
-		// put back. Recording the failed new release as serving would be a lie.
-		if envErr != nil {
-			return envErr
+	defer releaseLock()
+	env, err := s.environment(ctx, dep.App, dep.Environment)
+	if err != nil {
+		return err
+	}
+	owner, acquired, err := s.acquireDeploymentOwner(ctx, dep, env, op.Attempt)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		settled, err := s.recoverStaleDeploymentOwner(ctx, owner, env)
+		if err != nil {
+			return err
 		}
-		s.reconcileDeploymentCleanup(ctx, op, env, dep)
-		return s.failAfterRestore(ctx, op, dep, env, false)
-	}
-	if switched {
-		if verified {
-			// The switch and public verification both committed before the
-			// process died; the worker would have finished successfully.
-			return s.finishDeploymentAfterSwitch(ctx, op, dep, env)
+		if settled {
+			if state, _, stateErr := s.operationState(ctx, op.ID); stateErr == nil && state.Terminal() {
+				return nil
+			}
+			// The settled owner may have restored a different serving
+			// deployment. Re-read before freezing this owner's predecessor.
+			refreshedEnv, envErr := s.environment(ctx, dep.App, dep.Environment)
+			if envErr != nil {
+				return envErr
+			}
+			env = refreshedEnv
+			owner, acquired, err = s.acquireDeploymentOwner(ctx, dep, env, op.Attempt)
+			if err != nil {
+				return err
+			}
 		}
-		// The switch committed but the public check did not. Restore the
-		// previous upstreams from the still-old serving deployment and remove
-		// the unverified candidate formation.
-		restoreErr := s.syncRoutes(context.WithoutCancel(ctx))
-		s.reconcileDeploymentCleanup(ctx, op, env, dep)
-		if cancelling {
-			return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation reconciled after the switch; the previous serving release was restored.")
+		if !acquired {
+			return nil
 		}
-		if restoreErr != nil {
-			return s.failReconciledPlatform(ctx, op, "execution ended after the switch and restoring the previous upstreams failed: "+restoreErr.Error(), contract.Unavailable)
-		}
-		return s.failReconciledPlatform(ctx, op, "execution ended after the switch before public verification; the previous serving release was restored", contract.Unavailable)
 	}
-	if envErr == nil {
-		s.reconcileDeploymentCleanup(ctx, op, env, dep)
+	refreshed, refreshedHas, err := s.deploymentByOperation(ctx, op.ID)
+	if err != nil {
+		return err
 	}
-	if cancelling {
-		return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation reconciled before the traffic switch; the previous serving release is unchanged.")
+	if !refreshedHas {
+		return s.failReconciledPlatform(ctx, op, "deployment record is missing", contract.Unavailable)
 	}
-	return s.failReconciledPlatform(ctx, op, "execution ended before the serving release was verified; the previous serving release is unchanged", contract.Unavailable)
+	dep = refreshed
+	_, err = s.recoverOwnedDeployment(ctx, op, dep, env, owner, false)
+	return err
 }
 
 func (s *Service) completedStep(ctx context.Context, id contract.OperationID, step string) bool {
@@ -1175,109 +1570,27 @@ func (s *Service) completedStep(ctx context.Context, id contract.OperationID, st
 	return err == nil && ok && record.State == "completed"
 }
 
-// reconcileDeploymentCleanup removes a candidate left by a crashed attempt. The
-// candidate step row proves a container may exist. Cleanup is best effort here:
-// an unreachable node must not keep the operation running forever, but the
-// failure is visible.
-func (s *Service) reconcileDeploymentCleanup(ctx context.Context, op contract.Operation, env platform.Environment, dep platform.Deployment) {
-	instances := dep.Instances
-	revision := env.Revision
-	if dep.RevisionID != "" && (revision == nil || revision.ID != dep.RevisionID) {
-		pinned, err := s.revisionByID(ctx, dep.RevisionID)
-		if err == nil {
-			revision = &pinned
-		}
+func (s *Service) hasStepPrefix(ctx context.Context, id contract.OperationID, prefix string) (bool, error) {
+	if s.deploymentCleanupEvidence != nil {
+		return s.deploymentCleanupEvidence(ctx, id, prefix)
 	}
-	if len(instances) == 0 && revision != nil && s.hasStepPrefix(ctx, op.ID, deploymentContainerStepPrefix) {
-		plan, err := platform.PlanDeployment(env.App, env.Name, revision.RevisionState, dep.ReleaseID, dep.ID)
-		if err == nil {
-			for _, planned := range plan {
-				instances = append(instances, platform.DeploymentInstance{Name: planned.Name})
-			}
-		}
-	}
-	if len(instances) == 0 {
-		return
-	}
-	if s.resolver == nil {
-		s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Candidate cleanup was not attempted: the worker has no node resolver.")
-		return
-	}
-	// The candidate's pinned revision records the node it ran on; the
-	// environment may already point at another node.
-	nodeName := env.Node
-	if revision != nil && revision.Runtime.Node != "" {
-		nodeName = revision.Runtime.Node
-	}
-	tr, err := s.resolver.TransportFor(ctx, nodeName)
-	if err != nil {
-		s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Candidate cleanup could not reach the application node: "+contract.Classify(err).Message)
-		return
-	}
-	if err := s.removeDeploymentContainers(ctx, tr, op.ID, op.Attempt, env, dep.ID, nodeName, "candidate", instances); err != nil {
-		s.appendCleanupWarning(ctx, op.ID, op.Attempt, "Candidate cleanup is recorded for retry: "+contract.Classify(err).Message)
-	}
-}
-
-func (s *Service) hasStepPrefix(ctx context.Context, id contract.OperationID, prefix string) bool {
 	records, err := s.stepRecords(ctx, id)
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, record := range records {
 		if strings.HasPrefix(record.Step, prefix) {
-			return true
+			return true, nil
 		}
 	}
-	return false
-}
-
-// failAfterRestore records the previous release as serving after a completed
-// restore step. This is the honest outcome of a failed verification.
-func (s *Service) failAfterRestore(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, healthy bool) error {
-	health, detail, verification := platform.HealthUnknown, "previous release restored after a failed verification; restore health was not observed", "unknown"
-	if healthy {
-		health, detail, verification = platform.HealthHealthy, "previous release restored after a failed verification and passed its health check", "healthy"
-	}
-	serving := dep.PreviousReleaseID
-	_, owned, err := s.mutateOwned(ctx, op.ID, op.Attempt, func(tx pgx.Tx, current *contract.Operation) error {
-		if current.State.Terminal() {
-			return nil
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
-            SET state='failed',error_code=$2,message=$3,completed_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE operation_id=$1 AND state IN ('pending','running')`,
-			op.ID, string(contract.Unavailable), "The new release failed verification; the previous release "+string(serving)+" was restored."); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-            SET serving_release_id=$2,serving_deployment_id=$3,applied_release_id=$2,health_state=$4,health_detail=$5,health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
-            WHERE id=$1`, env.ID, serving, dep.PreviousDeploymentID, string(health), detail); err != nil {
-			return err
-		}
-		if err := appendEvent(ctx, tx, current, contract.Event{
-			Kind: "log", Stage: "deploy", ReleaseID: string(dep.ReleaseID), ServingReleaseID: string(serving),
-			Message: "Restore completed: release " + string(serving) + " serves again after release " + string(dep.ReleaseID) + " failed verification; restore health is " + verification + ".",
-		}); err != nil {
-			return err
-		}
-		if err := markIncompleteSteps(ctx, tx, op.ID, contract.Unavailable, "operation reconciled after restoring the previous release"); err != nil {
-			return err
-		}
-		return transition(ctx, tx, current, contract.Failed, contract.Unavailable,
-			"Verification failed and the previous release "+string(serving)+" was restored; recorded restore health is "+verification+".")
-	})
-	if err != nil {
-		return err
-	}
-	if !owned {
-		return nil
-	}
-	return nil
+	return false, nil
 }
 
 func (s *Service) finishDeploymentAfterSwitch(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment) error {
 	return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(tx pgx.Tx, current *contract.Operation) error {
+		if current.State == contract.Cancelling {
+			return errDeploymentCancelledAtFinalize
+		}
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
             SET state='succeeded',completed_at=$2,updated_at=$2,message=$3,error_code=''
@@ -1292,14 +1605,17 @@ func (s *Service) finishDeploymentAfterSwitch(ctx context.Context, op contract.O
 		}
 		if err := appendEvent(ctx, tx, current, contract.Event{
 			Kind: "log", Stage: "deploy", ReleaseID: string(dep.ReleaseID), ServingReleaseID: string(dep.ReleaseID),
-			Message: "Deployment completed after the switch and verification; serving release " + string(dep.ReleaseID) + ".",
+			Message: deploymentWord(current.Kind) + " completed after the switch and verification; serving release " + string(dep.ReleaseID) + ".",
 		}); err != nil {
 			return err
 		}
-		return insertPlatformChange(ctx, tx, current, string(dep.Action)+".succeeded", dep.App, dep.Environment,
+		if err := insertPlatformChange(ctx, tx, current, deploymentChangeKind(current.Kind, dep.Action, "succeeded"), dep.App, dep.Environment,
 			"Serving release "+string(dep.ReleaseID)+" for "+dep.App+"/"+dep.Environment+".",
 			map[string]any{"release_id": dep.ReleaseID},
-			map[string]any{"serving_release_id": dep.ReleaseID, "health": "healthy"})
+			map[string]any{"serving_release_id": dep.ReleaseID, "health": "healthy"}); err != nil {
+			return err
+		}
+		return releaseServedDeploymentOwnerTx(ctx, tx, op.ID)
 	})
 }
 
@@ -1307,6 +1623,24 @@ func depEnvironmentID(ctx context.Context, tx pgx.Tx, dep platform.Deployment) s
 	var id string
 	_ = tx.QueryRow(ctx, `SELECT e.id FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND e.name=$2`, dep.App, dep.Environment).Scan(&id)
 	return id
+}
+
+// deploymentChangeKind names the change history row for a deployment-family
+// operation. Promotion reuses the deploy runtime path but keeps its own
+// history kind, so an operator can tell a rebuilt deploy from an exact
+// cross-environment artifact move.
+func deploymentChangeKind(operationKind string, action platform.DeploymentAction, outcome string) string {
+	if operationKind == platform.KindPromote {
+		return "promotion." + outcome
+	}
+	return string(action) + "." + outcome
+}
+
+func deploymentWord(operationKind string) string {
+	if operationKind == platform.KindPromote {
+		return "Promotion"
+	}
+	return "Deployment"
 }
 
 // insertPlatformChange records desired/applied history without secret values.

@@ -96,10 +96,110 @@ it cannot overwrite the fresh view. Envs has no graph because no per-request
 history exists.
 
 `server status` and the existing `services.running` doctor check include
-`node-exporter.service` on the main role. There is no separate metric doctor
-check; the existing `services.running` row covers it alongside the other
-required services. The total number of doctor rows is not a fixed contract:
-compare the reported summary and the named service row, not an assumed count.
+`node-exporter.service` on the main role. `telemetry.local` additionally checks
+the local exporter health: it reads one bounded response from the WireGuard
+endpoint, requires `/var/lib/node_exporter/textfile` to exist with root:root
+0755 and no symlink, and requires node_exporter's `textfile` and `systemd`
+collector success families plus exactly one unlabelled `node_textfile_scrape_error`
+sample whose value is zero. Collector success alone does not prove the textfile
+was readable. A missing directory, missing/ambiguous scrape-error sample or a
+non-zero/ambiguous one fails; duplicate, timestamped or malformed collector
+success samples are also ambiguous and fail closed. A down WireGuard interface
+reports the collector health as unobserved (**warn**, not pass), while an
+independent directory configuration error still fails. The check does not store
+a sample, produce history or replace `metrics show`. The total number of doctor
+rows is not a fixed contract: compare the reported summary and the named rows,
+not an assumed count.
+
+## Local collector foundations
+
+`host-node-exporter-v2` is the versioned host step for the local primitives. It
+keeps node_exporter 1.11.1 bound only to the node's WireGuard address and adds:
+
+- the root-owned `0755` textfile directory
+  `/var/lib/node_exporter/textfile`, and its root-owned `0755` parent
+  `/var/lib/node_exporter`, both refused as symlinks or non-directories by the
+  apply/check; apply also refuses a non-root-owned or group/other-writable
+  existing parent before any mutation instead of repairing it. Setuid, setgid
+  and sticky bits are preserved in the observation and rejected by doctor. The
+  safe repair uses `chmod 0755` and then explicitly clears special bits with
+  `chmod u-s,g-s,o-t`, because numeric chmod can preserve setgid on a
+  directory; apply verifies the resulting mode is exactly `0755` and fails
+  closed otherwise;
+- `--collector.textfile.directory` with that directory;
+- `--collector.systemd` with a narrow unit include:
+  `(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)`.
+
+The textfile directory is a foundation, not a metrics source. No
+`eregion_*.prom` file is written today: a self-metric family must come from a
+real producer, such as a future retention/backup/doctor job that actually
+observes the value. Emitting a synthetic constant would be worse than exposing
+nothing. Future owners write one atomic `0644` file per owner; node_exporter
+reads them as its own user. The doctor check separately requires
+`node_textfile_scrape_error` to be present exactly once and zero, because
+`node_scrape_collector_success` can be 1 even when a `.prom` file is malformed
+or unreadable.
+
+The node_exporter unit remains WireGuard-only and keeps the existing systemd
+hardening. The systemd collector reads only the named unit set over D-Bus; it
+does not enumerate every host unit. The unit still starts with `wg0`, so a node
+with WireGuard down has no reachable exporter by design.
+
+## Read-only external scrape example
+
+The following examples are documentation only; eregion does not install,
+supervise or authenticate Prometheus or Grafana Alloy. They work only from a
+host with a WireGuard route to the node and firewall permission for 9100. They
+do not add a public endpoint, TLS terminator, basic-auth credential, service
+discovery or rotation.
+
+Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: eregion-node
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["10.78.0.1:9100"]
+```
+
+Grafana Alloy:
+
+```hcl
+prometheus.scrape "eregion_node" {
+  targets    = [{"__address__" = "10.78.0.1:9100"}]
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+```
+
+The Alloy fragment assumes a `prometheus.remote_write.default` receiver. The
+example intentionally shows no credential because the exporter has none, and it
+does not add a public endpoint, TLS terminator, service discovery or rotation. A
+future separate telemetry node or Grafana is **not prohibited long-term**.
+Adding one needs an explicit WireGuard peer/route, a firewall decision, an
+authenticated endpoint or a scraper-local trust boundary, discovery and
+credential rotation; none is in beta/v1 scope.
+
+## Not full vaire parity
+
+These local foundations borrow vaire's textfile and narrow systemd collector
+shape, but this is not vaire exporter parity. Missing today:
+
+- the authenticated external `https://<host>/metrics/...` endpoint, basic-auth
+  password file and fail2ban protection;
+- `targets.json`/`http_sd` (Prometheus) and `discovery.http` (Alloy) service
+  discovery;
+- credential rotation and a protected metrics credential handoff;
+- the exporter systemd slice/memory budget and postgres/pgbouncer exporters;
+- a central telemetry service, Prometheus/Grafana deployment, alerting,
+  metric/log storage or retained history;
+- eregion self-metric producers. The textfile directory is ready, but no
+  meaningful family is emitted until a real producer exists.
+
+None of these omissions is hidden by the `metrics show` snapshot or the doctor
+row. Host qualification of `host-node-exporter-v2`, the systemd collector over
+D-Bus, the textfile collector reading a real file, a real exporter restart and
+the scrape examples remains manual acceptance.
 
 ## Verification
 
@@ -111,7 +211,11 @@ label whitespace/trailing comma plus invalid grammar, label-value sanitization,
 materially future exporter timestamps, two-read collection, response bounds,
 node-RPC method selection, CLI plain/JSON shape and the workspace adapter
 including explicit freshness, node-computed age/threshold, refresh re-query,
-node mismatch and the metrics-response generation fence. They do not qualify a
-real server, exporter installation, WireGuard reachability, or a live upgrade.
-Record those runs in [MANUAL-TESTING](MANUAL-TESTING.md); never infer them from
-unit tests.
+node mismatch and the metrics-response generation fence. Local-health tests
+cover missing, duplicate, malformed, labelled, timestamped, non-zero and
+out-of-range `node_textfile_scrape_error`, strict root:root 0755 no-symlink
+directory observation, apply refusal before mutation, WireGuard-down warning and
+independent directory-error failure. They do not qualify a real server, exporter
+installation, WireGuard reachability, systemd D-Bus collection, textfile
+reading, exporter restart, a live upgrade or a real scrape. Record those runs in
+[MANUAL-TESTING](MANUAL-TESTING.md); never infer them from unit tests.

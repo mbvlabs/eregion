@@ -439,6 +439,169 @@ func TestParseNodeExporterSanitizesCPULabelInIssue(t *testing.T) {
 	}
 }
 
+func TestProbeLocalReportsCollectorHealth(t *testing.T) {
+	body := strings.Join([]string{
+		`node_exporter_build_info{branch="HEAD",goversion="go1.24.0",revision="abc",tags="unknown",version="1.11.1"} 1`,
+		`node_scrape_collector_success{collector="systemd"} 1`,
+		`node_scrape_collector_success{collector="textfile"} 1`,
+		`node_scrape_collector_success{collector="cpu"} 1`,
+		`node_textfile_scrape_error 0`,
+	}, "\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+	probe, err := ProbeLocal(context.Background(), server.URL+"/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !probe.Reachable || probe.ExporterVersion != "1.11.1" {
+		t.Fatalf("probe = %+v", probe)
+	}
+	if !probe.Collectors["systemd"] || !probe.Collectors["textfile"] {
+		t.Fatalf("collectors = %+v", probe.Collectors)
+	}
+	if _, present := probe.Collectors["missing"]; present {
+		t.Fatal("an unobserved collector was invented")
+	}
+	if probe.TextfileScrapeError == nil || *probe.TextfileScrapeError != 0 || probe.TextfileScrapeErrorAmbiguous {
+		t.Fatalf("textfile scrape error = %v ambiguous=%t", probe.TextfileScrapeError, probe.TextfileScrapeErrorAmbiguous)
+	}
+	if len(probe.CollectorsAmbiguous) != 0 {
+		t.Fatalf("collector ambiguity = %+v", probe.CollectorsAmbiguous)
+	}
+}
+
+func TestProbeLocalRequiresUnambiguousCollectorSuccess(t *testing.T) {
+	base := []string{
+		`node_exporter_build_info{version="1.11.1"} 1`,
+		`node_textfile_scrape_error 0`,
+	}
+	for name, tc := range map[string]struct {
+		extra     []string
+		ambiguous string
+	}{
+		"valid": {
+			extra: []string{
+				`node_scrape_collector_success{collector="textfile"} 1`,
+				`node_scrape_collector_success{collector="systemd"} 1`,
+			},
+		},
+		"duplicate textfile": {
+			extra: []string{
+				`node_scrape_collector_success{collector="textfile"} 1`,
+				`node_scrape_collector_success{collector="textfile"} 1`,
+				`node_scrape_collector_success{collector="systemd"} 1`,
+			},
+			ambiguous: "textfile",
+		},
+		"duplicate systemd conflicting": {
+			extra: []string{
+				`node_scrape_collector_success{collector="textfile"} 1`,
+				`node_scrape_collector_success{collector="systemd"} 0`,
+				`node_scrape_collector_success{collector="systemd"} 1`,
+			},
+			ambiguous: "systemd",
+		},
+		"timestamped textfile": {
+			extra: []string{
+				`node_scrape_collector_success{collector="textfile"} 1 1700000000`,
+				`node_scrape_collector_success{collector="systemd"} 1`,
+			},
+			ambiguous: "*",
+		},
+		"malformed": {
+			extra: []string{
+				`node_scrape_collector_success{collector="textfile"} 1`,
+				`node_scrape_collector_success{collector="systemd"`,
+			},
+			ambiguous: "*",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := strings.Join(append(append([]string{}, base...), tc.extra...), "\n")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+			probe, err := ProbeLocal(context.Background(), server.URL+"/metrics")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.ambiguous == "" {
+				if len(probe.CollectorsAmbiguous) != 0 {
+					t.Fatalf("collector ambiguity = %+v", probe.CollectorsAmbiguous)
+				}
+				return
+			}
+			if !probe.CollectorsAmbiguous[tc.ambiguous] {
+				t.Fatalf("collector ambiguity = %+v, want %q", probe.CollectorsAmbiguous, tc.ambiguous)
+			}
+		})
+	}
+}
+
+func TestProbeLocalRequiresUnambiguousTextfileScrapeError(t *testing.T) {
+	base := []string{
+		`node_exporter_build_info{version="1.11.1"} 1`,
+		`node_scrape_collector_success{collector="systemd"} 1`,
+		`node_scrape_collector_success{collector="textfile"} 1`,
+	}
+	for name, tc := range map[string]struct {
+		extra     []string
+		value     *float64
+		ambiguous bool
+	}{
+		"missing":     {extra: nil, value: nil, ambiguous: false},
+		"zero":        {extra: []string{"node_textfile_scrape_error 0"}, value: ptrFloat(0), ambiguous: false},
+		"error":       {extra: []string{"node_textfile_scrape_error 1"}, value: ptrFloat(1), ambiguous: false},
+		"duplicate":   {extra: []string{"node_textfile_scrape_error 0", "node_textfile_scrape_error 0"}, value: nil, ambiguous: true},
+		"malformed":   {extra: []string{"node_textfile_scrape_error{broken"}, value: nil, ambiguous: true},
+		"labelled":    {extra: []string{`node_textfile_scrape_error{path="/tmp/x"} 0`}, value: nil, ambiguous: true},
+		"timestamped": {extra: []string{"node_textfile_scrape_error 0 1700000000"}, value: nil, ambiguous: true},
+		"out of range": {
+			extra: []string{"node_textfile_scrape_error 2"}, value: nil, ambiguous: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := strings.Join(append(append([]string{}, base...), tc.extra...), "\n")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+			probe, err := ProbeLocal(context.Background(), server.URL+"/metrics")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if probe.TextfileScrapeErrorAmbiguous != tc.ambiguous {
+				t.Fatalf("ambiguous = %t, want %t; probe=%+v", probe.TextfileScrapeErrorAmbiguous, tc.ambiguous, probe)
+			}
+			switch {
+			case tc.value == nil && probe.TextfileScrapeError != nil:
+				t.Fatalf("textfile error = %v, want nil", *probe.TextfileScrapeError)
+			case tc.value != nil && (probe.TextfileScrapeError == nil || *probe.TextfileScrapeError != *tc.value):
+				t.Fatalf("textfile error = %v, want %v", probe.TextfileScrapeError, *tc.value)
+			}
+		})
+	}
+}
+
+func ptrFloat(value float64) *float64 { return &value }
+
+func TestProbeLocalRefusesAnUnrecognizedEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("hello\n"))
+	}))
+	defer server.Close()
+	if _, err := ProbeLocal(context.Background(), server.URL+"/metrics"); err == nil {
+		t.Fatal("an unrelated HTTP service was accepted as node_exporter")
+	}
+}
+
 func TestCollectNodeExporterReadsTwiceAndSetsScrapeDetails(t *testing.T) {
 	firstBody := readFixture(t, "node_exporter_first.prom")
 	secondBody := readFixture(t, "node_exporter_second.prom")

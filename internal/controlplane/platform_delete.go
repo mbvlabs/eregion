@@ -109,7 +109,16 @@ func (s *Service) environmentWorkloadNodes(ctx context.Context, envID platform.E
 	return nodes, nil
 }
 
-func (s *Service) lockTargets(ctx context.Context, targets []string) (func(), error) {
+// targetLockKey is the stable PostgreSQL advisory-lock key for one normalized
+// target. Session locks in workers and transaction locks in admission use the
+// same key, so scale submission waits for an in-flight deployment instead of
+// inspecting an ownership row across a lock gap.
+func targetLockKey(target string) int64 {
+	sum := sha256.Sum256([]byte(target))
+	return int64(binary.BigEndian.Uint64(sum[:8]))
+}
+
+func uniqueTargets(targets []string) []string {
 	sorted := append([]string(nil), targets...)
 	sort.Strings(sorted)
 	unique := sorted[:0]
@@ -118,14 +127,52 @@ func (s *Service) lockTargets(ctx context.Context, targets []string) (func(), er
 			unique = append(unique, target)
 		}
 	}
+	return unique
+}
+
+// tryLockTargets is the nonblocking worker form. A contended deployment target
+// returns acquired=false immediately, so a queued job can snooze without
+// holding a pool connection or consuming a River failure attempt.
+func (s *Service) tryLockTargets(ctx context.Context, targets []string) (func(), bool, error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, unavailable()
+	}
+	keys := make([]int64, 0, len(targets))
+	release := func() {
+		for index := len(keys) - 1; index >= 0; index-- {
+			_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, keys[index])
+		}
+		conn.Release()
+	}
+	for _, target := range uniqueTargets(targets) {
+		key := targetLockKey(target)
+		var acquired bool
+		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&acquired); err != nil {
+			release()
+			if ctx.Err() != nil {
+				return nil, false, ctx.Err()
+			}
+			return nil, false, unavailable()
+		}
+		if !acquired {
+			release()
+			return nil, false, nil
+		}
+		keys = append(keys, key)
+	}
+	return release, true, nil
+}
+
+func (s *Service) lockTargets(ctx context.Context, targets []string) (func(), error) {
+	unique := uniqueTargets(targets)
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return nil, unavailable()
 	}
 	keys := make([]int64, 0, len(unique))
 	for _, target := range unique {
-		sum := sha256.Sum256([]byte(target))
-		key := int64(binary.BigEndian.Uint64(sum[:8]))
+		key := targetLockKey(target)
 		if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
 			for index := len(keys) - 1; index >= 0; index-- {
 				_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, keys[index])
@@ -175,6 +222,23 @@ func (s *Service) ensureNoActiveDeleteTargets(ctx context.Context, tx pgx.Tx, id
 	if active > 0 {
 		return contract.NewFault(contract.Conflict, "another operation is still active for this target",
 			"Wait for it to finish or cancel it explicitly, then delete again.")
+	}
+	ownerStatement := `SELECT count(*) FROM eregion_platform_deployment_owners o
+        JOIN eregion_platform_environments e ON e.id=o.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE a.name=$1`
+	ownerArgs := []any{app}
+	if environment != "" {
+		ownerStatement += " AND e.name=$2"
+		ownerArgs = append(ownerArgs, environment)
+	}
+	var owners int
+	if err := tx.QueryRow(ctx, ownerStatement, ownerArgs...).Scan(&owners); err != nil {
+		return unavailable()
+	}
+	if owners > 0 {
+		return contract.NewFault(contract.Conflict, "deployment ownership is still settling",
+			"Wait for reconciliation to restore the terminal traffic target, then submit the deletion again.")
 	}
 	return nil
 }

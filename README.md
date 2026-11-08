@@ -8,9 +8,10 @@ web UI.
 
 **Status: alpha.3 is published; beta is in preparation and not qualified.**
 Setup, the private operator channel, durable operations, builds, deployments,
-domain routes and upgrades have code. Node-local telemetry is implemented in
-source; Cloudflare DNS automation is implemented in source; host qualification
-remains; see the work list in MASTER.
+domain routes, extensions, staging-to-production promotion and upgrades have
+code. Node-local telemetry, its local textfile/systemd collector foundations and
+Cloudflare DNS automation are implemented in source; host qualification remains;
+see the work list in MASTER.
 
 ## Start here
 

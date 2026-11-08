@@ -106,7 +106,7 @@ else
   systemctl restart wg-quick@wg0
 fi
 
-# node_exporter is installed by the host-node-exporter-v1 step before this
+# node_exporter is installed by the host-node-exporter-v2 step before this
 # runs; it can only bind to the WireGuard address once wg0 exists.
 systemctl enable node-exporter.service >/dev/null 2>&1 || true
 if systemctl cat node-exporter.service >/dev/null 2>&1; then

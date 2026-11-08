@@ -264,6 +264,28 @@ func (in *DeployInput) Target() Target {
 }
 func (in *DeployInput) Preview() any { return in }
 
+// PromotionTargetEnvironment is the only destination of platform.promote.
+// Promotion is a deliberate one-way artifact move into production, not a
+// general cross-environment deploy surface. A different target stays a
+// product decision rather than an inferred alias.
+const PromotionTargetEnvironment = "production"
+
+// PromoteInput promotes the source environment's current serving release to
+// production. The operation target is env/<app>/production; the source release
+// is resolved and pinned inside the submission transaction, so the accepted
+// operation never follows a later staging advance. No source config, secret,
+// domain or release command is copied: the target environment's current
+// revision applies.
+type PromoteInput struct {
+	App               string `json:"app,omitempty"`
+	SourceEnvironment string `json:"source_environment"`
+}
+
+func (in *PromoteInput) Target() Target {
+	return Target{Kind: TargetEnvironment, App: in.App, Environment: PromotionTargetEnvironment}
+}
+func (in *PromoteInput) Preview() any { return in }
+
 type RollbackInput struct {
 	App         string    `json:"app,omitempty"`
 	Environment string    `json:"environment,omitempty"`
@@ -348,6 +370,7 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindDeploy, Summary: "Build from the revision or deploy a release with blue/green switching", Normalize: normalizeDeploy})
 	r.registerBuiltin(Definition{Kind: KindRollback, Summary: "Redeploy a previous release with its revision and secret snapshot", Normalize: normalizeRollback})
 	r.registerBuiltin(Definition{Kind: KindRestart, Summary: "Reapply the serving release with the current revision", Normalize: normalizeRestart})
+	r.registerBuiltin(Definition{Kind: KindPromote, Summary: "Promote a source environment's serving release to production without rebuilding", Normalize: normalizePromote})
 	r.registerBuiltin(Definition{Kind: KindDomainAdd, Summary: "Route a public hostname to an environment through Caddy", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindDomainRemove, Summary: "Remove a public hostname's route", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindRetentionPrune, Summary: "Prune disk artifacts on one node under the D30 retention policy", Normalize: normalizeRetentionPrune})
@@ -1485,6 +1508,31 @@ func normalizeDeploy(target Target, raw json.RawMessage) (ActionInput, error) {
 	}
 	if input.ReleaseID != "" && input.Ref != "" {
 		return nil, invalid("ref", "Omit ref when redeploying an existing release.")
+	}
+	return &input, nil
+}
+
+func normalizePromote(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetEnvironment || target.Environment != PromotionTargetEnvironment {
+		return nil, invalid("target", "platform.promote requires target env/<app>/production.")
+	}
+	var input PromoteInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if input.App != "" && input.App != target.App {
+		return nil, invalid("app", "The app field must match the target app, or be omitted.")
+	}
+	input.App = target.App
+	input.SourceEnvironment = strings.TrimSpace(input.SourceEnvironment)
+	if input.SourceEnvironment == "" {
+		return nil, invalid("source_environment", "Name the environment whose serving release is promoted.")
+	}
+	if err := ValidateName(input.SourceEnvironment); err != nil {
+		return nil, invalid("source_environment", "Use a lowercase environment name of letters, digits, and inner hyphens.")
+	}
+	if input.SourceEnvironment == target.Environment {
+		return nil, invalid("source_environment", "An environment cannot be promoted to itself; name a different source environment.")
 	}
 	return &input, nil
 }

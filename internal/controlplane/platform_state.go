@@ -229,6 +229,8 @@ func platformAcceptedMessage(kind string) string {
 		return "Rollback accepted durably; it redeploys the earlier release with its recorded revision and secret snapshot."
 	case platform.KindRestart:
 		return "Restart accepted durably; the serving release is reapplied with the current revision."
+	case platform.KindPromote:
+		return "Promotion accepted durably; the source serving artifact is pinned as a new production release and the serving release is unchanged until the candidate passes health and the public check."
 	case platform.KindNodeRegister:
 		return "Node placement facts accepted durably. This does not install or verify host state."
 	case platform.KindNodeCheck:
@@ -364,9 +366,34 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 	case *platform.ProcessScaleInput:
+		// Scale publishes a revision and queues a restart during submission.
+		// Try the same advisory target lock as deployment execution before the
+		// environment row lock. A conflict is returned immediately instead of
+		// holding a pool connection in a blocking lock wait; the order remains
+		// advisory -> row.
+		var lockAcquired bool
+		if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`,
+			targetLockKey("env/"+input.App+"/"+input.Environment)).Scan(&lockAcquired); err != nil {
+			return unavailable(err)
+		}
+		if !lockAcquired {
+			return contract.NewFault(contract.Conflict,
+				"a deployment lifecycle owns this environment",
+				"Wait for the current deployment, rollback or restart to settle before scaling.")
+		}
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
 			return err
+		}
+		var ownerBusy bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(
+            SELECT 1 FROM eregion_platform_deployment_owners WHERE environment_id=$1)`, env.ID).Scan(&ownerBusy); err != nil {
+			return unavailable()
+		}
+		if ownerBusy {
+			return contract.NewFault(contract.Conflict,
+				"a deployment lifecycle owns this environment",
+				"Wait for the current deployment, rollback or restart to settle before scaling.")
 		}
 		base, err := currentRevisionStateTx(ctx, tx, env)
 		if err != nil {
@@ -699,6 +726,8 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err := s.prepareDeploymentTx(ctx, tx, id, env, release.ID, platform.ActionDeploy, env.RevisionID, env.ServingDeploymentID, nil); err != nil {
 			return err
 		}
+	case *platform.PromoteInput:
+		return s.preparePromotionTx(ctx, tx, id, input)
 	case *platform.RollbackInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
@@ -764,7 +793,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 				return contract.NewFault(contract.PreconditionFailed, "serving deployment changed before the repair was queued", "The next maintenance run will re-observe the serving workload.")
 			}
 			if !repairSubmissionAllowed(input.ExpectedServingDeploymentID, env.ServingDeploymentID, active) {
-				return contract.NewFault(contract.Conflict, "environment has an active deploy, restart or rollback operation", "Let the current operation finish; the next maintenance run will re-observe.")
+				return contract.NewFault(contract.Conflict, "environment has an active deployment, promotion, restart or deletion operation", "Let the current operation finish; the next maintenance run will re-observe.")
 			}
 		}
 		if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
@@ -2296,15 +2325,15 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	}
 	preview := platform.Preview{Kind: normalized.Kind, Target: normalized.Target.String(), DryRun: true, Input: normalized.Input.Preview(), Summary: normalized.Summary}
 	if idempotencyKey != "" {
-		op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5",
-			actor.Kind, actor.Subject, normalized.Kind, normalized.Target.String(), idempotencyKey))
-		switch {
-		case err == nil:
+		// Preview must use the same normalized-input hash fence as submit: an
+		// existing key with identical input is a replay, while the same key
+		// with changed input is a conflict and must not hide behind a preview.
+		if op, found, err := s.replaySubmission(ctx, normalized.Kind, normalized.Target.String(), actor, idempotencyKey, hashInput(normalized.Canonical)); err != nil {
+			return preview, err
+		} else if found {
 			preview.Replay, preview.Operation = true, &op
 			preview.Summary = "Replay the accepted operation " + string(op.ID) + "; the same submission already exists."
 			return preview, nil
-		case !errors.Is(err, pgx.ErrNoRows):
-			return preview, unavailable()
 		}
 	}
 	switch input := normalized.Input.(type) {
@@ -2331,6 +2360,8 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Steps = deploymentSteps()
 		preview.Summary = fmt.Sprintf("Deploy %s to %s/%s with the current revision after candidate health and public verification.", release.Image, env.App, env.Name)
 		addReleaseWarnings(&preview, release, env)
+	case *platform.PromoteInput:
+		return s.previewPromotion(ctx, normalized, input)
 	case *platform.BuildStopInput:
 		build, err := s.buildByID(ctx, input.BuildID)
 		if err != nil {

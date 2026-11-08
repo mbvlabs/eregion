@@ -94,6 +94,126 @@ func TestVersionSchemaReportsTheControlDatabaseFailure(t *testing.T) {
 	}
 }
 
+func telemetryTestFloat(value float64) *float64 { return &value }
+
+func telemetryTestPath(path string) TelemetryPathFacts {
+	return TelemetryPathFacts{
+		Path: path, Exists: true, Directory: true, OwnerKnown: true,
+		UID: 0, GID: 0, Mode: 0o755,
+	}
+}
+
+func TestValidateTelemetryDirectoryRejectsSpecialModeBits(t *testing.T) {
+	for _, mode := range []uint32{0o1755, 0o2755, 0o4755, 0o7755} {
+		path := telemetryTestPath("/var/lib/node_exporter/textfile")
+		path.Mode = mode
+		if err := ValidateTelemetryDirectory(path); err == nil {
+			t.Fatalf("mode %04o was accepted; setuid/setgid/sticky must fail", mode)
+		}
+	}
+	path := telemetryTestPath("/var/lib/node_exporter/textfile")
+	if err := ValidateTelemetryDirectory(path); err != nil {
+		t.Fatalf("0755 rejected: %v", err)
+	}
+}
+
+func TestTelemetryLocalHealth(t *testing.T) {
+	base := Facts{
+		WireGuardKnown: true, WireGuardActive: true,
+		Telemetry: TelemetryFacts{
+			Known: true, Endpoint: "http://10.78.0.1:9100/metrics",
+			Parent:              telemetryTestPath("/var/lib/node_exporter"),
+			Textfile:            telemetryTestPath("/var/lib/node_exporter/textfile"),
+			Collectors:          map[string]bool{"textfile": true, "systemd": true},
+			TextfileScrapeError: telemetryTestFloat(0),
+		},
+	}
+	if got := telemetryLocal(Facts{}); got[0].Status != Skip {
+		t.Fatalf("unconfigured telemetry = %+v, want skip", got)
+	}
+	wireGuardDown := base
+	wireGuardDown.WireGuardActive = false
+	if got := telemetryLocal(wireGuardDown); got[0].Status != Warn || !strings.Contains(got[0].Detail, "not observed") {
+		t.Fatalf("WireGuard down = %+v, want warn/unobserved", got)
+	}
+	wireGuardDownMissingDir := wireGuardDown
+	wireGuardDownMissingDir.Telemetry.Textfile.Exists = false
+	if got := telemetryLocal(wireGuardDownMissingDir); got[0].Status != Fail || !strings.Contains(got[0].Detail, "missing") {
+		t.Fatalf("WireGuard down with missing directory = %+v, want independent fail", got)
+	}
+	wireGuardUnknown := base
+	wireGuardUnknown.WireGuardKnown = false
+	wireGuardUnknown.Telemetry.EndpointError = "node_exporter is unreachable on the WireGuard address"
+	if got := telemetryLocal(wireGuardUnknown); got[0].Status != Warn || !strings.Contains(got[0].Detail, "WireGuard state is unknown") {
+		t.Fatalf("unknown WireGuard = %+v, want warn", got)
+	}
+	missingDir := base
+	missingDir.Telemetry.Textfile.Exists = false
+	if got := telemetryLocal(missingDir); got[0].Status != Fail || !strings.Contains(got[0].Detail, "missing") {
+		t.Fatalf("missing directory = %+v", got)
+	}
+	for name, mutate := range map[string]func(*TelemetryFacts){
+		"parent wrong mode": func(t *TelemetryFacts) { t.Parent.Mode = 0o775 },
+		"parent wrong owner": func(t *TelemetryFacts) {
+			t.Parent.UID = 1000
+		},
+		"parent symlink":      func(t *TelemetryFacts) { t.Parent.Exists, t.Parent.Symlink, t.Parent.Directory = true, true, false },
+		"textfile wrong mode": func(t *TelemetryFacts) { t.Textfile.Mode = 0o750 },
+		"textfile wrong owner": func(t *TelemetryFacts) {
+			t.Textfile.GID = 1000
+		},
+		"textfile symlink": func(t *TelemetryFacts) {
+			t.Textfile.Exists, t.Textfile.Symlink, t.Textfile.Directory = true, true, false
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			facts := base
+			mutate(&facts.Telemetry)
+			if got := telemetryLocal(facts); got[0].Status != Fail || !strings.Contains(got[0].Detail, "unsafe or missing") {
+				t.Fatalf("strict directory = %+v, want fail", got)
+			}
+		})
+	}
+	endpointDown := base
+	endpointDown.Telemetry.EndpointError = "node_exporter is unreachable on the WireGuard address"
+	if got := telemetryLocal(endpointDown); got[0].Status != Fail || !strings.Contains(got[0].Detail, "does not answer") {
+		t.Fatalf("unreachable endpoint = %+v", got)
+	}
+	missingCollector := base
+	missingCollector.Telemetry.Collectors = map[string]bool{"textfile": true}
+	if got := telemetryLocal(missingCollector); got[0].Status != Fail || !strings.Contains(got[0].Detail, "systemd") {
+		t.Fatalf("missing systemd collector = %+v", got)
+	}
+	failedCollector := base
+	failedCollector.Telemetry.Collectors = map[string]bool{"textfile": true, "systemd": false}
+	if got := telemetryLocal(failedCollector); got[0].Status != Fail || !strings.Contains(got[0].Detail, "reported failure") {
+		t.Fatalf("failed systemd collector = %+v", got)
+	}
+	missingTextfileError := base
+	missingTextfileError.Telemetry.TextfileScrapeError = nil
+	if got := telemetryLocal(missingTextfileError); got[0].Status != Fail || !strings.Contains(got[0].Detail, "node_textfile_scrape_error") {
+		t.Fatalf("missing textfile scrape error = %+v", got)
+	}
+	ambiguousTextfileError := base
+	ambiguousTextfileError.Telemetry.TextfileScrapeError = nil
+	ambiguousTextfileError.Telemetry.TextfileScrapeErrorAmbiguous = true
+	if got := telemetryLocal(ambiguousTextfileError); got[0].Status != Fail || !strings.Contains(got[0].Detail, "ambiguous") {
+		t.Fatalf("ambiguous textfile scrape error = %+v", got)
+	}
+	failedTextfile := base
+	failedTextfile.Telemetry.TextfileScrapeError = telemetryTestFloat(1)
+	if got := telemetryLocal(failedTextfile); got[0].Status != Fail || !strings.Contains(got[0].Detail, "node_textfile_scrape_error=1") {
+		t.Fatalf("failed textfile scrape = %+v", got)
+	}
+	healthy := base
+	healthy.Telemetry.ExporterVersion = "1.11.1"
+	healthy.Telemetry.Collectors = map[string]bool{"textfile": true, "systemd": true, "cpu": true}
+	if got := telemetryLocal(healthy); got[0].Status != Pass ||
+		!strings.Contains(got[0].Detail, "1.11.1") || !strings.Contains(got[0].Detail, "node_textfile_scrape_error=0") {
+		t.Fatalf("healthy telemetry = %+v", got)
+	}
+}
+
 func TestMainNodeReportCoversEveryCheck(t *testing.T) {
 	// Service checks expand to one result per configured unit; with
 	// node-exporter.service in the main role the report has one more row than

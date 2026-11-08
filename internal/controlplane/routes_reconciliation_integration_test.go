@@ -26,10 +26,17 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 		t.Fatal(err)
 	}
 	s := run.Service
+	// The test host has no Caddy; the failing deploy's restore step still must
+	// complete so reconciliation can end it instead of retrying an unreachable
+	// writer. The route-state assertions below read the shared desired query.
+	s.routeSync = func(context.Context) error { return nil }
 	ctx := context.Background()
 	checkCandidate := func(ctx context.Context, env platform.Environment) error {
 		var expected []byte
-		err := pool.QueryRow(ctx, `SELECT instances FROM eregion_platform_deployments WHERE environment_id=$1 AND state='running' ORDER BY created_at DESC LIMIT 1`, env.ID).Scan(&expected)
+		err := pool.QueryRow(ctx, `SELECT d.instances
+            FROM eregion_platform_deployment_owners o
+            JOIN eregion_platform_deployments d ON d.id=o.route_target_deployment_id
+            WHERE o.environment_id=$1 AND o.phase IN ('switching','verifying','serving')`, env.ID).Scan(&expected)
 		if err != nil {
 			return err
 		}
@@ -101,7 +108,7 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 }
 
 func routeInstancesForTest(ctx context.Context, s *Service, domain string) ([]platform.DeploymentInstance, error) {
-	rows, err := s.pool.Query(ctx, desiredRoutesQuery, deploymentRouteStep, deploymentPublicStep, deploymentRestoreRouteStep)
+	rows, err := s.pool.Query(ctx, desiredRoutesQuery)
 	if err != nil {
 		return nil, err
 	}

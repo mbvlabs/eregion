@@ -22,6 +22,8 @@ import (
 type containerCleanupRow struct {
 	ContainerName string
 	EnvironmentID platform.EnvironmentID
+	App           string
+	Environment   string
 	Node          string
 	DeploymentID  platform.DeploymentID
 	Reason        string
@@ -29,7 +31,14 @@ type containerCleanupRow struct {
 	CreatedAt     time.Time
 }
 
+var errCleanupDeferred = errors.New("container cleanup is waiting for deployment ownership or serving state to settle")
+
 const containerCleanupPageSize = 50
+
+// containerCleanupDeferInterval moves a guarded row out of the current due page
+// without counting a removal attempt. Without this, the oldest protected rows
+// would occupy every page forever and starve later cleanup rows.
+const containerCleanupDeferInterval = 5 * time.Minute
 
 // containerCleanupBackoff grows from one minute to a one-hour ceiling.
 func containerCleanupBackoff(attempts int) time.Duration {
@@ -115,13 +124,37 @@ func (s *Service) recordContainerCleanup(ctx context.Context, containerName stri
 	return nil
 }
 
+// ensureContainerCleanup records a cleanup candidate without counting a new
+// removal failure. Terminal/ambiguous owner recovery and protected-cleanup
+// deferrals can repeat this operation without inflating attempts or backoff.
+func (s *Service) ensureContainerCleanup(ctx context.Context, containerName string, environmentID platform.EnvironmentID, nodeName string, deploymentID platform.DeploymentID, reason string, cause error) error {
+	detail := ""
+	if cause != nil {
+		detail = s.cleanupCauseText(cause)
+	}
+	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_platform_container_cleanup
+        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,next_attempt_at)
+        VALUES($1,$2,$3,$4,$5,1,$6,clock_timestamp())
+        ON CONFLICT (container_name) DO UPDATE
+        SET environment_id=EXCLUDED.environment_id,node=EXCLUDED.node,
+            deployment_id=EXCLUDED.deployment_id,reason=EXCLUDED.reason,
+            last_error=EXCLUDED.last_error`, containerName, environmentID, nodeName,
+		nullableDeploymentID(deploymentID), reason, detail); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
 // retryDueContainerCleanups removes due leaked containers. A success deletes
 // the row; any failure is recorded again with the next backoff.
 func (s *Service) retryDueContainerCleanups(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT container_name,environment_id,node,coalesce(deployment_id,''),reason,attempts,created_at
-        FROM eregion_platform_container_cleanup
-        WHERE next_attempt_at <= clock_timestamp()
-        ORDER BY next_attempt_at,container_name LIMIT $1`, containerCleanupPageSize)
+	rows, err := s.pool.Query(ctx, `SELECT c.container_name,c.environment_id,a.name,e.name,c.node,
+            coalesce(c.deployment_id,''),c.reason,c.attempts,c.created_at
+        FROM eregion_platform_container_cleanup c
+        JOIN eregion_platform_environments e ON e.id=c.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE c.next_attempt_at <= clock_timestamp()
+        ORDER BY c.next_attempt_at,c.container_name LIMIT $1`, containerCleanupPageSize)
 	if err != nil {
 		return unavailable()
 	}
@@ -129,7 +162,7 @@ func (s *Service) retryDueContainerCleanups(ctx context.Context) error {
 	for rows.Next() {
 		var row containerCleanupRow
 		var deploymentID string
-		if err := rows.Scan(&row.ContainerName, &row.EnvironmentID, &row.Node, &deploymentID,
+		if err := rows.Scan(&row.ContainerName, &row.EnvironmentID, &row.App, &row.Environment, &row.Node, &deploymentID,
 			&row.Reason, &row.Attempts, &row.CreatedAt); err != nil {
 			rows.Close()
 			return unavailable()
@@ -145,6 +178,15 @@ func (s *Service) retryDueContainerCleanups(ctx context.Context) error {
 	var failures []error
 	for _, row := range due {
 		if err := s.retryContainerCleanup(ctx, row); err != nil {
+			if errors.Is(err, errCleanupDeferred) {
+				if _, deferErr := s.pool.Exec(ctx, `UPDATE eregion_platform_container_cleanup
+                    SET next_attempt_at=clock_timestamp()+$2::interval
+                    WHERE container_name=$1`, row.ContainerName,
+					fmt.Sprintf("%d seconds", int(containerCleanupDeferInterval.Seconds()))); deferErr != nil {
+					failures = append(failures, unavailable(deferErr))
+				}
+				continue
+			}
 			if recordErr := s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err); recordErr != nil {
 				failures = append(failures, recordErr)
 			}
@@ -159,6 +201,32 @@ func (s *Service) retryDueContainerCleanups(ctx context.Context) error {
 }
 
 func (s *Service) retryContainerCleanup(ctx context.Context, row containerCleanupRow) error {
+	release, err := s.lockTargets(ctx, []string{"env/" + row.App + "/" + row.Environment})
+	if err != nil {
+		return err
+	}
+	defer release()
+	env, err := s.environment(ctx, row.App, row.Environment)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	protected, err := s.deploymentCleanupProtected(ctx, env, row.DeploymentID)
+	if err != nil {
+		return err
+	}
+	if protected {
+		return errCleanupDeferred
+	}
+	return s.removeContainerCleanupRow(ctx, row)
+}
+
+// removeContainerCleanupRow performs one maintenance-style removal without
+// taking the environment lock. It is used by the post-success best-effort pass
+// while the worker already holds the lock.
+func (s *Service) removeContainerCleanupRow(ctx context.Context, row containerCleanupRow) error {
 	if s.resolver == nil {
 		return contract.NewFault(contract.Unavailable, "the worker has no node resolver", "Run cleanup in a worker configured with node transports.")
 	}
@@ -191,6 +259,99 @@ func (s *Service) retryContainerCleanup(ctx context.Context, row containerCleanu
 		return s.containerCleanupFailure(contract.Code(response.ErrorCode), response.Detail)
 	default:
 		return contract.NewFault(contract.Unavailable, "container cleanup did not finish", "The maintenance job will retry with backoff.")
+	}
+}
+
+// removeDeploymentCleanupRowsNow is a best-effort immediate pass over the
+// durable cleanup rows left by one terminal deployment. It runs after owner
+// release, so the owner's candidate protection no longer applies. Any failure
+// leaves the row for the normal maintenance retry.
+func (s *Service) removeDeploymentCleanupRowsNow(ctx context.Context, env platform.Environment, deploymentID platform.DeploymentID) {
+	protected, err := s.deploymentCleanupProtected(ctx, env, deploymentID)
+	if err != nil || protected {
+		return
+	}
+	rows, err := s.pool.Query(ctx, `SELECT c.container_name,c.environment_id,a.name,e.name,c.node,
+            coalesce(c.deployment_id,''),c.reason,c.attempts,c.created_at
+        FROM eregion_platform_container_cleanup c
+        JOIN eregion_platform_environments e ON e.id=c.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE c.environment_id=$1 AND c.deployment_id=$2
+        ORDER BY c.container_name`, env.ID, deploymentID)
+	if err != nil {
+		return
+	}
+	var due []containerCleanupRow
+	for rows.Next() {
+		var row containerCleanupRow
+		var storedDeployment string
+		if err := rows.Scan(&row.ContainerName, &row.EnvironmentID, &row.App, &row.Environment, &row.Node,
+			&storedDeployment, &row.Reason, &row.Attempts, &row.CreatedAt); err != nil {
+			rows.Close()
+			return
+		}
+		row.DeploymentID = platform.DeploymentID(storedDeployment)
+		due = append(due, row)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return
+	}
+	for _, row := range due {
+		if err := s.removeContainerCleanupRow(ctx, row); err != nil {
+			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_container_cleanup WHERE container_name=$1`, row.ContainerName); err != nil {
+			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+		}
+	}
+}
+
+// removePreviousDeploymentCleanupNow is a best-effort immediate pass over the
+// durable previous-cleanup rows after the success transaction committed. Any
+// failure leaves the row in place for the normal maintenance retry.
+func (s *Service) removePreviousDeploymentCleanupNow(ctx context.Context, env platform.Environment, deploymentID platform.DeploymentID) {
+	protected, err := s.deploymentCleanupProtected(ctx, env, deploymentID)
+	if err != nil || protected {
+		return
+	}
+	rows, err := s.pool.Query(ctx, `SELECT c.container_name,c.environment_id,a.name,e.name,c.node,
+            coalesce(c.deployment_id,''),c.reason,c.attempts,c.created_at
+        FROM eregion_platform_container_cleanup c
+        JOIN eregion_platform_environments e ON e.id=c.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE c.environment_id=$1 AND c.deployment_id=$2 AND c.reason='previous'
+        ORDER BY c.container_name`, env.ID, deploymentID)
+	if err != nil {
+		return
+	}
+	var due []containerCleanupRow
+	for rows.Next() {
+		var row containerCleanupRow
+		var storedDeployment string
+		if err := rows.Scan(&row.ContainerName, &row.EnvironmentID, &row.App, &row.Environment, &row.Node,
+			&storedDeployment, &row.Reason, &row.Attempts, &row.CreatedAt); err != nil {
+			rows.Close()
+			return
+		}
+		row.DeploymentID = platform.DeploymentID(storedDeployment)
+		due = append(due, row)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return
+	}
+	for _, row := range due {
+		if err := s.removeContainerCleanupRow(ctx, row); err != nil {
+			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_container_cleanup WHERE container_name=$1`, row.ContainerName); err != nil {
+			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
+		}
 	}
 }
 

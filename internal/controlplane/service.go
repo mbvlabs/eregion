@@ -42,6 +42,13 @@ type Service struct {
 	// step-boundary cancellation check and the operation-row-locked
 	// finalization. Production leaves it nil.
 	beforeResourceFinalize func()
+	// beforeDeploymentFinalize is a test-only seam between the last deployment
+	// cancellation check and the success transaction. Production leaves it nil.
+	beforeDeploymentFinalize func()
+	// deploymentCleanupEvidence is a test-only seam for the container-step
+	// evidence read used before reconstructing cleanup names. Production leaves
+	// it nil and reads eregion_operation_steps.
+	deploymentCleanupEvidence func(context.Context, contract.OperationID, string) (bool, error)
 	// beforeRetentionMark is a test-only seam between planning a retention run
 	// and marking its release rows. Production leaves it nil.
 	beforeRetentionMark func(context.Context, contract.OperationID)
@@ -51,8 +58,9 @@ type Service struct {
 	// run no Caddy on the test host. Production leaves them nil.
 	routeSwitch  func(context.Context, platform.Environment, []string) error
 	publicVerify func(context.Context, platform.Environment, string) error
-	// routeSync is the test-only seam for deletions that run no Caddy on the
-	// test host. Production leaves it nil and writes the real routes file.
+	// routeSync is the test-only seam for deletions and route recovery that
+	// run no Caddy on the test host. Production leaves it nil and writes the
+	// real routes file (or the explicit serving override during recovery).
 	routeSync func(context.Context) error
 	// secrets resolves environment secret references into transient values. Nil
 	// means referenced secrets fail honestly instead of being injected.

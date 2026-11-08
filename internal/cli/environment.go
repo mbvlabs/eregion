@@ -106,6 +106,7 @@ func (a *app) envSpecs() []spec {
 			},
 			a.envProtectionSpec(true),
 			a.envProtectionSpec(false),
+			a.envPromoteSpec(),
 			a.envDeleteSpec(),
 		},
 	}}

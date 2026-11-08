@@ -100,6 +100,9 @@ var migration024 string
 //go:embed migrations/025_domain_dns_ownership.sql
 var migration025 string
 
+//go:embed migrations/026_deployment_lifecycle_owner.sql
+var migration026 string
+
 type migration struct {
 	version int
 	name    string
@@ -135,6 +138,7 @@ var migrations = []migration{
 	{version: 23, name: "023_environment_resources.sql", sql: migration023},
 	{version: 24, name: "024_environment_protection.sql", sql: migration024},
 	{version: 25, name: "025_domain_dns_ownership.sql", sql: migration025},
+	{version: 26, name: "026_deployment_lifecycle_owner.sql", sql: migration026},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.
