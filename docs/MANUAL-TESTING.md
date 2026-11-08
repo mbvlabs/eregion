@@ -82,6 +82,49 @@ skipped; authenticated CI-token behavior was not retested. Evidence is in
 not the alpha baseline pass; alpha.1 qualification rests on the operator
 confirmation above.
 
+### 2026-11-08 alpha.4 candidate publication (`edge-f1b5440c146b`)
+
+Candidate `f1b5440c146bcd605b4ebb4aec978d0b64eb96f1` published as
+`edge-f1b5440c146b`. Publish edge `42518693443` and CI `42518693394` both
+completed success. The signed edge manifest and each of the four platform
+binaries verified with cosign against
+`https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master`
+and issuer `https://token.actions.githubusercontent.com` (six `Verified OK`
+results). The manifest hashes were:
+
+| Platform | SHA-256 |
+| --- | --- |
+| linux/amd64 | `580cdf6c24e91c9af0d91bbe3006cad33e7b52a66e84e6b3f43196a8eec3444a` |
+| linux/arm64 | `ec01fb8d813ac3055f389de65d9ac6746d40d959a5b818b27b128bcf08c8c3f9` |
+| darwin/amd64 | `524554e7d2d05d3eb8dfc33bb27b9680f501e00d87197777d8d4956b79ed8fda` |
+| darwin/arm64 | `ecdcfe0e1685fd45d5ddbb7eef55bdd95449c802ff90ed50aeb5cb70f13734f8` |
+
+The downloaded linux/amd64 binary reports version `edge-f1b5440c146b`, channel
+`edge`, commit `f1b5440c146b`, `dirty=false`, go1.27.1, and `commands --json`
+exits 0. Root, `1.x` and `rc` manifests returned HTTP 404 at publication time;
+no stable pointer changed. This is an immutable edge publication, not an alpha
+tag or release cut.
+
+**Host application on the authorized `main`.** CLI `upgrade --channel edge
+--yes` moved `/home/mbv/.local/bin/eregion` from `edge-fa33befb675d` to
+`edge-f1b5440c146b` (previous binary kept as `eregion.prev`). Before the node
+apply, `operations list --state queued`, `--state running` and `--state
+cancelling` each returned zero. `apply --auto-upgrade-nodes` succeeded as
+`op_ae5673fc2d52cd61c867489aac65c849`: 4 applied / 16 skipped. The executed
+steps were `host-database-v1` (migration 026, schema 25/26 to **26/26**, River
+7/7), `host-api-service-v1`, `host-worker-service-v1` and
+`host-node-exporter-v2`. Migration 026's fail-closed cutover therefore passed
+with no in-flight deployment lifecycle operation; no operation was cancelled,
+no SQL repair was used and no legacy owner was backfilled. A second real apply
+`op_df0185c4f7be369426011590fc7dd00e` was **0 applied / 20 skipped**; a dry run
+reported 20 complete steps and no pending step. `server status` reports both
+sides `edge-f1b5440c146b`, node commit `f1b5440c146b`, schema **26/26**, River
+7/7 and all services active. `doctor` is **22 pass / 0 warn / 0 fail**, adding
+the `telemetry.local` row. No Cloudflare token, DNS record, unrelated app,
+domain or secret was touched. The authorized hostname was reused through its
+existing proxied record and returned to unbound/525 after the promotion work;
+no new DNS record was created.
+
 ### 2026-11-06 alpha.2 definitions and resources on `edge-ef4a6f879f45`
 
 Authorized target: existing context/node `main` (`exploration`, Ubuntu 26.04
@@ -1100,12 +1143,18 @@ age/threshold with monotonic receipt aging, focused-detail refresh re-query, the
 metrics response generation fence, and refusal of a workspace query for a
 different node. No real exporter, WireGuard read or host run is recorded.
 
-## Alpha-ready — staging-to-production promotion (not run)
+## Alpha-ready — staging-to-production promotion (targeted host pass on `edge-f1b5440c146b`)
 
-This is the acceptance definition for MASTER D23. **No real-host promotion is
-recorded**; the offline/PostgreSQL evidence below is not host qualification.
-Run mutating checks only on an authorized disposable app and server, never on a
-live production app that has not been authorized.
+This is the acceptance definition for MASTER D23. Targeted host runs on the
+authorized `a2defs1106` fixture are recorded below on 2026-11-08. They cover the
+preview, exact-artifact pin, production config, same-key replay, duplicate
+refusal, a forced failed candidate that left the previous release serving, retry
+success and rollback. A second fixture pass with purpose-built scratch images
+covers release-command execution in staging and production, once-only restart,
+and production secret injection plus the recorded secret/revision snapshot on
+rollback. Concurrent host change remains not run. Run further mutating checks
+only on an authorized disposable app and server, never on a live production app
+that has not been authorized.
 
 | Check | Pass means |
 | --- | --- |
@@ -1119,6 +1168,142 @@ live production app that has not been authorized.
 | Idempotency/concurrency | Reusing the same `--idempotency-key` returns the original operation and creates no second release or deployment; the same key in a dry-run or interactive preview also reports the replay. A promotion is refused while **any** production deployment is active, including a different artifact, and while the exact artifact is already serving production; no new production release row is created. Concurrent promotions serialize on the production row: one is accepted and the other conflicts. If an ordinary deploy is queued after a promotion and runs first, the promotion rebinds its recorded previous release/deployment at execution, so cleanup and rollback target that actual predecessor, and the same holds when the promotion runs first. |
 | Agent safety | `--json` and no-TTY never prompt; the command has `--dry-run`, `--detach`, `--poll-interval` and `--idempotency-key`. It is not destructive, has no human-factor prompt and does not accept a target override. |
 | Isolation | The command always stays inside one app. No source secret, config, domain, release command or build metadata is copied. |
+
+**Host run (2026-11-08, `edge-f1b5440c146b`, authorized `a2defs1106`).**
+Production was serving `rel_b19f552b5afb5a727b7e7b897f59c181` (image
+`sha256:00832163…`, config `APP_BUILD=beta`) and staging had no release. Their
+revisions were given different config (`APP_BUILD=staging` vs
+`APP_BUILD=production`), different secret names (`STAGING_SECRET` vs
+`PROMO_SECRET`) and the authorized `eregion-alpha-two.mbvlabs.com` hostname was
+used for staging first. Staging deploy `op_11d3876fb705f3f79d95265188d73a7e`
+succeeded as `rel_c2aa240bf7f3032b64324b0cf601ce19`, image
+`sha256:b472757ee2279004e3229b25e620ff29ab2cd3335fd4fe59f3d67aa603c7ef33`;
+`/healthz` returned 200 and `/build` returned `staging`. The authorized hostname
+was then moved to production (existing proxied DNS record only, no provider
+call); production observed route applied, DNS proxied, certificate valid and
+public 200, and its existing `/build` still returned `beta`.
+
+Preview with key `f1b-promo-preview-1` returned `kind: platform.promote`, target
+`env/a2defs1106/production`, source release `rel_c2aa…`, source image ID
+`sha256:b472757e…`, production revision `erv_f6d85f295e5ee561c79a1fcb63c7885c`
+and serving release `rel_b19…`; the capped `operations list --limit 200` output
+returned 200 entries before and after (its maximum), and the preview created no
+operation, release, domain, secret or production container change.
+Real promotion `op_97c6fc15c288fd8949b2380738497ff3` succeeded as
+`rel_17e95932c935f0ca3cf937455fe39255`; its image ID is exactly
+`sha256:b472757e…`, no build ID is recorded, the container step reported the same
+digest, and `/build` returned `production`. Production's revision secret names
+are `PROMO_SECRET` and `SHARED_SECRET`, not `STAGING_SECRET`; runtime secret
+value injection could not be observed on that first image because it exposes no
+endpoint for it, and is covered by the second fixture pass below. A same-key resubmission returned the original operation, the same-key
+dry-run reported `replay: true` with that operation, and a new-key duplicate was
+refused with `conflict: production already serves the exact source artifact`.
+
+For the forced failure, production was rolled back to `rel_b19…`
+(`op_914561857a33a8378eed04f610a5c95b`), its health path was changed to
+`/missing` (`op_19a9b9380da2b30187e939b97deb9b50`), and promotion
+`op_ef84f8e631717f754ef40ee789d3fad8` was accepted. The candidate health step
+observed HTTP 404 and failed; the event reports the failed release
+`rel_f76ea33bc14918af6077c0e4a27fcde8` was not recorded as serving and
+`rel_b19…` still served. The public `/healthz` returned 200 and `/build` returned
+`beta` after the failure. Health was restored to `/healthz`
+(`op_fb825b247776ca4d2c1c6d08ed3e0dfc`), retry promotion
+`op_2804d698d1baa521859485d5c42f96e4` succeeded as
+`rel_845df06abc20275300ba01ec2e0d6242` with the same exact image, `/build`
+returned `production`, and a final rollback
+`op_d01367a6b146980ccadb881cb114fa0c` restored `rel_b19…` with `/build` back to
+`beta`.
+
+The first fixture image is a single scratch `/app` binary with no `/bin/sh`, no
+busybox and no release-command entrypoint. Attempts to set a shell release
+command failed with `executable file not found` / `stat /bin/sh: no such file or
+directory`; those commands were cleared rather than forced. That image could not
+exercise release-command execution or runtime secret injection. No source
+config, source secret name or source release command was copied; production
+`/build` proves its own plain config applied.
+
+**Release-command, restart and secret-snapshot completion (second fixture
+pass).** A purpose-built static fixture was compiled locally, built into two
+scratch images and pushed with ordinary `eregion image push` into the existing
+app repository: variant A
+`sha256:a40f79f446ba7ed1cacd1f8c04e059dc7aed84cd616556a3c9b0f34ca5f49c07`
+and variant B
+`sha256:24081ea9ed15253156a43afb1eb08fb0616df8860ce4e83ba10dab3cfca82622`.
+The fixture's `/secret` and release mode report only `set`/`unset`/`match`/
+`mismatch`; `PROMO_EXPECT_SHA256` is a hash of the production secret used to
+compare the injected value. No secret value was printed. Staging image A
+deploy `op_488f6b835f3f04bbdfccec38279e87e2` served
+`rel_fcc4002fb6f88d666595a82eb2bb1864`; its release command ran once with
+`release-check variant=a build=staging role=staging promo=unset staging=set shared=set expect=unset`,
+and `/build`, `/secret` and `/` returned `staging`, `staging=set`, and
+`alpha4-staging`.
+
+The first production promotion with the new image (`op_b3f0ef9e5a95bcc9a48fb14bf5857eb7`,
+release `rel_5f2499d30a8aa1fcf1b53fc7ba80bf83`) executed the command but reported
+`promo=mismatch`; the fixture-side comparison hash had included the secret
+file's trailing newline while `secret set` trims it. That release remains only
+in history, not serving. Production was rolled back to `rel_b19…`
+(`op_d10460aea7615ac1f2cdfaf6f6788904`), the comparison hash was corrected
+(`op_83f833b6b5bbb2b6f60590855fefbcd4`), and promotion
+`op_6b6f0dbb29a47a5cff71ac1fff6f487f` succeeded as
+`rel_ae27b5eaeec72503ee71a7fc405138d4` with image A. Its command output was
+`release-check variant=a build=production role=production promo=match staging=unset shared=set expect=set`;
+`/build` returned `production` and `/secret` returned `promo=match staging=unset
+shared=set`. Restart `op_7067a429671cadd525af83270eea8e1f` logged
+`release command already succeeded for this release`, executed no
+`platform-command-01-v1` step, and kept serving.
+
+The production secret was then rotated to a second value (secret revision 3),
+`PROMO_EXPECT_SHA256` was updated, and staging image B was deployed as
+`op_35b4137afedd6bd8bba090887e09aa0f` / release
+`rel_ee1c1680a4bb50d755300d28f3fdfd6a`; its command output was
+`release-check variant=b build=staging role=staging promo=unset staging=set shared=set expect=unset`.
+Promotion `op_199e140e3df12ef0449e908f18f2f993` succeeded as
+`rel_4b9f78aa990492aa6b379b21dea5245c` with image B and command output
+`release-check variant=b build=production role=production promo=match staging=unset shared=set expect=set`;
+`/secret` matched with the second production value. Restart
+`op_354cba46f851cf2f1c1c4599b91e6ec3` again logged
+`release command already succeeded for this release`, executed no command step,
+and kept serving.
+
+Rollback `op_66a976c3b62345cc69e0a7f7f2b02087` to the earlier image-A release
+`rel_ae27b5eaeec72503ee71a7fc405138d4` logged the same skip message and executed
+no command step. `/secret` returned `promo=match` and `/` returned
+`alpha4-fixture variant=a version=alpha4-prod` while the current production
+revision was `alpha4-prod2` with the rotated secret and second comparison hash.
+That is the recorded secret/revision snapshot, not the current revision or
+current secret value. No staging release command ran in production; the staging
+command only appeared in staging deploys. This completes the promotion
+release-command, once-only restart and production secret snapshot/injection
+checks.
+
+**Cleanup.** The primary binding was returned to `a2-primary.invalid`
+(`op_e9d9a1c3c0939f7df5c636b6e8fc8cc0` first pass; `op_600bd50719a398c587b4f4528e39e428`
+second pass), the authorized hostname binding was removed from production
+(`op_7f96df5e6abed37534d591a71d0cb48d`) and staging
+(`op_ec444c6a462b6c3a00fd515a491af379`), and its DNS record was never changed;
+the URL returned to Cloudflare 525. Production was rolled back to `rel_b19…`
+(`op_2d279c0c4fa13d509c1d4e8006524058`), config was restored to `APP_BUILD=beta`
+with `EXTERNAL_URL` (`op_082cc7165abd2c4c39ff40e44b629952`,
+`op_a2f6dfce99148abb108d0d6e53c5455d`), and release command is again empty
+(`op_3f0085ec681b4d57ff5786709c8509fa`). Staging was rolled back to
+`rel_c2aa…` (`op_ecf397ed633291a2474ddf006ed1fec1`), its current revision was
+restored to image `sha256:b472757e…` with `APP_BUILD=alpha2` and no release
+command (`op_b646d333bac803479513dbed611c0fe2`,
+`op_0782391479963aa47b3b3e8e03b50cb5`,
+`op_6b3097a3596349bf1c37965ac37e09c3`), and its placeholder primary was restored
+before the authorized binding was removed
+(`op_437973a5fa91234c18f33fc71d680b2f`). Staging retains the
+`staging-placeholder.invalid` primary because a primary domain cannot be
+removed and a definition cannot remove every binding; no DNS record exists for
+it. The local fixture images were removed after use. Registry manifests A and B
+remain referenced by release history (`rel_5f2499…`, `rel_ae27…`, `rel_4b9f…`
+and the staging A/B releases) and were left in place rather than break
+rollback/history. `PROMO_SECRET` remains an active encrypted test secret at
+revision 3 with the second test value; `STAGING_SECRET` remains at revision 1.
+All generated value and hash files were 0600, never printed, and were shredded.
+No app or environment deletion, no TOTP action, no Cloudflare call, no new DNS
+record and no unrelated app/domain was used.
 
 **Source-only evidence (2026-11-08).** `TestPromoteNormalizesFixedProductionTarget`
 covers target/source/self/app validation. `TestEnvironmentPromoteDryRunIsFlagOnlyAndTargetsProduction`,
@@ -1138,14 +1323,22 @@ deploy, concurrent-promotion serialization, and execution-time previous-release
 rebind when a later ordinary deploy runs first. The first promotion integration
 test passed in the earlier round before the admission/preview-hash changes; the
 updated test and the new admission test were **not run here** because no private
-disposable PostgreSQL was provided. No real host, production domain, release
-command or concurrent host change was exercised.
+disposable PostgreSQL was provided. That isolated pass exercised no host; the
+targeted host runs above cover the preview, exact artifact, production config,
+failure, replay, rollback, release-command execution, once-only restart and
+runtime secret snapshot/injection. Concurrent host change remains not run.
 
-## Local telemetry collector foundations (not run)
+## Local telemetry collector foundations (host-qualified on `edge-f1b5440c146b`)
 
-This is the acceptance definition for the D5 textfile/systemd extension.
-**No host application, exporter restart or collection is recorded.** Run it only
-with explicit authorization on a disposable or maintenance-authorized node.
+This is the acceptance definition for the D5 textfile/systemd extension. It was
+applied to the authorized `main` node on 2026-11-08 as `host-node-exporter-v2`
+under node apply `op_ae5673fc2d52cd61c867489aac65c849`. The directory,
+collector, listener, doctor and `metrics show` portions below passed; the
+temporary textfile-producer/malformed-file variant was **not run** because the
+operator session has no noninteractive sudo. The destructive stopped-exporter
+test was **not authorized and is marked skipped**; no node_exporter service was
+stopped. Run further mutation only with explicit authorization on a disposable
+or maintenance-authorized node.
 
 | Check | Pass means |
 | --- | --- |
@@ -1157,6 +1350,32 @@ with explicit authorization on a disposable or maintenance-authorized node.
 | Scrape example | From a host with a WireGuard route, the documented Prometheus or Alloy static target `10.78.0.1:9100` reads the metrics; from a host without the route it does not. The example is read-only, has no credential and is not installed by eregion. |
 | Regression | `metrics show` plain/JSON remains `eregion/node-metrics/v1`, does not include a new history/store, and still works with the control database unavailable. `commands --json`, doctor row counts and existing services rows are compared by name/summary, not assumed totals. |
 | Boundaries | The node still has no telemetry server, Prometheus/Grafana deployment, authenticated external endpoint, `targets.json`/`http_sd` discovery, credential rotation, central store, alerting or retained history. These remain follow-ups, not parity claims. A future optional separate telemetry node or Grafana is not prohibited long-term but is out of beta/v1 scope. |
+
+**Host run (2026-11-08, `edge-f1b5440c146b`).** `apply` executed only
+`host-node-exporter-v2` alongside the database and service restarts; a second
+apply was 0/20. `stat` reports `/var/lib/node_exporter` and
+`/var/lib/node_exporter/textfile` as `root root 755 directory`. The unit carries
+`--web.listen-address=10.78.0.1:9100`,
+`--collector.textfile.directory=/var/lib/node_exporter/textfile`,
+`--collector.systemd` and the narrow
+`(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)` include;
+`ss` shows only `10.78.0.1:9100` listening. A direct scrape returned
+`node_scrape_collector_success{collector="systemd"} 1`,
+`node_scrape_collector_success{collector="textfile"} 1` and exactly one
+`node_textfile_scrape_error 0`; `node_systemd_unit_state` series were present
+for `eregion-api.service`, `eregion-worker.service`, `caddy.service`,
+`node-exporter.service` and `docker.service`, and no unrelated unit name
+matched the spot check. `doctor` passed `telemetry.local` with the strict
+directory/collector/error checks, and total doctor was 22 pass / 0 warn / 0 fail.
+`metrics show --json` returned schema `eregion/node-metrics/v1`, exporter
+1.11.1, endpoint `http://10.78.0.1:9100/metrics`, access `wireguard`,
+`public: false`, authentication `none`, fresh timestamps, two real filesystems,
+memory, load, uptime and a numeric CPU calculated from a checked counter delta;
+the plain form agreed. The temporary root-owned textfile fixture/malformed-file
+and WireGuard-down warn variants were not run because sudo required an
+interactive password. The destructive stopped-exporter test was **not authorized
+and is skipped**; the exporter was not stopped. Those paths remain unit-tested
+only. No exporter self-metrics are claimed without a real producer.
 
 **Source-only evidence (2026-11-08).** Tests cover the `host-node-exporter-v2`
 unit flags and narrow include, the v2 selection replacing v1, the strict shared
