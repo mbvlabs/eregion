@@ -43,7 +43,7 @@ func TestLogsOutputModes(t *testing.T) {
 
 func TestDomainAddPreviewIsAJSONObject(t *testing.T) {
 	raw := json.RawMessage(`{"kind":"platform.domain.add","target":"env/hello/production","dry_run":true,"summary":"bind hello.example.com"}`)
-	data, err := domainAddPreview(raw, []domainRecord{{Type: "A", Name: "hello.example.com", Value: "203.0.113.10"}})
+	data, err := domainAddPreview(raw, "hello.example.com", []domainRecord{{Type: "A", Name: "hello.example.com", Value: "203.0.113.10"}})
 	if err != nil {
 		t.Fatal(err)
 	}

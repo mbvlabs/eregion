@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"net/http"
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,12 +30,17 @@ type ExtensionConfig struct {
 	DNSZones []integrations.DNSZone
 	// CloudflareBaseURL is a test seam; empty uses the real API.
 	CloudflareBaseURL string
+	// CloudflareClient is a test seam; empty uses a bounded default client.
+	CloudflareClient *http.Client
 }
 
 // Extensions is what RegisterExtensions built, for the caller to mount.
 type Extensions struct {
 	// Access is the private-access controller, nil when no admins are configured.
 	Access *integrations.AccessController
+	// DomainDNS is the domain-scoped Cloudflare planner/executor. It is present
+	// even without configured zones and fails closed on use.
+	DomainDNS *integrations.DomainDNS
 }
 
 var extensionMu sync.Mutex
@@ -63,7 +69,7 @@ func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
 		return nil, err
 	}
 	extensions := &Extensions{}
-	runtime := integrations.RuntimeConfig{Audit: audit, CloudflareBaseURL: config.CloudflareBaseURL, DNSZones: config.DNSZones}
+	runtime := integrations.RuntimeConfig{Audit: audit, CloudflareBaseURL: config.CloudflareBaseURL, CloudflareClient: config.CloudflareClient, DNSZones: config.DNSZones}
 	dnsAdmins := config.DNSAdmins
 	if len(dnsAdmins) == 0 {
 		dnsAdmins = config.AccessAdmins
@@ -86,6 +92,14 @@ func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
 		}
 		runtime.Access, extensions.Access = access, access
 	}
+	domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
+		Zones: config.DNSZones, BaseURL: config.CloudflareBaseURL, HTTPClient: config.CloudflareClient,
+		Authorizer: runtime.Authorizer, Audit: audit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	extensions.DomainDNS = domainDNS
 	if _, registered := registry.Lookup(integrations.KindAccessGrant); !registered {
 		if err := integrations.Configure(registry, runtime); err != nil {
 			return nil, err

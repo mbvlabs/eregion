@@ -21,6 +21,8 @@ const (
 	ActionDNSCreate = "dns.create"
 	ActionDNSUpdate = "dns.update"
 	ActionDNSDelete = "dns.delete"
+	ActionDNSRead   = "dns.read"
+	ActionDNSWrite  = "dns.write"
 
 	dnsOwnership = "eregion:managed"
 )
@@ -430,9 +432,47 @@ func (c *Cloudflare) zonePath() string {
 }
 
 func (c *Cloudflare) listRecords(ctx context.Context) ([]DNSRecord, error) {
+	return c.listRecordsQuery(ctx, "")
+}
+
+// ListNameRecords lists only records at one exact hostname. The domain-scoped
+// flow uses this read so a plan never discovers or reasons about unrelated
+// records in the zone.
+func (c *Cloudflare) ListNameRecords(ctx context.Context, name string) ([]DNSRecord, error) {
+	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	if name == "" || (!hostnameEqual(name, c.zoneName) && !strings.HasSuffix(name, "."+c.zoneName)) {
+		return nil, contract.NewFault(contract.ValidationFailed, "DNS record is outside the configured zone", "Read only names within the configured Cloudflare zone.")
+	}
+	records, err := c.listRecordsQuery(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]DNSRecord, 0, len(records))
+	for _, record := range records {
+		if hostnameEqual(record.Name, name) {
+			filtered = append(filtered, record)
+		}
+	}
+	return filtered, nil
+}
+
+func hostnameEqual(left, right string) bool {
+	return strings.EqualFold(strings.TrimSuffix(strings.TrimSpace(left), "."), strings.TrimSuffix(strings.TrimSpace(right), "."))
+}
+
+func hostnameBelongsToZone(hostname, zone string) bool {
+	hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
+	return hostname == zone || strings.HasSuffix(hostname, "."+zone)
+}
+
+func (c *Cloudflare) listRecordsQuery(ctx context.Context, name string) ([]DNSRecord, error) {
 	var result []DNSRecord
 	for page := 1; page <= 100; page++ {
 		endpoint := fmt.Sprintf("%s%s/dns_records?per_page=100&page=%d", c.base, c.zonePath(), page)
+		if name != "" {
+			endpoint = fmt.Sprintf("%s%s/dns_records?name=%s&per_page=100&page=%d", c.base, c.zonePath(), url.QueryEscape(name), page)
+		}
 		var records []DNSRecord
 		var info struct {
 			Page       int `json:"page"`

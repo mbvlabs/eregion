@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"regexp"
@@ -309,6 +310,18 @@ func (t *SSHTransport) runSession(client *ssh.Client, request node.Request, onEv
 	stderr := &tailBuffer{limit: StderrTailBytes}
 	session.Stderr = stderr
 	if err := session.Start(t.config.Command); err != nil {
+		// Start both sends the exec request and waits for the server's reply.
+		// If the stream dies after the request was written, the command may or
+		// may not have started even though no acknowledgement reached this
+		// side. The node hello and request frames are written only after Start
+		// succeeds, so this session has not sent the task. Treat that ambiguous
+		// EOF/closed stream as a lost stream so recovery asks for node status
+		// first; a prior operation on a reused execution may still be active.
+		// An explicit exec refusal proves no command ran here and stays a
+		// normal start failure, not a possibly-dispatched stream.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+			return node.Response{}, fmt.Errorf("%w: SSH command startup is uncertain: the exec acknowledgement was not received, and the node hello/request was not sent in this session. A previously dispatched operation may still be active on the node; recover it through a status lookup before retrying the request: %w", node.ErrStreamLost, err)
+		}
 		return node.Response{}, fmt.Errorf("start the node command: %w", err)
 	}
 	writer := bufio.NewWriter(stdin)

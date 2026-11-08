@@ -54,7 +54,7 @@ type app struct {
 func readMeta(summary string, when, examples []string, next ...string) CommandMeta {
 	return CommandMeta{
 		Summary: summary, WhenToUse: when, Examples: examples, Next: next,
-		Audience: []string{"agent", "human"}, Platforms: []string{"linux", "darwin", "windows"},
+		Audience: []string{"agent", "human"}, Platforms: []string{"linux", "darwin"},
 		NeedsRestart: "never", Output: "result", OutputModes: []string{"plain", "json"},
 		ErrorCodes: []contract.Code{contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.Internal, contract.Cancelled, contract.Unavailable},
 	}
@@ -89,7 +89,7 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.contextSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.workspaceSpecs(), a.logsSpecs()} {
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.contextSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.workspaceSpecs(), a.logsSpecs(), a.metricsSpecs()} {
 		for _, s := range specs {
 			a.attach(a.root, s)
 		}

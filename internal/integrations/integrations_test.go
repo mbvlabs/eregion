@@ -18,12 +18,17 @@ import (
 )
 
 type cloudflareFixture struct {
-	mu      sync.Mutex
-	zoneID  string
-	records map[string]DNSRecord
-	calls   []string
-	nextID  int
-	status  int
+	mu                  sync.Mutex
+	zoneID              string
+	records             map[string]DNSRecord
+	calls               []string
+	nextID              int
+	status              int
+	failCreate          bool
+	failDelete          bool
+	dropCreate          bool
+	reappearDelete      bool
+	failReadAfterDelete bool
 }
 
 func newCloudflareFixture(zoneID string) *cloudflareFixture {
@@ -52,6 +57,10 @@ func (f *cloudflareFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeEnvelope(w, values, map[string]any{"page": 1, "total_pages": 1})
 	case r.Method == http.MethodPost && r.URL.Path == base:
 		f.calls = append(f.calls, "create")
+		if f.failCreate {
+			http.Error(w, "injected create failure", http.StatusInternalServerError)
+			return
+		}
 		var record DNSRecord
 		if err := json.NewDecoder(r.Body).Decode(&record); err != nil {
 			http.Error(w, "bad", http.StatusBadRequest)
@@ -59,7 +68,9 @@ func (f *cloudflareFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.nextID++
 		record.ID = fmt.Sprintf("rec%08d", f.nextID)
-		f.records[record.ID] = record
+		if !f.dropCreate {
+			f.records[record.ID] = record
+		}
 		writeEnvelope(w, record, nil)
 	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, base+"/"):
 		f.calls = append(f.calls, "update")
@@ -78,8 +89,20 @@ func (f *cloudflareFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeEnvelope(w, record, nil)
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, base+"/"):
 		f.calls = append(f.calls, "delete")
+		if f.failDelete {
+			http.Error(w, "injected delete failure", http.StatusInternalServerError)
+			return
+		}
 		id := strings.TrimPrefix(r.URL.Path, base+"/")
+		record, existed := f.records[id]
 		delete(f.records, id)
+		if existed && f.reappearDelete {
+			record.ID = id + "-reappeared"
+			f.records[record.ID] = record
+		}
+		if f.failReadAfterDelete {
+			f.status = http.StatusInternalServerError
+		}
 		writeEnvelope(w, map[string]string{"id": id}, nil)
 	default:
 		http.NotFound(w, r)

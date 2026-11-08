@@ -29,15 +29,14 @@ func (a *app) workspaceSpecs() []spec {
 		"Explore fleet, app, environment, release, and deployment inventory with freshness and focused details.",
 		"Preview and submit an app, environment, image release, deploy, or rollback action; every action shows its exact noninteractive platform command equivalent.",
 		"Use ':' for command discovery, '/' to filter, and the documented destructive confirmation before submission.",
-		"Requires --interactive and a real terminal on stdin and stdout. Machine output never starts the interface.",
+		"Requires a real terminal on stdin and stdout. --json, --output json, and piped input or output are refused; the platform commands provide machine output.",
 	}
 	meta.Examples = []string{
 		"eregion ui",
 		"eregion ui --tab apps --ascii --no-color --reduced-motion",
 		"eregion ui --tab deployments",
-		"eregion ui --tab fleet --telemetry-url http://10.77.0.10",
+		"eregion ui --tab fleet",
 	}
-	meta.Environment = append(meta.Environment, telemetryEnvironment...)
 	return []spec{{
 		use:  "ui",
 		meta: meta,
@@ -46,7 +45,6 @@ func (a *app) workspaceSpecs() []spec {
 			cmd.Flags().Bool("ascii", false, "Use ASCII glyphs instead of Unicode")
 			cmd.Flags().Bool("no-color", false, "Disable colour (NO_COLOR is also honoured)")
 			cmd.Flags().Bool("reduced-motion", false, "Replace spinners with a static loading label (EREGION_REDUCED_MOTION=1 is also honoured)")
-			addTelemetrySourceFlags(cmd)
 		},
 		run: a.workspaceUI,
 	}}
@@ -78,10 +76,7 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	ascii, _ := cmd.Flags().GetBool("ascii")
 	noColor, _ := cmd.Flags().GetBool("no-color")
 	reduced, _ := cmd.Flags().GetBool("reduced-motion")
-	metrics, err := a.workspaceMetricsSource(cmd)
-	if err != nil {
-		return result{}, err
-	}
+	metrics := a.workspaceMetricsSource(client)
 	summary, err := workspaceui.Run(cmd.Context(), workspaceui.Options{
 		API:           workspaceAPI,
 		Metrics:       metrics,
@@ -156,93 +151,98 @@ func (w workspaceLiveAPI) Events(ctx context.Context, cursor contract.Cursor, li
 	return w.client.Events(ctx, cursor, limit)
 }
 
-// workspaceMetricsSource adapts the telemetry read configuration used by
-// `logs` to the workspace graph boundary. No telemetry configuration is the
-// explicit nil source, so the UI renders "no telemetry node" instead of an
-// empty graph.
-func (a *app) workspaceMetricsSource(cmd *cobra.Command) (workspaceui.MetricsSource, error) {
-	if strings.TrimSpace(flagOrEnvironment(cmd, "telemetry-url", "EREGION_TELEMETRY_URL")) == "" &&
-		strings.TrimSpace(flagOrEnvironment(cmd, "logs-url", "EREGION_TELEMETRY_LOGS_URL")) == "" &&
-		strings.TrimSpace(flagOrEnvironment(cmd, "metrics-url", "EREGION_TELEMETRY_METRICS_URL")) == "" {
-		return nil, nil
+// workspaceMetricsSource attaches the current per-node snapshot to the Fleet
+// detail. A backend without the node metrics method (an injected test client)
+// gets no source, and the UI then says so instead of drawing a graph.
+func (a *app) workspaceMetricsSource(client Backend) workspaceui.MetricsSource {
+	metrics, ok := client.(nodeMetricsClient)
+	if !ok {
+		return nil
 	}
-	source, err := a.telemetryDataSource(cmd)
-	if err != nil {
-		return nil, err
-	}
-	return workspaceMetrics{source: source, now: time.Now}, nil
+	return workspaceNodeMetrics{client: metrics}
 }
 
-type workspaceMetrics struct {
-	source telemetry.DataSource
-	now    func() time.Time
+type workspaceNodeMetrics struct {
+	client nodeMetricsClient
 }
 
-func (w workspaceMetrics) Query(ctx context.Context, query workspaceui.MetricsQuery) (workspaceui.MetricsSeries, error) {
-	window := query.Window
-	if window <= 0 {
-		window = 5 * time.Minute
-	}
-	now := time.Now
-	if w.now != nil {
-		now = w.now
-	}
-	end := now().UTC()
-	expression, unit := workspaceMetricExpression(query.Metric)
-	source := query.App
-	if source == "" {
-		source = query.Node
-	}
-	if source == "" {
-		source = "workspace"
-	}
-	result, err := w.source.Metrics(ctx, telemetry.MetricQuery{
-		Window: telemetry.Window{Start: end.Add(-window), End: end},
-		Source: source, Expression: expression, Unit: unit,
-	})
+func (w workspaceNodeMetrics) Query(ctx context.Context, query workspaceui.MetricsQuery) (workspaceui.MetricsSeries, error) {
+	snapshot, err := w.client.NodeMetrics(ctx)
 	if err != nil {
 		return workspaceui.MetricsSeries{}, err
 	}
-	if result.State == telemetry.StateAbsent {
-		return workspaceui.MetricsSeries{Source: result.Source, Metric: query.Metric, Unit: result.Unit, Window: window}, nil
+	if node := strings.TrimSpace(query.Node); node != "" && node != snapshot.Node {
+		return workspaceui.MetricsSeries{}, contract.NewFault(contract.Unavailable,
+			"node metrics are unavailable for node "+node,
+			"The current source observes "+snapshot.Node+"; select that node instead of relabeling another node's sample.")
 	}
-	if result.State == telemetry.StateError {
-		return workspaceui.MetricsSeries{}, contract.NewFault(contract.Unavailable, "telemetry metrics query failed", result.Message)
+	freshness := snapshot.Freshness.State
+	if freshness == "" {
+		freshness = telemetry.FreshnessUnknown
 	}
 	series := workspaceui.MetricsSeries{
-		Source: result.Source, Metric: query.Metric, Unit: result.Unit, Window: window,
-		ObservedAt: result.ObservedAt, Stale: result.State == telemetry.StateStale,
+		Source: "node_exporter on " + snapshot.Node,
+		Metric: query.Metric, Unit: "percent",
+		Freshness:  freshness,
+		ReceivedAt: time.Now(),
+		StaleAfter: time.Duration(snapshot.Freshness.ThresholdSeconds * float64(time.Second)),
 	}
-	if series.Unit == "" {
-		series.Unit = unit
+	if snapshot.Freshness.AgeSeconds != nil {
+		series.AgeAtReceipt = time.Duration(*snapshot.Freshness.AgeSeconds * float64(time.Second))
+		series.AgeKnown = true
 	}
-	if len(result.Series) > 0 {
-		for _, sample := range result.Series[0].Samples {
-			series.Samples = append(series.Samples, workspaceui.MetricsSample{At: sample.Timestamp, Value: sample.Value})
-		}
+	notes := []string{"One current node_exporter sample. No history is stored."}
+	if snapshot.ObservedAt != nil {
+		series.ObservedAt = *snapshot.ObservedAt
+	} else {
+		notes = append(notes, "Exporter time is unknown; no sample timestamp is invented.")
 	}
-	if len(series.Samples) > 0 {
-		last := series.Samples[len(series.Samples)-1].At
-		if series.ObservedAt.IsZero() || last.After(series.ObservedAt) {
-			series.ObservedAt = last
-		}
+	series.Stale = freshness == telemetry.FreshnessStale
+	if snapshot.CPU != nil && snapshot.CPU.UtilizationPercent != nil {
+		series.Samples = []workspaceui.MetricsSample{{
+			At: series.ObservedAt, Value: *snapshot.CPU.UtilizationPercent,
+		}}
+		series.Details = append(series.Details, workspaceui.Detail{
+			Label: "CPU",
+			Value: fmt.Sprintf("%.1f%% of %d logical CPUs over %.1fs of counters", *snapshot.CPU.UtilizationPercent, snapshot.CPU.LogicalCPUs, snapshot.CPU.WindowSeconds),
+		})
+	} else {
+		notes = append(notes, "CPU utilization is unavailable: "+nodeMetricsIssue(snapshot, "cpu")+".")
 	}
-	if !series.ObservedAt.IsZero() && end.Sub(series.ObservedAt) > window {
-		series.Stale = true
+	if snapshot.Memory != nil {
+		series.Details = append(series.Details, workspaceui.Detail{
+			Label: "Memory",
+			Value: fmt.Sprintf("%s used of %s (%.1f%%)", humanBytes(snapshot.Memory.UsedBytes), humanBytes(snapshot.Memory.TotalBytes), snapshot.Memory.UsedPercent),
+		})
 	}
+	if snapshot.Load != nil {
+		series.Details = append(series.Details, workspaceui.Detail{
+			Label: "Load",
+			Value: fmt.Sprintf("%.2f %.2f %.2f", snapshot.Load.Load1, snapshot.Load.Load5, snapshot.Load.Load15),
+		})
+	}
+	if snapshot.UptimeSeconds != nil {
+		series.Details = append(series.Details, workspaceui.Detail{Label: "Uptime", Value: uptimeText(int64(*snapshot.UptimeSeconds))})
+	}
+	for _, filesystem := range snapshot.Filesystems {
+		series.Details = append(series.Details, workspaceui.Detail{
+			Label: "Filesystem " + filesystem.Mountpoint,
+			Value: fmt.Sprintf("%s free of %s (%.0f%% free)", humanBytes(filesystem.AvailableBytes), humanBytes(filesystem.TotalBytes), 100-filesystem.UsedPercent),
+		})
+	}
+	series.Details = append(series.Details, workspaceui.Detail{
+		Label: "Source",
+		Value: snapshot.Scrape.Endpoint + " · WireGuard only; no public endpoint or credential",
+	})
+	series.Note = strings.Join(notes, " ")
 	return series, nil
 }
 
-// workspaceMetricExpression maps the workspace's stable observation names to
-// explicit PromQL. An unknown name is passed through as an expression: the
-// caller can ask for a real metric without the UI inventing a unit.
-func workspaceMetricExpression(metric string) (string, string) {
-	switch metric {
-	case "node.cpu.utilization":
-		return `100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])))`, "percent"
-	case "http.request.duration.p95":
-		return `histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))`, "seconds"
-	default:
-		return metric, ""
+func nodeMetricsIssue(snapshot telemetry.NodeSnapshot, field string) string {
+	for _, issue := range snapshot.Issues {
+		if issue.Field == field {
+			return issue.Reason
+		}
 	}
+	return "the exporter did not report it"
 }

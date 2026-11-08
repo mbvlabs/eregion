@@ -19,20 +19,44 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// runDomain applies a domain change: the domains table already holds it, so
-// the routes file is rewritten from the serving deployments and Caddy loads it.
+// runDomain applies a domain change. An add already has its desired binding;
+// an explicit Cloudflare effect runs before the route write. A remove keeps the
+// binding until the exact owned provider record is gone, then deletes the row.
 func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
 	input := normalized.Input.(*platform.DomainInput)
+	op, _, err := w.service.operationSnapshot(ctx, id)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.revalidateDomainOperation(ctx, op, input); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.applyDomainDNSEffect(ctx, op, attempt, input, normalized.Kind == platform.KindDomainRemove); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	// A cancellation accepted after provider effects but before the binding
+	// row is deleted must stop here and retain the ledger/cleanup state.
+	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if normalized.Kind == platform.KindDomainRemove {
+		if err := w.service.deleteDomainBindingRowOwned(ctx, id, attempt, input.App, input.Environment, input.Domain); err != nil {
+			return w.settle(ctx, id, attempt, err)
+		}
+	}
 	if err := w.service.syncRoutes(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		kind, summary := "domain.added", "Saved the binding for "+input.Domain+" on "+input.App+"/"+input.Environment+"; route and observations are reported separately."
 		if normalized.Kind == platform.KindDomainRemove {
 			kind, summary = "domain.removed", "Removed the binding and route for "+input.Domain
 		}
 		return insertPlatformChange(ctx, tx, op, kind, input.App, input.Environment, summary, map[string]any{"domain": input.Domain}, nil)
-	})
+	}); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	return nil
 }
 
 // caddyRoutesLockKey serializes every writer of the one routes file, including
@@ -44,6 +68,9 @@ const caddyRoutesLockKey int64 = 0x6361646479726f75 // "caddyrou"
 // environment's serving deployment, then loads the Caddyfile through Caddy's
 // admin endpoint. A config Caddy rejects puts the previous routes file back.
 func (s *Service) syncRoutes(ctx context.Context) error {
+	if s.routeSync != nil {
+		return s.routeSync(ctx)
+	}
 	return s.writeRoutes(ctx, "", nil)
 }
 

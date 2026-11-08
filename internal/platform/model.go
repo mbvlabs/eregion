@@ -481,6 +481,9 @@ type Preview struct {
 	Summary  string   `json:"summary"`
 	Steps    []string `json:"steps,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
+	// Data carries non-secret structured preview evidence, such as a real
+	// Cloudflare provider snapshot for an explicit managed-DNS plan.
+	Data map[string]any `json:"data,omitempty"`
 	// Replay reports that the actor's idempotency key already owns this
 	// kind and target. Operation is that accepted operation; a preview with
 	// Replay set skipped every conflict check, so the caller must not repeat

@@ -1,0 +1,59 @@
+# HELP node_cpu_seconds_total Seconds the CPUs spent in each mode.
+# TYPE node_cpu_seconds_total counter
+node_cpu_seconds_total{cpu="0",mode="idle"} 1000
+node_cpu_seconds_total{cpu="0",mode="system"} 100
+node_cpu_seconds_total{cpu="0",mode="user"} 200
+node_cpu_seconds_total{cpu="0",mode="nice"} 60
+node_cpu_seconds_total{cpu="0",mode="iowait"} 10
+node_cpu_seconds_total{cpu="0",mode="irq"} 5
+node_cpu_seconds_total{cpu="0",mode="softirq"} 2
+node_cpu_seconds_total{cpu="0",mode="steal"} 1
+node_cpu_seconds_total{cpu="1",mode="idle"} 2000
+node_cpu_seconds_total{cpu="1",mode="system"} 100
+node_cpu_seconds_total{cpu="1",mode="user"} 300
+node_cpu_seconds_total{cpu="1",mode="nice"} 80
+node_cpu_seconds_total{cpu="1",mode="iowait"} 20
+node_cpu_seconds_total{cpu="1",mode="irq"} 6
+node_cpu_seconds_total{cpu="1",mode="softirq"} 3
+node_cpu_seconds_total{cpu="1",mode="steal"} 2
+# HELP node_cpu_guest_seconds_total Seconds the CPUs spent in guests (VMs) for each mode.
+# TYPE node_cpu_guest_seconds_total counter
+node_cpu_guest_seconds_total{cpu="0",mode="user"} 100
+node_cpu_guest_seconds_total{cpu="0",mode="nice"} 50
+node_cpu_guest_seconds_total{cpu="1",mode="user"} 200
+node_cpu_guest_seconds_total{cpu="1",mode="nice"} 100
+# HELP node_memory_MemAvailable_bytes Memory information field MemAvailable_bytes.
+# TYPE node_memory_MemAvailable_bytes gauge
+node_memory_MemAvailable_bytes 5.36870912e+09
+# HELP node_memory_MemTotal_bytes Memory information field MemTotal_bytes.
+# TYPE node_memory_MemTotal_bytes gauge
+node_memory_MemTotal_bytes 8.589934592e+09
+# HELP node_load1 1m load average.
+# TYPE node_load1 gauge
+node_load1 0.5
+node_load5 0.4
+node_load15 0.3
+# HELP node_time_seconds System time in seconds since epoch.
+# TYPE node_time_seconds gauge
+node_time_seconds 1.7e+09
+# HELP node_boot_time_seconds Node boot time in seconds since epoch.
+# TYPE node_boot_time_seconds gauge
+node_boot_time_seconds 1.6999e+09
+# HELP node_filesystem_size_bytes Filesystem size in bytes.
+# TYPE node_filesystem_size_bytes gauge
+node_filesystem_size_bytes{device="/dev/sda1",fstype="ext4",mountpoint="/"} 4.294967296e+10
+node_filesystem_size_bytes{device="/dev/sda2",fstype="ext4",mountpoint="/boot"} 1.073741824e+09
+node_filesystem_size_bytes{device="tmpfs",fstype="tmpfs",mountpoint="/run"} 1.6777216e+08
+node_filesystem_size_bytes{device="overlay",fstype="overlay",mountpoint="/var/lib/docker/overlay2/abc/merged"} 4.294967296e+10
+# HELP node_filesystem_avail_bytes Filesystem space available to non-root users in bytes.
+# TYPE node_filesystem_avail_bytes gauge
+node_filesystem_avail_bytes{device="/dev/sda1",fstype="ext4",mountpoint="/"} 2.147483648e+10
+node_filesystem_avail_bytes{device="/dev/sda2",fstype="ext4",mountpoint="/boot"} 5.36870912e+08
+node_filesystem_avail_bytes{device="tmpfs",fstype="tmpfs",mountpoint="/run"} 1.6777216e+08
+node_filesystem_avail_bytes{device="overlay",fstype="overlay",mountpoint="/var/lib/docker/overlay2/abc/merged"} 2.147483648e+10
+# HELP node_uname_info Labeled system information as provided by the uname system call.
+# TYPE node_uname_info gauge
+node_uname_info{domainname="(none)",machine="x86_64",nodename="main.example",release="6.8.0-1-amd64",sysname="Linux",version="#1 SMP"} 1
+# HELP node_exporter_build_info A metric with a constant '1' value labeled by version, revision, branch, goversion.
+# TYPE node_exporter_build_info gauge
+node_exporter_build_info{branch="HEAD",goversion="go1.24.0",revision="abc123",tags="unknown",version="1.11.1"} 1

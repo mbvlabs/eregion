@@ -84,8 +84,8 @@ func (r registry) validate(root *cobra.Command) error {
 		if !nonempty(meta.Audience) || !allIn(meta.Audience, []string{"agent", "human", "node"}) {
 			add("audience must contain agent, human, or node")
 		}
-		if !nonempty(meta.Platforms) || !allIn(meta.Platforms, []string{"linux", "darwin", "windows"}) {
-			add("platforms must list supported operating systems")
+		if !nonempty(meta.Platforms) || !allIn(meta.Platforms, []string{"linux", "darwin"}) {
+			add("platforms must list linux or darwin")
 		}
 		if slices.Contains(meta.Audience, "node") && (len(meta.Platforms) != 1 || meta.Platforms[0] != "linux") {
 			add("node commands require Linux-only platforms")

@@ -921,11 +921,56 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 		}
 		return s.failReconciledPlatform(ctx, op, "enrollment ended before the node was verified; retry node enrollment", contract.Unavailable)
 	case platform.KindDomainAdd, platform.KindDomainRemove:
-		// The table already holds the change; the routes file is derived from it.
+		op, input, normalized, err := s.domainOperationInput(ctx, op.ID)
+		if err != nil {
+			return err
+		}
+		releaseLock, err := s.lockPlatformTargets(ctx, normalized)
+		if err != nil {
+			return err
+		}
+		defer releaseLock()
+		if err := s.revalidateDomainOperation(ctx, op, input); err != nil {
+			fault := contract.Classify(err)
+			return s.failReconciledPlatform(ctx, op, err.Error(), fault.Code)
+		}
+		if err := s.applyDomainDNSEffect(ctx, op, op.Attempt, input, op.Kind == platform.KindDomainRemove); err != nil {
+			if errors.Is(err, errPlatformCancelled) {
+				return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation acknowledged after provider effects; binding and cleanup ledger were retained.")
+			}
+			fault := contract.Classify(err)
+			return s.failReconciledPlatform(ctx, op, err.Error(), fault.Code)
+		}
+		if err := s.checkDomainDNSBoundary(ctx, op.ID, op.Attempt); err != nil {
+			if errors.Is(err, errPlatformCancelled) {
+				return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation acknowledged before binding deletion; cleanup state was retained.")
+			}
+			if errors.Is(err, errNotOwned) {
+				return s.waitForNewerAttempt(ctx, op.ID, op.Attempt)
+			}
+			return err
+		}
+		if op.Kind == platform.KindDomainRemove {
+			if err := s.deleteDomainBindingRowOwned(ctx, op.ID, op.Attempt, input.App, input.Environment, input.Domain); err != nil {
+				if errors.Is(err, errPlatformCancelled) {
+					return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation acknowledged before binding deletion; cleanup state was retained.")
+				}
+				if errors.Is(err, errNotOwned) {
+					return s.waitForNewerAttempt(ctx, op.ID, op.Attempt)
+				}
+				return s.failReconciledPlatform(ctx, op, err.Error(), contract.Unavailable)
+			}
+		}
 		if err := s.syncRoutes(ctx); err != nil {
 			return s.failReconciledPlatform(ctx, op, err.Error(), contract.Unavailable)
 		}
-		return s.finishPlatformOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil })
+		if err := s.finishDomainOperation(ctx, op.ID, op.Attempt, func(pgx.Tx, *contract.Operation) error { return nil }); err != nil {
+			if errors.Is(err, errPlatformCancelled) {
+				return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation acknowledged at domain finalization; completed effects were not rolled back.")
+			}
+			return err
+		}
+		return nil
 	case platform.KindAppDelete:
 		var raw []byte
 		if err := s.pool.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {

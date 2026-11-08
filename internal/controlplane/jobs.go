@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -331,13 +332,16 @@ type WorkerConfig struct {
 	// submission transaction. Node RPC sets it; HTTP and worker-only processes
 	// leave it nil, which fails factor-gated submissions closed.
 	HumanFactor func(string) error
+	// DomainDNS is the domain-scoped Cloudflare planner/executor. Nil means
+	// managed DNS fails closed; manual domain bindings remain unaffected.
+	DomainDNS *integrations.DomainDNS
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor}
+	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS}
 	service.redaction = config.Redaction
 	if service.redaction == nil {
 		service.redaction = &secrets.Registry{}

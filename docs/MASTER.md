@@ -1,7 +1,7 @@
 # eregion: deploycrate-ce, shaped like vaire
 
-> Master document: product, decisions, model, command tree, the v1 alpha scope
-> and **the only work list and status**. [IMPLEMENTATION](IMPLEMENTATION.md)
+> Master document: product, decisions, model, command tree, the v1 alpha/beta
+> scope and **the only work list and status**. [IMPLEMENTATION](IMPLEMENTATION.md)
 > describes current code and carries no status; [MANUAL-TESTING](MANUAL-TESTING.md)
 > holds acceptance checks and run evidence.
 > Rewritten 2026-10-26 from the alignment spec (D1–D7) after a re-read of
@@ -31,8 +31,8 @@ agent at `eregion` is a supported way to operate a server.
 
 The first goal is the **main node**: one VPS that runs the control plane, the
 River workers, builds, the registry, Caddy and the applications. Additional
-nodes, the telemetry node and HA come later, but early decisions must not block
-them.
+nodes and HA come later, but early decisions must not block them. Telemetry is
+node-local; there is no telemetry node to add.
 
 ### Never
 
@@ -82,8 +82,8 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D1 | Control model | The CLI talks to a node through SSH over embedded userspace WireGuard, always. Each operator command resolves the context, opens SSH in WireGuard and runs `eregion node <cmd> --json` there, which calls the same application services the API uses. Contexts hold a WireGuard identity and an SSH key, not a bearer token. |
 | D2 | Hardening | vaire's: admin user with a sudo password, root login and SSH passwords off, firewall, commit-confirm switchover of SSH to WireGuard with automatic revert, break-glass via the provider console and `eregion node unlock-ssh`. |
 | D3 | Ingress | Caddy on the main node. The main hostname is used exactly as entered. App domains are environment bindings. DNS records, direct or Cloudflare-proxied, and ACME. |
-| D4 | Backups | No backup product work before v1. Control-database recovery is the PostgreSQL provider's job. |
-| D5 | Telemetry | Every server runs node_exporter from setup on, bound to its WireGuard address only. The **telemetry node** is a separate self-hosted Grafana with its metrics and log storage, scraping servers over WireGuard; an external backend is the alternative. No ClickHouse. Operation history never depends on telemetry. |
+| D4 | Backups | Backups are deferred for beta and v1; there is no backup product or scheduled backup work. External PostgreSQL holds the control-plane state and operation history, but it is **not** a backup of application or managed-resource volumes: those Docker volumes need an operator backup outside eregion until a later decision. Control-database recovery is the PostgreSQL provider's job. |
+| D5 | Telemetry (beta) | Every node (currently the main node) runs node_exporter from setup on, bound to its WireGuard address only. Telemetry is **node-local and request-scoped**: `metrics show` (over `eregion node rpc` through SSH in WireGuard) reads one bounded current snapshot with CPU, memory, filesystem, load, uptime, identity, timestamps, freshness and explicit missing values. CPU utilization is computed from a second counter read and a checked delta; a missing or reset counter is unavailable, never zero. There is no telemetry server, Prometheus/Grafana/Loki, metric or log store, external backend, global PromQL or retained history; the exporter has no public endpoint or token. Operation history lives in PostgreSQL and never depends on telemetry. |
 | D6 | Command tree | [Section 5](#5-command-tree). `platform …`, operator-facing `bootstrap …`, `serve`/`worker`, `platform submit` and bearer-token `context login` are removed from the operator surface; the service, migration and bootstrap entry points live under the hidden Linux-only `node` group. The old resource surface was removed, but alpha.2 adds a new node-mode resource lifecycle under D19. Pre-v1: delete old paths, no aliases or compatibility shims. |
 | D7 | Tokens and the human factor | API tokens are per use, scoped, expiring, listed and revocable, and shown once. Creating one needs a human factor (a TOTP code from `eregion protect init`, or a master password) read without echo at a terminal, so an agent cannot mint its own. No token is minted at setup or handed off. The same factor gates **token create, secret export (`secret export`, `secrets export`), every `app delete`, a protected `env delete`, deletion of the last environment (which deletes the app), and `env unprotect`**. An unprotected non-last environment deletion needs only exact target confirmation (D33). The control plane verifies the code inside the submission transaction that locks the target state; a separate pre-check is UX only. `--yes`, `--json`, stdin and pipes never satisfy it. The factor stops an agent operating through `eregion` from reading secrets, minting tokens or deleting apps; it is not a sandbox: an OS account holding a context's files (SSH key, sudo password) is root-equivalent on that server. |
 | D8 | Hosts and platforms | Servers: Debian 13 and Ubuntu 26.04, amd64 and arm64. Operator CLI: Linux and macOS; no Windows builds. Operator mode pushes the matching verified Linux binary to the node. |
@@ -97,14 +97,14 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D16 | Order of work | Operator channel first (work list rows 1–3), then the app workflow (rows 4–8). New app commands are node-mode commands from the start, never built on the token adapter. |
 | D17 | Traffic switch | deploycrate's blue/green: the candidate runs on a dynamic loopback port, passes health, Caddy switches its backends, the public response is verified, then the previous containers stop. A failed candidate leaves the old release serving. Public verification requests the primary domain at its check path (D29) and records the host, path and status it observed. Failure to remove a previous or candidate container never fails a verified switch, but is recorded and retried, never silently dropped. |
 | D18 | Secret resolution | deploycrate's: the environment revision names its secrets; each deploy resolves their current values and records the exact secret revisions on the deployment, so a rollback reproduces them. No hand-pinned `vault:…@N` refs. |
-| D19 | Application resources | Alpha.2 adds optional, generic Docker resources owned by an environment; an application may instead use external dependencies through secrets. This supersedes the earlier exclusion of managed application databases: a PostgreSQL container is an app resource, never the external control-plane database. Resources use private networking and optional persistent volumes, secret names rather than values in definitions, and retain data when detached; deleting data requires a separate `resource destroy --delete-data` naming the exact resource, which removes only that resource's owned volumes. No backup product is implied. |
+| D19 | Application resources | Alpha.2 adds optional, generic Docker resources owned by an environment; an application may instead use external dependencies through secrets. This supersedes the earlier exclusion of managed application databases: a PostgreSQL container is an app resource, never the external control-plane database. Resources use private networking and optional persistent volumes, secret names rather than values in definitions, and retain data when detached; deleting data requires a separate `resource destroy --delete-data` naming the exact resource, which removes only that resource's owned volumes. No backup product is implied, and the external control-plane PostgreSQL is not a backup of these volumes. |
 | D20 | Sources | HTTPS git (public, or private with a per-environment read credential) and existing images. No GitHub App integration is planned (decided 2026-11-04): a per-environment read credential plus the D28 webhook covers private repositories and push to deploy with far less setup. |
 | D21 | Processes | deploycrate's: an environment declares processes of kind `web` (receives the domains through Caddy), `worker` (no port), `service` (port reachable privately, no domain) and a `release` command, each with a command, arguments and replicas. Caddy balances a `web` process across its replicas. The release command (typically migrations) is **release-scoped**, as in deploycrate: it runs once per release and command, before the release fans out to its deployments (and, after v1, to several nodes); a successful run is recorded, and `restart`, `process scale` and `rollback` to that release never run it again. A failed run blocks that release until a new `deploy`. A forced re-run is a possible later override, not alpha scope. A bare process command runs through the same static Linux `eregion` binary bind-mounted read-only at a fixed container path and execs after searching the effective launch-time PATH (including relative/empty entries, then cwd) with the target container's cwd, filesystem and permissions; the Buildpacks launcher completes its environment first, a plain image uses the resolver directly, and no shell or PATH rewrite is used. Explicit paths keep exact argv (plain image directly, Buildpacks through its launcher); commandless containers keep the native entrypoint. None receives the resolver mount. A configured or secret-valued PATH is applied only through the transient Docker client environment, never argv. |
 | D22 | Access modes | Public only in the alpha; basic auth and private-network access after v1. |
 | D23 | Promotion | After v1; `deploy --release` of another environment's release covers it by hand. |
 | D24 | `server init --local` | After v1; remote bootstrap only in the alpha. |
-| D25 | Logs | `logs` reads container logs over the operator channel and works without a telemetry node. |
-| D26 | Nodes and DNS automation | `node add` and Cloudflare DNS automation after v1; the alpha uses manual DNS with resolver checks. |
+| D25 | Logs | `logs` reads container logs over the operator channel and works without any telemetry service. |
+| D26 | Nodes and DNS automation | Cloudflare DNS automation is required before beta and is implemented in source as an explicit extension of the existing domain flow. Manual DNS stays the default. `domain add … --dns cloudflare --dns-zone ZONE --dns-origin ADDRESS --dns-proxy dns-only\|proxied` plans or applies only A/AAAA records for that exact hostname; origins are explicit public addresses and never derived from the context's WireGuard management endpoint. `domain remove` for a managed binding uses the persisted ledger automatically and removes only records carrying that binding's exact ownership marker; unmanaged explicit cleanup still requires the Cloudflare flags. A dry run reads a real provider snapshot and performs no mutation. The token comes from a configured root-owned `0640` service-group file (root reads as owner; the `eregion` worker reads through its group), never action input, argv, River arguments, events or logs. Domain admission and the worker use the same target ordering; a delayed removal revalidates the newest domain intent and binding identity under the target lock, so a readd or promotion admitted later cannot be deleted by the stale operation. Ownership is re-read immediately before each provider mutation; Cloudflare has no conditional-write API, so a final external-writer race remains and is reported on the next plan/reconciliation rather than hidden. Only A/AAAA records are managed; any CNAME is a conflict even with the exact marker. Existing foreign records and legacy `eregion:managed` records are never adopted or deleted implicitly; a conflict fails closed. Provider-observed state is separate from resolver, route, certificate and public readiness. Migration 025 adds an immutable domain ID and a durable per-binding DNS ledger written atomically with the operation/River job before provider effects. It stores provider/zone, exact ownership marker, generation, desired explicit origins/proxy, state and cleanup status, and is retained until exact provider cleanup is verified. Removal and app/environment deletion verify provider cleanup before removing serving workload containers or deleting rows; a provider failure or ownership conflict refuses deletion and preserves the app, workloads, ledger, records and credentials for retry. Deletion preflights every managed binding (operation ownership, authorization, zone/host recovery, provider read, exact ownership/conflict) before the first mutation; after that point Cloudflare effects are not atomic, so a later failure or cancellation can leave earlier bindings cleaned and later bindings unchanged or partially changed. Events report how many bindings were processed instead of claiming records were preserved. The workflow is also not atomic across provider and node effects and is not an availability guarantee: after provider cleanup succeeds, a node-step failure or cancellation can leave DNS removed, the ledger retained and some workloads present, while a later route-write failure can leave rows retryable after DNS and workloads are gone. Events record which effects completed; retry converges the rest and no repair command exists. The primary binding is cleaned through environment/application deletion, or after promoting another primary for an explicit removal. The main node remains the only node in beta: `node add`, additional placement and multi-node operations stay after v1. |
 | D27 | Plaintext secret read | No `secret get`. `secret export` is human-only behind the D7 factor. |
 | D28 | Push to deploy | In the alpha, as in deploycrate: an environment with auto-deploy on deploys every push to its bound branch through a signed GitHub webhook. Each environment has its own webhook URL and generated secret, shown once when auto-deploy is turned on and replaceable by rotation; the HMAC secret is resolved fresh per delivery, the signature is checked over the raw body before parsing, and pushes to other branches are ignored. A verified push is admitted by one PostgreSQL transaction that stores only a sanitized intent (hashes, validated repository/branch/commit and non-secret environment/revision/secret-revision identities) and its River processing job; the handler replies 202 only after that transaction commits, within one 8-second admission budget covering the fresh secret resolution, body read and database work. A worker then submits the ordinary `platform.deploy` operation and links it to the delivery in another single transaction. A redelivery returns the original operation and never deploys twice; a receipt means the push was accepted for processing, not that a deployment completed. If the environment is deleted or its repository/branch binding changes before the worker submits, the accepted intent fails terminally instead of deploying against the new binding. The routing lives in the environment revision, not in service environment variables. This replaces a GitHub App (qualified on a real server 2026-11-04). Planned for alpha.2, not an alpha.1 gate: optional `gh`-assisted webhook setup checks for an authenticated operator `gh` with repository hook permission and can create or update the hook without copying the secret by hand. Manual setup remains available when `gh` or permission is absent. Any prompt has a flag equivalent; JSON/no-TTY never prompts. Plaintext secrets never enter ordinary output, events or arguments (D7). No GitHub App integration is added. |
 | D29 | Domain check path | Each domain binding has an optional check path (`domain add … --check-path PATH`), defaulting to the `web` process health path. The domain observer and the D17 public verification request each host at its own path, so an alias that serves no health route can still be ready. deploycrate has one path per web process; this is an eregion extension found in a real deployment. |
@@ -168,9 +168,11 @@ eregion deploy <app> <env> [--ref REF | --release ID] | rollback <app> <env> [--
 eregion image push <local-image> --app <app> [--tag <tag>]   # local image into the node registry
 eregion build list|logs|stop|retry  ·  release list
 eregion domain add|list|remove [--primary] [--check-path PATH]
+                                                        # optional explicit --dns cloudflare --dns-zone ZONE --dns-origin ADDRESS --dns-proxy dns-only|proxied
 eregion config set|unset|list                          # plain variables
 eregion secret set|list|archive|export                 # values write-only
 eregion logs <app> <env> [--process NAME] [--follow]  ·  restart <app> <env>
+eregion metrics show                                  # current node_exporter snapshot, no history
 eregion retention show|set  ·  prune [--dry-run] [--confirm <server>]
 eregion resource apply|attach|detach|list|status|destroy [--delete-data]   # D19
 eregion operations list|get|follow|cancel
@@ -181,8 +183,10 @@ eregion ui  ·  commands | guide agents | skill install | version
 eregion node …                                         # node mode, not for operators
 ```
 
-After v1: `node add|list|status|remove`, `env promote`, access modes, the
-telemetry node and `metrics`.
+Beta: explicit Cloudflare DNS automation under the existing domain flow, with
+no new operator command. After v1: `node add|list|status|remove`, `env promote`,
+access modes, `server init --local` and HA. There is no telemetry node or
+telemetry server to add.
 
 ## 6. Flows
 
@@ -260,6 +264,33 @@ application, certificate and public response separately as
 pending/applied/failed. Routes are reconciled on worker start and after a
 failed reload. One primary per environment; others are aliases.
 
+DNS stays manual by default. With explicit `--dns cloudflare --dns-zone ZONE
+--dns-origin ADDRESS --dns-proxy dns-only|proxied`, the same command plans or
+reconciles only the exact A/AAAA records for that hostname; origins are explicit
+public addresses and are never taken from the context's WireGuard management
+endpoint. `--dry-run --json` includes a real Cloudflare provider snapshot,
+including the explicit origins, and changes nothing. An already-bound hostname
+can be reconciled the same way. Domain admission and execution are serialized;
+a delayed removal revalidates that it is still the newest domain intent and that
+the binding was neither promoted nor re-created under the target lock. Removal
+uses the persisted managed-DNS ledger; an unmanaged explicit cleanup uses
+`--dns cloudflare --dns-zone ZONE`. Only records whose comment is this binding's
+exact ownership identity are deleted. Ownership is re-read immediately before
+each mutation; Cloudflare has no conditional-write API, so the final
+external-writer race remains visible in the plan/reconciliation contract rather
+than being claimed closed. A foreign record at the same hostname makes the
+operation fail closed; legacy zone-wide `eregion:managed` records are never
+adopted. Explicit provider success is not public readiness: resolver, route,
+certificate and response stay separate observations. The durable
+`eregion_platform_domain_dns` ledger records provider/zone, explicit origins,
+proxy mode, generation, exact marker and cleanup state in the same transaction
+as the operation and River job. Removal and app/environment deletion mark it
+cleanup-pending, verify exact provider cleanup, then delete ledger and domain
+rows; a provider failure or ownership conflict refuses deletion and keeps the
+ledger, records and credentials retryable. A primary binding is cleaned by
+environment/application deletion, or by promoting another primary before an
+explicit removal.
+
 ### 6.6 Config and secrets
 
 `config set` changes plain variables, `secret set` stores a value (write-only,
@@ -294,16 +325,20 @@ over the operator channel (D25). `app delete`, `env delete`, `env protect` and
 protected or last environment and is otherwise available to agents with
 `--confirm` alone. `status` shows the persistent protection state.
 
-## 7. v1 alpha
+## 7. v1 alpha and beta
 
-**v1.0.0 (every alpha and the final) is one main node running applications
-end to end:** sections 6.1–6.8 on the main node, the command tree in section 5
-minus its "after v1" line, node_exporter on the server, and the release model
-in D14–D15. After v1.0.0 final: additional nodes, the telemetry node,
-Cloudflare DNS automation, promotion, access modes,
-`server init --local` and HA.
+**v1.0.0 (every alpha, beta and the final) is one main node running
+applications end to end:** sections 6.1–6.8 on the main node, the command tree
+in section 5 minus its "after v1" line, node_exporter on the server, and the
+release model in D14–D15. Beta adds node-local telemetry (D5) and Cloudflare
+DNS automation (D26) to the alpha.3 flows. It does not add a telemetry server,
+telemetry database or metric/log history, a backup product, or additional
+nodes. Cloudflare DNS automation is implemented in source for beta as an
+explicit, domain-scoped flow, but it is not host-qualified and no beta
+qualification is claimed here. After v1.0.0 final:
+additional nodes, promotion, access modes, `server init --local` and HA.
 
-**v1 is an alpha: nothing is frozen.** The `eregion/v1` JSON, the handoff and
+**v1 is pre-release: nothing is frozen.** The `eregion/v1` JSON, the handoff and
 bundle formats, context files, host step IDs and the database schema may change
 between alphas, and a later alpha may require a fresh `server init`. A v1
 compatibility contract in vaire's form (formats, JSON, commands, the
@@ -381,11 +416,24 @@ release/service/worker/web commands through the launcher's launch-layer `bin`
 PATH, with public health and app responses. CLI and `main` were upgraded; node
 apply `op_162c42a9c556258cd7123fd40b06965b`; schema stayed **24/24**, `doctor`
 20/0/0 and `apply --dry-run` 0 of 20. The test environments, domain bindings and
-images were removed and the fixture app was left intact. Alpha.3 is **not
-tagged**; snapshot/installer publication and tag checks remain, and this is a
-targeted host qualification rather than a repeated full manual acceptance. The
-schema-1 release safety guards (snapshot-only alpha/beta, rc-only pointer,
-final-only stable/line pointer, strict final stable tag) remain source-tested;
+images were removed and the fixture app was left intact. Alpha.3 is tagged as
+annotated `v1.0.0-alpha.3` at
+`b9fa7b962fa1520dde8a9acec4c0823389b1633c` (tag object
+`9517303a3f5904151018f985a26c8d05fcb5ddc6`) after PR #2 squash-merged the
+tested tree onto `1.x`; its tree
+`46c7190129a5b65832aa2cdea6e5fcc451e3d1ca` is identical to `fa996d8` and
+differs from candidate `9e71713` only in the two docs files. Publish stable
+`42390263289` and CI `42390263242` passed. The signed immutable snapshot at
+`releases/1.0.0-alpha.3/` reports version `1.0.0-alpha.3`, channel `stable`,
+and all four binaries match the manifest; the installer is version-pinned and
+syntax-checked. The tag itself was not installed on the authorized node or
+manually host-tested there; this is a targeted host qualification of the same
+source tree on
+`edge-9e71713eeff9`, not a repeated full manual acceptance. Root, `1.x` and RC
+pointers remain absent; the edge pointer is `edge-fa996d809378` from the master
+merge. The schema-1 release safety guards (snapshot-only alpha/beta, rc-only
+pointer, final-only stable/line pointer, strict final stable tag) remain
+source-tested;
 the existing schema-1 alpha.2 node/client path is compatible, with no
 manifest-schema migration or compatibility shim.
 The 2026-11-06 alpha.2 protection redesign is host-qualified on `main` at
@@ -702,6 +750,22 @@ the edge pointer did not change during tag publication. The CLI and `main` run
 apply was a no-op; four serving URLs returned 200. This release publication is
 separate from the qualification record; alpha.1 qualification rests on the
 operator confirmation above and MANUAL-TESTING.
+
+Beta scope status (2026-11-07): node-local telemetry is implemented in source.
+Every node runs node_exporter from setup on, bound to its WireGuard address;
+`eregion metrics show` reads one request-scoped snapshot through
+`eregion node rpc` over SSH in WireGuard, and the workspace Fleet detail shows
+the same current CPU sample plus memory, filesystem, load and uptime facts.
+There is no telemetry server, Prometheus/Loki/Grafana, external backend, global
+PromQL, metric/log store or retained history; missing observations and exporter
+errors are explicit, and CPU utilization is a checked counter delta that is
+unavailable after a reset. The `main` node's `server status` and `doctor`
+service row now expect `node-exporter.service`. Isolated parser, collector,
+node-RPC, CLI and workspace tests pass; **no host qualification is recorded**
+and this is not a beta release. Cloudflare DNS automation is implemented in
+source as an explicit domain-scoped flow and is **not host-qualified**. Backups
+remain deferred, and external PostgreSQL is control-plane state, not a backup
+of managed-resource volumes.
 
 Historical source state 2026-11-04: rows 1–15 and 17 were implemented in the
 integrated source on `master`. Row 17 (retention) had isolated tests and was an
@@ -1025,7 +1089,7 @@ MANUAL-TESTING for the evidence.
 | Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Closed by operator confirmation. |
 | CI and push to deploy | D7 tokens behind `protect init`; per-environment deploy endpoint; per-environment GitHub webhook via `env update --auto-deploy` with durable admission and atomic deploy linking; `secrets export`/`secret export` behind the factor. | Host checks pass for token reload, secret-export metadata, disposable deletes and webhook-secret recovery; migration 021 is applied on main; a real push deployed `59017d6` as `rel_d231a28c…` with delivery 202 and all four URLs 200. On the same build redelivery returned the original operation without another release, an invalid signature returned 401, and an existing other-branch fixture push was ignored. Old-secret rejection after rotation was not recorded; alpha.1 is operator-confirmed, and no result is backfilled. |
 | Surface | `commands --json` lists only section 5; node-only commands hidden under `eregion node`. | — |
-| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06`, `ef4a6f879f45`, `ba175353f00a`, `6d1ae98b9ac1`, `81998646916d`, `7e74edbed8bc` and `9e71713eeff9`; CLI and `main` now run `edge-9e71713eeff9` at schema 24/24, and the tagged `1.0.0-alpha.2` snapshot remains published (it was installed earlier and then superseded by this edge candidate). The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. The authorized alpha.2 tag was replaced at `85f2a4f` after PR #1; Publish stable `42363078147` and CI `42363078061` passed, and the signed `releases/1.0.0-alpha.2/` manifest and four binaries match the tag identity and manifest hashes. Tag replacement and its unsigned annotation are explicit release caveats; `install.sh` is version-pinned but outside the cosign-signed set. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
+| Release | Cosign keyless, `install.sh`, edge on push to `master`, opt-in RC and finals-only stable pointers, exact alpha/beta snapshots; origin `eregion.mbvlabs.com`. | Edge publishes verified for `527592419f06`, `ef4a6f879f45`, `ba175353f00a`, `6d1ae98b9ac1`, `81998646916d`, `7e74edbed8bc` and `9e71713eeff9`; CLI and `main` now run `edge-9e71713eeff9` at schema 24/24, and the tagged `1.0.0-alpha.2` snapshot remains published (it was installed earlier and then superseded by this edge candidate). The authorized alpha.1 tag was later moved to `37d4f19` and its snapshot published; see the release record above. The authorized alpha.2 tag was replaced at `85f2a4f` after PR #1; Publish stable `42363078147` and CI `42363078061` passed, and the signed `releases/1.0.0-alpha.2/` manifest and four binaries match the tag identity and manifest hashes. Tag replacement and its unsigned annotation are explicit release caveats; `install.sh` is version-pinned but outside the cosign-signed set. Alpha.3 was published by Publish stable `42390263289` (CI `42390263242`) after PR #2; `releases/1.0.0-alpha.3/` verifies against the tag identity and all four binaries match, while root/`1.x`/RC remain absent and edge is `edge-fa996d809378` from the master merge; the tag was not installed on the host. Channel manifest and signature are two objects with a pre-existing publication race; partial tagged uploads can block retry. Both remain follow-up risks, not blockers to the channel model. |
 
 ## 9. Work list
 
@@ -1042,7 +1106,11 @@ incrementally on the authorized existing node; `v1.0.0-alpha.2` is published
 at `85f2a4f` and installed on CLI and `main`, with the recorded evidence
 boundaries and residual TOTP/DNS items in MANUAL-TESTING. The `v1.0.0-alpha.2`
 tag publication succeeded at `85f2a4f` after PR #1; its signed immutable
-snapshot is published.
+snapshot is published. Rows 21–22 are beta work: node-local telemetry is
+implemented and offline-tested but not host-qualified; Cloudflare DNS
+automation is implemented in source as an explicit domain-scoped flow and is
+not host-qualified. Neither row adds a telemetry server, telemetry
+database/history, backup product or additional nodes.
 
 | # | Outcome | Done when |
 | --- | --- | --- |
@@ -1066,6 +1134,8 @@ snapshot is published.
 | 18 | **Optional app definitions and managed resources (D19, D32), alpha.2.** Implemented and published; host-qualified across `edge-6d1ae98b9ac1`, `edge-81998646916d`, `edge-7e74edbed8bc` and the tagged `1.0.0-alpha.2` snapshot (identical tree). `eregion.toml` input for `app create`, `env create|update` (`--from`) and `app export`, with shared defaults and selected environment overrides. Generic Docker resources have environment ownership, private networking, secret references, optional persistent volumes and durable lifecycle; explicit apply provisions them, while ordinary deploys never read the file. Existing file-free workflows remain supported. On 2026-11-06 `edge-ef4a6f879f45` passed definition create/override/export/reimport, secret-name-only storage and strict validation on `main`. Its first host run found the Docker 29.1.3 image-inspect and empty-slice removal defects; both fixes were retested on `edge-ba175353f00a`: Docker resource provisioning, file-based empty resource/secret removal, attach/detach, default destroy/re-apply data retention and delete-data cleanup passed for own Redis and PostgreSQL fixtures. An unhealthy resource was refused at the gate; after the resource was healthy, a real deployment served `a2defs1106` over HTTPS at the authorized `eregion-alpha-two.mbvlabs.com`, and its root response read the managed Redis (`alpha2:key=alpha2-serving`). A failed candidate left the previous release serving. The user then deleted the fixture with the D7 factor (`op_90e6c3530ef81a575bba1542a70cda0b`); read-only checks found no fixture app/environment/domain/resource rows, containers, networks or volumes. The pre-existing DNS record remains; identified fixture images were later removed too. A later disposable pass covered file-vs-flags/staging overrides, managed PostgreSQL app consumption and restart/redeploy persistence, stale-plan refusal and a simulated missing-admin fallback. The user then deleted the recreated fixture (`op_c113f640932b31df52c4a92117f3d105`); the default-retained PostgreSQL volume persisted untracked with its labels and no container references, then the authorized volume was removed. A later guided file-free fixture and failed-health provisioning retry passed; after the policy stop its unattached resource, network and images were removed, but that app/domain/secret row remained pending TOTP deletion. On `edge-6d1ae98b9ac1`, a failed-health provisioning retry reused its volume and reached ready; an actual worker-SIGKILL interruption was recovered at attempt 2 and a corrected retry reused the same volume and reached ready; destroying a resource with a dependent revision was refused; removing its declaration retained the container, volume and Redis data; `--delete-data` removed only the owned volume while an unrelated pre-created foreign volume remained untouched; a separately named deletion target with foreign ownership was explicitly refused; an external dependency without a managed resource served; a degraded resource blocked its dependent deploy while the serving release stayed up; a rogue `eregion.toml` in the working directory was ignored; and `env update --from` with `--confirm-domain` removed the designated alias, leaving a `.invalid` primary. A cancelled interruption attempt left `resource-audit/interrupt` stuck provisioning; after the `edge-81998646916d` cancellation fix, normal reconciliation moved it to degraded, and ordinary destroy plus noninteractive environment deletion succeeded. A no-kill cancellation retest then proved step-boundary and final-commit bugs: an accepted cancel during a successful health step still ended succeeded with a ready resource, and a cancel could commit between the last check and transactional finalization. The fix was published in `edge-7e74edbed8bc`: cancellation is checked at every resource step boundary and a scoped row-locked finalization rechecks `cancelling` before the resource callback. The apply/destroy finalization regressions pass, and a host successful-step cancellation test ended `cancelled` with the resource `degraded`; destroy and environment deletion succeeded. No known cancellation-state defect remains on this build. Details are in MANUAL-TESTING. | File and equivalent flags save equivalent supported desired state; export round-trips without secret values; unknown keys and secret-value fields are refused. Dry-run previews changes; destructive removals require target confirmation; detaching a resource retains its data and destruction is separate. A managed resource can be consumed by the app, and an external dependency still works without one. |
 | 19 | **Optional `gh`-assisted webhook setup (D28), alpha.2.** Implemented and host-qualified for the main paths; extended on `edge-6d1ae98b9ac1`. Check authenticated `gh` and repository hook permission; create or update the matching hook, retaining manual setup without `gh` or permission. No GitHub App; no plaintext secrets in ordinary output, events or arguments. | On 2026-11-06 against the authorized private `mbvlabs/eregion-hello`, `--auto-deploy --github-webhook` created hook `708277604` for `a2defs1106/production`, a repeat reported `unchanged`, and rotation updated the same hook. A real push (`f6bbfa7`) produced delivery HTTP 202 and webhook operation `op_1380428…`, which built `rel_29c45e28…` and served `/marker` 200. The manual one-time secret was handled in 0600 temporary files, sent on stdin, never printed and shredded; push `c4507c1` produced delivery 202 and `op_b4dc5f8b…`, serving `rel_df70f2b…`. The missing-`gh` fallback reported `skipped` with manual setup available. A temporary `gh` shim returning `permissions.admin=false` made the fallback report the missing-admin case and keep manual setup available without changing repository permissions or credentials; no real non-admin account was tested. Hook and test branch were deleted. The recreated fixture was later deleted with the D7 factor (`op_c113f640932b31df52c4a92117f3d105`); read-only checks found no fixture rows, container, network or image, and the default-retained PostgreSQL volume was observed untracked with its ownership labels then removed. The three identified image artifacts were removed after reference checks; the pre-existing DNS record remains because no safe Cloudflare access was available. On `edge-6d1ae98b9ac1`, a simulated failing hook call enabled auto-deploy without creating a hook; after disabling it, the real `--rotate-webhook-secret --github-webhook` created hook `708330096` (secret revision 3). Push `8fa8c11` produced delivery HTTP 202 and `op_73c9e2addecfd556686d431b1fd4c916`, serving `rel_c2df6de6c35011f6be98b270c859fc7e` with `/` returning `eregion sample: hello-v1 src3`; hook and test branch were then deleted. |
 | 20 | **Environment protection and app-create defaults (D33), alpha.2 redesign.** Published in `edge-6d1ae98b9ac1` (commit `6d1ae98`) and host-qualified on `main` for the main flows. `app create` records production and staging from one recipe, both protected by default and without TOTP enrollment. Migration 024 adds persistent protection and backfills existing environments protected; on 2026-11-06 node apply `op_fca44c39b625e2216d05d7581de99c18` applied it (schema 24/24), and all five pre-existing environments read protected. On `a2defs1106`, guided create `op_0e2c1e66043489dc1941825c705a8c1a` made production and staging protected; shared-recipe `pr-42` `op_1724f76965e70df26a026cfde545ceb8` was unprotected and deleted with `--confirm --json` `op_9eb5aa06b06766f163adfbe61b2c74bc`; protected `env delete`, `env unprotect` and `app delete` refused `input_required`, while direct node app/protected-env delete refused `precondition_failed`/`code_required`; `env protect` raised `prot-audit` agent-safely as `op_e248d36683e6317674fc36b9c5711439`, after which delete and unprotect refused. Fresh arbitrary-name `fresh-audit` (`op_4fa609d1c8502d17ab4e11baa2b4de02`) and shared-recipe `recipe-audit` (`op_a1505d66121293de4f0c8b9931de94c4`) were unprotected by default; a same-key `env create` replay returned the original operation, and both were deleted unattended (`op_d1144d2a44c97b3b8b284f827b6806ba`, `op_17179495fec1805fad3341a51366b0a8`). A separate disposable PostgreSQL test on `6d1ae98` passed atomic app-create rollback/replay and denied a last unprotected environment for missing, wrong and invalid verifier input; its valid injected verifier queued (not completed) a delete with workers stopped and was not a real TOTP; isolated protect-store/CLI tests and a direct-service local-verifier test cover generated local secrets with real TOTP codes. The multi-environment app-create same-key replay and the last-environment positive path were not re-run on the host; the operator must complete the residual app deletion with TOTP. | Create an app and verify two protected environments commit in one transaction and replay idempotently; protected/last deletion refuses without a code over direct node/HTTP paths; unprotected non-last deletion succeeds with `--json`/no-TTY and exact confirmation; unprotect without a terminal refuses; recipe create for `pr-42` needs no file entry; migration 024 backfills safely. |
+| 21 | **Node-local telemetry (D5), beta.** Implemented in source. Node-mode `metrics.show` reads the WireGuard-bound node_exporter twice with a bounded gap, parses only needed families and returns one current snapshot over the operator RPC: node/exporter identity, fetched/observed timestamps, freshness, CPU utilization from a checked counter delta, memory, real filesystems, load, uptime and explicit issues. `metrics show` has plain and JSON forms and never prompts; the workspace Fleet detail shows the same current CPU sample plus memory/filesystem/load/uptime facts, and Envs has no invented request graph. No telemetry server, Prometheus/Loki, external backend, global PromQL, metric store or history exists. `server status` and `doctor` include `node-exporter.service`. | Offline parser/collector/node-RPC/CLI/workspace tests pass, including text fixtures, counter reset and missing metrics; CPU is never a fabricated zero. On an authorized host, `metrics show --json` reports schema `eregion/node-metrics/v1`, the WireGuard scrape details, fresh timestamps and real values, and works with the control database unavailable; an unreachable exporter and missing families are explicit errors/unavailable states. **Not host-qualified; this row is not a beta release.** |
+| 22 | **Cloudflare DNS automation (D26), beta.** Implemented in source, not host-qualified. The existing `domain add`/`remove` flow accepts explicit `--dns cloudflare --dns-zone ZONE` (and `--dns-origin ADDRESS --dns-proxy dns-only\|proxied` on add). Manual DNS is the default. Origins are explicit validated public addresses; the context's WireGuard management endpoint is never used as the public origin. A dry run reads a real provider snapshot without mutation; apply and reconcile use only the configured zone token file and only the exact hostname. Admission and worker execution are serialized per target; a delayed removal revalidates the newest domain intent and binding identity under the target lock, so a later readd or promotion is not deleted by the stale operation. Ownership is re-read immediately before each provider mutation. Cloudflare has no CAS, so a remaining external-writer race is explicitly acknowledged and surfaced by the next plan/reconciliation. Foreign A/AAAA records and legacy `eregion:managed` records fail closed; any CNAME at the hostname is a conflict even when its comment exactly matches the marker, because managed DNS is A/AAAA only. None are adopted, updated or deleted. Provider changes are scoped to the selected binding and preserve unrelated records. Migration 025 adds an immutable domain ID and a durable ledger with provider/zone, exact ownership marker, generation, explicit origins/proxy, state and cleanup status, written atomically with operation/River before provider effects and retained until exact cleanup is verified. Removal and app/environment deletion verify owned DNS cleanup before removing serving workloads or deleting rows; provider failure or ownership conflict refuses deletion and preserves workloads, records and credentials for retry. Every managed binding is preflighted before the first provider mutation; after that point Cloudflare effects are not atomic, so a later failure or cancellation reports how many bindings were processed and never claims all records were preserved. The sequence is not fully atomic after provider success and is not an availability guarantee; a later node-step failure or cancellation retains the ledger while DNS may be gone, a later route-write failure leaves rows to retry, and events state which effects completed. Primary cleanup is usable through environment/application deletion. No ad-hoc store or compatibility shim was added. Provider state stays separate from resolver, route, certificate and public readiness. No `node add`, multi-node placement or backup product is part of this row. | An authorized hostname/zone accepts a new binding and updates the exact record through Cloudflare; a failed provider call leaves the desired binding and reports the failure without claiming DNS; removal and drift are observed. **Not run on a host; no Cloudflare zone, token or DNS was mutated.** |
 
 ## Reference index
 

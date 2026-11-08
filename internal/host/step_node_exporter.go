@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"fmt"
+	"net"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -18,6 +19,17 @@ const (
 	nodeExporterVersion = "1.11.1"
 	nodeExporterPort    = "9100"
 )
+
+// NodeExporterListenAddress is the only address node_exporter binds.
+func NodeExporterListenAddress() string {
+	return net.JoinHostPort(access.NodeAddress, nodeExporterPort)
+}
+
+// NodeExporterMetricsURL is the node-local read endpoint. It is reachable only
+// on wg0; no public listener or credential exists.
+func NodeExporterMetricsURL() string {
+	return "http://" + NodeExporterListenAddress() + "/metrics"
+}
 
 var nodeExporterSHA256 = map[string]string{
 	"amd64": "9f5ea48e5bc7b656f8a91a32e7d7deb89f70f73dabd0d974418aca15f37d6810",

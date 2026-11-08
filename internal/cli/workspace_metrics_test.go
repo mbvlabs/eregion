@@ -2,95 +2,128 @@ package cli
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/workspaceui"
-	"github.com/spf13/cobra"
 )
 
-func clearTelemetryEnvironment(t *testing.T) {
-	t.Helper()
-	for _, name := range telemetryEnvironment {
-		t.Setenv(name, "")
-	}
+type fakeNodeMetricsBackend struct {
+	Backend
+	snapshot telemetry.NodeSnapshot
+	err      error
+	calls    int
 }
 
-type fakeMetricsSource struct {
-	logs    telemetry.LogResult
-	metrics telemetry.MetricResult
-	query   telemetry.MetricQuery
-	err     error
+func (f *fakeNodeMetricsBackend) NodeMetrics(context.Context) (telemetry.NodeSnapshot, error) {
+	f.calls++
+	return f.snapshot, f.err
 }
 
-func (f *fakeMetricsSource) Logs(context.Context, telemetry.LogQuery) (telemetry.LogResult, error) {
-	return f.logs, f.err
-}
-
-func (f *fakeMetricsSource) Metrics(_ context.Context, query telemetry.MetricQuery) (telemetry.MetricResult, error) {
-	f.query = query
-	return f.metrics, f.err
-}
-
-func TestWorkspaceMetricsAdapterMapsSeriesAndHonestStates(t *testing.T) {
-	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
-	source := &fakeMetricsSource{metrics: telemetry.MetricResult{
-		State: telemetry.StateOK, Source: "app-1", Unit: "percent",
-		Window: telemetry.Window{Start: now.Add(-5 * time.Minute), End: now},
-		Series: []telemetry.MetricSeries{{Samples: []telemetry.MetricSample{
-			{Timestamp: now.Add(-2 * time.Minute), Value: 12},
-			{Timestamp: now.Add(-time.Minute), Value: 18},
-		}}},
+func TestWorkspaceNodeMetricsMapsOneCurrentSnapshot(t *testing.T) {
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	cpu := 12.5
+	uptime := 3600.0
+	age := 10.0
+	backend := &fakeNodeMetricsBackend{snapshot: telemetry.NodeSnapshot{
+		Schema: telemetry.NodeMetricsSchema, Node: "main", Hostname: "main.example",
+		FetchedAt: now, ObservedAt: &now, Freshness: telemetry.Freshness{State: telemetry.FreshnessFresh, AgeSeconds: &age, ThresholdSeconds: 30},
+		Scrape:        telemetry.ScrapeInfo{Endpoint: "http://10.78.0.1:9100/metrics", Listen: "10.78.0.1:9100", Access: "wireguard"},
+		CPU:           &telemetry.CPUStats{UtilizationPercent: &cpu, LogicalCPUs: 4, WindowSeconds: 1},
+		Memory:        &telemetry.MemoryStats{TotalBytes: 8 << 30, AvailableBytes: 6 << 30, UsedBytes: 2 << 30, UsedPercent: 25},
+		Load:          &telemetry.LoadStats{Load1: 0.5, Load5: 0.4, Load15: 0.3},
+		UptimeSeconds: &uptime,
+		Filesystems: []telemetry.FilesystemStats{{
+			Device: "/dev/sda1", Filesystem: "ext4", Mountpoint: "/",
+			TotalBytes: 100 << 30, AvailableBytes: 40 << 30, UsedBytes: 60 << 30, UsedPercent: 60,
+		}},
 	}}
-	adapter := workspaceMetrics{source: source, now: func() time.Time { return now }}
-	series, err := adapter.Query(context.Background(), workspaceui.MetricsQuery{Node: "app-1", Metric: "node.cpu.utilization", Window: 5 * time.Minute})
+	source := (&app{}).workspaceMetricsSource(backend)
+	if source == nil {
+		t.Fatal("node metrics backend produced no workspace source")
+	}
+	series, err := source.Query(context.Background(), workspaceui.MetricsQuery{Node: "main", Metric: "node.cpu.utilization"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(series.Samples) != 2 || series.Samples[1].Value != 18 || series.Unit != "percent" || series.Source != "app-1" {
-		t.Fatalf("series = %+v", series)
+	if backend.calls != 1 || len(series.Samples) != 1 || series.Samples[0].Value != 12.5 {
+		t.Fatalf("series = %+v calls=%d", series, backend.calls)
 	}
-	if series.Stale || !series.ObservedAt.Equal(now.Add(-time.Minute)) {
-		t.Fatalf("freshness = %+v", series)
+	if !series.ObservedAt.Equal(now) || series.Stale || series.Window != 0 {
+		t.Fatalf("freshness/window = %+v", series)
 	}
-	if source.query.Expression == "" || source.query.Unit != "percent" || source.query.Source != "app-1" {
-		t.Fatalf("telemetry query = %+v", source.query)
+	if !series.AgeKnown || series.AgeAtReceipt != 10*time.Second || series.StaleAfter != 30*time.Second || series.ReceivedAt.IsZero() {
+		t.Fatalf("node freshness age/threshold was not carried: %+v", series)
 	}
-	if !source.query.Window.End.Equal(now) || !source.query.Window.Start.Equal(now.Add(-5*time.Minute)) {
-		t.Fatalf("window = %+v", source.query.Window)
+	if !strings.Contains(series.Source, "node_exporter on main") || !strings.Contains(series.Note, "No history") {
+		t.Fatalf("source/note = %q / %q", series.Source, series.Note)
 	}
-
-	source.metrics = telemetry.MetricResult{State: telemetry.StateAbsent, Source: "app-1", Unit: "percent"}
-	series, err = adapter.Query(context.Background(), workspaceui.MetricsQuery{Node: "app-1", Metric: "node.cpu.utilization", Window: 5 * time.Minute})
-	if err != nil || len(series.Samples) != 0 {
-		t.Fatalf("absent series = %+v, %v", series, err)
+	labels := map[string]string{}
+	for _, detail := range series.Details {
+		labels[detail.Label] = detail.Value
 	}
-
-	source.metrics = telemetry.MetricResult{
-		State: telemetry.StateStale, Source: "app-1", Unit: "percent",
-		Series: []telemetry.MetricSeries{{Samples: []telemetry.MetricSample{{Timestamp: now.Add(-time.Hour), Value: 1}}}},
+	for _, want := range []string{"CPU", "Memory", "Load", "Uptime", "Filesystem /", "Source"} {
+		if labels[want] == "" {
+			t.Fatalf("missing detail %q in %+v", want, series.Details)
+		}
 	}
-	series, err = adapter.Query(context.Background(), workspaceui.MetricsQuery{Node: "app-1", Metric: "node.cpu.utilization", Window: 5 * time.Minute})
-	if err != nil || !series.Stale {
-		t.Fatalf("stale series = %+v, %v", series, err)
+	if strings.Contains(series.Details[len(series.Details)-1].Value, "password") || strings.Contains(series.Details[len(series.Details)-1].Value, "token") {
+		t.Fatalf("scrape details leaked a credential: %q", series.Details[len(series.Details)-1].Value)
 	}
 }
 
-func TestWorkspaceMetricsSourceIsNilWithoutConfiguration(t *testing.T) {
-	clearTelemetryEnvironment(t)
-	app := newApp()
-	cmd := &cobra.Command{}
-	addTelemetrySourceFlags(cmd)
-	source, err := app.workspaceMetricsSource(cmd)
-	if err != nil || source != nil {
-		t.Fatalf("unconfigured workspace metrics = %+v, %v", source, err)
+func TestWorkspaceNodeMetricsReportsMissingCPUWithoutInventingSamples(t *testing.T) {
+	now := time.Now().UTC()
+	backend := &fakeNodeMetricsBackend{snapshot: telemetry.NodeSnapshot{
+		Schema: telemetry.NodeMetricsSchema, Node: "main", FetchedAt: now.Add(2 * time.Second), ObservedAt: nil,
+		Freshness: telemetry.Freshness{State: telemetry.FreshnessUnknown},
+		Scrape:    telemetry.ScrapeInfo{Endpoint: "http://10.78.0.1:9100/metrics", Access: "wireguard"},
+		Issues:    []telemetry.Issue{{Field: "cpu", Reason: "node_cpu_seconds_total is missing"}},
+	}}
+	source := (&app{}).workspaceMetricsSource(backend)
+	series, err := source.Query(context.Background(), workspaceui.MetricsQuery{Node: "main", Metric: "node.cpu.utilization"})
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(series.Samples) != 0 {
+		t.Fatalf("missing CPU produced samples: %+v", series.Samples)
+	}
+	if !series.ObservedAt.IsZero() {
+		t.Fatalf("unknown exporter time was replaced with collection time: %v", series.ObservedAt)
+	}
+	if series.Freshness != telemetry.FreshnessUnknown || series.Stale {
+		t.Fatalf("explicit freshness was lost: %+v", series)
+	}
+	if !strings.Contains(series.Note, "node_cpu_seconds_total is missing") || !strings.Contains(series.Note, "Exporter time is unknown") || !strings.Contains(series.Note, "No history") {
+		t.Fatalf("note = %q", series.Note)
+	}
+}
 
-	t.Setenv("EREGION_TELEMETRY_METRICS_URL", "http://127.0.0.1:8427")
-	t.Setenv("EREGION_TELEMETRY_LOGS_URL", "http://127.0.0.1:9427")
-	source, err = app.workspaceMetricsSource(cmd)
-	if err != nil || source == nil {
-		t.Fatalf("configured workspace metrics = %+v, %v", source, err)
+func TestWorkspaceNodeMetricsRejectsAnotherNodesSample(t *testing.T) {
+	now := time.Now().UTC()
+	cpu := 12.5
+	backend := &fakeNodeMetricsBackend{snapshot: telemetry.NodeSnapshot{
+		Schema: telemetry.NodeMetricsSchema, Node: "main", FetchedAt: now, ObservedAt: &now,
+		Freshness: telemetry.Freshness{State: telemetry.FreshnessFresh},
+		Scrape:    telemetry.ScrapeInfo{Endpoint: "http://10.78.0.1:9100/metrics", Access: "wireguard"},
+		CPU:       &telemetry.CPUStats{UtilizationPercent: &cpu, LogicalCPUs: 4, WindowSeconds: 1},
+	}}
+	source := (&app{}).workspaceMetricsSource(backend)
+	series, err := source.Query(context.Background(), workspaceui.MetricsQuery{Node: "builder-2", Metric: "node.cpu.utilization"})
+	if err == nil {
+		t.Fatalf("another node's sample was relabeled: %+v", series)
+	}
+	if len(series.Samples) != 0 || backend.calls != 1 {
+		t.Fatalf("mismatch returned a fake series: %+v calls=%d", series, backend.calls)
+	}
+}
+
+type plainTestBackend struct{ Backend }
+
+func TestWorkspaceMetricsSourceIsAbsentForAPlainBackend(t *testing.T) {
+	if source := (&app{}).workspaceMetricsSource(&plainTestBackend{}); source != nil {
+		t.Fatalf("plain backend produced a metrics source: %+v", source)
 	}
 }

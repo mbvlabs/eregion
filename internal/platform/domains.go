@@ -51,13 +51,27 @@ const (
 	PublicFailed  PublicState = "failed"
 )
 
+type ManagedDNSBinding struct {
+	Provider          string   `json:"provider"`
+	ZoneID            string   `json:"zone_id"`
+	ZoneName          string   `json:"zone_name"`
+	Origins           []string `json:"origins"`
+	Proxied           bool     `json:"proxied"`
+	State             string   `json:"state"`
+	Generation        int64    `json:"generation"`
+	AppliedGeneration int64    `json:"applied_generation"`
+}
+
 // DomainBinding is the list/status view of one desired hostname plus its
 // applied route revision and the independent observations.
 type DomainBinding struct {
-	Domain      string `json:"domain"`
-	App         string `json:"app"`
-	Environment string `json:"environment"`
-	Primary     bool   `json:"primary"`
+	ID          DomainID `json:"id"`
+	Domain      string   `json:"domain"`
+	App         string   `json:"app"`
+	Environment string   `json:"environment"`
+	Primary     bool     `json:"primary"`
+	// ManagedDNS is the durable provider intent when this binding is managed.
+	ManagedDNS *ManagedDNSBinding `json:"managed_dns,omitempty"`
 	// CheckPath is this binding's HTTP observation path; empty uses the
 	// environment's web health path.
 	CheckPath string `json:"check_path,omitempty"`

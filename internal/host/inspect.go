@@ -30,7 +30,7 @@ func ServiceUnits(role Role, hostname string) []string {
 	}
 	var units []string
 	if config.ControlPlane {
-		units = append(units, "eregion-api.service", "eregion-worker.service", "wg-quick@wg0.service")
+		units = append(units, "eregion-api.service", "eregion-worker.service", "wg-quick@wg0.service", "node-exporter.service")
 		if hostname != "" {
 			units = append(units, "caddy.service")
 		}

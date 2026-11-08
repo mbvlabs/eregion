@@ -212,6 +212,95 @@ func TestSetupSecretWritesRespectEnvironmentSpecificNames(t *testing.T) {
 	}
 }
 
+func TestSetupProtectionFlag(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		want    string
+		wantErr bool
+	}{
+		{name: "default", want: "default"},
+		{name: "protected", args: []string{"--protected"}, want: "protected"},
+		{name: "unprotected", args: []string{"--unprotected"}, want: "unprotected"},
+		{name: "both", args: []string{"--protected", "--unprotected"}, wantErr: true},
+		{name: "both reversed", args: []string{"--unprotected", "--protected"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := &cobra.Command{Use: "create"}
+			addProtectionFlags(cmd)
+			if err := cmd.ParseFlags(tc.args); err != nil {
+				t.Fatal(err)
+			}
+			got, err := setupProtectionFlag(cmd)
+			if tc.wantErr {
+				if err == nil || contract.Classify(err).Code != contract.ValidationFailed {
+					t.Fatalf("err = %v, want validation_failed", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch tc.want {
+			case "default":
+				if got != nil {
+					t.Fatalf("default protection = %v, want nil", *got)
+				}
+			case "protected":
+				if got == nil || !*got {
+					t.Fatalf("protected = %v, want true", got)
+				}
+			case "unprotected":
+				if got == nil || *got {
+					t.Fatalf("unprotected = %v, want false", got)
+				}
+			}
+		})
+	}
+}
+
+func TestCreateRejectsConflictingProtectionFlags(t *testing.T) {
+	definition := writeDefinitionFile(t, testDefinition)
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "app create", args: []string{
+			"app", "create", "--name", "api", "--image", "ghcr.io/acme/api:1",
+			"--protected", "--unprotected", "--json",
+		}},
+		{name: "env create", args: []string{
+			"env", "create", "--app", "api", "--name", "production", "--image", "ghcr.io/acme/api:1",
+			"--unprotected", "--protected", "--json",
+		}},
+		{name: "app create from file", args: []string{
+			"app", "create", "--from", definition, "--name", "api", "--protected", "--unprotected", "--json",
+		}},
+		{name: "env create from file", args: []string{
+			"env", "create", "--from", definition, "--app", "api", "--name", "pr-42", "--unprotected", "--protected", "--json",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{}}
+			a := newApp()
+			a.backend = backend
+			var stdout, stderr bytes.Buffer
+			exit := runApp(context.Background(), tc.args, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
+			if exit != 2 || stderr.Len() != 0 {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", exit, stdout.String(), stderr.String())
+			}
+			envelope := decodeOne(t, stdout.String())
+			if envelope.OK || envelope.Error == nil || envelope.Error.Code != contract.ValidationFailed ||
+				!strings.Contains(envelope.Error.Message, "choose one protection state") {
+				t.Fatalf("envelope = %+v", envelope)
+			}
+			if len(backend.submissions) != 0 {
+				t.Fatalf("conflicting flags submitted work: %+v", backend.submissions)
+			}
+		})
+	}
+}
+
 func TestEnvProtectionRequiresFactorOnlyToLowerProtection(t *testing.T) {
 	environments := func(protected bool) json.RawMessage {
 		raw, _ := json.Marshal(map[string]any{"items": []platform.Environment{{

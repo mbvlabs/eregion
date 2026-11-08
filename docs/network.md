@@ -100,12 +100,16 @@ containers on dynamic loopback ports.
 
 ## Cloudflare and private access (off the surface)
 
-Cloudflare DNS automation comes after v1 (MASTER D26); the alpha uses manual DNS
-with resolver checks. The `dns plan/reconcile/list` commands and the backup
-inventory are not registered; the singular `resource` lifecycle is registered.
-`internal/integrations` keeps the DNS action and its explicit
-`zoneID=zoneName` configuration for the after-v1 phase; it never installs a
-Caddy route or binds an environment domain.
+Cloudflare DNS automation is beta work (MASTER D26). It is implemented in
+source only as explicit `domain add/remove` flags (`--dns cloudflare
+--dns-zone ZONE`, plus `--dns-origin ADDRESS` and `--dns-proxy` on add);
+manual DNS remains the default. Origins are explicit public addresses, not the
+WireGuard management endpoint. A managed binding's removal uses its persisted
+ledger; unmanaged explicit cleanup uses the flags. No `dns plan/reconcile/list`
+operator command is registered. The legacy
+zone-wide `internal/integrations` reconcile action remains off the operator
+surface for later phases; the domain flow uses the separate exact-host planner.
+No legacy action installs a Caddy route or binds an environment domain.
 
 Private-network access modes come after v1 (MASTER D22); the `access …` commands
 are not registered. The internal grant controller remains for the optional

@@ -94,20 +94,34 @@ func TestVersionSchemaReportsTheControlDatabaseFailure(t *testing.T) {
 	}
 }
 
-func TestMainNodeReportHasTwentyResults(t *testing.T) {
-	// The documented alpha baseline is 20 pass / 0 warn / 0 fail on a healthy
-	// main node: the previous 18 results plus host.retention and
-	// host.build_cache.
+func TestMainNodeReportCoversEveryCheck(t *testing.T) {
+	// Service checks expand to one result per configured unit; with
+	// node-exporter.service in the main role the report has one more row than
+	// the older five-service fixtures. Do not encode a total count here.
 	facts := Facts{
 		Now:           time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC),
 		Hostname:      "main.example.com",
 		ServicesKnown: true,
-		Services:      map[string]bool{"eregion-api.service": true, "eregion-worker.service": true, "wg-quick@wg0.service": true, "caddy.service": true, "docker.service": true},
-		Retention:     RetentionFacts{Enabled: true, Known: true},
-		BuildCache:    BuildCacheFacts{Applicable: true, Known: true, CapBytes: 10 << 30},
+		Services: map[string]bool{
+			"eregion-api.service": true, "eregion-worker.service": true,
+			"wg-quick@wg0.service": true, "caddy.service": true,
+			"docker.service": true, "node-exporter.service": true,
+		},
+		Retention:  RetentionFacts{Enabled: true, Known: true},
+		BuildCache: BuildCacheFacts{Applicable: true, Known: true, CapBytes: 10 << 30},
 	}
-	if results := Run(Checks(), facts); len(results) != 20 {
-		t.Fatalf("main node doctor results = %d, want 20", len(results))
+	results := Run(Checks(), facts)
+	seen := map[string]bool{}
+	for _, result := range results {
+		seen[result.ID] = true
+	}
+	for _, check := range Checks() {
+		if !seen[check.ID] {
+			t.Fatalf("check %s produced no doctor result; results = %+v", check.ID, results)
+		}
+	}
+	if len(results) < len(Checks()) {
+		t.Fatalf("doctor results = %d for %d checks", len(results), len(Checks()))
 	}
 }
 

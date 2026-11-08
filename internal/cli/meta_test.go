@@ -23,6 +23,7 @@ func TestMetadataGate(t *testing.T) {
 		{"use", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.WhenToUse = nil }, "when_to_use"},
 		{"audience", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Audience = []string{"everyone"} }, "audience"},
 		{"platform", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Platforms = nil }, "platforms"},
+		{"windows-platform", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Platforms = []string{"windows"} }, "platforms"},
 		{"node", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Audience = []string{"node"} }, "Linux-only"},
 		{"restart", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.NeedsRestart = "maybe" }, "needs_restart"},
 		{"output", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Output = "text" }, "output"},

@@ -313,7 +313,7 @@ func decodeEnvironments(raw json.RawMessage, clean func(string) string) ([]Item,
 			{Label: "updated", Value: environment.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")},
 		}
 		details = append(details, envDetails(environment.Env, clean)...)
-		details = append(details, Detail{Label: "telemetry", Value: "not configured; no metrics graph is available"})
+		details = append(details, Detail{Label: "request metrics", Value: "not collected; node-local telemetry exposes only current host counters"})
 		search := joinSearch(title, environment.Node, string(environment.HealthState), string(environment.DesiredRelease), string(environment.AppliedRelease), string(environment.ServingRelease), environment.HealthDetail)
 		items = append(items, Item{Key: title, Title: title, Subtitle: clean(environment.Node), Status: status, Details: details, SearchText: search, Data: map[string]string{
 			"app": app, "environment": name, "node": clean(environment.Node), "status": status,
