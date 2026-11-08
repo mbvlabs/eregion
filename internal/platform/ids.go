@@ -27,6 +27,7 @@ type ReleaseID string
 type DeploymentID string
 type ChangeID string
 type BuildID string
+type DomainID string
 
 var (
 	appIDPattern         = regexp.MustCompile(`^app_[0-9a-f]{32}$`)
@@ -36,6 +37,7 @@ var (
 	deploymentIDPattern  = regexp.MustCompile(`^dep_[0-9a-f]{32}$`)
 	changeIDPattern      = regexp.MustCompile(`^chg_[0-9a-f]{32}$`)
 	buildIDPattern       = regexp.MustCompile(`^bld_[0-9a-f]{32}$`)
+	domainIDPattern      = regexp.MustCompile(`^dom_[0-9a-f]{32}$`)
 	namePattern          = regexp.MustCompile(`^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$`)
 	imagePattern         = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$`)
 	capabilityPattern    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
@@ -86,6 +88,11 @@ func NewBuildID() (BuildID, error) {
 	return BuildID(value), err
 }
 
+func NewDomainID() (DomainID, error) {
+	value, err := newID("dom_")
+	return DomainID(value), err
+}
+
 func (id AppID) Validate() error {
 	if !appIDPattern.MatchString(string(id)) {
 		return contract.NewFault(contract.ValidationFailed, "invalid app ID", "Use the app ID returned by inventory.")
@@ -131,6 +138,13 @@ func (id ChangeID) Validate() error {
 func (id BuildID) Validate() error {
 	if !buildIDPattern.MatchString(string(id)) {
 		return contract.NewFault(contract.ValidationFailed, "invalid build ID", "Use the build ID returned by inventory.")
+	}
+	return nil
+}
+
+func (id DomainID) Validate() error {
+	if !domainIDPattern.MatchString(string(id)) {
+		return contract.NewFault(contract.ValidationFailed, "invalid domain ID", "Use the domain ID returned by inventory.")
 	}
 	return nil
 }

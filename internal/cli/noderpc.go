@@ -115,6 +115,7 @@ const (
 	methodRetentionPlan      = "retention.plan"
 	methodRetentionShow      = "retention.show"
 	methodRetentionSet       = "retention.set"
+	methodMetricsShow        = "metrics.show"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -716,6 +717,8 @@ func waitLabel(method string, params any) string {
 		return "Reading retention policy…"
 	case methodRetentionSet:
 		return "Writing the retention policy…"
+	case methodMetricsShow:
+		return "Reading node metrics…"
 	case methodVersion:
 		return "Checking the node version…"
 	}
@@ -1216,6 +1219,12 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		// The API watches the token store, so the revocation applies on its
 		// next request without an eregion-api.service restart.
 		return metadata, true, nil
+	case methodMetricsShow:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		snapshot, err := collectNodeMetrics(ctx)
+		return snapshot, true, err
 	case methodNodeInfo:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
 			return nil, true, err
@@ -1308,6 +1317,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		Redaction: registry,
+		DomainDNS: parts.DomainDNS,
 		HumanFactor: func(code string) error {
 			return protect.NewStore().Verify(code)
 		},

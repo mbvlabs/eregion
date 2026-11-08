@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -228,6 +229,8 @@ func platformAcceptedMessage(kind string) string {
 		return "Rollback accepted durably; it redeploys the earlier release with its recorded revision and secret snapshot."
 	case platform.KindRestart:
 		return "Restart accepted durably; the serving release is reapplied with the current revision."
+	case platform.KindPromote:
+		return "Promotion accepted durably; the source serving artifact is pinned as a new production release and the serving release is unchanged until the candidate passes health and the public check."
 	case platform.KindNodeRegister:
 		return "Node placement facts accepted durably. This does not install or verify host state."
 	case platform.KindNodeCheck:
@@ -237,7 +240,7 @@ func platformAcceptedMessage(kind string) string {
 	case platform.KindNodeReconcile:
 		return "Node reconciliation accepted durably."
 	case platform.KindDomainAdd, platform.KindDomainRemove:
-		return "Domain change accepted durably; the worker rewrites the Caddy routes."
+		return "Domain change accepted durably; any explicit Cloudflare effect runs before the Caddy route write."
 	case platform.KindEnvironmentDelete:
 		return "Environment deletion accepted durably; containers and routes are removed before platform state."
 	case platform.KindAppDelete:
@@ -363,9 +366,34 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 	case *platform.ProcessScaleInput:
+		// Scale publishes a revision and queues a restart during submission.
+		// Try the same advisory target lock as deployment execution before the
+		// environment row lock. A conflict is returned immediately instead of
+		// holding a pool connection in a blocking lock wait; the order remains
+		// advisory -> row.
+		var lockAcquired bool
+		if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`,
+			targetLockKey("env/"+input.App+"/"+input.Environment)).Scan(&lockAcquired); err != nil {
+			return unavailable(err)
+		}
+		if !lockAcquired {
+			return contract.NewFault(contract.Conflict,
+				"a deployment lifecycle owns this environment",
+				"Wait for the current deployment, rollback or restart to settle before scaling.")
+		}
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
 			return err
+		}
+		var ownerBusy bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(
+            SELECT 1 FROM eregion_platform_deployment_owners WHERE environment_id=$1)`, env.ID).Scan(&ownerBusy); err != nil {
+			return unavailable()
+		}
+		if ownerBusy {
+			return contract.NewFault(contract.Conflict,
+				"a deployment lifecycle owns this environment",
+				"Wait for the current deployment, rollback or restart to settle before scaling.")
 		}
 		base, err := currentRevisionStateTx(ctx, tx, env)
 		if err != nil {
@@ -464,13 +492,41 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 	case *platform.DomainInput:
+		if _, err := appByNameForUpdateTx(ctx, tx, input.App); err != nil {
+			return err
+		}
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
 			return err
 		}
+		if err := s.ensureNoActiveDomainChangeTx(ctx, tx, id, input.App, input.Environment); err != nil {
+			return err
+		}
+		if normalized.Kind == platform.KindDomainAdd && input.DNSMode == integrations.DomainDNSModeCloudflare {
+			if input.DNSProxied == nil {
+				return contract.NewFault(contract.ValidationFailed, "Cloudflare DNS needs an explicit proxy mode", "Use --dns-proxy dns-only or --dns-proxy proxied; the choice is never inferred.")
+			}
+			if len(input.DNSOrigins) == 0 {
+				return contract.NewFault(contract.ValidationFailed, "Cloudflare DNS needs explicit public origin addresses", "Pass --dns-origin for each public origin address; the WireGuard management endpoint is not used.")
+			}
+		}
+		var managedZone integrations.DNSZone
+		if normalized.Kind == platform.KindDomainAdd && input.DNSMode == integrations.DomainDNSModeCloudflare {
+			managedZone, err = s.resolveDomainDNSZone(input.DNSZone)
+			if err != nil {
+				return err
+			}
+			if err := integrations.ValidateDomainDNSHost(managedZone, input.Domain); err != nil {
+				return err
+			}
+			if err := s.authorizeDomainDNSWrite(ctx, actor); err != nil {
+				return err
+			}
+		}
 		if normalized.Kind == platform.KindDomainRemove {
+			var domainID platform.DomainID
 			var primary bool
-			err := tx.QueryRow(ctx, `SELECT is_primary FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2`, input.Domain, env.ID).Scan(&primary)
+			err := tx.QueryRow(ctx, `SELECT id,is_primary FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2`, input.Domain, env.ID).Scan(&domainID, &primary)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return contract.NewFault(contract.NotFound, input.Domain+" is not routed to "+input.App+"/"+input.Environment, "List routes with eregion domain list.")
 			}
@@ -482,14 +538,77 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			}
 			if primary {
 				return contract.NewFault(contract.PreconditionFailed, "the primary domain cannot be removed",
-					"Add another domain with --primary first, then remove this one.")
+					"Add another domain with --primary first, then remove this one. Deleting the environment or app cleans its managed DNS.")
 			}
-			if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2`, input.Domain, env.ID); err != nil {
-				return unavailable()
+			ledger, err := loadDomainDNSLedgerByDomainIDTx(ctx, tx, domainID)
+			if err != nil {
+				return err
 			}
+			if ledger != nil {
+				if input.DNSMode == integrations.DomainDNSModeCloudflare && input.DNSZone != "" {
+					zone, err := s.resolveDomainDNSZone(input.DNSZone)
+					if err != nil {
+						return err
+					}
+					if zone.ZoneID != ledger.ZoneID {
+						return contract.NewFault(contract.Conflict, "managed DNS zone does not match the binding ledger", "Omit --dns-zone to use the persisted zone, or correct the flag.")
+					}
+				}
+				if err := s.validateDomainDNSCleanupRecovery(*ledger); err != nil {
+					return err
+				}
+				if err := s.authorizeDomainDNSWrite(ctx, actor); err != nil {
+					return err
+				}
+				return markDomainDNSCleanupTx(ctx, tx, domainID, id)
+			}
+			if input.DNSMode != integrations.DomainDNSModeCloudflare {
+				return nil
+			}
+			zone, err := s.resolveDomainDNSZone(input.DNSZone)
+			if err != nil {
+				return err
+			}
+			if err := integrations.ValidateDomainDNSHost(zone, input.Domain); err != nil {
+				return err
+			}
+			if err := s.authorizeDomainDNSWrite(ctx, actor); err != nil {
+				return err
+			}
+			return insertDomainDNSCleanupIntentTx(ctx, tx, domainID, zone, id)
+		}
+		domainID, err := s.insertDomainTx(ctx, tx, env, *input)
+		if err != nil {
+			return err
+		}
+		if input.DNSMode == integrations.DomainDNSModeCloudflare {
+			return upsertDomainDNSIntentTx(ctx, tx, domainID, managedZone, input.DNSOrigins, *input.DNSProxied, id)
+		}
+		ledger, err := loadDomainDNSLedgerByDomainIDTx(ctx, tx, domainID)
+		if err != nil {
+			return err
+		}
+		if ledger == nil {
 			return nil
 		}
-		return s.insertDomainTx(ctx, tx, env, *input)
+		// A manual re-add or promotion of a managed binding still mutates the
+		// ownership fencing row. Require DNS authority even when the provider
+		// desired state is preserved.
+		if err := s.authorizeDomainDNSWrite(ctx, actor); err != nil {
+			return err
+		}
+		if ledger.State == domainDNSStateCleanupPending || ledger.State == domainDNSStateCleanupFailed {
+			return contract.NewFault(contract.Conflict, "managed DNS cleanup is pending for this binding", "Retry the deletion/cleanup, or re-add the binding explicitly with --dns cloudflare.")
+		}
+		if ledger.State != domainDNSStateApplied {
+			return contract.NewFault(contract.Conflict, "managed DNS desired state is not applied", "Retry domain add with the explicit Cloudflare flags, or clean up the binding first.")
+		}
+		if len(ledger.DesiredOrigins) > 0 {
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET expected_addresses=$2 WHERE id=$1`, domainID, ledger.DesiredOrigins); err != nil {
+				return unavailable()
+			}
+		}
+		return fenceDomainDNSOperationTx(ctx, tx, domainID, id)
 	case *platform.ReleaseCreateInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
@@ -607,6 +726,8 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err := s.prepareDeploymentTx(ctx, tx, id, env, release.ID, platform.ActionDeploy, env.RevisionID, env.ServingDeploymentID, nil); err != nil {
 			return err
 		}
+	case *platform.PromoteInput:
+		return s.preparePromotionTx(ctx, tx, id, input)
 	case *platform.RollbackInput:
 		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 		if err != nil {
@@ -672,7 +793,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 				return contract.NewFault(contract.PreconditionFailed, "serving deployment changed before the repair was queued", "The next maintenance run will re-observe the serving workload.")
 			}
 			if !repairSubmissionAllowed(input.ExpectedServingDeploymentID, env.ServingDeploymentID, active) {
-				return contract.NewFault(contract.Conflict, "environment has an active deploy, restart or rollback operation", "Let the current operation finish; the next maintenance run will re-observe.")
+				return contract.NewFault(contract.Conflict, "environment has an active deployment, promotion, restart or deletion operation", "Let the current operation finish; the next maintenance run will re-observe.")
 			}
 		}
 		if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
@@ -718,6 +839,12 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, input.App, ""); err != nil {
 			return err
 		}
+		if err := s.ensureDomainDNSCleanupSafeTx(ctx, tx, actor, input.App, ""); err != nil {
+			return err
+		}
+		if err := markDomainDNSCleanupForEnvironmentsTx(ctx, tx, input.App, "", id); err != nil {
+			return err
+		}
 	case *platform.EnvironmentDeleteInput:
 		app, err := appByNameForUpdateTx(ctx, tx, input.App)
 		if err != nil {
@@ -743,6 +870,12 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		if err := s.ensureNoActiveDeleteTargets(ctx, tx, id, env.App, env.Name); err != nil {
+			return err
+		}
+		if err := s.ensureDomainDNSCleanupSafeTx(ctx, tx, actor, env.App, env.Name); err != nil {
+			return err
+		}
+		if err := markDomainDNSCleanupForEnvironmentsTx(ctx, tx, env.App, env.Name, id); err != nil {
 			return err
 		}
 	case *platform.NodeCheckInput:
@@ -811,60 +944,71 @@ func lastEnvironmentTx(ctx context.Context, tx pgx.Tx, appID, envID string) (boo
 // insertDomainTx writes or promotes one domain binding. It is shared by
 // platform.domain.add and by app/environment creation, which carry the first
 // binding so it commits before any first deploy is queued.
-func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.Environment, input platform.DomainInput) error {
+func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.Environment, input platform.DomainInput) (platform.DomainID, error) {
+	var zero platform.DomainID
+	addresses := input.Addresses
+	if input.DNSMode == integrations.DomainDNSModeCloudflare && len(input.DNSOrigins) > 0 {
+		addresses = input.DNSOrigins
+	}
 	node, err := nodeByNameTx(ctx, tx, env.Node)
 	if err != nil {
-		return err
+		return zero, err
 	}
 	if node.Transport != "local" {
-		return contract.NewFault(contract.PreconditionFailed, "domains route only to environments on the main node for now", "Create the environment on the main node.")
+		return zero, contract.NewFault(contract.PreconditionFailed, "domains route only to environments on the main node for now", "Create the environment on the main node.")
 	}
+	var existingID platform.DomainID
 	var existingEnvironment string
-	err = tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE name=$1`, input.Domain).Scan(&existingEnvironment)
+	err = tx.QueryRow(ctx, `SELECT id,environment_id FROM eregion_platform_domains WHERE name=$1`, input.Domain).Scan(&existingID, &existingEnvironment)
 	switch {
 	case err == nil && existingEnvironment != string(env.ID):
-		return contract.NewFault(contract.Conflict, input.Domain+" is already routed to another environment", "Remove it from that environment first, or use another hostname.")
+		return zero, contract.NewFault(contract.Conflict, input.Domain+" is already routed to another environment", "Remove it from that environment first, or use another hostname.")
 	case err == nil:
 		// Re-adding the same binding is idempotent; --primary promotes it and
 		// refreshes the recorded main-node addresses for DNS observation.
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET check_path=$2 WHERE name=$1`, input.Domain, input.CheckPath); err != nil {
-			return unavailable()
+			return zero, unavailable()
 		}
-		if len(input.Addresses) > 0 {
-			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET expected_addresses=$2 WHERE name=$1`, input.Domain, input.Addresses); err != nil {
-				return unavailable()
+		if len(addresses) > 0 {
+			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET expected_addresses=$2 WHERE name=$1`, input.Domain, addresses); err != nil {
+				return zero, unavailable()
 			}
 		}
 		if input.Primary {
 			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary AND name<>$2`, env.ID, input.Domain); err != nil {
-				return unavailable()
+				return zero, unavailable()
 			}
 			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=true, desired_revision=desired_revision+1 WHERE name=$1`, input.Domain); err != nil {
-				return unavailable()
+				return zero, unavailable()
 			}
 		}
+		return existingID, nil
 	case errors.Is(err, pgx.ErrNoRows):
+		id, idErr := platform.NewDomainID()
+		if idErr != nil {
+			return zero, unavailable()
+		}
 		primary := input.Primary
 		if !primary {
 			var hasPrimary bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_domains WHERE environment_id=$1 AND is_primary)`, env.ID).Scan(&hasPrimary); err != nil {
-				return unavailable()
+				return zero, unavailable()
 			}
 			primary = !hasPrimary
 		}
 		if primary {
 			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET is_primary=false WHERE environment_id=$1 AND is_primary`, env.ID); err != nil {
-				return unavailable()
+				return zero, unavailable()
 			}
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary,expected_addresses,check_path)
-            VALUES($1,$2,$3,$4,$5)`, input.Domain, env.ID, primary, input.Addresses, input.CheckPath); err != nil {
-			return platformWriteError(err, input.Domain+" is already routed")
+		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domains(id,name,environment_id,is_primary,expected_addresses,check_path)
+            VALUES($1,$2,$3,$4,$5,$6)`, id, input.Domain, env.ID, primary, addresses, input.CheckPath); err != nil {
+			return zero, platformWriteError(err, input.Domain+" is already routed")
 		}
+		return id, nil
 	default:
-		return unavailable()
+		return zero, unavailable()
 	}
-	return nil
 }
 
 func envAppID(ctx context.Context, tx pgx.Tx, app string) string {
@@ -1715,16 +1859,19 @@ func (s *Service) inventoryEnvironments(ctx context.Context, query platform.Inve
 
 func (s *Service) inventoryDomains(ctx context.Context, query platform.InventoryQuery) ([]platform.DomainBinding, error) {
 	items := []platform.DomainBinding{}
-	statement := `SELECT d.name,a.name,e.name,d.is_primary,coalesce(d.check_path,''),d.desired_revision,d.applied_revision,
+	statement := `SELECT d.id,d.name,a.name,e.name,d.is_primary,coalesce(d.check_path,''),d.desired_revision,d.applied_revision,
         d.route_state,d.route_error,d.route_applied_at,d.route_observed_at,
         d.expected_addresses,d.dns_state,d.dns_addresses,d.dns_error,d.dns_observed_at,
         d.certificate_state,d.certificate_not_after,d.certificate_error,d.certificate_observed_at,
         d.public_state,coalesce(d.public_status,0),d.public_error,d.public_observed_at,d.observed_at,
-        coalesce(dep.instances,'[]'::jsonb)
+        coalesce(dep.instances,'[]'::jsonb),
+        coalesce(x.provider,''),coalesce(x.zone_id,''),coalesce(x.zone_name,''),coalesce(x.desired_origins,'{}'),
+        coalesce(x.desired_proxied,false),coalesce(x.state,''),coalesce(x.generation,0),coalesce(x.applied_generation,0)
         FROM eregion_platform_domains d
         JOIN eregion_platform_environments e ON e.id=d.environment_id
         JOIN eregion_platform_apps a ON a.id=e.app_id
         LEFT JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id
+        LEFT JOIN eregion_platform_domain_dns x ON x.domain_id=d.id
         WHERE ($1='' OR a.name=$1) AND ($2='' OR e.name=$2)
         ORDER BY a.name,e.name,d.is_primary DESC,d.name LIMIT $3`
 	rows, err := s.pool.Query(ctx, statement, query.App, query.Environment, query.Limit)
@@ -1735,14 +1882,27 @@ func (s *Service) inventoryDomains(ctx context.Context, query platform.Inventory
 	for rows.Next() {
 		var item platform.DomainBinding
 		var rawInstances []byte
-		if err := rows.Scan(&item.Domain, &item.App, &item.Environment, &item.Primary, &item.CheckPath,
+		var provider, managedZoneID, managedZoneName, managedState string
+		var managedOrigins []string
+		var managedProxied bool
+		var managedGeneration, managedAppliedGeneration int64
+		if err := rows.Scan(&item.ID, &item.Domain, &item.App, &item.Environment, &item.Primary, &item.CheckPath,
 			&item.DesiredRevision, &item.AppliedRevision, &item.RouteState, &item.RouteError,
 			&item.RouteAppliedAt, &item.RouteObservedAt, &item.ExpectedAddresses,
 			&item.DNSState, &item.DNSAddresses, &item.DNSError, &item.DNSObservedAt,
 			&item.CertificateState, &item.CertificateNotAfter, &item.CertificateError, &item.CertificateObservedAt,
 			&item.PublicState, &item.PublicStatus, &item.PublicError, &item.PublicObservedAt, &item.ObservedAt,
-			&rawInstances); err != nil {
+			&rawInstances,
+			&provider, &managedZoneID, &managedZoneName, &managedOrigins, &managedProxied, &managedState,
+			&managedGeneration, &managedAppliedGeneration); err != nil {
 			return nil, unavailable()
+		}
+		if provider != "" {
+			item.ManagedDNS = &platform.ManagedDNSBinding{
+				Provider: provider, ZoneID: managedZoneID, ZoneName: managedZoneName,
+				Origins: managedOrigins, Proxied: managedProxied, State: managedState,
+				Generation: managedGeneration, AppliedGeneration: managedAppliedGeneration,
+			}
 		}
 		if item.ExpectedAddresses == nil {
 			item.ExpectedAddresses = []string{}
@@ -2165,15 +2325,15 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	}
 	preview := platform.Preview{Kind: normalized.Kind, Target: normalized.Target.String(), DryRun: true, Input: normalized.Input.Preview(), Summary: normalized.Summary}
 	if idempotencyKey != "" {
-		op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5",
-			actor.Kind, actor.Subject, normalized.Kind, normalized.Target.String(), idempotencyKey))
-		switch {
-		case err == nil:
+		// Preview must use the same normalized-input hash fence as submit: an
+		// existing key with identical input is a replay, while the same key
+		// with changed input is a conflict and must not hide behind a preview.
+		if op, found, err := s.replaySubmission(ctx, normalized.Kind, normalized.Target.String(), actor, idempotencyKey, hashInput(normalized.Canonical)); err != nil {
+			return preview, err
+		} else if found {
 			preview.Replay, preview.Operation = true, &op
 			preview.Summary = "Replay the accepted operation " + string(op.ID) + "; the same submission already exists."
 			return preview, nil
-		case !errors.Is(err, pgx.ErrNoRows):
-			return preview, unavailable()
 		}
 	}
 	switch input := normalized.Input.(type) {
@@ -2200,6 +2360,8 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		preview.Steps = deploymentSteps()
 		preview.Summary = fmt.Sprintf("Deploy %s to %s/%s with the current revision after candidate health and public verification.", release.Image, env.App, env.Name)
 		addReleaseWarnings(&preview, release, env)
+	case *platform.PromoteInput:
+		return s.previewPromotion(ctx, normalized, input)
 	case *platform.BuildStopInput:
 		build, err := s.buildByID(ctx, input.BuildID)
 		if err != nil {
@@ -2489,6 +2651,61 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 			if item.Kind == retention.ItemRegistrySkipped {
 				preview.Warnings = append(preview.Warnings, "registry skipped: "+item.Reason)
 			}
+		}
+	case *platform.DomainInput:
+		if normalized.Kind == platform.KindDomainRemove {
+			preview.Summary = "Remove the binding and route for " + input.Domain + " from " + input.App + "/" + input.Environment + "."
+		} else {
+			preview.Summary = "Bind " + input.Domain + " to " + input.App + "/" + input.Environment + " through Caddy."
+		}
+		var ledger *domainDNSLedger
+		if s.pool != nil {
+			loaded, err := s.loadDomainDNSLedger(ctx, input.App, input.Environment, input.Domain)
+			if err != nil {
+				return preview, err
+			}
+			ledger = loaded
+		}
+		if normalized.Kind == platform.KindDomainAdd && input.DNSMode != "cloudflare" && ledger != nil {
+			preview.Data = map[string]any{"dns_managed": managedDNSBinding(*ledger)}
+			preview.Steps = append(preview.Steps, "preserve the persisted managed-DNS zone, origins and proxy desired state")
+			preview.Summary += " Managed DNS remains zone " + ledger.ZoneName + " with origins " + strings.Join(ledger.DesiredOrigins, ", ") + "; this operation does not change provider intent."
+			preview.Warnings = append(preview.Warnings, "The binding is already provider-managed; use explicit --dns cloudflare flags to change or reconcile its DNS.")
+			break
+		}
+		managed := input.DNSMode == "cloudflare" || ledger != nil
+		if managed {
+			previewInput := *input
+			previewInput.DNSMode = "cloudflare"
+			if ledger != nil && previewInput.DNSZone == "" {
+				previewInput.DNSZone = ledger.ZoneID
+			}
+			if normalized.Kind == platform.KindDomainAdd {
+				if previewInput.DNSProxied == nil {
+					return preview, contract.NewFault(contract.ValidationFailed, "Cloudflare DNS needs an explicit proxy mode", "Use --dns-proxy dns-only or --dns-proxy proxied; the choice is never inferred.")
+				}
+				if len(previewInput.DNSOrigins) == 0 {
+					return preview, contract.NewFault(contract.ValidationFailed, "Cloudflare DNS needs explicit public origin addresses", "Pass --dns-origin for each public origin address; the WireGuard management endpoint is not used.")
+				}
+			}
+			plan, err := s.previewDomainDNS(ctx, actor, &previewInput, normalized.Kind)
+			if err != nil {
+				return preview, err
+			}
+			preview.Data = map[string]any{"dns_provider": plan}
+			preview.Steps = append(preview.Steps, "read the Cloudflare provider snapshot for "+input.Domain)
+			if normalized.Kind == platform.KindDomainRemove {
+				preview.Steps = append(preview.Steps, "remove only records whose comment is this binding's exact ownership marker")
+				preview.Summary += " Explicit Cloudflare removal targets only this binding's exact owned records."
+			} else {
+				preview.Steps = append(preview.Steps, "create or update only the exact A/AAAA records this binding owns")
+				preview.Steps = append(preview.Steps, "explicit public origins: "+strings.Join(previewInput.DNSOrigins, ", "))
+				preview.Summary += " Explicit Cloudflare DNS will ensure the exact desired record from " + strings.Join(previewInput.DNSOrigins, ", ") + "."
+			}
+			preview.Warnings = append(preview.Warnings, plan.Warnings...)
+			preview.Warnings = append(preview.Warnings, "No provider change happens until this plan is submitted; manual DNS remains the default.")
+		} else {
+			preview.Summary += " DNS stays manual; no provider change is planned."
 		}
 	default:
 		if preview.Summary == "" {

@@ -209,12 +209,13 @@ type scriptedDeployTransport struct {
 	runs      map[string]int
 	down      map[string]int
 	hashes    map[string]string
+	payloads  map[string]json.RawMessage
 	lostStep  string
 	lostForOp contract.OperationID
 }
 
 func newScriptedDeployTransport() *scriptedDeployTransport {
-	return &scriptedDeployTransport{runs: map[string]int{}, down: map[string]int{}, hashes: map[string]string{}}
+	return &scriptedDeployTransport{runs: map[string]int{}, down: map[string]int{}, hashes: map[string]string{}, payloads: map[string]json.RawMessage{}}
 }
 
 // scriptedInputsHash is the hash a real node journals for a run: the step
@@ -291,6 +292,7 @@ func (s *scriptedDeployTransport) Call(_ context.Context, request node.Request, 
 		s.mu.Lock()
 		s.runs[key]++
 		s.hashes[key] = hash
+		s.payloads[key] = append(json.RawMessage(nil), request.Payload...)
 		first := s.runs[key] == 1
 		lost := first && request.Execution.Step == s.lostStep && request.Execution.OperationID == s.lostForOp
 		if lost {
@@ -313,6 +315,12 @@ func (s *scriptedDeployTransport) runCount(op contract.OperationID, step string)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.runs[string(op)+"|"+step]
+}
+
+func (s *scriptedDeployTransport) payload(op contract.OperationID, step string) json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append(json.RawMessage(nil), s.payloads[string(op)+"|"+step]...)
 }
 
 func latestRelease(t *testing.T, pool *pgxpool.Pool) string {

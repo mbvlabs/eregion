@@ -40,6 +40,7 @@ var followingCommands = []struct {
 	{name: "env delete", path: "eregion env delete", args: []string{"env", "delete", "api", "production", "--confirm", "api/production"}},
 	{name: "env protect", path: "eregion env protect", args: []string{"env", "protect", "api", "production"}},
 	{name: "env unprotect", path: "eregion env unprotect", args: []string{"env", "unprotect", "api", "production"}},
+	{name: "env promote", path: "eregion env promote", args: []string{"env", "promote", "api", "staging"}},
 	{name: "domain add", path: "eregion domain add", args: []string{"domain", "add", "api", "production", "hello.example.com"}},
 	{name: "domain remove", path: "eregion domain remove", args: []string{"domain", "remove", "api", "production", "hello.example.com", "--confirm", "hello.example.com"}},
 	{name: "process scale", path: "eregion process scale", args: []string{"process", "scale", "api", "production", "web", "2"}},

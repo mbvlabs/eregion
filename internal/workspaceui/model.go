@@ -205,9 +205,10 @@ type operationMsg struct {
 type tickMsg time.Time
 
 type metricsMsg struct {
-	key    string
-	series MetricsSeries
-	err    error
+	key        string
+	generation uint64
+	series     MetricsSeries
+	err        error
 }
 
 type opView struct {
@@ -244,8 +245,9 @@ type Model struct {
 	detailScroll int
 	showHelp     bool
 
-	metrics        *metricsView
-	metricsLoading bool
+	metrics           *metricsView
+	metricsLoading    bool
+	metricsGeneration uint64
 
 	form *formState
 	op   *opView
@@ -342,8 +344,7 @@ func (m *Model) setTab(tab Tab) tea.Cmd {
 	m.summary.Tab = tab.String()
 	m.detail = false
 	m.detailScroll = 0
-	m.metrics = nil
-	m.metricsLoading = false
+	m.clearMetrics()
 	m.notice = ""
 	if m.tabs[tab].state == loadIdle {
 		m.tabs[tab].state = loadLoading
@@ -357,7 +358,15 @@ func (m *Model) refresh() tea.Cmd {
 		return nil
 	}
 	m.tabs[m.tab].state = loadLoading
-	return tea.Batch(m.loadTabCommand(), m.spinCommand())
+	commands := []tea.Cmd{m.loadTabCommand(), m.spinCommand()}
+	if m.detail {
+		if item, ok := m.selectedItem(); ok {
+			if command := m.requestMetrics(item); command != nil {
+				commands = append(commands, command)
+			}
+		}
+	}
+	return tea.Batch(commands...)
 }
 
 func (m *Model) spinCommand() tea.Cmd {
@@ -429,6 +438,11 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyOperation(message)
 		return m, nil
 	case metricsMsg:
+		if message.generation != m.metricsGeneration {
+			// An older request finished after a newer one was issued. It must
+			// not overwrite the fresh view or clear the newer loading state.
+			return m, nil
+		}
 		m.metricsLoading = false
 		if item, ok := m.selectedItem(); !ok || item.Key != message.key {
 			return m, nil
@@ -678,14 +692,14 @@ func (m Model) handleDetailKey(pressed string) (tea.Model, tea.Cmd) {
 	item, ok := m.selectedItem()
 	if !ok {
 		m.detail = false
+		m.clearMetrics()
 		return m, nil
 	}
 	switch pressed {
 	case "esc", "enter":
 		m.detail = false
 		m.detailScroll = 0
-		m.metrics = nil
-		m.metricsLoading = false
+		m.clearMetrics()
 	case "up", "k":
 		m.detailScroll = max(0, m.detailScroll-1)
 	case "down", "j":

@@ -24,7 +24,14 @@ import (
 func (a *app) domainSpecs() []spec {
 	parent := platformMeta("Route public hostnames to environments through Caddy", "eregion domain list --json")
 	add := followingMeta(platformMutationMeta("Route a public hostname to an environment", "eregion domain add hello production hello.example.com"))
-	add.WhenToUse = []string{"Give an environment a public HTTPS URL. Create the DNS record it shows; Caddy gets the certificate once it resolves."}
+	add.WhenToUse = []string{
+		"Give an environment a public HTTPS URL. Manual DNS is the default: create the exact record it shows and Caddy gets the certificate once it resolves.",
+		"With explicit --dns cloudflare --dns-zone ZONE --dns-origin ADDRESS --dns-proxy dns-only|proxied, a dry run reads a real Cloudflare snapshot and apply reconciles only this hostname's exact owned A/AAAA records. Origins are never derived from the WireGuard management endpoint.",
+	}
+	add.Examples = []string{
+		"eregion domain add hello production hello.example.com",
+		"eregion domain add hello production hello.example.com --dns cloudflare --dns-zone example.com --dns-origin 93.184.216.34 --dns-proxy proxied --dry-run --json",
+	}
 	add.Next = []string{"eregion domain list"}
 	remove := followingMeta(platformDestructiveMeta("Remove a public hostname's route", "eregion domain remove hello production hello.example.com --confirm hello.example.com"))
 	remove.Confirmation = "target"
@@ -53,12 +60,14 @@ func (a *app) domainSpecs() []spec {
 				changeFlags(cmd)
 				cmd.Flags().Bool("primary", false, "Make this the environment's primary hostname, demoting the current one")
 				cmd.Flags().String("check-path", "", "HTTP path to observe on this hostname; empty uses the environment's web health path")
+				addDomainDNSFlags(cmd, true)
 			}, run: func(cmd *cobra.Command, args []string) (result, error) {
 				return a.domainAdd(cmd, args)
 			}},
 			{use: "remove <app> <environment> <hostname>", meta: remove, args: cobra.ExactArgs(3), flags: func(cmd *cobra.Command) {
 				changeFlags(cmd)
 				cmd.Flags().String("confirm", "", "Target-naming confirmation token: the hostname being removed")
+				addDomainDNSFlags(cmd, false)
 			}, run: func(cmd *cobra.Command, args []string) (result, error) {
 				return a.domainRemove(cmd, args)
 			}},
@@ -71,7 +80,82 @@ func (a *app) domainSpecs() []spec {
 
 func (a *app) domainAdd(cmd *cobra.Command, args []string) (result, error) {
 	primary, _ := cmd.Flags().GetBool("primary")
-	return a.domainChange(cmd, platform.KindDomainAdd, domainAddInput(cmd, args, primary))
+	input := domainAddInput(cmd, args, primary)
+	if err := applyDomainDNSFlags(cmd, &input, true); err != nil {
+		return result{}, err
+	}
+	return a.domainChange(cmd, platform.KindDomainAdd, input)
+}
+
+func addDomainDNSFlags(cmd *cobra.Command, forAdd bool) {
+	cmd.Flags().String("dns", "", "DNS mode: manual (default) or cloudflare; manual never changes the provider")
+	cmd.Flags().String("dns-zone", "", "Configured Cloudflare zone name or ID; required with --dns cloudflare")
+	if forAdd {
+		cmd.Flags().String("dns-proxy", "", "Explicit Cloudflare proxy mode: dns-only or proxied; required with --dns cloudflare")
+		cmd.Flags().StringArray("dns-origin", nil, "Explicit public IPv4/IPv6 origin address for Cloudflare DNS; repeatable and required")
+	}
+}
+
+// applyDomainDNSFlags keeps manual DNS the default and requires every managed
+// DNS choice to be explicit. Public origins come only from --dns-origin, never
+// from the context's WireGuard management endpoint.
+func applyDomainDNSFlags(cmd *cobra.Command, input *platform.DomainInput, forAdd bool) error {
+	mode, _ := cmd.Flags().GetString("dns")
+	zone, _ := cmd.Flags().GetString("dns-zone")
+	proxy, _ := cmd.Flags().GetString("dns-proxy")
+	origins, _ := cmd.Flags().GetStringArray("dns-origin")
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
+	proxy = strings.ToLower(strings.TrimSpace(proxy))
+	if !cmd.Flags().Changed("dns") {
+		if cmd.Flags().Changed("dns-zone") || cmd.Flags().Changed("dns-proxy") || cmd.Flags().Changed("dns-origin") {
+			return contract.NewFault(contract.Usage, "--dns-zone, --dns-origin and --dns-proxy need --dns cloudflare", "Omit DNS provider flags for manual DNS, or select --dns cloudflare explicitly.")
+		}
+		return nil
+	}
+	switch mode {
+	case "manual":
+		if zone != "" || proxy != "" || len(origins) > 0 {
+			return contract.NewFault(contract.Usage, "--dns manual cannot carry a zone, origin or proxy mode", "Use --dns cloudflare with --dns-zone, --dns-origin and --dns-proxy for managed DNS.")
+		}
+		input.DNSMode = "manual"
+		return nil
+	case "cloudflare":
+	default:
+		return contract.NewFault(contract.Usage, "unknown --dns mode", "Use manual (the default) or cloudflare.")
+	}
+	if zone == "" {
+		return contract.NewFault(contract.Usage, "--dns cloudflare needs --dns-zone", "Use a zone name or ID configured in EREGION_CLOUDFLARE_ZONES.")
+	}
+	input.DNSMode, input.DNSZone = "cloudflare", zone
+	if !forAdd {
+		if proxy != "" {
+			return contract.NewFault(contract.Usage, "--dns-proxy applies only to domain add", "Domain removal deletes only exact owned records and has no proxy choice.")
+		}
+		return nil
+	}
+	if !cmd.Flags().Changed("dns-proxy") {
+		return contract.NewFault(contract.Usage, "--dns cloudflare needs an explicit --dns-proxy", "Use --dns-proxy dns-only or --dns-proxy proxied; the choice is never inferred.")
+	}
+	proxied := false
+	switch proxy {
+	case "dns-only":
+	case "proxied":
+		proxied = true
+	default:
+		return contract.NewFault(contract.Usage, "unknown --dns-proxy mode", "Use dns-only or proxied.")
+	}
+	input.DNSProxied = &proxied
+	if !cmd.Flags().Changed("dns-origin") || len(origins) == 0 {
+		return contract.NewFault(contract.Usage, "--dns cloudflare needs explicit --dns-origin addresses", "Pass each public origin address with --dns-origin; the WireGuard management endpoint is not used.")
+	}
+	normalizedOrigins, err := platform.NormalizeDNSOrigins(origins)
+	if err != nil {
+		return err
+	}
+	input.DNSOrigins = normalizedOrigins
+	input.Addresses = append([]string(nil), normalizedOrigins...)
+	return nil
 }
 
 // domainAddInput records the selected context's public addresses as the
@@ -87,6 +171,9 @@ func domainAddInput(cmd *cobra.Command, args []string, primary bool) platform.Do
 func (a *app) domainRemove(cmd *cobra.Command, args []string) (result, error) {
 	confirm, _ := cmd.Flags().GetString("confirm")
 	input := platform.DomainInput{App: args[0], Environment: args[1], Domain: args[2], Confirm: confirm}
+	if err := applyDomainDNSFlags(cmd, &input, false); err != nil {
+		return result{}, err
+	}
 	return a.domainChange(cmd, platform.KindDomainRemove, input)
 }
 
@@ -127,15 +214,23 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 			preview.data, preview.plain = platformWithConfirmation(preview.data.(json.RawMessage), input.Domain)
 		} else {
 			records := domainRecords(input.Domain, input.Addresses)
-			preview.plain += "\n" + domainRecordText(input)
 			raw, ok := preview.data.(json.RawMessage)
 			if !ok {
 				return result{}, invalidNodeData("domain preview")
 			}
-			data, err := domainAddPreview(raw, records)
+			data, err := domainAddPreview(raw, input.Domain, records)
 			if err != nil {
 				return result{}, err
 			}
+			var envelope struct {
+				DNSRecords []domainRecord `json:"dns_records"`
+			}
+			if err := json.Unmarshal(data, &envelope); err != nil {
+				return result{}, contract.NewFault(contract.Internal, "could not read the domain preview records", "Report the command and binary version.")
+			}
+			preview.plain += "\n" + strings.Join(domainRecordLines(domainChangeData{
+				Domain: input.Domain, DNSRecords: envelope.DNSRecords,
+			}), "\n")
 			preview.data = data
 		}
 		return preview, nil
@@ -161,11 +256,17 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 		data := domainChangeData{
 			Domain: input.Domain, App: input.App, Environment: input.Environment,
 			Primary: input.Primary, OperationID: op.ID,
+			DNSMode: input.DNSMode, DNSZone: input.DNSZone, DNSOrigins: input.DNSOrigins, DNSProxied: input.DNSProxied,
 			DNSRecords: domainRecords(input.Domain, input.Addresses),
 		}
 		plain := "Accepted " + kind + " for " + input.Domain + "\noperation: " + string(op.ID) + "\nnext: eregion operations follow " + string(op.ID)
 		if kind == platform.KindDomainAdd {
-			plain += "\n" + domainRecordText(input)
+			if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
+				applyManagedDNSBinding(&data, binding)
+			}
+			plain += "\n" + strings.Join(domainRecordLines(domainChangeData{
+				Domain: input.Domain, DNSRecords: data.DNSRecords,
+			}), "\n")
 		}
 		return result{data: data, plain: plain}, nil
 	}
@@ -179,7 +280,11 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 			}
 			return result{streamed: true}, nil
 		}
-		fmt.Fprintln(config.out, domainRecordText(input))
+		recordData := domainChangeData{Domain: input.Domain, DNSRecords: domainRecords(input.Domain, input.Addresses)}
+		if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
+			applyManagedDNSBinding(&recordData, binding)
+		}
+		fmt.Fprintln(config.out, strings.Join(domainRecordLines(recordData), "\n"))
 		_, followErr := a.followOperation(cmd, client, op.ID)
 		if followErr != nil {
 			return result{streamed: true}, followErr
@@ -195,16 +300,68 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 // domainAddPreview nests the dry-run preview and the DNS records. Its result is
 // a json.RawMessage, not []byte: a []byte in result.data would serialize as a
 // base64 string instead of the object agents read with jq .data.preview.
-func domainAddPreview(raw json.RawMessage, records []domainRecord) (json.RawMessage, error) {
+func domainAddPreview(raw json.RawMessage, domain string, records []domainRecord) (json.RawMessage, error) {
 	var value any
 	if err := json.Unmarshal(raw, &value); err != nil {
 		return nil, contract.NewFault(contract.Unavailable, "the node returned an invalid preview", "Check binary compatibility before assuming the domain was refused.")
 	}
-	encoded, err := json.Marshal(map[string]any{"preview": value, "dns_records": records})
+	payload := map[string]any{"preview": value, "dns_records": records}
+	if provider := previewProviderData(value); provider != nil {
+		payload["dns_provider"] = provider
+	}
+	if managed := previewManagedData(value); managed != nil {
+		payload["dns_managed"] = managed
+		if persisted, ok := previewManagedRecords(managed, domain); ok {
+			payload["dns_records"] = persisted
+		}
+	}
+	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, contract.NewFault(contract.Internal, "could not encode the domain preview", "Report the command and binary version.")
 	}
 	return json.RawMessage(encoded), nil
+}
+
+func previewManagedRecords(managed any, domain string) ([]domainRecord, bool) {
+	object, ok := managed.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	raw, ok := object["origins"].([]any)
+	if !ok {
+		return nil, false
+	}
+	origins := make([]string, 0, len(raw))
+	for _, value := range raw {
+		if text, ok := value.(string); ok {
+			origins = append(origins, text)
+		}
+	}
+	return domainRecords(domain, origins), true
+}
+
+func previewProviderData(value any) any {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	data, ok := object["data"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return data["dns_provider"]
+}
+
+func previewManagedData(value any) any {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	data, ok := object["data"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return data["dns_managed"]
 }
 
 func submitDomain(cmd *cobra.Command, client Backend, kind, target string, input json.RawMessage, key string, dryRun bool) (result, error) {
@@ -227,6 +384,10 @@ type domainChangeData struct {
 	Environment  string               `json:"environment"`
 	Primary      bool                 `json:"primary"`
 	OperationID  contract.OperationID `json:"operation_id,omitempty"`
+	DNSMode      string               `json:"dns_mode,omitempty"`
+	DNSZone      string               `json:"dns_zone,omitempty"`
+	DNSOrigins   []string             `json:"dns_origins,omitempty"`
+	DNSProxied   *bool                `json:"dns_proxied,omitempty"`
 	DNSRecords   []domainRecord       `json:"dns_records"`
 	DNSState     platform.DNSState    `json:"dns_state,omitempty"`
 	DNSAddresses []string             `json:"dns_addresses,omitempty"`
@@ -245,20 +406,46 @@ func (a *app) domainChangeResult(cmd *cobra.Command, kind string, input platform
 		OperationID: op.ID, DNSRecords: domainRecords(input.Domain, input.Addresses),
 	}
 	if kind == platform.KindDomainRemove {
-		return data, "Accepted removal of " + input.Domain + "; the worker rewrites the Caddy routes.\noperation: " + string(op.ID)
+		plain := "Accepted removal of " + input.Domain + "; the worker rewrites the Caddy routes.\noperation: " + string(op.ID)
+		if input.DNSMode == "cloudflare" {
+			plain += "\nCloudflare DNS: remove only this binding's exact owned records in zone " + input.DNSZone + "."
+		} else {
+			plain += "\nDNS: any persisted managed-DNS ledger is cleaned with this removal; an unmanaged binding keeps manual DNS unchanged."
+		}
+		return data, plain
 	}
 	if binding, err := a.domainBinding(cmd, input.App, input.Environment, input.Domain); err == nil {
 		data.RouteState, data.RouteError = binding.RouteState, binding.RouteError
 		data.Certificate = string(binding.CertificateState)
 		data.PublicState, data.PublicError = binding.PublicState, binding.PublicError
 		data.Primary = binding.Primary
+		applyManagedDNSBinding(&data, binding)
 	}
 	observation := platform.LookupPublicDNS(cmd.Context(), input.Domain)
 	data.DNSAddresses, data.DNSError = observation.Addresses, observation.Error
-	data.DNSState = platform.ClassifyDNS(input.Addresses, observation.Addresses)
-	data.Ready = data.RouteState == platform.RouteApplied && data.DNSState == platform.DNSOK &&
+	expected := input.Addresses
+	if len(data.DNSOrigins) > 0 {
+		expected = data.DNSOrigins
+	}
+	data.DNSState = platform.ClassifyDNS(expected, observation.Addresses)
+	data.Ready = data.RouteState == platform.RouteApplied && platform.DNSReachesNode(data.DNSState) &&
 		data.Certificate == string(platform.CertificateValid) && data.PublicState == platform.PublicOK
 	return data, domainChangeText(data)
+}
+
+// applyManagedDNSBinding replaces transient manual input with the persisted
+// managed-DNS desired state. A re-add or promotion of an existing managed
+// binding never renders a false manual DNS mode or stale node addresses.
+func applyManagedDNSBinding(data *domainChangeData, binding *platform.DomainBinding) {
+	if binding == nil || binding.ManagedDNS == nil {
+		return
+	}
+	data.DNSMode = "cloudflare"
+	data.DNSZone = binding.ManagedDNS.ZoneName
+	data.DNSOrigins = append([]string(nil), binding.ManagedDNS.Origins...)
+	proxied := binding.ManagedDNS.Proxied
+	data.DNSProxied = &proxied
+	data.DNSRecords = domainRecords(binding.Domain, binding.ManagedDNS.Origins)
 }
 
 func (a *app) domainStateText(cmd *cobra.Command, input platform.DomainInput) string {
@@ -353,13 +540,16 @@ func domainChangeText(data domainChangeData) string {
 	if data.OperationID != "" {
 		lines = append(lines, "operation: "+string(data.OperationID))
 	}
+	if data.DNSMode == "cloudflare" {
+		proxy := "dns-only"
+		if data.DNSProxied != nil && *data.DNSProxied {
+			proxy = "proxied"
+		}
+		lines = append(lines, "Cloudflare DNS: zone "+data.DNSZone+", origins "+strings.Join(data.DNSOrigins, ", ")+", "+proxy+"; provider state is not public readiness.")
+	}
 	lines = append(lines, domainRecordLines(data)...)
 	lines = append(lines, domainStateLines(data))
 	return strings.Join(lines, "\n")
-}
-
-func domainRecordText(input platform.DomainInput) string {
-	return strings.Join(domainRecordLines(domainChangeData{Domain: input.Domain, DNSRecords: domainRecords(input.Domain, input.Addresses)}), "\n")
 }
 
 func domainRecordLines(data domainChangeData) []string {

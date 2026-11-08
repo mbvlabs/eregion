@@ -168,6 +168,46 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 	}
 }
 
+func TestCatalogPlatformsMatchSupportedScope(t *testing.T) {
+	code, stdout, _ := invoke(t, "commands", "--json")
+	if code != 0 {
+		t.Fatal(stdout)
+	}
+	envelope := decodeOne(t, stdout)
+	raw, _ := json.Marshal(envelope.Data)
+	var data struct {
+		Commands []Command `json:"commands"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range data.Commands {
+		platforms := map[string]bool{}
+		for _, platform := range command.Platforms {
+			platforms[platform] = true
+		}
+		if len(command.Platforms) != 2 || !platforms["linux"] || !platforms["darwin"] {
+			t.Fatalf("%s platforms = %v, want linux and darwin", command.Path, command.Platforms)
+		}
+	}
+
+	// Per-platform overrides remain: the hidden node group is Linux-only.
+	a := newApp()
+	node, _, err := a.root.Find([]string{"node"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cmd := range walk(node) {
+		meta, ok := a.meta[cmd]
+		if !ok {
+			t.Fatalf("%s has no metadata", cmd.CommandPath())
+		}
+		if len(meta.Platforms) != 1 || meta.Platforms[0] != "linux" {
+			t.Fatalf("%s platforms = %v, want linux only", cmd.CommandPath(), meta.Platforms)
+		}
+	}
+}
+
 func TestInvocationIsolation(t *testing.T) {
 	for range 12 {
 		t.Run("parallel", func(t *testing.T) {

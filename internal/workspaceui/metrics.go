@@ -10,16 +10,17 @@ import (
 	tea "charm.land/bubbletea/v2"
 )
 
-// MetricsSource is the small data-source boundary for terminal graphs. The
-// telemetry node implementation lives outside this package; the workspace only
+// MetricsSource is the small data-source boundary for the Fleet detail. The
+// node-local implementation lives outside this package; the workspace only
 // accepts this interface and never imports a telemetry client directly. A nil
-// source is the honest "no telemetry node configured" state.
+// source is the honest "no node metrics source attached" state. No source keeps
+// history: one current observation is returned and discarded.
 type MetricsSource interface {
 	Query(ctx context.Context, query MetricsQuery) (MetricsSeries, error)
 }
 
 // MetricsQuery identifies the observed subject, metric, and window. It carries
-// no credential; the source owns authentication to the telemetry node.
+// no credential; the source owns the SSH/WireGuard read.
 type MetricsQuery struct {
 	Node        string
 	App         string
@@ -36,15 +37,28 @@ type MetricsSample struct {
 
 // MetricsSeries is a bounded observation with its provenance and freshness.
 // The presentation shows Source, Unit, and Window so a graph never hides where
-// its data came from.
+// its data came from. Details carry current non-graph facts (memory, load,
+// uptime); Note states a limitation or why a value is unavailable.
 type MetricsSeries struct {
 	Source     string
 	Metric     string
 	Unit       string
 	Window     time.Duration
 	ObservedAt time.Time
-	Stale      bool
-	Samples    []MetricsSample
+	// Freshness is the source's explicit "fresh", "stale" or "unknown"
+	// state. It is independent of whether CPU or another metric is available.
+	Freshness string
+	Stale     bool
+	// AgeAtReceipt and StaleAfter come from the node's snapshot. When
+	// ReceivedAt is set, presentation adds monotonic local elapsed time instead
+	// of subtracting the node's wall clock from the operator's wall clock.
+	AgeAtReceipt time.Duration
+	AgeKnown     bool
+	StaleAfter   time.Duration
+	ReceivedAt   time.Time
+	Samples      []MetricsSample
+	Details      []Detail
+	Note         string
 }
 
 type metricsView struct {
@@ -57,42 +71,38 @@ func (m Model) metricsQuery(item Item) (MetricsQuery, bool) {
 	if m.opts.Metrics == nil {
 		return MetricsQuery{}, false
 	}
-	switch m.tab {
-	case Fleet:
-		if item.Data["name"] == "" {
-			return MetricsQuery{}, false
-		}
-		return MetricsQuery{Node: item.Data["name"], Metric: "node.cpu.utilization", Window: 5 * time.Minute}, true
-	case Envs:
-		if item.Data["app"] == "" || item.Data["environment"] == "" {
-			return MetricsQuery{}, false
-		}
-		return MetricsQuery{
-			Node: item.Data["node"], App: item.Data["app"], Environment: item.Data["environment"],
-			Metric: "http.request.duration.p95", Window: 5 * time.Minute,
-		}, true
-	default:
+	// Only the Fleet node detail has a real local source: node_exporter's
+	// current host counters. There is no application request history, so the
+	// workspace must not invent an Envs graph or a global PromQL query.
+	if m.tab != Fleet {
 		return MetricsQuery{}, false
 	}
+	if item.Data["name"] == "" {
+		return MetricsQuery{}, false
+	}
+	return MetricsQuery{Node: item.Data["name"], Metric: "node.cpu.utilization"}, true
 }
 
 // metricsCommand is issued when focused details open. It never blocks Update.
+// The captured generation fences an older response from overwriting a newer
+// one for the same item.
 func (m Model) metricsCommand(item Item) tea.Cmd {
 	source := m.opts.Metrics
 	query, ok := m.metricsQuery(item)
 	if source == nil || !ok {
 		return nil
 	}
-	key := item.Key
+	key, generation := item.Key, m.metricsGeneration
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		series, err := source.Query(ctx, query)
-		return metricsMsg{key: key, series: series, err: err}
+		return metricsMsg{key: key, generation: generation, series: series, err: err}
 	}
 }
 
 func (m *Model) requestMetrics(item Item) tea.Cmd {
+	m.metricsGeneration++
 	if _, ok := m.metricsQuery(item); !ok {
 		m.metrics = nil
 		m.metricsLoading = false
@@ -103,24 +113,39 @@ func (m *Model) requestMetrics(item Item) tea.Cmd {
 	return m.metricsCommand(item)
 }
 
+// clearMetrics invalidates any in-flight metrics response as well as the
+// currently displayed view.
+func (m *Model) clearMetrics() {
+	m.metricsGeneration++
+	m.metrics = nil
+	m.metricsLoading = false
+}
+
 func (m Model) metricsText(width int) []string {
 	if m.opts.Metrics == nil {
-		return []string{m.dim().Render("Telemetry: no telemetry node is configured. No metric samples are available; operation history is still available.")}
+		return []string{m.dim().Render("Node metrics: no node metrics source is attached to this view. Operation history is still available.")}
 	}
 	if m.metricsLoading || m.metrics == nil {
-		return []string{m.dim().Render("Telemetry: waiting for the configured data source.")}
+		return []string{m.dim().Render("Node metrics: waiting for the current node_exporter sample.")}
 	}
 	view := m.metrics
 	if view.errText != "" {
-		return []string{m.warnStyle().Render("Telemetry unavailable: " + view.errText)}
+		return []string{m.warnStyle().Render("Node metrics unavailable: " + view.errText)}
 	}
 	series := view.series
 	if len(series.Samples) == 0 {
 		source := series.Source
 		if source == "" {
-			source = "configured data source"
+			source = "the node metrics source"
 		}
-		return []string{m.dim().Render("Telemetry: " + source + " returned no samples for this window; no graph is drawn.")}
+		reason := source + " returned no samples for this node; no graph is drawn."
+		if series.Note != "" {
+			reason = series.Note
+		}
+		return m.metricLines(series, []string{
+			m.dim().Render("Node metrics: " + m.clean(reason)),
+			m.dim().Render("freshness: " + m.metricsFreshnessText(series)),
+		})
 	}
 	unit := series.Unit
 	if unit == "" {
@@ -130,30 +155,88 @@ func (m Model) metricsText(width int) []string {
 	if source == "" {
 		source = "source not reported"
 	}
-	window := series.Window
-	if window <= 0 {
-		window = 5 * time.Minute
-	}
 	metric := series.Metric
 	if metric == "" {
 		metric = "metric"
 	}
 	last := series.Samples[len(series.Samples)-1]
-	freshness := "freshness unknown"
-	if !series.ObservedAt.IsZero() {
+	freshness := m.metricsFreshnessText(series)
+	var lines []string
+	if len(series.Samples) == 1 {
+		lines = append(lines, m.infoStyle().Render(fmt.Sprintf("Current %s: %.4g %s", metric, last.Value, unit)))
+	} else {
+		lines = append(lines, m.infoStyle().Render(sparkline(series.Samples, m.opts.ASCII, width)))
+	}
+	lines = append(lines, m.dim().Render(fmt.Sprintf("%s · %.4g %s · %s", metric, last.Value, unit, source)))
+	if series.Window > 0 {
+		lines = append(lines, m.dim().Render(fmt.Sprintf("%s window · %s · %d samples", shortDuration(series.Window), freshness, len(series.Samples))))
+	} else {
+		lines = append(lines, m.dim().Render(fmt.Sprintf("current sample · %s · no history retained", freshness)))
+	}
+	return m.metricLines(series, lines)
+}
+
+func (m Model) metricsFreshnessText(series MetricsSeries) string {
+	age, ageKnown := m.metricAge(series)
+	observed := ""
+	if ageKnown {
+		observed = "last sample " + shortDuration(age) + " ago"
+	}
+	effective := series.Freshness
+	if effective != "unknown" && effective != "stale" {
+		if ageKnown && series.StaleAfter > 0 && age > series.StaleAfter {
+			effective = "stale"
+		} else if effective == "" && series.Stale {
+			effective = "stale"
+		}
+	}
+	switch effective {
+	case "fresh":
+		if observed != "" {
+			return observed
+		}
+		return "fresh · timestamp unavailable"
+	case "stale":
+		if observed != "" {
+			return "stale · " + observed
+		}
+		return "stale · timestamp unavailable"
+	case "unknown":
+		return "freshness unknown"
+	}
+	// Sources that predate the explicit field retain the older behavior, but
+	// never turn an explicit unknown into an age computed from collection time.
+	if observed != "" {
+		return observed
+	}
+	return "freshness unknown"
+}
+
+func (m Model) metricAge(series MetricsSeries) (time.Duration, bool) {
+	if series.AgeKnown && !series.ReceivedAt.IsZero() {
+		age := series.AgeAtReceipt + time.Since(series.ReceivedAt)
+		if age < 0 {
+			age = 0
+		}
+		return age, true
+	}
+	if !series.ObservedAt.IsZero() && !m.now.IsZero() {
 		age := m.now.Sub(series.ObservedAt)
 		if age < 0 {
 			age = 0
 		}
-		freshness = "last sample " + shortDuration(age) + " ago"
-		if series.Stale {
-			freshness = "stale · " + freshness
-		}
+		return age, true
 	}
-	lines := []string{
-		m.infoStyle().Render(sparkline(series.Samples, m.opts.ASCII, width)),
-		m.dim().Render(fmt.Sprintf("%s · %.4g %s · %s", metric, last.Value, unit, source)),
-		m.dim().Render(fmt.Sprintf("%s window · %s · %d samples", shortDuration(window), freshness, len(series.Samples))),
+	return 0, false
+}
+
+func (m Model) metricLines(series MetricsSeries, lines []string) []string {
+	if series.Note != "" {
+		lines = append(lines, m.dim().Render(m.clean(series.Note)))
+	}
+	for _, detail := range series.Details {
+		value := m.clean(detail.Value)
+		lines = append(lines, m.dim().Render(detail.Label+": ")+value)
 	}
 	return lines
 }

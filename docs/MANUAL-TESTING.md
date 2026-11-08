@@ -1,6 +1,6 @@
 # Manual testing
 
-Acceptance checks for the v1 alpha and the record of real-server runs.
+Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 [MASTER](MASTER.md) owns scope, decisions (D-numbers below) and order; this file
 says what must work on a real server and what has been observed.
 
@@ -81,6 +81,49 @@ skipped; authenticated CI-token behavior was not retested. Evidence is in
 `950-*` under the fresh-session evidence directory. This publication record is
 not the alpha baseline pass; alpha.1 qualification rests on the operator
 confirmation above.
+
+### 2026-11-08 alpha.4 candidate publication (`edge-f1b5440c146b`)
+
+Candidate `f1b5440c146bcd605b4ebb4aec978d0b64eb96f1` published as
+`edge-f1b5440c146b`. Publish edge `42518693443` and CI `42518693394` both
+completed success. The signed edge manifest and each of the four platform
+binaries verified with cosign against
+`https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master`
+and issuer `https://token.actions.githubusercontent.com` (six `Verified OK`
+results). The manifest hashes were:
+
+| Platform | SHA-256 |
+| --- | --- |
+| linux/amd64 | `580cdf6c24e91c9af0d91bbe3006cad33e7b52a66e84e6b3f43196a8eec3444a` |
+| linux/arm64 | `ec01fb8d813ac3055f389de65d9ac6746d40d959a5b818b27b128bcf08c8c3f9` |
+| darwin/amd64 | `524554e7d2d05d3eb8dfc33bb27b9680f501e00d87197777d8d4956b79ed8fda` |
+| darwin/arm64 | `ecdcfe0e1685fd45d5ddbb7eef55bdd95449c802ff90ed50aeb5cb70f13734f8` |
+
+The downloaded linux/amd64 binary reports version `edge-f1b5440c146b`, channel
+`edge`, commit `f1b5440c146b`, `dirty=false`, go1.27.1, and `commands --json`
+exits 0. Root, `1.x` and `rc` manifests returned HTTP 404 at publication time;
+no stable pointer changed. This is an immutable edge publication, not an alpha
+tag or release cut.
+
+**Host application on the authorized `main`.** CLI `upgrade --channel edge
+--yes` moved `/home/mbv/.local/bin/eregion` from `edge-fa33befb675d` to
+`edge-f1b5440c146b` (previous binary kept as `eregion.prev`). Before the node
+apply, `operations list --state queued`, `--state running` and `--state
+cancelling` each returned zero. `apply --auto-upgrade-nodes` succeeded as
+`op_ae5673fc2d52cd61c867489aac65c849`: 4 applied / 16 skipped. The executed
+steps were `host-database-v1` (migration 026, schema 25/26 to **26/26**, River
+7/7), `host-api-service-v1`, `host-worker-service-v1` and
+`host-node-exporter-v2`. Migration 026's fail-closed cutover therefore passed
+with no in-flight deployment lifecycle operation; no operation was cancelled,
+no SQL repair was used and no legacy owner was backfilled. A second real apply
+`op_df0185c4f7be369426011590fc7dd00e` was **0 applied / 20 skipped**; a dry run
+reported 20 complete steps and no pending step. `server status` reports both
+sides `edge-f1b5440c146b`, node commit `f1b5440c146b`, schema **26/26**, River
+7/7 and all services active. `doctor` is **22 pass / 0 warn / 0 fail**, adding
+the `telemetry.local` row. No Cloudflare token, DNS record, unrelated app,
+domain or secret was touched. The authorized hostname was reused through its
+existing proxied record and returned to unbound/525 after the promotion work;
+no new DNS record was created.
 
 ### 2026-11-06 alpha.2 definitions and resources on `edge-ef4a6f879f45`
 
@@ -771,8 +814,9 @@ safety guard, not a new protocol or stable promotion claim.
 
 The alpha.3 source also adds the shared read-only container resolver for bare
 process/release commands. It is now host-qualified on `edge-9e71713eeff9` for
-the plain-Docker and Buildpacks paths below. Alpha.3 is **not tagged**; a
-snapshot, installer checks and tag publication remain future work.
+the plain-Docker and Buildpacks paths below. Alpha.3 is now tagged and its
+snapshot published; the tag itself has not been installed or manually
+host-tested, and the tag/snapshot checks are recorded below.
 
 Candidate `9e71713eeff9e2534452a913b54683e9a45e629c` published as
 `edge-9e71713eeff9`: Publish edge `42387096819` and CI `42387096776` both passed
@@ -837,8 +881,62 @@ Offline checks for this source change are
 `scripts/test-sign-release.sh` and
 `scripts/test-upload-guard.sh`; no tag, upload, bucket write, Docker, VM or
 database was used in that source-only pass. This host run is a targeted
-qualification, not a repeated full manual acceptance. Alpha.3 snapshot/tag and
-installer checks remain. No TOTP, secret value or unrelated app was touched.
+qualification, not a repeated full manual acceptance. Alpha.3 tag publication
+and installer checks are recorded below; the tag was not installed on the
+authorized node. No TOTP, secret value or unrelated app was touched.
+
+### 2026-11-07 — alpha.3 tag publication (succeeded; signed snapshot verified)
+
+PR #2 (`feat: deliver alpha.3 release`, merged 2026-11-07T16:13:59Z)
+squash-merged the tested source onto `1.x` as
+`b9fa7b962fa1520dde8a9acec4c0823389b1633c`. Its tree
+`46c7190129a5b65832aa2cdea6e5fcc451e3d1ca` is identical to `fa996d8` and
+differs from host-tested candidate `9e71713` only in `docs/MASTER.md` and
+`docs/MANUAL-TESTING.md`. The annotated tag object
+`9517303a3f5904151018f985a26c8d05fcb5ddc6` (tagger 2026-11-07T16:14:05Z)
+points at that commit and is not GPG-signed.
+
+Publish stable `42390263289` (event push, head `b9fa7b9`) completed **success**
+via `gh run watch` (exit 0); `classify` and `publish_prerelease` passed and the
+finals-only `publish` job was skipped. CI `42390263242` also passed via
+`gh run watch` (exit 0). The upload step wrote only the fifteen
+`releases/1.0.0-alpha.3/` files; the RC promotion step was skipped.
+
+The immutable snapshot at
+`https://eregion.mbvlabs.com/releases/1.0.0-alpha.3/` returns 200 for the
+manifest, signature, installer, four binaries, four `.sha256` files and four
+binary signatures. The manifest reports `schemaVersion: 1`, `channel: stable`,
+`version: 1.0.0-alpha.3`, and the exact release base URL. Responses carry
+`Cache-Control: public,max-age=31536000,immutable`. Cosign verified the manifest
+and each binary against
+`https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0-alpha.3`
+and issuer `https://token.actions.githubusercontent.com`; all five returned
+`Verified OK`. Each binary and `.sha256` matched:
+
+| Platform | SHA-256 |
+| --- | --- |
+| linux/amd64 | `58a91dd99ca000395abba253eb5b8529c4a40a516cc4f1035b09de159bb8ad48` |
+| linux/arm64 | `83d703eab5d8ebcaaa1c8a99de09f73c3b8fcd12aab420f1bc7d691599b02b91` |
+| darwin/amd64 | `81f71e184fdff71d64da029ac2efd852e4edc3149cac3ea3e3d387d04ed5c32a` |
+| darwin/arm64 | `ca688837a52906d46e88688eb915f6b21fc06e9a18360b9981a5ef2f5e3e3e1e` |
+
+The linux/amd64 binary reported `version=1.0.0-alpha.3`, `channel=stable`,
+`commit=b9fa7b962fa1`, `dirty=false`.
+
+The snapshot installer has `snapshot_version="1.0.0-alpha.3"`, resolves the
+version manifest under `/releases/1.0.0-alpha.3/`, is syntactically valid
+(`bash -n`), and refused a mismatched `--version 1.0.0-alpha.2`. A local
+installer run verified the manifest and binary signatures/hash and installed
+the snapshot; it was not on the authorized node, and the prior
+`edge-9e71713eeff9` CLI was restored afterward.
+
+**Caveats.** The tag annotation is unsigned; authenticity rests on the cosign
+bundles. `install.sh` is version-pinned but is not one of the cosign-signed
+files. Root, `1.x` and RC manifests remain HTTP 404, so no stable pointer
+moved. The edge pointer is `edge-fa996d809378`, produced by the master merge,
+not by this tag workflow. The tag itself was not installed or manually
+host-tested on the authorized node; host qualification remains the targeted
+`edge-9e71713eeff9` run above on the same source tree.
 
 ## Developer checks
 
@@ -905,6 +1003,397 @@ sanitized operation evidence. Alpha.1 remains operator-qualified.
   manual fallback when it is unavailable or lacks permission. Check failure
   and retry behavior, JSON/no-TTY operation, and secret-safe output.
 
+## Beta acceptance — Cloudflare DNS automation (not run)
+
+This is the beta acceptance definition for MASTER D26. **No real-host or real
+Cloudflare run is recorded for this change.** The isolated checks below are not
+host qualification, and no zone, token or DNS record was read or mutated.
+
+| Check | Pass means |
+| --- | --- |
+| Plan only | `eregion --context main domain add <app> <env> <hostname> --dns cloudflare --dns-zone ZONE --dns-origin ADDRESS --dns-proxy dns-only --dry-run --json` authorizes `dns.read` before token access, returns the ordinary preview plus the explicit public origins, a real `dns_provider` snapshot and changes; Cloudflare receives only list reads and no record is mutated. A CNAME is a conflict even with the exact marker. Non-managed TXT/CNAME content, comments, TTL and proxy state are redacted. |
+| Explicit apply | The same command without `--dry-run` authorizes `dns.write` before any operation/ledger commit, then accepts an operation; the worker reconciles only the exact A/AAAA records for the named hostname and records applied/unchanged. Creates/updates run before obsolete deletions, and the complete desired A/AAAA set is re-read and verified before any obsolete owned record is deleted. An A-to-AAAA or AAAA-to-A replacement keeps the old address until the replacement exists; a failed replacement create leaves the old record intact. A provider failure leaves the saved binding and reports the failure without setting `dns_state` or readiness. |
+| Origins | `--dns-origin` is required on add and each value is a validated public IPv4/IPv6 address. Private/RFC1918, CGNAT `100.64/10`, loopback, link-local, multicast, unspecified, documentation, benchmarking, reserved and hostname values are refused; IPv6 must be in the global `2000::/3` unicast range. IPv4 and IPv6 cases are covered by tests. The context's WireGuard management endpoint is never used as the origin. |
+| Zone validation | Admission validates that the configured zone actually contains the hostname before writing operation/ledger intent. A pending/failed invalid ledger with no applied generation can be discarded on removal without a provider call; an invalid applied ledger fails closed and is retained. |
+| Serialization | While a domain removal is queued or running, a readd or primary promotion for the same environment is refused with `conflict`. A delayed removal revalidates that it is still the newest domain intent and that the binding was neither promoted nor re-created after admission; it does not delete the new binding. |
+| Cancellation | An attempt-fenced cancellation check runs before every DNS provider effect, again after it, and before each mutation in a multi-record plan. The worker's claimed attempt is propagated explicitly through domain and app/environment deletion cleanup, so a newer attempt loaded from the operation snapshot cannot authorize the effect. A cancellation accepted beforehand leaves provider records untouched and the ledger/cleanup state intact; a mid-plan stop leaves earlier convergent A/AAAA changes for an idempotent retry. Cancellation after provider effects but before binding deletion also retains state and never reports success. Binding/domain row deletion and finalization recheck cancellation under the operation row lock. |
+| Ownership | A pre-existing foreign record at the hostname, including a legacy `eregion:managed` record, makes apply fail closed with `precondition_failed`; the foreign record is untouched. Any CNAME is a conflict even when its comment exactly matches the binding marker; managed DNS is A/AAAA only. A record for another hostname in the same zone is never changed or deleted. Ownership is re-read immediately before each mutation and the desired replacement set is verified before obsolete records are deleted; the Cloudflare no-CAS external-writer race is explicitly reported. |
+| Proxy mode | `--dns-proxy dns-only` and `--dns-proxy proxied` produce the explicit provider `proxied` value; omission is a usage error, never inferred. |
+| Manual default | Manual DNS remains the default for unmanaged bindings. A managed binding’s removal uses its persisted ledger even without DNS flags; re-add/promotion preview and result show the persisted managed zone/origins/proxy rather than a false manual input. |
+| Removal | `domain remove … [--dns cloudflare --dns-zone ZONE]` uses the persisted ledger to delete only exact-owned A/AAAA records; a foreign A/AAAA or any CNAME at the hostname (even with the exact marker) fails closed and the binding/ledger remain for retry. After the delete requests, the exact hostname is read again and cleanup is marked verified only when no exact-owned A/AAAA remains and no conflict appeared; a read failure, reappeared record or conflict retains the ledger. App/environment deletion preflights every managed binding (operation ownership, authorization, zone/host recovery, provider read, exact ownership/conflict) before the first provider mutation, so an obvious refusal leaves every record untouched, and a provider cleanup failure leaves the app, workload containers, routes, rows, ledger and credentials intact for retry. After that point provider effects are not atomic: a later binding failure or cancellation can leave earlier bindings cleaned and later bindings unchanged or partially changed; the event reports how many bindings were processed and does not claim records were preserved. If provider cleanup succeeds and a later node step fails or is cancelled, DNS may already be removed while some workloads remain and the ledger is retained; a later route-write failure can leave only rows to retry after DNS and workloads are gone. Events state which effects completed, retry resumes, and this is not claimed as a single atomic transaction or a public-availability guarantee. The primary binding is cleaned through environment/application deletion. |
+| Durable state | Migration 025 gives every domain an immutable `dom_…` ID and a `platform_domain_dns` ledger row written in the same transaction as the operation and River job. It stores provider, zone ID/name, exact marker, generation, desired origins/proxy, last operation, state and cleanup status. The ledger remains until provider cleanup is verified. Recreating a hostname gets a new ID and cannot adopt the previous record. |
+| Secrets | The token comes only from the configured root-owned `0640` service-group file (or an owner-only `0600` development file); argv, action input, River arguments, operation events, ordinary output, ledger rows and error details contain no token. The root node RPC reads as owner and the `eregion` worker reads through its primary group from the same regular, non-symlink file; the path is walked from `/` with descriptor-relative no-follow opens, and unsafe owners, modes, special bits, writable immediate directories, symlinks, FIFOs and devices are refused. Provider reads and writes are authorized separately; unauthorized admission leaves no operation or ledger row. Every intent/success/unchanged/failure is audited. |
+| Idempotence | Repeating apply or removal with the same explicit inputs makes zero provider mutations after the first convergence; an uncertain create/readback is re-read and converges without adopting a foreign record. |
+
+**Host/database evidence boundary.** Migration 025 and the ledger/cleanup/delete
+order integration tests were run against a disposable local PostgreSQL 18.6
+cluster under `/tmp/opencode` and passed. Migration 025 was applied to the
+authorized main node on 2026-11-08 as part of the telemetry beta candidate
+(schema 25/25). No provider token or real DNS record was read or mutated, and
+the Cloudflare flow remains not host-qualified. Pre-ledger name-based ownership
+markers are not migrated or adopted; only the new immutable domain-ID ledger is
+used. The existing Cloudflare no-CAS external-writer race remains documented,
+not claimed solved.
+
+**Offline evidence (2026-11-08).** Source-only tests use a fake Cloudflare HTTP
+server. They cover read-only dry-run planning after read authorization, explicit
+public origin validation (IPv4/IPv6), update/create/delete scoping, ownership
+rechecks before mutation, legacy and foreign-record conflicts with redacted
+foreign content, exact-marker CNAME rejection for both apply and removal,
+duplicate/ambiguous ownership, cross-domain preservation, per-record mutation
+guards with convergent partial retry, app/environment deletion proving a failed
+Cloudflare cleanup runs no node workload step and preserves the app/workloads,
+multi-binding deletion proving a preflight conflict mutates no record and that a
+later-binding delete failure, post-delete read failure or mid-cleanup
+cancellation retains the ledger and workloads, reports the processed binding
+count and converges on retry, create-before-delete A/AAAA replacement,
+replacement-create failure retaining the old record, replacement-delete failure
+retaining both records until retry, post-delete owned-record reappearance and
+read-failure refusal with ledger retention, explicit proxy, removal and
+idempotence, write-before-token authorization and admission refusal, audit
+refusal, token non-disclosure, credential-file policy for distinct root/worker
+UIDs and GIDs, descriptor-relative ancestor walking, unsafe-ancestor/symlink and
+nonblocking-FIFO rejection, CLI flag/non-TTY
+handling, operator preview plumbing, immutable ownership identity, persisted
+managed preview and result records, zone/hostname validation,
+cancellation-state retention, admission guarding and stale-removal identity
+checks. The database integration tests for migration 025, unauthorized
+admission, ledger persistence, cleanup, cancellation boundaries, a deterministic
+attempt takeover between worker claim and reloaded snapshot, and the
+app/environment deletion ordering regression were run against a disposable local
+PostgreSQL 18.6 under `/tmp/opencode`; all passed. No Docker, VM, real server,
+zone, token or DNS was used or mutated.
+
+## Beta acceptance — node-local telemetry (host-qualified on `edge-fa33befb675d`)
+
+This is the beta acceptance definition for MASTER D5. The host run below records
+the authorized main-node check; it is a targeted telemetry qualification, not a
+full fresh-server baseline or a beta release. Cloudflare DNS automation remains
+not host-qualified.
+
+| Check | Pass means |
+| --- | --- |
+| Snapshot shape | On the authorized main node, `eregion --context main metrics show --json` returns schema `eregion/node-metrics/v1` with node identity, exporter version, `fetched_at` recorded after the second response, `observed_at` from the second scrape only, freshness, and `scrape.endpoint` = the node's WireGuard address (`http://10.78.0.1:9100/metrics`), `access: wireguard`, `public: false`, `authentication: none`. No token, public URL or password appears. |
+| Values | CPU, memory, filesystem, load and uptime are present and plausible, and agree with a separately read `node_cpu_seconds_total`/memory/filesystem/load sample within a reasonable tolerance. CPU is computed from the one-second counter delta and may legitimately be 0.0% on an idle host; `logical_cpus` matches the exporter. node_exporter v1.11.1 emits the eight modes `user`, `nice`, `system`, `idle`, `iowait`, `irq`, `softirq` and `steal` in `node_cpu_seconds_total`; guest time is a separate `node_cpu_guest_seconds_total`. Every observed CPU needs those eight modes in both reads, otherwise `cpu` is null with an issue; a partial family is never presented as a numeric zero. Legacy guest/guest_nice series are ignored for the denominator. |
+| Missing values | Remove or rename a needed gatherer in an isolated fixture, or point the check at a counter reset: the field is null and `issues` names the field and reason. The plain form says `unavailable`; no zero, empty graph or healthy state is fabricated. A missing second `node_time_seconds` leaves freshness unknown even if the first scrape carried one. |
+| Truthful failure | With node_exporter stopped, `metrics show` fails `unavailable` and names `node-exporter.service`/`wg0`; with malformed, timestamped or duplicate relevant samples, a materially future exporter timestamp or oversized text it refuses/returns an explicit unknown rather than rendering partial, old or clamped-fresh data. Invalid label escapes/separators and unsupported sample timestamps are refused while valid label whitespace and a single trailing comma are accepted; unrelated malformed lines are ignored. It still works when PostgreSQL is unreachable. |
+| No backend | The command opens no telemetry server, external URL, Prometheus/Loki, database or history store. `--json`, no TTY and pipes do not prompt; the operator only reads the node over SSH in WireGuard. |
+| Workspace | Fleet detail shows one current CPU sample and current memory/filesystem/load/uptime facts, with source and explicit freshness; unknown or stale freshness is shown independently of CPU availability and is never replaced by collection time. It carries the node-computed age and threshold, ages it with monotonic local receipt time, and a focused-detail refresh re-queries metrics. A query naming a different node is refused, not relabeled; an older metrics response cannot overwrite a newer request after a refresh. Envs shows no invented request graph or history. |
+| Sanitization | Exporter-provided values such as node identity, exporter version, CPU labels, filesystem device and mountpoint contain no terminal control or format characters in plain output or JSON. |
+| Readiness | `server status` and `doctor` show `node-exporter.service` active on the main node; the `services.running` row covers it alongside the other required services. A stopped exporter is visible rather than silently absent. Compare the named row and reported summary; the doctor's total row count is not a fixed contract. |
+| Regression | `metrics show`, `commands --json` and the plain/JSON envelope expose the same command and snapshot; unit tests cover fixtures, counter reset, missing values, node-RPC selection, CLI and workspace reuse. |
+
+The later textfile/systemd collector extension and its `telemetry.local` doctor
+row are a separate section below; they are not part of the recorded
+`edge-fa33befb675d` run and remain not host-qualified.
+
+**Host run (2026-11-08, `edge-fa33befb675d`).** The candidate
+`fa33befb675d1a2bb6794283853ab3cbeae1904c` published as
+`edge-fa33befb675d`; Publish edge `42432197965` and CI `42432197908` passed
+via `gh run watch`. The signed manifest verified with the pinned edge identity;
+linux/amd64 SHA256 was
+`ef0f0388b6972cde799c3c21183e66f2f8a96a550bff6e44b15aad784034cd09`.
+
+Before the upgrade, CLI/node were `edge-9e71713eeff9` with schema **24/24**.
+CLI and node were upgraded; apply `op_ff005d3f9ca17f48f59ffd0f152f06ea`
+executed `host-database-v1` and moved schema from **24/25 to 25/25**, River 7/7.
+No other database or server target was touched. `server status` reports both
+sides `edge-fa33befb675d`, node commit `fa33befb675d`, schema 25/25 and
+`node-exporter.service` active. `doctor` is **21 pass / 0 warn / 0 fail**.
+A second real apply `op_fcb885a96a4e5f5521926d8433b98133` was a no-op:
+**0 applied / 20 skipped**, with no executed steps. `apply --dry-run` was 0 of
+20.
+
+`metrics show` plain output was read successfully in a no-TTY shell: exporter
+`1.11.1` at WireGuard `http://10.78.0.1:9100/metrics`, sample marked
+`fresh (under 1s old)`, CPU `2.0%` of 2 CPUs, memory `851.8 MiB used of 7.6
+GiB`, load `0.10 0.10 0.09`, uptime `3d 15h 34m`, and real `/` and `/boot/efi`
+filesystems. JSON returned schema `eregion/node-metrics/v1` with
+`scrape.access=wireguard`, `public=false`, `authentication=none`; `logical_cpus`
+2; CPU `utilization_percent=4.2654`, exactly
+`(2.1100-2.0200)/2.1100*100`; memory/filesystem/load/uptime populated; and
+freshness `age_seconds=0.0471`, `threshold_seconds=30`, `state=fresh`.
+`fetched_at` minus `observed_at` was the same 0.0471s.
+
+A direct `curl` of the actual exporter over the node's WireGuard address
+returned **HTTP 200**, 97,364 bytes in 0.0456s. Its `node_exporter_build_info`
+reported v1.11.1, `node_uname_info` matched host `exploration`, kernel
+`7.0.0-30-generic`, x86_64, and `node_load1/5/15` matched the JSON exactly.
+Memory available and `/` filesystem available differed only by about 12 MiB and
+4 KiB respectively because the scrape and `metrics show` were separate samples
+about three seconds apart. No HTTP error occurred; the explicit unavailable/
+malformed/freshness error paths were covered by the unit suite
+(`TestMetricsShowUnavailableValuesAreNotZero`, telemetry tests) rather than
+induced by stopping the exporter. The interactive TUI was not exercised; plain
+and JSON no-TTY output were.
+
+No Cloudflare token was read, no DNS record was changed, and no domain command
+was run. Existing public URLs remained HTTP 200 and the designated hostname
+remained 525.
+
+**Source-only regression evidence (2026-11-07).** Isolated tests cover the
+pinned v1.11.1 eight-mode CPU set in both reads, separate guest metric
+tolerance, duplicate consumed-series rejection,
+second-scrape-only `observed_at`, completion `fetched_at`, materially future
+timestamps becoming unknown without a clamped fresh age, malformed and
+timestamped relevant samples, strict label grammar/escapes with valid label
+whitespace and trailing comma, label-value sanitization, explicit workspace
+freshness (`unknown` and `stale`) independent of CPU, node-computed
+age/threshold with monotonic receipt aging, focused-detail refresh re-query, the
+metrics response generation fence, and refusal of a workspace query for a
+different node. No real exporter, WireGuard read or host run is recorded.
+
+## Alpha-ready — staging-to-production promotion (targeted host pass on `edge-f1b5440c146b`)
+
+This is the acceptance definition for MASTER D23. Targeted host runs on the
+authorized `a2defs1106` fixture are recorded below on 2026-11-08. They cover the
+preview, exact-artifact pin, production config, same-key replay, duplicate
+refusal, a forced failed candidate that left the previous release serving, retry
+success and rollback. A second fixture pass with purpose-built scratch images
+covers release-command execution in staging and production, once-only restart,
+and production secret injection plus the recorded secret/revision snapshot on
+rollback. Concurrent host change remains not run. Run further mutating checks
+only on an authorized disposable app and server, never on a live production app
+that has not been authorized.
+
+| Check | Pass means |
+| --- | --- |
+| Setup | An authorized app has `production` and `staging` on the same node, each with a distinct image release and its own primary domain. Production has production-only plain config (`ROLE=production`), a production-only secret name/value, and a production release command; staging has different config (`ROLE=staging`), a different secret, and a different release command. Both deploy and serve. |
+| Preview | `eregion env promote <app> staging --dry-run --json` returns `kind: platform.promote`, target `env/<app>/production`, the source serving release ID, its exact immutable image ID and commit, production's current revision and serving release, and zero operation count change. It performs no build, release insert, domain change, secret write or production container change. A preview with the same `--idempotency-key` and identical normalized input reports the replay; the same key with changed input returns `conflict` before source resolution. |
+| Exact artifact | A real `eregion env promote <app> staging --json` (or followed plain form) is accepted and completes. The source serving release is resolved and pinned **at submission**, not at worker execution. Production's new serving release has the same image ID and commit as the staging release that was serving at submission; no `platform_builds` row is created for the promotion. A later staging advance does not change the promoted artifact or operation input. |
+| Production state | The promoted production containers carry production's plain config, resolve production's current secret names/values and use production's current release command. Staging config, secret values, secret names, domains and release command do not appear in production. Production's primary domain and aliases remain exactly as before; no domain is added, adopted, changed or removed. |
+| Release command | Production's release command runs once for the new production release, before the switch. A production `restart` after promotion skips the succeeded command; `rollback` to an earlier production release follows its recorded command/secret snapshot. No staging release command runs in production. |
+| Blue/green | The previous production release keeps serving until the candidate passes health and the production primary-domain public check. A forced candidate failure leaves the previous production release and route serving, and the promotion operation fails rather than claiming a switch. |
+| Validation | A source with no serving release, a source release that is not ready or has no immutable image, a pruned release, a different-node source, a missing production environment, a production without a primary domain or a failed explicit-release deployability gate is refused before acceptance with the named precondition. `env promote` cannot target another environment; a source equal to production is refused. |
+| Idempotency/concurrency | Reusing the same `--idempotency-key` returns the original operation and creates no second release or deployment; the same key in a dry-run or interactive preview also reports the replay. A promotion is refused while **any** production deployment is active, including a different artifact, and while the exact artifact is already serving production; no new production release row is created. Concurrent promotions serialize on the production row: one is accepted and the other conflicts. If an ordinary deploy is queued after a promotion and runs first, the promotion rebinds its recorded previous release/deployment at execution, so cleanup and rollback target that actual predecessor, and the same holds when the promotion runs first. |
+| Agent safety | `--json` and no-TTY never prompt; the command has `--dry-run`, `--detach`, `--poll-interval` and `--idempotency-key`. It is not destructive, has no human-factor prompt and does not accept a target override. |
+| Isolation | The command always stays inside one app. No source secret, config, domain, release command or build metadata is copied. |
+
+**Host run (2026-11-08, `edge-f1b5440c146b`, authorized `a2defs1106`).**
+Production was serving `rel_b19f552b5afb5a727b7e7b897f59c181` (image
+`sha256:00832163…`, config `APP_BUILD=beta`) and staging had no release. Their
+revisions were given different config (`APP_BUILD=staging` vs
+`APP_BUILD=production`), different secret names (`STAGING_SECRET` vs
+`PROMO_SECRET`) and the authorized `eregion-alpha-two.mbvlabs.com` hostname was
+used for staging first. Staging deploy `op_11d3876fb705f3f79d95265188d73a7e`
+succeeded as `rel_c2aa240bf7f3032b64324b0cf601ce19`, image
+`sha256:b472757ee2279004e3229b25e620ff29ab2cd3335fd4fe59f3d67aa603c7ef33`;
+`/healthz` returned 200 and `/build` returned `staging`. The authorized hostname
+was then moved to production (existing proxied DNS record only, no provider
+call); production observed route applied, DNS proxied, certificate valid and
+public 200, and its existing `/build` still returned `beta`.
+
+Preview with key `f1b-promo-preview-1` returned `kind: platform.promote`, target
+`env/a2defs1106/production`, source release `rel_c2aa…`, source image ID
+`sha256:b472757e…`, production revision `erv_f6d85f295e5ee561c79a1fcb63c7885c`
+and serving release `rel_b19…`; the capped `operations list --limit 200` output
+returned 200 entries before and after (its maximum), and the preview created no
+operation, release, domain, secret or production container change.
+Real promotion `op_97c6fc15c288fd8949b2380738497ff3` succeeded as
+`rel_17e95932c935f0ca3cf937455fe39255`; its image ID is exactly
+`sha256:b472757e…`, no build ID is recorded, the container step reported the same
+digest, and `/build` returned `production`. Production's revision secret names
+are `PROMO_SECRET` and `SHARED_SECRET`, not `STAGING_SECRET`; runtime secret
+value injection could not be observed on that first image because it exposes no
+endpoint for it, and is covered by the second fixture pass below. A same-key resubmission returned the original operation, the same-key
+dry-run reported `replay: true` with that operation, and a new-key duplicate was
+refused with `conflict: production already serves the exact source artifact`.
+
+For the forced failure, production was rolled back to `rel_b19…`
+(`op_914561857a33a8378eed04f610a5c95b`), its health path was changed to
+`/missing` (`op_19a9b9380da2b30187e939b97deb9b50`), and promotion
+`op_ef84f8e631717f754ef40ee789d3fad8` was accepted. The candidate health step
+observed HTTP 404 and failed; the event reports the failed release
+`rel_f76ea33bc14918af6077c0e4a27fcde8` was not recorded as serving and
+`rel_b19…` still served. The public `/healthz` returned 200 and `/build` returned
+`beta` after the failure. Health was restored to `/healthz`
+(`op_fb825b247776ca4d2c1c6d08ed3e0dfc`), retry promotion
+`op_2804d698d1baa521859485d5c42f96e4` succeeded as
+`rel_845df06abc20275300ba01ec2e0d6242` with the same exact image, `/build`
+returned `production`, and a final rollback
+`op_d01367a6b146980ccadb881cb114fa0c` restored `rel_b19…` with `/build` back to
+`beta`.
+
+The first fixture image is a single scratch `/app` binary with no `/bin/sh`, no
+busybox and no release-command entrypoint. Attempts to set a shell release
+command failed with `executable file not found` / `stat /bin/sh: no such file or
+directory`; those commands were cleared rather than forced. That image could not
+exercise release-command execution or runtime secret injection. No source
+config, source secret name or source release command was copied; production
+`/build` proves its own plain config applied.
+
+**Release-command, restart and secret-snapshot completion (second fixture
+pass).** A purpose-built static fixture was compiled locally, built into two
+scratch images and pushed with ordinary `eregion image push` into the existing
+app repository: variant A
+`sha256:a40f79f446ba7ed1cacd1f8c04e059dc7aed84cd616556a3c9b0f34ca5f49c07`
+and variant B
+`sha256:24081ea9ed15253156a43afb1eb08fb0616df8860ce4e83ba10dab3cfca82622`.
+The fixture's `/secret` and release mode report only `set`/`unset`/`match`/
+`mismatch`; `PROMO_EXPECT_SHA256` is a hash of the production secret used to
+compare the injected value. No secret value was printed. Staging image A
+deploy `op_488f6b835f3f04bbdfccec38279e87e2` served
+`rel_fcc4002fb6f88d666595a82eb2bb1864`; its release command ran once with
+`release-check variant=a build=staging role=staging promo=unset staging=set shared=set expect=unset`,
+and `/build`, `/secret` and `/` returned `staging`, `staging=set`, and
+`alpha4-staging`.
+
+The first production promotion with the new image (`op_b3f0ef9e5a95bcc9a48fb14bf5857eb7`,
+release `rel_5f2499d30a8aa1fcf1b53fc7ba80bf83`) executed the command but reported
+`promo=mismatch`; the fixture-side comparison hash had included the secret
+file's trailing newline while `secret set` trims it. That release remains only
+in history, not serving. Production was rolled back to `rel_b19…`
+(`op_d10460aea7615ac1f2cdfaf6f6788904`), the comparison hash was corrected
+(`op_83f833b6b5bbb2b6f60590855fefbcd4`), and promotion
+`op_6b6f0dbb29a47a5cff71ac1fff6f487f` succeeded as
+`rel_ae27b5eaeec72503ee71a7fc405138d4` with image A. Its command output was
+`release-check variant=a build=production role=production promo=match staging=unset shared=set expect=set`;
+`/build` returned `production` and `/secret` returned `promo=match staging=unset
+shared=set`. Restart `op_7067a429671cadd525af83270eea8e1f` logged
+`release command already succeeded for this release`, executed no
+`platform-command-01-v1` step, and kept serving.
+
+The production secret was then rotated to a second value (secret revision 3),
+`PROMO_EXPECT_SHA256` was updated, and staging image B was deployed as
+`op_35b4137afedd6bd8bba090887e09aa0f` / release
+`rel_ee1c1680a4bb50d755300d28f3fdfd6a`; its command output was
+`release-check variant=b build=staging role=staging promo=unset staging=set shared=set expect=unset`.
+Promotion `op_199e140e3df12ef0449e908f18f2f993` succeeded as
+`rel_4b9f78aa990492aa6b379b21dea5245c` with image B and command output
+`release-check variant=b build=production role=production promo=match staging=unset shared=set expect=set`;
+`/secret` matched with the second production value. Restart
+`op_354cba46f851cf2f1c1c4599b91e6ec3` again logged
+`release command already succeeded for this release`, executed no command step,
+and kept serving.
+
+Rollback `op_66a976c3b62345cc69e0a7f7f2b02087` to the earlier image-A release
+`rel_ae27b5eaeec72503ee71a7fc405138d4` logged the same skip message and executed
+no command step. `/secret` returned `promo=match` and `/` returned
+`alpha4-fixture variant=a version=alpha4-prod` while the current production
+revision was `alpha4-prod2` with the rotated secret and second comparison hash.
+That is the recorded secret/revision snapshot, not the current revision or
+current secret value. No staging release command ran in production; the staging
+command only appeared in staging deploys. This completes the promotion
+release-command, once-only restart and production secret snapshot/injection
+checks.
+
+**Cleanup.** The primary binding was returned to `a2-primary.invalid`
+(`op_e9d9a1c3c0939f7df5c636b6e8fc8cc0` first pass; `op_600bd50719a398c587b4f4528e39e428`
+second pass), the authorized hostname binding was removed from production
+(`op_7f96df5e6abed37534d591a71d0cb48d`) and staging
+(`op_ec444c6a462b6c3a00fd515a491af379`), and its DNS record was never changed;
+the URL returned to Cloudflare 525. Production was rolled back to `rel_b19…`
+(`op_2d279c0c4fa13d509c1d4e8006524058`), config was restored to `APP_BUILD=beta`
+with `EXTERNAL_URL` (`op_082cc7165abd2c4c39ff40e44b629952`,
+`op_a2f6dfce99148abb108d0d6e53c5455d`), and release command is again empty
+(`op_3f0085ec681b4d57ff5786709c8509fa`). Staging was rolled back to
+`rel_c2aa…` (`op_ecf397ed633291a2474ddf006ed1fec1`), its current revision was
+restored to image `sha256:b472757e…` with `APP_BUILD=alpha2` and no release
+command (`op_b646d333bac803479513dbed611c0fe2`,
+`op_0782391479963aa47b3b3e8e03b50cb5`,
+`op_6b3097a3596349bf1c37965ac37e09c3`), and its placeholder primary was restored
+before the authorized binding was removed
+(`op_437973a5fa91234c18f33fc71d680b2f`). Staging retains the
+`staging-placeholder.invalid` primary because a primary domain cannot be
+removed and a definition cannot remove every binding; no DNS record exists for
+it. The local fixture images were removed after use. Registry manifests A and B
+remain referenced by release history (`rel_5f2499…`, `rel_ae27…`, `rel_4b9f…`
+and the staging A/B releases) and were left in place rather than break
+rollback/history. `PROMO_SECRET` remains an active encrypted test secret at
+revision 3 with the second test value; `STAGING_SECRET` remains at revision 1.
+All generated value and hash files were 0600, never printed, and were shredded.
+No app or environment deletion, no TOTP action, no Cloudflare call, no new DNS
+record and no unrelated app/domain was used.
+
+**Source-only evidence (2026-11-08).** `TestPromoteNormalizesFixedProductionTarget`
+covers target/source/self/app validation. `TestEnvironmentPromoteDryRunIsFlagOnlyAndTargetsProduction`,
+`TestEnvironmentPromoteRefusesProductionAsSourceWithoutSubmitting`,
+`TestEnvironmentPromoteDryRunPassesIdempotencyKey` and the catalog metadata test
+cover the CLI, including the supplied key in JSON and plain dry-run previews.
+`TestValidatePromotionStateRefusesUnsafeSources`
+covers no-serving, changed source, wrong environment, pruned, not-ready,
+no-image, different-node, cross-app and self cases. The PostgreSQL/River
+integration tests
+`TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState` and
+`TestIntegrationPromotionAdmissionSerializesProductionDeployments` cover the
+exact image pin at submission, no build, production config/secret/command
+selection, the blue/green serving switch, `promotion.succeeded` history,
+same-key replay, duplicate refusal, refusal behind a queued different-artifact
+deploy, concurrent-promotion serialization, and execution-time previous-release
+rebind when a later ordinary deploy runs first. The first promotion integration
+test passed in the earlier round before the admission/preview-hash changes; the
+updated test and the new admission test were **not run here** because no private
+disposable PostgreSQL was provided. That isolated pass exercised no host; the
+targeted host runs above cover the preview, exact artifact, production config,
+failure, replay, rollback, release-command execution, once-only restart and
+runtime secret snapshot/injection. Concurrent host change remains not run.
+
+## Local telemetry collector foundations (host-qualified on `edge-f1b5440c146b`)
+
+This is the acceptance definition for the D5 textfile/systemd extension. It was
+applied to the authorized `main` node on 2026-11-08 as `host-node-exporter-v2`
+under node apply `op_ae5673fc2d52cd61c867489aac65c849`. The directory,
+collector, listener, doctor and `metrics show` portions below passed; the
+temporary textfile-producer/malformed-file variant was **not run** because the
+operator session has no noninteractive sudo. The destructive stopped-exporter
+test was **not authorized and is marked skipped**; no node_exporter service was
+stopped. Run further mutation only with explicit authorization on a disposable
+or maintenance-authorized node.
+
+| Check | Pass means |
+| --- | --- |
+| Versioned step | `eregion plan --json` lists `host-node-exporter-v2` once on a node with the old `host-node-exporter-v1`; unrelated steps stay skipped. `apply` creates `/var/lib/node_exporter` and `/var/lib/node_exporter/textfile` as root:root `0755` real directories, refuses a symlink/non-directory instead of mutating it, writes `node-exporter.service` with `--collector.textfile.directory=/var/lib/node_exporter/textfile` and `--collector.systemd` with the narrow unit include, and restarts only node_exporter. A second `plan`/`apply` is a no-op. An existing safe root-owned non-writable directory with the wrong mode (including setuid/setgid/sticky bits) is set to exact `0755`; special bits are cleared explicitly after numeric chmod, the resulting mode is verified, unsafe ownership or group/other writability is refused without mutation, and a symlink is never followed. |
+| Listener | `ss -ltnp` (or the host firewall view) shows node_exporter bound only to the WireGuard address `10.78.0.1:9100`; no public listener, token, basic-auth file or external endpoint is created. |
+| Textfile collector | Over WireGuard, the exporter response has `node_scrape_collector_success{collector="textfile"} 1` and exactly one unlabelled `node_textfile_scrape_error 0`. A temporary root-owned `0644` fixture file in the textfile directory with a documented test family appears in the scrape; removing it removes the family. A malformed/unreadable fixture makes `node_textfile_scrape_error` non-zero (or makes the sample missing/ambiguous) and `doctor` fails instead of trusting collector success alone. No permanent `eregion_*.prom` self-metric is claimed without a real producer. |
+| Systemd collector | The response has `node_scrape_collector_success{collector="systemd"} 1` and series for the narrow set, for example `node_systemd_unit_state{name="eregion-worker.service",state="active"} 1`, Caddy, Docker and `wg-quick@wg0`. An unrelated host unit outside the include is not collected. |
+| Health | `doctor` includes `telemetry.local` and passes only with the strict root:root 0755 parent and textfile directories present (no setuid/setgid/sticky bits), both collectors successful with one unambiguous untimestamped success sample each, and one unambiguous `node_textfile_scrape_error 0`. With node_exporter stopped (authorized maintenance) it fails and names `node-exporter.service`/`wg0`; with a directory missing, symlinked, wrong owner/mode or special mode bits it fails and names the path; a missing, duplicated, malformed, labelled, timestamped or non-zero textfile error fails, and a duplicated/timestamped/malformed collector success is ambiguous and fails. A down WireGuard interface reports the collector health as unobserved as **warn**, not pass, while an independent directory error still fails; unknown WireGuard plus an unreachable endpoint is also warn, not a fabricated pass. |
+| Scrape example | From a host with a WireGuard route, the documented Prometheus or Alloy static target `10.78.0.1:9100` reads the metrics; from a host without the route it does not. The example is read-only, has no credential and is not installed by eregion. |
+| Regression | `metrics show` plain/JSON remains `eregion/node-metrics/v1`, does not include a new history/store, and still works with the control database unavailable. `commands --json`, doctor row counts and existing services rows are compared by name/summary, not assumed totals. |
+| Boundaries | The node still has no telemetry server, Prometheus/Grafana deployment, authenticated external endpoint, `targets.json`/`http_sd` discovery, credential rotation, central store, alerting or retained history. These remain follow-ups, not parity claims. A future optional separate telemetry node or Grafana is not prohibited long-term but is out of beta/v1 scope. |
+
+**Host run (2026-11-08, `edge-f1b5440c146b`).** `apply` executed only
+`host-node-exporter-v2` alongside the database and service restarts; a second
+apply was 0/20. `stat` reports `/var/lib/node_exporter` and
+`/var/lib/node_exporter/textfile` as `root root 755 directory`. The unit carries
+`--web.listen-address=10.78.0.1:9100`,
+`--collector.textfile.directory=/var/lib/node_exporter/textfile`,
+`--collector.systemd` and the narrow
+`(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)` include;
+`ss` shows only `10.78.0.1:9100` listening. A direct scrape returned
+`node_scrape_collector_success{collector="systemd"} 1`,
+`node_scrape_collector_success{collector="textfile"} 1` and exactly one
+`node_textfile_scrape_error 0`; `node_systemd_unit_state` series were present
+for `eregion-api.service`, `eregion-worker.service`, `caddy.service`,
+`node-exporter.service` and `docker.service`, and no unrelated unit name
+matched the spot check. `doctor` passed `telemetry.local` with the strict
+directory/collector/error checks, and total doctor was 22 pass / 0 warn / 0 fail.
+`metrics show --json` returned schema `eregion/node-metrics/v1`, exporter
+1.11.1, endpoint `http://10.78.0.1:9100/metrics`, access `wireguard`,
+`public: false`, authentication `none`, fresh timestamps, two real filesystems,
+memory, load, uptime and a numeric CPU calculated from a checked counter delta;
+the plain form agreed. The temporary root-owned textfile fixture/malformed-file
+and WireGuard-down warn variants were not run because sudo required an
+interactive password. The destructive stopped-exporter test was **not authorized
+and is skipped**; the exporter was not stopped. Those paths remain unit-tested
+only. No exporter self-metrics are claimed without a real producer.
+
+**Source-only evidence (2026-11-08).** Tests cover the `host-node-exporter-v2`
+unit flags and narrow include, the v2 selection replacing v1, the strict shared
+parent+child root:root 0755 no-symlink validation including setuid/setgid/sticky
+mode bits, apply refusal before any mutation for an unsafe/attacker-writable
+parent, safe mode repair clearing special bits in real isolated temporary
+directories including setgid, the safe apply/converge script shape and its
+post-clear exact-mode verification, the bounded `telemetry.ProbeLocal`
+collector-health parser with an HTTP
+fixture, missing/duplicate/malformed/labelled/timestamped/non-zero/out-of-range
+`node_textfile_scrape_error` cases, duplicate/timestamped/malformed collector
+success ambiguity, the directory/collector facts, and the `telemetry.local`
+pass/fail/warn/skip branches (missing/symlink/wrong-owner/wrong-mode/special-bit
+directory, ambiguous collector success, missing/ambiguous/non-zero scrape error,
+unreachable endpoint, missing/failed collector, WireGuard down, unknown
+WireGuard, healthy). No Docker, VM, real server, exporter restart or scrape was
+used.
+
 ## Alpha baseline — one main node
 
 This is the historical alpha.1/final-rehearsal baseline guidance. Under the
@@ -923,7 +1412,7 @@ fails. Install the CLI from published edge or an exact alpha snapshot.
 | Install | `install.sh` installs a signed CLI on Linux and on macOS; `upgrade` moves between two edge builds. |
 | Preflight | Unsupported OS/arch, a missing credential or an unreachable host is refused before any change, with the fix. |
 | Init plan | The plan names every change; declining starts nothing; `--json` without `--confirm <server>` refuses instead of prompting. |
-| Init apply | Fresh server ends hardened, SSH on WireGuard only, Caddy with a valid certificate for the hostname, node_exporter reachable only over WireGuard, services ready, and the final doctor gate reports `doctor: 20 ok` before the handoff. A forced failing check stops before the handoff with `doctor_failed` and the fix commands; `--resume` after the fix completes without repeating earlier phases, and `--skip-doctor` ends with a warning. |
+| Init apply | Fresh server ends hardened, SSH on WireGuard only, Caddy with a valid certificate for the hostname, node_exporter reachable only over WireGuard, services ready, and the final doctor gate reports no failing check before the handoff. A forced failing check stops before the handoff with `doctor_failed` and the fix commands; `--resume` after the fix completes without repeating earlier phases, and `--skip-doctor` ends with a warning. |
 | Lockdown revert | Breaking confirmation during the SSH switchover reopens public SSH by itself; `server init --resume` completes. |
 | Interrupted init | Interrupting before and after the database step and before the handoff resumes with `--resume` without lockout or duplicate identity; `--discard` drops a pending init. |
 | Handoff | Plain secrets plus bundle and passphrase; init waits for "stored"; no API token in it; `--secrets-out` writes a file only when asked. |
@@ -959,17 +1448,73 @@ fails. Install the CLI from published edge or an exact alpha snapshot.
 | Release command recovery | After a lost command response leaves the run unresolved, making the original operation terminal and deploying again recovers the completed command as succeeded without running it a second time; running, absent or unreachable original effects keep the original owner and defer. Missing/mismatched inputs hashes and status-query failures also preserve ownership and dispatch no command. |
 | Leaked-container retry | A forced previous/candidate-container removal failure creates a named cleanup row visible in `env status` without failing a verified traffic switch; removing the obstruction lets maintenance remove the container and row. |
 | Container repair | Removing a serving web container and restarting the worker queues one `platform.restart`, the container returns, and a second worker start with nothing missing queues no operation. A competing deploy or changed serving-deployment ID causes stale repair to skip/refuse, never restore an old release. |
+| Durable deployment ownership | Migration 026 gives every environment at most one deployment lifecycle owner. Deploy, rollback, restart and promotion use a nonblocking target lock; contention snoozes without consuming a River failure attempt or holding a pool connection. `process scale` submission uses a nonblocking transaction try-lock and conflicts on contention. Route writers select only the owner's target; a newer-created deployment cannot win by creation time and a running route step is intent, not proof. The owner freezes the predecessor and exact restore target. Owner creation and the deployment predecessor binding are one transaction; renewal reasserts the frozen binding before effects, so a crash cannot leave stale cleanup history. A waiting operation reloads the environment after settling a terminal/stale owner and before reacquiring, so the restored serving deployment becomes its predecessor instead of the stale snapshot. Interruption after route apply before acknowledgement, failed verification, cancellation, exhausted attempts, stale ownership and terminal-owner sweep restore that exact target before candidate cleanup; a failed restore keeps candidates and ownership retryable. Cancellation accepted before the success transaction wins and restores; the finalizer rechecks cancelling under the row lock. Serving and guarded cleanup read current rows, and the frozen restore deployment is protected until ownership ends. Protected cleanup is recorded durably and rescheduled without starving later rows, while cleanup-record failures retain terminal/ambiguous ownership. The owner phase is authoritative: a restoring/restored owner never revives a completed switch, even when the restore-step row is missing after a crash. Previous-container lookup/pre-record failures and pinned-revision node lookup or empty-node failures retain ownership and the nonterminal operation until durable/corrected; only unpinned legacy deployments fall back to the environment node. Nonretryable live and recovery post-switch sync failures share restoration logic; restoration failure retains the owner. Cancellation/failure recovery persists candidate cleanup intent before terminalizing, and the live terminal/public-failure paths do the same before settling. Interruption before instance save reconstructs planned cleanup names from container-step evidence and the pinned revision; an evidence read error retains ownership, and a missing pinned node fails closed. The owner's own candidate deployment stays protected from maintenance cleanup for the owner lifetime, including prepared, so partial cleanup inserts cannot delete containers a retry still needs. Every terminal exit after owner acquisition, including a pre-plan placement or transport-resolution error on retry, persists durable candidate cleanup before releasing a prepared owner; recording intent requires no node transport. Worker context cancellation retains candidates and leaves the operation for retry; only a durable cancelling operation cleans and settles. Retryable pre-switch failures retain candidates and completed steps, so retry never skips recreated containers. The restore step uses the owner's frozen release and always reasserts the selected target, even when the step row was already completed. Ambiguous recovery propagates deployment lookup errors and keeps its owner. Only successful finalization releases a serving owner. Migration 026 is a fail-closed cutover with no legacy backfill: it refuses while a deploy/rollback/restart/promote operation is queued, running or cancelling, or while any deployment row is pending/running. Finish or cancel old work first; a safe upgrade leaves terminal history and serving untouched and creates no owner rows. |
 | Create replay | Retrying `app create` and `env create` with the original idempotency key returns the same create and first-deploy IDs without another vault revision; without a key an existing name conflicts. |
 | JSON contracts | `domain add --dry-run --json` returns one object with preview and DNS records under `data`; `logs --json` is one envelope, `--output ndjson` is the explicit streaming choice, and `--json --follow` refuses with that fix. |
 | Detach and retry | Ctrl-C detaches without cancelling; `operations follow` replays; the same submission key returns the original operation; `cancel` is explicit. |
 | Restart | Restarting services, the worker and Caddy keeps serving state and routes; reconciliation completes without duplicate effects. |
 | Route failure | A forced Caddy reload failure shows desired, applied and failed state separately and recovers on retry; concurrent domain changes keep unrelated routes. |
-| Status and logs | `app status`/`env status` show the serving release, processes, domains with DNS/route/TLS/public state and recent operations; `logs` works with no telemetry node. |
+| Status and logs | `app status`/`env status` show the serving release, processes, domains with DNS/route/TLS/public state and recent operations; `logs` works with no telemetry service. |
 | CI | The per-environment endpoint deploys a ref with a deploy token; expired, revoked and wrong-environment tokens fail; nothing else of the API is reachable publicly. |
 | Push to deploy | With auto-deploy on, a push to the bound branch deploys that commit; GitHub's redeliver creates no second deployment; a push to another branch and a wrongly signed request do nothing; after `--rotate-webhook-secret` the old secret fails. |
 | Token factor | `token create` needs the TOTP code; `--yes`, `--json` and stdin cannot mint one; the secret is shown once and `token list` shows metadata only. |
 | Factor-gated removal | Real `app delete`/`env delete` need exact-target confirmation and a TOTP code at a human terminal; JSON/yes/pipes cannot perform them. Direct node submission without a valid same-request factor and all real HTTP delete submissions refuse; dry-run preview stays agent-usable. |
 | Removal | `domain remove`, `env delete --confirm` and `app delete --confirm` remove containers, routes and secrets per D13; other apps keep serving; operation history remains. |
+
+The ownership and route-recovery checks are covered by source-level pure tests
+and PostgreSQL integration tests (`TestIntegrationDeploymentOwnerRouteSelectionIsNotCreationOrder`,
+`TestIntegrationDeploymentInterruptionAfterApplyBeforeAckRestoresExactTarget`,
+`TestIntegrationDeploymentCancellationRestoresBeforeCancel`,
+`TestIntegrationDeploymentFailedRestoreRetainsOwnerAndCandidates`,
+`TestIntegrationDeploymentStaleAttemptCannotChangeOwnerRoute`,
+`TestIntegrationDeploymentDifferentEnvironmentIsNotBlocked`,
+`TestIntegrationContainerCleanupDefersServingAndOwnerTarget`,
+`TestIntegrationDeploymentLegacyAmbiguousOwnerRecoversConservatively`,
+`TestIntegrationDeploymentExhaustionRestoresBeforeTerminalFailure`,
+`TestIntegrationDeploymentScaleSubmissionFencedByOwner`,
+`TestIntegrationDeploymentVerifiedCancellationRecoveryRestores`,
+`TestIntegrationDeploymentCancellationDuringPublicVerificationRestores`,
+`TestIntegrationDeploymentCancellationAtFinalizeRestoresBeforeCleanup`,
+`TestIntegrationDeploymentSuccessfulCleanupUsesCurrentServing`,
+`TestIntegrationDeploymentCleanupGuardUsesCurrentServing`,
+`TestIntegrationDeploymentCleanupProtectsFrozenRestoreTarget`,
+`TestIntegrationDeploymentServingCleanupIsDurable`,
+`TestIntegrationDeploymentPreRecordFailureRetainsOwner`,
+`TestIntegrationDeploymentCleanupRecordFailureRetainsOwnership`,
+`TestIntegrationTerminalOwnerCleanupUsesPostRestoreState`,
+`TestIntegrationAmbiguousCleanupUsesPostRestoreState`,
+`TestIntegrationDeploymentPostSwitchNonretryableSyncFailureRestores`,
+`TestIntegrationDeploymentPostSwitchRestoreFailureRetainsOwner`,
+`TestIntegrationDeploymentPostSwitchRetryableSyncFailureRetainsOwner`,
+`TestIntegrationDeploymentRestorePhaseAuthoritative`,
+`TestIntegrationRecoveryPostSwitchSyncFailureUsesRestoration`,
+`TestIntegrationCancellationCleanupIntentIsDurable`,
+`TestIntegrationDeploymentPreSaveCleanupReconstruction`,
+`TestIntegrationDeploymentRetryableFailureRetainsCandidates`,
+`TestIntegrationLiveCleanupIntentFailureRetainsOwner`,
+`TestIntegrationMaintenanceCleanupProtectsOwnerCandidate`,
+`TestIntegrationWorkerShutdownRetainsCandidates`,
+`TestIntegrationCleanupEvidenceReadFailureRetainsOwner`,
+`TestIntegrationDeploymentTerminalRetryWithRetainedCandidates`,
+`TestIntegrationDeploymentRenewalRepairsCrashGapPredecessor`,
+`TestIntegrationWaitingOwnerReloadsAfterStaleSettlement`,
+`TestIntegrationPreviousCleanupPinnedRevisionNode`,
+`TestIntegrationAmbiguousDeploymentLookupFailureRetainsOwner`,
+`TestIntegrationContainerCleanupDeferredRowsDoNotStarveQueue`,
+`TestIntegrationScaleAdmissionContentionIsNonblocking`,
+`TestIntegrationDeployWorkerLockContentionSnoozes`,
+`TestIntegrationMigration026FailsClosedOnInflightDeployment`,
+`TestIntegrationMigration026LeavesNoLegacyOwners`). They were run on 2026-11-08
+against a private disposable PostgreSQL 18.6 cluster extracted under
+`/tmp/opencode`, with loopback trust authentication and no shared DSN, Docker or
+host mutation. The migration test builds schema 25 with an in-flight deployment
+and verifies 026 refuses to apply; a second safe schema builds a terminal
+deployment and verifies 026 creates an empty owner table without backfilling an
+owner or changing serving history. There is no legacy restore-step hash
+compatibility or historical owner inference: old in-flight work must finish or
+be cancelled before upgrade. **No real
+host interruption, Caddy race or public-route failure has been recorded**; host
+qualification remains manual.
 
 ### Disk retention (D30, alpha.1)
 
@@ -985,7 +1530,7 @@ checks.
 | Registry GC | Record `du -sb /var/lib/eregion/registry` and the registry service state before a prune that removes at least one `registry_artifact`. The operation events show the manifest removal, then `Registry garbage collection completed`; `du` falls by at least the removed manifests/layers, `systemctl is-active eregion-registry` is active and `curl -fsS 127.0.0.1:5000/v2/` returns 200. A stale `eregion-registry-gc` container or a running `garbage-collect` process makes the step fail closed with the registry left stopped and its recovery instruction; a collection or restart failure is never suppressed, and `--delete-untagged` is never used. A deploy after GC builds, verifies publicly and serves. Host status late 2026-11-03 (`edge-690baaf`): **not exercised** — the plan had no `registry_artifact` items, and the real run failed on local images before any GC; registry `du` stayed 312,003,409 and no garbage-collection event appeared. The polkit path itself was verified separately: `sudo -u eregion systemctl restart eregion-registry.service` succeeded, the registry returned active with `/v2/` 200 (312); this was not a retention GC. 2026-11-04 on `edge-786fdcf`: still **not exercised** — the dry run's `registry_skipped` names retained failed release `rel_53a22cfea2e1f3a2fa9dd523ac4c5510` (no `image_id`, tag `eregion/githello-production:d0f76b56af71`, no local image); the planner therefore skips repository `eregion/githello-production` fail-safe. The registry catalog contains only `andurel`, whose 10 releases are all retained, so there was no eligible registry artifact. No GC and no deploy after GC (339, 345). Candidate `edge-0a1a492`: the imageless-release fix removed the `registry_skipped` diagnostic; the dry run is only the `image_skipped`. The registry still held only retained andurel artifacts, so GC was still not exercised in that candidate run (378, 379). Fresh-server `edge-f447aa3a0d30` 2026-11-05: **pass** — the earlier prune `op_14dacc9e25d8d900752bfd3b0f336bb9` removed a registry manifest and ran GC; the after-GC deploy `op_141d2d0b97cf9da670d5a631c97418d1` then built, passed public verification and served (584). The cache-qualification prune `op_2786073ca510236984f6267b73662cc1` removed registry manifest `img@sha256:67b46713…` (2,408,739 bytes); events show 197 blobs marked, 3 blobs deleted and `Registry garbage collection completed`; the registry stayed active and `/v2/` returned 200 (617, 630). |
 | 30-release retention | On the disposable app run `eregion retention set --app <app> --env <env> --keep-releases 5 --keep-days 1 --json`, deploy 30 distinct releases, then use an authorized SQL update on the disposable control database to backdate all 30 `created_at` values to older than one day and run `prune --confirm <server>`. Exactly the newest five releases remain unpruned (serving release #30 and rollback target #29 are in that set); 25 release items mark rows with `pruned_at` while all 30 release rows remain, and separate `image`/registry items remove their images and manifests. A following `prune --dry-run` lists no release items. Git builds stay local and never reach the registry, so to cover **Registry GC** run this row (or a second app) with releases published by `eregion image push`; only those produce `registry_artifact` items, GC and the deploy-after-GC check. **2026-11-06: pass** on `edge-527592419f06` with 30 distinct genuine deployments and synthetic-aged image fixtures, temporary environment artifact grace one day; 25 marks, images and matching manifests in one successful prune with all 30 rows retained, five newest kept, follow-up plan empty. Details and separate GC measurement limitations in the run record below. |
 | host-registry-v2 upgrade | On a node whose registry predates `host-registry-v2`, `plan` lists `host-registry-v2` once. `apply` writes `storage.delete.enabled: true` in `/etc/eregion/registry/config.yml`, restarts `eregion-registry.service` with `REGISTRY_STORAGE_DELETE_ENABLED=true`, and a second `plan`/`apply` reports the step skipped. A manifest delete no longer returns 405, and a deploy after the upgrade serves. Host status 2026-11-03: pass on main (230–233, 270–273); the manifest-delete/deploy-after-upgrade variants were not separately run. |
-| Doctor retention | `eregion doctor --json` includes `host.retention`. With no run yet on a fresh install it is `pass` with "no retention run yet"; the startup catch-up or next daily run records one. After a run it names the finish time, status, removed items and reclaimed/planned bytes. A failed last run, a running run older than two days, or a last success older than two days with the worker up is `warn` with a fix. The main-node summary is 20 pass / 0 warn / 0 fail. Host status 2026-11-04 (`edge-786fdcf`): **pass (20/0/0)** — the latest run succeeded at 2026-11-04T01:11:20Z, removed 4 items and recorded no errors; the row detail reads "4 item(s) removed, 0 B reclaimed" (343, 347, 352, 353). A transient control-DB read failure produced a 19/1 warn in 2 of 5 repeated doctor runs; every successful read was 20/0/0. Candidate `edge-0a1a492`: **pass (20/0/0) in all three runs and after the restart**; the latest daily run succeeded at 01:47:57Z with 0 items removed, and no transient read warning occurred (380–383, 391, 392). |
+| Doctor retention | `eregion doctor --json` includes `host.retention`. With no run yet on a fresh install it is `pass` with "no retention run yet"; the startup catch-up or next daily run records one. After a run it names the finish time, status, removed items and reclaimed/planned bytes. A failed last run, a running run older than two days, or a last success older than two days with the worker up is `warn` with a fix. The main-node summary must name the row and have no unexpected warn/fail check; do not assert a fixed total row count. Host status 2026-11-04 (`edge-786fdcf`): **pass (20/0/0)** — the latest run succeeded at 2026-11-04T01:11:20Z, removed 4 items and recorded no errors; the row detail reads "4 item(s) removed, 0 B reclaimed" (343, 347, 352, 353). A transient control-DB read failure produced a 19/1 warn in 2 of 5 repeated doctor runs; every successful read was 20/0/0. Candidate `edge-0a1a492`: **pass (20/0/0) in all three runs and after the restart**; the latest daily run succeeded at 01:47:57Z with 0 items removed, and no transient read warning occurred (380–383, 391, 392). |
 | Doctor Buildpacks cache | `host.build_cache` reads the latest durable cache measurement from `retention_runs`; it never walks Docker volumes or the filesystem in `doctor`. With no measurement, or one older than 48 hours, it is `pass` with unknown (a fresh host stays healthy), never a zero-byte pass. After a retention run records a measurement under the cap it is `pass` and names used and cap bytes. Set the server cap below the measured cache within the allowed range (`retention set --cache-cap-bytes 1073741824 --json`) or build until the cache exceeds it; `doctor` reports `warn` naming the cap. After `prune --confirm <server>` removes least-recently-used entries the next retention run refreshes the measurement and the row returns to `pass`. Cache volumes are named `eregion-build-cache-<hex app>_<hex env>`, `eregion-launch-cache-<hex app>_<hex env>` or legacy `pack-cache-*.<build\|launch>`. Host status 2026-11-04 (`edge-786fdcf`): **pass with a known measurement** — 4.7 GiB of the 10.0 GiB cap (350, 352). Candidate `edge-0a1a492`: **pass** — 4.7 GiB of the 10.0 GiB cap (383, 392). Fresh-server `edge-f447aa3a0d30` 2026-11-05: **warn-to-pass qualified** — the 09:06 retention measurement was 1.0 GiB over the 1 GiB/75% test cap, so the row warned; the build-cache volume was held by a stopped pack container from cancelled operation `op_337e60a9fced63a8d8a5b6d8a4c1a959`. Read-only selected-field inspection proved it stale and ownerless; only that disposable container was removed, then real prune `op_2786073ca510236984f6267b73662cc1` removed the 348,112,124-byte build cache and follow-up prune `op_80f9f730b33ec9d2ec5e4b55149fb740` recorded 725.1 MiB. The row passed with a known measurement (586–647). Unknown/stale-measurement and percentage-only variants were not run. |
 
 Host status on main (2026-11-04 candidate, `edge-0a1a492d8207`): **policy**
@@ -1109,14 +1654,14 @@ rebuild. andurel and its `eregion-test*` hostnames go with it, and its
 - [ ] **Init apply, end state:** public 22 is closed and SSH works over
       WireGuard. Root login and password auth are off and the firewall is
       active. `curl https://$MAIN` verifies without `-k`. node_exporter answers
-      only over WireGuard. `doctor` reports 20 ok.
+      only over WireGuard. `doctor` reports no failing check.
 
 ### 4. Login here, operator tools and break-glass
 
 - [ ] **Login** (you, in a terminal on this box): `eregion login` with the
       bundle as context `fresh`, entering the passphrase. It reaches the same
       server the laptop initialized, and both machines then work.
-      `eregion --context fresh doctor` reports 20 ok here.
+      `eregion --context fresh doctor` reports no failing check here.
 - [ ] **Operator tools:** `server status`, `doctor`, an `eregion ssh` shell (agent).
 - [ ] **SSH command:** piped `ssh --command` keeps stdout and the exit status.
       A sudo password refusal shows `input_required` (agent).
@@ -1134,7 +1679,7 @@ rebuild. andurel and its `eregion-test*` hostnames go with it, and its
       **Dry-run version mismatch:** `apply --dry-run --auto-upgrade-nodes`
       leaves the node build unchanged.
 - [ ] `apply --auto-upgrade-nodes` upgrades the node. A second `apply` is a
-      no-op and `doctor` reports 20 ok.
+      no-op and `doctor` reports no failing check.
 - [ ] **Signed node upgrade:** an unsigned or mismatching upload and a dev CLI
       are refused. A failed manifest download refuses with no checksum-only
       fallback, the same method as evidence 193.
@@ -1586,6 +2131,24 @@ criteria; a fresh-server baseline is not required by the updated policy.
 `host.retention` remains intermittently 19/1 with healthy data, consistent with
 a transient control-database read. See the 2026-11-06 alpha.2 records above and
 MASTER section 8.
+
+Beta node-local telemetry's original snapshot path is host-qualified on
+`edge-fa33befb675d`; the later `host-node-exporter-v2`
+textfile/systemd collector extension and `telemetry.local` doctor row are
+implemented in source and covered by isolated fixture/HTTP tests, but **no host
+application, exporter restart, systemd D-Bus collection, textfile read or
+scrape is recorded**. It remains node-local and request-scoped: no telemetry
+server, authenticated external endpoint, discovery, credential rotation,
+external backend, metric store, PromQL or history. A future optional separate
+telemetry node or Grafana is not prohibited long-term and is out of beta/v1
+scope. Staging-to-production promotion is implemented in source with
+offline/pure and disposable-PostgreSQL integration coverage; **no real-host
+promotion, production switch or release-command run is recorded**. Cloudflare
+DNS automation is implemented in source as an explicit domain-scoped flow, with
+no host or real-zone run recorded. Backups remain deferred; external PostgreSQL
+is control-plane state, not a backup of managed-resource volumes. The beta and
+alpha-ready acceptance definitions above are not pass records unless their own
+host evidence says so.
 
 The 2026-10-29/30 runs closed
 release-changing dense switches, symlink-escape rejection, same-key replay after

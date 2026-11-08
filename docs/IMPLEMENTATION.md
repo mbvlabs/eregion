@@ -1,6 +1,6 @@
 # Implementation reference
 
-Checked against the integrated source on 2026-11-06; the managed-resource
+Checked against the integrated source on 2026-11-08; the managed-resource
 comparison with deploycrate-ce was checked on 2026-11-07. This describes
 **current code**, not the target command tree or a real-host certification.
 Product decisions and all work status belong in [MASTER](MASTER.md); run
@@ -78,7 +78,7 @@ re-queue the older one's live platform jobs.
 | Location | Responsibility |
 | --- | --- |
 | `cmd/eregion` | One executable entry point: the operator surface, hidden `node` mode (`rpc`, `serve`, `worker`, `migrate`, `bootstrap`) and hidden `node-agent`. |
-| `internal/cli/tree.go`, `meta.go`, `run.go`, `deploy.go` | Command catalog, safety metadata, output selection, dispatch and the deploy/rollback/build/release pipeline commands. |
+| `internal/cli/tree.go`, `meta.go`, `run.go`, `deploy.go`, `promote.go` | Command catalog, safety metadata, output selection, dispatch and the deploy/rollback/promote/build/release pipeline commands. |
 | `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup (preflight, answers/pending, plan/confirm, apply, guarded handoff), first contact, DNS, private access and token-free age handoff/import. |
 | `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host and local RPC, Docker workload/log reads, SSH/WireGuard route. |
 | `internal/cli/observe.go`, `internal/cli/logs.go`, `internal/cli/delete.go`, `internal/cli/operations.go` | Extended app/environment status, container logs over the operator channel, target-confirmed deletion and operation-history filters. |
@@ -89,14 +89,14 @@ re-queue the older one's live platform jobs.
 | `internal/cli/resource.go`, `internal/platform/resource*.go`, `internal/controlplane/resource.go` | Generic environment-owned Docker resources: durable identity and desired state, private per-environment networking, image identity, vault secret-name injection, a cumulative owned-volume ledger written before volume creation, exec health gating, attach/detach revisions, deployment-aware destroy refusals and container destroy that retains data by default. |
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
 | `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, CI deploy, per-environment push webhook and private proxy adapters. |
-| `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation, node resolution, extension wiring. |
+| `internal/controlplane` | pgx transactions, River, platform state/workers, deployment reconciliation including staging-to-production release promotion, node resolution, extension wiring. |
 | `internal/platform` | Validated action/input types, inventory model, placement rules, source/runtime steps, disk-retention inventory and removal/GC node effects, Caddy route renderer and the domain DNS/TLS/HTTP observation helpers. |
 | `internal/retention` | D30 retention policy, environment override merge/validation, Buildpacks cache limits and run/item records shared by the planner, CLI and node effects. |
 | `internal/engine`, `internal/node`, `internal/noded`, `internal/transport` | Check/Apply journal, effect identity, detached tasks, pinned SSH and userspace WireGuard. |
 | `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps (incl. vault keyring and node_exporter), local pending-init state, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
-| `internal/integrations`, `internal/telemetry` | Internal DNS/private-access actions (no operator CLI before v1) and the telemetry read adapters used by the workspace metrics graph. |
+| `internal/integrations`, `internal/telemetry` | The domain-scoped Cloudflare planner/executor used by explicit `domain add/remove` (configured zone token file, exact per-binding ownership, no zone-wide delete), retained internal DNS/private-access actions for later phases, and the bounded node-local node_exporter parser/snapshot plus the narrow local collector-health probe used by `metrics show`, the workspace Fleet detail and `doctor`. There is no telemetry server, external data source, scrape endpoint, discovery file, credential rotation or metric/log history. |
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
 | `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement plus the verified linux/<node arch> binary used by `apply --auto-upgrade-nodes`. |
 
@@ -118,35 +118,39 @@ bin/eregion help app create --json
 | `login --file … --passphrase-file … [--replace NAME]` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle must carry the context, operator keys, admin user, WireGuard address/public key/endpoint and SSH host key. Login builds and proves the identity in a sibling temporary directory, pins the host key in a copy of known_hosts and runs the readiness check there; only then does it swap the directory and save the context. An existing context name is refused with `conflict` unless `--replace` names it exactly, and any failure leaves the old context and pinned key byte-for-byte unchanged. |
 | `context list/show/use/remove` | Saved contexts, target-confirmed removal with its key files. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. Every node command accepts the root `--context NAME`; resolution is the flag, then `EREGION_CONTEXT`, then the current context, and an unknown name is `not_found` with `eregion context list`. The node client, local identity reads (`secrets export`), DNS addresses and endpoint labels all use that one selected context, so they cannot disagree; only `context show/use` with no `--name` read the current context on purpose. `login` and `server init` keep their own naming inputs and refuse a `--context` that disagrees, including on `server init --resume`. `context credential add` is removed: tokens are minted only through `token create` with the human factor (D7). |
 | `app create/list/status/delete` | Guided or flag-only creation of **production and staging in one submission**: source, Buildpacks settings, processes, plain config, vault secret names and production's optional domain. Both environments and their first revisions commit in the same transaction; both are protected by default, with `--unprotected` as the explicit creation-time opt-out. Supplied `--secret` values and the Git read credential are written before submission into every created environment namespace whose revision names them; a shared recipe therefore writes both production and staging, while an environment-specific name or credential is never copied into another namespace. `create` accepts `platform.app.create` with an `environments` array, the first domain, primary flag and main-node addresses; the first environment's binding commits before its optional first deploy is queued, and the accepted operation exposes that deploy's ID as `first_deploy_operation_id`. A retry with the operator's `--idempotency-key` previews as a replay, writes no vault revision, and returns the original operation including that ID; without the key an existing name is a conflict. Duplicate hostnames across the two environments are refused before or inside the transaction. In a terminal with deploy requested and no `--detach`, `create` follows the create operation and then the first deploy with the deploy viewer and outcome; Ctrl-C detaches with the follow command. `--detach`, JSON and no-TTY return at accepted. List/status read inventory. `status` shows the serving release, processes, persistent protection, per-domain state and recent operations; `delete` always takes `--confirm <app>` and, unless `--dry-run`, a TOTP code typed at a human terminal (D7, D13, D33). The control plane verifies the code and confirmation against locked state in the submission transaction; dry-run preview needs neither and stays available to an agent. |
-| `env create/update/protect/unprotect/list/status/delete` | `create` accepts an environment with its first revision, optional domain binding and its first deploy unless `--no-deploy`; the accepted operation exposes the queued deploy's `first_deploy_operation_id`, and a terminal follows create then the first deploy with the deploy viewer unless `--detach` is given. Protection defaults from the name (production and staging protected, every other name unprotected); `--protected`/`--unprotected` override it at creation. `--from FILE` applies the shared recipe to any name, including a PR name absent from the file. A retry with the operator's `--idempotency-key` replays the accepted operation including that ID without rewriting vault values; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. `protect` records durable protected state and is agent-safe; `unprotect` lowers protection and needs a TOTP code at a human terminal, refusing JSON/no-TTY. List/status include revision, processes, protection and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>`; a protected or last environment also needs a TOTP code at a human terminal, while an unprotected non-last environment deletion is available to agents with the exact confirmation alone (D33). |
+| `env create/update/protect/unprotect/promote/list/status/delete` | `create` accepts an environment with its first revision, optional domain binding and its first deploy unless `--no-deploy`; the accepted operation exposes the queued deploy's `first_deploy_operation_id`, and a terminal follows create then the first deploy with the deploy viewer unless `--detach` is given. Protection defaults from the name (production and staging protected, every other name unprotected); `--protected`/`--unprotected` override it at creation. `--from FILE` applies the shared recipe to any name, including a PR name absent from the file. A retry with the operator's `--idempotency-key` replays the accepted operation including that ID without rewriting vault values; `update` merges source, placement, runtime and process changes into a new immutable revision. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. `protect` records durable protected state and is agent-safe; `unprotect` lowers protection and needs a TOTP code at a human terminal, refusing JSON/no-TTY. `promote <app> <source-environment>` is the dedicated D23 path: the target is the app's fixed `production` environment; it resolves and pins the source's current serving image digest, commit and source **inside the submission transaction** as a new production release without a build, then applies production's current revision, config, secret values and release command through the same blue/green path. It refuses a source without a ready serving release, **any** active production deployment (including a different artifact), an artifact already serving production, a different node, a non-production target, cross-app input and a target that fails the explicit-release deployability gate. It never copies domains, config, secrets or the source release command. Dry-run and interactive previews pass the supplied idempotency key, so an accepted same-key submission previews as a replay. List/status include revision, processes, protection and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>`; a protected or last environment also needs a TOTP code at a human terminal, while an unprotected non-last environment deletion is available to agents with the exact confirmation alone (D33). |
 | `app create|env create|env update --from FILE`, `app export` | Opt-in definition input turns strict TOML into ordinary desired state; existing flag/guided flows never read a file. The document is a shared recipe plus optional `[environments.production]`, `[environments.staging]` and `[environments.<name>]` overrides; `app create --from` resolves production and staging, while `env create --from --name pr-42` applies the shared recipe without requiring an override entry; the environment name is a command argument, not a document identity. File updates are complete supported state, carry a revision fence, refuse domain drift, require target confirmation when they remove processes/config/secret names/resources, and never deploy. Declared Docker resources are explicitly applied after the environment exists. Export is deterministic, places domains under the selected environment's override, and refuses unrepresentable auto-deploy, webhook and retention state rather than dropping it. |
 | `resource apply|attach|detach|list|status|destroy` | Node-mode generic Docker resource lifecycle. Apply resolves an immutable image, ensures the environment's private bridge network, records the cumulative owned volume identities before creating any volume, injects only vault secret names/values transiently, starts one container with no published host port and probes its exec health. An interrupted apply or a later declaration that drops a mount never loses a recorded volume identity; the row keeps every identity this resource owns. Attach/detach publishes a revision; deployment refuses while an attached resource is absent or unhealthy. Health is observed at apply and deployability checks the recorded state; there is no periodic resource-health repair job, so a container that degrades after apply needs an explicit re-apply. A failed image update leaves the new container degraded instead of restoring the previous image; named data volumes are unaffected. Destroy executes under the environment target lock, refuses while the current or serving revision still attaches the resource or a queued/running deployment may use it in a switch, removes the container and retains named volumes and identity by default; `--delete-data` separately deletes only volumes carrying this resource's ownership labels, including previously mounted identities and volumes whose create preceded an interrupted durable write, and is refused otherwise. Repeating `destroy --delete-data` after a default destroy is supported. App or environment deletion does not delete resource volumes. Cancelling or failing a resource operation after it entered `provisioning`/`destroying` settles the row to `degraded` in the same terminal transaction, fenced by the row's `operation_id`; image, container, network and the cumulative volume ledger are retained, so a later apply or destroy is a normal retry. Cancellation is checked at every resource apply/destroy step boundary, so a cancel accepted during an in-flight step cannot be converted into success; finalization then locks the operation row and rechecks `cancelling` before the resource update, closing the last-check-to-commit race. The maintenance reconciler also sweeps rows left in those transient states by operations that were already terminal before this fix, so an old stuck fixture converges without a repair command or direct database edit. |
 | `process list/scale` | Read the desired formation; scale one process's replicas in a new revision. A serving environment also queues a blue/green restart in the same transaction so the new formation runs immediately; without a serving deployment the next deploy applies it. |
 | `config set/unset/list` | Plain variables as a new revision or read from the current revision. No deploy is queued. |
-| `deploy <app> <env> [--ref REF \| --release ID]` | Node-mode `platform.deploy`. In a terminal it prints source, ref/commit, revision and processes, then follows the operation with the shared viewer (build log lines and stages). `--detach` returns after acceptance. |
+| `deploy <app> <env> [--ref REF \| --release ID]` | Node-mode `platform.deploy`. In a terminal it prints source, ref/commit, revision and processes, then follows the operation with the shared viewer (build log lines and stages). `--detach` returns after acceptance. `--release` requires a release from that same app and environment; cross-environment artifact movement is only `env promote` (D23), never a disguised deploy. |
 | `rollback <app> <env> [--to ID]` | Node-mode `platform.rollback`; requires `--confirm <app>/<env>`, validated by the node and control plane against the current target (D12). There is no plan-token scheme for rollback. |
 | `build list/logs/stop/retry`, `release list`, `restart <app> <env>` | Build lifecycle over `platform_builds`; `build logs` reads (and with `--follow` streams) the build operation's events. `build get` is served by the `builds` inventory filter. `restart` reapplies the serving release through the blue/green path. |
-| `domain add/remove <app> <environment> <hostname> [--primary] [--check-path PATH]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `add --check-path` sets the binding's optional observation path; empty defaults to the web health path. `domain add --dry-run --json` returns the preview object and DNS records under `data`. `remove` takes `--confirm <hostname>` and refuses the primary. |
+| `domain add/remove <app> <environment> <hostname> [--primary] [--check-path PATH] [--dns cloudflare --dns-zone ZONE (add also needs --dns-origin ADDRESS --dns-proxy dns-only\|proxied)]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `add --check-path` sets the binding's optional observation path; empty defaults to the web health path. Manual DNS is the default and never calls a provider. Explicit `--dns cloudflare` plans or reconciles only the exact A/AAAA records for that hostname through a zone configured in `EREGION_CLOUDFLARE_ZONES`; the token stays in the root-owned `0640` service-group file named by `EREGION_CLOUDFLARE_TOKEN_FILE` and never enters argv, action input, River arguments, events or logs. `--dns-origin` is required on add: each value is a validated public IPv4/IPv6 origin, never the context's WireGuard management endpoint, and the explicit origins appear in the preview. `--dns-proxy` is required on add, so proxy mode is never inferred. `domain add --dry-run --json` returns the preview, desired records and a real `dns_provider` snapshot under `data`; it performs no mutation. Ownership is an immutable per-binding marker derived from the domain ID, so re-creation cannot adopt a previous record; foreign records, including legacy `eregion:managed`, fail closed and are never adopted. `remove` takes `--confirm <hostname>`, refuses the primary, and removes exact-owned records using the persisted ledger; an unmanaged binding with no ledger has no provider record to clean. Admission and worker execution are serialized; a delayed removal revalidates the newest domain intent and binding identity under the target lock, and the ledger's last-operation fence prevents a later readd, promotion or file update from being deleted. Ownership is re-read immediately before each mutation; Cloudflare's lack of CAS leaves a visible final external-writer race. App/environment deletion marks managed ledgers cleanup-pending and verifies exact provider cleanup before removing serving workload containers or deleting domain/platform rows; a provider failure or ownership conflict refuses deletion and keeps the app, workloads, records, ledger and credentials retryable. This is intentionally not presented as one atomic transaction or an availability guarantee: after provider cleanup succeeds, a node-step failure or cancellation can leave DNS removed with the ledger retained and some serving workloads still present, while a later route-write failure can leave the environment rows retryable after DNS and the workloads are already gone. The ledger and operation events state which effects completed, and retry resumes the idempotent deletion without falsely claiming completion. Provider state is not public readiness. Migration 025 persists provider mode/zone/origins/proxy and cleanup state; primary cleanup is usable through environment/application deletion. |
 | `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secret export` carries the code in the same node request that returns the value (`vault.export`); there is no separate pre-check request to skip. `secrets export` rebuilds the server-init handoff (including the vault keyring) and honours `--secrets-out`. |
 | `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
-| `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry node is needed. Ctrl-C detaches. `--json` without `--follow` returns one envelope; NDJSON requires `--output ndjson`, and `--json --follow` is a usage error that names that fix. |
-| `ui` | Full-screen workspace over the same inventory and node-mode action service. The graph still uses the telemetry read adapter for metrics. |
+| `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry service is needed. Ctrl-C detaches. `--json` without `--follow` returns one envelope; NDJSON requires `--output ndjson`, and `--json --follow` is a usage error that names that fix. |
+| `metrics show` | Read-only node RPC (`metrics.show`) executed on the node: two bounded reads of the WireGuard-bound node_exporter with a one-second gap, then one current snapshot. Returns node/exporter identity, fetched and observed timestamps, freshness and explicit issues; CPU utilization is computed from a checked counter delta (nil and an issue after a reset or missing counter), and memory, real filesystems, load and uptime are parsed from the needed metric families. There is no eregion-run telemetry server, Prometheus/Loki deployment, external backend, global PromQL, metric store or history; an external scraper can read the same exporter only over WireGuard using the documented static example. Plain and JSON are the same snapshot; JSON/no-TTY never prompts. It needs no control database and no credential because the exporter is reachable only on `wg0`. |
+| `ui` | Full-screen workspace over the same inventory and node-mode action service. Fleet details show one current node_exporter CPU sample plus current memory, filesystem, load and uptime facts through `metrics.show`; no history or request graph is invented. |
 | `operations list/get/follow/cancel` | Over node RPC the SSH-authenticated operator has server authority: an unfiltered list shows every operation on the node newest first (bounded by `--limit`), and snapshot/follow/cancel may open any operation, including CI tokens, the GitHub webhook and other operators' submissions. `--app`/`--environment` select the platform target and include the environment's `build/<id>` operations. State and limit filters apply. The public HTTP API remains strictly actor- and grant-scoped. |
 | `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
 All of MASTER section 5's app, environment, deployment and observation surface
-exists. The `platform` command group is deleted: `app`, `env`, `process`,
-`config`, `domain`, `deploy`, `rollback`, `restart`, `build`, `release`, `logs`
-and `operations` are the operator commands. Token/protect commands remain for
-work list row 8. The old plural `resources …` surface and the backup code are
-deleted (MASTER D19); alpha.2's singular
-`resource apply|attach|detach|list|status|destroy` lifecycle is registered. The
-Docker Compose telemetry stack install is deleted (D5), and `dns …`, `access …`,
-`platform …`, `metrics …` and `operations test` are no longer registered
-(D6, D19, D22, D26). Their internal packages remain for the after-v1 phases
-where the work list says they return. `bootstrap …`, `serve`, `worker` and
+exists. The `platform` command group is deleted: `app`, `env` (including
+`env promote`), `process`, `config`, `domain`, `deploy`, `rollback`, `restart`,
+`build`, `release`, `logs` and `operations` are the operator commands. Token/
+protect commands remain for work list row 8. The old plural `resources …`
+surface and the backup code are deleted (MASTER D19); alpha.2's singular
+`resource apply|attach|detach|list|status|destroy` lifecycle is registered.
+The Docker Compose telemetry stack install is deleted (D5); the local textfile
+directory and narrow systemd collector are node_exporter unit arguments, not a
+telemetry stack. `dns …`,
+`access …`, `platform …` and `operations test` are no longer registered
+(D6, D19, D22, D26); `metrics show` is registered as the node-local read
+described above. The DNS/access internal packages remain for the after-v1
+phases where the work list says they return. `bootstrap …`, `serve`, `worker` and
 `system migrate` are not operator commands; they live under the hidden Linux-only
 `node` group (`node rpc`, `node unlock-ssh`, `node serve`, `node worker`,
 `node migrate`, `node bootstrap …`) and `commands --json` lists only the section
@@ -188,6 +192,124 @@ accepts `--output ndjson` and streams the same event records as
 `--json` on a submitting command keeps returning the accepted operation without
 waiting. NDJSON never prompts: a guided command with missing input, or a
 factor-gated delete, refuses instead of asking.
+
+## Node-local telemetry
+
+`metrics show` is a node-mode read over the normal operator channel: the CLI
+calls `metrics.show` in `eregion node rpc`, which runs on the node as root and
+does not open PostgreSQL. The node side reads
+`http://10.78.0.1:9100/metrics` (the only node_exporter listener) twice, one
+second apart, with an HTTP client that ignores ambient proxies and does not
+follow redirects, a five-second request timeout and a 4 MiB body bound. The
+parser keeps only the families it needs and returns one
+`eregion/node-metrics/v1` snapshot; the samples are not written anywhere.
+
+The snapshot carries the logical node name from `node.json` when readable, the
+exporter's uname identity and build version, `fetched_at` recorded after the
+second response completes, the second scrape's `node_time_seconds` as
+`observed_at`, freshness (`fresh`, `stale` or `unknown` against a 30-second
+threshold) and a `scrape` object naming the WireGuard HTTP endpoint,
+`access: wireguard`, `public: false`, no authentication and the operator-RPC
+collection mode. A missing second timestamp stays unknown; it never borrows the
+first scrape. A materially future exporter timestamp is also unknown and its
+future `observed_at` is not exposed as current. The snapshot never claims a
+public endpoint or an independent unattended scraper.
+
+CPU utilization is `(1 - idle_delta/total_delta) * 100` over the reported CPU
+mode counters. The pinned node_exporter v1.11.1 emits the eight modes `user`,
+`nice`, `system`, `idle`, `iowait`, `irq`, `softirq` and `steal` on
+`node_cpu_seconds_total`; guest time is a separate
+`node_cpu_guest_seconds_total` family and is ignored. Legacy
+`guest`/`guest_nice` series are tolerated but excluded from the denominator
+because Linux counts that time inside user/nice. A missing counter family, a
+changed counter set, a counter reset, a missing any of the expected eight Linux
+modes for any observed CPU, a non-positive total delta, a missing idle delta or
+inconsistent movement returns `cpu: null` plus an issue; it is never a
+fabricated zero. Memory uses
+`MemTotal`/`MemAvailable`; a missing or inconsistent pair is null plus an issue.
+Filesystems pair `node_filesystem_size_bytes` with
+`node_filesystem_avail_bytes` and omit pseudo/tmpfs/overlay/Docker mounts.
+Load requires all three `node_load*` values, and uptime uses
+`node_time_seconds - node_boot_time_seconds`. Unavailable values stay null and
+are named under `issues`; the human form prints the reason. An unparseable,
+timestamped, duplicated or otherwise invalid sample for any consumed family is
+a hard `unavailable` refusal; valid label whitespace and one trailing comma are
+accepted, and unknown unrelated lines are ignored. Exporter label values are
+stripped of control and format characters before they can reach terminal
+output.
+
+Plain and JSON render the same snapshot. The command has no prompt, dry-run,
+confirmation or mutation path. The workspace Fleet detail reuses the same node
+RPC and turns it into one current CPU sample plus current facts; Envs has no
+graph because no per-request history exists. The workspace carries the
+source's explicit freshness independently of CPU availability, never replaces
+unknown exporter time with collection time, adds monotonic local elapsed time to
+the node-computed age against the node threshold, re-queries metrics on a
+focused-detail refresh, fences an older response behind the latest query
+generation, and refuses a query for a different node instead of relabeling the
+snapshot. `ServiceUnits` includes
+`node-exporter.service` for the main role, so `server status` displays it.
+`host-node-exporter-v2` additionally creates
+`/var/lib/node_exporter` and `/var/lib/node_exporter/textfile` (both root:root
+0755 real directories; a symlink or non-directory is refused rather than
+followed), enables node_exporter's textfile collector and a narrow systemd
+collector include for eregion, Caddy, Docker, node_exporter and `wg-quick@wg0`
+service/timer units. Apply refuses an unsafe/non-root-owned or group/other-
+writable existing parent before any mutation, rather than repairing an
+attacker-controlled path. Setuid/setgid/sticky bits are preserved in the
+observation; the strict check rejects them, and a safe root-owned non-writable
+path with those bits is repaired with `chmod 0755` followed by an explicit
+`chmod u-s,g-s,o-t`, because numeric chmod can preserve setgid on a directory.
+Apply then verifies the exact `0755` mode and fails closed otherwise. No
+eregion self-metric is written today: the textfile directory and collector are
+foundations, and a
+metric family must come from a real producer rather than a synthetic line. The
+`telemetry.local` doctor check
+uses the same strict parent+child validator and reads one bounded exporter
+response; it requires successful `textfile` and `systemd` collector families
+with unambiguous success samples, and exactly one unlabelled
+`node_textfile_scrape_error` sample with value zero. Collector success alone does
+not detect a malformed or unreadable `.prom`; a missing, duplicated, malformed,
+labelled, timestamped or non-zero scrape error fails, and duplicate/timestamped
+collector success is ambiguous fail-closed. WireGuard down leaves collector
+health unobserved as **warn**, not pass, while an independent directory
+configuration error still fails. It does not store a sample or replace the
+`metrics show` snapshot.
+
+A host with a WireGuard route to the node can scrape the exporter read-only with
+Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: eregion-node
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["10.78.0.1:9100"]
+```
+
+or Grafana Alloy:
+
+```hcl
+prometheus.scrape "eregion_node" {
+  targets    = [{"__address__" = "10.78.0.1:9100"}]
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+```
+
+The example has no public endpoint, TLS terminator, basic-auth credential or
+discovery service; it is not installed or managed by eregion. The Alloy fragment
+assumes a `prometheus.remote_write.default` receiver. WireGuard peer routing and
+firewall access are operator prerequisites. A future optional separate telemetry
+node or Grafana is not prohibited long-term, but is out of beta/v1 scope.
+
+This is intentionally **not** full vaire exporter parity. Missing today:
+the authenticated external `/metrics` endpoint and password file, `targets.json`
+service discovery for Prometheus `http_sd`/Alloy `discovery.http`, credential
+rotation, an exporter slice/memory budget, postgres/pgbouncer exporters,
+central aggregation/alerting and any metric/log store or retained history.
+Textfile/collector/doctor tests use text and HTTP fixtures; no Docker, database
+or real server is needed. Host step application, a real exporter restart, the
+systemd collector over D-Bus and a real scrape remain manual acceptance.
 
 ## Release and local upgrade
 
@@ -245,7 +367,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 024
+## Database: embedded schema 025
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -277,6 +399,8 @@ node protocol version and database migration version are independent.
 | `022_managed_resources.sql` | Environment-owned generic Docker resource identity, image and immutable image ID, spec, private network/container, a cumulative owned-volume ledger, exec health observation and lifecycle state. Named volumes are runtime state and are never deleted by this migration; a default resource destroy retains them and only explicit `--delete-data` removes owned volumes. |
 | `023_environment_resources.sql` | Revision-level managed-resource dependency names; deployment is gated on their observed readiness. Names only, never secret values. |
 | `024_environment_protection.sql` | Persistent `eregion_platform_environments.protected`. Existing environments are backfilled protected (fail closed); new rows receive the creation default or explicit value. The column is mutable state, not a desired-state revision. |
+| `025_domain_dns_ownership.sql` | Immutable `eregion_platform_domains.id` (`dom_…`) and the `eregion_platform_domain_dns` ledger. The ledger stores provider, zone, exact ownership marker, generation, desired origins/proxy, state, last operation and cleanup status. It is written atomically with the operation/River job before provider effects and is retained until exact owned provider cleanup is verified; `domain_id` restricts domain deletion while it exists. |
+| `026_deployment_lifecycle_owner.sql` | One durable deployment lifecycle owner per environment. Stores owner operation/deployment/attempt, phase, exclusive route target, frozen restore release/deployment and timestamps. Route writers read this row exclusively. The cutover is fail closed with no legacy backfill: it refuses while a deploy/rollback/restart/promote operation is queued, running or cancelling, or while any deployment row is pending/running. Finish or cancel old work before upgrading; a safe upgrade creates the empty owner table. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -293,8 +417,10 @@ Tables below have the literal `eregion_` prefix:
 | `platform_builds` | `bld_…` ID and unique operation FK; app/env, pinned revision and release, source, exact commit, pending/running/succeeded/failed/cancelled lifecycle, timestamps and error. Logs are the owning operation's events. |
 | `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, image/image ID, build link, exact commit, pending/ready/failed status and error, and `pruned_at` when disk retention removed the artifact. The row is never deleted. |
 | `platform_deployments` | Deployment ID and unique operation FK; action (`deploy`, `rollback`, `restart`), release, previous release/deployment, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), recorded process instances/ports, state and errors. |
+| `platform_deployment_owners` | One row per environment: owning operation/deployment/attempt, lifecycle phase, exclusive route-target deployment, frozen restore release/deployment and timestamps. Route writers read `route_target_deployment_id` exclusively; deploy-family retries renew the same owner and release it only after terminal traffic is safe. Cascades with its environment/deployment. |
 | `platform_changes` | App/env history, sequence, operation/actor, desired/applied JSON and summary. |
-| `platform_domains` | Domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment, and an optional `check_path`. `desired_revision`/`applied_revision` and `route_state`/`route_error` record the Caddy write; `expected_addresses` plus `dns_state`/`dns_addresses` record public-resolver observation; `certificate_state`/`certificate_not_after` and `public_state`/`public_status` keep the other observations separate. |
+| `platform_domains` | Immutable `id` (`dom_…`, unique) and domain name PK, environment FK, `is_primary` with a partial unique index enforcing one primary per environment, and an optional `check_path`. `desired_revision`/`applied_revision` and `route_state`/`route_error` record the Caddy write; `expected_addresses` plus `dns_state`/`dns_addresses` record public-resolver observation; `certificate_state`/`certificate_not_after` and `public_state`/`public_status` keep the other observations separate. |
+| `platform_domain_dns` | One managed-DNS ledger per immutable domain ID: provider, zone ID/name, exact ownership marker, generation, desired public origins/proxy, state (`pending`/`applied`/`failed`/`cleanup_pending`/`cleanup_verified`/`cleanup_failed`), last operation, errors and timestamps. It is retained until provider cleanup is verified; the domain FK restricts deletion while it exists. |
 | `platform_release_command_runs` | `(release_id, command_digest)` PK; the owning operation, running/succeeded/failed state, error code/message and timestamps. One row per release and command specification; it cascades with its release. |
 | `platform_container_cleanup` | Container name PK; environment/node/deployment, reason, attempts, last error and next attempt. A failed removal is retried with backoff; the row cascades with its environment. |
 | `server_settings` | Singleton row (`singleton` boolean PK); one `retention` jsonb block for the server-level default. An absent row or empty block means the D30 defaults in `internal/retention`. |
@@ -748,9 +874,19 @@ the control-plane account) and
 `/etc/eregion/vault-keyring.json` (0600, owned by the control-plane account and
 named by `EREGION_VAULT_KEY_FILE` in `control-plane.env`) and node_exporter
 1.11.1 with a pinned sha256 per architecture, listening only on
-`10.78.0.1:9100`; the access setup allows 9100 on `wg0` and starts the unit once
-`wg0` exists. `internal/access` remains the hardening/WireGuard/commit-confirm
-lockdown implementation.
+`10.78.0.1:9100`; `host-node-exporter-v2` also creates
+`/var/lib/node_exporter` and `/var/lib/node_exporter/textfile` (both root:root
+0755 real directories, no symlinks), enables the textfile collector
+and the narrow systemd collector set
+`(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)`. The
+access setup allows 9100 on `wg0` and starts the unit once `wg0` exists.
+`node-exporter.service` is part of the main role's service readiness, so
+`server status` and `doctor` show its active state. `telemetry.local` also reads
+the exporter endpoint and fails when the strict textfile directory is absent/
+wrong, either collector is missing/failed, or `node_textfile_scrape_error` is
+missing, ambiguous or non-zero; a down WireGuard interface is warn/unobserved,
+not pass. It does not store samples. `internal/access`
+remains the hardening/WireGuard/commit-confirm lockdown implementation.
 
 After lockdown the CLI pins the WireGuard host key, saves the token-free context,
 and calls node RPC `ready`. It then checks node_exporter over the tunnel, asks the
@@ -813,8 +949,8 @@ error instead of refusing silently. `doctor` covers pending steps, sshd root and
 password login, the WireGuard-only public SSH rule, the firewall, the Caddy
 certificate for the main hostname, disk, the last retention run, the Buildpacks
 cache against the policy cap, CLI/node/schema/River versions and the role's
-systemd units; any `fail` finding makes the command exit non-zero. A healthy
-main node reports 20 pass / 0 warn / 0 fail.
+systemd units; every service unit contributes its own result row, so the total
+grows with the role. Any `fail` finding makes the command exit non-zero.
 
 An unreachable control database is classified before it reaches operator output:
 `dns_resolution`, `tcp_connect` (refused or unreachable), `tls_handshake`,
@@ -878,7 +1014,8 @@ window.
 | `/var/lib/eregion/access/` | Operator-access snapshot and lockdown state; separate from bootstrap commit-confirm. |
 | `/etc/caddy/Caddyfile` | Bootstrap-owned main hostname config, importing routes. |
 | `/etc/caddy/eregion.d/routes.caddy` | Worker-owned generated app host routes. |
-| `/usr/local/bin/node_exporter`, `/etc/systemd/system/node-exporter.service` | Pinned exporter and its unit, bound to the WireGuard address only; the access setup opens 9100 on `wg0`. |
+| `/usr/local/bin/node_exporter`, `/etc/systemd/system/node-exporter.service` | Pinned exporter and its unit, bound to the WireGuard address only; `host-node-exporter-v2` enables the textfile collector at `/var/lib/node_exporter/textfile` and the narrow systemd collector set. The access setup opens 9100 on `wg0`. |
+| `/var/lib/node_exporter/`, `/var/lib/node_exporter/textfile/` | Root:root `0755` real directories (no symlinks) read by node_exporter's textfile collector. Apply refuses to follow or mutate a symlink/non-directory; no eregion self-metrics are written until a real producer exists. |
 | OS config dir + `/eregion/contexts.json` | Owner-only context store (SSH/WireGuard route and `auto_upgrade_nodes`); overridden by `EREGION_CONTEXT_FILE`. No API token. |
 | Context store's parent + `/servers/<context>/` | Operator SSH key, WireGuard key and sudo password files. |
 | Context store's parent + `/pending/<server>/` | Unfinished `server init`: answers, phases, pinned host keys and the captured vault keyring (0700 directory, 0600 files). |
@@ -916,11 +1053,12 @@ the human factor:
 | `platform.build.stop` | `build/<build ID>` | Cancels the build, marks its operation cancelling, and signals the running pack process. |
 | `platform.build.retry` | `build/<build ID>` | New build and release of the same exact commit; it does not deploy. |
 | `platform.deploy` | `env/<app>/<env>` | Optional `release_id` and `ref`. Without a release it resolves the current revision's bound source to an exact commit, builds, records the release digest and deploys it with the current revision. With a release it redeploys that release with the current revision. CI and push to deploy submit `ref`. |
+| `platform.promote` | `env/<app>/production` | `source_environment`; the app comes from the target. Submission locks the source environment row and production row, resolves and pins the source's current serving release (ready, unpruned, immutable image), requires both environments on the same node and production's explicit-release deployability, and refuses **any** active production deployment or an artifact already serving production. It records a new ready production release with the exact source image/image ID/commit/source but no build row and no command; the ordinary deployment path runs production's revision release command and blue/green switch. No source config, secret, domain or command is copied. Same-key submission replays without re-resolving the source, including the dry-run preview. |
 | `platform.rollback` | `env/<app>/<env>` | Optional `to_release_id`; default resolves previous successful serving history, then uses that deployment's revision and exact secret revisions. |
 | `platform.restart` | `env/<app>/<env>` | Reapplies the serving release with the current revision through the same blue/green path, so a scaled formation takes effect. |
-| `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary`, `addresses` (the selected main node's public A/AAAA targets) and `check_path` (an absolute HTTP path without control characters). Removal also requires `confirm` equal to the current hostname; removing the primary is refused. |
-| `platform.environment.delete` | `env/<app>/<env>` | `confirm` equal to `<app>/<environment>`; a protected or last environment also needs the transient human factor. The worker removes labeled containers and routes before platform rows. |
-| `platform.app.delete` | `app/<app>` | `confirm` equal to `<app>` plus the transient human factor on every real submission; every environment is deleted and the app record last. |
+| `platform.domain.add/remove` | `env/<app>/<env>` | `domain`, optional `primary`, `addresses` (the selected main node's public A/AAAA targets), `check_path` (an absolute HTTP path without control characters), and optional `dns_mode`/`dns_zone`/`dns_origins`/`dns_proxied`. Manual is the default; `cloudflare` requires a configured zone, explicit public origins on add, and an explicit proxy choice on add. The token file never enters input. Removal also requires `confirm` equal to the current hostname; removing the primary is refused. |
+| `platform.environment.delete` | `env/<app>/<env>` | `confirm` equal to `<app>/<environment>`; a protected or last environment also needs the transient human factor. The worker preflights and verifies managed DNS cleanup, then removes labeled containers and routes before platform rows. |
+| `platform.app.delete` | `app/<app>` | `confirm` equal to `<app>` plus the transient human factor on every real submission; every environment's managed DNS is preflighted and cleaned before workloads, then the environments and app record are deleted last. |
 
 Names: lowercase letters/digits/hyphens, start with a letter, max 40 characters.
 Unknown input fields fail, including nested revision fields. Refer to
@@ -1017,6 +1155,124 @@ new domain's site and its first certificate only appear at the switch) ->
 remove the previous deployment's containers. A container
 removal that fails is recorded in `platform_container_cleanup` and retried;
 the verified switch stays successful and the failure is never silently dropped.
+
+Migration 026 adds `eregion_platform_deployment_owners`, one row per
+environment. It is the sole route-intent authority: `desiredRoutesQuery` joins
+the owner and uses `route_target_deployment_id`, falling back to
+`serving_deployment_id` only when no owner row exists. It does not scan running
+deployments, order by creation time or infer proof from a running route step.
+The migration itself is fail closed and performs no backfill: it refuses while
+any deploy/rollback/restart/promote operation is queued, running or cancelling,
+or while any deployment row is pending/running. Operators finish or cancel old
+work before upgrading; a safe cutover creates an empty owner table and leaves
+serving pointers and terminal history unchanged.
+The owner is acquired and released while holding `env/<app>/<env>`; it records
+the frozen predecessor release/deployment, owner operation/deployment/attempt,
+phase and exact restore target. Owner creation and the deployment's
+previous-release/deployment binding commit in the same transaction; renewal
+reasserts the binding from the frozen owner before effects, so a crash cannot
+leave a stale predecessor. After settling a terminal/stale owner, a waiting
+operation reloads the environment before reacquiring, because that settlement
+may have restored serving to a different deployment. Deploy-family workers use
+`pg_try_advisory_lock`; contention returns job snooze, so deferral neither
+consumes a River attempt nor holds a pool connection in a blocking wait. Scale
+submission uses `pg_try_advisory_xact_lock` on the same env target before its
+row lock and returns conflict immediately on contention.
+
+The live deployment records candidate intent (`switching`, route target =
+candidate) before route application. Success requires both the completed route
+step and completed public step. Recovery for any other state moves the owner to
+the frozen restore target, writes that exact deployment's upstreams, updates
+serving to the restored target, cleans candidates only after a successful
+restore, and then fails/cancels. A failed restore retains both candidates and
+the owner. Cancellation before route intent cancels under the owner; cancellation
+after intent restores first. The live path checks cancellation after the public
+step and after resync, and the success transaction rechecks `cancelling` under
+the operation row lock, returning to restoration rather than committing success.
+Reconciliation acquires the same owner; if a worker lease is gone before any
+route evidence, it cleans and fails rather than resuming a deployment from
+maintenance. River exhaustion leaves the operation running with its owner until
+the reconcile worker restores the route and records the terminal failure. A
+sweep settles terminal/stale owners and ambiguous legacy rows under the same
+lock, using the post-restore target rather than a pre-restore environment
+snapshot. Previous-container cleanup lookup and pre-record errors propagate:
+success is not finalized and ownership/operation remain retryable until the rows
+are durable, including the recovered-success path. A successful terminal
+operation cannot own new node cleanup steps, so a best-effort post-commit pass
+uses the maintenance cleanup identity and leaves failures for the guarded retry.
+`retryContainerCleanup` takes the env lock and reads the current serving/owner
+rows, protecting the owner's frozen restore target for its whole lifetime and
+also the owner's own candidate deployment in every owner phase, including
+`prepared`. A partial cleanup-intent insert therefore cannot be removed by
+maintenance while a retry may still resume onto those containers. Every early
+terminal exit after owner acquisition, including `deploymentPlan` placement or
+node lookup failures and pre-step transport-resolution failures, routes through
+the deployment failure helper so retained candidates get a durable cleanup row
+before the prepared owner is released; recording rows does not require a node
+transport. Protected rows
+reschedule without incrementing attempts, so they cannot starve later rows;
+cleanup record failures retain terminal/ambiguous ownership. A worker's own
+`context.Canceled` is not a durable cancellation: it returns without removing
+candidates or terminalizing, while an explicit durable `cancelling` state still
+runs the cleanup/settlement tail. A nonretryable post-`recordServing` resync
+failure restores the frozen predecessor before terminal failure; restoration
+failure retains retryable ownership. The owner phase is authoritative:
+`restoring`/`restored` never enters the success proof branch, even if the
+restore step row is missing after a crash between phase update and step insert.
+Live and recovery post-switch route failures use one classified restoration
+helper. Cancellation/failure recovery persists candidate cleanup intent before
+terminalizing; insert or pinned-revision node lookup failures retain ownership
+and the nonterminal operation. The live terminal and post-switch public-failure
+paths persist the same intent before settling, and the evidence read for
+pre-save reconstruction propagates database errors instead of treating them as
+"no containers". When a crash or cancellation precedes
+`saveDeploymentInstances`, planned names are reconstructed from
+`platform-container-*` step evidence and the pinned revision; a pinned revision
+without a readable runtime node fails closed. Retryable pre-switch failures
+retain candidates and their completed step rows so the retry resumes without
+recreating containers, while terminal and cancellation failures clean up. The
+restore step uses the owner's frozen release, reasserts the selected target even
+when the step row was already completed, and records/releases only after that
+route write succeeds. Previous cleanup
+resolves a pinned revision's exact runtime node and fails closed on lookup/empty
+node; only an unpinned legacy deployment falls back to the environment node.
+Ambiguous recovery propagates deployment lookup errors and retains the ambiguous
+owner. Owner release is split: the success finalizer releases a serving owner,
+while failure/cancellation releases only a prepared/restored owner whose exact
+target is durable. Migration 026 uses no legacy backfill: it fails closed while
+any deployment lifecycle operation is in flight or any deployment row is
+pending/running, and a safe cutover creates the empty owner table.
+
+Promotion is a separate submission kind, not a cross-environment
+`platform.deploy`. `preparePromotionTx` locks the source environment row before
+the production row, resolves and pins the source's current serving release at
+**submission time** (not when the worker later runs), validates
+ready/unpruned/immutable-image and same-node placement, runs the explicit-release
+deployability gate against production, and refuses a release whose image is
+already serving or while **any** production deployment is active, including a
+different artifact. The deployment row and its previous release/deployment are
+then recorded in the same transaction. It inserts a new production release with
+the source image reference, image ID, commit and source JSON, status `ready`, no
+build link and no command, then calls `prepareDeploymentTx` with the deploy
+action. The worker follows the ordinary deployment path: no build, production
+preflight, production revision release command, production config/secret
+resolution and blue/green switch. Success and failure change history use
+`promotion.succeeded`/`promotion.failed`, while the deployment action remains
+`deploy` so release-command and restart/rollback semantics are the shared ones.
+If an ordinary deploy is queued after an accepted promotion and runs first, the
+promotion's `deploymentPlan` rebinds its previous release/deployment to that
+actual serving predecessor under the target lock; the same applies when the
+promotion runs first. Cleanup and rollback therefore follow execution order,
+not a stale admission snapshot. `env promote` is the only CLI path; `--release`
+on `deploy` still refuses another environment's release. Operation input carries
+only app and source environment; the pinned artifact identity is in the new
+release row, its image/commit and operation events, so no source secret or
+domain can flow into production. A preview passes the supplied idempotency key
+and compares the same normalized-input hash as submit: an identical accepted
+submission reports the replay, while the same key with changed input returns
+`conflict` before any source resolution. `Service.Preview` therefore cannot hide
+a changed-input conflict behind a stale preview.
+
 The cleanup warning names the containers and the node's own removal reason
 (one redacted, bounded line), so a failed removal does not report only a
 generic internal error.
@@ -1120,8 +1376,10 @@ durable status visible and marks replica state `unknown`. Domains come from the
 public-response state plus the ready flag; a failed domain read is reported
 separately instead of inventing `unknown` per domain. `logs` uses
 `platform.logs` to stream the serving deployment's containers as RPC events,
-filtered by `--process`; it does not read telemetry. The workspace metrics graph
-still uses the telemetry data source.
+filtered by `--process`; it does not read node metrics. The workspace Fleet
+detail reads one current `metrics.show` snapshot over node RPC and shows
+current CPU, memory, filesystem, load and uptime facts; it retains no samples
+and does not query PromQL or an external backend.
 
 Domains are changed in the submission transaction, then the worker reads all
 bindings, writes one Caddy site per domain with the serving deployment's web
@@ -1149,7 +1407,130 @@ SNI. Wrong DNS stays unready. A Cloudflare-proxied record (deploycrate's
 Cloudflare mode) counts as reaching the node: the certificate and public checks
 still run against local Caddy, so readiness means the origin serves the host. `domain add` records the main node's
 public addresses so observation has an expected value. Inventory `domains` and
-`domain list` expose each state separately. A third periodic maintenance job
+`domain list` expose each state separately.
+
+Explicit Cloudflare DNS is a separate provider effect under the same domain
+operation. `platform.DomainInput` carries only `dns_mode`, `dns_zone`, explicit
+`dns_origins` and the explicit proxy choice; the token file path and value stay
+in server configuration. Origins are validated public addresses supplied by the
+operator, never derived from the context's WireGuard management endpoint. Public
+origin validation rejects private, RFC1918, CGNAT (`100.64/10`), loopback,
+link-local, multicast, unspecified, documentation/benchmarking and other
+non-public ranges for IPv4 and IPv6; IPv6 origins must also be in the global
+`2000::/3` unicast range. The node executes the effect through
+`integrations.DomainDNS`, which reads the configured zone's root-owned `0640`
+service-group token file, lists only the exact hostname, and writes only records whose comment
+equals the immutable binding marker (`DomainDNSOwnership(domain_id, zone_id)`).
+The marker uses the stable `dom_…` binding ID, not app/environment/hostname
+names, so deleting and re-creating a hostname cannot adopt the previous
+incarnation's record. Admission validates that the configured zone actually
+contains the hostname before writing any operation/ledger intent; an invalid
+pending/failed ledger with no applied generation can be discarded during
+removal without a provider call, while an invalid applied ledger fails closed.
+A plan applies creates/updates before obsolete deletions, then re-reads and
+verifies the complete desired A/AAAA set before deleting any obsolete owned
+record. An A-to-AAAA or AAAA-to-A replacement therefore keeps the old address
+until the replacement exists; a failed or cancelled replacement create leaves
+the old record intact for an idempotent retry.
+
+### Cloudflare credential file
+
+Install one root-owned service-group-readable file on the main node. The root
+node RPC reads it as owner; the `eregion` worker reads it through its primary
+group. Do not put the token on a command line or in shell history.
+
+```sh
+sudo install -d -o root -g eregion -m 0750 /etc/eregion/credentials
+sudoedit /etc/eregion/credentials/cloudflare-token
+sudo chown root:eregion /etc/eregion/credentials/cloudflare-token
+sudo chmod 0640 /etc/eregion/credentials/cloudflare-token
+```
+
+Set both variables in `/etc/eregion/control-plane.env` (replace the zone pair
+with the configured zone ID and name):
+
+```sh
+EREGION_CLOUDFLARE_ZONES=0123456789abcdef0123456789abcdef=example.com
+EREGION_CLOUDFLARE_TOKEN_FILE=/etc/eregion/credentials/cloudflare-token
+```
+
+The file must be a regular file, not a symlink or FIFO, no larger than 4 KiB,
+root-owned, mode `0640`, and in the `eregion` group for the service. The reader
+walks the configured path from `/` with descriptor-relative, no-follow opens;
+every ancestor must be root- or reader-owned, and no ancestor may be writable
+by group or others unless it is a sticky shared directory such as `/tmp`. The
+immediate directory is stricter and must not be writable by group or others at
+all (`0750` above). The final file is opened
+nonblocking and rejected unless `fstat` proves a regular file. Group/other
+readable modes other than `0640`, other owners, setuid/setgid/sticky file bits,
+symlinks, FIFOs, devices and unsafe ancestors are refused. A development
+non-root user may use an owner-only `0600` file instead; that form is not
+readable by the root node RPC and is not the installed service policy. The token
+value never enters action input, argv, River arguments, events, logs or ordinary
+output.
+`EREGION_DNS_ADMINS` must grant `dns.read`, `dns.write` and the specific
+create/update/delete actions, and the durable PostgreSQL audit sink must record
+every intent and result. Provider previews authorize `dns.read` before token
+access; admission authorizes `dns.write` before any ledger/operation mutation,
+and the worker rechecks `dns.write` before token access and each specific
+create/update/delete action before its mutation. The provider plan invokes the
+attempt/cancellation guard immediately before each A/AAAA mutation. Foreign
+A/AAAA records and legacy `eregion:managed` records are conflicts; any CNAME is
+a conflict even when its comment exactly matches the binding marker, because the
+managed policy is A/AAAA only. None are adopted, updated or deleted. Non-managed
+TXT/CNAME content, comments, TTL and proxy state are redacted from preview
+output.
+The `eregion_platform_domain_dns` ledger is written in the same transaction as
+the operation and River job, before any provider effect. It persists provider,
+zone, marker, generation, desired public origins/proxy, state, last operation
+and cleanup status. Adds apply from the ledger, never from transient operation
+input; a successful apply marks the applied generation. Domain admission locks
+the app and environment rows and refuses while another domain change or
+app/environment deletion is queued, running or cancelling. The worker holds the
+same ordered target lock, verifies the operation is still the newest domain
+intent for the target, and the ledger's `last_operation_id` fences the exact
+intent; a later readd, promotion or file update cannot be deleted by a delayed
+removal. Managed re-add/promotion preview and result use the persisted zone,
+origins, proxy and state rather than a false manual input. Adds apply before the
+route write. The worker's claimed attempt is passed explicitly through domain
+and environment/application deletion effects, so a newer attempt loaded from the
+operation snapshot is never accepted as the worker's own. An attempt-fenced
+cancellation check runs before and after every DNS provider effect and before
+each mutation in a multi-record plan. A stopped guard leaves earlier convergent
+A/AAAA changes for an idempotent retry and does not turn cleanup into a failure.
+Cancellation is honored at safe boundaries after provider effects and before
+binding deletion; binding/domain row deletion and finalization recheck
+cancellation under the operation row lock, and completed effects are not
+reported as success. Removal
+and app/environment deletion mark the ledger `cleanup_pending` and verify
+provider cleanup before removing serving workload containers. Deletion first
+preflights every managed binding: the operation-ownership fence, authorization,
+zone/host recovery, a real provider read and exact ownership/conflict checks. An
+obvious refusal therefore stops before the first provider mutation. After that
+point Cloudflare effects are not atomic: a later binding's read/delete failure or
+a cancellation can leave earlier bindings cleaned while later bindings are
+unchanged or partially changed. The worker removes only exact-owned provider
+records, re-reads the exact hostname and marks `cleanup_verified` only when no
+exact-owned A/AAAA remains and no conflict appeared. A read failure, reappeared
+owned record or conflict leaves the ledger retryable, refuses deletion without
+touching workloads, and records how many bindings the pass processed. It never
+claims all records were preserved or that public availability was maintained.
+Retry re-plans the remaining bindings and converges the cleanup. After verification
+the workload and route deletion continues; the ledger and domain rows are
+deleted only after the workload step succeeds. The primary binding is cleaned through
+environment/application deletion (or after promoting another primary for an
+explicit domain removal). Ownership is re-read immediately before each provider
+mutation. Cloudflare has no conditional-write/CAS API, so a concurrent external
+writer can still race the final request; the plan says so and the next
+reconciliation reports the resulting conflict. A dry run of an explicit
+managed-DNS change authorizes read access, then calls the same read-only planner
+and returns a real provider snapshot with the explicit origins or the persisted
+ledger. A manual re-add/promotion preview reports the persisted managed state
+without a provider read or change. Provider success does not update `dns_state`;
+the resolver, Caddy route, certificate and public response remain separate
+observations.
+
+A third periodic maintenance job
 retries due `platform_container_cleanup` rows with one-minute-to-one-hour
 backoff on worker start and every five minutes, deleting a row on success. A
 fourth job compares every environment's recorded serving instances with the

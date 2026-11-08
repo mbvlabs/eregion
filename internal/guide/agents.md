@@ -149,6 +149,23 @@ context. Use `--file` and `--passphrase-file` when no terminal is available.
 credentials; `context remove <name> --confirm <name>` deletes one with its key
 files.
 
+### Deploy, rollback and promotion
+
+`eregion deploy <app> <env>` builds the current source or deploys an existing
+release from the same environment; `rollback` restores an earlier release with
+its recorded revision and secret snapshot. Both are durable operations: follow
+the operation and read the serving state before claiming success.
+
+`eregion env promote <app> <source-environment>` moves the source's current
+serving release to the same app's fixed `production` environment without
+rebuilding. Production keeps its own domain, plain config, secrets and release
+command; the command never copies source domains, config, secrets or command.
+Use `--dry-run --json` first. The source must be serving a ready, unpruned release
+and both environments must be on the same node. A repeated submission with the
+same `--idempotency-key` returns the original operation; an artifact already
+serving or actively deploying to production is refused. `deploy --release` is
+not a cross-environment promotion and refuses another environment's release.
+
 ### Domains
 
 `eregion domain add <app> <environment> <hostname> [--primary]` saves the binding

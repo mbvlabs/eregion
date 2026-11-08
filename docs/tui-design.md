@@ -104,9 +104,11 @@ applied and observed state. A saved domain is not proof of a route, valid
 certificate or healthy public application: show DNS, route application, TLS and
 public health independently, with pending/failed/unknown states.
 
-Optional charts identify source, unit, time window, and freshness. If no external
-backend is configured, say so and show a setup action. Do not synthesize charts or
-display “0” for unavailable telemetry. Durable operation history remains available.
+Node details may show one current node_exporter sample and current memory,
+filesystem, load and uptime facts read over the operator channel. There is no
+telemetry server or retained history: do not synthesize a chart from one sample,
+do not run a global PromQL query, and display “unavailable” with its reason
+instead of “0”. Durable operation history remains available and independent.
 
 ### Plan and confirmation
 

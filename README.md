@@ -6,19 +6,21 @@ One Go binary sets up, secures, deploys and operates applications on servers
 you own. Agent-first JSON commands and a polished human terminal experience; no
 web UI.
 
-**Status: preparing the first v1 alpha; nothing released.** Setup, the private
-operator channel, durable operations, builds, deployments, domain routes and
-upgrades have code. The alpha's operator channel, application workflow and
-release pipeline are still being built; see the work list in MASTER.
+**Status: alpha.3 is published; beta is in preparation and not qualified.**
+Setup, the private operator channel, durable operations, builds, deployments,
+domain routes, extensions, staging-to-production promotion and upgrades have
+code. Node-local telemetry, its local textfile/systemd collector foundations and
+Cloudflare DNS automation are implemented in source; host qualification remains;
+see the work list in MASTER.
 
 ## Start here
 
 1. [MASTER](docs/MASTER.md): goal, decisions, the application model, the target
-   command tree, the v1 alpha scope and the one work list with status.
+   command tree, the v1 alpha/beta scope and the one work list with status.
 2. [IMPLEMENTATION](docs/IMPLEMENTATION.md): code map, current commands, database
    schema and execution boundaries.
-3. [MANUAL-TESTING](docs/MANUAL-TESTING.md): the alpha acceptance checks and the
-   record of real-server runs.
+3. [MANUAL-TESTING](docs/MANUAL-TESTING.md): the alpha/beta acceptance checks and
+   the record of real-server runs.
 
 [AGENTS.md](AGENTS.md) explains how to work in this repository.
 
@@ -35,8 +37,9 @@ bin/eregion help server init --json
 Discovery and help need no database or credentials. The operator surface is
 MASTER section 5: `server init`, `plan`, `apply`, `login`, `context`, `secrets
 export`, `app`, `env`, `process`, `config`, `domain`, `deploy`, `rollback`,
-`restart`, `build`, `release list`, `logs`, `operations`, `token`, `protect`,
-`ssh`, `upgrade`, `doctor`, `ui`, `commands`, `guide`, `skill` and `version`.
+`restart`, `build`, `release list`, `logs`, `metrics show`, `operations`,
+`token`, `protect`, `ssh`, `upgrade`, `doctor`, `ui`, `commands`, `guide`,
+`skill` and `version`.
 Node-mode entry points (`eregion node …`) are hidden server plumbing, not part of
 `commands --json`.
 

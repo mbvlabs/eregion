@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"fmt"
+	"net"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -17,7 +18,26 @@ import (
 const (
 	nodeExporterVersion = "1.11.1"
 	nodeExporterPort    = "9100"
+	// NodeExporterDir is node_exporter's own state directory. Both it and the
+	// textfile directory are root:root 0755 and must not be symlinks.
+	NodeExporterDir         = "/var/lib/node_exporter"
+	NodeExporterTextfileDir = NodeExporterDir + "/textfile"
+	// nodeExporterCollectorUnits is deliberately narrow: eregion's own units,
+	// the container/ingress services and its WireGuard interface. It does not
+	// collect every systemd unit on the host.
+	nodeExporterCollectorUnits = `(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)`
 )
+
+// NodeExporterListenAddress is the only address node_exporter binds.
+func NodeExporterListenAddress() string {
+	return net.JoinHostPort(access.NodeAddress, nodeExporterPort)
+}
+
+// NodeExporterMetricsURL is the node-local read endpoint. It is reachable only
+// on wg0; no public listener or credential exists.
+func NodeExporterMetricsURL() string {
+	return "http://" + NodeExporterListenAddress() + "/metrics"
+}
 
 var nodeExporterSHA256 = map[string]string{
 	"amd64": "9f5ea48e5bc7b656f8a91a32e7d7deb89f70f73dabd0d974418aca15f37d6810",
@@ -38,11 +58,27 @@ func nodeExporterURL(arch string) string {
 type nodeExporterStep struct {
 	cfg  Config
 	exec Exec
+	// parentDir/textfileDir are normally the constants below. Tests set them
+	// to a temporary tree so the strict directory checks can be exercised
+	// without root-owned /var/lib paths.
+	parentDir   string
+	textfileDir string
 }
 
-func (s *nodeExporterStep) ID() string { return "host-node-exporter-v1" }
+func (s *nodeExporterStep) dirs() (string, string) {
+	parent, textfile := s.parentDir, s.textfileDir
+	if parent == "" {
+		parent = NodeExporterDir
+	}
+	if textfile == "" {
+		textfile = NodeExporterTextfileDir
+	}
+	return parent, textfile
+}
+
+func (s *nodeExporterStep) ID() string { return "host-node-exporter-v2" }
 func (s *nodeExporterStep) Describe() string {
-	return "Install node_exporter " + nodeExporterVersion + " on the WireGuard address"
+	return "Install node_exporter " + nodeExporterVersion + " on the WireGuard address with textfile and narrow systemd collectors"
 }
 func (s *nodeExporterStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -70,6 +106,7 @@ func (s *nodeExporterStep) binaryPath() string {
 }
 
 func (s *nodeExporterStep) unit() []byte {
+	_, textfile := s.dirs()
 	return []byte(fmt.Sprintf(`[Unit]
 Description=Prometheus node exporter for eregion
 Documentation=https://github.com/prometheus/node_exporter
@@ -82,7 +119,7 @@ StartLimitBurst=5
 Type=simple
 User=node_exporter
 Group=node_exporter
-ExecStart=%s --web.listen-address=%s
+ExecStart=%s --web.listen-address=%s --collector.textfile.directory=%s --collector.systemd --collector.systemd.unit-include=%s
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=yes
@@ -108,7 +145,7 @@ AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
-`, s.binaryPath(), access.NodeAddress+":"+nodeExporterPort))
+`, s.binaryPath(), access.NodeAddress+":"+nodeExporterPort, textfile, nodeExporterCollectorUnits))
 }
 
 func (s *nodeExporterStep) Inputs() ([]byte, error) {
@@ -116,14 +153,18 @@ func (s *nodeExporterStep) Inputs() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	parent, textfile := s.dirs()
 	return canonicalInput(struct {
-		Version  string `json:"version"`
-		Arch     string `json:"arch"`
-		SHA256   string `json:"sha256"`
-		Unit     string `json:"unit"`
-		UnitPath string `json:"unit_path"`
-		Binary   string `json:"binary"`
-	}{nodeExporterVersion, arch, nodeExporterSHA256[arch], string(s.unit()), s.unitPath(), s.binaryPath()})
+		Version     string `json:"version"`
+		Arch        string `json:"arch"`
+		SHA256      string `json:"sha256"`
+		Unit        string `json:"unit"`
+		UnitPath    string `json:"unit_path"`
+		Binary      string `json:"binary"`
+		ParentDir   string `json:"parent_dir"`
+		TextfileDir string `json:"textfile_dir"`
+		Collectors  string `json:"collector_units"`
+	}{nodeExporterVersion, arch, nodeExporterSHA256[arch], string(s.unit()), s.unitPath(), s.binaryPath(), parent, textfile, nodeExporterCollectorUnits})
 }
 
 func (s *nodeExporterStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
@@ -155,6 +196,13 @@ if systemctl is-active --quiet node-exporter.service; then echo active:ok; else 
 			return incomplete("node-exporter.service is not enabled")
 		}
 	}
+	parent, textfile := s.dirs()
+	if err := validateNodeExporterApplyDirectories(parent, textfile); err != nil {
+		return incomplete(err.Error())
+	}
+	if err := nodeExporterStrictDirectoryState(parent, textfile); err != nil {
+		return incomplete(err.Error())
+	}
 	// The unit can only bind after wg0 exists, so a host that has not brought
 	// up WireGuard yet is complete once the unit is installed and enabled.
 	if !strings.Contains(output, "wg:up") {
@@ -163,7 +211,44 @@ if systemctl is-active --quiet node-exporter.service; then echo active:ok; else 
 	if !strings.Contains(output, "active:ok") {
 		return incomplete("node-exporter.service is not active although wg0 is up")
 	}
-	return complete("node_exporter " + nodeExporterVersion + " answers on " + access.NodeAddress + ":" + nodeExporterPort)
+	return complete("node_exporter " + nodeExporterVersion + " answers on " + access.NodeAddress + ":" + nodeExporterPort + " with textfile and narrow systemd collectors")
+}
+
+// nodeExporterDirectoryModeClear deliberately clears special bits in a second
+// command. chmod with a numeric mode can preserve setgid on a directory (GNU
+// coreutils may do so), so 0755 alone is not an exact-mode repair. Tests
+// execute these same commands against real temporary directories with
+// setgid/sticky bits.
+const nodeExporterDirectoryModeClear = `chmod 0755 "$parent" "$textfile"
+chmod u-s,g-s,o-t "$parent" "$textfile"`
+
+// nodeExporterDirectoryScript is the shell fallback that refuses symlinks and
+// non-directories again immediately before install. The Go preflight in Apply
+// also requires trusted ancestors and safe root ownership/writability first, so
+// an unprivileged parent cannot swap the child between these checks.
+func nodeExporterDirectoryScript(parent, textfile string) string {
+	return fmt.Sprintf(`parent=%q
+textfile=%q
+for path in "$parent" "$textfile"; do
+  if [ -L "$path" ]; then
+    echo "refusing to use symlinked node_exporter path ${path}" >&2
+    exit 1
+  fi
+  if [ -e "$path" ] && [ ! -d "$path" ]; then
+    echo "refusing non-directory node_exporter path ${path}" >&2
+    exit 1
+  fi
+done
+install -d -m 0755 -o root -g root "$parent" "$textfile"
+chown root:root "$parent" "$textfile"
+%s
+for path in "$parent" "$textfile"; do
+  mode="$(stat -c '%%a' "$path")"
+  if [ "$mode" != "755" ]; then
+    echo "refusing to leave node_exporter path ${path} with mode ${mode}; want 0755" >&2
+    exit 1
+  fi
+done`, parent, textfile, nodeExporterDirectoryModeClear)
 }
 
 func (s *nodeExporterStep) Apply(ctx context.Context, _ engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
@@ -171,7 +256,13 @@ func (s *nodeExporterStep) Apply(ctx context.Context, _ engine.Runtime, report e
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
+	parent, textfile := s.dirs()
+	if err := validateNodeExporterApplyDirectories(parent, textfile); err != nil {
+		return engine.ApplyResult{}, err
+	}
+	directoryScript := nodeExporterDirectoryScript(parent, textfile)
 	script := fmt.Sprintf(`set -euo pipefail
+%[7]s
 if ! id node_exporter >/dev/null 2>&1; then
   useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin node_exporter
 fi
@@ -184,7 +275,7 @@ if ! { [ -x %[1]s ] && %[1]s --version 2>/dev/null | grep -q '%[2]s'; }; then
   install -o root -g root -m 0755 "${temporary}/node_exporter-%[2]s.linux-%[6]s/node_exporter" %[1]s
 fi`,
 		s.binaryPath(), nodeExporterVersion, nodeExporterArchive(arch), nodeExporterURL(arch),
-		nodeExporterSHA256[arch], arch)
+		nodeExporterSHA256[arch], arch, directoryScript)
 	if err := s.exec.Run(ctx, s.ID()+"-binary", script, nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
@@ -206,9 +297,9 @@ fi`
 	}
 	return engine.ApplyResult{
 		Notes: []string{
-			"node_exporter " + nodeExporterVersion + " is installed; it listens only on " + access.NodeAddress + ":" + nodeExporterPort + " and starts with wg0",
+			"node_exporter " + nodeExporterVersion + " is installed; it listens only on " + access.NodeAddress + ":" + nodeExporterPort + ", starts with wg0, and reads " + textfile + " plus the narrow systemd unit set",
 		},
-		Result: map[string]any{"version": nodeExporterVersion, "listen": access.NodeAddress + ":" + nodeExporterPort, "unit": s.unitPath()},
+		Result: map[string]any{"version": nodeExporterVersion, "listen": access.NodeAddress + ":" + nodeExporterPort, "unit": s.unitPath(), "parent_dir": parent, "textfile_dir": textfile, "collector_units": nodeExporterCollectorUnits},
 	}, nil
 }
 
@@ -217,9 +308,11 @@ func (s *nodeExporterStep) Diff(context.Context, engine.Runtime) ([]string, erro
 	if err != nil {
 		return nil, err
 	}
+	parent, textfile := s.dirs()
 	out := []string{
 		"+ install node_exporter " + nodeExporterVersion + " (" + arch + ", sha256 " + nodeExporterSHA256[arch] + ")",
 		"+ write " + s.unitPath() + " listening on " + access.NodeAddress + ":" + nodeExporterPort,
+		"+ enable the textfile collector at " + textfile + " (root:root 0755, no symlink; trusted parent " + parent + ") and the narrow systemd unit set " + nodeExporterCollectorUnits,
 		"+ allow " + nodeExporterPort + "/tcp on wg0 only",
 	}
 	if ok, _, _ := sameFileContent(s.unitPath(), s.unit()); !ok {

@@ -120,7 +120,7 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if len(spec.Domains) > 0 {
 		env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: node.Name}
 		for _, declaration := range spec.Domains {
-			if err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
+			if _, err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
 				App: app.Name, Environment: spec.Name, Domain: declaration.Domain,
 				Primary: declaration.Primary, Addresses: spec.DomainAddresses, CheckPath: declaration.CheckPath,
 			}); err != nil {
@@ -129,7 +129,7 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 		}
 	} else if spec.Domain != "" {
 		env := platform.Environment{ID: envID, App: app.Name, Name: spec.Name, Node: node.Name}
-		if err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
+		if _, err := s.insertDomainTx(ctx, tx, env, platform.DomainInput{
 			App: app.Name, Environment: spec.Name, Domain: spec.Domain,
 			Primary: spec.DomainPrimary, Addresses: spec.DomainAddresses, CheckPath: spec.DomainCheckPath,
 		}); err != nil {

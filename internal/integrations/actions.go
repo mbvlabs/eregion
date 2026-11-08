@@ -27,8 +27,9 @@ const (
 )
 
 // DNSZone configures one read-only Cloudflare zone inventory. TokenFile is an
-// absolute root-owned 0600 credential-file reference; the token is never part of
-// action input, route output, or logs.
+// absolute approved credential-file reference (root-owned 0640 with the eregion
+// service group, or owner-only 0600); the token is never part of action input,
+// route output, or logs.
 type DNSZone struct {
 	ZoneID    string
 	ZoneName  string
@@ -130,18 +131,8 @@ func Configure(reg *platform.Registry, cfg RuntimeConfig) error {
 	}); err != nil {
 		return err
 	}
-	seenZones := map[string]bool{}
-	for _, zone := range cfg.DNSZones {
-		if err := ValidateSecretRef(zone.TokenFile); err != nil {
-			return err
-		}
-		if !zoneIDPattern.MatchString(zone.ZoneID) || !dnsNamePattern.MatchString(zone.ZoneName) || !strings.Contains(zone.ZoneName, ".") {
-			return contract.NewFault(contract.ValidationFailed, "invalid DNS inventory zone", "Configure a lowercase 32-character zone ID and a lowercase zone name.")
-		}
-		if seenZones[zone.ZoneID] {
-			return contract.NewFault(contract.ValidationFailed, "duplicate DNS inventory zone", "Configure each Cloudflare zone once.")
-		}
-		seenZones[zone.ZoneID] = true
+	if err := validateDNSZones(cfg.DNSZones); err != nil {
+		return err
 	}
 	if err := reg.RegisterInventory(dnsInventory{
 		zones: cfg.DNSZones, baseURL: cfg.CloudflareBaseURL, client: cfg.CloudflareClient,
@@ -158,6 +149,25 @@ func configuredZone(zones []DNSZone, zoneID, zoneName string) bool {
 		}
 	}
 	return false
+}
+
+func validateDNSZones(zones []DNSZone) error {
+	seenIDs := map[string]bool{}
+	seenNames := map[string]bool{}
+	for _, zone := range zones {
+		if err := ValidateSecretRef(zone.TokenFile); err != nil {
+			return err
+		}
+		if !zoneIDPattern.MatchString(zone.ZoneID) || !dnsNamePattern.MatchString(zone.ZoneName) || !strings.Contains(zone.ZoneName, ".") {
+			return contract.NewFault(contract.ValidationFailed, "invalid DNS inventory zone", "Configure a lowercase 32-character zone ID and a lowercase zone name.")
+		}
+		if seenIDs[zone.ZoneID] || seenNames[strings.ToLower(zone.ZoneName)] {
+			return contract.NewFault(contract.ValidationFailed, "duplicate DNS inventory zone", "Configure each Cloudflare zone once by ID and name.")
+		}
+		seenIDs[zone.ZoneID] = true
+		seenNames[strings.ToLower(zone.ZoneName)] = true
+	}
+	return nil
 }
 
 func normalizeDNS(target platform.Target, raw json.RawMessage) (platform.ActionInput, error) {

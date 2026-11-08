@@ -184,14 +184,14 @@ func repairRestartStillApplies(input platform.RestartInput, env platform.Environ
 }
 
 // environmentOperationBlocksRepair is the pure skip rule: an active deploy,
-// rollback, restart or delete owns the environment and repair must not queue a
-// competing restart.
+// rollback, restart, promotion or delete owns the environment and repair must
+// not queue a competing restart.
 func environmentOperationBlocksRepair(kind string, state contract.State) bool {
 	if state.Terminal() {
 		return false
 	}
 	switch kind {
-	case platform.KindDeploy, platform.KindRollback, platform.KindRestart,
+	case platform.KindDeploy, platform.KindRollback, platform.KindRestart, platform.KindPromote,
 		platform.KindAppDelete, platform.KindEnvironmentDelete:
 		return true
 	default:

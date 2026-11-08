@@ -29,6 +29,7 @@ const (
 	KindDeploy                    = "platform.deploy"
 	KindRollback                  = "platform.rollback"
 	KindRestart                   = "platform.restart"
+	KindPromote                   = "platform.promote"
 	KindDomainAdd                 = "platform.domain.add"
 	KindDomainRemove              = "platform.domain.remove"
 	KindRetentionPrune            = "platform.retention.prune"

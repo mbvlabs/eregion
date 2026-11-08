@@ -179,6 +179,9 @@ func platformWithConfirmation(data json.RawMessage, token string) (json.RawMessa
 	var preview any
 	_ = json.Unmarshal(data, &preview)
 	wrapped := map[string]any{"preview": preview, "confirmation_token": token}
+	if provider := previewProviderData(preview); provider != nil {
+		wrapped["dns_provider"] = provider
+	}
 	encoded, _ := json.Marshal(wrapped)
 	return encoded, platformPretty(encoded) + "\nconfirmation_token: " + token
 }

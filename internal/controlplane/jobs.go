@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -200,9 +201,22 @@ func (s *Service) recoverOrphanedPlatformJob(ctx context.Context, job orphanedPl
 			return false, false, err
 		}
 		if op.Attempt <= uint32(job.Attempt) {
-			failure := fmt.Sprintf("Platform execution stopped after River attempt %d of %d was left running by an earlier worker process on this host; the job was discarded because no attempts remain.", job.Attempt, job.MaxAttempts)
-			if err := s.failPlatformOperationTx(ctx, tx, &op, contract.Unavailable, failure); err != nil {
-				return false, false, err
+			if deploymentLifecycleKind(op.Kind) {
+				// Restore the owner's exact traffic target before the terminal
+				// failure. Reconcile sees the discarded job and completes the
+				// owner recovery; marking the operation failed here would hide
+				// the route from that recovery.
+				if err := appendEvent(ctx, tx, &op, contract.Event{
+					Kind: "warning", Stage: "owner",
+					Message: "River attempts are exhausted; durable deployment ownership will restore the exact recorded serving route before the terminal failure is recorded.",
+				}); err != nil {
+					return false, false, err
+				}
+			} else {
+				failure := fmt.Sprintf("Platform execution stopped after River attempt %d of %d was left running by an earlier worker process on this host; the job was discarded because no attempts remain.", job.Attempt, job.MaxAttempts)
+				if err := s.failPlatformOperationTx(ctx, tx, &op, contract.Unavailable, failure); err != nil {
+					return false, false, err
+				}
 			}
 		}
 	} else {
@@ -331,13 +345,16 @@ type WorkerConfig struct {
 	// submission transaction. Node RPC sets it; HTTP and worker-only processes
 	// leave it nil, which fails factor-gated submissions closed.
 	HumanFactor func(string) error
+	// DomainDNS is the domain-scoped Cloudflare planner/executor. Nil means
+	// managed DNS fails closed; manual domain bindings remain unaffected.
+	DomainDNS *integrations.DomainDNS
 }
 
 func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime, error) {
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor}
+	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS}
 	service.redaction = config.Redaction
 	if service.redaction == nil {
 		service.redaction = &secrets.Registry{}
@@ -851,6 +868,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	}
 	if err := s.reconcileTerminalResourceStates(ctx); err != nil {
 		failures = append(failures, fmt.Errorf("reconcile terminal resource states: %w", err))
+	}
+	if err := s.reconcileDeploymentOwners(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("reconcile deployment owners: %w", err))
 	}
 	rows, err := s.pool.Query(ctx, `SELECT o.id FROM eregion_operations o LEFT JOIN river_job j ON j.id=o.job_id
         WHERE o.state IN ('queued','running','cancelling') AND (j.id IS NULL OR j.state IN ('discarded','cancelled','completed')) LIMIT 100`)

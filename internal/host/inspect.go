@@ -15,9 +15,11 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/buildinfo"
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
 const caddyCertificateRoot = "/var/lib/caddy/.local/share/caddy/certificates"
@@ -30,7 +32,7 @@ func ServiceUnits(role Role, hostname string) []string {
 	}
 	var units []string
 	if config.ControlPlane {
-		units = append(units, "eregion-api.service", "eregion-worker.service", "wg-quick@wg0.service")
+		units = append(units, "eregion-api.service", "eregion-worker.service", "wg-quick@wg0.service", "node-exporter.service")
 		if hostname != "" {
 			units = append(units, "caddy.service")
 		}
@@ -89,11 +91,39 @@ func GatherFacts(ctx context.Context, cfg Config, cfgErr error, drift Plan, drif
 	facts.SchemaCurrent, facts.SchemaRequired, facts.RiverCurrent, facts.RiverRequired, facts.SchemaKnown, facts.SchemaError, facts.SchemaFix = schemaVersions(ctx, cfg.DatabaseURL, redact)
 	facts.Services = serviceStates(ctx, ServiceUnits(cfg.Role, cfg.Hostname))
 	facts.ServicesKnown = len(facts.Services) > 0
+	facts.Telemetry = telemetryFacts(ctx, Role(facts.Role), NodeExporterTextfileDir, NodeExporterMetricsURL())
 	facts.Retention, facts.BuildCache = doctor.GatherRetentionFacts(ctx, facts.Role, cfg.DatabaseURL)
 
 	if cfgErr != nil {
 		facts.ConfigError = redact(safeError(cfgErr))
 	}
+	return facts
+}
+
+// telemetryFacts gathers the current local exporter health used by doctor. It
+// runs on the node itself and reads only the WireGuard-bound endpoint; it does
+// not persist samples, start a scraper or require the control database.
+func telemetryFacts(ctx context.Context, role Role, textfileDir, endpoint string) doctor.TelemetryFacts {
+	roleConfig, err := ConfigForRole(role)
+	if err != nil || !roleConfig.ControlPlane {
+		return doctor.TelemetryFacts{}
+	}
+	facts := doctor.TelemetryFacts{Known: true, Endpoint: endpoint}
+	parent := filepath.Dir(textfileDir)
+	facts.Parent = inspectNodeExporterDir(parent).doctorFacts()
+	facts.Textfile = inspectNodeExporterDir(textfileDir).doctorFacts()
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	probe, err := telemetry.ProbeLocal(probeCtx, endpoint)
+	if err != nil {
+		facts.EndpointError = contract.Classify(err).Message
+		return facts
+	}
+	facts.ExporterVersion = probe.ExporterVersion
+	facts.Collectors = probe.Collectors
+	facts.CollectorsAmbiguous = probe.CollectorsAmbiguous
+	facts.TextfileScrapeError = probe.TextfileScrapeError
+	facts.TextfileScrapeErrorAmbiguous = probe.TextfileScrapeErrorAmbiguous
 	return facts
 }
 

@@ -389,8 +389,8 @@ func (m Model) renderDetail(width, height int) string {
 		lines = append(lines, m.statusStyle(item.Status).Render(item.Status))
 	}
 	lines = append(lines, "")
-	if m.tab == Fleet || m.tab == Envs {
-		lines = append(lines, m.boldStyle().Render("GRAPH"))
+	if m.tab == Fleet {
+		lines = append(lines, m.boldStyle().Render("NODE METRICS"))
 		lines = append(lines, m.metricsText(max(8, width-2))...)
 		lines = append(lines, "")
 	}
@@ -531,7 +531,7 @@ func (m Model) renderHelp(width, height int) string {
 		m.dim().Render(": command palette shows every action with its exact noninteractive CLI equivalent."),
 		m.boldStyle().Render("Safety"),
 		m.dim().Render("Deploys and rollbacks require typing the target name; submission is bound to the previewed plan. A detached UI never cancels an operation."),
-		m.dim().Render("No telemetry node is configured by default, so no graph is drawn. Operations do not need telemetry."),
+		m.dim().Render("Fleet details show one current node_exporter sample over the operator channel. No telemetry server, history or PromQL query exists; operations do not depend on metrics."),
 	}
 	return fitLines(strings.Join(lines, "\n"), width, height)
 }

@@ -265,8 +265,8 @@ func TestMetricsUnavailableAndAvailable(t *testing.T) {
 	m = load(t, m, nodesJSON)
 	next, command := stepCmd(t, m, special(tea.KeyEnter))
 	m = applyCommand(t, next, command)
-	if !strings.Contains(render(m), "no telemetry node is configured") {
-		t.Fatalf("missing honest no-telemetry state:\n%s", render(m))
+	if !strings.Contains(render(m), "no node metrics source is attached") {
+		t.Fatalf("missing honest no-metrics state:\n%s", render(m))
 	}
 
 	source := &fakeMetrics{series: MetricsSeries{
@@ -291,8 +291,14 @@ func TestMetricsUnavailableAndAvailable(t *testing.T) {
 	if !strings.ContainsAny(view, "▁▂▃▄▅▆▇█.:-=+*#@") {
 		t.Fatalf("metric detail did not draw measured samples:\n%s", view)
 	}
-	if len(source.queries) != 1 || source.queries[0].Node != "main" {
+	if len(source.queries) != 1 || source.queries[0].Node != "main" || source.queries[0].Metric != "node.cpu.utilization" {
 		t.Fatalf("metric query = %+v", source.queries)
+	}
+
+	next, command = stepCmd(t, m, press('r'))
+	m = applyCommand(t, next, command)
+	if len(source.queries) != 2 {
+		t.Fatalf("refresh did not re-query metrics: %+v", source.queries)
 	}
 
 	source.series = MetricsSeries{Source: "telemetry-01", Metric: "node.cpu.utilization", Unit: "%", Window: 5 * time.Minute}
@@ -304,16 +310,156 @@ func TestMetricsUnavailableAndAvailable(t *testing.T) {
 	}
 }
 
+func TestFleetCurrentSnapshotDoesNotPretendHistory(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
+		return json.RawMessage(nodesJSON), nil
+	}
+	m = load(t, m, nodesJSON)
+	source := &fakeMetrics{series: MetricsSeries{
+		Source: "node_exporter on main", Metric: "node.cpu.utilization", Unit: "percent",
+		ObservedAt: time.Date(2026, 10, 20, 9, 59, 59, 0, time.UTC),
+		Samples:    []MetricsSample{{At: time.Date(2026, 10, 20, 9, 59, 59, 0, time.UTC), Value: 12.5}},
+		Details:    []Detail{{Label: "Memory", Value: "2.0 GiB used of 8.0 GiB (25.0%)"}, {Label: "Source", Value: "WireGuard only"}},
+		Note:       "One current node_exporter sample. No history is stored.",
+	}}
+	m.opts.Metrics = source
+	next, command := stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view := render(m)
+	for _, want := range []string{"Current node.cpu.utilization", "current sample", "no history retained", "Memory: 2.0 GiB", "Source: WireGuard only", "No history is stored"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing %q in current snapshot view:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "5m window") || strings.Contains(view, "3 samples") {
+		t.Fatalf("current snapshot pretended to have history:\n%s", view)
+	}
+}
+
+func TestMetricFreshnessIsExplicitAndIndependentOfCPUPresence(t *testing.T) {
+	m, api, clock := testArgs(t)
+	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
+		return json.RawMessage(nodesJSON), nil
+	}
+	m = load(t, m, nodesJSON)
+	source := &fakeMetrics{series: MetricsSeries{
+		Source: "node_exporter on main", Metric: "node.cpu.utilization", Unit: "percent",
+		Freshness: "unknown",
+		Samples:   []MetricsSample{{Value: 12.5}},
+		Note:      "Exporter time is unknown; no sample timestamp is invented.",
+	}}
+	m.opts.Metrics = source
+	next, command := stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view := render(m)
+	if !strings.Contains(view, "freshness unknown") {
+		t.Fatalf("explicit unknown freshness was not shown:\n%s", view)
+	}
+	if strings.Contains(view, "last sample") || strings.Contains(view, "ago") {
+		t.Fatalf("unknown freshness was replaced by an invented age:\n%s", view)
+	}
+
+	source.series = MetricsSeries{
+		Source: "node_exporter on main", Metric: "node.cpu.utilization", Unit: "percent",
+		Freshness: "stale", Stale: true,
+		ObservedAt: clock.Add(-2 * time.Minute),
+		Samples:    []MetricsSample{{At: clock.Add(-2 * time.Minute), Value: 12.5}},
+	}
+	m = step(t, m, special(tea.KeyEsc))
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view = render(m)
+	if !strings.Contains(view, "stale ·") || !strings.Contains(view, "last sample") {
+		t.Fatalf("explicit stale freshness was not shown:\n%s", view)
+	}
+
+	source.series = MetricsSeries{
+		Source: "node_exporter on main", Metric: "node.cpu.utilization", Unit: "percent",
+		Freshness: "stale", Stale: true,
+		Note: "CPU utilization is unavailable: no idle series. No history is stored.",
+	}
+	m = step(t, m, special(tea.KeyEsc))
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view = render(m)
+	if !strings.Contains(view, "freshness: stale") || !strings.Contains(view, "CPU utilization is unavailable") {
+		t.Fatalf("CPU absence overwrote explicit stale freshness:\n%s", view)
+	}
+
+	source.series = MetricsSeries{
+		Source: "node_exporter on main", Metric: "node.cpu.utilization", Unit: "percent",
+		Freshness: "fresh", AgeKnown: true, AgeAtReceipt: 40 * time.Second,
+		StaleAfter: 30 * time.Second, ReceivedAt: time.Now(),
+		Samples: []MetricsSample{{Value: 12.5}},
+	}
+	m = step(t, m, special(tea.KeyEsc))
+	next, command = stepCmd(t, m, special(tea.KeyEnter))
+	m = applyCommand(t, next, command)
+	view = render(m)
+	if !strings.Contains(view, "stale ·") {
+		t.Fatalf("node-computed age past threshold did not age to stale:\n%s", view)
+	}
+}
+
+func TestMetricsResponseGenerationFencesOlderRequest(t *testing.T) {
+	m, api, _ := testArgs(t)
+	api.inventory = func(context.Context, string, url.Values) (json.RawMessage, error) {
+		return json.RawMessage(nodesJSON), nil
+	}
+	m = load(t, m, nodesJSON)
+	source := &fakeMetrics{sequence: []MetricsSeries{
+		{Source: "old response", Metric: "node.cpu.utilization", Unit: "percent", Samples: []MetricsSample{{Value: 10}}},
+		{Source: "fresh response", Metric: "node.cpu.utilization", Unit: "percent", Samples: []MetricsSample{{Value: 20}}},
+	}}
+	m.opts.Metrics = source
+	item, ok := m.selectedItem()
+	if !ok {
+		t.Fatal("no selected fleet item")
+	}
+	first := m.requestMetrics(item)
+	second := m.requestMetrics(item)
+	oldMessage := runCommand(t, first)
+	freshMessage := runCommand(t, second)
+
+	m = step(t, m, oldMessage)
+	if !m.metricsLoading || m.metrics != nil {
+		t.Fatalf("older response changed newer loading state: loading=%v metrics=%+v", m.metricsLoading, m.metrics)
+	}
+	m = step(t, m, freshMessage)
+	if m.metrics == nil || m.metrics.series.Source != "fresh response" || m.metricsLoading {
+		t.Fatalf("fresh response was not retained: loading=%v metrics=%+v", m.metricsLoading, m.metrics)
+	}
+}
+
+func TestOnlyFleetQueriesNodeMetrics(t *testing.T) {
+	m, _, _ := testArgs(t)
+	m.opts.Metrics = &fakeMetrics{}
+	if _, ok := m.metricsQuery(Item{Data: map[string]string{"app": "api", "environment": "production", "node": "main"}}); ok {
+		t.Fatal("Envs requested a node metrics query")
+	}
+	m.tab = Envs
+	if _, ok := m.metricsQuery(Item{Data: map[string]string{"app": "api", "environment": "production"}}); ok {
+		t.Fatal("Envs requested a node metrics query")
+	}
+}
+
 type fakeMetrics struct {
-	series  MetricsSeries
-	err     error
-	queries []MetricsQuery
+	series   MetricsSeries
+	sequence []MetricsSeries
+	err      error
+	queries  []MetricsQuery
 }
 
 func (f *fakeMetrics) Query(_ context.Context, query MetricsQuery) (MetricsSeries, error) {
 	f.queries = append(f.queries, query)
 	if f.err != nil {
 		return MetricsSeries{}, f.err
+	}
+	if len(f.sequence) > 0 {
+		series := f.sequence[0]
+		f.sequence = f.sequence[1:]
+		return series, nil
 	}
 	return f.series, nil
 }

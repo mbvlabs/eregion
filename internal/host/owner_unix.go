@@ -15,3 +15,11 @@ func ownershipMatches(info os.FileInfo, owner, group string) (bool, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && (uid < 0 || int(stat.Uid) == uid) && (gid < 0 || int(stat.Gid) == gid), nil
 }
+
+func fileUIDGID(info os.FileInfo) (uint32, uint32, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, false
+	}
+	return stat.Uid, stat.Gid, true
+}

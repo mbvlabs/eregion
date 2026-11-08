@@ -460,6 +460,43 @@ func countEffects(t *testing.T, stateDir string, exec engine.Execution) int {
 	return count
 }
 
+func TestSSHExecReplyLossIsStreamLost(t *testing.T) {
+	server := newTestServer(t)
+	server.dropExecReply = true
+	client := server.transport(t, nil)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	_, err := client.Call(context.Background(), statusRequest(exec), nil)
+	if !node.IsStreamLost(err) {
+		t.Fatalf("lost exec acknowledgement = %v, want node.ErrStreamLost", err)
+	}
+	message := err.Error()
+	for _, want := range []string{"startup is uncertain", "hello/request was not sent in this session", "status lookup"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("lost exec acknowledgement %q does not explain %q", message, want)
+		}
+	}
+	if strings.Contains(message, "may have received the exec request") {
+		t.Fatalf("lost exec acknowledgement still implies this session dispatched the task: %q", message)
+	}
+	if IsTunnelDown(err) {
+		t.Fatalf("lost exec acknowledgement was mislabeled as a tunnel-down handshake failure: %v", err)
+	}
+}
+
+func TestSSHExecRefusalIsNotStreamLost(t *testing.T) {
+	server := newTestServer(t)
+	server.refuseExec = true
+	client := server.transport(t, nil)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	_, err := client.Call(context.Background(), statusRequest(exec), nil)
+	if err == nil {
+		t.Fatal("refused exec was accepted")
+	}
+	if node.IsStreamLost(err) {
+		t.Fatalf("a refused exec that never started was labelled as a lost stream: %v", err)
+	}
+}
+
 func TestHostKeysLoadKnownHosts(t *testing.T) {
 	server := newTestServer(t)
 	path := filepath.Join(t.TempDir(), "known_hosts")

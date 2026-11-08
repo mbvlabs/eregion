@@ -19,20 +19,44 @@ import (
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// runDomain applies a domain change: the domains table already holds it, so
-// the routes file is rewritten from the serving deployments and Caddy loads it.
+// runDomain applies a domain change. An add already has its desired binding;
+// an explicit Cloudflare effect runs before the route write. A remove keeps the
+// binding until the exact owned provider record is gone, then deletes the row.
 func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
 	input := normalized.Input.(*platform.DomainInput)
+	op, _, err := w.service.operationSnapshot(ctx, id)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.revalidateDomainOperation(ctx, op, input); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.service.applyDomainDNSEffect(ctx, op, attempt, input, normalized.Kind == platform.KindDomainRemove); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	// A cancellation accepted after provider effects but before the binding
+	// row is deleted must stop here and retain the ledger/cleanup state.
+	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if normalized.Kind == platform.KindDomainRemove {
+		if err := w.service.deleteDomainBindingRowOwned(ctx, id, attempt, input.App, input.Environment, input.Domain); err != nil {
+			return w.settle(ctx, id, attempt, err)
+		}
+	}
 	if err := w.service.syncRoutes(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	return w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		kind, summary := "domain.added", "Saved the binding for "+input.Domain+" on "+input.App+"/"+input.Environment+"; route and observations are reported separately."
 		if normalized.Kind == platform.KindDomainRemove {
 			kind, summary = "domain.removed", "Removed the binding and route for "+input.Domain
 		}
 		return insertPlatformChange(ctx, tx, op, kind, input.App, input.Environment, summary, map[string]any{"domain": input.Domain}, nil)
-	})
+	}); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	return nil
 }
 
 // caddyRoutesLockKey serializes every writer of the one routes file, including
@@ -44,12 +68,34 @@ const caddyRoutesLockKey int64 = 0x6361646479726f75 // "caddyrou"
 // environment's serving deployment, then loads the Caddyfile through Caddy's
 // admin endpoint. A config Caddy rejects puts the previous routes file back.
 func (s *Service) syncRoutes(ctx context.Context) error {
+	if s.routeSync != nil {
+		return s.routeSync(ctx)
+	}
 	return s.writeRoutes(ctx, "", nil)
 }
 
 // switchRoutesForDeployment points one environment's domains at candidate
 // upstreams while leaving every other environment on its serving deployment.
 func (s *Service) switchRoutesForDeployment(ctx context.Context, env platform.Environment, upstreams []string) error {
+	return s.writeRoutes(ctx, env.ID, upstreams)
+}
+
+// writeRoutesForDeployment forces one environment to an exact deployment's
+// recorded upstreams. It is used for the owner's frozen restore target. The
+// environment advisory lock is held by every caller, so no deployment can
+// change that target between the read and write.
+func (s *Service) writeRoutesForDeployment(ctx context.Context, env platform.Environment, deploymentID platform.DeploymentID) error {
+	if s.routeSync != nil {
+		return s.routeSync(ctx)
+	}
+	upstreams := []string{}
+	if deploymentID != "" {
+		deployment, err := s.deploymentByID(ctx, deploymentID)
+		if err != nil {
+			return err
+		}
+		upstreams = platform.WebUpstreams(deployment.Instances)
+	}
 	return s.writeRoutes(ctx, env.ID, upstreams)
 }
 
@@ -69,7 +115,7 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 			return unavailable()
 		}
 	}
-	rows, err := tx.Query(ctx, desiredRoutesQuery, deploymentRouteStep, deploymentPublicStep, deploymentRestoreRouteStep)
+	rows, err := tx.Query(ctx, desiredRoutesQuery)
 	if err != nil {
 		return unavailable()
 	}
@@ -133,34 +179,22 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 	return s.finishRouteWrite(ctx, tx, routed, unrouted, nil, now)
 }
 
-// desiredRoutesQuery is shared by every route writer. Between the candidate
-// switch and recordServing, the serving pointer still names the previous
-// deployment. Rendering only that pointer would undo an in-flight switch (and
-// remove a first deploy's site) during public verification. The step records
-// and saved instances identify the active routing target without declaring it
-// verified/serving. Failure, cancellation or restoration selects serving again.
-// Include a running switch: its file write and step acknowledgement are not one
-// transaction, and another writer can run between them.
+// desiredRoutesQuery is shared by every route writer. The owner row is the
+// exclusive source of route intent; without an owner the recorded serving
+// deployment is used. There is deliberately no scan of running deployments,
+// no creation-time election and no inference that a running step proves an
+// applied route. A route step can be running before its apply; the owner's
+// explicit intent is what concurrent writers honor.
 const desiredRoutesQuery = `SELECT d.name,e.id,d.is_primary,
-        coalesce(candidate.instances,dep.instances,'[]'::jsonb)
+        coalesce(target.instances,'[]'::jsonb)
     FROM eregion_platform_domains d
     JOIN eregion_platform_environments e ON e.id=d.environment_id
-    LEFT JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id
-    LEFT JOIN LATERAL (
-        SELECT active.instances
-        FROM eregion_platform_deployments active
-        JOIN eregion_operations op ON op.id=active.operation_id
-        JOIN eregion_operation_steps switched ON switched.operation_id=op.id AND switched.step=$1
-        WHERE active.environment_id=e.id AND active.state='running'
-          AND op.state='running' AND switched.state IN ('running','completed')
-          AND NOT EXISTS (
-              SELECT 1 FROM eregion_operation_steps failed
-              WHERE failed.operation_id=op.id AND failed.step=$2 AND failed.state='failed')
-          AND NOT EXISTS (
-              SELECT 1 FROM eregion_operation_steps restoring
-              WHERE restoring.operation_id=op.id AND restoring.step=$3)
-        ORDER BY active.created_at DESC,active.id DESC LIMIT 1
-    ) candidate ON true
+    LEFT JOIN eregion_platform_deployment_owners o ON o.environment_id=e.id
+    LEFT JOIN eregion_platform_deployments target
+        ON target.id=CASE
+            WHEN o.environment_id IS NOT NULL THEN o.route_target_deployment_id
+            ELSE e.serving_deployment_id
+        END
     ORDER BY d.name`
 
 // finishRouteWrite records the applied or failed route attempt and commits the

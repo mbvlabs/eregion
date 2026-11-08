@@ -1,0 +1,6 @@
+# HELP node_exporter_build_info A metric with a constant '1' value labeled by version, revision, branch, goversion.
+# TYPE node_exporter_build_info gauge
+node_exporter_build_info{branch="HEAD",goversion="go1.24.0",revision="abc123",tags="unknown",version="1.11.1"} 1
+# HELP node_uname_info Labeled system information as provided by the uname system call.
+# TYPE node_uname_info gauge
+node_uname_info{domainname="(none)",machine="x86_64",nodename="main.example",release="6.8.0-1-amd64",sysname="Linux",version="#1 SMP"} 1

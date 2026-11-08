@@ -41,8 +41,16 @@ message parsing; missing observations stay unknown. Inventory may carry newer
 reconciliation results than the event view.
 
 Failed refreshes preserve last-known rows with their age. Empty inventory is not
-unreachable inventory. Graphs require a configured metrics source and label unit,
-window and freshness. Absent/stale/no-data is never a zero-valued healthy graph.
+unreachable inventory. Fleet details show one current `metrics.show` snapshot
+from the node's WireGuard-bound node_exporter: one measured CPU sample plus
+current memory, filesystem, load and uptime facts, with source and explicit
+freshness named. Unknown exporter time is not replaced by collection time; the
+node-computed age and threshold are aged with monotonic local receipt time, and
+a focused-detail refresh re-queries metrics. A query for a different node is
+refused rather than relabeling this snapshot. There is no telemetry server,
+history or PromQL, so the view never draws a multi-sample history graph or
+invents request metrics. Unavailable/stale/no data is never a zero-valued
+healthy graph.
 
 Detach never cancels work. `operations follow <id> --interactive` reattaches;
 machine output takes precedence and must not launch Bubble Tea. Current follow

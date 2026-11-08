@@ -303,6 +303,7 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
 		LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		Nodes:         a.fleetResolverConfig(logger), Resolver: nodes, Redaction: a.secrets,
+		DomainDNS: parts.DomainDNS,
 	})
 	if err != nil {
 		closeTransport()

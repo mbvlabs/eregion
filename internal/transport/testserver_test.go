@@ -46,6 +46,11 @@ type testServer struct {
 	// stderr is written to the channel's standard error before the request is
 	// handled.
 	stderr string
+	// dropExecReply closes the channel after receiving exec without replying,
+	// producing the ambiguous session.Start EOF seen on a lost tunnel.
+	dropExecReply bool
+	// refuseExec replies that the exec request was refused, so no command ran.
+	refuseExec bool
 	// transportConfig adjusts the client configuration of the test.
 	transportConfig func(*SSHConfig)
 
@@ -195,6 +200,14 @@ func (s *testServer) handleSession(channel ssh.Channel, requests <-chan *ssh.Req
 		if request.Type != "exec" {
 			_ = request.Reply(false, nil)
 			continue
+		}
+		if s.dropExecReply {
+			_ = channel.Close()
+			return
+		}
+		if s.refuseExec {
+			_ = request.Reply(false, nil)
+			return
 		}
 		_ = request.Reply(true, nil)
 		if s.stderr != "" {

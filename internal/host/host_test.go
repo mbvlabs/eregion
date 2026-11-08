@@ -93,6 +93,26 @@ func TestSupportAndRoleMatrix(t *testing.T) {
 	}
 }
 
+func TestMainServiceUnitsIncludeTheWireGuardExporter(t *testing.T) {
+	units := ServiceUnits(RoleMain, "app.example.com")
+	want := map[string]bool{
+		"eregion-api.service": true, "eregion-worker.service": true,
+		"wg-quick@wg0.service": true, "node-exporter.service": true, "caddy.service": true,
+	}
+	for _, unit := range units {
+		delete(want, unit)
+	}
+	if len(want) != 0 {
+		t.Fatalf("main units missing %v in %v", want, units)
+	}
+	if got := NodeExporterListenAddress(); got != "10.78.0.1:9100" {
+		t.Fatalf("exporter listen = %q", got)
+	}
+	if got := NodeExporterMetricsURL(); got != "http://10.78.0.1:9100/metrics" {
+		t.Fatalf("exporter URL = %q", got)
+	}
+}
+
 func TestConfirmationBindingAndExpiry(t *testing.T) {
 	now := time.Unix(1800000000, 0)
 	inputs := []byte("input")

@@ -76,6 +76,7 @@ func TestNodeUpgradeModePushesOrFetchesTheVerifiedLinuxBuild(t *testing.T) {
 type fakeNodeTransport struct {
 	version  rpcVersionResult
 	fresh    rpcVersionResult
+	metrics  any
 	methods  []string
 	uploads  int
 	installs int
@@ -122,6 +123,11 @@ func (f *fakeNodeTransport) Run(_ context.Context, _ string, stdin io.Reader, st
 		f.installs++
 		f.version = f.fresh
 		data = map[string]bool{"installed": true}
+	case methodMetricsShow:
+		if f.metrics == nil {
+			return fmt.Errorf("no metrics fixture")
+		}
+		data = f.metrics
 	default:
 		return fmt.Errorf("unexpected method %q", request.Method)
 	}

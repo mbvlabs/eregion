@@ -404,7 +404,7 @@ func (m *Model) ServingLine() string {
 	if m.Kind == "" {
 		return "serving release: unknown · no observation yet"
 	}
-	if m.Kind != "platform.deploy" && m.Kind != "platform.rollback" {
+	if m.Kind != "platform.deploy" && m.Kind != "platform.rollback" && m.Kind != "platform.promote" {
 		return "serving release: not applicable to " + m.Kind
 	}
 	return "serving release: unknown · no serving-container event was emitted"

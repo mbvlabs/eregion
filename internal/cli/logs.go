@@ -6,40 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/url"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
-	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/spf13/cobra"
 )
 
-var telemetryEnvironment = []string{
-	"EREGION_TELEMETRY_URL",
-	"EREGION_TELEMETRY_LOGS_URL",
-	"EREGION_TELEMETRY_METRICS_URL",
-	"EREGION_TELEMETRY_LOGS_TOKEN_FILE",
-	"EREGION_TELEMETRY_METRICS_TOKEN_FILE",
-	"EREGION_TELEMETRY_LOGS_TOKEN",
-	"EREGION_TELEMETRY_METRICS_TOKEN",
-}
-
-func addTelemetrySourceFlags(cmd *cobra.Command) {
-	cmd.Flags().String("telemetry-url", "", "Telemetry node origin, such as http://10.77.0.10; ports 8427/9427 are derived")
-	cmd.Flags().String("logs-url", "", "Logs read-gateway origin (defaults to EREGION_TELEMETRY_LOGS_URL)")
-	cmd.Flags().String("metrics-url", "", "Metrics read-gateway origin (defaults to EREGION_TELEMETRY_METRICS_URL)")
-	cmd.Flags().String("logs-token-file", "", "0600 file containing the logs read token (defaults to EREGION_TELEMETRY_LOGS_TOKEN_FILE)")
-	cmd.Flags().String("metrics-token-file", "", "0600 file containing the metrics read token (defaults to EREGION_TELEMETRY_METRICS_TOKEN_FILE)")
-}
-
-// logsSpecs replaces the telemetry-backed query with the operator channel read
-// required by D25. The workspace graph still uses the telemetry data source for
-// metrics; logs never depend on it.
+// logsSpecs reads container logs over the operator channel as required by D25.
+// It never depends on node telemetry.
 func (a *app) logsSpecs() []spec {
 	meta := followingMeta(operationMeta("Read an environment's serving container logs over the operator channel",
 		"eregion logs api production --since 15m --tail 200"))
@@ -197,64 +174,4 @@ func writeLogNDJSON(out io.Writer, record logNDJSONRecord) error {
 		err = io.ErrShortWrite
 	}
 	return err
-}
-
-// telemetryDataSource remains for the workspace metrics graph. `logs` no longer
-// calls it.
-func (a *app) telemetryDataSource(cmd *cobra.Command) (telemetry.DataSource, error) {
-	base := flagOrEnvironment(cmd, "telemetry-url", "EREGION_TELEMETRY_URL")
-	logsURL := flagOrEnvironment(cmd, "logs-url", "EREGION_TELEMETRY_LOGS_URL")
-	metricsURL := flagOrEnvironment(cmd, "metrics-url", "EREGION_TELEMETRY_METRICS_URL")
-	logsTokenFile := flagOrEnvironment(cmd, "logs-token-file", "EREGION_TELEMETRY_LOGS_TOKEN_FILE")
-	metricsTokenFile := flagOrEnvironment(cmd, "metrics-token-file", "EREGION_TELEMETRY_METRICS_TOKEN_FILE")
-	logsToken := os.Getenv("EREGION_TELEMETRY_LOGS_TOKEN")
-	metricsToken := os.Getenv("EREGION_TELEMETRY_METRICS_TOKEN")
-	a.secrets.Add(logsToken, metricsToken)
-	if logsURL == "" && metricsURL == "" && base == "" {
-		return telemetry.Unconfigured{}, nil
-	}
-	if base != "" {
-		derivedLogs, derivedMetrics, err := telemetryNodeEndpoints(base)
-		if err != nil {
-			return nil, err
-		}
-		if logsURL == "" {
-			logsURL = derivedLogs
-		}
-		if metricsURL == "" {
-			metricsURL = derivedMetrics
-		}
-	}
-	if logsURL == "" || metricsURL == "" {
-		return nil, contract.NewFault(contract.InputRequired, "both telemetry read endpoints are required", "Set --logs-url and --metrics-url, or one --telemetry-url whose standard ports are derived.")
-	}
-	return telemetry.NewHTTPDataSource(telemetry.HTTPConfig{
-		MetricsURL: metricsURL, LogsURL: logsURL,
-		MetricsTokenFile: metricsTokenFile, LogsTokenFile: logsTokenFile,
-		MetricsToken: metricsToken, LogsToken: logsToken,
-	})
-}
-
-func flagOrEnvironment(cmd *cobra.Command, flag, environment string) string {
-	value, _ := cmd.Flags().GetString(flag)
-	if value == "" {
-		value = os.Getenv(environment)
-	}
-	return strings.TrimSpace(value)
-}
-
-func telemetryNodeEndpoints(base string) (string, string, error) {
-	if !strings.Contains(base, "://") {
-		base = "http://" + base
-	}
-	parsed, err := url.Parse(base)
-	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
-		return "", "", contract.NewFault(contract.ValidationFailed, "invalid telemetry node URL", "Use an origin such as http://10.77.0.10 without a path, query, or credentials.")
-	}
-	if parsed.Port() != "" {
-		return "", "", contract.NewFault(contract.ValidationFailed, "telemetry node URL must not include a port", "Use the origin only; read ports 8427 and 9427 are derived, or set --logs-url/--metrics-url explicitly.")
-	}
-	host := parsed.Hostname()
-	return parsed.Scheme + "://" + net.JoinHostPort(host, "9427"),
-		parsed.Scheme + "://" + net.JoinHostPort(host, "8427"), nil
 }

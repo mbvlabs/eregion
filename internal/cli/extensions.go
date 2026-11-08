@@ -39,6 +39,7 @@ var serveExtensionEnvironment = []string{
 type extensionRuntime struct {
 	Vault      *vault.Service
 	Extensions *controlplane.Extensions
+	DomainDNS  *integrations.DomainDNS
 	Deliveries *controlplane.PostgresWebhookDeliveries
 	Webhooks   *controlplane.PushWebhookResolver
 }
@@ -71,6 +72,7 @@ func (a *app) startExtensions(pool *pgxpool.Pool) (extensionRuntime, *vault.Envi
 		return parts, nil, err
 	}
 	parts.Extensions = extensions
+	parts.DomainDNS = extensions.DomainDNS
 	parts.Webhooks = controlplane.NewPushWebhookResolver(pool, parts.Vault)
 	return parts, vault.NewEnvironmentResolver(parts.Vault), nil
 }
@@ -88,7 +90,7 @@ func parseCloudflareZones(value, tokenFile string) ([]integrations.DNSZone, erro
 		return nil, nil
 	}
 	if strings.TrimSpace(tokenFile) == "" {
-		return nil, contract.NewFault(contract.InputRequired, "EREGION_CLOUDFLARE_TOKEN_FILE is required with EREGION_CLOUDFLARE_ZONES", "Set the absolute path of a root-owned 0600 Cloudflare API token file.")
+		return nil, contract.NewFault(contract.InputRequired, "EREGION_CLOUDFLARE_TOKEN_FILE is required with EREGION_CLOUDFLARE_ZONES", "Set the absolute path of a root-owned 0640 Cloudflare API token file in the eregion group (or an owner-only 0600 file for a development user).")
 	}
 	seen := map[string]bool{}
 	zones := make([]integrations.DNSZone, 0, len(entries))

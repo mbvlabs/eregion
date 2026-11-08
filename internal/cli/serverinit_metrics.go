@@ -3,12 +3,10 @@ package cli
 import (
 	"context"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/host"
 )
@@ -31,7 +29,7 @@ func (r *serverInit) checkNodeExporter(ctx context.Context, route *host.ContextS
 		Timeout:   10 * time.Second,
 		Transport: &http.Transport{DialContext: dial},
 	}
-	url := "http://" + net.JoinHostPort(access.NodeAddress, "9100") + "/metrics"
+	url := host.NodeExporterMetricsURL()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		task.end(ui.EndWarn, "")

@@ -29,8 +29,10 @@ const (
 )
 
 type secretSnapshotCall struct {
-	names []string
-	refs  map[string]string
+	app         string
+	environment string
+	names       []string
+	refs        map[string]string
 }
 
 // snapshotSecretResolver stands in for the vault resolver: it stores named
@@ -65,7 +67,7 @@ func (*snapshotSecretResolver) Resolve(context.Context, map[string]string) (map[
 func (r *snapshotSecretResolver) ResolveEnvironmentSnapshot(_ context.Context, app, environment string, names []string, refs map[string]string) (map[string]string, map[string]vault.RevisionRef, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	call := secretSnapshotCall{names: append([]string(nil), names...), refs: map[string]string{}}
+	call := secretSnapshotCall{app: app, environment: environment, names: append([]string(nil), names...), refs: map[string]string{}}
 	for key, ref := range refs {
 		call.refs[key] = ref
 	}

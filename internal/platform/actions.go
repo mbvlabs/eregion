@@ -25,6 +25,8 @@ const (
 var (
 	processNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
 	secretNamePattern  = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,127}$`)
+	dnsZoneIDPattern   = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	dnsZoneNamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
 )
 
 type AppCreateInput struct {
@@ -262,6 +264,28 @@ func (in *DeployInput) Target() Target {
 }
 func (in *DeployInput) Preview() any { return in }
 
+// PromotionTargetEnvironment is the only destination of platform.promote.
+// Promotion is a deliberate one-way artifact move into production, not a
+// general cross-environment deploy surface. A different target stays a
+// product decision rather than an inferred alias.
+const PromotionTargetEnvironment = "production"
+
+// PromoteInput promotes the source environment's current serving release to
+// production. The operation target is env/<app>/production; the source release
+// is resolved and pinned inside the submission transaction, so the accepted
+// operation never follows a later staging advance. No source config, secret,
+// domain or release command is copied: the target environment's current
+// revision applies.
+type PromoteInput struct {
+	App               string `json:"app,omitempty"`
+	SourceEnvironment string `json:"source_environment"`
+}
+
+func (in *PromoteInput) Target() Target {
+	return Target{Kind: TargetEnvironment, App: in.App, Environment: PromotionTargetEnvironment}
+}
+func (in *PromoteInput) Preview() any { return in }
+
 type RollbackInput struct {
 	App         string    `json:"app,omitempty"`
 	Environment string    `json:"environment,omitempty"`
@@ -346,6 +370,7 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindDeploy, Summary: "Build from the revision or deploy a release with blue/green switching", Normalize: normalizeDeploy})
 	r.registerBuiltin(Definition{Kind: KindRollback, Summary: "Redeploy a previous release with its revision and secret snapshot", Normalize: normalizeRollback})
 	r.registerBuiltin(Definition{Kind: KindRestart, Summary: "Reapply the serving release with the current revision", Normalize: normalizeRestart})
+	r.registerBuiltin(Definition{Kind: KindPromote, Summary: "Promote a source environment's serving release to production without rebuilding", Normalize: normalizePromote})
 	r.registerBuiltin(Definition{Kind: KindDomainAdd, Summary: "Route a public hostname to an environment through Caddy", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindDomainRemove, Summary: "Remove a public hostname's route", Normalize: normalizeDomain})
 	r.registerBuiltin(Definition{Kind: KindRetentionPrune, Summary: "Prune disk artifacts on one node under the D30 retention policy", Normalize: normalizeRetentionPrune})
@@ -1487,6 +1512,31 @@ func normalizeDeploy(target Target, raw json.RawMessage) (ActionInput, error) {
 	return &input, nil
 }
 
+func normalizePromote(target Target, raw json.RawMessage) (ActionInput, error) {
+	if target.Kind != TargetEnvironment || target.Environment != PromotionTargetEnvironment {
+		return nil, invalid("target", "platform.promote requires target env/<app>/production.")
+	}
+	var input PromoteInput
+	if err := strictDecode(raw, &input); err != nil {
+		return nil, err
+	}
+	if input.App != "" && input.App != target.App {
+		return nil, invalid("app", "The app field must match the target app, or be omitted.")
+	}
+	input.App = target.App
+	input.SourceEnvironment = strings.TrimSpace(input.SourceEnvironment)
+	if input.SourceEnvironment == "" {
+		return nil, invalid("source_environment", "Name the environment whose serving release is promoted.")
+	}
+	if err := ValidateName(input.SourceEnvironment); err != nil {
+		return nil, invalid("source_environment", "Use a lowercase environment name of letters, digits, and inner hyphens.")
+	}
+	if input.SourceEnvironment == target.Environment {
+		return nil, invalid("source_environment", "An environment cannot be promoted to itself; name a different source environment.")
+	}
+	return &input, nil
+}
+
 func normalizeBuildStop(target Target, raw json.RawMessage) (ActionInput, error) {
 	if target.Kind != TargetBuild {
 		return nil, invalid("target", "platform.build.stop requires target build/<build ID>.")
@@ -1633,6 +1683,19 @@ type DomainInput struct {
 	// CheckPath is an optional per-binding HTTP path for observation and the
 	// deploy public check. Empty uses the environment's web health path (D29).
 	CheckPath string `json:"check_path,omitempty"`
+	// DNSMode selects provider automation. Empty and "manual" leave DNS
+	// untouched; "cloudflare" explicitly plans/applies this one hostname.
+	DNSMode string `json:"dns_mode,omitempty"`
+	// DNSZone names one zone from EREGION_CLOUDFLARE_ZONES. The token file is
+	// server configuration and never enters this action input.
+	DNSZone string `json:"dns_zone,omitempty"`
+	// DNSOrigins are the explicitly supplied public origin addresses used for
+	// Cloudflare-managed A/AAAA records. They are never derived from the
+	// operator's WireGuard management endpoint.
+	DNSOrigins []string `json:"dns_origins,omitempty"`
+	// DNSProxied is the explicit Cloudflare proxy choice. Nil means it was not
+	// supplied; Cloudflare mode requires an explicit value.
+	DNSProxied *bool `json:"dns_proxied,omitempty"`
 	// Confirm names the hostname being removed (MASTER D12). It is required
 	// for platform.domain.remove and validated by the node against the current
 	// binding; it is empty for add and for a dry run.
@@ -1643,6 +1706,93 @@ func (in *DomainInput) Target() Target {
 	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
 }
 func (in *DomainInput) Preview() any { return in }
+
+func validDNSZoneReference(value string) bool {
+	if value == "" || strings.ContainsAny(value, " \t\r\n/") {
+		return false
+	}
+	if dnsZoneIDPattern.MatchString(value) {
+		return true
+	}
+	return len(value) <= 253 && strings.Contains(value, ".") && dnsZoneNamePattern.MatchString(value)
+}
+
+// NormalizeDNSOrigins validates explicit public origin addresses for managed
+// DNS. It deliberately rejects private, loopback, link-local, multicast,
+// unspecified and non-global addresses: a WireGuard management endpoint or a
+// container address is not a public origin.
+func NormalizeDNSOrigins(values []string) ([]string, error) {
+	if len(values) > 8 {
+		return nil, invalid("dns origins", "Use at most 8 public origin addresses.")
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		text := strings.TrimSpace(value)
+		addr, err := netip.ParseAddr(text)
+		if err != nil {
+			return nil, invalid("dns origin", "Use an IPv4 or IPv6 address, never a hostname or the WireGuard management endpoint.")
+		}
+		addr = addr.Unmap()
+		if !addr.IsValid() || addr.Zone() != "" || addr.IsUnspecified() || addr.IsLoopback() || addr.IsMulticast() ||
+			addr.IsLinkLocalUnicast() || addr.IsPrivate() || !addr.IsGlobalUnicast() ||
+			(addr.Is6() && !publicIPv6GlobalPrefix.Contains(addr)) || nonPublicDNSOrigin(addr) {
+			return nil, invalid("dns origin", "Use a public global unicast address; private, carrier-grade NAT, documentation, benchmarking, loopback, link-local, multicast and unspecified addresses are refused. IPv6 origins must be in the global 2000::/3 unicast range.")
+		}
+		canonical := addr.String()
+		if seen[canonical] {
+			continue
+		}
+		seen[canonical] = true
+		out = append(out, canonical)
+	}
+	return out, nil
+}
+
+var publicIPv6GlobalPrefix = netip.MustParsePrefix("2000::/3")
+
+var nonPublicDNSOriginPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:2::/48"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2001:10::/28"),
+	netip.MustParsePrefix("2001:20::/28"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("fec0::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
+
+func nonPublicDNSOrigin(addr netip.Addr) bool {
+	for _, prefix := range nonPublicDNSOriginPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
 
 func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 	if target.Kind != TargetEnvironment {
@@ -1666,6 +1816,28 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 	input.Domain, input.Addresses = domain, addresses
 	if input.CheckPath != "" && !validAbsolutePath(input.CheckPath) {
 		return nil, invalid("check path", "Use an absolute path such as /users/sign-in without a scheme, host, whitespace, controls, query, or fragment, up to 256 bytes.")
+	}
+	input.DNSMode = strings.ToLower(strings.TrimSpace(input.DNSMode))
+	switch input.DNSMode {
+	case "", "manual":
+		input.DNSMode = ""
+		if input.DNSZone != "" || input.DNSProxied != nil || len(input.DNSOrigins) > 0 {
+			return nil, invalid("dns mode", "Omit --dns-zone, --dns-origin and --dns-proxy for manual DNS; manual DNS is the default and leaves the provider untouched.")
+		}
+	case "cloudflare":
+		input.DNSZone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.DNSZone), "."))
+		if !validDNSZoneReference(input.DNSZone) {
+			return nil, invalid("dns zone", "Use a zone name from EREGION_CLOUDFLARE_ZONES or its lowercase 32-character ID.")
+		}
+		if len(input.DNSOrigins) > 0 {
+			origins, err := NormalizeDNSOrigins(input.DNSOrigins)
+			if err != nil {
+				return nil, err
+			}
+			input.DNSOrigins = origins
+		}
+	default:
+		return nil, invalid("dns mode", "Use manual (the default) or cloudflare.")
 	}
 	if input.Confirm != "" {
 		input.Confirm = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.Confirm), "."))
