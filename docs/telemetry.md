@@ -275,9 +275,10 @@ Missing today:
 - cross-node aggregation; there is only the main node today.
 
 None of these omissions is hidden by the `metrics show` snapshot or the doctor
-rows. Host qualification of `host-telemetry-v1`, the dedicated Caddy unit, the
-real systemd collector over D-Bus, a real `.prom` file and a real external
-scraper remains manual acceptance.
+rows. `host-telemetry-v1`, the dedicated Caddy unit and the real systemd collector
+over D-Bus were host-qualified on `edge-2767500209f1`; MANUAL-TESTING records
+the run. A real `.prom` fixture and a separately deployed Prometheus/Alloy
+scraper remain manual acceptance.
 
 ## Verification
 
