@@ -19,15 +19,15 @@ type ExtensionConfig struct {
 	// AccessAdmins are the actor subjects allowed to administer private-device
 	// grants. Empty leaves access actions registered but fail-closed.
 	AccessAdmins []string
-	// DNSAdmins are the actor subjects allowed to reconcile managed DNS. When
-	// empty they fall back to AccessAdmins, preserving the earlier single-admin
-	// configuration. DNS authorization is otherwise independent of private
-	// access grants.
+	// DNSAdmins grants the unrelated generic integration DNS action. The
+	// domain-scoped flow uses the operator-only provider authorizer instead and
+	// never falls back to these subjects or AccessAdmins.
 	DNSAdmins []string
-	// DNSZones is the explicit read-only Cloudflare inventory configuration.
-	// Reconcile actions must name one of these zones; with no zones configured,
-	// DNS actions fail closed instead of accepting an arbitrary zone.
-	DNSZones []integrations.DNSZone
+	// DNSZones and DNSCredentials are the authoritative PostgreSQL provider
+	// inventory/credential resolver. Nil fails provider access closed. There is
+	// no environment or file fallback.
+	DNSZones       integrations.DNSZoneSource
+	DNSCredentials integrations.DNSCredentialSource
 	// CloudflareBaseURL is a test seam; empty uses the real API.
 	CloudflareBaseURL string
 	// CloudflareClient is a test seam; empty uses a bounded default client.
@@ -69,14 +69,13 @@ func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
 		return nil, err
 	}
 	extensions := &Extensions{}
-	runtime := integrations.RuntimeConfig{Audit: audit, CloudflareBaseURL: config.CloudflareBaseURL, CloudflareClient: config.CloudflareClient, DNSZones: config.DNSZones}
-	dnsAdmins := config.DNSAdmins
-	if len(dnsAdmins) == 0 {
-		dnsAdmins = config.AccessAdmins
+	runtime := integrations.RuntimeConfig{
+		Audit: audit, CloudflareBaseURL: config.CloudflareBaseURL, CloudflareClient: config.CloudflareClient,
+		Zones: config.DNSZones, Credentials: config.DNSCredentials,
 	}
-	if len(dnsAdmins) > 0 {
+	if len(config.DNSAdmins) > 0 {
 		allow := map[string][]string{}
-		for _, subject := range dnsAdmins {
+		for _, subject := range config.DNSAdmins {
 			allow[subject] = []string{"*"}
 		}
 		authorizer, err := integrations.NewStaticAuthorizer(allow)
@@ -93,8 +92,9 @@ func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
 		runtime.Access, extensions.Access = access, access
 	}
 	domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-		Zones: config.DNSZones, BaseURL: config.CloudflareBaseURL, HTTPClient: config.CloudflareClient,
-		Authorizer: runtime.Authorizer, Audit: audit,
+		Zones: config.DNSZones, Credentials: config.DNSCredentials,
+		BaseURL: config.CloudflareBaseURL, HTTPClient: config.CloudflareClient,
+		Authorizer: integrations.NewOperatorDNSAuthorizer(), Audit: audit,
 	})
 	if err != nil {
 		return nil, err

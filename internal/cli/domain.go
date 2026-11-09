@@ -74,6 +74,7 @@ func (a *app) domainSpecs() []spec {
 			{use: "list", meta: platformMeta("List public hostnames with route, DNS, certificate and public-response state", "eregion domain list --app hello --environment production --json"), args: platformReadArgs,
 				flags: listFlags,
 				run:   a.domainList},
+			a.domainCloudflareSpec(),
 		},
 	}}
 }
@@ -125,7 +126,7 @@ func applyDomainDNSFlags(cmd *cobra.Command, input *platform.DomainInput, forAdd
 		return contract.NewFault(contract.Usage, "unknown --dns mode", "Use manual (the default) or cloudflare.")
 	}
 	if zone == "" {
-		return contract.NewFault(contract.Usage, "--dns cloudflare needs --dns-zone", "Use a zone name or ID configured in EREGION_CLOUDFLARE_ZONES.")
+		return contract.NewFault(contract.Usage, "--dns cloudflare needs --dns-zone", "Configure the zone with eregion domain cloudflare configure first.")
 	}
 	input.DNSMode, input.DNSZone = "cloudflare", zone
 	if !forAdd {

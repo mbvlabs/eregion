@@ -114,6 +114,25 @@ terminal, some need a human, and a retry may need the same idempotency key.
   (`--dest`), never prints the value, and needs a TOTP code at a human's
   terminal. `secret list` shows metadata only. `secrets export` rebuilds the
   whole server handoff behind the same factor.
+- `app create`, `env create` and `env update` accept explicit `--github-auth`
+  for an `https://github.com/...` git source. It reads the operator's
+  authenticated `gh auth token` in memory and writes it as the repository read
+  credential; it never prints the token and never creates a token file. This is
+  opt-in because a gh token can carry broader scopes than a read credential.
+  `--git-credential-file` remains the explicit-file alternative and cannot be
+  combined with `--github-auth`. A read-credential name that is already a
+  runtime secret or the webhook secret is refused before any gh read or vault
+  write, for both the gh and explicit-file paths. The same invariant applies to
+  the effective desired revision of a definition-file update, even when its
+  source binding is unchanged. A dry run or idempotent replay does not read gh.
+- Cloudflare provider setup is a human handoff: ask the operator to run
+  `eregion --context NAME domain cloudflare configure` in their own terminal.
+  They enter the zone and token through its hidden prompt; never request the
+  token in chat, a file, flags or service-environment edits. The command stores
+  it encrypted in the provider vault. `domain cloudflare status --json` is a
+  metadata-only read an agent may use after the human finishes. Then preview
+  exact DNS changes before applying them; saved/read-validated credentials do
+  not prove DNS-write permission or a ready application.
 - A command that prints a secret once is a human handoff: show it to the human
   and do not retain it.
 - `metrics endpoint` reports whether the dedicated WireGuard-only Caddy

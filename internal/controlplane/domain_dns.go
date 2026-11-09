@@ -22,7 +22,7 @@ func (s *Service) previewDomainDNS(ctx context.Context, actor contract.Actor, in
 		return integrations.DomainDNSPlan{}, contract.NewFault(contract.ValidationFailed, "Cloudflare DNS is not selected", "Use --dns cloudflare with --dns-zone and --dns-origin, or omit DNS flags for manual DNS.")
 	}
 	if s.domainDNS == nil {
-		return integrations.DomainDNSPlan{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES and EREGION_CLOUDFLARE_TOKEN_FILE, then retry; manual DNS remains the default.")
+		return integrations.DomainDNSPlan{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; manual DNS remains the default.")
 	}
 	if err := s.domainDNS.AuthorizeRead(ctx, actor); err != nil {
 		return integrations.DomainDNSPlan{}, err
@@ -43,7 +43,7 @@ func (s *Service) previewDomainDNS(ctx context.Context, actor contract.Actor, in
 		domainID = ledger.DomainID
 		ownership = ledger.Ownership
 		if input.DNSZone != "" {
-			requested, err := s.resolveDomainDNSZone(input.DNSZone)
+			requested, err := s.resolveDomainDNSZone(ctx, input.DNSZone)
 			if err != nil {
 				return integrations.DomainDNSPlan{}, err
 			}
@@ -52,7 +52,7 @@ func (s *Service) previewDomainDNS(ctx context.Context, actor contract.Actor, in
 			}
 		}
 	} else {
-		zone, err = s.resolveDomainDNSZone(input.DNSZone)
+		zone, err = s.resolveDomainDNSZone(ctx, input.DNSZone)
 		if err != nil {
 			return integrations.DomainDNSPlan{}, err
 		}

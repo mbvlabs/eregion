@@ -13,6 +13,9 @@ func TestMigration005MatchesVaultSchema(t *testing.T) {
 	if migration005 != vault.SchemaSQL {
 		t.Fatal("005_vault.sql differs from vault/schema.sql; add a new migration instead of editing an applied one")
 	}
+	if migration027 != vault.ProviderSchemaSQL {
+		t.Fatal("027_provider_credentials.sql differs from vault/provider_schema.sql; add a new migration instead of editing an applied one")
+	}
 	for index, m := range migrations {
 		if m.version != index+1 {
 			t.Fatalf("migration %d is out of order at index %d", m.version, index)

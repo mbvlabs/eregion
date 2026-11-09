@@ -142,6 +142,7 @@ func TestCatalogIsCompleteAndOnlyImplemented(t *testing.T) {
 			"eregion server init": true, "eregion login": true, "eregion upgrade": true,
 			"eregion skill install": true, "eregion app create": true, "eregion env create": true,
 			"eregion env update": true, "eregion retention set": true,
+			"eregion domain cloudflare configure": true,
 			// These prompt only for the TOTP code at a terminal.
 			"eregion secret export": true, "eregion secrets export": true,
 			"eregion app delete": true, "eregion env delete": true, "eregion env unprotect": true,

@@ -127,6 +127,7 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	f.String("git-ref", "", "Branch or tag to build; empty uses the repository default")
 	f.String("git-credential-file", "", "Protected 0600 file containing the repository read token")
 	f.String("git-credential-name", "", "Vault secret name for the read token (default GIT_READ_TOKEN)")
+	f.Bool("github-auth", false, "Use the local authenticated gh token as the github.com read credential (opt-in; broader scopes may apply)")
 	f.String("image", "", "Existing OCI image reference; alternative to --git-url")
 	f.String("builder", platform.DefaultBuilder, "Buildpacks builder image for a git source")
 	f.String("context-path", "", "Build context path inside the repository")
@@ -509,6 +510,9 @@ func cloneStringMap(values map[string]string) map[string]string {
 // readSetup reads the flags, asks only for what is still missing in a terminal
 // and returns one validated declaration. Every question has a flag equivalent.
 func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, error) {
+	if err := validateGitHubAuthFlags(cmd); err != nil {
+		return nil, err
+	}
 	if from := flagString(cmd, "from"); from != "" {
 		return a.readSetupFromFile(cmd, mode, from)
 	}
@@ -785,6 +789,11 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 }
 
 func (a *app) readSetupCredential(cmd *cobra.Command, ans *setupAnswers, interactive bool) error {
+	if githubAuthRequested(cmd) {
+		// The explicit flag skips the private-repository prompt; the token is
+		// read only after preview confirms this is not a dry run or replay.
+		return nil
+	}
 	path := flagString(cmd, "git-credential-file")
 	name := flagString(cmd, "git-credential-name")
 	if path != "" {

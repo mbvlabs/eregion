@@ -64,6 +64,9 @@ type Backend interface {
 	GetSecretMetadata(context.Context, vault.Namespace) (vault.Metadata, error)
 	ListSecrets(context.Context, string, string, int) ([]vault.Metadata, error)
 	ExportSecret(context.Context, vault.Namespace, string) (vault.Metadata, []byte, error)
+	PreviewCloudflareCredential(context.Context, string, string, []byte) (api.CloudflareCredentialPreview, error)
+	ConfigureCloudflareCredential(context.Context, string, string, uint64, []byte) (vault.ProviderMetadata, error)
+	ListCloudflareCredentials(context.Context, string) ([]vault.ProviderMetadata, error)
 	ProtectInit(context.Context, bool, string, string) (protect.Setup, error)
 	ProtectConfirm(context.Context, string) (protect.Status, error)
 	ProtectStatus(context.Context) (protect.Status, error)
@@ -87,40 +90,42 @@ type Backend interface {
 const (
 	nodeBinaryPath = "/usr/local/bin/eregion"
 
-	methodVersion            = "version"
-	methodUpgradeInstall     = "upgrade.install"
-	methodTest               = "operations.test"
-	methodSubmit             = "operations.submit"
-	methodGet                = "operations.get"
-	methodEvents             = "operations.events"
-	methodCancel             = "operations.cancel"
-	methodInventory          = "platform.inventory"
-	methodSecretSet          = "vault.set"
-	methodSecretArchive      = "vault.archive"
-	methodSecretMetadata     = "vault.metadata"
-	methodSecretList         = "vault.list"
-	methodSecretExport       = "vault.export"
-	methodReady              = "ready"
-	methodHostPlan           = "host.plan"
-	methodHostApply          = "host.apply"
-	methodHostDoctor         = "host.doctor"
-	methodHostStatus         = "host.status"
-	methodProtectInit        = "protect.init"
-	methodProtectConfirm     = "protect.confirm"
-	methodProtectStatus      = "protect.status"
-	methodTokenCreate        = "token.create"
-	methodTokenList          = "token.list"
-	methodTokenRevoke        = "token.revoke"
-	methodHandoffExport      = "handoff.export"
-	methodNodeInfo           = "node.info"
-	methodImagePush          = "image.push"
-	methodRetentionInventory = "retention.inventory"
-	methodRetentionPlan      = "retention.plan"
-	methodRetentionShow      = "retention.show"
-	methodRetentionSet       = "retention.set"
-	methodMetricsShow        = "metrics.show"
-	methodMetricsEndpoint    = "metrics.endpoint"
-	methodMetricsRotate      = "metrics.rotate"
+	methodVersion             = "version"
+	methodUpgradeInstall      = "upgrade.install"
+	methodTest                = "operations.test"
+	methodSubmit              = "operations.submit"
+	methodGet                 = "operations.get"
+	methodEvents              = "operations.events"
+	methodCancel              = "operations.cancel"
+	methodInventory           = "platform.inventory"
+	methodSecretSet           = "vault.set"
+	methodSecretArchive       = "vault.archive"
+	methodSecretMetadata      = "vault.metadata"
+	methodSecretList          = "vault.list"
+	methodSecretExport        = "vault.export"
+	methodCloudflareConfigure = "domain.cloudflare.configure"
+	methodCloudflareStatus    = "domain.cloudflare.status"
+	methodReady               = "ready"
+	methodHostPlan            = "host.plan"
+	methodHostApply           = "host.apply"
+	methodHostDoctor          = "host.doctor"
+	methodHostStatus          = "host.status"
+	methodProtectInit         = "protect.init"
+	methodProtectConfirm      = "protect.confirm"
+	methodProtectStatus       = "protect.status"
+	methodTokenCreate         = "token.create"
+	methodTokenList           = "token.list"
+	methodTokenRevoke         = "token.revoke"
+	methodHandoffExport       = "handoff.export"
+	methodNodeInfo            = "node.info"
+	methodImagePush           = "image.push"
+	methodRetentionInventory  = "retention.inventory"
+	methodRetentionPlan       = "retention.plan"
+	methodRetentionShow       = "retention.show"
+	methodRetentionSet        = "retention.set"
+	methodMetricsShow         = "metrics.show"
+	methodMetricsEndpoint     = "metrics.endpoint"
+	methodMetricsRotate       = "metrics.rotate"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -206,6 +211,18 @@ type rpcSecretListParams struct {
 type rpcSecretExportResult struct {
 	Secret      vault.Metadata `json:"secret"`
 	ValueBase64 string         `json:"value_base64"`
+}
+
+const rpcCloudflareTokenSecret = "cloudflare_token"
+
+type rpcCloudflareConfigureParams struct {
+	ZoneID           string `json:"zone_id"`
+	ZoneName         string `json:"zone_name"`
+	ExpectedRevision uint64 `json:"expected_revision"`
+}
+
+type rpcCloudflareStatusParams struct {
+	Zone string `json:"zone,omitempty"`
 }
 
 // rpcInstallParams is frozen. upgrade.install is how a node on an older build
@@ -503,6 +520,59 @@ func (n *nodeClient) ExportSecret(ctx context.Context, namespace vault.Namespace
 		return vault.Metadata{}, nil, invalidNodeData("secret export")
 	}
 	return response.Secret, value, nil
+}
+
+func (n *nodeClient) PreviewCloudflareCredential(ctx context.Context, zoneID, zoneName string, token []byte) (api.CloudflareCredentialPreview, error) {
+	raw, err := n.call(ctx, methodCloudflareConfigure, rpcCloudflareConfigureParams{ZoneID: zoneID, ZoneName: zoneName}, rpcCallOptions{
+		DryRun: true, Secrets: map[string]string{rpcCloudflareTokenSecret: base64Encode(token)},
+	})
+	if err != nil {
+		return api.CloudflareCredentialPreview{}, err
+	}
+	var preview api.CloudflareCredentialPreview
+	if json.Unmarshal(raw, &preview) != nil || preview.Provider != vault.ProviderCloudflare ||
+		preview.ZoneID != strings.ToLower(strings.TrimSpace(zoneID)) ||
+		preview.ZoneName != strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zoneName), ".")) ||
+		preview.NextRevision == 0 || !preview.ReadValidated || preview.Validation == "" {
+		return api.CloudflareCredentialPreview{}, invalidNodeData("Cloudflare credential preview")
+	}
+	return preview, nil
+}
+
+func (n *nodeClient) ConfigureCloudflareCredential(ctx context.Context, zoneID, zoneName string, expectedRevision uint64, token []byte) (vault.ProviderMetadata, error) {
+	raw, err := n.call(ctx, methodCloudflareConfigure, rpcCloudflareConfigureParams{
+		ZoneID: zoneID, ZoneName: zoneName, ExpectedRevision: expectedRevision,
+	}, rpcCallOptions{Secrets: map[string]string{rpcCloudflareTokenSecret: base64Encode(token)}})
+	if err != nil {
+		return vault.ProviderMetadata{}, err
+	}
+	var metadata vault.ProviderMetadata
+	if json.Unmarshal(raw, &metadata) != nil || metadata.Validate() != nil ||
+		metadata.ZoneID != strings.ToLower(strings.TrimSpace(zoneID)) ||
+		metadata.ZoneName != strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zoneName), ".")) ||
+		metadata.LatestRevision != expectedRevision+1 {
+		return vault.ProviderMetadata{}, invalidNodeData("Cloudflare credential result")
+	}
+	return metadata, nil
+}
+
+func (n *nodeClient) ListCloudflareCredentials(ctx context.Context, zoneRef string) ([]vault.ProviderMetadata, error) {
+	raw, err := n.call(ctx, methodCloudflareStatus, rpcCloudflareStatusParams{Zone: zoneRef}, rpcCallOptions{})
+	if err != nil {
+		return nil, err
+	}
+	var page struct {
+		Credentials []vault.ProviderMetadata `json:"credentials"`
+	}
+	if json.Unmarshal(raw, &page) != nil || page.Credentials == nil || len(page.Credentials) > vault.MaxProviderZones {
+		return nil, invalidNodeData("Cloudflare credential status")
+	}
+	for _, metadata := range page.Credentials {
+		if metadata.Validate() != nil {
+			return nil, invalidNodeData("Cloudflare credential status")
+		}
+	}
+	return page.Credentials, nil
 }
 
 func (n *nodeClient) ProtectInit(ctx context.Context, rotate bool, label, code string) (protect.Setup, error) {
@@ -1073,6 +1143,12 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	for _, value := range request.Secrets {
 		registry.Add(value)
 	}
+	if request.Method == methodCloudflareConfigure {
+		if decoded, err := base64Decode(request.Secrets[rpcCloudflareTokenSecret]); err == nil && len(decoded) > 0 {
+			registry.Add(string(decoded))
+			clearBytes(decoded)
+		}
+	}
 	if os.Geteuid() != 0 {
 		return writeRPCResult(stdout, nil, contract.NewFault(contract.PreconditionFailed, "eregion node rpc must run as root", "Run it through sudo -n /usr/local/bin/eregion node rpc."))
 	}
@@ -1349,6 +1425,9 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 	}
 	appService := api.NewAppService(run.Service, parts.Vault, func(ctx context.Context) error { return controlplane.Ready(ctx, pool) })
 	appService.Retention = run.Service
+	if parts.Cloudflare != nil {
+		appService.Cloudflare = parts.Cloudflare
+	}
 	return appService, func() { run.Close(); pool.Close() }, nil
 }
 
@@ -1546,6 +1625,31 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 		encoded := base64Encode(value)
 		clearBytes(value)
 		return rpcSecretExportResult{Secret: metadata, ValueBase64: encoded}, nil
+	case methodCloudflareConfigure:
+		var params rpcCloudflareConfigureParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		token, err := base64Decode(request.Secrets[rpcCloudflareTokenSecret])
+		if err != nil || len(token) == 0 || len(token) > 2048 {
+			clearBytes(token)
+			return nil, contract.NewFault(contract.ValidationFailed, "invalid Cloudflare token encoding", "Send the token only as a transient base64 request secret.")
+		}
+		defer clearBytes(token)
+		if request.DryRun {
+			return app.PreviewCloudflareCredential(ctx, actor, params.ZoneID, params.ZoneName, token)
+		}
+		return app.ConfigureCloudflareCredential(ctx, actor, params.ZoneID, params.ZoneName, params.ExpectedRevision, token)
+	case methodCloudflareStatus:
+		var params rpcCloudflareStatusParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		metadata, err := app.ListCloudflareCredentials(ctx, actor, params.Zone)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"credentials": metadata}, nil
 	case methodReady:
 		if err := app.Ready(ctx); err != nil {
 			return nil, err

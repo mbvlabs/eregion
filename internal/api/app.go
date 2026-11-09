@@ -23,6 +23,30 @@ type AppService struct {
 	// Retention is the optional disk-retention surface. It performs the same
 	// planner and policy writes as the periodic job.
 	Retention RetentionService
+	// Cloudflare is the bounded provider-credential setup surface. It is not a
+	// platform action and never enters River.
+	Cloudflare CloudflareSetupService
+}
+
+// CloudflareCredentialPreview is the revision-bound, secret-free setup plan.
+type CloudflareCredentialPreview struct {
+	Provider        string   `json:"provider"`
+	ZoneID          string   `json:"zone_id"`
+	ZoneName        string   `json:"zone_name"`
+	CurrentRevision uint64   `json:"current_revision"`
+	NextRevision    uint64   `json:"next_revision"`
+	ReadValidated   bool     `json:"read_validated"`
+	Validation      string   `json:"validation"`
+	Warnings        []string `json:"warnings,omitempty"`
+}
+
+// CloudflareSetupService is the narrow AppService dependency. Implementations
+// validate the token with a read-only provider request before activation and
+// must leave the previous credential active on any failure.
+type CloudflareSetupService interface {
+	PreviewCloudflareCredential(context.Context, contract.Actor, string, string, []byte) (CloudflareCredentialPreview, error)
+	ConfigureCloudflareCredential(context.Context, contract.Actor, string, string, uint64, []byte) (vault.ProviderMetadata, error)
+	ListCloudflareCredentials(context.Context, contract.Actor, string) ([]vault.ProviderMetadata, error)
 }
 
 // RetentionService is the node-side retention surface. It is separate from
@@ -46,6 +70,31 @@ func (s AppService) Ready(ctx context.Context) error {
 		return contract.NewFault(contract.Unavailable, "readiness is not configured", "Start the node's control plane service.")
 	}
 	return s.ReadyCheck(ctx)
+}
+
+// PreviewCloudflareCredential is the dedicated bounded setup preview. The
+// token travels as transient request data, never as operation input.
+func (s AppService) PreviewCloudflareCredential(ctx context.Context, actor contract.Actor, zoneID, zoneName string, token []byte) (CloudflareCredentialPreview, error) {
+	if s.Cloudflare == nil {
+		return CloudflareCredentialPreview{}, contract.NewFault(contract.Unavailable, "Cloudflare setup is not configured on this node", "Set EREGION_VAULT_KEY_FILE and start the node control plane.")
+	}
+	return s.Cloudflare.PreviewCloudflareCredential(ctx, actor, zoneID, zoneName, token)
+}
+
+// ConfigureCloudflareCredential commits one revision-bound provider credential.
+func (s AppService) ConfigureCloudflareCredential(ctx context.Context, actor contract.Actor, zoneID, zoneName string, expectedRevision uint64, token []byte) (vault.ProviderMetadata, error) {
+	if s.Cloudflare == nil {
+		return vault.ProviderMetadata{}, contract.NewFault(contract.Unavailable, "Cloudflare setup is not configured on this node", "Set EREGION_VAULT_KEY_FILE and start the node control plane.")
+	}
+	return s.Cloudflare.ConfigureCloudflareCredential(ctx, actor, zoneID, zoneName, expectedRevision, token)
+}
+
+// ListCloudflareCredentials reads secret-free provider metadata for status.
+func (s AppService) ListCloudflareCredentials(ctx context.Context, actor contract.Actor, zoneRef string) ([]vault.ProviderMetadata, error) {
+	if s.Cloudflare == nil {
+		return nil, contract.NewFault(contract.Unavailable, "Cloudflare setup is not configured on this node", "Set EREGION_VAULT_KEY_FILE and start the node control plane.")
+	}
+	return s.Cloudflare.ListCloudflareCredentials(ctx, actor, zoneRef)
 }
 
 // NormalizeAction validates one platform action before authorization or

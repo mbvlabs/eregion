@@ -6,7 +6,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,8 +25,6 @@ var extensionEnvironment = []string{
 	"EREGION_VAULT_KEY_FILE",
 	"EREGION_ACCESS_ADMINS",
 	"EREGION_DNS_ADMINS",
-	"EREGION_CLOUDFLARE_ZONES",
-	"EREGION_CLOUDFLARE_TOKEN_FILE",
 }
 
 // serveExtensionEnvironment lists the variables only the API listener reads.
@@ -40,6 +37,7 @@ type extensionRuntime struct {
 	Vault      *vault.Service
 	Extensions *controlplane.Extensions
 	DomainDNS  *integrations.DomainDNS
+	Cloudflare *controlplane.CloudflareSetup
 	Deliveries *controlplane.PostgresWebhookDeliveries
 	Webhooks   *controlplane.PushWebhookResolver
 }
@@ -62,64 +60,23 @@ func (a *app) startExtensions(pool *pgxpool.Pool) (extensionRuntime, *vault.Envi
 	config := controlplane.ExtensionConfig{Pool: pool}
 	config.AccessAdmins = splitList(os.Getenv("EREGION_ACCESS_ADMINS"))
 	config.DNSAdmins = splitList(os.Getenv("EREGION_DNS_ADMINS"))
-	zones, err := parseCloudflareZones(os.Getenv("EREGION_CLOUDFLARE_ZONES"), os.Getenv("EREGION_CLOUDFLARE_TOKEN_FILE"))
-	if err != nil {
-		return parts, nil, err
+	var credentials *controlplane.CloudflareCredentialStore
+	if parts.Vault != nil {
+		credentials = controlplane.NewCloudflareCredentialStore(parts.Vault)
+		config.DNSZones = credentials
+		config.DNSCredentials = credentials
 	}
-	config.DNSZones = zones
 	extensions, err := controlplane.RegisterExtensions(config)
 	if err != nil {
 		return parts, nil, err
 	}
 	parts.Extensions = extensions
 	parts.DomainDNS = extensions.DomainDNS
+	if parts.Vault != nil {
+		parts.Cloudflare = controlplane.NewCloudflareSetup(parts.Vault, config.CloudflareBaseURL, config.CloudflareClient)
+	}
 	parts.Webhooks = controlplane.NewPushWebhookResolver(pool, parts.Vault)
 	return parts, vault.NewEnvironmentResolver(parts.Vault), nil
-}
-
-var cloudflareZoneIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
-
-// parseCloudflareZones parses EREGION_CLOUDFLARE_ZONES. Every entry is one
-// explicit zone pair, for example 0123456789abcdef0123456789abcdef=example.com
-// (either side of "=" or ":" may be the 32-character zone ID). A single name or
-// ID is refused: the inventory and reconcile path need both facts, and this
-// command never guesses or resolves a zone from the network.
-func parseCloudflareZones(value, tokenFile string) ([]integrations.DNSZone, error) {
-	entries := splitList(value)
-	if len(entries) == 0 {
-		return nil, nil
-	}
-	if strings.TrimSpace(tokenFile) == "" {
-		return nil, contract.NewFault(contract.InputRequired, "EREGION_CLOUDFLARE_TOKEN_FILE is required with EREGION_CLOUDFLARE_ZONES", "Set the absolute path of a root-owned 0640 Cloudflare API token file in the eregion group (or an owner-only 0600 file for a development user).")
-	}
-	seen := map[string]bool{}
-	zones := make([]integrations.DNSZone, 0, len(entries))
-	for _, entry := range entries {
-		left, right, ok := strings.Cut(entry, "=")
-		if !ok {
-			left, right, ok = strings.Cut(entry, ":")
-		}
-		if !ok {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid EREGION_CLOUDFLARE_ZONES entry", "Use zoneID=zoneName pairs separated by commas; both the 32-character zone ID and the zone name are required.")
-		}
-		id, name := strings.TrimSpace(left), strings.TrimSpace(right)
-		if cloudflareZoneIDPattern.MatchString(name) && !cloudflareZoneIDPattern.MatchString(id) {
-			id, name = name, id
-		}
-		if !cloudflareZoneIDPattern.MatchString(id) {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid Cloudflare zone ID in EREGION_CLOUDFLARE_ZONES", "Use the lowercase 32-character zone identifier.")
-		}
-		name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
-		if name == "" || !strings.Contains(name, ".") || strings.ContainsAny(name, " \t\r\n/") {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid Cloudflare zone name in EREGION_CLOUDFLARE_ZONES", "Use a lowercase zone name such as example.com.")
-		}
-		if seen[id] {
-			return nil, contract.NewFault(contract.ValidationFailed, "duplicate Cloudflare zone in EREGION_CLOUDFLARE_ZONES", "Configure each zone once.")
-		}
-		seen[id] = true
-		zones = append(zones, integrations.DNSZone{ZoneID: id, ZoneName: name, TokenFile: strings.TrimSpace(tokenFile)})
-	}
-	return zones, nil
 }
 
 // rewritePrivateRequest forwards only the path and the headers the private

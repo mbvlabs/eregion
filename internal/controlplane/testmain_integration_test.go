@@ -6,15 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/mbvlabs/eregion/internal/integrations"
 )
 
 // secureTestTempRoot creates a private temporary root and resolves every
-// symlink in its path. The production credential reader walks the path with
-// O_NOFOLLOW and refuses symlink ancestors; macOS exposes /tmp and /var through
-// /private, so GOTMPDIR must be the canonical path for t.TempDir() to exercise
-// the same safe layout the production reader accepts.
+// symlink in its path. Tests that need a canonical private temporary directory
+// use it; macOS exposes /tmp and /var through /private.
 func secureTestTempRoot(base, pattern string) (string, error) {
 	dir, err := os.MkdirTemp(base, pattern)
 	if err != nil {
@@ -98,18 +94,5 @@ func TestSecureTestTempRootCanonicalizesSymlinkedBase(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o700 {
 		t.Fatalf("test root mode = %o, want 700", info.Mode().Perm())
-	}
-	token := filepath.Join(root, "cloudflare-token")
-	if err := os.WriteFile(token, []byte("token\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := integrations.ReadSecretFile(token, 4096); err != nil {
-		t.Fatalf("credential under canonicalized test root = %v", err)
-	}
-	// The same file reached through the symlinked base must still be refused;
-	// canonicalizing the test root must not weaken the production no-follow walk.
-	linkedToken := filepath.Join(link, filepath.Base(root), "cloudflare-token")
-	if _, err := integrations.ReadSecretFile(linkedToken, 4096); err == nil {
-		t.Fatal("production reader accepted the symlinked path")
 	}
 }

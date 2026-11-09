@@ -16,7 +16,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/bundle"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/transport"
@@ -226,20 +225,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	if _, err := transport.ReadWireGuardKey(wgPath); err != nil {
 		return result{}, contract.NewFault(contract.ValidationFailed, "the record's WireGuard key is not usable", err.Error())
 	}
-	knownHosts, err := knownHostsPath()
-	if err != nil {
-		return result{}, err
-	}
-	knownHostsBefore, hadKnownHosts, err := readOptionalFile(knownHosts)
-	if err != nil {
-		return result{}, err
-	}
 	tempKnownHosts := filepath.Join(tempDir, "known_hosts")
-	if hadKnownHosts {
-		if err := os.WriteFile(tempKnownHosts, knownHostsBefore, 0o600); err != nil {
-			return result{}, err
-		}
-	}
 	route := &host.ContextSSH{
 		Address: net.JoinHostPort(wireGuardAddress, "22"), User: adminUser,
 		Identity: sshPath, KnownHosts: tempKnownHosts,
@@ -249,24 +235,23 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 			Endpoint: get("Main node", "WireGuard endpoint"),
 		},
 	}
-	// Pin the host key seen through the tunnel when it matches the record.
-	if !hostKeyPinned(tempKnownHosts, route.Address) {
-		want := get("Main node", "SSH host key")
-		keyType, _, _ := strings.Cut(want, " ")
-		probe := a.loginSeams.probe
-		if probe == nil {
-			probe = probeOverWireGuard
-		}
-		key, err := probe(cmd.Context(), route, keyType)
-		if err != nil {
-			return result{}, contract.NewFault(contract.Unavailable, "the node does not answer over WireGuard", err.Error())
-		}
-		if got := key.Type() + " " + ssh.FingerprintSHA256(key); got != want {
-			return result{}, contract.NewFault(contract.PreconditionFailed, "the node's host key "+got+" does not match the record", "Do not continue until the server is checked.")
-		}
-		if err := pinHostKey(tempKnownHosts, route.Address, key); err != nil {
-			return result{}, err
-		}
+	// The import is fresh, so always prove the key through the tunnel against
+	// the record before writing anything the context will trust.
+	want := get("Main node", "SSH host key")
+	keyType, _, _ := strings.Cut(want, " ")
+	probe := a.loginSeams.probe
+	if probe == nil {
+		probe = probeOverWireGuard
+	}
+	key, err := probe(cmd.Context(), route, keyType)
+	if err != nil {
+		return result{}, contract.NewFault(contract.Unavailable, "the node does not answer over WireGuard", err.Error())
+	}
+	if got := key.Type() + " " + ssh.FingerprintSHA256(key); got != want {
+		return result{}, contract.NewFault(contract.PreconditionFailed, "the node's host key "+got+" does not match the record", "Do not continue until the server is checked.")
+	}
+	if err := pinHostKey(tempKnownHosts, route.Address, key); err != nil {
+		return result{}, err
 	}
 	ready := a.loginSeams.ready
 	if ready == nil {
@@ -280,10 +265,6 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		}
 	}
 	if err := ready(cmd.Context(), route); err != nil {
-		return result{}, err
-	}
-	mergedKnownHosts, hadTempKnownHosts, err := readOptionalFile(tempKnownHosts)
-	if err != nil {
 		return result{}, err
 	}
 
@@ -304,11 +285,6 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 			_ = os.Rename(backup, dir)
 		}
 		_ = restoreStore.Save()
-		if hadKnownHosts {
-			_ = engine.WriteFileAtomic(knownHosts, knownHostsBefore, 0o600)
-		} else {
-			_ = os.Remove(knownHosts)
-		}
 	}
 	if hadOld {
 		if err := os.Rename(dir, backup); err != nil {
@@ -321,15 +297,9 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		}
 		return result{}, err
 	}
-	if hadTempKnownHosts {
-		if err := engine.WriteFileAtomic(knownHosts, mergedKnownHosts, 0o600); err != nil {
-			restore()
-			return result{}, err
-		}
-	}
 	savedRoute := *route
 	savedRoute.Identity = filepath.Join(dir, "ssh_ed25519")
-	savedRoute.KnownHosts = knownHosts
+	savedRoute.KnownHosts = filepath.Join(dir, "known_hosts")
 	if route.WireGuard != nil {
 		wg := *route.WireGuard
 		wg.PrivateKeyFile = filepath.Join(dir, "wireguard.key")
@@ -371,18 +341,6 @@ func restoreMetricsCredential(dir string, record handoffRecord) (string, error) 
 		return "", err
 	}
 	return password, nil
-}
-
-// readOptionalFile reads path and reports whether it exists.
-func readOptionalFile(path string) ([]byte, bool, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: eregion's own file.
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	return raw, true, nil
 }
 
 // readyRoute checks a not-yet-saved route without touching the context store.

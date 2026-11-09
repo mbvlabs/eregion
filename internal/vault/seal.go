@@ -92,6 +92,95 @@ func (k *KeyRing) Open(namespace Namespace, revision uint64, envelope []byte) ([
 	return plaintext, keyID, nil
 }
 
+// SealProvider encrypts one provider credential for an exact typed scope and
+// revision. The AAD includes a provider-scope tag, so provider ciphertext can
+// never be opened as an application secret (or vice versa).
+func (k *KeyRing) SealProvider(scope ProviderScope, revision uint64, plaintext []byte) ([]byte, string, error) {
+	if k == nil || k.current == "" {
+		return nil, "", contractFault("provider credential encryption key is not loaded", "Configure the protected master-key file before accepting provider credentials.")
+	}
+	if err := scope.Validate(); err != nil {
+		return nil, "", err
+	}
+	if revision == 0 {
+		return nil, "", contractFault("provider credential revision must be positive", "Create revision 1 through the provider store; revisions are never zero.")
+	}
+	key := k.keys[k.current]
+	if key == nil {
+		return nil, "", contractFault("provider credential encryption key is missing", "Repair the protected master-key file.")
+	}
+	block, err := aes.NewCipher(key.key[:])
+	if err != nil {
+		return nil, "", contractFault("provider credential encryption is unavailable", "Check the binary build and master-key format.")
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, "", contractFault("provider credential encryption is unavailable", "Check the binary build.")
+	}
+	nonce := make([]byte, gcmNonceBytes)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, "", contractFault("could not generate a provider credential nonce", "Check the operating system random source.")
+	}
+	keyID := key.id
+	envelope := make([]byte, 0, headerFixed+len(keyID)+gcmNonceBytes+len(plaintext)+gcmTagBytes)
+	envelope = append(envelope, envelopeMagic[:]...)
+	envelope = append(envelope, EnvelopeVersion)
+	envelope = append(envelope, byte(len(keyID)))
+	envelope = append(envelope, keyID...)
+	envelope = append(envelope, nonce...)
+	envelope = aead.Seal(envelope, nonce, plaintext, providerSealAAD(keyID, scope, revision))
+	return envelope, keyID, nil
+}
+
+// OpenProvider authenticates and decrypts one provider credential envelope.
+// A wrong key, scope, revision, header, or ciphertext all return
+// ErrCiphertext without detail.
+func (k *KeyRing) OpenProvider(scope ProviderScope, revision uint64, envelope []byte) ([]byte, string, error) {
+	if err := scope.Validate(); err != nil {
+		return nil, "", err
+	}
+	if revision == 0 {
+		return nil, "", contractFault("provider credential revision must be positive", "Read an existing immutable revision.")
+	}
+	keyID, nonce, ciphertext, err := parseEnvelope(envelope)
+	if err != nil {
+		return nil, "", err
+	}
+	if k == nil {
+		return nil, "", contractFault("provider credential encryption key is not loaded", "Configure the protected master-key file.")
+	}
+	key := k.keys[keyID]
+	if key == nil {
+		return nil, "", contractFault("provider credential ciphertext references an unavailable key", "Restore the key ID from the protected key file; never delete an old key before re-encrypting its revisions.")
+	}
+	block, err := aes.NewCipher(key.key[:])
+	if err != nil {
+		return nil, "", ErrCiphertext
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, "", ErrCiphertext
+	}
+	plaintext, err := aead.Open(nil, nonce, ciphertext, providerSealAAD(keyID, scope, revision))
+	if err != nil {
+		return nil, "", ErrCiphertext
+	}
+	return plaintext, keyID, nil
+}
+
+func providerSealAAD(keyID string, scope ProviderScope, revision uint64) []byte {
+	aad := make([]byte, 0, 64+len(keyID)+len(scope.Provider)+len(scope.ZoneID))
+	aad = append(aad, envelopeMagic[:]...)
+	aad = append(aad, EnvelopeVersion)
+	aad = binary.BigEndian.AppendUint16(aad, uint16(len(keyID)))
+	aad = append(aad, keyID...)
+	aad = append(aad, []byte("provider-scope")...)
+	aad = appendField(aad, scope.Provider)
+	aad = appendField(aad, scope.ZoneID)
+	aad = binary.BigEndian.AppendUint64(aad, revision)
+	return aad
+}
+
 func parseEnvelope(envelope []byte) (string, []byte, []byte, error) {
 	if len(envelope) < headerFixed+gcmNonceBytes+gcmTagBytes {
 		return "", nil, nil, ErrCiphertext

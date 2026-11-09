@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 
@@ -43,15 +41,12 @@ func TestPreviewDomainDNSReadsProviderWithoutMutation(t *testing.T) {
 	fixture := &domainDNSPreviewFixture{}
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
-	if err := os.WriteFile(tokenPath, []byte("cf-preview-token-0123456789\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDNSStore(integrations.DNSZone{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com"}).withToken("0123456789abcdef0123456789abcdef", "cf-preview-token-0123456789")
 	domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-		Zones:      []integrations.DNSZone{{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com", TokenFile: tokenPath}},
+		Zones: store, Credentials: store,
 		BaseURL:    server.URL + "/client/v4",
 		HTTPClient: server.Client(),
-		Authorizer: mustPreviewAuthorizer(t),
+		Authorizer: integrations.NewOperatorDNSAuthorizer(),
 		Audit:      integrations.NewMemoryAudit(),
 	})
 	if err != nil {
@@ -100,13 +95,10 @@ func TestPreviewDomainDNSFailsClosedWithoutConfiguration(t *testing.T) {
 }
 
 func TestPreviewDomainDNSAuthorizesReadBeforeTokenAccess(t *testing.T) {
-	authz, err := integrations.NewStaticAuthorizer(map[string][]string{"ops": {integrations.ActionDNSWrite}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDNSStore(integrations.DNSZone{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com"}).withToken("0123456789abcdef0123456789abcdef", "cf-preview-token-0123456789")
 	domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-		Zones:      []integrations.DNSZone{{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com", TokenFile: filepath.Join(t.TempDir(), "missing-token")}},
-		Authorizer: authz,
+		Zones: store, Credentials: store,
+		Authorizer: integrations.NewOperatorDNSAuthorizer(),
 		Audit:      integrations.NewMemoryAudit(),
 	})
 	if err != nil {
@@ -118,16 +110,10 @@ func TestPreviewDomainDNSAuthorizesReadBeforeTokenAccess(t *testing.T) {
 		App: "api", Environment: "production", Domain: "app.example.com",
 		DNSMode: "cloudflare", DNSZone: "example.com", DNSOrigins: []string{"8.8.8.8"}, DNSProxied: &proxied,
 	}
-	if _, err := service.previewDomainDNS(context.Background(), contract.Actor{Kind: "operator", Subject: "ops"}, input, platform.KindDomainAdd); contract.Classify(err).Code != contract.Forbidden {
+	if _, err := service.previewDomainDNS(context.Background(), contract.Actor{Kind: "ci", Subject: "ops"}, input, platform.KindDomainAdd); contract.Classify(err).Code != contract.Forbidden {
 		t.Fatalf("read authorization error = %v", err)
 	}
-}
-
-func mustPreviewAuthorizer(t *testing.T) integrations.Authorizer {
-	t.Helper()
-	authz, err := integrations.NewStaticAuthorizer(map[string][]string{"ops": {"*"}})
-	if err != nil {
-		t.Fatal(err)
+	if _, reads := store.counts(); reads != 0 {
+		t.Fatalf("denied preview resolved the provider credential %d times", reads)
 	}
-	return authz
 }

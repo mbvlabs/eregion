@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -869,8 +870,28 @@ func normalizeRevisionStateWithHosts(state *RevisionState, enforceGitHosts bool)
 	if state.AutoDeploy && state.Source.Kind != "git" {
 		return invalid("auto_deploy", "Automatic deployment requires a git source binding.")
 	}
+	if err := validateSourceCredentialRole(state.Source, state.SecretNames, state.WebhookSecretName); err != nil {
+		return err
+	}
 	if err := state.Retention.Validate(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateSourceCredentialRole keeps the source read credential in its own
+// vault role. The same value cannot also be injected into application
+// processes or used as the push-to-deploy webhook secret.
+func validateSourceCredentialRole(source SourceBinding, runtimeSecretNames []string, webhookSecretName string) error {
+	name := strings.TrimSpace(source.CredentialSecretName)
+	if name == "" {
+		return nil
+	}
+	if slices.Contains(runtimeSecretNames, name) {
+		return invalid("source.credential_secret", "The git read credential cannot also be a runtime secret; use a separate vault name.")
+	}
+	if webhookSecretName != "" && name == webhookSecretName {
+		return invalid("source.credential_secret", "The git read credential cannot also be the push-to-deploy webhook secret; use a separate vault name.")
 	}
 	return nil
 }
@@ -1686,8 +1707,8 @@ type DomainInput struct {
 	// DNSMode selects provider automation. Empty and "manual" leave DNS
 	// untouched; "cloudflare" explicitly plans/applies this one hostname.
 	DNSMode string `json:"dns_mode,omitempty"`
-	// DNSZone names one zone from EREGION_CLOUDFLARE_ZONES. The token file is
-	// server configuration and never enters this action input.
+	// DNSZone names one zone configured with eregion domain cloudflare configure. The credential is
+	// encrypted server state and never enters this action input.
 	DNSZone string `json:"dns_zone,omitempty"`
 	// DNSOrigins are the explicitly supplied public origin addresses used for
 	// Cloudflare-managed A/AAAA records. They are never derived from the
@@ -1827,7 +1848,7 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 	case "cloudflare":
 		input.DNSZone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.DNSZone), "."))
 		if !validDNSZoneReference(input.DNSZone) {
-			return nil, invalid("dns zone", "Use a zone name from EREGION_CLOUDFLARE_ZONES or its lowercase 32-character ID.")
+			return nil, invalid("dns zone", "Use a configured zone name or its lowercase 32-character ID; configure it with eregion domain cloudflare configure.")
 		}
 		if len(input.DNSOrigins) > 0 {
 			origins, err := NormalizeDNSOrigins(input.DNSOrigins)

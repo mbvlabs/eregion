@@ -18,6 +18,20 @@ func platformSubmission(kind, target, key string, input any) operations.Submissi
 	return operations.Submission{Kind: kind, Target: target, Actor: testActor, IdempotencyKey: key, Input: raw}
 }
 
+func platformSubmissionAs(actor contract.Actor, kind, target, key string, input any) operations.Submission {
+	raw, _ := json.Marshal(input)
+	return operations.Submission{Kind: kind, Target: target, Actor: actor, IdempotencyKey: key, Input: raw}
+}
+
+func platformSubmitAs(t *testing.T, s *Service, actor contract.Actor, kind, target, key string, input any) contract.Operation {
+	t.Helper()
+	op, err := s.Submit(context.Background(), platformSubmissionAs(actor, kind, target, key, input))
+	if err != nil {
+		t.Fatalf("submit %s as %s: %v (%v)", kind, actor.Subject, err, errors.Unwrap(err))
+	}
+	return op
+}
+
 func platformSubmit(t *testing.T, s *Service, kind, target, key string, input any) contract.Operation {
 	t.Helper()
 	op, err := s.Submit(context.Background(), platformSubmission(kind, target, key, input))

@@ -14,7 +14,6 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/transport"
 	"github.com/spf13/cobra"
@@ -137,13 +136,15 @@ func expandHome(path string) string {
 	return path
 }
 
-// knownHostsPath is eregion's own known_hosts, next to the context file.
-func knownHostsPath() (string, error) {
-	contexts, err := host.DefaultContextPath()
+// contextKnownHostsPath is the pinned host keys of one saved context. Every
+// node is reached at the same WireGuard address, so a shared known_hosts file
+// cannot tell two nodes' host keys apart.
+func contextKnownHostsPath(name string) (string, error) {
+	dir, err := identityDir(name)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(contexts), "known_hosts"), nil
+	return filepath.Join(dir, "known_hosts"), nil
 }
 
 // probeHostKey reads the server's host key without authenticating.

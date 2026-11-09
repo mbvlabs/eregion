@@ -25,22 +25,23 @@ func (a *app) envSpecs() []spec {
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
 		"app", "name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
-		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
+		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
 	}
 	create.Examples = []string{
 		"eregion env create",
 		"eregion env create --app api --name staging --node main --git-url https://github.com/acme/api --git-ref next --domain staging.example.com --json",
+		"eregion env create --app api --name production --node main --git-url https://github.com/acme/api --github-auth --no-deploy --json",
 		"eregion env create --from ./eregion.toml --name pr-42 --no-deploy --json",
 	}
 	create.Next = []string{"eregion env status <app> <environment> --json", "eregion domain add <app> <environment> <hostname>"}
 
 	update := operationMeta("Change an environment as a new desired-state revision", "eregion env update api production --git-ref release-2026-10 --json")
-	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued. With an authenticated gh, --github-webhook creates or updates the repository webhook for --auto-deploy or --rotate-webhook-secret; manual paste remains the fallback."}
+	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued. --github-auth reads the local authenticated gh token for a github.com source as the new read credential; it is opt-in because that token may carry broader scopes. With an authenticated gh, --github-webhook creates or updates the repository webhook for --auto-deploy or --rotate-webhook-secret; manual paste remains the fallback."}
 	update.Mutating, update.DryRun, update.Prompts = true, true, true
 	update.InputFlags = []string{
-		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name",
+		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name", "github-auth",
 		"image", "builder", "context-path", "health-type", "health-path", "health-timeout",
 		"release-command", "process", "from", "github-webhook",
 	}
@@ -50,6 +51,7 @@ func (a *app) envSpecs() []spec {
 		"eregion env update api production --process 'web=web:8080:2:' --json",
 		"eregion env update api production --auto-deploy",
 		"eregion env update api production --auto-deploy --github-webhook",
+		"eregion env update api production --github-auth --json",
 		"eregion env update api production --rotate-webhook-secret",
 		"eregion env update api production --from ./eregion.toml --dry-run --json",
 	}
@@ -223,6 +225,7 @@ func addEnvironmentUpdateFlags(cmd *cobra.Command) {
 	f.String("git-ref", "", "Branch or tag; empty clears to the repository default")
 	f.String("git-credential-file", "", "Protected 0600 file containing a new repository read token")
 	f.String("git-credential-name", "", "Vault secret name for the read token; empty clears the name")
+	f.Bool("github-auth", false, "Use the local authenticated gh token as the github.com read credential (opt-in; broader scopes may apply)")
 	f.String("image", "", "Existing OCI image reference; replaces a git source")
 	f.String("builder", "", "Buildpacks builder image for a git source")
 	f.String("context-path", "", "Build context path inside the repository")
@@ -257,6 +260,14 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if err != nil {
 		return result{}, err
 	}
+	specs, err := applyGitHubAuthToSpecs(cmd, ans, []platform.EnvironmentSpec{spec})
+	if err != nil {
+		return result{}, err
+	}
+	if err := validateEnvironmentGitCredentialRoles(specs); err != nil {
+		return result{}, err
+	}
+	spec = specs[0]
 	follow := !boolFlag(cmd, "detach") && (streamsNDJSON(cmd) || (interactive && ans.Deploy && followsByDefault(cmd)))
 	if err := validateFollowRequest(cmd, follow); err != nil {
 		return result{}, err
@@ -335,6 +346,9 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
 	} else {
+		if err := a.fillGitHubAuthCredential(cmd, ans); err != nil {
+			return result{}, err
+		}
 		if _, err := a.writeSetupSecrets(cmd, ans, spec); err != nil {
 			return result{}, err
 		}
@@ -418,6 +432,9 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 	if err := validateIdempotencyFlag(cmd); err != nil {
 		return result{}, err
 	}
+	if err := validateGitHubAuthFlags(cmd); err != nil {
+		return result{}, err
+	}
 	if err := validateGitHubWebhookFlags(cmd); err != nil {
 		return result{}, err
 	}
@@ -463,7 +480,24 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 			changed = append(changed, "auto_deploy")
 		}
 	}
-	defer clearBytes(credential)
+	defer func() { clearBytes(credential) }()
+	runtimeSecrets, webhookSecret := revisionCredentialRoles(current)
+	if patch.WebhookSecretName != nil {
+		webhookSecret = *patch.WebhookSecretName
+	}
+	validateSelectedCredential := credentialName != ""
+	if guided && len(credential) == 0 {
+		existing := ""
+		if current.Revision != nil {
+			existing = current.Revision.Source.CredentialSecretName
+		}
+		validateSelectedCredential = credentialName != existing
+	}
+	if validateSelectedCredential {
+		if err := validateGitCredentialRole(credentialName, runtimeSecrets, webhookSecret); err != nil {
+			return result{}, err
+		}
+	}
 	rotateOnly := webhook.Rotated && len(changed) == 0
 	if len(changed) == 0 {
 		if guided {
@@ -545,6 +579,14 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		return result{data: resultData, plain: plain.String()}, nil
 	}
 
+	if githubAuthRequested(cmd) && credentialName != "" && !preview.Replay {
+		token, err := acquireGitHubAuthToken(cmd.Context())
+		if err != nil {
+			return result{}, err
+		}
+		a.registerSecretValue(token)
+		credential = token
+	}
 	if credentialName != "" && len(credential) > 0 {
 		namespace, err := vault.NewNamespace(appName, environment, credentialName)
 		if err != nil {
@@ -728,6 +770,11 @@ func (a *app) applyDefinitionDomains(cmd *cobra.Command, appName, environment st
 func (a *app) envUpdateFromFile(cmd *cobra.Command, appName, environment, path string) (result, error) {
 	if err := validateIdempotencyFlag(cmd); err != nil {
 		return result{}, err
+	}
+	if githubAuthRequested(cmd) {
+		return result{}, contract.NewFault(contract.Usage,
+			"--github-auth cannot be combined with --from",
+			"The definition path writes no secret value; set the read credential with env update --github-auth without --from.")
 	}
 	for _, name := range definitionRevisionFlags {
 		if flagChanged(cmd, name) {
@@ -1000,7 +1047,7 @@ func (a *app) buildEnvironmentUpdate(cmd *cobra.Command, current platform.Enviro
 		changed = append(changed, "build_node")
 	}
 
-	source, sourceChanged, credential, credentialName, err := a.readUpdateSource(cmd, base.Source)
+	source, sourceChanged, credential, credentialName, err := a.readUpdateSource(cmd, base.Source, current)
 	if err != nil {
 		return patch, nil, "", nil, err
 	}
@@ -1059,9 +1106,16 @@ func (a *app) buildEnvironmentUpdate(cmd *cobra.Command, current platform.Enviro
 	return patch, credential, credentialName, changed, nil
 }
 
-func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding) (platform.SourceBinding, bool, []byte, string, error) {
+func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding, current platform.Environment) (platform.SourceBinding, bool, []byte, string, error) {
 	imageChanged := flagChanged(cmd, "image")
-	gitChanged := flagChanged(cmd, "git-url") || flagChanged(cmd, "git-ref") ||
+	githubAuth := githubAuthRequested(cmd)
+	runtimeSecrets, webhookSecret := revisionCredentialRoles(current)
+	if githubAuth && flagChanged(cmd, "git-credential-file") {
+		return platform.SourceBinding{}, false, nil, "", contract.NewFault(contract.Usage,
+			"--github-auth and --git-credential-file choose different credentials",
+			"Use --github-auth for the local gh token, or --git-credential-file for an explicit protected token file, not both.")
+	}
+	gitChanged := githubAuth || flagChanged(cmd, "git-url") || flagChanged(cmd, "git-ref") ||
 		flagChanged(cmd, "git-credential-file") || flagChanged(cmd, "git-credential-name") ||
 		flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env")
 	if !imageChanged && !gitChanged {
@@ -1093,6 +1147,13 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding) 
 	if err := validateGitURLShape(source.URL); err != nil {
 		return platform.SourceBinding{}, false, nil, "", err
 	}
+	if githubAuth {
+		if _, ok := platform.GitHubRepository(source.URL); !ok {
+			return platform.SourceBinding{}, false, nil, "", contract.NewFault(contract.ValidationFailed,
+				"--github-auth needs a GitHub HTTPS git source",
+				"Use an https://github.com/owner/repository source; another forge needs --git-credential-file with a token for that host.")
+		}
+	}
 	if flagChanged(cmd, "git-ref") {
 		source.Ref = flagString(cmd, "git-ref")
 	}
@@ -1109,10 +1170,30 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding) 
 		}
 		source.BuildEnv = values
 	}
+	if githubAuth {
+		name := source.CredentialSecretName
+		if flagChanged(cmd, "git-credential-name") {
+			name = flagString(cmd, "git-credential-name")
+		}
+		if name == "" {
+			name = defaultGitReadCredentialName
+		}
+		if err := vault.ValidateName(name); err != nil {
+			return platform.SourceBinding{}, false, nil, "", err
+		}
+		if err := validateGitCredentialRole(name, runtimeSecrets, webhookSecret); err != nil {
+			return platform.SourceBinding{}, false, nil, "", err
+		}
+		source.CredentialSecretName = name
+		return source, true, nil, name, nil
+	}
 	if flagChanged(cmd, "git-credential-name") && !flagChanged(cmd, "git-credential-file") {
 		name := flagString(cmd, "git-credential-name")
 		if name != "" {
 			if err := vault.ValidateName(name); err != nil {
+				return platform.SourceBinding{}, false, nil, "", err
+			}
+			if err := validateGitCredentialRole(name, runtimeSecrets, webhookSecret); err != nil {
 				return platform.SourceBinding{}, false, nil, "", err
 			}
 		}
@@ -1124,9 +1205,12 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding) 
 			name = source.CredentialSecretName
 		}
 		if name == "" {
-			name = "GIT_READ_TOKEN"
+			name = defaultGitReadCredentialName
 		}
 		if err := vault.ValidateName(name); err != nil {
+			return platform.SourceBinding{}, false, nil, "", err
+		}
+		if err := validateGitCredentialRole(name, runtimeSecrets, webhookSecret); err != nil {
 			return platform.SourceBinding{}, false, nil, "", err
 		}
 		value, err := readProtectedSecretFile(flagString(cmd, "git-credential-file"))

@@ -55,7 +55,7 @@ func writeTestContext(t *testing.T, store *host.ContextStore, name, nodeAddress,
 	if err != nil {
 		t.Fatal(err)
 	}
-	knownHosts, err := knownHostsPath()
+	knownHosts, err := contextKnownHostsPath(name)
 	if err != nil {
 		t.Fatal(err)
 	}

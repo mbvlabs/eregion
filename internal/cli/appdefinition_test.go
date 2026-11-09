@@ -308,9 +308,11 @@ type definitionInventoryBackend struct {
 	input            json.RawMessage
 	dryRun           bool
 	secretWrite      int
+	secretRead       int
 	secretNamespaces []vault.Namespace
 	secretPayloads   map[string]string
 	submissions      []definitionSubmission
+	previewReplay    bool
 }
 
 func (f *definitionInventoryBackend) PlatformInventory(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
@@ -329,6 +331,21 @@ func (f *definitionInventoryBackend) record(kind, target string, input json.RawM
 
 func (f *definitionInventoryBackend) preview(kind, target string) (json.RawMessage, error) {
 	preview := platform.Preview{Kind: kind, Target: target, DryRun: true, Summary: "test preview", Steps: []string{"revision"}}
+	if f.previewReplay {
+		now := time.Unix(1700000000, 0).UTC()
+		preview.Replay = true
+		preview.Operation = &contract.Operation{
+			ID:           "op_replay",
+			Kind:         kind,
+			Target:       target,
+			Actor:        contract.Actor{Kind: "operator", Subject: "definition-test"},
+			State:        contract.Succeeded,
+			Attempt:      1,
+			LastSequence: 1,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+	}
 	return json.Marshal(preview)
 }
 
@@ -367,6 +384,7 @@ func (f *definitionInventoryBackend) SetSecret(_ context.Context, namespace vaul
 }
 
 func (f *definitionInventoryBackend) GetSecretMetadata(context.Context, vault.Namespace) (vault.Metadata, error) {
+	f.secretRead++
 	return vault.Metadata{}, contract.NewFault(contract.NotFound, "secret not found", "Set the secret first.")
 }
 

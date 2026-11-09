@@ -24,16 +24,34 @@ const (
 
 	InventoryCollection    = "access"
 	InventoryCollectionDNS = "dns"
+
+	// DNSProviderCloudflare is the provider key for the configured credential
+	// scope. The token itself is never part of action input.
+	DNSProviderCloudflare = "cloudflare"
 )
 
-// DNSZone configures one read-only Cloudflare zone inventory. TokenFile is an
-// absolute approved credential-file reference (root-owned 0640 with the eregion
-// service group, or owner-only 0600); the token is never part of action input,
-// route output, or logs.
+// DNSZone is one provider zone configured in PostgreSQL. It carries no
+// credential path; the token is resolved from the typed provider scope.
 type DNSZone struct {
-	ZoneID    string
-	ZoneName  string
-	TokenFile string
+	ZoneID   string
+	ZoneName string
+}
+
+// DNSZoneSource resolves zones from the authoritative provider metadata in
+// PostgreSQL. Implementations must not fall back to environment or file
+// configuration.
+type DNSZoneSource interface {
+	// DNSZone resolves an exact pair. When zoneID is empty, zoneName (or a zone
+	// ID passed as the reference) may be used as a lookup reference.
+	DNSZone(context.Context, string, string) (DNSZone, bool, error)
+	DNSZones(context.Context) ([]DNSZone, error)
+}
+
+// DNSCredentialSource resolves the active provider credential fresh for one
+// provider operation. Implementations must read the current revision from
+// encrypted storage on every call.
+type DNSCredentialSource interface {
+	DNSCredential(context.Context, string, string) ([]byte, error)
 }
 
 // DNSRoute is one observed record in the read-only DNS inventory.
@@ -58,25 +76,24 @@ type RuntimeConfig struct {
 	Access            *AccessController
 	CloudflareBaseURL string
 	CloudflareClient  *http.Client
-	// DNSZones configures the read-only dns inventory collection. Mutations
-	// still carry their own zone and token-file reference in action input.
-	DNSZones []DNSZone
+	// Zones and Credentials are the authoritative PostgreSQL provider
+	// configuration. Nil fails provider access closed; there is no environment
+	// or file fallback.
+	Zones       DNSZoneSource
+	Credentials DNSCredentialSource
 }
 
 type dnsInput struct {
-	target    platform.Target
-	ZoneID    string      `json:"zone_id"`
-	ZoneName  string      `json:"zone_name"`
-	TokenFile string      `json:"api_token_file"`
-	Records   []DNSRecord `json:"records"`
+	target   platform.Target
+	ZoneID   string      `json:"zone_id"`
+	ZoneName string      `json:"zone_name"`
+	Records  []DNSRecord `json:"records"`
 }
 
 func (i dnsInput) Target() platform.Target { return i.target }
 func (i dnsInput) Preview() any {
 	return map[string]any{
-		"zone_id": i.ZoneID, "zone_name": i.ZoneName, "api_token_file": i.TokenFile,
-		"records": i.Records,
-		"note":    "api_token_file is a path reference; its contents are never part of action input.",
+		"zone_id": i.ZoneID, "zone_name": i.ZoneName, "records": i.Records,
 	}
 }
 
@@ -131,43 +148,12 @@ func Configure(reg *platform.Registry, cfg RuntimeConfig) error {
 	}); err != nil {
 		return err
 	}
-	if err := validateDNSZones(cfg.DNSZones); err != nil {
-		return err
-	}
 	if err := reg.RegisterInventory(dnsInventory{
-		zones: cfg.DNSZones, baseURL: cfg.CloudflareBaseURL, client: cfg.CloudflareClient,
+		zones: cfg.Zones, credentials: cfg.Credentials, baseURL: cfg.CloudflareBaseURL, client: cfg.CloudflareClient,
 	}); err != nil {
 		return err
 	}
 	return reg.RegisterInventory(accessInventory{access: cfg.Access})
-}
-
-func configuredZone(zones []DNSZone, zoneID, zoneName string) bool {
-	for _, zone := range zones {
-		if zone.ZoneID == zoneID && zone.ZoneName == zoneName {
-			return true
-		}
-	}
-	return false
-}
-
-func validateDNSZones(zones []DNSZone) error {
-	seenIDs := map[string]bool{}
-	seenNames := map[string]bool{}
-	for _, zone := range zones {
-		if err := ValidateSecretRef(zone.TokenFile); err != nil {
-			return err
-		}
-		if !zoneIDPattern.MatchString(zone.ZoneID) || !dnsNamePattern.MatchString(zone.ZoneName) || !strings.Contains(zone.ZoneName, ".") {
-			return contract.NewFault(contract.ValidationFailed, "invalid DNS inventory zone", "Configure a lowercase 32-character zone ID and a lowercase zone name.")
-		}
-		if seenIDs[zone.ZoneID] || seenNames[strings.ToLower(zone.ZoneName)] {
-			return contract.NewFault(contract.ValidationFailed, "duplicate DNS inventory zone", "Configure each Cloudflare zone once by ID and name.")
-		}
-		seenIDs[zone.ZoneID] = true
-		seenNames[strings.ToLower(zone.ZoneName)] = true
-	}
-	return nil
 }
 
 func normalizeDNS(target platform.Target, raw json.RawMessage) (platform.ActionInput, error) {
@@ -177,9 +163,6 @@ func normalizeDNS(target platform.Target, raw json.RawMessage) (platform.ActionI
 	var input dnsInput
 	input.target = target
 	if err := strictActionDecode(raw, &input); err != nil {
-		return nil, err
-	}
-	if err := ValidateSecretRef(input.TokenFile); err != nil {
 		return nil, err
 	}
 	if !zoneIDPattern.MatchString(input.ZoneID) {
@@ -277,8 +260,8 @@ func (e *actionExecutor) Execute(ctx context.Context, exec platform.Execution) (
 }
 
 func (e *actionExecutor) dns(ctx context.Context, exec platform.Execution) (platform.Result, error) {
-	if len(e.runtime.DNSZones) == 0 {
-		return platform.Result{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES (zoneID=zoneName pairs) and EREGION_CLOUDFLARE_TOKEN_FILE before reconciling DNS.")
+	if e.runtime.Zones == nil || e.runtime.Credentials == nil {
+		return platform.Result{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; there is no environment or file fallback.")
 	}
 	if e.runtime.Authorizer == nil || e.runtime.Audit == nil {
 		return platform.Result{}, contract.NewFault(contract.Unavailable, "DNS reconciliation is not configured", "Wire explicit authorization and a durable audit sink; DNS changes fail closed.")
@@ -292,16 +275,20 @@ func (e *actionExecutor) dns(ctx context.Context, exec platform.Execution) (plat
 		return platform.Result{}, contract.NewFault(contract.ValidationFailed, "invalid DNS target", "Use platform.")
 	}
 	input.target = target
-	if !configuredZone(e.runtime.DNSZones, input.ZoneID, input.ZoneName) {
-		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "Cloudflare zone is not configured on this control plane", "Add the exact zone ID and name to EREGION_CLOUDFLARE_ZONES; reconcile never accepts a zone that the service was not configured to manage.")
-	}
-	raw, err := ReadSecretFile(input.TokenFile, 4096)
+	zone, ok, err := e.runtime.Zones.DNSZone(ctx, input.ZoneID, input.ZoneName)
 	if err != nil {
 		return platform.Result{}, err
 	}
-	token := strings.TrimRight(string(raw), "\r\n")
+	if !ok {
+		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "Cloudflare zone is not configured on this control plane", "Configure the exact zone ID and name with eregion domain cloudflare configure; reconcile never accepts a zone that is not configured.")
+	}
+	raw, err := e.runtime.Credentials.DNSCredential(ctx, DNSProviderCloudflare, zone.ZoneID)
+	if err != nil {
+		return platform.Result{}, err
+	}
+	defer clearBytes(raw)
 	client, err := NewCloudflare(CloudflareConfig{
-		APIToken: token, ZoneID: input.ZoneID, ZoneName: input.ZoneName,
+		APIToken: strings.TrimRight(string(raw), "\r\n"), ZoneID: zone.ZoneID, ZoneName: zone.ZoneName,
 		BaseURL: e.runtime.CloudflareBaseURL, HTTPClient: e.runtime.CloudflareClient,
 		Authorizer: e.runtime.Authorizer, Audit: e.runtime.Audit,
 	})
@@ -401,25 +388,33 @@ func boundedLimit(limit int) int {
 	return limit
 }
 
-// dnsInventory reads records from explicitly configured zones. It performs no
+// dnsInventory reads records from configured provider zones. It performs no
 // mutation and records no audit entry; authorization for mutations remains in
 // the reconcile action path.
 type dnsInventory struct {
-	zones   []DNSZone
-	baseURL string
-	client  *http.Client
+	zones       DNSZoneSource
+	credentials DNSCredentialSource
+	baseURL     string
+	client      *http.Client
 }
 
 func (dnsInventory) Collection() string { return InventoryCollectionDNS }
 
 func (p dnsInventory) Read(ctx context.Context, query platform.InventoryQuery) (any, error) {
-	if len(p.zones) == 0 {
-		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES (zoneID=zoneName pairs) and EREGION_CLOUDFLARE_TOKEN_FILE; the DNS inventory does not guess a zone.")
+	if p.zones == nil || p.credentials == nil {
+		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; the DNS inventory does not guess a zone.")
+	}
+	zones, err := p.zones.DNSZones(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(zones) == 0 {
+		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; the DNS inventory does not guess a zone.")
 	}
 	limit := boundedLimit(query.Limit)
 	routes := make([]DNSRoute, 0)
-	for _, zone := range p.zones {
-		raw, err := ReadSecretFile(zone.TokenFile, 4096)
+	for _, zone := range zones {
+		raw, err := p.credentials.DNSCredential(ctx, DNSProviderCloudflare, zone.ZoneID)
 		if err != nil {
 			return nil, err
 		}
@@ -428,6 +423,7 @@ func (p dnsInventory) Read(ctx context.Context, query platform.InventoryQuery) (
 			ZoneID:   zone.ZoneID, ZoneName: zone.ZoneName,
 			BaseURL: p.baseURL, HTTPClient: p.client,
 		})
+		clearBytes(raw)
 		if err != nil {
 			return nil, err
 		}

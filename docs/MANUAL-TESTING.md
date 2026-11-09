@@ -1058,6 +1058,103 @@ sanitized operation evidence. Alpha.1 remains operator-qualified.
 
 ## Beta acceptance — Cloudflare DNS automation (not run)
 
+### Requested CLI credential setup and alpha.5 upgrade follow-up (not run)
+
+**Integrated source/database evidence (2026-11-09).** Independent verification
+of the combined tree passed the six provider/migration tests (including 026→027
+application-secret/history preservation, encrypted storage, failure atomicity,
+provider/app-scope isolation and concurrent CAS), and all six selected managed
+DNS ledger/delete-order integration tests, using only an explicitly named
+disposable native PostgreSQL 18.6 instance bound to loopback. Rotation and
+simultaneous CAS tests also passed three consecutive race-enabled runs, with
+exactly one concurrent winner/one conflict and atomic revision/audit counts.
+The initial invalid operation-kind and CI-actor test-fixture failures were
+corrected without weakening product authorization; CI DNS denial still passes.
+
+All packages passed the serialized broad offline suite excluding integration
+and Docker SSH/WireGuard fixtures. Build, vet, darwin/arm64 cross-build,
+example vet and diff/module checks passed. An initial parallel linker attempt
+exhausted temporary disk quota; standalone CLI and the serialized suite passed
+afterward. Static review cleared the integrated changes, including safe unknown
+commit-outcome guidance. Logs: `/tmp/opencode/eregion-final-verify.00Kqp0/`.
+No real gh credential, Cloudflare, DNS, VPS or production database was used.
+Publication, real upgrade and human terminal/provider qualification remain
+not run. Post-check removal of the obsolete unused file reader and the agent
+guide handoff clarification passed independent integrations/API and safe CLI
+tests, build/vet, example tests/vet and diff/module checks. No reader references
+remain. The disposable PostgreSQL instance was gracefully stopped, its PID and
+loopback listener verified gone, and its owned temporary directory removed.
+Post-check logs: `/tmp/opencode/eregion-postmech-verify.WwkdRZ/`.
+
+**Related source-only GitHub authentication evidence (2026-11-09).** The
+opt-in `--github-auth` implementation uses local `gh` in memory and the
+existing per-environment vault pipeline, with no intermediate token file.
+Review identified runtime/webhook credential-name aliasing and a definition
+update bypass; the corrections add early CLI checks plus shared effective
+revision validation, including unchanged source and preserved webhook roles.
+Worker-run CLI tests with the Docker fixture explicitly skipped, platform,
+appdef, contract and command tests, build, vet and formatting checks pass.
+Sentinel regressions assert zero gh/file/vault access on refusal and no token
+acquisition for dry-run/replay; mixed recipes write only Git namespaces.
+Independent review cleared the role checks. Independent pre-Cloudflare
+verification passed build/vet, the CLI suite excluding the remote Docker
+fixture, host tests, transport tests excluding SSH/WireGuard Docker fixtures,
+platform/appdef/vault tests, focused collision/login/resume regressions,
+darwin/arm64 cross-build and diff checks. It used isolated HOME/XDG locations,
+unset ambient DSNs/contexts and a blocking real-gh guard; no DB, Docker, live
+gh, host or provider was accessed. This is not final integrated alpha.6
+verification. No real private-repository clone or `gh` credential acquisition
+has run in this follow-up. Earlier
+unfiltered worker CLI runs did start the existing Docker fixture; those
+containers cleaned up, and subsequent runs explicitly excluded that fixture.
+
+**Offline release-script evidence (2026-11-09, base `74e8746`).** Independent
+`just test-release-scripts` passed all six suites: install pins, install
+routing, release channels, release environments, sign-release metadata and
+upload guards. Execution used a read-only repository, cleared environment,
+network-isolated sandbox and blocking wrappers for real publishing/network/Go
+tools; no unexpected tool invocation occurred. This proves fixture guard
+behavior only, not a live publication, OIDC signature, download or upgrade.
+
+**Related source-only login fix evidence (2026-11-09).** Context-scoped
+WireGuard SSH pins and unconditional bundle-fingerprint verification are
+integrated. Targeted CLI login/init/handoff/pending tests, host pending/context
+tests, transport host-key tests, `go build ./...`, scoped vet and a
+darwin/arm64 CLI cross-build passed in the isolated implementation worktree.
+Review caught and then cleared a pending-init resume regression: resume now
+rebuilds scoped trust only from the verified pending public-address pin, and
+refuses shared/global pins as a substitute. Tests cover two distinct keys at
+`10.78.0.1` in one store and byte-identical failure preservation. No live
+multi-server login/reimport was run; existing saved routes retain their saved
+pin path until explicitly reimported. Independent pre-Cloudflare verification
+also passed the full safe CLI/host/transport suites and focused login/resume
+regressions described above. Final integrated verification is pending.
+
+The operator requested replacing token-file setup on 2026-11-09. The checks
+below are acceptance requirements, not evidence of implementation or success.
+
+- A human configures the Cloudflare zone and enters its token without echo
+  through `eregion`; no file path, manual service-environment edit or token in
+  argv/chat is required. JSON/no-TTY refuses secret entry without prompting.
+- The credential is encrypted by the existing PostgreSQL vault; provider setup
+  metadata and secret references are durable in PostgreSQL. No plaintext token
+  enters ordinary output, errors, action input, River arguments, events or
+  journals. Status reports metadata/configuration state only.
+- Provider preview and workers resolve the configured credential through the
+  same application services. Invalid setup or failed validation must not claim
+  success, overwrite a working credential unexpectedly, or mutate DNS.
+- Rotation uses the same human entry flow. Subsequent provider reads use the
+  current configured credential without distributing token files or requiring
+  manual service restarts. Foreign DNS records remain fail-closed.
+- Verify the published new alpha's signatures and CLI upgrade from
+  `1.0.0-alpha.5` / `71c678362029`, then node upgrade through the normal
+  `apply --auto-upgrade-nodes` path on authorized context `thelab`. Dry-run must
+  not upgrade; before/after build, schema, River and operation identities must
+  be captured. Repeat real apply must be a no-op and doctor must pass.
+- Continue actual Cloudflare previews/apply/idempotence/ownership/removal and
+  fresh production/staging deploy, promotion/rollback and signed GitHub webhook
+  checks. Release publication and source tests alone do not qualify beta.
+
 This is the beta acceptance definition for MASTER D26. **No real-host or real
 Cloudflare run is recorded for this change.** The isolated checks below are not
 host qualification, and no zone, token or DNS record was read or mutated.
@@ -1075,7 +1172,7 @@ host qualification, and no zone, token or DNS record was read or mutated.
 | Manual default | Manual DNS remains the default for unmanaged bindings. A managed binding’s removal uses its persisted ledger even without DNS flags; re-add/promotion preview and result show the persisted managed zone/origins/proxy rather than a false manual input. |
 | Removal | `domain remove … [--dns cloudflare --dns-zone ZONE]` uses the persisted ledger to delete only exact-owned A/AAAA records; a foreign A/AAAA or any CNAME at the hostname (even with the exact marker) fails closed and the binding/ledger remain for retry. After the delete requests, the exact hostname is read again and cleanup is marked verified only when no exact-owned A/AAAA remains and no conflict appeared; a read failure, reappeared record or conflict retains the ledger. App/environment deletion preflights every managed binding (operation ownership, authorization, zone/host recovery, provider read, exact ownership/conflict) before the first provider mutation, so an obvious refusal leaves every record untouched, and a provider cleanup failure leaves the app, workload containers, routes, rows, ledger and credentials intact for retry. After that point provider effects are not atomic: a later binding failure or cancellation can leave earlier bindings cleaned and later bindings unchanged or partially changed; the event reports how many bindings were processed and does not claim records were preserved. If provider cleanup succeeds and a later node step fails or is cancelled, DNS may already be removed while some workloads remain and the ledger is retained; a later route-write failure can leave only rows to retry after DNS and workloads are gone. Events state which effects completed, retry resumes, and this is not claimed as a single atomic transaction or a public-availability guarantee. The primary binding is cleaned through environment/application deletion. |
 | Durable state | Migration 025 gives every domain an immutable `dom_…` ID and a `platform_domain_dns` ledger row written in the same transaction as the operation and River job. It stores provider, zone ID/name, exact marker, generation, desired origins/proxy, last operation, state and cleanup status. The ledger remains until provider cleanup is verified. Recreating a hostname gets a new ID and cannot adopt the previous record. |
-| Secrets | The token comes only from the configured root-owned `0640` service-group file (or an owner-only `0600` development file); argv, action input, River arguments, operation events, ordinary output, ledger rows and error details contain no token. The root node RPC reads as owner and the `eregion` worker reads through its primary group from the same regular, non-symlink file; the path is walked from `/` with descriptor-relative no-follow opens, and unsafe owners, modes, special bits, writable immediate directories, symlinks, FIFOs and devices are refused. Provider reads and writes are authorized separately; unauthorized admission leaves no operation or ledger row. Every intent/success/unchanged/failure is audited. |
+| Secrets | Human-only `domain cloudflare configure` accepts a no-echo token and stores encrypted provider/zone revisions in the existing PostgreSQL vault; no token file, env, argv or stdin fallback exists. JSON/NDJSON/no-TTY setup refuses before token access or RPC. Provider previews/workers resolve the current credential without restart. Ordinary output, action input, River arguments, events, ledgers and errors contain no token. Metadata status never decrypts it. Generic app-secret APIs cannot address provider scope. Read-only validation precedes revision-CAS activation; ciphertext, metadata and sanitized audit commit atomically. Operator DNS actions remain individually authorized; CI/webhook/system actors are denied and unauthorized admission leaves no operation/ledger. |
 | Idempotence | Repeating apply or removal with the same explicit inputs makes zero provider mutations after the first convergence; an uncertain create/readback is re-read and converges without adopting a foreign record. |
 
 **Host/database evidence boundary.** Migration 025 and the ledger/cleanup/delete
@@ -1460,6 +1557,62 @@ WireGuard, healthy). No Docker, VM, real server, exporter restart or scrape was
 used.
 
 ## Alpha.5 telemetry extension — Caddy endpoint, discovery, rotation
+
+### Fresh VPS follow-up — operator report (2026-11-09)
+
+This is the operator's session summary, not a reproduced agent-run result.
+The exact build identity, VPS/context identity and operation IDs have not yet
+been captured in this checkout. Do not conflate this VPS with the existing
+`main` telemetry qualification recorded below.
+
+- A separate PostgreSQL test database was created; `server init`, protected
+  handoff storage and login using a separate context store were reported done.
+- Reported `server status`: services active, schema 26/26, River 7/7.
+  Reported `doctor`: 23 pass / 0 warn / 0 fail.
+  Reported `apply --dry-run`: 0 of 21 steps would change.
+- **Open defect:** login initially failed because different servers share the
+  `10.78.0.1` host-key pin. The separate context store is only a workaround;
+  server-scoped isolation and a same-store multi-server regression are needed.
+- **Next:** run the real second apply on the confirmed fresh target, then
+  create production/staging, deploy distinct versions, promote and roll back.
+  The fixture is `~/work/alpha-five-eregion` (private GitHub repository), with
+  `/healthz`, a visible version and non-secret `APP_ENV` output.
+- Cloudflare provider qualification and GitHub webhook testing are now requested;
+  neither has run on this fresh target. Preview exact DNS changes before apply.
+  Private-source setup must not require manually exporting a local `gh` token
+  file; Cloudflare secret entry should be a human-only handoff.
+- Fresh-target metrics inspection, credential rotation, authenticated and
+  unauthenticated WireGuard scraping, protected handoff refresh and final
+  status/doctor checks remain pending. Backups remain out of scope.
+
+**Agent follow-up (2026-11-09, installed `1.0.0-alpha.5`, commit
+`71c678362029`, channel `stable`).** The operator confirmed context `thelab`
+at `46.224.129.96` as the authorized fresh test target, and designated
+`git-test2.mbvlabs.com` for production and `git-test3.mbvlabs.com` for staging.
+The node reports host `exploration`, node `main`, Ubuntu 26.04.1 amd64 and
+control-plane hostname `eregrion-alpha5.mbvlabs.com`. Although the address and
+host name overlap historical records, this run's build/context and observed
+empty domain inventory are recorded separately; no historical results are
+carried forward.
+
+- CLI and node both report `1.0.0-alpha.5` / `71c678362029`; schema 26/26,
+  River 7/7; all six reported services active. Domain inventory was empty.
+- Dry-run apply reported `would_change=0` of 21. The **real second apply
+  passed: 0 applied / 21 skipped**, operation
+  `op_9c1f5d04ddadbdc5ccc453eac65fb85d`, completed
+  `2026-11-09T17:05:03.653258349Z`.
+- `metrics show --json` returned a fresh snapshot, exporter 1.11.1,
+  CPU utilization approximately 2.44%, memory used approximately 8.05% and
+  root filesystem used approximately 8.32%, with explicit loopback RPC
+  collection. `metrics endpoint` reported WireGuard-only basic authentication
+  at `10.78.0.1:9101`, configured endpoint and a local credential.
+- `metrics config --json` returned Prometheus/Alloy configs with password
+  placeholders only. `doctor --json` passed **23/0/0**, including
+  `telemetry.endpoint` observing unauthenticated discovery returning 401.
+- No credential was read or rotated, no authenticated scrape was attempted,
+  and no app, GitHub hook or DNS record was changed in this follow-up.
+  Cloudflare, app/deploy/promotion/webhook testing and protected handoff refresh
+  remain pending.
 
 This is the acceptance definition for the alpha.5 local-telemetry extension. It
 supersedes the older listener details above: node_exporter is now loopback-only;

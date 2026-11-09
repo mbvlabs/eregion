@@ -139,6 +139,31 @@ func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts
 	}
 }
 
+// pinContextKnownHosts copies the host keys verified for the public
+// first-contact address into the context's own known_hosts under the
+// WireGuard address. The pending known_hosts remains the public-address
+// record, so a first contact or resume still verifies that address on its
+// own.
+func pinContextKnownHosts(pending, scoped, publicAddress, wireGuardAddress string) error {
+	keys, err := transport.LoadHostKeys(pending)
+	if err != nil {
+		return err
+	}
+	verified := keys.Keys(publicAddress)
+	if len(verified) == 0 {
+		return contract.NewFault(contract.PreconditionFailed, "the init has no verified host key for "+publicAddress, "Run server init --discard and start again; first contact must pin the host key.")
+	}
+	if err := unpinHostKey(scoped, wireGuardAddress); err != nil {
+		return err
+	}
+	for _, key := range verified {
+		if err := pinHostKey(scoped, wireGuardAddress, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // routeRemote opens a host.Remote for a context route.
 func routeRemote(route *host.ContextSSH, prompt bool) (*host.Remote, error) {
 	auth, err := sshAuth(route.Identity, prompt)
@@ -157,7 +182,7 @@ func routeRemote(route *host.ContextSSH, prompt bool) (*host.Remote, error) {
 // secureAccess hardens the server and moves SSH onto WireGuard (vaire §5.2):
 // setup over public SSH as root, a login as the admin user over WireGuard,
 // then the commit-confirm lockdown confirmed from a fresh connection.
-func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, publicHost, knownHosts string) (*host.ContextSSH, error) {
+func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, publicHost string) (*host.ContextSSH, error) {
 	nodeKey := r.pending.NodePublicKey
 	if !r.pending.Done(phaseAccessSetup) {
 		root := r.remote
@@ -198,20 +223,19 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 		return nil, contract.NewFault(contract.PreconditionFailed, "the pending init has no node WireGuard key", "Run server init --discard and start again; the access setup did not finish.")
 	}
 
-	route := id.wireGuardRoute(publicHost, nodeKey, knownHosts, r.answers.AdminUser)
-	if !hostKeyPinned(knownHosts, route.Address) {
-		// The node presents the same host keys on every address. Pin the key
-		// learned over public SSH for the WireGuard address too; on a resume
-		// that skipped first contact it comes from the pending known_hosts.
-		public := net.JoinHostPort(publicHost, r.answers.Port)
-		if keys, err := transport.LoadHostKeys(knownHosts); err == nil {
-			for _, key := range keys.Keys(public) {
-				if err := pinHostKey(knownHosts, route.Address, key); err != nil {
-					return nil, err
-				}
-			}
-		}
+	knownHosts, err := contextKnownHostsPath(r.answers.Context)
+	if err != nil {
+		return nil, err
 	}
+	// The node presents the same host keys on every address. Pin the key
+	// verified over public SSH for the WireGuard address in this context's
+	// own known_hosts; on a resume that skipped first contact it comes from
+	// the pending known_hosts, which keeps verifying the public address.
+	publicAddress := net.JoinHostPort(publicHost, r.answers.Port)
+	if err := pinContextKnownHosts(r.knownHosts, knownHosts, publicAddress, net.JoinHostPort(access.NodeAddress, "22")); err != nil {
+		return nil, err
+	}
+	route := id.wireGuardRoute(publicHost, nodeKey, knownHosts, r.answers.AdminUser)
 
 	task := r.start("wireguard", "SSH as "+r.answers.AdminUser+" over WireGuard")
 	if err := runWithRetry(ctx, route, "true", 45*time.Second); err != nil {

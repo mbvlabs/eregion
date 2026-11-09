@@ -21,9 +21,9 @@ const pendingSchema = 1
 // PendingInitFile is the unfinished init's answers and completed phases.
 const PendingInitFile = "init.json"
 
-// PendingKnownHostsFile is the host-key pin of the init. It is merged into the
-// context store's known_hosts only when the init succeeds, so --discard drops
-// trust learned by an abandoned attempt.
+// PendingKnownHostsFile is the host-key pin of the init's public first-contact
+// address. The saved context pins the WireGuard address in its own
+// known_hosts, so --discard drops trust learned by an abandoned attempt.
 const PendingKnownHostsFile = "known_hosts"
 
 // PendingInit is one unfinished `server init`, saved under the context store's

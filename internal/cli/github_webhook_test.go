@@ -22,6 +22,11 @@ const fakeGHScript = `#!/bin/sh
     printf '\n'
 } >> "$GH_FAKE_ARGS"
 
+if [ "$1" = "auth" ] && [ "$2" = "token" ]; then
+    printf '%s' "${GH_FAKE_TOKEN:-fake-gh-token-value}"
+    exit "${GH_FAKE_TOKEN_EXIT:-0}"
+fi
+
 if [ "$1" = "auth" ]; then
     exit "${GH_FAKE_AUTH_EXIT:-0}"
 fi

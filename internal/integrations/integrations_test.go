@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -311,27 +309,23 @@ func TestIntegrationActionsConfiguredAndSecretFree(t *testing.T) {
 	fixture := newCloudflareFixture(testZoneID)
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	dir := t.TempDir()
-	tokenPath := filepath.Join(dir, "cloudflare-token")
-	if err := os.WriteFile(tokenPath, []byte(testCloudflareToken+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
 	audit := NewMemoryAudit()
 	authz, _ := NewStaticAuthorizer(map[string][]string{"ops": {ActionDNSCreate, ActionDNSUpdate, ActionDNSDelete}})
 	access, err := NewAccessController(AccessConfig{AdminSubjects: []string{"ops"}, Audit: audit, Store: NewMemoryGrantStore()})
 	if err != nil {
 		t.Fatal(err)
 	}
+	store := newTestDNSStore(DNSZone{ZoneID: testZoneID, ZoneName: "example.com"}).withToken(testZoneID, testCloudflareToken)
 	registry := platform.NewRegistry()
 	if err := Configure(registry, RuntimeConfig{
 		Authorizer: authz, Audit: audit, Access: access,
-		DNSZones:          []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: tokenPath}},
+		Zones: store, Credentials: store,
 		CloudflareBaseURL: server.URL + "/client/v4", CloudflareClient: server.Client(),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	dnsRaw, _ := json.Marshal(map[string]any{
-		"zone_id": testZoneID, "zone_name": "example.com", "api_token_file": tokenPath,
+		"zone_id": testZoneID, "zone_name": "example.com",
 		"records": []DNSRecord{{Name: "app.example.com", Type: "A", Content: "10.0.0.3", TTL: 300}},
 	})
 	normalized, err := registry.Normalize(KindDNSReconcile, "platform", dnsRaw)
@@ -405,13 +399,10 @@ func TestDNSInventoryReadsConfiguredZonesWithoutMutationRuntime(t *testing.T) {
 	fixture.records["existing"] = DNSRecord{ID: "existing", Name: "app.example.com", Type: "A", Content: "10.0.0.4", TTL: 300, Comment: "eregion:managed"}
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
-	if err := os.WriteFile(tokenPath, []byte(testCloudflareToken+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDNSStore(DNSZone{ZoneID: testZoneID, ZoneName: "example.com"}).withToken(testZoneID, testCloudflareToken)
 	registry := platform.NewRegistry()
 	if err := Configure(registry, RuntimeConfig{
-		DNSZones:          []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: tokenPath}},
+		Zones: store, Credentials: store,
 		CloudflareBaseURL: server.URL + "/client/v4", CloudflareClient: server.Client(),
 	}); err != nil {
 		t.Fatal(err)
@@ -435,9 +426,6 @@ func TestDNSInventoryReadsConfiguredZonesWithoutMutationRuntime(t *testing.T) {
 	encoded, _ := json.Marshal(inventory)
 	if strings.Contains(string(encoded), testCloudflareToken) {
 		t.Fatal("DNS inventory leaked the API token")
-	}
-	if err := Configure(platform.NewRegistry(), RuntimeConfig{DNSZones: []DNSZone{{ZoneID: "bad", ZoneName: "example.com", TokenFile: tokenPath}}}); err == nil {
-		t.Fatal("invalid DNS inventory zone was accepted")
 	}
 }
 
