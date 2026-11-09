@@ -64,7 +64,38 @@ func TestIngressSysctlRunsOnlyWithAMainHostname(t *testing.T) {
 		t.Fatalf("main node steps: %s", got)
 	}
 	cfg.Hostname = ""
-	if got := strings.Join(ids(cfg), " "); strings.Contains(got, "host-ingress-sysctl") {
-		t.Fatalf("no ingress, yet: %s", got)
+	got = strings.Join(ids(cfg), " ")
+	if strings.Contains(got, "host-ingress-sysctl") {
+		t.Fatalf("hostname-less node still gets ingress sysctl: %s", got)
+	}
+	if !strings.Contains(got, "host-ingress-v2") {
+		t.Fatalf("hostname-less control plane lacks the pinned Caddy prerequisite: %s", got)
+	}
+	steps := ids(cfg)
+	ingress, telemetry := -1, -1
+	for i, id := range steps {
+		switch id {
+		case "host-ingress-v2":
+			ingress = i
+		case "host-telemetry-v1":
+			telemetry = i
+		}
+	}
+	if ingress < 0 || telemetry < 0 || ingress > telemetry {
+		t.Fatalf("Caddy prerequisite must precede telemetry: %v", steps)
+	}
+}
+
+func TestIngressWithoutHostnameInstallsCaddyWithoutAPublicSite(t *testing.T) {
+	step := &ingressStep{cfg: Config{Arch: "amd64"}}
+	if file := step.caddyfile(); file != nil {
+		t.Fatalf("hostname-less Caddyfile must not be written:\n%s", file)
+	}
+	if !strings.Contains(step.Describe(), "dedicated telemetry") {
+		t.Fatalf("describe = %q", step.Describe())
+	}
+	diff, err := step.Diff(context.Background(), engine.Runtime{})
+	if err != nil || !strings.Contains(strings.Join(diff, "\n"), "refuse an existing /etc/caddy/Caddyfile") {
+		t.Fatalf("diff = %v err=%v", diff, err)
 	}
 }

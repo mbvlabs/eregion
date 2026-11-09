@@ -3,6 +3,7 @@ set -euo pipefail
 : "${CADDY_ARCH:?}"
 : "${CADDY_URL:?}"
 : "${CADDY_SHA256:?}"
+CADDY_BIN="${CADDY_BIN:-/usr/bin/caddy}"
 
 [ "$(dpkg --print-architecture)" = "$CADDY_ARCH" ] || {
     echo "Caddy package architecture does not match this host" >&2
@@ -10,8 +11,8 @@ set -euo pipefail
 }
 
 installed_version=""
-if command -v caddy >/dev/null 2>&1; then
-    installed_version="$(caddy version | awk '{print $1}')"
+if [ -x "$CADDY_BIN" ]; then
+    installed_version="$("$CADDY_BIN" version | awk '{print $1}')"
 fi
 if [ "$installed_version" != "v$CADDY_VERSION" ]; then
     work="$(mktemp -d)"
@@ -25,7 +26,7 @@ if [ "$installed_version" != "v$CADDY_VERSION" ]; then
         install -y --no-install-recommends --allow-downgrades "$package"
 fi
 
-[ "$(caddy version | awk '{print $1}')" = "v$CADDY_VERSION" ] || {
-    echo "Caddy did not report the pinned version $CADDY_VERSION after installation" >&2
+[ "$("$CADDY_BIN" version | awk '{print $1}')" = "v$CADDY_VERSION" ] || {
+    echo "Caddy did not report the pinned version $CADDY_VERSION at $CADDY_BIN after installation" >&2
     exit 1
 }

@@ -3,12 +3,10 @@ package host
 import (
 	"context"
 	"fmt"
-	"net"
 	"path/filepath"
 	"runtime"
 	"strings"
 
-	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
@@ -17,7 +15,6 @@ import (
 // it listens on every interface on install.
 const (
 	nodeExporterVersion = "1.11.1"
-	nodeExporterPort    = "9100"
 	// NodeExporterDir is node_exporter's own state directory. Both it and the
 	// textfile directory are root:root 0755 and must not be symlinks.
 	NodeExporterDir         = "/var/lib/node_exporter"
@@ -28,13 +25,15 @@ const (
 	nodeExporterCollectorUnits = `(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)`
 )
 
-// NodeExporterListenAddress is the only address node_exporter binds.
+// NodeExporterListenAddress is the only node_exporter listener. It is
+// loopback: the authenticated telemetry service is the WireGuard-facing edge,
+// so a WireGuard peer cannot bypass basic authentication by dialing 9100.
 func NodeExporterListenAddress() string {
-	return net.JoinHostPort(access.NodeAddress, nodeExporterPort)
+	return NodeExporterLoopbackAddress
 }
 
-// NodeExporterMetricsURL is the node-local read endpoint. It is reachable only
-// on wg0; no public listener or credential exists.
+// NodeExporterMetricsURL is the node-local read endpoint used by metrics.show
+// and doctor. It is not reachable from another host.
 func NodeExporterMetricsURL() string {
 	return "http://" + NodeExporterListenAddress() + "/metrics"
 }
@@ -52,9 +51,10 @@ func nodeExporterURL(arch string) string {
 	return "https://github.com/prometheus/node_exporter/releases/download/v" + nodeExporterVersion + "/" + nodeExporterArchive(arch)
 }
 
-// nodeExporterStep installs node_exporter on the node's WireGuard address only.
-// The access setup opens 9100 on wg0 and starts the unit once wg0 exists; the
-// step itself is versioned and idempotent like every other host step.
+// nodeExporterStep installs node_exporter on loopback. It starts with its own
+// unit and does not wait for WireGuard; the separate authenticated telemetry
+// endpoint is the only WireGuard-facing listener. The step is versioned and
+// idempotent like every other host step.
 type nodeExporterStep struct {
 	cfg  Config
 	exec Exec
@@ -78,7 +78,7 @@ func (s *nodeExporterStep) dirs() (string, string) {
 
 func (s *nodeExporterStep) ID() string { return "host-node-exporter-v2" }
 func (s *nodeExporterStep) Describe() string {
-	return "Install node_exporter " + nodeExporterVersion + " on the WireGuard address with textfile and narrow systemd collectors"
+	return "Install node_exporter " + nodeExporterVersion + " on loopback with textfile and narrow systemd collectors"
 }
 func (s *nodeExporterStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -110,8 +110,8 @@ func (s *nodeExporterStep) unit() []byte {
 	return []byte(fmt.Sprintf(`[Unit]
 Description=Prometheus node exporter for eregion
 Documentation=https://github.com/prometheus/node_exporter
-Wants=network-online.target wg-quick@wg0.service
-After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+After=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -145,7 +145,7 @@ AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target
-`, s.binaryPath(), access.NodeAddress+":"+nodeExporterPort, textfile, nodeExporterCollectorUnits))
+`, s.binaryPath(), NodeExporterListenAddress(), textfile, nodeExporterCollectorUnits))
 }
 
 func (s *nodeExporterStep) Inputs() ([]byte, error) {
@@ -168,8 +168,7 @@ func (s *nodeExporterStep) Inputs() ([]byte, error) {
 }
 
 func (s *nodeExporterStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
-	arch, err := s.arch()
-	if err != nil {
+	if _, err := s.arch(); err != nil {
 		return engine.CheckResult{}, err
 	}
 	ok, _, err := sameFileContent(s.unitPath(), s.unit())
@@ -181,9 +180,8 @@ func (s *nodeExporterStep) Check(ctx context.Context, _ engine.Runtime) (engine.
 	}
 	script := fmt.Sprintf(`if [ -x %[1]s ] && %[1]s --version 2>/dev/null | grep -q '%[2]s'; then echo version:ok; else echo version:missing; fi
 if systemctl is-enabled node-exporter.service >/dev/null 2>&1; then echo enabled:ok; else echo enabled:missing; fi
-if ip -4 addr show wg0 2>/dev/null | grep -q 'inet %[3]s/'; then echo wg:up; else echo wg:down; fi
 if systemctl is-active --quiet node-exporter.service; then echo active:ok; else echo active:missing; fi`,
-		s.binaryPath(), nodeExporterVersion, access.NodeAddress)
+		s.binaryPath(), nodeExporterVersion)
 	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, script)
 	if err != nil {
 		return engine.CheckResult{}, err
@@ -203,15 +201,10 @@ if systemctl is-active --quiet node-exporter.service; then echo active:ok; else 
 	if err := nodeExporterStrictDirectoryState(parent, textfile); err != nil {
 		return incomplete(err.Error())
 	}
-	// The unit can only bind after wg0 exists, so a host that has not brought
-	// up WireGuard yet is complete once the unit is installed and enabled.
-	if !strings.Contains(output, "wg:up") {
-		return complete("node_exporter " + nodeExporterVersion + " is installed and enabled; it starts with wg0 (arch " + arch + ")")
-	}
 	if !strings.Contains(output, "active:ok") {
-		return incomplete("node-exporter.service is not active although wg0 is up")
+		return incomplete("node-exporter.service is not active")
 	}
-	return complete("node_exporter " + nodeExporterVersion + " answers on " + access.NodeAddress + ":" + nodeExporterPort + " with textfile and narrow systemd collectors")
+	return complete("node_exporter " + nodeExporterVersion + " answers on " + NodeExporterListenAddress() + " with textfile and narrow systemd collectors")
 }
 
 // nodeExporterDirectoryModeClear deliberately clears special bits in a second
@@ -282,24 +275,21 @@ fi`,
 	if err := writePublicFile(s.unitPath(), s.unit(), "root", "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
+	// node_exporter is loopback-only and independent of WireGuard. It starts
+	// with its own unit.
 	enable := `set -euo pipefail
-if command -v ufw >/dev/null 2>&1; then
-  ufw allow in on wg0 to ` + access.NodeAddress + ` port ` + nodeExporterPort + ` proto tcp >/dev/null || true
-fi
 systemctl daemon-reload
 systemctl enable node-exporter.service
-if ip -4 addr show wg0 2>/dev/null | grep -q 'inet ` + access.NodeAddress + `/'; then
-  systemctl restart node-exporter.service
-  systemctl is-active --quiet node-exporter.service
-fi`
+systemctl restart node-exporter.service
+systemctl is-active --quiet node-exporter.service`
 	if err := s.exec.Run(ctx, s.ID()+"-service", enable, nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	return engine.ApplyResult{
 		Notes: []string{
-			"node_exporter " + nodeExporterVersion + " is installed; it listens only on " + access.NodeAddress + ":" + nodeExporterPort + ", starts with wg0, and reads " + textfile + " plus the narrow systemd unit set",
+			"node_exporter " + nodeExporterVersion + " is installed; it listens only on " + NodeExporterListenAddress() + " and reads " + textfile + " plus the narrow systemd unit set",
 		},
-		Result: map[string]any{"version": nodeExporterVersion, "listen": access.NodeAddress + ":" + nodeExporterPort, "unit": s.unitPath(), "parent_dir": parent, "textfile_dir": textfile, "collector_units": nodeExporterCollectorUnits},
+		Result: map[string]any{"version": nodeExporterVersion, "listen": NodeExporterListenAddress(), "unit": s.unitPath(), "parent_dir": parent, "textfile_dir": textfile, "collector_units": nodeExporterCollectorUnits},
 	}, nil
 }
 
@@ -311,9 +301,9 @@ func (s *nodeExporterStep) Diff(context.Context, engine.Runtime) ([]string, erro
 	parent, textfile := s.dirs()
 	out := []string{
 		"+ install node_exporter " + nodeExporterVersion + " (" + arch + ", sha256 " + nodeExporterSHA256[arch] + ")",
-		"+ write " + s.unitPath() + " listening on " + access.NodeAddress + ":" + nodeExporterPort,
+		"+ write " + s.unitPath() + " listening on " + NodeExporterListenAddress(),
 		"+ enable the textfile collector at " + textfile + " (root:root 0755, no symlink; trusted parent " + parent + ") and the narrow systemd unit set " + nodeExporterCollectorUnits,
-		"+ allow " + nodeExporterPort + "/tcp on wg0 only",
+		"+ allow no WireGuard port for node_exporter; the authenticated telemetry endpoint is the only WireGuard listener",
 	}
 	if ok, _, _ := sameFileContent(s.unitPath(), s.unit()); !ok {
 		out = append(out, "~ restart node-exporter.service for the desired unit")

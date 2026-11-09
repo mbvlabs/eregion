@@ -116,6 +116,18 @@ terminal, some need a human, and a retry may need the same idempotency key.
   whole server handoff behind the same factor.
 - A command that prints a secret once is a human handoff: show it to the human
   and do not retain it.
+- `metrics endpoint` reports whether the dedicated WireGuard-only Caddy
+  endpoint is configured and whether this machine holds a local credential. `metrics
+  config` ordinary output always uses a password placeholder.
+  `metrics config --format prometheus|alloy --out FILE` writes an owner-only
+  file with the real telemetry credential when one is held locally; never print
+  that file or pass it as a normal log. `metrics rotate` replaces the credential
+  behind exact `--confirm <node>/metrics`, prints no password or hash, and warns
+  that the protected handoff is stale. It saves the new password locally before
+  the request and restores the previous one if the request fails; a lost
+  successful response can leave the local password stale, so a later deliberate
+  rotation may be needed. It is a deliberate destructive rotation, not a retry
+  loop.
 - Token issuance needs a human factor at the human's terminal, such as a code
   from their authenticator app or a master password (MASTER D7). There is no
   flag, environment variable or stdin path that lets an agent mint its own

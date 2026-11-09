@@ -23,12 +23,12 @@ type nodeMetricsClient interface {
 }
 
 func (a *app) metricsSpecs() []spec {
-	parentMeta := operationMeta("Read a current node-local host observation",
+	parentMeta := operationMeta("Read and configure current node-local host telemetry",
 		"eregion metrics show")
 	parentMeta.WhenToUse = []string{
-		"Read CPU, memory, filesystem, load and uptime from the node's WireGuard-bound node_exporter through SSH.",
-		"Use --json for the same snapshot in a structured envelope.",
-		"There is no metrics history, PromQL, telemetry server or database: this is one current sample collected for this command.",
+		"Read CPU, memory, filesystem, load and uptime from the node's local node_exporter through SSH.",
+		"Configure an authenticated Prometheus or Grafana Alloy scrape over WireGuard, and rotate its credential.",
+		"There is no central telemetry server, metric store, PromQL endpoint or retained history: the snapshot is one current sample and the endpoint serves current metrics only.",
 	}
 	parentMeta.Next = []string{"eregion doctor", "eregion server status --json"}
 
@@ -36,22 +36,67 @@ func (a *app) metricsSpecs() []spec {
 		"eregion metrics show --json")
 	showMeta.WhenToUse = []string{
 		"Read one current CPU, memory, filesystem, load and uptime snapshot from the node's local node_exporter.",
-		"The exporter is bound to the WireGuard address; the operator command reaches it through SSH in WireGuard. No public endpoint, token or separate scraper identity exists.",
+		"The exporter is loopback-only; the operator command reaches it through SSH in WireGuard. This snapshot read uses no credential and has no public endpoint. External scrapers use the separately authenticated endpoint described by `metrics endpoint`.",
 		"Do not use this as a time-series or historical query. No samples are stored server-side and no external backend is read.",
 	}
 	showMeta.Examples = []string{"eregion metrics show", "eregion metrics show --json"}
-	showMeta.Next = []string{"eregion doctor", "eregion server status --json"}
+	showMeta.Next = []string{"eregion metrics endpoint", "eregion doctor"}
 	showMeta.OutputModes = []string{"plain", "json"}
+
+	endpointMeta := operationMeta("Show the authenticated WireGuard telemetry endpoint and its discovery path",
+		"eregion metrics endpoint --json")
+	endpointMeta.WhenToUse = []string{
+		"Inspect the WireGuard-only Caddy metrics endpoint and HTTP service-discovery URL before configuring a scraper.",
+		"It reports whether the endpoint credential is configured and whether this machine holds the matching local credential; no password or hash is printed.",
+	}
+	endpointMeta.Examples = []string{"eregion metrics endpoint", "eregion metrics endpoint --json"}
+	endpointMeta.Next = []string{"eregion metrics rotate", "eregion doctor"}
+	endpointMeta.OutputModes = []string{"plain", "json"}
+
+	configMeta := operationMeta("Generate Prometheus and Grafana Alloy scrape configs for the local endpoint",
+		"eregion metrics config --format prometheus --out ./eregion-scrape.yml")
+	configMeta.WhenToUse = []string{
+		"Copy a scrape configuration that follows the endpoint's HTTP service discovery. Ordinary output uses a password placeholder.",
+		"With --format and --out, write one owner-only file containing the real credential; the file is written once and never printed.",
+		"Prometheus or Grafana Alloy must reach the node as a WireGuard peer. The endpoint is never public.",
+	}
+	configMeta.Examples = []string{
+		"eregion metrics config",
+		"eregion metrics config --format prometheus",
+		"eregion metrics config --format alloy --out ./eregion.alloy",
+		"eregion metrics config --format targets",
+	}
+	configMeta.OutputModes = []string{"plain", "json"}
+	configMeta.Next = []string{"eregion metrics endpoint", "eregion doctor"}
+
+	rotateMeta := operationMeta("Replace the authenticated telemetry credential",
+		"eregion metrics rotate --confirm main/metrics")
+	rotateMeta.WhenToUse = []string{
+		"Replace the basic-auth password used by every scraper. The node receives only a bcrypt hash; the new password is stored owner-only in this machine's context and is shown only through the protected handoff or an explicit metrics config --out file. The previous local credential is restored if the node request fails.",
+		"Scrapers using the old password fail until they are updated. The command warns that the server handoff is stale.",
+	}
+	rotateMeta.Examples = []string{"eregion metrics rotate --dry-run --json", "eregion metrics rotate --confirm main/metrics"}
+	rotateMeta.Mutating, rotateMeta.DryRun, rotateMeta.Destructive, rotateMeta.Confirmation = true, true, true, "target"
+	rotateMeta.ErrorCodes = append(rotateMeta.ErrorCodes, contract.ConfirmationRequired, contract.InputRequired)
+	rotateMeta.Next = []string{"eregion metrics config --format prometheus --out ./eregion-scrape.yml", "eregion secrets export"}
+	rotateMeta.OutputModes = []string{"plain", "json"}
 
 	return []spec{{
 		use:  "metrics",
 		meta: parentMeta,
 		run:  func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
-		children: []spec{{
-			use:  "show",
-			meta: showMeta,
-			run:  a.metricsShow,
-		}},
+		children: []spec{
+			{use: "show", meta: showMeta, run: a.metricsShow},
+			{use: "endpoint", meta: endpointMeta, run: a.metricsEndpoint},
+			{use: "config", meta: configMeta, flags: func(cmd *cobra.Command) {
+				cmd.Flags().String("format", "all", "Config format: all, prometheus, alloy, or targets")
+				cmd.Flags().String("out", "", "Write one owner-only config file with the real credential; requires --format")
+			}, run: a.metricsConfig},
+			{use: "rotate", meta: rotateMeta, flags: func(cmd *cobra.Command) {
+				cmd.Flags().String("confirm", "", "The node name plus /metrics; must match exactly")
+				cmd.Flags().Bool("dry-run", false, "Show the rotation target without changing the credential")
+			}, run: a.metricsRotate},
+		},
 	}}
 }
 
@@ -85,17 +130,47 @@ func (n *nodeClient) NodeMetrics(ctx context.Context) (telemetry.NodeSnapshot, e
 	return snapshot, nil
 }
 
+// MetricsEndpoint reads the authenticated endpoint description. It carries no
+// credential value.
+func (n *nodeClient) MetricsEndpoint(ctx context.Context) (telemetry.EndpointInfo, error) {
+	raw, err := n.call(ctx, methodMetricsEndpoint, struct{}{}, rpcCallOptions{})
+	if err != nil {
+		return telemetry.EndpointInfo{}, err
+	}
+	var info telemetry.EndpointInfo
+	if err := json.Unmarshal(raw, &info); err != nil || info.Validate() != nil {
+		return telemetry.EndpointInfo{}, invalidNodeData("telemetry endpoint")
+	}
+	return info, nil
+}
+
+// MetricsRotate sends only the new bcrypt hash. The plaintext password never
+// leaves the operator machine.
+func (n *nodeClient) MetricsRotate(ctx context.Context, hash, confirm string, dryRun bool) (telemetry.Rotation, error) {
+	raw, err := n.call(ctx, methodMetricsRotate, struct{}{}, rpcCallOptions{
+		Secrets: map[string]string{"metrics.htpasswd": hash}, Confirm: confirm, DryRun: dryRun,
+	})
+	if err != nil {
+		return telemetry.Rotation{}, err
+	}
+	var rotation telemetry.Rotation
+	if err := json.Unmarshal(raw, &rotation); err != nil || rotation.Schema != telemetry.RotationSchema || rotation.Username != telemetry.Username {
+		return telemetry.Rotation{}, invalidNodeData("telemetry rotation")
+	}
+	return rotation, nil
+}
+
 // collectNodeMetrics is the node-side implementation. It scrapes the local
 // exporter twice, computes the CPU counter delta and never opens a database.
 func collectNodeMetrics(ctx context.Context) (telemetry.NodeSnapshot, error) {
 	info := telemetry.ScrapeInfo{
 		Endpoint:       host.NodeExporterMetricsURL(),
 		Listen:         host.NodeExporterListenAddress(),
-		Access:         "wireguard",
+		Access:         "loopback",
 		Public:         false,
 		Authentication: "none",
 		Collection:     "operator_node_rpc",
-		Note:           "Collected by this operator command over SSH inside WireGuard; the exporter has no public endpoint and no independent scraper identity.",
+		Note:           "Collected by this operator command over SSH inside WireGuard from the loopback-only exporter. External scrapers use the separately authenticated metrics endpoint.",
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -150,7 +225,7 @@ func nodeMetricsText(snapshot telemetry.NodeSnapshot) string {
 		version = "version unknown"
 	}
 	field("exporter", version+" · "+snapshot.Scrape.Endpoint)
-	field("access", "WireGuard only · no public endpoint or credential · read by this operator command over SSH")
+	field("access", "loopback exporter · no public listener · read by this operator command over SSH")
 	field("sample", sampleText(snapshot))
 	if snapshot.CPU == nil {
 		field("cpu", "unavailable: "+issueReason(snapshot, "cpu"))

@@ -121,7 +121,7 @@ func TestTelemetryLocalHealth(t *testing.T) {
 	base := Facts{
 		WireGuardKnown: true, WireGuardActive: true,
 		Telemetry: TelemetryFacts{
-			Known: true, Endpoint: "http://10.78.0.1:9100/metrics",
+			Known: true, Endpoint: "http://127.0.0.1:9100/metrics",
 			Parent:              telemetryTestPath("/var/lib/node_exporter"),
 			Textfile:            telemetryTestPath("/var/lib/node_exporter/textfile"),
 			Collectors:          map[string]bool{"textfile": true, "systemd": true},
@@ -133,8 +133,8 @@ func TestTelemetryLocalHealth(t *testing.T) {
 	}
 	wireGuardDown := base
 	wireGuardDown.WireGuardActive = false
-	if got := telemetryLocal(wireGuardDown); got[0].Status != Warn || !strings.Contains(got[0].Detail, "not observed") {
-		t.Fatalf("WireGuard down = %+v, want warn/unobserved", got)
+	if got := telemetryLocal(wireGuardDown); got[0].Status != Pass {
+		t.Fatalf("WireGuard down = %+v, want the loopback exporter still observed", got)
 	}
 	wireGuardDownMissingDir := wireGuardDown
 	wireGuardDownMissingDir.Telemetry.Textfile.Exists = false
@@ -143,7 +143,7 @@ func TestTelemetryLocalHealth(t *testing.T) {
 	}
 	wireGuardUnknown := base
 	wireGuardUnknown.WireGuardKnown = false
-	wireGuardUnknown.Telemetry.EndpointError = "node_exporter is unreachable on the WireGuard address"
+	wireGuardUnknown.Telemetry.EndpointError = "node_exporter is unreachable on the loopback address"
 	if got := telemetryLocal(wireGuardUnknown); got[0].Status != Warn || !strings.Contains(got[0].Detail, "WireGuard state is unknown") {
 		t.Fatalf("unknown WireGuard = %+v, want warn", got)
 	}
@@ -175,7 +175,7 @@ func TestTelemetryLocalHealth(t *testing.T) {
 		})
 	}
 	endpointDown := base
-	endpointDown.Telemetry.EndpointError = "node_exporter is unreachable on the WireGuard address"
+	endpointDown.Telemetry.EndpointError = "node_exporter is unreachable on the loopback address"
 	if got := telemetryLocal(endpointDown); got[0].Status != Fail || !strings.Contains(got[0].Detail, "does not answer") {
 		t.Fatalf("unreachable endpoint = %+v", got)
 	}
@@ -211,6 +211,48 @@ func TestTelemetryLocalHealth(t *testing.T) {
 	if got := telemetryLocal(healthy); got[0].Status != Pass ||
 		!strings.Contains(got[0].Detail, "1.11.1") || !strings.Contains(got[0].Detail, "node_textfile_scrape_error=0") {
 		t.Fatalf("healthy telemetry = %+v", got)
+	}
+}
+
+func TestTelemetryEndpointHealth(t *testing.T) {
+	base := Facts{
+		WireGuardKnown: true, WireGuardActive: true,
+		Telemetry: TelemetryFacts{
+			Known: true, EndpointListen: "10.78.0.1:9101",
+			EndpointConfigured: true,
+			EndpointAuthKnown:  true, EndpointAuthStatus: 401,
+		},
+	}
+	if got := telemetryEndpoint(Facts{}); got[0].Status != Skip {
+		t.Fatalf("unconfigured endpoint = %+v, want skip", got)
+	}
+	if got := telemetryEndpoint(base); got[0].Status != Pass || !strings.Contains(got[0].Detail, "401") {
+		t.Fatalf("healthy endpoint = %+v", got)
+	}
+	unconfigured := base
+	unconfigured.Telemetry.EndpointConfigured = false
+	if got := telemetryEndpoint(unconfigured); got[0].Status != Warn || !strings.Contains(got[0].Detail, "no credential") {
+		t.Fatalf("missing credential = %+v", got)
+	}
+	unconfigured.Telemetry.EndpointAuthStatus = 200
+	if got := telemetryEndpoint(unconfigured); got[0].Status != Fail || !strings.Contains(got[0].Detail, "without authentication") {
+		t.Fatalf("unauthenticated endpoint with missing credential = %+v, want fail", got)
+	}
+	exposed := base
+	exposed.Telemetry.EndpointAuthStatus = 200
+	if got := telemetryEndpoint(exposed); got[0].Status != Fail || !strings.Contains(got[0].Detail, "without authentication") {
+		t.Fatalf("unauthenticated endpoint = %+v", got)
+	}
+	down := base
+	down.Telemetry.EndpointAuthKnown = false
+	down.Telemetry.EndpointAuthError = "connection refused"
+	if got := telemetryEndpoint(down); got[0].Status != Fail || !strings.Contains(got[0].Detail, "does not answer") {
+		t.Fatalf("unreachable endpoint = %+v", got)
+	}
+	wireGuardDown := base
+	wireGuardDown.WireGuardActive = false
+	if got := telemetryEndpoint(wireGuardDown); got[0].Status != Warn || !strings.Contains(got[0].Detail, "WireGuard is down") {
+		t.Fatalf("WireGuard down = %+v", got)
 	}
 }
 

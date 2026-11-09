@@ -20,6 +20,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/upgrade"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
@@ -114,7 +115,7 @@ type serverInitSummary struct {
 	AdminUser     string         `json:"admin_user"`
 	PublicAddress string         `json:"public_address"`
 	API           string         `json:"api"`
-	NodeExporter  string         `json:"node_exporter,omitempty"`
+	Telemetry     string         `json:"telemetry,omitempty"`
 	SecretsOut    string         `json:"secrets_out,omitempty"`
 	Steps         []string       `json:"steps,omitempty"`
 	OperationID   string         `json:"operation_id,omitempty"`
@@ -147,8 +148,14 @@ type serverInit struct {
 	operationID  string
 	vaultKeyring string
 	warnings     []string
+	// metricsCredential is loaded or generated after WireGuard access exists.
+	// The node receives only its bcrypt hash.
+	metricsCredential *telemetry.Credential
 	// hostDoctor is replaced by tests; production reads the node's report.
 	hostDoctor func(context.Context, bool) (doctor.Report, error)
+	// metricsClient is replaced by tests; production resolves the init context's
+	// node client.
+	metricsClient metricsRotationClient
 }
 
 // hostname is the main node's public name, as the operator gave it.
@@ -368,6 +375,9 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		}
 	}
 
+	if err := r.ensureTelemetryCredential(ctx); err != nil {
+		return err
+	}
 	if !r.pending.Done(phaseChecks) {
 		task := r.start("ready", "Checking that the node RPC answers")
 		err := r.readyNode(ctx)
@@ -377,7 +387,7 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		}
 		task.end(ui.EndOK, "eregion node rpc over SSH in WireGuard")
 
-		summary.NodeExporter = r.checkNodeExporter(ctx, route)
+		summary.Telemetry = r.checkTelemetryEndpoint(ctx, route)
 		r.checkDNS(ctx)
 		r.waitForCertificate(ctx)
 		if err := ctx.Err(); err != nil {
@@ -1441,6 +1451,36 @@ func (r *serverInit) initNodeClient() (*nodeClient, error) {
 	return r.a.nodeClientFor(r.cmd, r.answers.Context)
 }
 
+// ensureTelemetryCredential reuses or generates the operator-side credential
+// and sends only its bcrypt hash to the node. It runs after access exists and
+// before the doctor gate sees the endpoint.
+func (r *serverInit) ensureTelemetryCredential(ctx context.Context) error {
+	client := r.metricsClient
+	if client == nil {
+		var err error
+		client, err = r.initNodeClient()
+		if err != nil {
+			return err
+		}
+	}
+	credential, err := loadMetricsCredential(r.answers.Context)
+	if err != nil {
+		return err
+	}
+	if _, err := rotateMetricsCredential(ctx, client, r.answers.Context, r.answers.Node, r.answers.Node+"/metrics", credential, func(value string) { r.a.secrets.Add(value) }); err != nil {
+		return err
+	}
+	credential, err = loadMetricsCredential(r.answers.Context)
+	if err != nil {
+		return err
+	}
+	if credential == nil {
+		return contract.NewFault(contract.Internal, "the telemetry credential transaction produced no active credential", "Retry server init --resume.")
+	}
+	r.metricsCredential = credential
+	return nil
+}
+
 // readyNode is the init's readiness probe over the explicit init context.
 func (r *serverInit) readyNode(ctx context.Context) error {
 	client, err := r.initNodeClient()
@@ -1677,8 +1717,8 @@ func (r *serverInit) finish(s serverInitSummary) {
 		{"route", s.API},
 		{"database", "external PostgreSQL"},
 	}
-	if s.NodeExporter != "" {
-		rows = append(rows, [2]string{"node_exporter", s.NodeExporter})
+	if s.Telemetry != "" {
+		rows = append(rows, [2]string{"telemetry", s.Telemetry})
 	}
 	if s.Doctor != nil {
 		rows = append(rows, [2]string{"doctor", doctor.SummaryLine(s.Doctor.Summary)})

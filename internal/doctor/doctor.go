@@ -155,6 +155,7 @@ func Checks() []Check {
 		{ID: "version.schema", Category: CatVersions, AtInit: true, Run: versionSchema},
 		{ID: "version.river", Category: CatVersions, AtInit: true, Run: versionRiver},
 		{ID: "telemetry.local", Category: CatServices, AtInit: true, Run: telemetryLocal},
+		{ID: "telemetry.endpoint", Category: CatServices, AtInit: true, Run: telemetryEndpoint},
 		{ID: "services.running", Category: CatServices, AtInit: true, Run: services},
 	}
 }

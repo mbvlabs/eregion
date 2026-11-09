@@ -57,8 +57,8 @@ const (
 )
 
 // ScrapeInfo describes where the current observation came from. The exporter is
-// reachable only on the node's WireGuard address and is read by the operator's
-// node-RPC command; there is no public endpoint or independent scraper account.
+// reachable only on the node's loopback address and is read by the operator's
+// node-RPC command; external scrapers use the authenticated endpoint.
 type ScrapeInfo struct {
 	Endpoint       string `json:"endpoint"`
 	Listen         string `json:"listen"`
@@ -277,7 +277,7 @@ func defaultNodeExporterClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{
-			// The endpoint is a local WireGuard address. An ambient HTTP proxy
+			// The endpoint is a local loopback address. An ambient HTTP proxy
 			// must never receive this read.
 			Proxy: nil,
 		},
@@ -399,7 +399,7 @@ func ProbeLocal(ctx context.Context, endpoint string) (LocalProbe, error) {
 func validateNodeExporterURL(value string) (string, error) {
 	parsed, err := url.Parse(strings.TrimSpace(value))
 	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "/metrics" {
-		return "", contract.NewFault(contract.ValidationFailed, "invalid node_exporter endpoint", "Use the node's WireGuard HTTP endpoint ending in /metrics.")
+		return "", contract.NewFault(contract.ValidationFailed, "invalid node_exporter endpoint", "Use the node's loopback HTTP endpoint ending in /metrics.")
 	}
 	return parsed.String(), nil
 }
@@ -415,7 +415,7 @@ func fetchNodeExporter(ctx context.Context, client *http.Client, endpoint string
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		return "", contract.NewFault(contract.Unavailable, "node_exporter is unreachable on the WireGuard address", "Check node-exporter.service and that wg0 is up; the exporter is not public.")
+		return "", contract.NewFault(contract.Unavailable, "node_exporter is unreachable on the loopback address", "Check node-exporter.service; the exporter is loopback-only.")
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {

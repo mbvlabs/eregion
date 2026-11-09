@@ -30,7 +30,7 @@ func TestWorkspaceNodeMetricsMapsOneCurrentSnapshot(t *testing.T) {
 	backend := &fakeNodeMetricsBackend{snapshot: telemetry.NodeSnapshot{
 		Schema: telemetry.NodeMetricsSchema, Node: "main", Hostname: "main.example",
 		FetchedAt: now, ObservedAt: &now, Freshness: telemetry.Freshness{State: telemetry.FreshnessFresh, AgeSeconds: &age, ThresholdSeconds: 30},
-		Scrape:        telemetry.ScrapeInfo{Endpoint: "http://10.78.0.1:9100/metrics", Listen: "10.78.0.1:9100", Access: "wireguard"},
+		Scrape:        telemetry.ScrapeInfo{Endpoint: "http://127.0.0.1:9100/metrics", Listen: "127.0.0.1:9100", Access: "loopback"},
 		CPU:           &telemetry.CPUStats{UtilizationPercent: &cpu, LogicalCPUs: 4, WindowSeconds: 1},
 		Memory:        &telemetry.MemoryStats{TotalBytes: 8 << 30, AvailableBytes: 6 << 30, UsedBytes: 2 << 30, UsedPercent: 25},
 		Load:          &telemetry.LoadStats{Load1: 0.5, Load5: 0.4, Load15: 0.3},
@@ -79,7 +79,7 @@ func TestWorkspaceNodeMetricsReportsMissingCPUWithoutInventingSamples(t *testing
 	backend := &fakeNodeMetricsBackend{snapshot: telemetry.NodeSnapshot{
 		Schema: telemetry.NodeMetricsSchema, Node: "main", FetchedAt: now.Add(2 * time.Second), ObservedAt: nil,
 		Freshness: telemetry.Freshness{State: telemetry.FreshnessUnknown},
-		Scrape:    telemetry.ScrapeInfo{Endpoint: "http://10.78.0.1:9100/metrics", Access: "wireguard"},
+		Scrape:    telemetry.ScrapeInfo{Endpoint: "http://127.0.0.1:9100/metrics", Access: "loopback"},
 		Issues:    []telemetry.Issue{{Field: "cpu", Reason: "node_cpu_seconds_total is missing"}},
 	}}
 	source := (&app{}).workspaceMetricsSource(backend)
@@ -107,7 +107,7 @@ func TestWorkspaceNodeMetricsRejectsAnotherNodesSample(t *testing.T) {
 	backend := &fakeNodeMetricsBackend{snapshot: telemetry.NodeSnapshot{
 		Schema: telemetry.NodeMetricsSchema, Node: "main", FetchedAt: now, ObservedAt: &now,
 		Freshness: telemetry.Freshness{State: telemetry.FreshnessFresh},
-		Scrape:    telemetry.ScrapeInfo{Endpoint: "http://10.78.0.1:9100/metrics", Access: "wireguard"},
+		Scrape:    telemetry.ScrapeInfo{Endpoint: "http://127.0.0.1:9100/metrics", Access: "loopback"},
 		CPU:       &telemetry.CPUStats{UtilizationPercent: &cpu, LogicalCPUs: 4, WindowSeconds: 1},
 	}}
 	source := (&app{}).workspaceMetricsSource(backend)

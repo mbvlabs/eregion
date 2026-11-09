@@ -17,6 +17,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
 // clearScreen clears the screen and, where the terminal supports it, the
@@ -248,12 +249,14 @@ type handoffRecordInput struct {
 	OperatorSSHKey           string
 	DatabaseURL              string
 	VaultKeyring             string
+	MetricsUsername          string
+	MetricsPassword          string
 }
 
 // handoffGroups is the password-manager shape of the record. Every value here
 // is a handoff exception: it is shown once and never becomes ordinary output.
 func handoffGroups(in handoffRecordInput) []handoffGroup {
-	return []handoffGroup{
+	groups := []handoffGroup{
 		{title: "Main node " + in.NodeName, fields: []handoffField{
 			{"Node name", in.NodeName},
 			{"Context", in.Context},
@@ -280,17 +283,39 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 		{title: "Vault keyring", fields: []handoffField{
 			{"EREGION_VAULT_KEY_FILE content", in.VaultKeyring},
 		}},
-		{title: "Break-glass", fields: []handoffField{
-			{"When", "Only when WireGuard or the node is unreachable."},
-			{"How", "Use the provider console as root and run `eregion node unlock-ssh`. It reopens public SSH for its fixed window."},
-			{"Public SSH", "Closed after server init; sshd accepts the admin user over WireGuard only."},
-			{"Recovery", "The transfer bundle above rebuilds the context on another machine. Without it, use the provider console and this record."},
-		}},
 	}
+	if in.MetricsUsername != "" && in.MetricsPassword != "" {
+		groups = append(groups, metricsHandoffGroup(in.MetricsUsername, in.MetricsPassword))
+	}
+	groups = append(groups, handoffGroup{title: "Break-glass", fields: []handoffField{
+		{"When", "Only when WireGuard or the node is unreachable."},
+		{"How", "Use the provider console as root and run `eregion node unlock-ssh`. It reopens public SSH for its fixed window."},
+		{"Public SSH", "Closed after server init; sshd accepts the admin user over WireGuard only."},
+		{"Recovery", "The transfer bundle above rebuilds the context on another machine. Without it, use the provider console and this record."},
+	}})
+	return groups
+}
+
+// metricsHandoffGroup is added only when a credential exists. Its values are a
+// protected handoff exception, never ordinary output.
+func metricsHandoffGroup(username, password string) handoffGroup {
+	return handoffGroup{title: "Node metrics", fields: []handoffField{
+		{"Metrics URL", telemetry.EndpointMetricsURL(access.NodeAddress)},
+		{"Discovery URL", telemetry.EndpointDiscoveryURL(access.NodeAddress)},
+		{"Username", username},
+		{"Password", password},
+		{"Access", "WireGuard only; basic authentication; no public endpoint"},
+	}}
 }
 
 // handoffGroups is the init record built from the answers and operator identity.
 func (r *serverInit) handoffGroups() []handoffGroup {
+	credential := r.metricsCredential
+	if credential == nil {
+		if loaded, err := loadMetricsCredential(r.answers.Context); err == nil {
+			credential = loaded
+		}
+	}
 	return handoffGroups(handoffRecordInput{
 		NodeName: r.answers.Node, Context: r.answers.Context, Hostname: r.answers.Hostname,
 		PublicAddress: r.answers.Host, Platform: r.platform.String(), SSHHostKey: r.hostKey,
@@ -300,5 +325,20 @@ func (r *serverInit) handoffGroups() []handoffGroup {
 		OperatorWireGuardAddress: access.OperatorAddress, OperatorWireGuardKey: r.identity.wg.Encode(),
 		OperatorSSHKey: strings.TrimSpace(r.identity.sshKeyPEM),
 		DatabaseURL:    r.answers.DatabaseURL, VaultKeyring: r.vaultKeyring,
+		MetricsUsername: metricsUsername(credential), MetricsPassword: metricsPassword(credential),
 	})
+}
+
+func metricsUsername(credential *telemetry.Credential) string {
+	if credential == nil {
+		return ""
+	}
+	return credential.Username
+}
+
+func metricsPassword(credential *telemetry.Credential) string {
+	if credential == nil {
+		return ""
+	}
+	return credential.Password
 }

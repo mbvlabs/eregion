@@ -232,7 +232,7 @@ func (w workspaceNodeMetrics) Query(ctx context.Context, query workspaceui.Metri
 	}
 	series.Details = append(series.Details, workspaceui.Detail{
 		Label: "Source",
-		Value: snapshot.Scrape.Endpoint + " · WireGuard only; no public endpoint or credential",
+		Value: snapshot.Scrape.Endpoint + " · loopback exporter; external scraping uses the authenticated WireGuard endpoint",
 	})
 	series.Note = strings.Join(notes, " ")
 	return series, nil

@@ -70,12 +70,20 @@ type TelemetryFacts struct {
 	TextfileScrapeError          *float64
 	TextfileScrapeErrorAmbiguous bool
 	EndpointError                string
+
+	// Endpoint is the authenticated WireGuard-facing endpoint, separate from
+	// the loopback exporter read above.
+	EndpointListen     string
+	EndpointConfigured bool
+	EndpointAuthStatus int
+	EndpointAuthKnown  bool
+	EndpointAuthError  string
 }
 
-// telemetryLocal checks that node_exporter answers on its WireGuard-only
-// address and that its textfile and narrow systemd collectors are enabled and
-// successful. It is a health check, not a metrics scrape or a Prometheus
-// server: no sample is stored and no collector is invented.
+// telemetryLocal checks that the loopback node_exporter answers and that its
+// textfile and narrow systemd collectors are enabled and successful. It is a
+// health check, not a metrics scrape or a Prometheus server: no sample is
+// stored and no collector is invented.
 func telemetryLocal(facts Facts) []Result {
 	telemetry := facts.Telemetry
 	if !telemetry.Known {
@@ -89,14 +97,11 @@ func telemetryLocal(facts Facts) []Result {
 			return one(Fail, "node_exporter directory is unsafe or missing: "+err.Error(), "fix ownership/mode to root:root 0755 without symlinks, then run eregion apply")
 		}
 	}
-	if facts.WireGuardKnown && !facts.WireGuardActive {
-		return one(Warn, "WireGuard is down; node_exporter and its collectors were not observed, so collector health is unknown (the strict textfile directories are present)", "bring wg0 up, then re-run doctor; node_exporter starts with wg0")
-	}
 	if telemetry.EndpointError != "" {
 		if !facts.WireGuardKnown {
-			return one(Warn, "node_exporter was not observed and WireGuard state is unknown: "+telemetry.EndpointError, "check wg0 and node-exporter.service, then re-run doctor")
+			return one(Warn, "node_exporter was not observed and WireGuard state is unknown: "+telemetry.EndpointError, "check the loopback exporter, then re-run doctor")
 		}
-		return one(Fail, "node_exporter does not answer on "+telemetry.Endpoint+": "+telemetry.EndpointError, "check node-exporter.service and wg0, then run eregion apply")
+		return one(Fail, "node_exporter does not answer on "+telemetry.Endpoint+": "+telemetry.EndpointError, "check node-exporter.service and retry")
 	}
 	for _, collector := range []string{"*", "textfile", "systemd"} {
 		if telemetry.CollectorsAmbiguous[collector] {
@@ -134,6 +139,41 @@ func telemetryLocal(facts Facts) []Result {
 		detail += " (" + extra + " also reported)"
 	}
 	return one(Pass, detail, "")
+}
+
+// telemetryEndpoint checks the WireGuard-facing authenticated endpoint. It
+// probes discovery without a credential: a healthy endpoint answers 401, and a
+// 200 is an exposure rather than a pass. A missing Caddyfile means rotation has not
+// configured the endpoint yet and is a warning, not a pass.
+func telemetryEndpoint(facts Facts) []Result {
+	telemetry := facts.Telemetry
+	if !telemetry.Known {
+		return one(Skip, "local telemetry is not configured for this role", "")
+	}
+	// An observed unauthenticated 200 is a security failure regardless of the
+	// local configuration; do not downgrade it to a missing-credential warning.
+	if telemetry.EndpointAuthKnown && telemetry.EndpointAuthStatus == 200 {
+		return one(Fail, "the telemetry endpoint served discovery without authentication", "remove the public/unauthenticated route and run eregion metrics rotate; an unauthenticated telemetry endpoint is never healthy")
+	}
+	if !telemetry.EndpointConfigured {
+		return one(Warn, "the authenticated telemetry endpoint has no credential; external scrapers cannot connect", "run eregion metrics rotate --confirm <node>/metrics")
+	}
+	if facts.WireGuardKnown && !facts.WireGuardActive {
+		return one(Warn, "WireGuard is down; the authenticated telemetry endpoint was not observed", "bring wg0 up, then re-run doctor")
+	}
+	if telemetry.EndpointAuthError != "" {
+		if !facts.WireGuardKnown {
+			return one(Warn, "the telemetry endpoint was not observed and WireGuard state is unknown: "+telemetry.EndpointAuthError, "check wg0 and eregion-telemetry.service, then re-run doctor")
+		}
+		return one(Fail, "the telemetry endpoint does not answer on "+telemetry.EndpointListen+": "+telemetry.EndpointAuthError, "check eregion-telemetry.service and run eregion apply")
+	}
+	if !telemetry.EndpointAuthKnown {
+		return one(Fail, "the telemetry endpoint's authentication was not observed", "check eregion-telemetry.service and retry")
+	}
+	if telemetry.EndpointAuthStatus != 401 {
+		return one(Fail, fmt.Sprintf("the telemetry endpoint answered HTTP %d without a credential; want 401", telemetry.EndpointAuthStatus), "check eregion-telemetry.service and run eregion metrics rotate")
+	}
+	return one(Pass, "the authenticated telemetry endpoint answers 401 without a credential over WireGuard only", "")
 }
 
 func formatTelemetryValue(value float64) string {
