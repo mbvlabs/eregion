@@ -1058,7 +1058,45 @@ sanitized operation evidence. Alpha.1 remains operator-qualified.
 
 ## Beta acceptance — Cloudflare DNS automation (not run)
 
-### Requested CLI credential setup and alpha.5 upgrade follow-up (not run)
+### Alpha.6 publication and alpha.5 upgrade — pass (2026-11-09)
+
+- PR #5 merged into `1.x` at `b8211a2c44f65ade07eff4e15063c4a901b9408b`;
+  annotated tag `v1.0.0-alpha.6` has object
+  `89aeb4cea95daf75fb0d9977ca1a03f41b387dcf`. Fresh candidate CI
+  `42673387396` passed all jobs. Publish stable `42674342682` and tag CI
+  `42674342778` passed on retry after GitHub's Actions/Checks startup outage.
+- Independent public verification passed the schema-1 immutable manifest and
+  all four binaries' SHA-256 and cosign bundles against
+  `publish-stable.yml@refs/tags/v1.0.0-alpha.6` with the GitHub OIDC issuer.
+  Linux/amd64 SHA-256 is
+  `c6de515174591c6103528fb4091d9fd06f39b8e942b3f120cb4a3b60603fd042`;
+  the verified binary reports alpha.6 / `b8211a2c44f6`, channel `stable`, clean.
+  Root, `1.x` and RC manifest pointers remain HTTP 404. Evidence is retained at
+  `/tmp/opencode/relverify-alpha6-1794251036/` without downloaded binaries.
+- Authorized target: context `thelab`, `46.224.129.96`, node `main`, host
+  `exploration`. Pre-upgrade CLI/node were alpha.5 / `71c678362029`, schema
+  26/26, River 7/7, and queued/running/cancelling operation lists were empty.
+- `upgrade --version 1.0.0-alpha.6 --dry-run --json` planned CLI replacement
+  only. The real `--yes --json` upgrade succeeded. Subsequent node apply with
+  `--auto-upgrade-nodes --dry-run` refused with `node_version_mismatch` (exit 5)
+  and explicitly did not install the node; this is the expected dry-run gate.
+- Real `apply --auto-upgrade-nodes --json` succeeded as
+  `op_effa34cc656b7e48116e1243a58b6886` at `2026-11-09T19:07:20Z`:
+  **4 applied / 17 skipped**, migration 027, API/worker restart and readiness.
+  A transient connection-refused readiness observation was shown during the
+  restart, then the step and command completed successfully. Both sides report
+  alpha.6 / `b8211a2c44f6`, schema **27/27**, River **7/7**, all six services
+  active, and doctor **23 pass / 0 warn / 0 fail**.
+- Repeat real apply `op_3a6a7b76ae9ef2f5a0688ee17abad10b` was
+  **0 applied / 21 skipped**; dry-run `op_afb4c9a4bab3a0a5d2dbc792c57441d0`
+  reported `would_change=0`. `domain cloudflare status --json` succeeded with
+  an empty credential inventory. No Cloudflare token was entered, DNS changed,
+  app deployed or webhook configured. Those live checks remain pending.
+- The separately approved linear-history cleanup preserved every tag object
+  and the release tree; MASTER D14 and `docs/upgrades.md` describe the new
+  fast-forward policy. This is release/upgrade evidence, not beta qualification.
+
+### Requested CLI credential setup follow-up (provider/human checks pending)
 
 **Integrated source/database evidence (2026-11-09).** Independent verification
 of the combined tree passed the six provider/migration tests (including 026→027
@@ -1078,8 +1116,9 @@ exhausted temporary disk quota; standalone CLI and the serialized suite passed
 afterward. Static review cleared the integrated changes, including safe unknown
 commit-outcome guidance. Logs: `/tmp/opencode/eregion-final-verify.00Kqp0/`.
 No real gh credential, Cloudflare, DNS, VPS or production database was used.
-Publication, real upgrade and human terminal/provider qualification remain
-not run. Post-check removal of the obsolete unused file reader and the agent
+At this source-only stage, publication, real upgrade and human terminal/provider
+qualification had not run; the publication/upgrade record above supersedes
+those two pending items. Post-check removal of the obsolete unused file reader and the agent
 guide handoff clarification passed independent integrations/API and safe CLI
 tests, build/vet, example tests/vet and diff/module checks. No reader references
 remain. The disposable PostgreSQL instance was gracefully stopped, its PID and
