@@ -105,11 +105,17 @@ func TestMainServiceUnitsIncludeTheWireGuardExporter(t *testing.T) {
 	if len(want) != 0 {
 		t.Fatalf("main units missing %v in %v", want, units)
 	}
-	if got := NodeExporterListenAddress(); got != "10.78.0.1:9100" {
+	if got := NodeExporterListenAddress(); got != "127.0.0.1:9100" {
 		t.Fatalf("exporter listen = %q", got)
 	}
-	if got := NodeExporterMetricsURL(); got != "http://10.78.0.1:9100/metrics" {
+	if got := NodeExporterMetricsURL(); got != "http://127.0.0.1:9100/metrics" {
 		t.Fatalf("exporter URL = %q", got)
+	}
+	if got := TelemetryListenAddress(); got != "10.78.0.1:9101" {
+		t.Fatalf("telemetry listen = %q", got)
+	}
+	if got := TelemetryDiscoveryURL(); got != "http://10.78.0.1:9101/targets.json" {
+		t.Fatalf("telemetry discovery URL = %q", got)
 	}
 }
 

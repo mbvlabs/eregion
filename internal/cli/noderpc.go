@@ -34,6 +34,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/retention"
 	"github.com/mbvlabs/eregion/internal/rpc"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/tokens"
 	"github.com/mbvlabs/eregion/internal/upgrade"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -79,6 +80,8 @@ type Backend interface {
 	RetentionPlan(context.Context, string, string, string) (retention.PlanResult, error)
 	RetentionShow(context.Context, string, string) (retention.PolicyView, error)
 	RetentionSetServer(context.Context, retention.Policy) (retention.PolicyView, error)
+	MetricsEndpoint(context.Context) (telemetry.EndpointInfo, error)
+	MetricsRotate(context.Context, string, string, bool) (telemetry.Rotation, error)
 }
 
 const (
@@ -116,6 +119,8 @@ const (
 	methodRetentionShow      = "retention.show"
 	methodRetentionSet       = "retention.set"
 	methodMetricsShow        = "metrics.show"
+	methodMetricsEndpoint    = "metrics.endpoint"
+	methodMetricsRotate      = "metrics.rotate"
 )
 
 // nodeRPCCommand is the fixed command the operator runs on the node.
@@ -719,6 +724,10 @@ func waitLabel(method string, params any) string {
 		return "Writing the retention policy…"
 	case methodMetricsShow:
 		return "Reading node metrics…"
+	case methodMetricsEndpoint:
+		return "Reading the telemetry endpoint…"
+	case methodMetricsRotate:
+		return "Rotating the telemetry credential…"
 	case methodVersion:
 		return "Checking the node version…"
 	}
@@ -1225,6 +1234,18 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		}
 		snapshot, err := collectNodeMetrics(ctx)
 		return snapshot, true, err
+	case methodMetricsEndpoint:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		info, err := host.TelemetryEndpointInfo()
+		return info, true, err
+	case methodMetricsRotate:
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, true, err
+		}
+		rotation, err := host.RotateTelemetryCredential(ctx, request.Confirm, request.DryRun, request.Secrets["metrics.htpasswd"])
+		return rotation, true, err
 	case methodNodeInfo:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
 			return nil, true, err

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/transport"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
@@ -216,6 +218,11 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 			return result{}, err
 		}
 	}
+	if password, err := restoreMetricsCredential(tempDir, rec); err != nil {
+		return result{}, err
+	} else if password != "" {
+		a.secrets.Add(password)
+	}
 	if _, err := transport.ReadWireGuardKey(wgPath); err != nil {
 		return result{}, contract.NewFault(contract.ValidationFailed, "the record's WireGuard key is not usable", err.Error())
 	}
@@ -341,6 +348,29 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{data: data, streamed: true}, nil
 	}
 	return result{data: data, plain: "logged in to " + name}, nil
+}
+
+// restoreMetricsCredential writes the handoff's Node metrics credential into
+// the new identity directory. It returns the password for redaction, or empty
+// when the record predates the authenticated endpoint.
+func restoreMetricsCredential(dir string, record handoffRecord) (string, error) {
+	username := strings.TrimSpace(record.field("Node metrics", "Username"))
+	password := strings.TrimSpace(record.field("Node metrics", "Password"))
+	if username == "" && password == "" {
+		return "", nil
+	}
+	credential := telemetry.Credential{Username: username, Password: password}
+	if err := credential.Validate(); err != nil {
+		return "", contract.NewFault(contract.ValidationFailed, "the record's telemetry credential is not usable", err.Error())
+	}
+	raw, err := json.MarshalIndent(credential, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := writePrivate(filepath.Join(dir, metricsCredentialFile), append(raw, '\n')); err != nil {
+		return "", err
+	}
+	return password, nil
 }
 
 // readOptionalFile reads path and reports whether it exists.

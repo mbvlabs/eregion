@@ -33,6 +33,9 @@ func TestNodeExporterV2EnablesScopedLocalCollectors(t *testing.T) {
 	if strings.Contains(unit, "0.0.0.0:9100") || strings.Contains(unit, "[::]:9100") {
 		t.Fatalf("node_exporter unit exposes a public listener:\n%s", unit)
 	}
+	if strings.Contains(unit, "wg-quick@wg0.service") {
+		t.Fatalf("loopback node_exporter retains a WireGuard dependency:\n%s", unit)
+	}
 	if strings.Contains(nodeExporterCollectorUnits, "postgresql") || strings.Contains(nodeExporterCollectorUnits, ".*") {
 		t.Fatalf("systemd collector set is not narrow: %s", nodeExporterCollectorUnits)
 	}

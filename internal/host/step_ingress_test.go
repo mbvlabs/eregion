@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
@@ -63,11 +64,188 @@ func (e caddyVersionExec) Run(context.Context, string, string, map[string]string
 
 func TestIngressCheckRejectsAnUnpinnedOrMissingCaddy(t *testing.T) {
 	for _, e := range []caddyVersionExec{{version: "2.6.2"}, {version: "v2.11.40"}, {err: errors.New("not installed")}} {
-		step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: e}
+		step := &ingressStep{cfg: Config{Arch: "amd64", Hostname: "main.example.com"}, exec: e}
 		check, err := step.Check(context.Background(), engine.Runtime{})
 		if err != nil || check.Complete || !strings.Contains(check.Detail, CaddyVersion) {
 			t.Fatalf("version %q: check=%+v err=%v", e.version, check, err)
 		}
+	}
+}
+
+type caddyStateExec struct {
+	version string
+	state   string
+	account string
+}
+
+func (e caddyStateExec) Output(_ context.Context, script string) (string, error) {
+	if strings.Contains(script, "caddy version") {
+		return e.version, nil
+	}
+	if strings.Contains(script, "getent group caddy") {
+		if e.account == "" {
+			return "account:ok", nil
+		}
+		return e.account, nil
+	}
+	return e.state, nil
+}
+
+func (e caddyStateExec) Run(context.Context, string, string, map[string]string, engine.Reporter) error {
+	panic("preflight refusal must not apply")
+}
+
+func TestHostnameLessIngressRejectsUnmanagedCaddyState(t *testing.T) {
+	for name, state := range map[string]string{
+		"enabled public service": "caddy.service:enabled",
+		"active public service":  "caddy.service:active",
+		"active API service":     "caddy-api.service:active",
+	} {
+		t.Run(name, func(t *testing.T) {
+			step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: caddyStateExec{version: "v" + CaddyVersion, state: state}, configPath: filepath.Join(t.TempDir(), "Caddyfile")}
+			check, err := step.Check(context.Background(), engine.Runtime{})
+			if err != nil || check.Complete || !strings.Contains(check.Detail, "refusing to manage existing Caddy state") {
+				t.Fatalf("check = %+v err=%v", check, err)
+			}
+		})
+	}
+}
+
+type caddyApplyExec struct {
+	scripts []string
+}
+
+func (e *caddyApplyExec) Output(_ context.Context, script string) (string, error) {
+	if strings.Contains(script, "caddy version") {
+		return "v" + CaddyVersion, nil
+	}
+	return "", nil
+}
+
+func (e *caddyApplyExec) Run(_ context.Context, _ string, script string, _ map[string]string, _ engine.Reporter) error {
+	e.scripts = append(e.scripts, script)
+	return nil
+}
+
+func TestHostnameLessIngressInstallsCaddyWithoutWritingAPublicConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "Caddyfile")
+	exec := &caddyApplyExec{}
+	step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: exec, configPath: configPath}
+	if _, err := step.Apply(context.Background(), engine.Runtime{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(exec.scripts) != 3 {
+		t.Fatalf("scripts = %v", exec.scripts)
+	}
+	for _, script := range exec.scripts {
+		if strings.Contains(script, "writePublicFile") {
+			t.Fatalf("unexpected script = %s", script)
+		}
+	}
+	if !strings.Contains(strings.Join(exec.scripts, "\n"), "rm -f /etc/caddy/Caddyfile") {
+		t.Fatalf("fresh apply did not neutralize the package default: %v", exec.scripts)
+	}
+	if !strings.Contains(strings.Join(exec.scripts, "\n"), "useradd --system --gid caddy") {
+		t.Fatalf("fresh apply did not ensure the Caddy account: %v", exec.scripts)
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatalf("hostname-less apply wrote a public Caddyfile: %v", err)
+	}
+}
+
+type caddyFailingInstallExec struct {
+	scripts []string
+	runs    int
+}
+
+func (e *caddyFailingInstallExec) Output(_ context.Context, script string) (string, error) {
+	if strings.Contains(script, "caddy version") {
+		return "v" + CaddyVersion, nil
+	}
+	return "", nil
+}
+
+func (e *caddyFailingInstallExec) Run(_ context.Context, _ string, script string, _ map[string]string, _ engine.Reporter) error {
+	e.runs++
+	e.scripts = append(e.scripts, script)
+	if e.runs == 1 {
+		return errors.New("apt failed")
+	}
+	return nil
+}
+
+func TestHostnameLessIngressCleansUpAFailedFreshInstall(t *testing.T) {
+	exec := &caddyFailingInstallExec{}
+	step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: exec, configPath: filepath.Join(t.TempDir(), "Caddyfile")}
+	if _, err := step.Apply(context.Background(), engine.Runtime{}, nil); err == nil || !strings.Contains(err.Error(), "apt failed") {
+		t.Fatalf("apply = %v", err)
+	}
+	if len(exec.scripts) != 2 || !strings.Contains(exec.scripts[1], "rm -f /etc/caddy/Caddyfile") {
+		t.Fatalf("failed install was not neutralized: %v", exec.scripts)
+	}
+}
+
+func TestHostnameLessIngressRejectsExistingCaddyfile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "Caddyfile")
+	if err := os.WriteFile(path, []byte("example.com { respond ok }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: caddyStateExec{version: "v" + CaddyVersion}, configPath: path}
+	if check, err := step.Check(context.Background(), engine.Runtime{}); err != nil || check.Complete {
+		t.Fatalf("check = %+v err=%v", check, err)
+	}
+	_, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+	if err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("apply = %v, want precondition_failed", err)
+	}
+}
+
+func TestHostnameLessIngressAcceptsFreshPinnedCaddy(t *testing.T) {
+	step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: caddyStateExec{version: "v" + CaddyVersion}, configPath: filepath.Join(t.TempDir(), "Caddyfile")}
+	check, err := step.Check(context.Background(), engine.Runtime{})
+	if err != nil || !check.Complete || !strings.Contains(check.Detail, "no public Caddy config or service") {
+		t.Fatalf("check = %+v err=%v", check, err)
+	}
+}
+
+func TestHostnameLessIngressRequiresTheExactCaddyPath(t *testing.T) {
+	step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: caddyExactPathExec{}, configPath: filepath.Join(t.TempDir(), "Caddyfile")}
+	check, err := step.Check(context.Background(), engine.Runtime{})
+	if err != nil || !check.Complete {
+		t.Fatalf("exact path was not accepted: check=%+v err=%v", check, err)
+	}
+}
+
+type caddyExactPathExec struct{}
+
+func (caddyExactPathExec) Output(_ context.Context, script string) (string, error) {
+	switch {
+	case script == CaddyBinaryPath+" version":
+		return "v" + CaddyVersion, nil
+	case strings.Contains(script, "getent group caddy"):
+		return "account:ok", nil
+	default:
+		return "", nil
+	}
+}
+
+func (caddyExactPathExec) Run(context.Context, string, string, map[string]string, engine.Reporter) error {
+	panic("a read-only check must not apply")
+}
+
+func TestHostnameLessIngressRequiresTheCaddyAccount(t *testing.T) {
+	step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: caddyStateExec{version: "v" + CaddyVersion, account: "account:missing"}, configPath: filepath.Join(t.TempDir(), "Caddyfile")}
+	check, err := step.Check(context.Background(), engine.Runtime{})
+	if err != nil || check.Complete || !strings.Contains(check.Detail, "account") {
+		t.Fatalf("check = %+v err=%v", check, err)
+	}
+}
+
+func TestHostnameLessIngressRefusesBeforeInstallingOverUnmanagedCaddy(t *testing.T) {
+	step := &ingressStep{cfg: Config{Arch: "amd64"}, exec: caddyStateExec{version: "v" + CaddyVersion, state: "caddy.service:active"}, configPath: filepath.Join(t.TempDir(), "Caddyfile")}
+	_, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+	if err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("apply = %v, want precondition_failed", err)
 	}
 }
 
@@ -120,6 +298,7 @@ printf '%s\n' "$*" > "$TEST_APT_LOG"
 printf '%s' "$TEST_AFTER" > "$TEST_VERSION_FILE"
 `, 0o700)
 			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("CADDY_BIN", filepath.Join(dir, "caddy"))
 			t.Setenv("TEST_VERSION_FILE", state)
 			t.Setenv("TEST_APT_LOG", log)
 			t.Setenv("TEST_AFTER", tc.after)
@@ -201,7 +380,7 @@ func TestCaddyActivationRestartsOnlyForANewBinary(t *testing.T) {
 		t.Fatalf("new binary does not restart:\n%s", restart)
 	}
 	for _, script := range []string{reload, restart} {
-		if !strings.HasPrefix(script, "set -euo pipefail\ncaddy validate ") || !strings.HasSuffix(script, "systemctl is-active --quiet caddy.service") {
+		if !strings.HasPrefix(script, "set -euo pipefail\n"+CaddyBinaryPath+" validate ") || !strings.HasSuffix(script, "systemctl is-active --quiet caddy.service") {
 			t.Fatalf("activation must validate first and verify last:\n%s", script)
 		}
 	}

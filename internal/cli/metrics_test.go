@@ -46,7 +46,7 @@ func testMetricsSnapshot() telemetry.NodeSnapshot {
 		FetchedAt: now, ObservedAt: &now,
 		Freshness: telemetry.Freshness{State: telemetry.FreshnessFresh, AgeSeconds: &age, ThresholdSeconds: 30},
 		Scrape: telemetry.ScrapeInfo{
-			Endpoint: "http://10.78.0.1:9100/metrics", Listen: "10.78.0.1:9100", Access: "wireguard",
+			Endpoint: "http://127.0.0.1:9100/metrics", Listen: "127.0.0.1:9100", Access: "loopback",
 			Public: false, Authentication: "none", Collection: "operator_node_rpc",
 			Note: "read by this operator command",
 		},
@@ -79,7 +79,7 @@ func TestMetricsShowPlainAndJSONReadOneSnapshot(t *testing.T) {
 	if snapshot.Node != "main" || snapshot.CPU == nil || snapshot.CPU.UtilizationPercent == nil || *snapshot.CPU.UtilizationPercent != 12.5 {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
-	if snapshot.Scrape.Public || snapshot.Scrape.Access != "wireguard" || snapshot.Scrape.Authentication != "none" {
+	if snapshot.Scrape.Public || snapshot.Scrape.Access != "loopback" || snapshot.Scrape.Authentication != "none" {
 		t.Fatalf("scrape details = %+v", snapshot.Scrape)
 	}
 
@@ -87,7 +87,7 @@ func TestMetricsShowPlainAndJSONReadOneSnapshot(t *testing.T) {
 	if exit != 0 || stderr != "" {
 		t.Fatalf("plain exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
 	}
-	for _, want := range []string{"Node metrics main", "main.example", "12.5% of 4 logical CPUs", "WireGuard only", "no public endpoint", "25.0%", "0.50 0.40 0.30", "1d 3h 46m", "/ (ext4)", "sample 2s old", "no samples are stored"} {
+	for _, want := range []string{"Node metrics main", "main.example", "12.5% of 4 logical CPUs", "loopback exporter", "no public listener", "25.0%", "0.50 0.40 0.30", "1d 3h 46m", "/ (ext4)", "sample 2s old", "no samples are stored"} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("plain output missing %q:\n%s", want, stdout)
 		}
@@ -138,6 +138,23 @@ func TestMetricsShowUsesTheNodeRPCMethod(t *testing.T) {
 	}
 	if snapshot.Node != "main" || !transport.called(methodMetricsShow) {
 		t.Fatalf("snapshot=%+v methods=%v", snapshot, transport.methods)
+	}
+}
+
+func TestMetricsRotateDryRunAndRealRotationUseTheNodeRPCMethod(t *testing.T) {
+	transport := &fakeNodeTransport{
+		version:  rpcVersionResult{Version: buildinfo.Version, Commit: buildinfo.Commit, Arch: "amd64"},
+		rotation: telemetry.Rotation{Schema: telemetry.RotationSchema, Node: "main", Username: telemetry.Username},
+	}
+	client := &nodeClient{remote: transport}
+	if _, err := client.MetricsRotate(context.Background(), "", "main/metrics", true); err != nil {
+		t.Fatalf("dry-run rotation = %v", err)
+	}
+	if _, err := client.MetricsRotate(context.Background(), "$2a$08$invalid", "main/metrics", false); err != nil {
+		t.Fatalf("rotation = %v", err)
+	}
+	if !transport.called(methodMetricsRotate) {
+		t.Fatal("rotation did not use metrics.rotate")
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 	"github.com/mbvlabs/eregion/internal/transport"
 	"github.com/spf13/cobra"
 )
@@ -53,6 +54,11 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
+	metricsCredential, err := loadMetricsCredential(identity.context.Name)
+	if err != nil {
+		return result{}, err
+	}
+	identity.metrics = metricsCredential
 	exported, err := client.HandoffExport(cmd.Context(), code)
 	if err != nil {
 		return result{}, err
@@ -87,6 +93,14 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 		data["secrets_out"] = record.path
 		plain += " and wrote " + record.path
 	}
+	if identity.metrics == nil {
+		data["metrics_credential"] = false
+		warning := "this machine has no telemetry credential; the handoff omits it. Run eregion metrics rotate to create one."
+		data["warnings"] = []map[string]string{{"code": "metrics_credential_missing", "message": warning}}
+		plain += "\nwarning: " + warning
+	} else {
+		data["metrics_credential"] = true
+	}
 	return result{data: data, plain: plain + "; eregion does not store it.\n"}, nil
 }
 
@@ -113,6 +127,7 @@ type handoffExportIdentity struct {
 	sshKey       string
 	wgKey        transport.WireGuardKey
 	sudoPassword string
+	metrics      *telemetry.Credential
 }
 
 func loadHandoffExportIdentity(cmd *cobra.Command) (handoffExportIdentity, error) {
@@ -157,5 +172,6 @@ func handoffExportInput(identity handoffExportIdentity, exported rpcHandoffExpor
 		OperatorWireGuardAddress: current.SSH.WireGuard.Address, OperatorWireGuardKey: identity.wgKey.Encode(),
 		OperatorSSHKey: identity.sshKey,
 		DatabaseURL:    exported.DatabaseURL, VaultKeyring: exported.VaultKeyring,
+		MetricsUsername: metricsUsername(identity.metrics), MetricsPassword: metricsPassword(identity.metrics),
 	}
 }

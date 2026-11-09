@@ -3,11 +3,13 @@ package host
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -17,6 +19,11 @@ const CaddyfilePath = platform.CaddyfilePath
 
 // CaddyVersion pins the same upstream release as deploycrate-ce setup.
 const CaddyVersion = "2.11.4"
+
+// CaddyBinaryPath is the executable both the public service and the dedicated
+// telemetry unit run. Never resolve Caddy through PATH here: a matching manual
+// binary elsewhere must not satisfy this dependency.
+const CaddyBinaryPath = "/usr/bin/caddy"
 
 //go:embed scripts/install-caddy.sh
 var installCaddyScript string
@@ -56,20 +63,36 @@ var PublicAPIPaths = []string{
 // ValidateHostname checks a DNS name such as main.example.com.
 func ValidateHostname(name string) error { return platform.ValidateDomain(name) }
 
-// ingressStep installs Caddy on the main node: an ACME certificate for the
-// hostname and a reverse proxy for the public API paths only.
+// ingressStep installs pinned Caddy on every control-plane node. With a
+// hostname it serves the public API paths and ACME certificate; without one it
+// only ensures the binary/account for the dedicated telemetry unit and refuses
+// to touch any pre-existing Caddy configuration or service.
 type ingressStep struct {
-	cfg  Config
-	exec Exec
+	cfg        Config
+	exec       Exec
+	configPath string
 }
 
 func (s *ingressStep) ID() string { return "host-ingress-v2" }
 func (s *ingressStep) Describe() string {
+	if strings.TrimSpace(s.cfg.Hostname) == "" {
+		return "Install pinned Caddy " + CaddyVersion + " for the dedicated telemetry endpoint without a public hostname"
+	}
 	return "Install pinned Caddy " + CaddyVersion + " for " + s.cfg.Hostname + " with an ACME certificate"
 }
 func (s *ingressStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
+func (s *ingressStep) caddyConfigPath() string {
+	if s.configPath != "" {
+		return s.configPath
+	}
+	return CaddyfilePath
+}
+
 func (s *ingressStep) caddyfile() []byte {
+	if strings.TrimSpace(s.cfg.Hostname) == "" {
+		return nil
+	}
 	return []byte(fmt.Sprintf(`# managed by eregion
 import %s/*.caddy
 
@@ -83,6 +106,49 @@ import %s/*.caddy
 	}
 }
 `, platform.CaddyRoutesDir, s.cfg.Hostname, strings.Join(PublicAPIPaths, " "), s.cfg.APIListen))
+}
+
+// unmanagedCaddy returns a non-empty reason when a hostname-less control plane
+// already has Caddy state that eregion did not install. Callers must not run
+// the package install or mutate caddy.service while an unmanaged reason exists:
+// apt's postinst can otherwise overwrite a Caddyfile or start a service.
+func (s *ingressStep) unmanagedCaddy(ctx context.Context) (string, error) {
+	if _, err := os.Lstat(s.caddyConfigPath()); err == nil {
+		return s.caddyConfigPath() + " exists", nil
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	output, err := checkOutput(ctx, engine.Runtime{}, s.exec, `if ! command -v systemctl >/dev/null 2>&1; then echo systemctl:missing; exit 0; fi
+for unit in caddy.service caddy-api.service; do
+  if systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then echo "$unit:enabled"; fi
+  if systemctl is-active --quiet "$unit" >/dev/null 2>&1; then echo "$unit:active"; fi
+done`)
+	if err != nil {
+		return "", err
+	}
+	output = strings.TrimSpace(output)
+	switch output {
+	case "":
+		return "", nil
+	case "systemctl:missing":
+		return "systemd is unavailable", nil
+	default:
+		return strings.ReplaceAll(output, "\n", ", "), nil
+	}
+}
+
+// neutralizeFreshCaddy removes only package-created defaults on a hostname-less
+// node. Preflight established that no Caddyfile and no enabled/active Caddy
+// service existed, so this never disables an unrelated running service.
+func (s *ingressStep) neutralizeFreshCaddy(ctx context.Context, report engine.Reporter) error {
+	cleanup := `set -euo pipefail
+rm -f /etc/caddy/Caddyfile
+for unit in caddy.service caddy-api.service; do
+  if systemctl is-enabled --quiet "$unit" >/dev/null 2>&1 || systemctl is-active --quiet "$unit" >/dev/null 2>&1; then
+    systemctl disable --now "$unit" >/dev/null
+  fi
+done`
+	return s.exec.Run(ctx, s.ID()+"-cleanup", cleanup, nil, report)
 }
 
 func (s *ingressStep) Inputs() ([]byte, error) {
@@ -100,15 +166,52 @@ func (s *ingressStep) Inputs() ([]byte, error) {
 	}{s.cfg.Hostname, contentSHA256(s.caddyfile()), CaddyVersion, s.arch(), url, checksum})
 }
 
+// caddyAccountCheckScript verifies the account the telemetry and public Caddy
+// units actually run as. A matching binary elsewhere on PATH is insufficient.
+func caddyAccountCheckScript() string {
+	return `if getent group caddy >/dev/null 2>&1 && getent passwd caddy >/dev/null 2>&1; then echo account:ok; else echo account:missing; fi`
+}
+
+// caddyAccountScript creates the service account only when it is absent. It
+// does not modify an existing Caddy configuration or service.
+func caddyAccountScript() string {
+	return `set -euo pipefail
+if ! getent group caddy >/dev/null 2>&1; then
+  groupadd --system caddy
+fi
+if ! getent passwd caddy >/dev/null 2>&1; then
+  useradd --system --gid caddy --create-home --home-dir /var/lib/caddy --shell /usr/sbin/nologin --comment "Caddy web server" caddy
+fi`
+}
+
 func (s *ingressStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
+	if strings.TrimSpace(s.cfg.Hostname) == "" {
+		reason, err := s.unmanagedCaddy(ctx)
+		if err != nil {
+			return engine.CheckResult{}, err
+		}
+		if reason != "" {
+			return incomplete("refusing to manage existing Caddy state: " + reason)
+		}
+	}
 	if _, _, ok := caddyArtifact(s.arch()); !ok {
 		return engine.CheckResult{}, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
 	}
-	version, err := s.exec.Output(ctx, "caddy version")
+	version, err := s.exec.Output(ctx, CaddyBinaryPath+" version")
 	if err != nil || !pinnedCaddyVersion(version) {
-		return incomplete("Caddy must report pinned version " + CaddyVersion)
+		return incomplete("Caddy must report pinned version " + CaddyVersion + " at " + CaddyBinaryPath)
 	}
-	ok, _, err := sameFileContent(CaddyfilePath, s.caddyfile())
+	account, err := checkOutput(ctx, engine.Runtime{}, s.exec, caddyAccountCheckScript())
+	if err != nil {
+		return engine.CheckResult{}, err
+	}
+	if account != "account:ok" {
+		return incomplete("Caddy service account caddy:caddy is missing")
+	}
+	if strings.TrimSpace(s.cfg.Hostname) == "" {
+		return complete("Caddy " + CaddyVersion + " is installed for the dedicated telemetry endpoint; no public Caddy config or service")
+	}
+	ok, _, err := sameFileContent(s.caddyConfigPath(), s.caddyfile())
 	if err != nil {
 		return engine.CheckResult{}, err
 	}
@@ -133,14 +236,47 @@ func (s *ingressStep) Apply(ctx context.Context, _ engine.Runtime, report engine
 	if !ok {
 		return engine.ApplyResult{}, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
 	}
+	hostnameLess := strings.TrimSpace(s.cfg.Hostname) == ""
+	if hostnameLess {
+		reason, err := s.unmanagedCaddy(ctx)
+		if err != nil {
+			return engine.ApplyResult{}, err
+		}
+		if reason != "" {
+			fault := contract.NewFault(contract.PreconditionFailed,
+				"refusing to install Caddy over unmanaged existing state: "+reason,
+				"Remove or stop the existing Caddy configuration/service, or configure a public hostname so eregion can manage it.")
+			fault.Details = map[string]any{"unmanaged_caddy": reason}
+			return engine.ApplyResult{}, fault
+		}
+	}
 	// Only a changed executable needs a restart, which drops every site's
 	// connections; a Caddyfile change on the pinned version reloads.
-	installed, err := s.exec.Output(ctx, "caddy version")
+	installed, err := s.exec.Output(ctx, CaddyBinaryPath+" version")
 	restart := err != nil || !pinnedCaddyVersion(installed)
 	if err := s.exec.Run(ctx, s.ID(), installCaddyScript, map[string]string{
-		"CADDY_VERSION": CaddyVersion, "CADDY_ARCH": s.arch(), "CADDY_URL": url, "CADDY_SHA256": checksum,
+		"CADDY_VERSION": CaddyVersion, "CADDY_ARCH": s.arch(), "CADDY_URL": url, "CADDY_SHA256": checksum, "CADDY_BIN": CaddyBinaryPath,
 	}, report); err != nil {
+		if hostnameLess {
+			if cleanupErr := s.neutralizeFreshCaddy(ctx, report); cleanupErr != nil {
+				return engine.ApplyResult{}, errors.Join(err, fmt.Errorf("neutralize the failed Caddy install: %w", cleanupErr))
+			}
+		}
 		return engine.ApplyResult{}, err
+	}
+	if err := s.exec.Run(ctx, s.ID()+"-account", caddyAccountScript(), nil, report); err != nil {
+		return engine.ApplyResult{}, fmt.Errorf("ensure the Caddy service account: %w", err)
+	}
+	if hostnameLess {
+		// apt's postinst may create its default public Caddyfile and start
+		// caddy.service. The state was absent at preflight, so neutralize only
+		// the package's fresh defaults; never touch a pre-existing service.
+		if err := s.neutralizeFreshCaddy(ctx, report); err != nil {
+			return engine.ApplyResult{}, err
+		}
+		return engine.ApplyResult{Notes: []string{"Caddy " + CaddyVersion + " is installed for the dedicated telemetry endpoint; no public Caddy config or service"}, Result: map[string]any{
+			"hostname": "", "paths": []string{}, "public": false, "version": CaddyVersion, "sha256": checksum,
+		}}, nil
 	}
 	// The worker owns the routes file; it rewrites it on every domain change.
 	routes := fmt.Sprintf(`set -euo pipefail
@@ -149,7 +285,7 @@ install -d -m 0755 -o %[1]s -g %[2]s %[3]s
 	if err := s.exec.Run(ctx, s.ID(), routes, nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := writePublicFile(CaddyfilePath, s.caddyfile(), "root", "root"); err != nil {
+	if err := writePublicFile(s.caddyConfigPath(), s.caddyfile(), "root", "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	if err := s.exec.Run(ctx, s.ID(), caddyActivateScript(restart), nil, report); err != nil {
@@ -169,22 +305,26 @@ func caddyActivateScript(restart bool) string {
 		activate = "systemctl restart caddy.service"
 	}
 	return `set -euo pipefail
-caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+` + CaddyBinaryPath + ` validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 systemctl enable caddy.service >/dev/null 2>&1
 ` + activate + `
 systemctl is-active --quiet caddy.service`
 }
 
 func (s *ingressStep) Diff(context.Context, engine.Runtime) ([]string, error) {
-	raw, _, _, err := fileState(CaddyfilePath)
-	if err != nil {
-		return nil, err
-	}
 	url, checksum, ok := caddyArtifact(s.arch())
 	if !ok {
 		return nil, fmt.Errorf("%w: no pinned Caddy artifact for architecture %s", engine.ErrPermanent, s.arch())
 	}
-	return append([]string{"+ install Caddy " + CaddyVersion + " from " + url, "+ verify sha256 " + checksum}, simpleDiff(CaddyfilePath, raw, s.caddyfile())...), nil
+	lines := []string{"+ install Caddy " + CaddyVersion + " from " + url, "+ verify sha256 " + checksum}
+	if strings.TrimSpace(s.cfg.Hostname) == "" {
+		return append(lines, "+ refuse an existing /etc/caddy/Caddyfile or enabled/active Caddy service; keep a fresh package install without a public config"), nil
+	}
+	raw, _, _, err := fileState(s.caddyConfigPath())
+	if err != nil {
+		return nil, err
+	}
+	return append(lines, simpleDiff(s.caddyConfigPath(), raw, s.caddyfile())...), nil
 }
 
 func pinnedCaddyVersion(output string) bool {

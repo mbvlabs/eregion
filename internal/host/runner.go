@@ -222,18 +222,23 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		steps = append(steps, &vaultKeyringStep{cfg: r.Config})
 		steps = append(steps, &credentialsStep{cfg: r.Config, credentials: credentials})
 		// Before the services: the worker's unit makes the routes dir writable,
-		// which must exist when it starts.
+		// which must exist when it starts. Caddy is installed for every
+		// control-plane node because the dedicated telemetry unit uses the same
+		// pinned binary; a hostname adds the public ingress site.
 		if r.Config.Hostname != "" {
-			steps = append(steps, newIngressSysctlStep(), &ingressStep{cfg: r.Config, exec: r.Exec})
+			steps = append(steps, newIngressSysctlStep())
 		}
+		steps = append(steps, &ingressStep{cfg: r.Config, exec: r.Exec})
 	}
 	steps = append(steps, &binaryStep{cfg: r.Config, role: role})
 	if role.ControlPlane {
 		steps = append(steps, newAPIService(r.Config, r.Exec), newWorkerService(r.Config, r.Exec))
 		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe})
-		// node_exporter listens on the node's WireGuard address only. It is
-		// installed here and started by the access setup once wg0 exists.
-		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec})
+		// node_exporter listens on loopback only. It starts with its unit; the
+		// authenticated telemetry endpoint is a dedicated Caddy instance on
+		// the WireGuard address, enabled by credential rotation and separate
+		// from public ingress.
+		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec}, &telemetryStep{cfg: r.Config, exec: r.Exec})
 	}
 	// The main node also needs /etc/eregion/node.json: node RPC, the CI URLs,
 	// push-to-deploy and secrets export all read the node identity and main

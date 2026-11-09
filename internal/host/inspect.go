@@ -100,19 +100,26 @@ func GatherFacts(ctx context.Context, cfg Config, cfgErr error, drift Plan, drif
 	return facts
 }
 
-// telemetryFacts gathers the current local exporter health used by doctor. It
-// runs on the node itself and reads only the WireGuard-bound endpoint; it does
-// not persist samples, start a scraper or require the control database.
+// telemetryFacts gathers the current local exporter and authenticated-endpoint
+// health used by doctor. It runs on the node itself and reads the loopback
+// exporter plus one unauthenticated endpoint probe; it does not persist
+// samples, start a scraper or require the control database.
 func telemetryFacts(ctx context.Context, role Role, textfileDir, endpoint string) doctor.TelemetryFacts {
 	roleConfig, err := ConfigForRole(role)
 	if err != nil || !roleConfig.ControlPlane {
 		return doctor.TelemetryFacts{}
 	}
-	facts := doctor.TelemetryFacts{Known: true, Endpoint: endpoint}
+	facts := doctor.TelemetryFacts{Known: true, Endpoint: endpoint, EndpointListen: TelemetryListenAddress(), EndpointConfigured: TelemetryConfigured()}
 	parent := filepath.Dir(textfileDir)
 	facts.Parent = inspectNodeExporterDir(parent).doctorFacts()
 	facts.Textfile = inspectNodeExporterDir(textfileDir).doctorFacts()
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	endpointProbe := telemetry.ProbeEndpoint(probeCtx, TelemetryDiscoveryURL(), nil)
+	cancel()
+	facts.EndpointAuthKnown = endpointProbe.Reachable
+	facts.EndpointAuthStatus = endpointProbe.Status
+	facts.EndpointAuthError = endpointProbe.Error
+	probeCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	probe, err := telemetry.ProbeLocal(probeCtx, endpoint)
 	if err != nil {

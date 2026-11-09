@@ -42,7 +42,7 @@ reconciliation results than the event view.
 
 Failed refreshes preserve last-known rows with their age. Empty inventory is not
 unreachable inventory. Fleet details show one current `metrics.show` snapshot
-from the node's WireGuard-bound node_exporter: one measured CPU sample plus
+from the node's loopback node_exporter: one measured CPU sample plus
 current memory, filesystem, load and uptime facts, with source and explicit
 freshness named. Unknown exporter time is not replaced by collection time; the
 node-computed age and threshold are aged with monotonic local receipt time, and

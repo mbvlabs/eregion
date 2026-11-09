@@ -620,7 +620,7 @@ func TestCollectNodeExporterReadsTwiceAndSetsScrapeDetails(t *testing.T) {
 	defer server.Close()
 	now := time.Unix(1700000010, 0).UTC()
 	scrape := ScrapeInfo{
-		Endpoint: server.URL + "/metrics", Listen: "10.78.0.1:9100", Access: "wireguard",
+		Endpoint: server.URL + "/metrics", Listen: "127.0.0.1:9100", Access: "loopback",
 		Authentication: "none", Collection: "operator_node_rpc", Note: "test",
 	}
 	snapshot, err := CollectNodeExporter(context.Background(), NodeExporterConfig{
@@ -654,7 +654,7 @@ func TestCollectNodeExporterDoesNotClampMateriallyFutureTimestampToFresh(t *test
 	defer server.Close()
 	snapshot, err := CollectNodeExporter(context.Background(), NodeExporterConfig{
 		Endpoint:       server.URL + "/metrics",
-		Scrape:         ScrapeInfo{Endpoint: server.URL + "/metrics", Access: "wireguard"},
+		Scrape:         ScrapeInfo{Endpoint: server.URL + "/metrics", Access: "loopback"},
 		Now:            func() time.Time { return now },
 		SampleInterval: 100 * time.Millisecond,
 	})
@@ -686,7 +686,7 @@ func TestCollectNodeExporterRecordsCompletionTimestampAfterSecondRead(t *testing
 	completion := start.Add(3 * time.Second)
 	var calls int
 	snapshot, err := CollectNodeExporter(context.Background(), NodeExporterConfig{
-		Endpoint: server.URL + "/metrics", Scrape: ScrapeInfo{Endpoint: server.URL + "/metrics", Access: "wireguard"},
+		Endpoint: server.URL + "/metrics", Scrape: ScrapeInfo{Endpoint: server.URL + "/metrics", Access: "loopback"},
 		Now: func() time.Time {
 			calls++
 			if calls == 1 {

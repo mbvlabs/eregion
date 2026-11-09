@@ -6,12 +6,14 @@ One Go binary sets up, secures, deploys and operates applications on servers
 you own. Agent-first JSON commands and a polished human terminal experience; no
 web UI.
 
-**Status: alpha.3 is published; beta is in preparation and not qualified.**
+**Status: alpha.3 is published; alpha.4 is a source candidate and beta is not
+qualified.**
 Setup, the private operator channel, durable operations, builds, deployments,
 domain routes, extensions, staging-to-production promotion and upgrades have
-code. Node-local telemetry, its local textfile/systemd collector foundations and
-Cloudflare DNS automation are implemented in source; host qualification remains;
-see the work list in MASTER.
+code. Node-local telemetry, its authenticated WireGuard-only endpoint,
+discovery/config/rotation primitives and local textfile/systemd collector
+foundations, plus Cloudflare DNS automation, are implemented in source; host
+qualification remains; see the work list in MASTER.
 
 ## Start here
 
@@ -37,7 +39,8 @@ bin/eregion help server init --json
 Discovery and help need no database or credentials. The operator surface is
 MASTER section 5: `server init`, `plan`, `apply`, `login`, `context`, `secrets
 export`, `app`, `env`, `process`, `config`, `domain`, `deploy`, `rollback`,
-`restart`, `build`, `release list`, `logs`, `metrics show`, `operations`,
+`restart`, `build`, `release list`, `logs`,
+`metrics show|endpoint|config|rotate`, `operations`,
 `token`, `protect`, `ssh`, `upgrade`, `doctor`, `ui`, `commands`, `guide`,
 `skill` and `version`.
 Node-mode entry points (`eregion node …`) are hidden server plumbing, not part of

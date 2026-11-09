@@ -96,7 +96,7 @@ re-queue the older one's live platform jobs.
 | `internal/host`, `internal/access`, `internal/doctor` | Bootstrap steps (incl. vault keyring and node_exporter), local pending-init state, recorded host intent, read-only observations, admin/firewall/WireGuard/SSH lockdown and break-glass scripts, and pure doctor checks. |
 | `internal/guide` | Embedded agent operating guide printed by `guide agents` and installed as `SKILL.md` by `skill install`. |
 | `internal/vault`, `internal/secrets` | Revisioned ciphertext/keyring and redaction. |
-| `internal/integrations`, `internal/telemetry` | The domain-scoped Cloudflare planner/executor used by explicit `domain add/remove` (configured zone token file, exact per-binding ownership, no zone-wide delete), retained internal DNS/private-access actions for later phases, and the bounded node-local node_exporter parser/snapshot plus the narrow local collector-health probe used by `metrics show`, the workspace Fleet detail and `doctor`. There is no telemetry server, external data source, scrape endpoint, discovery file, credential rotation or metric/log history. |
+| `internal/integrations`, `internal/telemetry` | The domain-scoped Cloudflare planner/executor used by explicit `domain add/remove` (configured zone token file, exact per-binding ownership, no zone-wide delete), retained internal DNS/private-access actions for later phases, and the node-local telemetry primitives: the bounded node_exporter parser/snapshot, the WireGuard-only HTTP discovery/config generation, and the basic-auth credential helpers used by Caddy. There is no central telemetry service, external data source, public scrape endpoint, metric store or history. |
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
 | `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement plus the verified linux/<node arch> binary used by `apply --auto-upgrade-nodes`. |
 
@@ -112,7 +112,7 @@ bin/eregion help app create --json
 
 | Current commands | Meaning/limit |
 | --- | --- |
-| `server init` | Guided root first contact; Linux/macOS operator, arch-matching linux node binary, preflight, answer flags/TOML, plan/confirm, vault keyring and node_exporter steps, pending-init resume/discard, the final doctor gate and guarded handoff. First contact requires SSH on port 22; another port is refused before any remote change. The plan lists the host steps and the setup.sh access changes (admin user, wg0, firewall, SSH lockdown switchover). A pending init stores the pinned SSH host key and fingerprint; `--dns-ready` skips the confirmation prompt interactively, non-interactively and on resume. `--skip-doctor` skips the gate with a warning; a failing check returns `doctor_failed` with the failed checks and resume hint. Declining the plan (or any exit that does not apply) removes the uploaded planning bundle from the server. |
+| `server init` | Guided root first contact; Linux/macOS operator, arch-matching linux node binary, preflight, answer flags/TOML, plan/confirm, vault keyring, loopback node_exporter and telemetry endpoint prerequisites, pending-init resume/discard, the final doctor gate and guarded handoff. First contact requires SSH on port 22; another port is refused before any remote change. The plan lists the host steps and the setup.sh access changes (admin user, wg0, firewall, SSH lockdown switchover). A pending init stores the pinned SSH host key and fingerprint; `--dns-ready` skips the confirmation prompt interactively, non-interactively and on resume. `--skip-doctor` skips the gate with a warning; a failing check returns `doctor_failed` with the failed checks and resume hint. Declining the plan (or any exit that does not apply) removes the uploaded planning bundle from the server. |
 | `plan`, `apply [--dry-run]`, `doctor`, `ssh [node] [--command CMD]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. `ssh` opens a shell at a terminal or runs one command with `--command`; piped or JSON output runs without a PTY, a sudo password prompt becomes an `input_required` fault whose code and fix the runner still prints, and the remote exit status propagates. `--auto-upgrade-nodes` installs the operator's build on a mismatched node: a `dev` node accepts the caller's checksum, while a published node requires its own signed release manifest to match; `--dry-run` never installs. |
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
 | `login --file … --passphrase-file … [--replace NAME]` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle must carry the context, operator keys, admin user, WireGuard address/public key/endpoint and SSH host key. Login builds and proves the identity in a sibling temporary directory, pins the host key in a copy of known_hosts and runs the readiness check there; only then does it swap the directory and save the context. An existing context name is refused with `conflict` unless `--replace` names it exactly, and any failure leaves the old context and pinned key byte-for-byte unchanged. |
@@ -127,14 +127,17 @@ bin/eregion help app create --json
 | `rollback <app> <env> [--to ID]` | Node-mode `platform.rollback`; requires `--confirm <app>/<env>`, validated by the node and control plane against the current target (D12). There is no plan-token scheme for rollback. |
 | `build list/logs/stop/retry`, `release list`, `restart <app> <env>` | Build lifecycle over `platform_builds`; `build logs` reads (and with `--follow` streams) the build operation's events. `build get` is served by the `builds` inventory filter. `restart` reapplies the serving release through the blue/green path. |
 | `domain add/remove <app> <environment> <hostname> [--primary] [--check-path PATH] [--dns cloudflare --dns-zone ZONE (add also needs --dns-origin ADDRESS --dns-proxy dns-only\|proxied)]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized atomic Caddy writes and separate route/DNS/certificate/public observations. `add --check-path` sets the binding's optional observation path; empty defaults to the web health path. Manual DNS is the default and never calls a provider. Explicit `--dns cloudflare` plans or reconciles only the exact A/AAAA records for that hostname through a zone configured in `EREGION_CLOUDFLARE_ZONES`; the token stays in the root-owned `0640` service-group file named by `EREGION_CLOUDFLARE_TOKEN_FILE` and never enters argv, action input, River arguments, events or logs. `--dns-origin` is required on add: each value is a validated public IPv4/IPv6 origin, never the context's WireGuard management endpoint, and the explicit origins appear in the preview. `--dns-proxy` is required on add, so proxy mode is never inferred. `domain add --dry-run --json` returns the preview, desired records and a real `dns_provider` snapshot under `data`; it performs no mutation. Ownership is an immutable per-binding marker derived from the domain ID, so re-creation cannot adopt a previous record; foreign records, including legacy `eregion:managed`, fail closed and are never adopted. `remove` takes `--confirm <hostname>`, refuses the primary, and removes exact-owned records using the persisted ledger; an unmanaged binding with no ledger has no provider record to clean. Admission and worker execution are serialized; a delayed removal revalidates the newest domain intent and binding identity under the target lock, and the ledger's last-operation fence prevents a later readd, promotion or file update from being deleted. Ownership is re-read immediately before each mutation; Cloudflare's lack of CAS leaves a visible final external-writer race. App/environment deletion marks managed ledgers cleanup-pending and verifies exact provider cleanup before removing serving workload containers or deleting domain/platform rows; a provider failure or ownership conflict refuses deletion and keeps the app, workloads, records, ledger and credentials retryable. This is intentionally not presented as one atomic transaction or an availability guarantee: after provider cleanup succeeds, a node-step failure or cancellation can leave DNS removed with the ledger retained and some serving workloads still present, while a later route-write failure can leave the environment rows retryable after DNS and the workloads are already gone. The ledger and operation events state which effects completed, and retry resumes the idempotent deletion without falsely claiming completion. Provider state is not public readiness. Migration 025 persists provider mode/zone/origins/proxy and cleanup state; primary cleanup is usable through environment/application deletion. |
-| `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secret export` carries the code in the same node request that returns the value (`vault.export`); there is no separate pre-check request to skip. `secrets export` rebuilds the server-init handoff (including the vault keyring) and honours `--secrets-out`. |
+| `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secret export` carries the code in the same node request that returns the value (`vault.export`); there is no separate pre-check request to skip. `secrets export` rebuilds the server-init handoff (including the vault keyring and the local telemetry credential when present) and honours `--secrets-out`; a missing telemetry credential is reported as a warning, never invented. |
 | `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
 | `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry service is needed. Ctrl-C detaches. `--json` without `--follow` returns one envelope; NDJSON requires `--output ndjson`, and `--json --follow` is a usage error that names that fix. |
-| `metrics show` | Read-only node RPC (`metrics.show`) executed on the node: two bounded reads of the WireGuard-bound node_exporter with a one-second gap, then one current snapshot. Returns node/exporter identity, fetched and observed timestamps, freshness and explicit issues; CPU utilization is computed from a checked counter delta (nil and an issue after a reset or missing counter), and memory, real filesystems, load and uptime are parsed from the needed metric families. There is no eregion-run telemetry server, Prometheus/Loki deployment, external backend, global PromQL, metric store or history; an external scraper can read the same exporter only over WireGuard using the documented static example. Plain and JSON are the same snapshot; JSON/no-TTY never prompts. It needs no control database and no credential because the exporter is reachable only on `wg0`. |
+| `metrics show` | Read-only node RPC (`metrics.show`) executed on the node: two bounded reads of the loopback node_exporter with a one-second gap, then one current snapshot. Returns node/exporter identity, fetched and observed timestamps, freshness and explicit issues; CPU utilization is computed from a checked counter delta (nil and an issue after a reset or missing counter), and memory, real filesystems, load and uptime are parsed from the needed metric families. There is no eregion-run telemetry server, Prometheus/Loki deployment, external backend, global PromQL, metric store or history. Plain and JSON are the same snapshot; JSON/no-TTY never prompts. It needs no control database and no credential because the exporter is loopback-only. |
+| `metrics endpoint` | Read-only node RPC (`metrics.endpoint`): the WireGuard-only authenticated endpoint's listen address, `/node` and `/targets.json` URLs, basic-auth username, whether the telemetry Caddyfile is configured, and whether this machine holds a local credential. It never prints a password or hash and is independent of PostgreSQL. |
+| `metrics config` | Generates Prometheus and Grafana Alloy scrape configs that follow the endpoint's HTTP service discovery and use basic auth. Ordinary output (including JSON) always uses a password placeholder. `--format prometheus|alloy|targets --out FILE` writes one new owner-only file with the real credential when one is held locally; the file is never echoed. Targets output carries no secret and is also valid `file_sd`. |
+| `metrics rotate --confirm <node>/metrics` | Generates a 256-bit password, saves it owner-only in the context before the RPC, and sends only its bcrypt hash. Under a node-local telemetry lock the node renders and validates the dedicated WireGuard-only Caddyfile, restarts only `eregion-telemetry.service`, and restores the previous Caddyfile on failure. Public Caddy and its route writer are never touched. A failed RPC restores the previous local credential. There is no generation compare-and-swap, pending file or recovery journal; a lost successful response can leave the local password stale until the next rotation. No password or hash appears in plain/JSON output, logs, events or journals. |
 | `ui` | Full-screen workspace over the same inventory and node-mode action service. Fleet details show one current node_exporter CPU sample plus current memory, filesystem, load and uptime facts through `metrics.show`; no history or request graph is invented. |
 | `operations list/get/follow/cancel` | Over node RPC the SSH-authenticated operator has server authority: an unfiltered list shows every operation on the node newest first (bounded by `--limit`), and snapshot/follow/cancel may open any operation, including CI tokens, the GitHub webhook and other operators' submissions. `--app`/`--environment` select the platform target and include the environment's `build/<id>` operations. State and limit filters apply. The public HTTP API remains strictly actor- and grant-scoped. |
-| `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. |
+| `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. The telemetry endpoint is a dedicated Caddy unit, not an eregion node service. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
 All of MASTER section 5's app, environment, deployment and observation surface
@@ -148,13 +151,14 @@ The Docker Compose telemetry stack install is deleted (D5); the local textfile
 directory and narrow systemd collector are node_exporter unit arguments, not a
 telemetry stack. `dns …`,
 `access …`, `platform …` and `operations test` are no longer registered
-(D6, D19, D22, D26); `metrics show` is registered as the node-local read
+(D6, D19, D22, D26); `metrics show`, `metrics endpoint`, `metrics config` and
+`metrics rotate` are registered as the node-local read/config primitives
 described above. The DNS/access internal packages remain for the after-v1
-phases where the work list says they return. `bootstrap …`, `serve`, `worker` and
-`system migrate` are not operator commands; they live under the hidden Linux-only
-`node` group (`node rpc`, `node unlock-ssh`, `node serve`, `node worker`,
-`node migrate`, `node bootstrap …`) and `commands --json` lists only the section
-5 tree plus `help`.
+phases where the work list says they return. `bootstrap …`, `serve`, `worker`
+and `system migrate` are not operator commands; they live under the hidden
+Linux-only `node` group (`node rpc`, `node unlock-ssh`, `node serve`,
+`node worker`, `node migrate`, `node bootstrap …`) and `commands --json` lists
+only the section 5 tree plus `help`.
 
 ## Human presentation and waiting
 
@@ -198,22 +202,23 @@ factor-gated delete, refuses instead of asking.
 `metrics show` is a node-mode read over the normal operator channel: the CLI
 calls `metrics.show` in `eregion node rpc`, which runs on the node as root and
 does not open PostgreSQL. The node side reads
-`http://10.78.0.1:9100/metrics` (the only node_exporter listener) twice, one
-second apart, with an HTTP client that ignores ambient proxies and does not
-follow redirects, a five-second request timeout and a 4 MiB body bound. The
-parser keeps only the families it needs and returns one
-`eregion/node-metrics/v1` snapshot; the samples are not written anywhere.
+`http://127.0.0.1:9100/metrics` twice, one second apart, with an HTTP client
+that ignores ambient proxies and does not follow redirects, a five-second
+request timeout and a 4 MiB body bound. The parser keeps only the families it
+needs and returns one `eregion/node-metrics/v1` snapshot; the samples are not
+written anywhere. node_exporter has no WireGuard or public listener.
 
 The snapshot carries the logical node name from `node.json` when readable, the
 exporter's uname identity and build version, `fetched_at` recorded after the
 second response completes, the second scrape's `node_time_seconds` as
 `observed_at`, freshness (`fresh`, `stale` or `unknown` against a 30-second
-threshold) and a `scrape` object naming the WireGuard HTTP endpoint,
-`access: wireguard`, `public: false`, no authentication and the operator-RPC
+threshold) and a `scrape` object naming the loopback HTTP endpoint,
+`access: loopback`, `public: false`, no authentication and the operator-RPC
 collection mode. A missing second timestamp stays unknown; it never borrows the
 first scrape. A materially future exporter timestamp is also unknown and its
-future `observed_at` is not exposed as current. The snapshot never claims a
-public endpoint or an independent unattended scraper.
+future `observed_at` is not exposed as current. External scrapers use the
+separate authenticated endpoint below; `metrics show` never claims that
+endpoint is being scraped.
 
 CPU utilization is `(1 - idle_delta/total_delta) * 100` over the reported CPU
 mode counters. The pinned node_exporter v1.11.1 emits the eight modes `user`,
@@ -225,18 +230,17 @@ because Linux counts that time inside user/nice. A missing counter family, a
 changed counter set, a counter reset, a missing any of the expected eight Linux
 modes for any observed CPU, a non-positive total delta, a missing idle delta or
 inconsistent movement returns `cpu: null` plus an issue; it is never a
-fabricated zero. Memory uses
-`MemTotal`/`MemAvailable`; a missing or inconsistent pair is null plus an issue.
-Filesystems pair `node_filesystem_size_bytes` with
-`node_filesystem_avail_bytes` and omit pseudo/tmpfs/overlay/Docker mounts.
-Load requires all three `node_load*` values, and uptime uses
-`node_time_seconds - node_boot_time_seconds`. Unavailable values stay null and
-are named under `issues`; the human form prints the reason. An unparseable,
-timestamped, duplicated or otherwise invalid sample for any consumed family is
-a hard `unavailable` refusal; valid label whitespace and one trailing comma are
-accepted, and unknown unrelated lines are ignored. Exporter label values are
-stripped of control and format characters before they can reach terminal
-output.
+fabricated zero. Memory uses `MemTotal`/`MemAvailable`; a missing or
+inconsistent pair is null plus an issue. Filesystems pair
+`node_filesystem_size_bytes` with `node_filesystem_avail_bytes` and omit
+pseudo/tmpfs/overlay/Docker mounts. Load requires all three `node_load*` values,
+and uptime uses `node_time_seconds - node_boot_time_seconds`. Unavailable
+values stay null and are named under `issues`; the human form prints the reason.
+An unparseable, timestamped, duplicated or otherwise invalid sample for any
+consumed family is a hard `unavailable` refusal; valid label whitespace and one
+trailing comma are accepted, and unknown unrelated lines are ignored. Exporter
+label values are stripped of control and format characters before they can
+reach terminal output.
 
 Plain and JSON render the same snapshot. The command has no prompt, dry-run,
 confirmation or mutation path. The workspace Fleet detail reuses the same node
@@ -247,69 +251,150 @@ unknown exporter time with collection time, adds monotonic local elapsed time to
 the node-computed age against the node threshold, re-queries metrics on a
 focused-detail refresh, fences an older response behind the latest query
 generation, and refuses a query for a different node instead of relabeling the
-snapshot. `ServiceUnits` includes
-`node-exporter.service` for the main role, so `server status` displays it.
-`host-node-exporter-v2` additionally creates
-`/var/lib/node_exporter` and `/var/lib/node_exporter/textfile` (both root:root
-0755 real directories; a symlink or non-directory is refused rather than
-followed), enables node_exporter's textfile collector and a narrow systemd
-collector include for eregion, Caddy, Docker, node_exporter and `wg-quick@wg0`
-service/timer units. Apply refuses an unsafe/non-root-owned or group/other-
-writable existing parent before any mutation, rather than repairing an
-attacker-controlled path. Setuid/setgid/sticky bits are preserved in the
-observation; the strict check rejects them, and a safe root-owned non-writable
-path with those bits is repaired with `chmod 0755` followed by an explicit
-`chmod u-s,g-s,o-t`, because numeric chmod can preserve setgid on a directory.
-Apply then verifies the exact `0755` mode and fails closed otherwise. No
-eregion self-metric is written today: the textfile directory and collector are
-foundations, and a
-metric family must come from a real producer rather than a synthetic line. The
-`telemetry.local` doctor check
-uses the same strict parent+child validator and reads one bounded exporter
-response; it requires successful `textfile` and `systemd` collector families
-with unambiguous success samples, and exactly one unlabelled
-`node_textfile_scrape_error` sample with value zero. Collector success alone does
-not detect a malformed or unreadable `.prom`; a missing, duplicated, malformed,
-labelled, timestamped or non-zero scrape error fails, and duplicate/timestamped
-collector success is ambiguous fail-closed. WireGuard down leaves collector
-health unobserved as **warn**, not pass, while an independent directory
-configuration error still fails. It does not store a sample or replace the
-`metrics show` snapshot.
+snapshot. `ServiceUnits` includes `node-exporter.service` and `caddy.service` for
+the main role, so `server status` displays both; the dedicated telemetry unit
+is checked by `telemetry.endpoint`, not the shared service list.
 
-A host with a WireGuard route to the node can scrape the exporter read-only with
-Prometheus:
+### Authenticated endpoint, discovery and configuration
+
+Eregion adapts vaire's nginx metrics endpoint to a **dedicated Caddy instance**,
+separate from the public ingress Caddy. `host-telemetry-v1` ensures
+`/etc/eregion-telemetry/targets.json` (`root:caddy 0640`, no secret), the
+`eregion-telemetry.service` unit and the WireGuard-only firewall rule. The
+Caddyfile is `/etc/eregion-telemetry/Caddyfile`, written by `metrics rotate`,
+not by `apply`. The unit uses isolated `XDG_CONFIG_HOME`/`XDG_DATA_HOME` and
+`StateDirectory`, `admin off`, and its own Caddyfile; public `caddy.service`,
+`/etc/caddy/Caddyfile` and `/etc/caddy/eregion.d/*.caddy` are never touched by
+telemetry. A missing wg0 or a bad telemetry config cannot stop public ingress.
+
+The unit runs the pinned Caddy binary as `caddy`, waits for
+`network-online.target` and `wg-quick@wg0.service`, and requires the telemetry
+Caddyfile before starting. It is `BindsTo=wg-quick@wg0.service` and
+`WantedBy=multi-user.target wg-quick@wg0.service`, so a later wg start or
+restart also triggers telemetry; it is not skipped permanently when wg0 is
+absent at boot. The telemetry Caddyfile uses an explicit `bind 10.78.0.1`; the
+site address alone is only a Host matcher. The site listens only on the node's
+WireGuard address at `10.78.0.1:9101`; port 9101 is opened only on `wg0`, a
+failing ufw rule fails apply instead of being swallowed, and Check compares
+`ufw show added` against the exact rule so drift is repaired. If ufw is
+unavailable, Check records the firewall as unobserved rather than failing the
+step. It serves exactly two basic-auth paths:
+
+- `/node` reverse-proxies `http://127.0.0.1:9100/metrics` and strips the
+  scraper's `Authorization` and `Cookie` headers before the loopback request;
+- `/targets.json` serves the node's HTTP service-discovery document, one target
+  with `__metrics_path__: /node`, `__scheme__: http`, `eregion_node`,
+  `eregion_component: node`, `eregion_access: wireguard` and
+  `eregion_public: false`.
+
+The telemetry Caddyfile (`root:caddy 0640`) carries only the basic-auth username
+and a bcrypt hash, never the password. There is no TLS terminator because
+WireGuard already encrypts the transport; there is no public listener. Caddy's
+own request handling and timeouts apply; there is no custom endpoint process,
+connection limiter or rate-limit table.
+
+`metrics endpoint` reads the non-secret endpoint description through
+`metrics.endpoint`: listen address, URLs, access, basic-auth username, whether
+the telemetry Caddyfile exists, and whether this machine holds a local
+credential. `metrics config` generates a Prometheus `http_sd_configs` snippet
+and the equivalent Alloy `discovery.http` plus `prometheus.scrape` snippet.
+Ordinary output, including `--json`, always uses `<metrics-password>`.
+`--format prometheus|alloy|targets --out FILE` writes one new owner-only file
+(`0600`) with the real credential when the format needs one; it fails without a
+local credential. The targets file contains no secret and is also usable as
+Prometheus `file_sd`.
+
+The control-plane ingress step installs the pinned Caddy package even without a
+public hostname. It checks the actual `/usr/bin/caddy` path for the pinned
+version and the `caddy:caddy` account, so a matching manual binary elsewhere on
+`PATH` cannot satisfy the prerequisite. Before installation it inspects
+`/etc/caddy/Caddyfile` and `caddy.service`/`caddy-api.service`; any existing
+config or enabled/active Caddy service is unmanaged and the step refuses rather
+than overwriting or stopping it. On a fresh host it installs the pinned package,
+ensures the account, removes only the package-created default Caddyfile and
+disables only a package-started service, leaving no public site. A hostname adds
+the existing public API/ACME site.
+
+`metrics rotate --confirm <node>/metrics` follows vaire's rotate path. It
+generates a 256-bit password, saves it owner-only in the operator context before
+the RPC, and sends only the bcrypt hash. Under a node-local telemetry lock the
+node renders the telemetry Caddyfile, validates it with `caddy validate`,
+restarts only `eregion-telemetry.service`, and restores the previous Caddyfile
+if validation or restart fails. The public route writer's PostgreSQL advisory
+lock and public Caddy reload are not involved. If the RPC fails, the CLI
+restores the previous local credential (or removes the first credential it
+generated). Rotation never prints the password; it warns that scrapers must be
+updated and that `secrets export` is stale. There is no generation
+compare-and-swap, pending file or recovery journal, so a lost successful
+response can leave the local password stale until the next rotation. `server
+init` generates or reuses the credential and performs the same rotate before
+its doctor gate; the protected handoff and `login` carry username and password
+only. `secrets export` includes the local credential when present and reports a
+missing one as an explicit omission. A node upgraded from the older layout has
+no telemetry Caddyfile until `metrics rotate` is run or a fresh handoff is
+imported; `doctor` reports that as a warning.
+
+`host-node-exporter-v2` creates `/var/lib/node_exporter` and
+`/var/lib/node_exporter/textfile` (both root:root 0755 real directories; a
+symlink or non-directory is refused rather than followed), enables
+node_exporter's textfile collector and a narrow systemd collector include for
+eregion, Caddy, Docker, node_exporter and `wg-quick@wg0` service/timer units.
+Apply refuses an unsafe/non-root-owned or group/other-writable existing parent
+before any mutation, rather than repairing an attacker-controlled path.
+Setuid/setgid/sticky bits are preserved in the observation; the strict check
+rejects them, and a safe root-owned non-writable path with those bits is
+repaired with `chmod 0755` followed by an explicit `chmod u-s,g-s,o-t`, because
+numeric chmod can preserve setgid on a directory. Apply then verifies the exact
+`0755` mode and fails closed otherwise. The exporter unit is loopback-only and
+has no `wg-quick@wg0.service` `Wants`/`After` dependency; startup no longer
+waits for WireGuard. The access setup opens 9101 on `wg0` and restarts only
+`eregion-telemetry.service` after WireGuard comes up.
+
+The textfile directory is a foundation, not a metrics source. No eregion
+self-metric is written without a real producer.
+
+The `telemetry.local` doctor check uses the same strict parent+child validator
+and reads one bounded loopback exporter response; it requires successful
+`textfile` and `systemd` collector families with unambiguous success samples,
+and exactly one unlabelled `node_textfile_scrape_error` sample with value zero.
+Collector success alone does not detect a malformed or unreadable `.prom`; a
+missing, duplicated, malformed, labelled, timestamped or non-zero scrape error
+fails, and duplicate/timestamped collector success is ambiguous fail-closed.
+The separate `telemetry.endpoint` check probes `/targets.json` without a
+credential: a healthy endpoint answers 401, an unauthenticated 200 fails, a
+node without the telemetry Caddyfile warns, and WireGuard down leaves the
+endpoint unobserved as warn while a strict directory error still fails.
+
+### Scrape examples
+
+A host with a WireGuard route to the node can ask `eregion metrics config` for
+the current snippets. The generated Prometheus form is:
 
 ```yaml
 scrape_configs:
-  - job_name: eregion-node
-    metrics_path: /metrics
-    static_configs:
-      - targets: ["10.78.0.1:9100"]
+  - job_name: eregion-main
+    scheme: http
+    basic_auth:
+      username: metrics
+      password: <metrics-password>
+    http_sd_configs:
+      - url: http://10.78.0.1:9101/targets.json
+        refresh_interval: 5m
+        basic_auth:
+          username: metrics
+          password: <metrics-password>
 ```
 
-or Grafana Alloy:
+Grafana Alloy uses `discovery.http "eregion_main"` and
+`prometheus.scrape "eregion_main"` with the same discovery URL and basic auth.
+`metrics config --format prometheus|alloy --out FILE` replaces the placeholder
+with the local credential and writes an owner-only file. The examples assume a
+`prometheus.remote_write.default` receiver for Alloy. The endpoint is not
+installed or managed by Prometheus/Grafana and has no public listener.
 
-```hcl
-prometheus.scrape "eregion_node" {
-  targets    = [{"__address__" = "10.78.0.1:9100"}]
-  forward_to = [prometheus.remote_write.default.receiver]
-}
-```
-
-The example has no public endpoint, TLS terminator, basic-auth credential or
-discovery service; it is not installed or managed by eregion. The Alloy fragment
-assumes a `prometheus.remote_write.default` receiver. WireGuard peer routing and
-firewall access are operator prerequisites. A future optional separate telemetry
-node or Grafana is not prohibited long-term, but is out of beta/v1 scope.
-
-This is intentionally **not** full vaire exporter parity. Missing today:
-the authenticated external `/metrics` endpoint and password file, `targets.json`
-service discovery for Prometheus `http_sd`/Alloy `discovery.http`, credential
-rotation, an exporter slice/memory budget, postgres/pgbouncer exporters,
-central aggregation/alerting and any metric/log store or retained history.
-Textfile/collector/doctor tests use text and HTTP fixtures; no Docker, database
-or real server is needed. Host step application, a real exporter restart, the
-systemd collector over D-Bus and a real scrape remain manual acceptance.
+A future optional separate telemetry node or Grafana is not prohibited
+long-term, but is out of beta/v1 scope. A future central scraper must be a
+WireGuard peer; adding one would need topology, retention and access decisions.
 
 ## Release and local upgrade
 
@@ -873,35 +958,45 @@ at `/usr/local/bin/eregion`. The main role also gets
 the control-plane account) and
 `/etc/eregion/vault-keyring.json` (0600, owned by the control-plane account and
 named by `EREGION_VAULT_KEY_FILE` in `control-plane.env`) and node_exporter
-1.11.1 with a pinned sha256 per architecture, listening only on
-`10.78.0.1:9100`; `host-node-exporter-v2` also creates
+1.11.1 with a pinned sha256 per architecture, listening only on loopback
+`127.0.0.1:9100`; `host-node-exporter-v2` also creates
 `/var/lib/node_exporter` and `/var/lib/node_exporter/textfile` (both root:root
 0755 real directories, no symlinks), enables the textfile collector
 and the narrow systemd collector set
-`(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)`. The
-access setup allows 9100 on `wg0` and starts the unit once `wg0` exists.
-`node-exporter.service` is part of the main role's service readiness, so
-`server status` and `doctor` show its active state. `telemetry.local` also reads
-the exporter endpoint and fails when the strict textfile directory is absent/
-wrong, either collector is missing/failed, or `node_textfile_scrape_error` is
-missing, ambiguous or non-zero; a down WireGuard interface is warn/unobserved,
-not pass. It does not store samples. `internal/access`
-remains the hardening/WireGuard/commit-confirm lockdown implementation.
+`(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)`.
+`host-telemetry-v1` ensures `/etc/eregion-telemetry/targets.json`, the dedicated
+`eregion-telemetry.service` unit and the WireGuard-only firewall rule; `metrics
+rotate` writes the rotation-owned telemetry Caddyfile and restarts only that
+unit. The dedicated Caddy instance listens on `10.78.0.1:9101` with basic auth,
+`/node` and `/targets.json`; public Caddy is untouched. The access setup allows
+9101 on `wg0` only and restarts `eregion-telemetry.service` after WireGuard
+comes up. `node-exporter.service` and `caddy.service` are part of the main
+role's service readiness, so `server status` and `doctor` show their active
+state; the telemetry instance is checked by `telemetry.endpoint`.
+`telemetry.local` also reads the loopback exporter and fails when the strict
+textfile directory is absent/wrong, either collector is missing/failed, or
+`node_textfile_scrape_error` is missing, ambiguous or non-zero.
+`telemetry.endpoint` independently requires 401 without a credential, fails an
+unauthenticated 200 and warns until rotation configures the telemetry Caddyfile. Neither
+check stores samples. `internal/access` remains the
+hardening/WireGuard/commit-confirm lockdown implementation.
 
 After lockdown the CLI pins the WireGuard host key, saves the token-free context,
-and calls node RPC `ready`. It then checks node_exporter over the tunnel, asks the
-public resolvers once, waits for Caddy's certificate, and runs the doctor gate
-(`host.doctor` with `init: true`). Init mode carries an `AtInit` filter for checks
-that cannot pass before the first handoff; no current doctor check is excluded,
-and a pending certificate for the main hostname stays a warning. Any remaining
-`fail` stops init with `doctor_failed`, the failing checks and their fixes, and
-the resume instruction. `--skip-doctor` skips the gate and
-leaves a warning in the result. Only then does init build the handoff: every
-server secret in plain text (operator keys, sudo password, DSN, vault keyring)
-plus an armored age transfer bundle with a generated passphrase and break-glass
-instructions. A terminal waits for `stored`; JSON/no-TTY requires `--secrets-out`
-before any change and writes the whole record to a new 0600 file. No API token is
-in the handoff.
+generates the operator-side telemetry credential (or reuses the one already in
+the context), sends only its bcrypt hash to `metrics.rotate`, and calls node RPC
+`ready`. It then checks the authenticated telemetry endpoint over the tunnel,
+asks the public resolvers once, waits for Caddy's certificate, and runs the
+doctor gate (`host.doctor` with `init: true`). Init mode carries an `AtInit`
+filter for checks that cannot pass before the first handoff; no current doctor
+check is excluded, and a pending certificate for the main hostname stays a
+warning. Any remaining `fail` stops init with `doctor_failed`, the failing
+checks and their fixes, and the resume instruction. `--skip-doctor` skips the
+gate and leaves a warning in the result. Only then does init build the handoff:
+every server secret in plain text (operator keys, sudo password, DSN, vault
+keyring, telemetry credential) plus an armored age transfer bundle with a
+generated passphrase and break-glass instructions. A terminal waits for
+`stored`; JSON/no-TTY requires `--secrets-out` before any change and writes the
+whole record to a new 0600 file. No API token is in the handoff.
 
 The unfinished init is saved locally under the context store directory:
 `pending/<server>/init.json` (answers, learned facts, completed phases),
@@ -1012,10 +1107,13 @@ window.
 | `/var/lib/eregion/bootstrap/` | Pre-database state/journal, protected cached credentials, uploaded bundles, commit-confirm snapshots, the recorded host intent (`intent.json`) and owner-only copies of its TLS/key inputs (`inputs/`). |
 | `/var/lib/eregion/node/` | Node journal, per-effect records/locks, detached-task logs and identity. |
 | `/var/lib/eregion/access/` | Operator-access snapshot and lockdown state; separate from bootstrap commit-confirm. |
-| `/etc/caddy/Caddyfile` | Bootstrap-owned main hostname config, importing routes. |
+| `/etc/caddy/Caddyfile` | Bootstrap-owned main hostname config, importing routes, when a public hostname is configured. Absent on a hostname-less control plane; existing unmanaged config/service is refused rather than overwritten. |
 | `/etc/caddy/eregion.d/routes.caddy` | Worker-owned generated app host routes. |
-| `/usr/local/bin/node_exporter`, `/etc/systemd/system/node-exporter.service` | Pinned exporter and its unit, bound to the WireGuard address only; `host-node-exporter-v2` enables the textfile collector at `/var/lib/node_exporter/textfile` and the narrow systemd collector set. The access setup opens 9100 on `wg0`. |
-| `/var/lib/node_exporter/`, `/var/lib/node_exporter/textfile/` | Root:root `0755` real directories (no symlinks) read by node_exporter's textfile collector. Apply refuses to follow or mutate a symlink/non-directory; no eregion self-metrics are written until a real producer exists. |
+| `/etc/eregion-telemetry/Caddyfile` | Rotation-owned basic-auth Caddyfile for the dedicated telemetry instance (`10.78.0.1:9101`), `/targets.json` HTTP discovery and `/node` loopback proxy. It carries the bcrypt hash, never the password; apply never overwrites it. |
+| `/etc/systemd/system/eregion-telemetry.service` | Dedicated Caddy instance for telemetry. `host-telemetry-v1` writes it; it waits for `wg0` and the Caddyfile, and is independent of public `caddy.service` and its route reload. |
+| `/usr/local/bin/node_exporter`, `/etc/systemd/system/node-exporter.service` | Pinned exporter and its unit, bound to loopback only; `host-node-exporter-v2` enables the textfile collector at `/var/lib/node_exporter/textfile` and the narrow systemd collector set. No WireGuard or public port is opened for the exporter. |
+| `/etc/eregion-telemetry/targets.json` | Root:caddy `0640` HTTP service-discovery document (no secret). `host-telemetry-v1` writes it; the access setup opens 9101 on `wg0` only. |
+| `/var/lib/node_exporter/`, `/var/lib/node_exporter/textfile/` | Root:root `0755` real directories (no symlinks) read by node_exporter's textfile collector. Apply refuses to follow or mutate a symlink/non-directory; no eregion self-metric is written without a real producer. |
 | OS config dir + `/eregion/contexts.json` | Owner-only context store (SSH/WireGuard route and `auto_upgrade_nodes`); overridden by `EREGION_CONTEXT_FILE`. No API token. |
 | Context store's parent + `/servers/<context>/` | Operator SSH key, WireGuard key and sudo password files. |
 | Context store's parent + `/pending/<server>/` | Unfinished `server init`: answers, phases, pinned host keys and the captured vault keyring (0700 directory, 0600 files). |

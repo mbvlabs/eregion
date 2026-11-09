@@ -239,8 +239,8 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 
 // planRows adds the access changes to the host steps. The admin user, wg0,
 // firewall and SSH lockdown switchover are applied by setup.sh, not by a host
-// bootstrap step, so the plan names them explicitly. node_exporter is already
-// a host step; add it only when a plan does not carry it.
+// bootstrap step, so the plan names them explicitly. The exporter and endpoint
+// are host steps; add fallback rows only when a plan does not carry them.
 func (r *serverInit) planRows(plan host.Plan) []host.PlanEntry {
 	rows := append([]host.PlanEntry(nil), plan.Steps...)
 	rows = append(rows,
@@ -249,12 +249,23 @@ func (r *serverInit) planRows(plan host.Plan) []host.PlanEntry {
 		host.PlanEntry{ID: "access-firewall", Description: "Enable ufw: deny incoming, allow WireGuard, HTTP, HTTPS and SSH on wg0"},
 		host.PlanEntry{ID: "access-lockdown", Description: "Switch SSH to " + r.answers.AdminUser + " over WireGuard and close public SSH (reverted unless confirmed)"},
 	)
+	lower := func(row host.PlanEntry) string { return strings.ToLower(row.Description) }
+	hasExporter, hasTelemetry := false, false
 	for _, row := range rows {
-		if strings.Contains(strings.ToLower(row.Description), "node_exporter") {
-			return rows
+		if strings.Contains(lower(row), "node_exporter") {
+			hasExporter = true
+		}
+		if strings.Contains(lower(row), "telemetry endpoint") {
+			hasTelemetry = true
 		}
 	}
-	return append(rows, host.PlanEntry{ID: "access-node-exporter", Description: "Install node_exporter on the WireGuard address"})
+	if !hasExporter {
+		rows = append(rows, host.PlanEntry{ID: "access-node-exporter", Description: "Install node_exporter on loopback"})
+	}
+	if !hasTelemetry {
+		rows = append(rows, host.PlanEntry{ID: "access-telemetry", Description: "Install the authenticated telemetry endpoint prerequisites on the WireGuard address"})
+	}
+	return rows
 }
 
 func runWithRetry(ctx context.Context, route *host.ContextSSH, command string, within time.Duration) error {
