@@ -49,6 +49,22 @@ closed.
 
 ## Release safety guards
 
+### Linear branch promotion
+
+Squash feature PRs into `master`. For a release, review the exact candidate and
+wait for its checks, then advance `1.x` to that same commit with a normal
+fast-forward push before tagging it. Verify that the current `1.x` tip is an
+ancestor of the candidate; if not, stop for explicit resolution.
+
+Do not create a second squashed release commit or merge the release branch back
+into `master`. Both branches share the released commit, and later development
+continues on `master`. Tags never move. The tagged workflow's existing major-line
+ancestry check supports this model without changing signing or artifact paths.
+The operator-approved November 2026 history cleanup was a one-time guarded
+`master` realignment, not an automatic force-push release step.
+
+### Artifact and channel guards
+
 These do not change the manifest schema or make alpha.2 artifacts invalid:
 
 - `build-release.sh` accepts `snapshot` only for alpha/beta and creates no
