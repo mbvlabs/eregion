@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -82,19 +81,13 @@ func TestIntegrationManagedDNSLedgerPersistsAndCleansUp(t *testing.T) {
 	fixture := &domainDNSLedgerFixture{records: map[string]integrations.DNSRecord{}}
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
-	if err := os.WriteFile(tokenPath, []byte("ledger-token-0123456789\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	authz, err := integrations.NewStaticAuthorizer(map[string][]string{testActor.Subject: {"*"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDNSStore(integrations.DNSZone{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com"}).withToken("0123456789abcdef0123456789abcdef", "ledger-token-0123456789")
+	domainActor := contract.Actor{Kind: "operator", Subject: testActor.Subject}
 	domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-		Zones:      []integrations.DNSZone{{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com", TokenFile: tokenPath}},
+		Zones: store, Credentials: store,
 		BaseURL:    server.URL + "/client/v4",
 		HTTPClient: server.Client(),
-		Authorizer: authz,
+		Authorizer: integrations.NewOperatorDNSAuthorizer(),
 		Audit:      integrations.NewMemoryAudit(),
 	})
 	if err != nil {
@@ -109,27 +102,23 @@ func TestIntegrationManagedDNSLedgerPersistsAndCleansUp(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, envCreateOp.ID); err != nil {
 		t.Fatal(err)
 	}
-	readAuthz, err := integrations.NewStaticAuthorizer(map[string][]string{testActor.Subject: {integrations.ActionDNSRead}})
-	if err != nil {
-		t.Fatal(err)
-	}
 	readOnly, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-		Zones:   []integrations.DNSZone{{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com", TokenFile: tokenPath}},
+		Zones: store, Credentials: store,
 		BaseURL: server.URL + "/client/v4", HTTPClient: server.Client(),
-		Authorizer: readAuthz, Audit: integrations.NewMemoryAudit(),
+		Authorizer: integrations.NewOperatorDNSAuthorizer(), Audit: integrations.NewMemoryAudit(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.domainDNS = readOnly
 	proxied := true
-	if _, err := s.Submit(ctx, platformSubmission(platform.KindDomainAdd, "env/ledger/test", "ledger-outside-zone", map[string]any{
+	if _, err := s.Submit(ctx, platformSubmissionAs(domainActor, platform.KindDomainAdd, "env/ledger/test", "ledger-outside-zone", map[string]any{
 		"domain": "app.other.example", "dns_mode": "cloudflare",
 		"dns_zone": "example.com", "dns_origins": []string{"8.8.8.8"}, "dns_proxied": proxied,
 	})); contract.Classify(err).Code != contract.ValidationFailed {
 		t.Fatalf("outside-zone managed DNS admission = %v", err)
 	}
-	if _, err := s.Submit(ctx, platformSubmission(platform.KindDomainAdd, "env/ledger/test", "ledger-denied", map[string]any{
+	if _, err := s.Submit(ctx, platformSubmissionAs(contract.Actor{Kind: "ci", Subject: domainActor.Subject}, platform.KindDomainAdd, "env/ledger/test", "ledger-denied", map[string]any{
 		"domain": "app.example.com", "dns_mode": "cloudflare",
 		"dns_zone": "example.com", "dns_origins": []string{"8.8.8.8"}, "dns_proxied": proxied,
 	})); contract.Classify(err).Code != contract.Forbidden {
@@ -146,7 +135,7 @@ func TestIntegrationManagedDNSLedgerPersistsAndCleansUp(t *testing.T) {
 		t.Fatalf("unauthorized admission left durable state: operations=%d ledgers=%d", deniedOps, deniedLedgers)
 	}
 	s.domainDNS = domainDNS
-	addOp := platformSubmit(t, s, platform.KindDomainAdd, "env/ledger/test", "ledger-add", map[string]any{
+	addOp := platformSubmitAs(t, s, domainActor, platform.KindDomainAdd, "env/ledger/test", "ledger-add", map[string]any{
 		"domain": "app.example.com", "dns_mode": "cloudflare",
 		"dns_zone": "example.com", "dns_origins": []string{"8.8.8.8"}, "dns_proxied": proxied,
 	})
@@ -181,7 +170,7 @@ func TestIntegrationManagedDNSLedgerPersistsAndCleansUp(t *testing.T) {
         WHERE a.name='ledger' AND e.name='test'`).Scan(&envID); err != nil {
 		t.Fatal(err)
 	}
-	deleteOp := platformSubmit(t, s, platform.KindEnvironmentDelete, "env/ledger/test", "ledger-delete", map[string]any{
+	deleteOp := platformSubmitAs(t, s, domainActor, platform.KindEnvironmentDelete, "env/ledger/test", "ledger-delete", map[string]any{
 		"confirm": "ledger/test",
 	})
 	ledger, err := s.loadDomainDNSLedger(ctx, "ledger", "test", "app.example.com")

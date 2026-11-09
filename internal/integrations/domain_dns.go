@@ -23,18 +23,22 @@ const (
 
 // DomainDNSConfig wires the domain-scoped Cloudflare flow. Unlike the generic
 // zone reconciler, this flow reads and writes only the named hostname and only
-// records whose comment is this binding's exact ownership identity.
+// records whose comment is this binding's exact ownership identity. Zones and
+// credentials are resolved from PostgreSQL on every operation; there is no
+// environment or file configuration.
 type DomainDNSConfig struct {
-	Zones      []DNSZone
-	BaseURL    string
-	HTTPClient *http.Client
-	Authorizer Authorizer
-	Audit      AuditSink
-	Now        func() time.Time
+	Zones       DNSZoneSource
+	Credentials DNSCredentialSource
+	BaseURL     string
+	HTTPClient  *http.Client
+	Authorizer  Authorizer
+	Audit       AuditSink
+	Now         func() time.Time
 }
 
 type DomainDNS struct {
-	zones  []DNSZone
+	zones  DNSZoneSource
+	creds  DNSCredentialSource
 	base   string
 	client *http.Client
 	authz  Authorizer
@@ -44,7 +48,7 @@ type DomainDNS struct {
 
 // DomainDNSRequest is one explicit operator request for a durable binding.
 // The zone, immutable domain ID and exact ownership marker come from the
-// binding ledger; the token file stays in server configuration and never
+// binding ledger; the credential stays in encrypted server state and never
 // enters this value.
 type DomainDNSRequest struct {
 	ZoneID    string   `json:"zone_id"`
@@ -100,22 +104,19 @@ type DomainDNSPlan struct {
 }
 
 func NewDomainDNS(cfg DomainDNSConfig) (*DomainDNS, error) {
-	if err := validateDNSZones(cfg.Zones); err != nil {
-		return nil, err
-	}
 	now := cfg.Now
 	if now == nil {
 		now = time.Now
 	}
 	return &DomainDNS{
-		zones: append([]DNSZone(nil), cfg.Zones...), base: cfg.BaseURL,
+		zones: cfg.Zones, creds: cfg.Credentials, base: cfg.BaseURL,
 		client: cfg.HTTPClient, authz: cfg.Authorizer, audit: cfg.Audit, now: now,
 	}, nil
 }
 
 func (d *DomainDNS) AuthorizeRead(ctx context.Context, actor contract.Actor) error {
 	if d == nil || d.authz == nil {
-		return contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization is not configured", "Configure EREGION_DNS_ADMINS; provider reads fail closed.")
+		return contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization is not configured", "Wire the operator DNS authorizer; provider reads fail closed.")
 	}
 	if err := actor.Validate(); err != nil {
 		return err
@@ -125,7 +126,7 @@ func (d *DomainDNS) AuthorizeRead(ctx context.Context, actor contract.Actor) err
 
 func (d *DomainDNS) AuthorizeWrite(ctx context.Context, actor contract.Actor) error {
 	if d == nil || d.authz == nil {
-		return contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization is not configured", "Configure EREGION_DNS_ADMINS; managed DNS changes fail closed.")
+		return contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization is not configured", "Wire the operator DNS authorizer; managed DNS changes fail closed.")
 	}
 	if err := actor.Validate(); err != nil {
 		return err
@@ -133,18 +134,22 @@ func (d *DomainDNS) AuthorizeWrite(ctx context.Context, actor contract.Actor) er
 	return d.authz.Authorize(ctx, actor, ActionDNSWrite, "cloudflare")
 }
 
-func (d *DomainDNS) clientFor(zoneID, zoneName string) (DNSZone, *Cloudflare, error) {
-	if d == nil {
-		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES and EREGION_CLOUDFLARE_TOKEN_FILE, then retry.")
+func (d *DomainDNS) clientFor(ctx context.Context, zoneID, zoneName string) (DNSZone, *Cloudflare, error) {
+	if d == nil || d.zones == nil || d.creds == nil {
+		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; manual DNS remains the default.")
 	}
-	zone, ok := d.configuredZone(zoneID, zoneName)
-	if !ok {
-		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Use a zone name or ID from EREGION_CLOUDFLARE_ZONES; manual DNS remains the default.")
-	}
-	raw, err := ReadSecretFile(zone.TokenFile, 4096)
+	zone, ok, err := d.zones.DNSZone(ctx, zoneID, zoneName)
 	if err != nil {
 		return DNSZone{}, nil, err
 	}
+	if !ok {
+		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Configure it with eregion domain cloudflare configure; manual DNS remains the default.")
+	}
+	raw, err := d.creds.DNSCredential(ctx, DNSProviderCloudflare, zone.ZoneID)
+	if err != nil {
+		return DNSZone{}, nil, err
+	}
+	defer clearBytes(raw)
 	client, err := NewCloudflare(CloudflareConfig{
 		APIToken: strings.TrimRight(string(raw), "\r\n"),
 		ZoneID:   zone.ZoneID, ZoneName: zone.ZoneName,
@@ -157,35 +162,20 @@ func (d *DomainDNS) clientFor(zoneID, zoneName string) (DNSZone, *Cloudflare, er
 }
 
 // ResolveZone maps an operator zone reference (configured name or ID) to the
-// exact configured zone without reading the token file. Admission persists the
-// ID/name so later cleanup does not depend on operator flags.
-func (d *DomainDNS) ResolveZone(ref string) (DNSZone, bool) {
-	if d == nil {
-		return DNSZone{}, false
+// exact configured zone through PostgreSQL. Admission persists the ID/name so
+// later cleanup does not depend on operator flags.
+func (d *DomainDNS) ResolveZone(ctx context.Context, ref string) (DNSZone, error) {
+	if d == nil || d.zones == nil {
+		return DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; manual DNS remains the default.")
 	}
-	ref = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ref), "."))
-	if zone, ok := d.configuredZone(ref, ""); ok {
-		return zone, true
+	zone, ok, err := d.zones.DNSZone(ctx, "", ref)
+	if err != nil {
+		return DNSZone{}, err
 	}
-	return d.configuredZone("", ref)
-}
-
-func (d *DomainDNS) configuredZone(zoneID, zoneName string) (DNSZone, bool) {
-	zoneID = strings.ToLower(strings.TrimSpace(zoneID))
-	zoneName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zoneName), "."))
-	for _, zone := range d.zones {
-		if zoneID != "" && zoneID != zone.ZoneID {
-			continue
-		}
-		if zoneName != "" && zoneName != strings.ToLower(zone.ZoneName) {
-			continue
-		}
-		if zoneID == "" && zoneName == "" {
-			return DNSZone{}, false
-		}
-		return zone, true
+	if !ok {
+		return DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Configure it with eregion domain cloudflare configure; manual DNS remains the default.")
 	}
-	return DNSZone{}, false
+	return zone, nil
 }
 
 // ValidateDomainDNSHost requires the hostname to be the configured zone or a
@@ -205,7 +195,7 @@ func ValidateDomainDNSHost(zone DNSZone, host string) error {
 // PlanApply returns a real provider snapshot for one hostname and the exact
 // create/update/delete set an apply would make. It performs no mutation.
 func (d *DomainDNS) PlanApply(ctx context.Context, req DomainDNSRequest) (DomainDNSPlan, error) {
-	zone, client, err := d.clientFor(req.ZoneID, req.ZoneName)
+	zone, client, err := d.clientFor(ctx, req.ZoneID, req.ZoneName)
 	if err != nil {
 		return DomainDNSPlan{}, err
 	}
@@ -239,7 +229,7 @@ func (d *DomainDNS) planApply(ctx context.Context, zone DNSZone, client *Cloudfl
 // PlanRemove returns the exact owned records an explicit removal would delete.
 // Foreign address records make the removal fail closed instead of guessing.
 func (d *DomainDNS) PlanRemove(ctx context.Context, req DomainDNSRequest) (DomainDNSPlan, error) {
-	zone, client, err := d.clientFor(req.ZoneID, req.ZoneName)
+	zone, client, err := d.clientFor(ctx, req.ZoneID, req.ZoneName)
 	if err != nil {
 		return DomainDNSPlan{}, err
 	}
@@ -300,12 +290,12 @@ func (d *DomainDNS) ApplyWithGuard(ctx context.Context, actor contract.Actor, op
 
 func (d *DomainDNS) apply(ctx context.Context, actor contract.Actor, opID contract.OperationID, req DomainDNSRequest, guard func(context.Context) error) (DomainDNSPlan, error) {
 	if d == nil || d.authz == nil || d.audit == nil {
-		return DomainDNSPlan{}, contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization or audit is not configured", "Configure EREGION_DNS_ADMINS and the durable audit sink; DNS changes fail closed.")
+		return DomainDNSPlan{}, contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization or audit is not configured", "Wire the operator DNS authorizer and the durable audit sink; DNS changes fail closed.")
 	}
 	if err := d.AuthorizeWrite(ctx, actor); err != nil {
 		return DomainDNSPlan{}, err
 	}
-	zone, client, err := d.clientFor(req.ZoneID, req.ZoneName)
+	zone, client, err := d.clientFor(ctx, req.ZoneID, req.ZoneName)
 	if err != nil {
 		return DomainDNSPlan{}, err
 	}
@@ -330,12 +320,12 @@ func (d *DomainDNS) RemoveWithGuard(ctx context.Context, actor contract.Actor, o
 
 func (d *DomainDNS) remove(ctx context.Context, actor contract.Actor, opID contract.OperationID, req DomainDNSRequest, guard func(context.Context) error) (DomainDNSPlan, error) {
 	if d == nil || d.authz == nil || d.audit == nil {
-		return DomainDNSPlan{}, contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization or audit is not configured", "Configure EREGION_DNS_ADMINS and the durable audit sink; DNS changes fail closed.")
+		return DomainDNSPlan{}, contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization or audit is not configured", "Wire the operator DNS authorizer and the durable audit sink; DNS changes fail closed.")
 	}
 	if err := d.AuthorizeWrite(ctx, actor); err != nil {
 		return DomainDNSPlan{}, err
 	}
-	zone, client, err := d.clientFor(req.ZoneID, req.ZoneName)
+	zone, client, err := d.clientFor(ctx, req.ZoneID, req.ZoneName)
 	if err != nil {
 		return DomainDNSPlan{}, err
 	}
@@ -358,7 +348,7 @@ func (d *DomainDNS) remove(ctx context.Context, actor contract.Actor, opID contr
 
 func (d *DomainDNS) applyPlan(ctx context.Context, actor contract.Actor, opID contract.OperationID, zone DNSZone, client *Cloudflare, plan DomainDNSPlan, guard func(context.Context) error) (DomainDNSPlan, error) {
 	if d.authz == nil || d.audit == nil {
-		return plan, contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization or audit is not configured", "Configure EREGION_DNS_ADMINS and the durable audit sink; DNS changes fail closed.")
+		return plan, contract.NewFault(contract.Unavailable, "Cloudflare DNS authorization or audit is not configured", "Wire the operator DNS authorizer and the durable audit sink; DNS changes fail closed.")
 	}
 	if err := actor.Validate(); err != nil {
 		return plan, err

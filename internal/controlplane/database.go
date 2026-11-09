@@ -103,6 +103,12 @@ var migration025 string
 //go:embed migrations/026_deployment_lifecycle_owner.sql
 var migration026 string
 
+// 027 is a byte-for-byte copy of vault/provider_schema.sql so the migration
+// stays explicit and immutable even if the package schema is edited later.
+//
+//go:embed migrations/027_provider_credentials.sql
+var migration027 string
+
 type migration struct {
 	version int
 	name    string
@@ -139,6 +145,7 @@ var migrations = []migration{
 	{version: 24, name: "024_environment_protection.sql", sql: migration024},
 	{version: 25, name: "025_domain_dns_ownership.sql", sql: migration025},
 	{version: 26, name: "026_deployment_lifecycle_owner.sql", sql: migration026},
+	{version: 27, name: "027_provider_credentials.sql", sql: migration027},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.

@@ -6,8 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -21,16 +19,14 @@ func testDomainDNS(t *testing.T, fixture *cloudflareFixture, authorizer Authoriz
 	t.Helper()
 	server := httptest.NewServer(fixture)
 	t.Cleanup(server.Close)
-	tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
-	if err := os.WriteFile(tokenPath, []byte(testCloudflareToken+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDNSStore(DNSZone{ZoneID: testZoneID, ZoneName: "example.com"}).withToken(testZoneID, testCloudflareToken)
 	domainDNS, err := NewDomainDNS(DomainDNSConfig{
-		Zones:      []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: tokenPath}},
-		BaseURL:    server.URL + "/client/v4",
-		HTTPClient: server.Client(),
-		Authorizer: authorizer,
-		Audit:      audit,
+		Zones:       store,
+		Credentials: store,
+		BaseURL:     server.URL + "/client/v4",
+		HTTPClient:  server.Client(),
+		Authorizer:  authorizer,
+		Audit:       audit,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -38,37 +34,9 @@ func testDomainDNS(t *testing.T, fixture *cloudflareFixture, authorizer Authoriz
 	return domainDNS
 }
 
-func dnsAuthorizer(t *testing.T) *StaticAuthorizer {
+func dnsAuthorizer(t *testing.T) Authorizer {
 	t.Helper()
-	authz, err := NewStaticAuthorizer(map[string][]string{"ops": {ActionDNSCreate, ActionDNSUpdate, ActionDNSDelete, ActionDNSRead, ActionDNSWrite}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return authz
-}
-
-func TestReadSecretFileRejectsUnsafeCredentialFiles(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "cloudflare-token")
-	if err := os.WriteFile(path, []byte("token\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadSecretFile(path, 4096); err != nil {
-		t.Fatalf("safe credential file refused: %v", err)
-	}
-	if err := os.Chmod(path, 0644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadSecretFile(path, 4096); contract.Classify(err).Code != contract.PreconditionFailed {
-		t.Fatalf("group-readable credential file = %v", err)
-	}
-	link := filepath.Join(dir, "cloudflare-token-link")
-	if err := os.Symlink(path, link); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ReadSecretFile(link, 4096); contract.Classify(err).Code != contract.PreconditionFailed {
-		t.Fatalf("symlinked credential file = %v", err)
-	}
+	return NewOperatorDNSAuthorizer()
 }
 
 func TestDomainDNSOwnershipIsImmutableIdentityNotNames(t *testing.T) {
@@ -85,31 +53,47 @@ func TestDomainDNSOwnershipIsImmutableIdentityNotNames(t *testing.T) {
 	}
 }
 
-func TestDomainDNSReadAuthorizationPrecedesCredentialAccess(t *testing.T) {
-	authz, err := NewStaticAuthorizer(map[string][]string{"ops": {ActionDNSWrite}})
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDomainDNSAuthorizationIsOperatorOnlyAndPrecedesCredentialResolution(t *testing.T) {
+	store := newTestDNSStore(DNSZone{ZoneID: testZoneID, ZoneName: "example.com"}).withToken(testZoneID, testCloudflareToken)
 	domainDNS, err := NewDomainDNS(DomainDNSConfig{
-		Zones:      []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: filepath.Join(t.TempDir(), "missing-token")}},
-		Authorizer: authz,
+		Zones: store, Credentials: store,
+		Authorizer: NewOperatorDNSAuthorizer(),
 		Audit:      NewMemoryAudit(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	actor := contract.Actor{Kind: "operator", Subject: "ops"}
-	if err := domainDNS.AuthorizeRead(context.Background(), actor); contract.Classify(err).Code != contract.Forbidden {
-		t.Fatalf("read authorization = %v", err)
+	operator := contract.Actor{Kind: "operator", Subject: "ops"}
+	if err := domainDNS.AuthorizeRead(context.Background(), operator); err != nil {
+		t.Fatalf("operator read authorization = %v", err)
 	}
-	if err := domainDNS.AuthorizeRead(context.Background(), contract.Actor{Kind: "operator", Subject: "other"}); contract.Classify(err).Code != contract.Forbidden {
-		t.Fatalf("unknown actor read authorization = %v", err)
+	if err := domainDNS.AuthorizeWrite(context.Background(), operator); err != nil {
+		t.Fatalf("operator write authorization = %v", err)
 	}
-	if err := domainDNS.AuthorizeWrite(context.Background(), actor); err != nil {
-		t.Fatalf("write authorization = %v", err)
+	if err := domainDNS.AuthorizeRead(context.Background(), contract.Actor{Kind: "operator", Subject: "second"}); err != nil {
+		t.Fatalf("second operator authorization = %v", err)
 	}
-	if err := domainDNS.AuthorizeWrite(context.Background(), contract.Actor{Kind: "operator", Subject: "other"}); contract.Classify(err).Code != contract.Forbidden {
-		t.Fatalf("unknown actor write authorization = %v", err)
+	request := DomainDNSRequest{
+		ZoneID: testZoneID, ZoneName: "example.com", DomainID: testDomainID,
+		Ownership: DomainDNSOwnership(testDomainID, testZoneID), Host: "app.example.com", Addresses: []string{"8.8.8.8"},
+	}
+	for _, kind := range []string{"ci", "webhook", "system"} {
+		actor := contract.Actor{Kind: kind, Subject: "ops"}
+		if err := domainDNS.AuthorizeRead(context.Background(), actor); contract.Classify(err).Code != contract.Forbidden {
+			t.Fatalf("%s read authorization = %v", kind, err)
+		}
+		if _, err := domainDNS.Apply(context.Background(), actor, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request); contract.Classify(err).Code != contract.Forbidden {
+			t.Fatalf("%s apply authorization = %v", kind, err)
+		}
+		if _, err := domainDNS.Remove(context.Background(), actor, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request); contract.Classify(err).Code != contract.Forbidden {
+			t.Fatalf("%s remove authorization = %v", kind, err)
+		}
+	}
+	if _, reads := store.counts(); reads != 0 {
+		t.Fatalf("denied actors resolved the provider credential %d times", reads)
+	}
+	if err := NewOperatorDNSAuthorizer().Authorize(context.Background(), operator, "dns.unknown", "cloudflare"); contract.Classify(err).Code != contract.Forbidden {
+		t.Fatalf("unknown action authorization = %v", err)
 	}
 }
 
@@ -127,29 +111,63 @@ func TestValidateDomainDNSHostBelongsToConfiguredZone(t *testing.T) {
 	}
 }
 
-func TestDomainDNSWriteAuthorizationPrecedesTokenAccess(t *testing.T) {
-	authz, err := NewStaticAuthorizer(map[string][]string{"ops": {ActionDNSRead}})
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDomainDNSUnconfiguredZoneFailsBeforeCredentialResolution(t *testing.T) {
+	store := newTestDNSStore()
 	domainDNS, err := NewDomainDNS(DomainDNSConfig{
-		Zones:      []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: filepath.Join(t.TempDir(), "missing-token")}},
-		Authorizer: authz,
+		Zones: store, Credentials: store,
+		Authorizer: NewOperatorDNSAuthorizer(),
 		Audit:      NewMemoryAudit(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	actor := contract.Actor{Kind: "operator", Subject: "ops"}
 	request := DomainDNSRequest{
 		ZoneID: testZoneID, ZoneName: "example.com", DomainID: testDomainID,
 		Ownership: DomainDNSOwnership(testDomainID, testZoneID), Host: "app.example.com", Addresses: []string{"8.8.8.8"},
 	}
-	if _, err := domainDNS.Apply(context.Background(), actor, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request); contract.Classify(err).Code != contract.Forbidden {
-		t.Fatalf("apply authorization error = %v", err)
+	if _, err := domainDNS.Apply(context.Background(), contract.Actor{Kind: "operator", Subject: "ops"}, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request); contract.Classify(err).Code != contract.InputRequired {
+		t.Fatalf("unconfigured zone = %v", err)
 	}
-	if _, err := domainDNS.Remove(context.Background(), actor, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request); contract.Classify(err).Code != contract.Forbidden {
-		t.Fatalf("remove authorization error = %v", err)
+	if _, reads := store.counts(); reads != 0 {
+		t.Fatalf("unconfigured zone resolved the provider credential %d times", reads)
+	}
+}
+
+func TestDomainDNSResolvesTheActiveCredentialForEachOperation(t *testing.T) {
+	fixture := newCloudflareFixture(testZoneID)
+	server := httptest.NewServer(fixture)
+	defer server.Close()
+	store := newTestDNSStore(DNSZone{ZoneID: testZoneID, ZoneName: "example.com"}).withToken(testZoneID, testCloudflareToken)
+	domainDNS, err := NewDomainDNS(DomainDNSConfig{
+		Zones: store, Credentials: store,
+		BaseURL: server.URL + "/client/v4", HTTPClient: server.Client(),
+		Authorizer: NewOperatorDNSAuthorizer(), Audit: NewMemoryAudit(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := DomainDNSRequest{
+		ZoneID: testZoneID, ZoneName: "example.com", DomainID: testDomainID,
+		Ownership: DomainDNSOwnership(testDomainID, testZoneID), Host: "app.example.com", Addresses: []string{"10.0.0.2"},
+	}
+	if _, err := domainDNS.PlanApply(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.tokens[testZoneID] = testCloudflareToken
+	store.mu.Unlock()
+	if _, err := domainDNS.PlanApply(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	for _, call := range fixture.calls {
+		if call != "list" {
+			t.Fatalf("plan mutated the provider: %v", fixture.calls)
+		}
+	}
+	if _, reads := store.counts(); reads != 2 {
+		t.Fatalf("credential reads = %d, want one per operation", reads)
 	}
 }
 
@@ -780,13 +798,9 @@ func TestDomainDNSRemoveRefusesForeignAddressRecord(t *testing.T) {
 
 func TestDomainDNSAuthorizationAndAuditFailClosed(t *testing.T) {
 	fixture := newCloudflareFixture(testZoneID)
-	denied, err := NewStaticAuthorizer(map[string][]string{"ops": {ActionDNSWrite}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	domainDNS := testDomainDNS(t, fixture, denied, NewMemoryAudit())
+	domainDNS := testDomainDNS(t, fixture, NewOperatorDNSAuthorizer(), NewMemoryAudit())
 	request := DomainDNSRequest{ZoneID: testZoneID, ZoneName: "example.com", DomainID: testDomainID, Ownership: DomainDNSOwnership(testDomainID, testZoneID), Host: "app.example.com", Addresses: []string{"10.0.0.2"}, Proxied: false}
-	if _, err := domainDNS.Apply(context.Background(), contract.Actor{Kind: "operator", Subject: "ops"}, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request); contract.Classify(err).Code != contract.Forbidden {
+	if _, err := domainDNS.Apply(context.Background(), contract.Actor{Kind: "ci", Subject: "ops"}, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request); contract.Classify(err).Code != contract.Forbidden {
 		t.Fatalf("authorization error = %v", err)
 	}
 	if countMutations(fixture.calls) != 0 {
@@ -846,12 +860,9 @@ func TestDomainDNSRechecksOwnershipImmediatelyBeforeMutation(t *testing.T) {
 	}}}
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
-	if err := os.WriteFile(tokenPath, []byte(testCloudflareToken+"\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDNSStore(DNSZone{ZoneID: testZoneID, ZoneName: "example.com"}).withToken(testZoneID, testCloudflareToken)
 	domainDNS, err := NewDomainDNS(DomainDNSConfig{
-		Zones:      []DNSZone{{ZoneID: testZoneID, ZoneName: "example.com", TokenFile: tokenPath}},
+		Zones: store, Credentials: store,
 		BaseURL:    server.URL + "/client/v4",
 		HTTPClient: server.Client(),
 		Authorizer: dnsAuthorizer(t),

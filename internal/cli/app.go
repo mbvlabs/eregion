@@ -22,13 +22,14 @@ func (a *app) appSpecs() []spec {
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
 		"name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
-		"git-credential-name", "image", "builder", "context-path", "build-env", "container-port",
+		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
 	}
 	create.Examples = []string{
 		"eregion app create",
 		"eregion app create --name api --node main --git-url https://github.com/acme/api --git-ref main --container-port 8080 --health-path /healthz --domain api.example.com --json",
+		"eregion app create --name api --node main --git-url https://github.com/acme/api --github-auth --no-deploy --json",
 		"eregion app create --name api --node main --image ghcr.io/acme/api:2026-10-20 --no-deploy --json",
 		"eregion app create --from ./eregion.toml --no-deploy --json",
 	}
@@ -207,6 +208,13 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if err := validateUniqueEnvironmentDomains(specs); err != nil {
 		return result{}, err
 	}
+	specs, err = applyGitHubAuthToSpecs(cmd, ans, specs)
+	if err != nil {
+		return result{}, err
+	}
+	if err := validateEnvironmentGitCredentialRoles(specs); err != nil {
+		return result{}, err
+	}
 	ans.PrebuiltSpecs = specs
 	spec := specs[0]
 	follow := !boolFlag(cmd, "detach") && (streamsNDJSON(cmd) || (interactive && ans.Deploy && followsByDefault(cmd)))
@@ -277,6 +285,9 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		// needs the same accepted operation.
 		summary.SecretNames = setupSecretNames(ans)
 	} else {
+		if err := a.fillGitHubAuthCredential(cmd, ans); err != nil {
+			return result{}, err
+		}
 		if _, err := a.writeSetupSecretsForEnvironments(cmd, ans, specs); err != nil {
 			return result{}, err
 		}

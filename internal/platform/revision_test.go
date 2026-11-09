@@ -3,8 +3,10 @@ package platform
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/retention"
 )
 
@@ -109,6 +111,48 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 	}
 	if _, err := normalize(KindEnvironmentSecretAttach, "env/api/production", map[string]any{"name": "database_url"}); err == nil {
 		t.Fatal("lowercase secret name must be refused")
+	}
+}
+
+func TestNormalizeRevisionStateRejectsSourceCredentialAliasing(t *testing.T) {
+	base := RevisionState{
+		Source: SourceBinding{
+			Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
+			CredentialSecretName: "GIT_READ_TOKEN",
+		},
+		Runtime: RuntimeSpec{Node: "app-1", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
+		Processes: []ProcessSpec{
+			{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080},
+		},
+		Config: map[string]string{},
+	}
+	if err := NormalizeRevisionState(&base); err != nil {
+		t.Fatalf("the valid base revision was refused: %v", err)
+	}
+
+	runtimeAlias := base
+	runtimeAlias.SecretNames = []string{"GIT_READ_TOKEN"}
+	if fault := contract.Classify(NormalizeRevisionState(&runtimeAlias)); fault.Code != contract.ValidationFailed || !strings.Contains(fault.Hint, "runtime secret") {
+		t.Fatalf("runtime-secret alias error = %+v", fault)
+	}
+
+	webhookAlias := base
+	webhookAlias.WebhookSecretName = "GIT_READ_TOKEN"
+	if fault := contract.Classify(NormalizeRevisionState(&webhookAlias)); fault.Code != contract.ValidationFailed || !strings.Contains(fault.Hint, "webhook secret") {
+		t.Fatalf("webhook-secret alias error = %+v", fault)
+	}
+
+	valid := base
+	valid.SecretNames = []string{"DATABASE_URL"}
+	valid.WebhookSecretName = "EREGION_WEBHOOK_SECRET"
+	if err := NormalizeRevisionState(&valid); err != nil {
+		t.Fatalf("distinct credential roles were refused: %v", err)
+	}
+
+	names := []string{"GIT_READ_TOKEN"}
+	merged := ApplyEnvironmentPatch(base, EnvironmentUpdateInput{SecretNames: &names})
+	if fault := contract.Classify(NormalizeRevisionState(&merged)); fault.Code != contract.ValidationFailed || !strings.Contains(fault.Hint, "runtime secret") {
+		t.Fatalf("merged runtime-secret alias error = %+v", fault)
 	}
 }
 

@@ -512,7 +512,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		}
 		var managedZone integrations.DNSZone
 		if normalized.Kind == platform.KindDomainAdd && input.DNSMode == integrations.DomainDNSModeCloudflare {
-			managedZone, err = s.resolveDomainDNSZone(input.DNSZone)
+			managedZone, err = s.resolveDomainDNSZone(ctx, input.DNSZone)
 			if err != nil {
 				return err
 			}
@@ -546,7 +546,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			}
 			if ledger != nil {
 				if input.DNSMode == integrations.DomainDNSModeCloudflare && input.DNSZone != "" {
-					zone, err := s.resolveDomainDNSZone(input.DNSZone)
+					zone, err := s.resolveDomainDNSZone(ctx, input.DNSZone)
 					if err != nil {
 						return err
 					}
@@ -565,7 +565,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			if input.DNSMode != integrations.DomainDNSModeCloudflare {
 				return nil
 			}
-			zone, err := s.resolveDomainDNSZone(input.DNSZone)
+			zone, err := s.resolveDomainDNSZone(ctx, input.DNSZone)
 			if err != nil {
 				return err
 			}

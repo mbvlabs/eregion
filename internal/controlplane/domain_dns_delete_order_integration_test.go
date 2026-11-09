@@ -5,13 +5,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/integrations"
+	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -54,19 +53,13 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 			fixture := &domainDNSLedgerFixture{records: map[string]integrations.DNSRecord{}}
 			server := httptest.NewServer(fixture)
 			defer server.Close()
-			tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
-			if err := os.WriteFile(tokenPath, []byte("ledger-token-0123456789\n"), 0600); err != nil {
-				t.Fatal(err)
-			}
-			authz, err := integrations.NewStaticAuthorizer(map[string][]string{testActor.Subject: {"*"}})
-			if err != nil {
-				t.Fatal(err)
-			}
+			store := newTestDNSStore(integrations.DNSZone{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com"}).withToken("0123456789abcdef0123456789abcdef", "ledger-token-0123456789")
+			domainActor := contract.Actor{Kind: "operator", Subject: testActor.Subject}
 			domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-				Zones:      []integrations.DNSZone{{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com", TokenFile: tokenPath}},
+				Zones: store, Credentials: store,
 				BaseURL:    server.URL + "/client/v4",
 				HTTPClient: server.Client(),
-				Authorizer: authz,
+				Authorizer: integrations.NewOperatorDNSAuthorizer(),
 				Audit:      integrations.NewMemoryAudit(),
 			})
 			if err != nil {
@@ -87,7 +80,7 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 					t.Fatal(err)
 				}
 			}
-			addOp := platformSubmit(t, s, platform.KindDomainAdd, "env/"+test.app+"/test", "delete-order-domain", map[string]any{
+			addOp := platformSubmitAs(t, s, domainActor, platform.KindDomainAdd, "env/"+test.app+"/test", "delete-order-domain", map[string]any{
 				"domain": "app.example.com", "dns_mode": "cloudflare", "dns_zone": "example.com",
 				"dns_origins": []string{"8.8.8.8"}, "dns_proxied": proxied,
 			})
@@ -109,14 +102,14 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 			var deleteOp contract.Operation
 			if test.deleteKind == platform.KindAppDelete {
 				s.humanFactor = func(string) error { return nil }
-				submission := platformSubmission(platform.KindAppDelete, "app/"+test.app, "delete-order-app-op", map[string]any{"confirm": test.app})
+				submission := platformSubmissionAs(domainActor, platform.KindAppDelete, "app/"+test.app, "delete-order-app-op", map[string]any{"confirm": test.app})
 				submission.HumanFactor = "test-factor"
 				deleteOp, err = s.Submit(ctx, submission)
 				if err != nil {
 					t.Fatal(err)
 				}
 			} else {
-				deleteOp = platformSubmit(t, s, platform.KindEnvironmentDelete, "env/"+test.app+"/test", "delete-order-env-op", map[string]any{"confirm": test.app + "/test"})
+				deleteOp = platformSubmitAs(t, s, domainActor, platform.KindEnvironmentDelete, "env/"+test.app+"/test", "delete-order-env-op", map[string]any{"confirm": test.app + "/test"})
 			}
 			test.call(t, &platformWorker{service: s}, deleteOp, test.app)
 
@@ -168,17 +161,12 @@ func setupMultiBindingDelete(t *testing.T, app string) (*Service, *scriptedPlatf
 	fixture := &domainDNSLedgerFixture{records: map[string]integrations.DNSRecord{}}
 	server := httptest.NewServer(fixture)
 	t.Cleanup(server.Close)
-	tokenPath := filepath.Join(t.TempDir(), "cloudflare-token")
-	if err := os.WriteFile(tokenPath, []byte("ledger-token-0123456789\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	authz, err := integrations.NewStaticAuthorizer(map[string][]string{testActor.Subject: {"*"}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := newTestDNSStore(integrations.DNSZone{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com"}).withToken("0123456789abcdef0123456789abcdef", "ledger-token-0123456789")
+	domainActor := contract.Actor{Kind: "operator", Subject: testActor.Subject}
 	domainDNS, err := integrations.NewDomainDNS(integrations.DomainDNSConfig{
-		Zones:   []integrations.DNSZone{{ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com", TokenFile: tokenPath}},
-		BaseURL: server.URL + "/client/v4", HTTPClient: server.Client(), Authorizer: authz, Audit: integrations.NewMemoryAudit(),
+		Zones: store, Credentials: store,
+		BaseURL: server.URL + "/client/v4", HTTPClient: server.Client(),
+		Authorizer: integrations.NewOperatorDNSAuthorizer(), Audit: integrations.NewMemoryAudit(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +184,7 @@ func setupMultiBindingDelete(t *testing.T, app string) (*Service, *scriptedPlatf
 		}
 	}
 	for index, host := range []string{"a.example.com", "b.example.com"} {
-		addOp := platformSubmit(t, s, platform.KindDomainAdd, "env/"+app+"/test", "multi-delete-domain-"+string(rune('a'+index)), map[string]any{
+		addOp := platformSubmitAs(t, s, domainActor, platform.KindDomainAdd, "env/"+app+"/test", "multi-delete-domain-"+string(rune('a'+index)), map[string]any{
 			"domain": host, "dns_mode": "cloudflare", "dns_zone": "example.com",
 			"dns_origins": []string{"8.8.8.8"}, "dns_proxied": proxied,
 		})
@@ -213,7 +201,7 @@ func setupMultiBindingDelete(t *testing.T, app string) (*Service, *scriptedPlatf
 		}
 		fixture.mu.Unlock()
 	}
-	deleteOp := platformSubmit(t, s, platform.KindEnvironmentDelete, "env/"+app+"/test", "multi-delete-op", map[string]any{"confirm": app + "/test"})
+	deleteOp := platformSubmitAs(t, s, domainActor, platform.KindEnvironmentDelete, "env/"+app+"/test", "multi-delete-op", map[string]any{"confirm": app + "/test"})
 	// The tests call the worker body directly instead of starting River, so
 	// they perform the same queued-to-running claim the worker would do.
 	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='running' WHERE id=$1`, deleteOp.ID); err != nil {
@@ -235,7 +223,8 @@ func providerRecordPresent(f *domainDNSLedgerFixture, name string) bool {
 
 func operationEventText(t *testing.T, s *Service, id contract.OperationID) string {
 	t.Helper()
-	page, err := s.Events(context.Background(), testActor, contract.Cursor{OperationID: id}, 200)
+	authority := operations.OperatorAuthority(contract.Actor{Kind: "operator", Subject: testActor.Subject})
+	page, err := s.Events(context.Background(), authority, contract.Cursor{OperationID: id}, 200)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +371,7 @@ func TestIntegrationMultiBindingDNSCancelRetainsLedgerAndRetries(t *testing.T) {
 	fixture.mu.Lock()
 	fixture.afterDelete = nil
 	fixture.mu.Unlock()
-	retryOp := platformSubmit(t, s, platform.KindEnvironmentDelete, "env/multi-cancel/test", "multi-cancel-retry", map[string]any{"confirm": "multi-cancel/test"})
+	retryOp := platformSubmitAs(t, s, contract.Actor{Kind: "operator", Subject: testActor.Subject}, platform.KindEnvironmentDelete, "env/multi-cancel/test", "multi-cancel-retry", map[string]any{"confirm": "multi-cancel/test"})
 	if _, err := s.pool.Exec(ctx, `UPDATE eregion_operations SET state='running' WHERE id=$1`, retryOp.ID); err != nil {
 		t.Fatal(err)
 	}

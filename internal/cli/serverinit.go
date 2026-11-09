@@ -339,14 +339,9 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 
 	var route *host.ContextSSH
 	if !r.pending.Done(phaseAccess) {
-		if route, err = r.secureAccess(ctx, r.identity, r.answers.Host, r.knownHosts); err != nil {
+		if route, err = r.secureAccess(ctx, r.identity, r.answers.Host); err != nil {
 			return err
 		}
-		globalKnownHosts, err := r.pinPendingKnownHosts()
-		if err != nil {
-			return err
-		}
-		route.KnownHosts = globalKnownHosts
 		r.pending.NodePublicKey = route.WireGuard.NodePublicKey
 		if err := r.savePending(); err != nil {
 			return err
@@ -1083,43 +1078,18 @@ func (r *serverInit) routeFromPending() (*host.ContextSSH, error) {
 	if r.pending.NodePublicKey == "" {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the pending init has no node WireGuard key", "Run server init --discard and start again; the host may need a rebuild.")
 	}
-	known, err := knownHostsPath()
+	known, err := contextKnownHostsPath(r.answers.Context)
 	if err != nil {
 		return nil, err
 	}
+	// The saved route always uses the context's own known_hosts. A resume can
+	// reach this point after access setup but before the context was saved, so
+	// rebuild that file from the verified public first-contact pin instead of
+	// relying on a pin left by an earlier run or on the shared store.
+	if err := pinContextKnownHosts(r.knownHosts, known, r.answers.address(), net.JoinHostPort(access.NodeAddress, "22")); err != nil {
+		return nil, err
+	}
 	return r.identity.wireGuardRoute(r.answers.Host, r.pending.NodePublicKey, known, r.answers.AdminUser), nil
-}
-
-// pinPendingKnownHosts copies the init's pins into the context store's
-// known_hosts so the saved context can verify the node after the pending state
-// is gone.
-func (r *serverInit) pinPendingKnownHosts() (string, error) {
-	global, err := knownHostsPath()
-	if err != nil {
-		return "", err
-	}
-	raw, err := os.ReadFile(r.knownHosts)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	if len(raw) == 0 {
-		return global, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(global), 0o700); err != nil {
-		return "", err
-	}
-	file, err := os.OpenFile(global, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600) //nolint:gosec // eregion's own known_hosts.
-	if err != nil {
-		return "", err
-	}
-	if _, err := file.Write(raw); err != nil {
-		_ = file.Close()
-		return "", err
-	}
-	if err := file.Close(); err != nil {
-		return "", err
-	}
-	return global, nil
 }
 
 func (r *serverInit) saveContext(route *host.ContextSSH) error {

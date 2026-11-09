@@ -140,18 +140,18 @@ func (s *Service) checkDomainDNSBoundary(ctx context.Context, id contract.Operat
 
 func (s *Service) authorizeDomainDNSWrite(ctx context.Context, actor contract.Actor) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES and EREGION_CLOUDFLARE_TOKEN_FILE, then retry.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; retry.")
 	}
 	return s.domainDNS.AuthorizeWrite(ctx, actor)
 }
 
-func (s *Service) resolveDomainDNSZone(ref string) (integrations.DNSZone, error) {
+func (s *Service) resolveDomainDNSZone(ctx context.Context, ref string) (integrations.DNSZone, error) {
 	if s.domainDNS == nil {
-		return integrations.DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES and EREGION_CLOUDFLARE_TOKEN_FILE, then retry.")
+		return integrations.DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; manual DNS remains the default.")
 	}
-	zone, ok := s.domainDNS.ResolveZone(ref)
-	if !ok {
-		return integrations.DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Use a zone name or ID from EREGION_CLOUDFLARE_ZONES; manual DNS remains the default.")
+	zone, err := s.domainDNS.ResolveZone(ctx, ref)
+	if err != nil {
+		return integrations.DNSZone{}, err
 	}
 	return zone, nil
 }
@@ -342,7 +342,7 @@ func (s *Service) finishDomainOperation(ctx context.Context, id contract.Operati
 
 func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Set EREGION_CLOUDFLARE_ZONES and EREGION_CLOUDFLARE_TOKEN_FILE, then retry; the durable binding is retained.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion domain cloudflare configure; the durable binding is retained.")
 	}
 	if ledger.LastOperationID != op.ID {
 		return contract.NewFault(contract.Conflict, "a newer domain operation owns this managed binding", "This operation is stale and did not apply DNS; retry the current intent.")
@@ -396,7 +396,7 @@ func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operatio
 // unsafe ledger therefore stops the whole deletion before its first DNS write.
 func (s *Service) preflightDomainDNSLedger(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Restore EREGION_CLOUDFLARE_ZONES and the token file; no workload was removed.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion domain cloudflare configure; no workload was removed.")
 	}
 	if ledger.LastOperationID != op.ID {
 		return contract.NewFault(contract.Conflict, "a newer operation owns this managed binding cleanup", "No provider mutation was attempted; retry the current deletion.")
@@ -436,7 +436,7 @@ func (s *Service) preflightDomainDNSLedger(ctx context.Context, op contract.Oper
 
 func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Restore EREGION_CLOUDFLARE_ZONES and the token file; the binding and cleanup ledger are retained.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion domain cloudflare configure; the binding and cleanup ledger are retained.")
 	}
 	if ledger.LastOperationID != op.ID {
 		return contract.NewFault(contract.Conflict, "a newer operation owns this managed binding cleanup", "This deletion is stale; retry the current deletion after the newer operation finishes.")

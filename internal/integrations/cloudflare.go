@@ -84,7 +84,7 @@ var (
 
 func NewCloudflare(cfg CloudflareConfig) (*Cloudflare, error) {
 	if len(cfg.APIToken) < 20 || len(cfg.APIToken) > 512 || strings.TrimSpace(cfg.APIToken) != cfg.APIToken || strings.ContainsAny(cfg.APIToken, "\r\n") {
-		return nil, contract.NewFault(contract.InputRequired, "a Cloudflare API token is required", "Supply it from a private credential file, never from action input or a command line.")
+		return nil, contract.NewFault(contract.InputRequired, "a Cloudflare API token is required", "Configure it with eregion domain cloudflare configure; never put it in action input or a command line.")
 	}
 	if !zoneIDPattern.MatchString(cfg.ZoneID) {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid Cloudflare zone ID", "Use the lowercase 32-character zone identifier.")
@@ -498,6 +498,27 @@ func (c *Cloudflare) listRecordsQuery(ctx context.Context, name string) ([]DNSRe
 	return result, nil
 }
 
+// ValidateToken performs the bounded read-only DNS list used before a provider
+// credential is activated. It reads at most one record page for the exact
+// configured zone ID; it never discovers zones and does not require Zone Read.
+// Success proves this token can list DNS records for the zone, not that it can
+// create, update or delete them.
+func (c *Cloudflare) ValidateToken(ctx context.Context) error {
+	if c == nil {
+		return contract.NewFault(contract.Unavailable, "Cloudflare client is not configured", "Configure a provider credential and retry.")
+	}
+	endpoint := fmt.Sprintf("%s%s/dns_records?per_page=1&page=1", c.base, c.zonePath())
+	var records []DNSRecord
+	if err := c.requestWithInfo(ctx, http.MethodGet, endpoint, nil, &records, nil); err != nil {
+		return err
+	}
+	if records == nil {
+		// A successful empty result is valid. The envelope shape is enough.
+		records = []DNSRecord{}
+	}
+	return nil
+}
+
 type cloudflareError struct {
 	Code int `json:"code"`
 }
@@ -547,7 +568,7 @@ func (c *Cloudflare) requestWithInfo(ctx context.Context, method, endpoint strin
 		return contract.NewFault(contract.Unavailable, "Cloudflare response exceeded the bound", "Check the Cloudflare API and retry.")
 	}
 	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return contract.NewFault(contract.Forbidden, "Cloudflare rejected the API token", "Rotate the credential file and retry; no DNS change was authorized by Cloudflare.")
+		return contract.NewFault(contract.Forbidden, "Cloudflare rejected the API token", "Configure a replacement credential with eregion domain cloudflare configure; no DNS change was authorized by Cloudflare.")
 	}
 	if response.StatusCode == http.StatusTooManyRequests {
 		return contract.NewFault(contract.Unavailable, "Cloudflare rate limited the request", "Retry the operation later; reconciliation is idempotent.")

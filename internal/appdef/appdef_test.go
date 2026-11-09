@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
 )
@@ -507,6 +508,74 @@ B = "3"
 	}
 	if len(diff) == 0 {
 		t.Fatal("no human-readable diff was produced")
+	}
+}
+
+func TestUpdatePatchRejectsSourceCredentialRoleAliasing(t *testing.T) {
+	current := platform.Environment{
+		App: "api", Name: "production", Node: "main",
+		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
+			Source: platform.SourceBinding{
+				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
+				CredentialSecretName: "GIT_READ_TOKEN", Builder: platform.DefaultBuilder,
+			},
+			AutoDeploy:        true,
+			WebhookSecretName: "EREGION_WEBHOOK_SECRET",
+			Runtime:           platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
+			Processes: []platform.ProcessSpec{
+				{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080},
+			},
+			Config:      map[string]string{},
+			SecretNames: []string{"DATABASE_URL"},
+		}},
+	}
+	for _, test := range []struct {
+		name        string
+		credential  string
+		secretNames string
+		wantError   string
+	}{
+		{name: "runtime secret", credential: "GIT_READ_TOKEN", secretNames: `["GIT_READ_TOKEN"]`, wantError: "runtime secret"},
+		{name: "preserved webhook", credential: "EREGION_WEBHOOK_SECRET", secretNames: `[]`, wantError: "webhook secret"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw := fmt.Sprintf(`
+version = 1
+app = "api"
+node = "main"
+secret_names = %s
+
+[source]
+kind = "git"
+url = "https://github.com/acme/api"
+ref = "main"
+credential_secret = "%s"
+
+[runtime]
+health_path = "/"
+
+[[processes]]
+name = "web"
+kind = "web"
+container_port = 8080
+replicas = 1
+`, test.secretNames, test.credential)
+			definition, err := Parse([]byte(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := definition.Resolve("production")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fault := contract.Classify(func() error {
+				_, _, _, err := resolved.UpdatePatch(current, nil)
+				return err
+			}())
+			if fault.Code != contract.ValidationFailed || !strings.Contains(fault.Hint, test.wantError) {
+				t.Fatalf("UpdatePatch error = %+v", fault)
+			}
+		})
 	}
 }
 
