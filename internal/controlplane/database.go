@@ -230,7 +230,8 @@ func migrationByVersion(version int) (migration, bool) {
 
 // PlanMigrations performs no DDL. Newer/inconsistent schemas fail closed.
 // Each top-level read is labelled for readiness diagnostics; River's
-// ExistingVersions performs several queries inside the river_versions stage.
+// ExistingVersions owns the river_migration existence/legacy checks and
+// performs several queries inside the river_versions stage.
 func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
 	plan := MigrationPlan{Required: requiredVersion()}
 	exists, err := schemaMigrationsTableExists(ctx, pool)
@@ -248,14 +249,11 @@ func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, err
 	}
 	versions := m.AllVersions()
 	plan.RiverRequired = versions[len(versions)-1].Version
-	exists, err = riverMigrationTableExists(ctx, pool)
-	if err != nil {
-		return plan, unavailable(err)
-	}
-	if exists {
-		if err := readRiverMigrations(ctx, m, &plan); err != nil {
-			return plan, err
-		}
+	// River's ExistingVersions checks river_migration and its legacy line
+	// column itself, returning no versions when the table is absent. An outer
+	// table-existence query would only duplicate that first round trip.
+	if err := readRiverMigrations(ctx, m, &plan); err != nil {
+		return plan, err
 	}
 	return plan, nil
 }
@@ -304,13 +302,9 @@ func readSchemaMigrations(ctx context.Context, pool *pgxpool.Pool, plan *Migrati
 	return nil
 }
 
-func riverMigrationTableExists(ctx context.Context, pool *pgxpool.Pool) (exists bool, err error) {
-	ctx, end := beginReadyStage(ctx, "river_table")
-	defer func() { end(err) }()
-	err = pool.QueryRow(ctx, "SELECT to_regclass('river_migration') IS NOT NULL").Scan(&exists)
-	return exists, err
-}
-
+// readRiverMigrations also handles an absent river_migration table: River's
+// ExistingVersions checks the table and legacy line column itself and returns
+// no versions when the table is missing.
 func readRiverMigrations(ctx context.Context, m *rivermigrate.Migrator[pgx.Tx], plan *MigrationPlan) (err error) {
 	ctx, end := beginReadyStage(ctx, "river_versions")
 	defer func() { end(err) }()
@@ -323,6 +317,10 @@ func readRiverMigrations(ctx context.Context, m *rivermigrate.Migrator[pgx.Tx], 
 			plan.RiverCurrent = version.Version
 		}
 	}
+	return checkRiverPlan(*plan)
+}
+
+func checkRiverPlan(plan MigrationPlan) error {
 	if plan.RiverCurrent > plan.RiverRequired {
 		return contract.NewFault(contract.PreconditionFailed, "River schema is newer than this binary", "Upgrade the binary before using this database.")
 	}

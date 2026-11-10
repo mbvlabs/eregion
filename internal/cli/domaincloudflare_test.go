@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/api"
+	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/rpc"
@@ -61,6 +63,69 @@ func TestCloudflareConfigureRefusesNonTerminalBeforeBackend(t *testing.T) {
 	}
 	if backend.calls != 0 {
 		t.Fatal("nonterminal configure reached the backend")
+	}
+}
+
+func TestCloudflareConfigurePromptInterruptIsCancellation(t *testing.T) {
+	backend := &cloudflareCLIBackend{}
+	a := &app{secrets: &secrets.Registry{}, backend: backend}
+	cmd := &cobra.Command{}
+	cmd.Flags().String("zone", "", "")
+	cmd.Flags().String("zone-name", "", "")
+	cmd.SetContext(context.Background())
+
+	secretOrConfirmCalled := false
+	prompts := cloudflarePrompts{
+		input: func(string, string, string) (string, error) {
+			return "", ui.ErrAborted
+		},
+		secret: func(string) (string, error) {
+			secretOrConfirmCalled = true
+			return "", errors.New("token prompt must not run after an interrupt")
+		},
+		confirm: func(string, string, bool) (bool, error) {
+			secretOrConfirmCalled = true
+			return false, errors.New("confirmation must not run after an interrupt")
+		},
+	}
+	if _, err := a.configureCloudflareCredential(cmd, prompts); !errors.Is(err, ui.ErrAborted) {
+		t.Fatalf("prompt interruption = %v, want typed aborted error", err)
+	} else if contract.Classify(err).Code != contract.Cancelled || contract.ExitCode(err) != 130 {
+		t.Fatalf("prompt interruption contract = %s/%d, want cancelled/130", contract.Classify(err).Code, contract.ExitCode(err))
+	}
+	if backend.calls != 0 || secretOrConfirmCalled {
+		t.Fatalf("prompt interruption reached backend=%d secretOrConfirm=%t", backend.calls, secretOrConfirmCalled)
+	}
+}
+
+func TestCloudflareConfigurePromptEOFIsNotCancellation(t *testing.T) {
+	backend := &cloudflareCLIBackend{}
+	a := &app{secrets: &secrets.Registry{}, backend: backend}
+	cmd := &cobra.Command{}
+	cmd.Flags().String("zone", "", "")
+	cmd.Flags().String("zone-name", "", "")
+	cmd.SetContext(context.Background())
+
+	prompts := cloudflarePrompts{
+		input: func(string, string, string) (string, error) {
+			return "", io.EOF
+		},
+		secret: func(string) (string, error) {
+			t.Fatal("token prompt ran after EOF")
+			return "", nil
+		},
+		confirm: func(string, string, bool) (bool, error) {
+			t.Fatal("confirmation ran after EOF")
+			return false, nil
+		},
+	}
+	if _, err := a.configureCloudflareCredential(cmd, prompts); !errors.Is(err, io.EOF) {
+		t.Fatalf("EOF prompt error = %v, want io.EOF", err)
+	} else if errors.Is(err, ui.ErrAborted) || contract.Classify(err).Code == contract.Cancelled {
+		t.Fatalf("EOF was rewritten as prompt cancellation: %v", err)
+	}
+	if backend.calls != 0 {
+		t.Fatalf("EOF reached backend %d times", backend.calls)
 	}
 }
 

@@ -146,12 +146,33 @@ access material and verifies node trust before publishing it locally; exact
 | TOTP human factor | Protects token minting, secret/handoff export and protected destructive actions. `--yes`, JSON and stdin do not satisfy it. |
 | Telemetry credential | WireGuard-only authenticated scrape access, distinct from operator control. Ordinary config output uses a placeholder; explicit protected files contain the real credential. |
 
+`--github-auth` invokes the authenticated `gh` on the operator's machine during
+setup. The acquired repository-read credential is encrypted in the environment
+vault; a later private clone and build run on the build node, not on the
+operator's machine. GitHub delivers webhooks directly to the server, which
+admits and executes the deployment through PostgreSQL and River. The workstation
+does not need to remain online after setup. Local hook administration, the
+stored clone credential and the webhook signing secret remain separate roles;
+rotating one does not automatically rotate the others.
+
 Cloudflare setup needs the **zone ID**, not the account ID: select the DNS zone
 in Cloudflare and use its zone identity with the matching zone name. A rejected
 read validation activates no credential and is not repaired by repeated apply.
 An accepted credential proves read validation, not write permission, DNS
 reconciliation, valid TLS or public reachability. Missing context must be fixed
 before entering the token.
+
+For setup followed by DNS changes, create a Cloudflare API token with
+**Zone → DNS → Edit**, scoped to **Include → Specific zone → the configured
+zone**. Edit includes read/list access, so a separate DNS Read grant is not
+needed. A **Zone → DNS → Read** token can pass setup but cannot authorize
+record changes. Cloudflare's API reference calls the mutation permission
+**DNS Write**; the dashboard calls it **DNS Edit**. Current validation lists
+records using the supplied zone ID; it neither discovers zones nor fetches zone
+details, so **Zone → Zone → Read** is not required and the supplied zone name
+is not independently matched to that ID. See Cloudflare's
+[token permissions](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
+and [DNS listing API](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/list/).
 
 Human flows may prompt only at a real terminal; agent flows need explicit
 flags and JSON/NDJSON and must not prompt. Human-only factor/secret-display
@@ -967,10 +988,14 @@ intermittent alpha.6 timeout. The handler remains synchronous and public errors
 are generic. HTTP server `ReadTimeout` is not the handler-execution deadline.
 
 Readiness still validates Eregion migration history/checksums and River
-versions through the persistent API pool. Four top-level read stages include
+versions through the persistent API pool. Three top-level read stages include
 River's internal table/column/version queries: the initialized path involves
-six logical SQL executions, not just four. The API's pool maximum remains 12;
-worker connections belong to a separate process/pool in the installed layout.
+five logical SQL executions. The redundant outer River-table lookup is removed;
+River still performs its own existence check and handles an absent table. This
+eliminates one serial exchange on the initialized path without weakening
+migration validation, but is not a demonstrated timeout fix. The API's pool
+maximum remains 12; worker connections belong to a separate process/pool in the
+installed layout.
 
 Request-scoped pgx acquire/query/release traces record fixed stage names,
 durations and counts, including row lifetime. Each stage also retains bounded

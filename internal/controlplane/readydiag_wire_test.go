@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mbvlabs/eregion/internal/contract"
 )
 
 // This file exercises the readiness tracer through a real pgxpool connected to
@@ -53,6 +55,15 @@ func (g *fakeGate) Wait(stop <-chan struct{}) error {
 	}
 }
 
+type fakePlanState struct {
+	schemaTableExists bool
+	schemaVersions    []int64
+	riverTableExists  bool
+	riverLineColumn   bool
+	riverVersions     []int64
+	riverFail         bool
+}
+
 type fakePGServer struct {
 	t  *testing.T
 	ln net.Listener
@@ -64,6 +75,7 @@ type fakePGServer struct {
 	mu        sync.Mutex
 	gates     map[string]*fakeGate
 	conns     map[net.Conn]struct{}
+	plan      fakePlanState
 	started   chan string
 	accepted  chan struct{}
 	active    atomic.Int32
@@ -139,6 +151,23 @@ func (s *fakePGServer) gate(name string) *fakeGate {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gates[name]
+}
+
+func (s *fakePGServer) setPlanState(state fakePlanState) {
+	s.mu.Lock()
+	state.schemaVersions = append([]int64(nil), state.schemaVersions...)
+	state.riverVersions = append([]int64(nil), state.riverVersions...)
+	s.plan = state
+	s.mu.Unlock()
+}
+
+func (s *fakePGServer) planState() fakePlanState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.plan
+	state.schemaVersions = append([]int64(nil), state.schemaVersions...)
+	state.riverVersions = append([]int64(nil), state.riverVersions...)
+	return state
 }
 
 func (s *fakePGServer) accept() {
@@ -293,14 +322,39 @@ func (s *fakePGServer) handleQuery(backend *pgproto3.Backend, query string) erro
 		backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("1")}})
 		return s.finishQuery(backend)
 	case strings.Contains(query, "to_regclass"):
-		backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{
-			Name:         []byte("n"),
-			DataTypeOID:  pgtype.BoolOID,
-			DataTypeSize: 1,
-			TypeModifier: -1,
-			Format:       pgproto3.TextFormat,
-		}}})
-		backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte("f")}})
+		state := s.planState()
+		exists := false
+		switch {
+		case strings.Contains(query, "eregion_schema_migrations"):
+			exists = state.schemaTableExists
+		case strings.Contains(query, "river_migration"):
+			exists = state.riverTableExists
+		}
+		s.sendBool(backend, exists)
+		return s.finishQuery(backend)
+	case strings.Contains(query, "eregion_schema_migrations") && strings.Contains(query, "checksum"):
+		state := s.planState()
+		s.sendSchemaMigrations(backend, state.schemaVersions)
+		return s.finishQuery(backend)
+	case strings.Contains(query, "information_schema.columns"):
+		state := s.planState()
+		s.sendBool(backend, state.riverLineColumn)
+		return s.finishQuery(backend)
+	case strings.Contains(query, "river_migration") && strings.Contains(query, "created_at"):
+		state := s.planState()
+		if err := s.gate("river_versions").Wait(s.stop); err != nil {
+			return err
+		}
+		if state.riverFail {
+			backend.Send(&pgproto3.ErrorResponse{Severity: "ERROR", SeverityUnlocalized: "ERROR", Code: "57014", Message: "wire river version failure"})
+			backend.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+			return backend.Flush()
+		}
+		if strings.Contains(query, "WHERE line =") {
+			s.sendRiverVersionsByLine(backend, state.riverVersions)
+		} else {
+			s.sendRiverVersionsLegacy(backend, state.riverVersions)
+		}
 		return s.finishQuery(backend)
 	default:
 		s.sendRowDescription(backend)
@@ -317,6 +371,66 @@ func (s *fakePGServer) sendRowDescription(backend *pgproto3.Backend) {
 		TypeModifier: -1,
 		Format:       pgproto3.TextFormat,
 	}}})
+}
+
+func (s *fakePGServer) sendBool(backend *pgproto3.Backend, value bool) {
+	text := "f"
+	if value {
+		text = "t"
+	}
+	backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{{
+		Name:         []byte("exists"),
+		DataTypeOID:  pgtype.BoolOID,
+		DataTypeSize: 1,
+		TypeModifier: -1,
+		Format:       pgproto3.TextFormat,
+	}}})
+	backend.Send(&pgproto3.DataRow{Values: [][]byte{[]byte(text)}})
+}
+
+func (s *fakePGServer) sendSchemaMigrations(backend *pgproto3.Backend, versions []int64) {
+	backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+		{Name: []byte("version"), DataTypeOID: pgtype.Int4OID, DataTypeSize: 4, TypeModifier: -1, Format: pgproto3.TextFormat},
+		{Name: []byte("checksum"), DataTypeOID: pgtype.TextOID, DataTypeSize: -1, TypeModifier: -1, Format: pgproto3.TextFormat},
+	}})
+	for _, version := range versions {
+		migration, ok := migrationByVersion(int(version))
+		if !ok {
+			continue
+		}
+		backend.Send(&pgproto3.DataRow{Values: [][]byte{
+			[]byte(strconv.FormatInt(version, 10)),
+			[]byte(migrationHash(migration)),
+		}})
+	}
+}
+
+func (s *fakePGServer) sendRiverVersionsByLine(backend *pgproto3.Backend, versions []int64) {
+	backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+		{Name: []byte("line"), DataTypeOID: pgtype.TextOID, DataTypeSize: -1, TypeModifier: -1, Format: pgproto3.TextFormat},
+		{Name: []byte("version"), DataTypeOID: pgtype.Int8OID, DataTypeSize: 8, TypeModifier: -1, Format: pgproto3.TextFormat},
+		{Name: []byte("created_at"), DataTypeOID: pgtype.TimestamptzOID, DataTypeSize: 8, TypeModifier: -1, Format: pgproto3.TextFormat},
+	}})
+	for _, version := range versions {
+		backend.Send(&pgproto3.DataRow{Values: [][]byte{
+			[]byte("main"),
+			[]byte(strconv.FormatInt(version, 10)),
+			[]byte("2026-01-01 00:00:00+00"),
+		}})
+	}
+}
+
+func (s *fakePGServer) sendRiverVersionsLegacy(backend *pgproto3.Backend, versions []int64) {
+	backend.Send(&pgproto3.RowDescription{Fields: []pgproto3.FieldDescription{
+		{Name: []byte("created_at"), DataTypeOID: pgtype.TimestamptzOID, DataTypeSize: 8, TypeModifier: -1, Format: pgproto3.TextFormat},
+		{Name: []byte("version"), DataTypeOID: pgtype.Int8OID, DataTypeSize: 8, TypeModifier: -1, Format: pgproto3.TextFormat},
+	}})
+	for _, version := range versions {
+		backend.Send(&pgproto3.DataRow{Values: [][]byte{
+			[]byte("2026-01-01 00:00:00+00"),
+			[]byte(strconv.FormatInt(version, 10)),
+		}})
+	}
 }
 
 func (s *fakePGServer) finishQuery(backend *pgproto3.Backend) error {
@@ -839,7 +953,7 @@ func TestReadinessWirePlanMigrationsEarlyReturnReleases(t *testing.T) {
 		t.Fatalf("River plan = %+v", plan)
 	}
 	report := trace.report()
-	if len(report.stages) != 2 || report.stages[0].name != "schema_table" || report.stages[1].name != "river_table" {
+	if len(report.stages) != 2 || report.stages[0].name != "schema_table" || report.stages[1].name != "river_versions" {
 		t.Fatalf("early-return stages = %+v", report.stages)
 	}
 	if report.queries != 2 || report.acquires != 2 {
@@ -850,6 +964,230 @@ func TestReadinessWirePlanMigrationsEarlyReturnReleases(t *testing.T) {
 	}
 	if report.poolAfter.acquired != 0 {
 		t.Fatalf("early-return held a lease: %+v", report.poolAfter)
+	}
+}
+
+func riverRequiredVersion(t *testing.T, pool *pgxpool.Pool) int {
+	t.Helper()
+	m, err := migrator(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions := m.AllVersions()
+	if len(versions) == 0 {
+		t.Fatal("River migrator has no versions")
+	}
+	return versions[len(versions)-1].Version
+}
+
+func TestReadinessWirePlanMigrationsRiverExisting(t *testing.T) {
+	server := newFakePGServer(t)
+	pool := newWirePool(t, server, 1)
+	required := riverRequiredVersion(t, pool)
+	server.setPlanState(fakePlanState{riverTableExists: true, riverLineColumn: true, riverVersions: []int64{int64(required)}})
+
+	trace := newReadyTrace(nil)
+	trace.poolBefore = snapshotReadyPool(pool)
+	ctx := context.WithValue(context.Background(), readyTraceKey{}, trace)
+	plan, err := PlanMigrations(ctx, pool)
+	trace.finishContext(ctx, snapshotReadyPool(pool), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.RiverCurrent != required || plan.RiverRequired != required {
+		t.Fatalf("River plan = %+v", plan)
+	}
+	report := trace.report()
+	if len(report.stages) != 2 || report.stages[0].name != "schema_table" || report.stages[1].name != "river_versions" {
+		t.Fatalf("River stages = %+v", report.stages)
+	}
+	if report.stages[1].queries != 3 || report.queries != 4 {
+		t.Fatalf("River query count = %+v, total %d", report.stages[1], report.queries)
+	}
+	if report.acquires != 4 || report.leases != report.released || report.poolAfter.acquired != 0 {
+		t.Fatalf("River leases = acquires %d leases %d released %d after %+v", report.acquires, report.leases, report.released, report.poolAfter)
+	}
+	if len(report.stages[1].queryDetails) != 3 || report.stages[1].queryDetails[2].failed {
+		t.Fatalf("River query ordinals = %+v", report.stages[1].queryDetails)
+	}
+}
+
+func TestReadinessWirePlanMigrationsNormalExistingPathQueryCount(t *testing.T) {
+	server := newFakePGServer(t)
+	pool := newWirePool(t, server, 1)
+	schemaRequired := requiredVersion()
+	schemaVersions := make([]int64, 0, schemaRequired)
+	for version := 1; version <= schemaRequired; version++ {
+		schemaVersions = append(schemaVersions, int64(version))
+	}
+	riverRequired := riverRequiredVersion(t, pool)
+	server.setPlanState(fakePlanState{
+		schemaTableExists: true,
+		schemaVersions:    schemaVersions,
+		riverTableExists:  true,
+		riverLineColumn:   true,
+		riverVersions:     []int64{int64(riverRequired)},
+	})
+
+	trace := newReadyTrace(nil)
+	trace.poolBefore = snapshotReadyPool(pool)
+	ctx := context.WithValue(context.Background(), readyTraceKey{}, trace)
+	plan, err := PlanMigrations(ctx, pool)
+	trace.finishContext(ctx, snapshotReadyPool(pool), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Current != schemaRequired || plan.RiverCurrent != riverRequired {
+		t.Fatalf("normal plan = %+v", plan)
+	}
+	report := trace.report()
+	if len(report.stages) != 3 || report.stages[0].name != "schema_table" ||
+		report.stages[1].name != "schema_migrations" || report.stages[2].name != "river_versions" {
+		t.Fatalf("normal stages = %+v", report.stages)
+	}
+	if report.queries != 5 || report.acquires != 5 {
+		t.Fatalf("normal query count = queries %d acquires %d, want 5/5", report.queries, report.acquires)
+	}
+	if report.leases != report.released || report.poolAfter.acquired != 0 {
+		t.Fatalf("normal leases = leases %d released %d after %+v", report.leases, report.released, report.poolAfter)
+	}
+}
+
+func TestReadinessWirePlanMigrationsRiverLegacyLine(t *testing.T) {
+	server := newFakePGServer(t)
+	pool := newWirePool(t, server, 1)
+	required := riverRequiredVersion(t, pool)
+	server.setPlanState(fakePlanState{riverTableExists: true, riverLineColumn: false, riverVersions: []int64{int64(required)}})
+
+	trace := newReadyTrace(nil)
+	trace.poolBefore = snapshotReadyPool(pool)
+	ctx := context.WithValue(context.Background(), readyTraceKey{}, trace)
+	plan, err := PlanMigrations(ctx, pool)
+	trace.finishContext(ctx, snapshotReadyPool(pool), err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.RiverCurrent != required {
+		t.Fatalf("legacy River plan = %+v", plan)
+	}
+	report := trace.report()
+	if len(report.stages) != 2 || report.stages[1].name != "river_versions" || report.stages[1].queries != 3 {
+		t.Fatalf("legacy River stages = %+v", report.stages)
+	}
+	if report.acquires != 4 || report.leases != report.released || report.poolAfter.acquired != 0 {
+		t.Fatalf("legacy River leases = acquires %d leases %d released %d after %+v", report.acquires, report.leases, report.released, report.poolAfter)
+	}
+}
+
+func TestReadinessWirePlanMigrationsRiverVersionFailure(t *testing.T) {
+	server := newFakePGServer(t)
+	pool := newWirePool(t, server, 1)
+	required := riverRequiredVersion(t, pool)
+	server.setPlanState(fakePlanState{riverTableExists: true, riverLineColumn: true, riverVersions: []int64{int64(required)}, riverFail: true})
+
+	trace := newReadyTrace(nil)
+	trace.poolBefore = snapshotReadyPool(pool)
+	ctx := context.WithValue(context.Background(), readyTraceKey{}, trace)
+	_, err := PlanMigrations(ctx, pool)
+	trace.finishContext(ctx, snapshotReadyPool(pool), err)
+	if err == nil {
+		t.Fatal("River version failure was accepted")
+	}
+	if contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("River version failure code = %s", contract.Classify(err).Code)
+	}
+	report := trace.report()
+	if report.failedStage != "river_versions" || report.queryErrs != 1 {
+		t.Fatalf("River failure report = %+v", report)
+	}
+	if len(report.stages) != 2 || len(report.stages[1].queryDetails) != 3 || !report.stages[1].queryDetails[2].failed {
+		t.Fatalf("River failure ordinals = %+v", report.stages)
+	}
+	if report.errorClass != readinessErrorPostgres {
+		t.Fatalf("River failure class = %q, want postgres", report.errorClass)
+	}
+	if report.leases != report.released || report.poolAfter.acquired != 0 {
+		t.Fatalf("River failure leases = leases %d released %d after %+v", report.leases, report.released, report.poolAfter)
+	}
+}
+
+func TestReadinessWirePlanMigrationsRiverUnknownNewerFailsClosed(t *testing.T) {
+	server := newFakePGServer(t)
+	pool := newWirePool(t, server, 1)
+	required := riverRequiredVersion(t, pool)
+	server.setPlanState(fakePlanState{riverTableExists: true, riverLineColumn: true, riverVersions: []int64{int64(required + 1)}})
+
+	trace := newReadyTrace(nil)
+	trace.poolBefore = snapshotReadyPool(pool)
+	ctx := context.WithValue(context.Background(), readyTraceKey{}, trace)
+	_, err := PlanMigrations(ctx, pool)
+	trace.finishContext(ctx, snapshotReadyPool(pool), err)
+	if err == nil {
+		t.Fatal("an unknown newer River version was accepted")
+	}
+	if contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("unknown newer River version code = %s", contract.Classify(err).Code)
+	}
+	report := trace.report()
+	if report.failedStage != "river_versions" {
+		t.Fatalf("unknown newer River report = %+v", report)
+	}
+	if report.leases != report.released || report.poolAfter.acquired != 0 {
+		t.Fatalf("unknown newer River leases = leases %d released %d after %+v", report.leases, report.released, report.poolAfter)
+	}
+}
+
+func TestReadinessWirePlanMigrationsRiverCancellation(t *testing.T) {
+	server := newFakePGServer(t)
+	pool := newWirePool(t, server, 1)
+	required := riverRequiredVersion(t, pool)
+	gate := newFakeGate()
+	server.setGate("river_versions", gate)
+	server.setPlanState(fakePlanState{riverTableExists: true, riverLineColumn: true, riverVersions: []int64{int64(required)}})
+	t.Cleanup(gate.Release)
+
+	trace := newReadyTrace(nil)
+	trace.poolBefore = snapshotReadyPool(pool)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx = context.WithValue(ctx, readyTraceKey{}, trace)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := PlanMigrations(ctx, pool)
+		done <- err
+	}()
+
+	started := false
+	for !started {
+		select {
+		case query := <-server.started:
+			if strings.Contains(query, "river_migration") && strings.Contains(query, "WHERE line =") {
+				cancel()
+				gate.Release()
+				started = true
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("River version query did not start")
+		}
+	}
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("River cancellation did not return")
+	}
+	trace.finishContext(ctx, snapshotReadyPool(pool), err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("River cancellation = %v, want context.Canceled", err)
+	}
+	report := trace.report()
+	if report.failedStage != "river_versions" || report.queryErrs != 1 || report.contextState != readinessContextCanceled {
+		t.Fatalf("River cancellation report = %+v", report)
+	}
+	if report.leases != report.released {
+		t.Fatalf("River cancellation leases = leases %d released %d", report.leases, report.released)
 	}
 }
 

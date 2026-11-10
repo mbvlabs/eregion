@@ -307,6 +307,18 @@ func TestReadyStillChecksMigrationVersions(t *testing.T) {
 	}
 }
 
+func TestReadinessRefusesNewerRiverSchema(t *testing.T) {
+	// ExistingVersions rejects an unknown newer version before this guard; the
+	// explicit plan check remains covered independently.
+	err := checkRiverPlan(MigrationPlan{Current: 2, Required: 2, RiverCurrent: 8, RiverRequired: 7})
+	if contract.Classify(err).Code != contract.PreconditionFailed || !strings.Contains(err.Error(), "River schema is newer") {
+		t.Fatalf("newer River schema not refused: %v", err)
+	}
+	if err := checkRiverPlan(MigrationPlan{Current: 2, Required: 2, RiverCurrent: 7, RiverRequired: 7}); err != nil {
+		t.Fatalf("current River schema was refused: %v", err)
+	}
+}
+
 func TestReadinessLogRateLimitAndSuppression(t *testing.T) {
 	now := time.Unix(1300, 0)
 	var logs bytes.Buffer

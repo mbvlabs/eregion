@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,9 +12,17 @@ import (
 	"charm.land/huh/v2"
 )
 
+// abortedError is a typed prompt interruption. Unwrapping to context.Canceled
+// lets the shared CLI contract report it as cancelled (exit 130) while
+// errors.Is(err, ErrAborted) still identifies the prompt-specific sentinel.
+type abortedError struct{}
+
+func (abortedError) Error() string { return "prompt cancelled" }
+func (abortedError) Unwrap() error { return context.Canceled }
+
 // ErrAborted is returned when the operator cancels a prompt with Ctrl+C or
-// Esc.
-var ErrAborted = errors.New("prompt cancelled")
+// Esc. It is a cancellation, not an internal failure or a missing answer.
+var ErrAborted error = abortedError{}
 
 // run shows one form on stderr with the eregion theme, with the live area
 // suspended. huh erases the form when it ends, so once it is answered run

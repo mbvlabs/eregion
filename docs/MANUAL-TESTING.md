@@ -66,8 +66,9 @@ Alpha.7 acceptance requires the operator's explicit acceptance of its candidate
 delta evidence. An unexplained readiness timeout remains blocking. Publication,
 live mutation and beta promotion each need separate authorization.
 
-The 2026-11-10 signed-edge record below covers the candidate-upgrade row for
-`edge-079363faf394` on `thelab`/`main`. That is delta evidence, not alpha.7
+The 2026-11-10 signed-edge and fixture-webhook records below cover parts of the
+candidate-upgrade, webhook, workspace, discovery and TUI rows for
+`edge-079363faf394` on `thelab`/`main`. They are delta evidence, not alpha.7
 acceptance or a readiness fix.
 
 ### Beta.1, RC and final gates
@@ -299,10 +300,12 @@ discarded and the evidence directory is mode 0700 with mode-0600 files. The new
 tunnel daemon was left running. Evidence:
 `/tmp/opencode/alpha7-live-qual.preflight/live-20261110-125853/`. This run
 covers the candidate-upgrade row and the unchanged production/staging markers
-for this delta only. Still unqualified: live hook rotation/push, protected
-handoff/login, changed TUI terminal acceptance, real second-machine workspace
-handoff/login, multi-server/shared-IP SSH-pin qualification, Cloudflare adverse
-cases, live server init and macOS installation/upgrade. The persistent API-pool
+for this delta only. Still unqualified from that run: protected handoff/login,
+changed TUI terminal acceptance, real second-machine workspace handoff/login,
+multi-server/shared-IP SSH-pin qualification, Cloudflare adverse cases, live
+server init and macOS installation/upgrade. The later 14:01–14:15 fixture-webhook
+run below supplies live hook rotation/push evidence for `079`; the earlier phase
+performed none. The persistent API-pool
 timeout LABS-346 remains unreproduced and unresolved; no cause-specific fix is
 claimed. Alpha.7 is not complete, no tag or beta promotion is implied, and
 explicit operator acceptance of this delta evidence is still required.
@@ -330,8 +333,277 @@ because some existing tests can start Docker or use an integration database.
 
 Evidence: `/tmp/opencode/offline-alpha7-final-followup.summary.md` and
 `/tmp/opencode/offline-alpha7-followup.summary.md`. These are local implementation
-checks, not signed publication or host qualification of this follow-up.
+checks, not signed publication or host qualification of this follow-up. The
+`6514486f6cc1` (`edge-6514486f6cc1`) diagnostic candidate's artifact handoff and
+host upgrade remain a separate pending qualification; it was not installed or
+validated here, and this local record is not blanket alpha.7 acceptance.
 LABS-346 remains open pending classified live evidence and a verified correction.
+
+### Fixture webhook, workspace and discovery live qualification (`edge-079363faf394`)
+
+**Scope and target.** 2026-11-10, approximately 14:01–14:15 UTC. Context
+`thelab`, node `main`, `46.224.129.96`; explicit
+`EREGION_CONTEXT_FILE=/home/mbv/.config/eregion-fresh-test/contexts.json`, and
+every node call used `/home/mbv/.local/bin/eregion --context thelab`. Installed
+CLI and node were `edge-079363faf394`, commit `079363faf394`, `dirty=false`;
+schema 28/28, River 7/7, workspace `thelab`
+(`ws_779004d145462c0fd7f48868`). Newer
+`6514486f6cc14b1cf256d037ee7c1ecc5e6455e4` (`edge-6514486f6cc1`) was not
+installed; no upgrade or artifact download occurred.
+
+**Workspace identity and dry-run plans.** `server status` and `context show` both
+reported workspace `thelab`/`ws_779004d145462c0fd7f48868`; CLI and node were both
+`edge079`; all six services were true. Valid-name
+`apply --workspace thelab --dry-run` returned rc 0, `would_change=0`,
+`ready=true`, and 22/22 steps complete. Wrong-name
+`apply --workspace lab --dry-run` also returned rc 0 with `ok=true`, but
+`would_change=1` and plan step `host-workspace-v1` incomplete with error
+`the workspace identity is already configured as thelab`; it made no mutation.
+Workspace, services, health and active operations were unchanged. This is
+recorded as a plan-level observation: the conflict appears as an incomplete
+step, **not** an exit-code refusal, and no mutation occurred; it is not claimed
+as a top-level conflict. Final queued/running/cancelling were 0/0/0.
+
+**Agent discovery, help, search and no-TTY.** Non-TTY was confirmed
+(`stdin_tty=no`). Root `eregion --json` returned rc 0, valid `eregion/v1`, 100
+visible commands, version `edge079`; root plain returned rc 0 without ANSI.
+`commands --json` returned rc 0, valid JSON and 100 visible commands, with no
+hidden `node` path; `commands --check-meta --json` returned rc 0 with
+`checked=115`, `ok=true`; `commands --search workspace --json` returned rc 0
+with two matching visible commands; `help apply --json` returned rc 0 with valid
+flag/metadata JSON. All discovery output was ANSI-free. The existing tunnel
+daemon pid `2880221` and handshake `2026-11-10T13:54:07Z` were unchanged; these
+offline commands made no node contact and started no daemon.
+
+**Cloudflare prompt order.** `domain cloudflare configure --context thelab` with
+no TTY returned rc 2 `input_required` ("needs a human at an interactive
+terminal") without a token prompt; the same with `--json` returned rc 2
+structured `input_required` with empty stderr and no token prompt. PTY
+`--context does-not-exist` returned rc 3 `not_found` before any zone/token
+prompt; the captured typescript contained no `Cloudflare zone ID`, `Cloudflare
+zone name`, or `Cloudflare API token` prompt. `domain cloudflare status
+--context does-not-exist --json` returned rc 3 `not_found` with no provider
+call. No Cloudflare credential was created, rotated, read or exported. The
+correct-context human token flow was intentionally not run; credential
+entry/rotation is not needed merely to repeat prompt-order testing, and the
+ordering evidence is limited to these pre-token refusals. That correct-context
+human step is not claimed.
+
+**TUI via PTY.** No-TTY `ui --json` returned rc 2 `invalid_output_mode` ("the
+interactive workspace cannot produce machine output") and launched no TUI. PTY
+launch `ui --tab apps --ascii --no-color --reduced-motion` followed only by `q`
+returned rc 0; it rendered `Apps`, `alpha-five`, `thelab` and `Fleet`, and no
+action key was sent. No residual `eregion ui` process remained. The transcript
+contained alternate-screen exit (`?1049l`), cursor-show (`?25h`) and
+bracketed-paste-off (`?2004l`) sequences; ANSI is expected in a full-screen TUI.
+The TUI is mutating and has no read-only mode, so this was a limited
+inventory/quit smoke. The escape output demonstrates terminal-mode restoration
+events, not full human visual acceptance: wide/narrow resize, real-terminal
+visual restoration and no-color/ASCII review remain human checks.
+
+**GitHub fixture preflight.** App `alpha-five`; staging source
+`https://github.com/mbvlabs/alpha-five-eregion` ref `master`,
+`auto_deploy=true`; production used the same repository/ref with
+`auto_deploy=false`. Hook `709788240` was active for `push` events, content type
+`json`, and its URL matched the node ingress host and expected
+app/environment webhook route; the full URL is retained only as a SHA-256 hash
+in safe evidence. URL, active state and events were unchanged through rotation.
+Checkout `~/work/alpha-five-eregion` was clean `master` at
+`6fceddac583aac6603682a5bcb1a8b7a98b8fdb4`, with expected origin and no
+credential URL; `gh` auth worked (account `MBvisti`), the repository was private
+with default `master`. Initial active staging deploy operations were zero; GitHub
+repository/hook reads succeeded.
+
+**Old-HMAC gate and rotation.** Existing successful delivery
+`3853233692285599744` was a `push` with status `OK`, HTTP 202 and matching
+repository/ref `master`. Its signature was extracted into a 0700/0600 replay
+area; no signature, header, Authorization value or raw payload was printed.
+Only the compact JSON **without LF** candidate was sent: exact HTTP **200** with
+message `pong` (`exact_200_pong=true`); the LF candidate was not sent. This
+proves the old HMAC keypair validated the old body before rotation without a
+deployment or secret export. Dry-run `env update alpha-five staging
+--rotate-webhook-secret --github-webhook --dry-run --json` returned rc 0,
+`changed=[webhook_secret_rotation]`, no operation; hook `updated_at` and webhook
+secret revision 1 were unchanged. Real rotation
+`op_03d3a256e57d897be8645209f475e949` succeeded with
+`webhook_secret_activated=true`. GitHub hook `709788240` reported `updated`,
+`updated_at=2026-11-10T14:03:15Z`, with URL/active/`push`/`json` unchanged;
+webhook secret revision moved **1 → 2** and became active. The rotation emitted
+a natural safe `control-plane readiness slow` summary at 4054 ms; no journal was
+read. Replaying the exact old pair after rotation returned exact HTTP **401**
+with message `invalid GitHub signature` (`exact_401_invalid_signature=true`). No
+second rotation or hook update was performed. The original rotation CLI
+submission was replayed once after rotation and before any `651` upgrade, with
+the same command, flags and idempotency key
+`alpha7-wh-rotate-20261110-140210`; it returned rc 0, the same operation
+`op_03d3a256e57d897be8645209f475e949` and `webhook_replay=true`, with
+`webhook_rotated`, `webhook_secret_activated` and `github_webhook` absent. Its
+message was `Idempotent replay: the original operation is returned; the GitHub
+webhook was NOT retried or verified.` Webhook secret revision stayed **2 → 2**
+active and hook `updated_at` stayed `2026-11-10T14:03:15Z`
+(active/`push`/`json`); there was no GitHub mutation or new operation. Raw output
+was deleted; safe fields remain in `68-replay-safe.txt` and
+`68-replay-safe.json`. This is the replay proof, not an inference from the
+absence of a second rotation. Replay material and raw delivery/hook files were
+shredded; only hashes/booleans remain, and no webhook signature header value or
+raw request header remains in evidence.
+
+**Fresh push, redelivery and other-branch test.** Empty commit
+`test(qualification): verify rotated webhook` produced
+`3f669fe3a92861cac28494d04d13df2b0dee8c3d` and was pushed normally to `master`
+with no force or rewrite. Delivery `3853271865590022144` was a `push` with HTTP
+**202**, and repository/ref `master` plus `after=3f669fe…` matched. Node
+deployment `op_6b6d68c4cd75dc7475bc2997a106d532` succeeded as actor `webhook`
+(`github:mbvlabs/alpha-five-eregion`), target `env/alpha-five/staging`. Staging
+ran release `rel_ccc92b340d2396c39b3583cbf9c73baf` at commit `3f669fe3…`, ready
+and healthy. Production stayed at release
+`rel_7e5930ed6f4595943f87f341e14df402`, commit `5022dc2d…`, healthy and
+unchanged. After the push/redelivery, production returned the
+v1/production/secret-match markers and staging the v3/staging/secret-match
+markers, both HTTP 200 with TLS verify 0.
+
+A single redelivery POST returned HTTP 202; its row had the same GUID
+`cc9f5f36-dd0f-11f1-9413-c30b0f960ebb`, delivered
+`2026-11-10T14:09:10.235Z`, status 202. Operation verification found only the
+original `op_6b6…` deployment and no extra operation. A first `jq` check
+compared only seconds and falsely reported zero; a corrected `startswith` filter
+reported `deploy_ops_after_push=1` and `extra_deploy_ops=0`. Temporary branch
+`alpha7-qualification-20261110-1413` was unused, pushed once, then deleted
+normally; its delivery `3853272652856705024` returned HTTP **200** with `push is
+not to the bound branch`, matching the temporary-branch repository/ref and
+`after=3f669fe…`, and produced no extra deployment operation. Remote and local
+branch were removed. Final checkout was clean `master` at
+`3f669fe3a92861cac28494d04d13df2b0dee8c3d`, local equal to remote, with no
+`alpha7-qualification-*` branch.
+
+**Final state.** CLI/node `edge-079363faf394`, node commit `079363faf394`,
+schema 28/28, River 7/7, workspace `thelab`, all six services true; production
+v1/production/secret markers; staging v3/staging/secret markers;
+queued/running/cancelling 0/0/0; no unhealthy app or active operation observed.
+
+**Natural readiness diagnostics.** Across ordinary operator reads in this phase,
+29 unique safe `control-plane readiness slow` summaries were emitted naturally
+(including three during the same-key rotation replay), min **1000 ms**, max
+**7851 ms**. These were existing sanitized CLI stderr
+summaries from NodeApp RPC reads; no readiness probes were added, no general/raw
+journal was read and no packet/traffic capture was performed. The `079`
+instrumentation lacks the newer runtime/phase/error_class/context_state fields,
+and the expanded fail-closed journal whitelist remains pending the `6514`
+handoff/source review. This is not a reproduction of the persistent API-pool
+timeout and not a fix: the intermittent readiness issue is active in this
+build, and no cause-specific correction is claimed.
+
+**Safety and remaining gates.** No upgrade to `6514`, no unverified binary
+install, no tag/beta, no fresh-server init, no DNS/provider mutation, no GitHub
+push to any other repository, no app/environment/resource/domain deletion, no
+secret read/export, no human-factor bypass, no direct database/shared-DSN test
+and no journal read. The main checkout was not edited, committed, pushed or
+tagged by this phase; the pre-existing `docs/IMPLEMENTATION.md` modification and
+untracked `internal/cli/metrics_qualification_test.go` and `specs/` were not
+touched. The fixture repository received only the authorized empty commit and
+temporary branch. Replay material was shredded; safe hashes/booleans remain, and
+the evidence directory is mode 0700 with files 0600. The owned tunnel daemon pid
+`2880221` (`edge079`) was left running; no user daemon or service was killed.
+
+This run supplies the live hook rotation/push evidence for `079` that the
+earlier 12:59–13:09 delta record left unqualified; it does not broaden that to
+another build or scope. Still unqualified: the `6514486f6cc1` artifact handoff
+(not received), installation and host upgrade as a separate diagnostic
+qualification (its new readiness diagnostics and filter expansion were not
+installed or validated); the correct-context Cloudflare human token flow;
+protected handoff/login at a full TTY and real second-machine workspace login;
+full TUI visual acceptance, including real-terminal restoration and wide/narrow
+resize; multi-server/shared-IP SSH-pin qualification; Cloudflare
+adverse/provider-interruption cases; live server init; and macOS
+installation/upgrade. The `079` intermittent readiness slow remains
+active and unresolved, with no cause-specific fix. Alpha.7 acceptance, beta
+promotion and a clean readiness result are not claimed.
+
+Evidence: `/tmp/opencode/alpha7-qual-20261110-135243/` (0700, files 0600). Key
+files include `55-replay-safe-evidence.txt`, `55-hook-before-safe.json`,
+`55-hook-after-safe.json`, `55-secret-before-safe.json`,
+`55-secret-after-safe.json`, `55-rotate-dryrun-safe.json`,
+`55-rotate-real-safe.json`, `55-operation-safe.json`,
+`68-replay-safe.txt`, `68-replay-safe.json`,
+`67-redelivery-safe-evidence.txt`, `70-branch-safe-evidence.txt`,
+`65-staging-safe.json`, `65-production-safe.json`, `65-deploy-op-safe.json`,
+`80-build.json`, `80-server-status.json`, `80-final-qualification.txt`,
+`81-natural-readiness-summaries.txt` and `90-tui-safe-evidence.txt`.
+
+### Diagnostic candidate publication and live upgrade (`edge-6514486f6cc1`)
+
+Candidate `6514486f6cc14b1cf256d037ee7c1ecc5e6455e4` passed CI
+`42831080539`, including PostgreSQL integration and macOS checks. Publication
+`42831080477` first failed fetching the GitHub Actions OIDC signing identity,
+before upload. One retry of the same tested commit succeeded; the immutable
+manifest and all four binaries passed pinned-identity cosign and SHA-256
+verification. The linux/amd64 binary SHA-256 is
+`667461d7a24f77a15ba30305c4e576a0edfb4148eb340caa96d075dcfc314f2b`.
+No unsigned build was installed. Publication evidence:
+`/tmp/opencode/edge-6514486f6cc1-verify.20261110-140858/`.
+
+On 2026-11-10, 14:34–14:45 UTC, the CLI and `thelab`/`main` were upgraded to
+that exact candidate using the same explicit isolated context store. Previous
+CLI `edge-079363faf394` was preserved. Apply
+`op_b35268cbecd8ac116570d195ea9d0e93` completed with **3 applied / 19 skipped**:
+API, worker and readiness converged; database/workspace steps were skipped.
+Schema **28/28**, River **7/7** and the workspace identity remained unchanged.
+Doctor passed **23/0/0**; all six services were healthy, API/worker active with
+`NRestarts=0`, and active operations were **0/0/0**. Verified HTTPS responses
+preserved production v1/production/secret match and staging v3/staging/secret
+match. No GitHub or DNS mutation occurred in this upgrade phase.
+
+**New diagnostic attribution is live.** A startup API slow summary reported
+1087 ms with `runtime=api`, `phase=startup`, active context and bounded query
+ordinals. One allowed loopback API readiness request returned HTTP 200 in
+1.938788 seconds. Its correlated summary reported `runtime=api`,
+`phase=request`, active context, 1937 ms total, 1759 ms query time, 178 ms
+acquisition time, six queries and zero query errors. Both messages were tied to
+the same PID, service invocation and boot. This establishes a query-dominated
+**API request slowdown**, not the historical five-second timeout or its cause.
+No failure occurred, so live failure-class/failed-stage fields remain
+unobserved. No additional probes, timeout/pool changes or repair restarts were
+used. LABS-346 remains unresolved.
+
+The node lacked `jq`; that extraction path failed closed. A locally tested
+on-node awk whitelist reconstructed only validated new-format diagnostic
+fields and selected process/journal metadata before SSH output. No raw journal
+message, SQL, error text, DSN or credential was emitted.
+
+**Prompt-order pass, cancellation defect found.** A correct-context PTY launch
+of Cloudflare configure reached the zone-ID prompt, then was cancelled before
+any zone or token entry. No provider request or credential change occurred and
+no process remained. Ctrl-C nevertheless exited **70 / internal_error** instead
+of reporting cancellation; this is an open defect, not a clean-cancellation
+pass. Full human visual TUI and protected handoff/login acceptance remain
+unclaimed. Evidence:
+`/tmp/opencode/alpha7-651-live-20261110-143421/LIVE-SUMMARY.md`.
+
+### Prompt cancellation and redundant-query follow-up — local verification
+
+The prompt fix routes the shared typed interruption through the existing
+`cancelled` / exit **130** contract while preserving sentinel matching, EOF and
+genuine fault classifications. The readiness improvement removes only the
+outer River-table existence lookup: the initialized path changes **6 → 5**
+queries, while absent-table bootstrap remains **2 → 2**. River retains its own
+existence/legacy-column handling; application checksum/gap validation and newer
+River refusal remain fail closed. This is not a demonstrated LABS-346 fix.
+
+Independent review cleared both changes. Offline verification passed **158
+top-level / 275 including subtests**, normally and with the race detector, with
+zero failures or skips. Build and vet passed. The source manifest covered 557
+Go files, including the authorized new cancellation regression test, and was
+unchanged before/after: `e9ba04b239dbfe80458387a0280381859e4177678eea43adab5252f59cdfa765`.
+Coverage includes prompt classification/presentation, Cloudflare interruption
+before token/backend activity, unchanged no-TTY gates, River absent/current/
+legacy/newer/error/cancellation paths, webhook boundaries, discovery and
+terminal-model behavior. Unrestricted Docker/DB-capable suites were not run;
+the isolated readiness fake uses only ephemeral loopback connections. Existing
+user-owned untracked files were excluded without reading or changing them.
+Evidence: `/tmp/opencode/offline-alpha7-final2.summary.md`.
+
+These are local implementation checks; signed publication and actual PTY
+cancellation on the resulting candidate still need separate evidence.
 
 ## Historical run evidence
 
