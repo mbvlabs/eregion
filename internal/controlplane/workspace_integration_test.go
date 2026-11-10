@@ -9,7 +9,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 )
 
-func TestWorkspaceAssignmentIsSingletonIdempotentAndImmutable(t *testing.T) {
+func TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 
@@ -58,7 +58,7 @@ func TestWorkspaceAssignmentIsSingletonIdempotentAndImmutable(t *testing.T) {
 	}
 }
 
-func TestConcurrentWorkspaceAssignmentAgrees(t *testing.T) {
+func TestIntegrationConcurrentWorkspaceAssignmentAgrees(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	const workers = 8
@@ -83,7 +83,7 @@ func TestConcurrentWorkspaceAssignmentAgrees(t *testing.T) {
 	}
 }
 
-func TestConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner(t *testing.T) {
+func TestIntegrationConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	names := []string{"alpha", "beta"}
@@ -122,7 +122,7 @@ func TestConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner(t *testing.
 	}
 }
 
-func TestWorkspaceReadBeforeMigrationDoesNotInitialize(t *testing.T) {
+func TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize(t *testing.T) {
 	pool, _ := testPool(t, false)
 	identity, err := ReadWorkspace(context.Background(), pool)
 	if err != nil {
@@ -174,7 +174,7 @@ func applyMigrationsThrough(t *testing.T, pool *pgxpool.Pool, version int) {
 	}
 }
 
-func TestWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIdentity(t *testing.T) {
+func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIdentity(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := context.Background()
 	applyMigrationsThrough(t, pool, 27)
@@ -254,7 +254,7 @@ func TestWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIdentity(t *tes
 	}
 }
 
-func TestAssignWorkspaceRejectsAnInvalidNameBeforeDatabaseAccess(t *testing.T) {
+func TestIntegrationAssignWorkspaceRejectsAnInvalidNameBeforeDatabaseAccess(t *testing.T) {
 	pool, _ := testPool(t, false)
 	_, err := AssignWorkspace(context.Background(), pool, "The Lab")
 	if contract.Classify(err).Code != contract.ValidationFailed {
