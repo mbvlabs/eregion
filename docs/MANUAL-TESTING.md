@@ -602,8 +602,80 @@ the isolated readiness fake uses only ephemeral loopback connections. Existing
 user-owned untracked files were excluded without reading or changing them.
 Evidence: `/tmp/opencode/offline-alpha7-final2.summary.md`.
 
-These are local implementation checks; signed publication and actual PTY
-cancellation on the resulting candidate still need separate evidence.
+These were local implementation checks. The signed publication and actual PTY
+cancellation evidence follows below.
+
+### Final signed-edge qualification (`edge-b04777ce2218`)
+
+Candidate `b04777ce2218f3b544d6db96832cad0e975ccc56` passed CI
+`42841616664` (check, PostgreSQL 17 integration and macOS) and publication
+`42841616638`, both on attempt one. Its immutable manifest and all four platform
+binaries passed pinned-workflow/issuer cosign verification and matched both
+manifest and sidecar SHA-256 values. The installed linux/amd64 binary is
+41,795,744 bytes with SHA-256
+`e65989c57b30d6d3b02f083b851bac99d2076b30d89650b4d00799d52d167c30`.
+Command metadata checked 115 commands; nine isolated offline smoke commands
+passed. No unsigned or moving-pointer substitute was installed.
+
+On 2026-11-10, 15:22–15:28 UTC, the CLI and `thelab`/`main` were upgraded to
+that exact candidate using the explicit isolated context store. The previous
+651 CLI was preserved. Apply `op_371b169cd2470cd6e29c2d845d7a98c8`
+completed with **2 applied / 20 skipped**, generation 9: only API and worker
+service steps executed. Schema **28/28**, River **7/7** and workspace
+`thelab` / `ws_779004d145462c0fd7f48868` were unchanged. Doctor passed
+**23/0/0**; all six services were healthy, API/worker active with
+`NRestarts=0`, and active operations were **0/0/0**. Verified HTTPS responses
+preserved production v1/production/secret match and staging v3/staging/secret
+match. No repeated apply or repair command was used.
+
+**Prompt-cancellation fix — pass.** The correct-context Cloudflare configure
+flow reached the zone-ID prompt; Ctrl-C before any entry exited **130 /
+cancelled**, not 70/internal_error. No process remained. No zone or token was
+entered, and no provider request or credential change occurred. LABS-348 is qualified.
+This does not repeat or replace the protected credential setup flow.
+
+**Readiness limit.** Normal apply skipped the readiness step, and a bounded
+whitelist read of existing API messages since startup found zero slow/failed
+summaries. No extra probe or synthetic load was added. Thus the five-query live
+API path was not observed in this phase; its count/semantic proof is offline and
+CI evidence. The three-stage diagnostic parser was separately checked to accept
+the new bounded format and reject the old four-stage and extra-field forms.
+LABS-346 remains open: neither the performance change nor absence of a new
+message establishes the historical timeout's cause or a verified fix.
+
+Current evidence is retained inside the repository, ignored by Git and
+owner-only:
+
+- `.local/qualification/edge-b04777ce2218-artifacts/` — 69 verified manifest
+  entries; manifest SHA-256
+  `c4d776f31c445485939e42cc14cb4c30d29d6bb8eff9bebaa81f849213094d46`.
+- `.local/qualification/edge-b04777ce2218-live/` — 75 verified manifest entries;
+  manifest SHA-256
+  `a273442688e0152112cc343b823e8ad6ef40dd2425f444d27ff1f62b52eaafa7`.
+
+Full human TUI visual/resize/terminal-restoration acceptance and refreshed
+protected workspace handoff/login remain unqualified. Actual macOS
+installation/upgrade and fresh beta/provider/multi-server gates remain separate.
+No alpha.7 tag, beta promotion or overall acceptance is implied.
+
+### Evidence retention correction (2026-11-10)
+
+Earlier qualification phases incorrectly retained detailed evidence under
+`/tmp/opencode`. By approximately 15:20 UTC, named alpha.7/079 and 651 evidence
+directories were no longer present. The cause is unknown; inspection found no
+repository test cleanup targeting those directories. Do not treat the old
+temporary links above as currently available archives or reconstruct missing
+raw logs from the summaries. Recorded outcomes and hashes remain in Git, but
+the missing detailed evidence limits retrospective re-verification.
+
+Retained qualification evidence now belongs inside this repository under the
+already ignored, owner-only `.local/qualification/` directory. The final b047
+artifact verification is preserved at
+`.local/qualification/edge-b04777ce2218-artifacts/`; its SHA-256 manifest is
+`c4d776f31c445485939e42cc14cb4c30d29d6bb8eff9bebaa81f849213094d46`,
+and all 69 entries verified after copying. Current signed artifact URLs and
+GitHub workflow records are independent sources; they do not replace missing
+historical live evidence.
 
 ## Historical run evidence
 
