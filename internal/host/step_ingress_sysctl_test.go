@@ -60,7 +60,7 @@ func TestIngressSysctlRunsOnlyWithAMainHostname(t *testing.T) {
 	}
 	cfg := Config{Role: RoleMain, Hostname: "main.example.com"}
 	got := strings.Join(ids(cfg), " ")
-	if !strings.Contains(got, "host-ingress-sysctl-v1 host-ingress-v2") {
+	if !strings.Contains(got, "host-ingress-sysctl-v1 host-ingress-v3") {
 		t.Fatalf("main node steps: %s", got)
 	}
 	cfg.Hostname = ""
@@ -68,16 +68,16 @@ func TestIngressSysctlRunsOnlyWithAMainHostname(t *testing.T) {
 	if strings.Contains(got, "host-ingress-sysctl") {
 		t.Fatalf("hostname-less node still gets ingress sysctl: %s", got)
 	}
-	if !strings.Contains(got, "host-ingress-v2") {
+	if !strings.Contains(got, "host-ingress-v3") {
 		t.Fatalf("hostname-less control plane lacks the pinned Caddy prerequisite: %s", got)
 	}
 	steps := ids(cfg)
 	ingress, telemetry := -1, -1
 	for i, id := range steps {
 		switch id {
-		case "host-ingress-v2":
+		case "host-ingress-v3":
 			ingress = i
-		case "host-telemetry-v1":
+		case "host-telemetry-v2":
 			telemetry = i
 		}
 	}

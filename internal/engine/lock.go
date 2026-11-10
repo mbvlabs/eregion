@@ -35,6 +35,19 @@ func Acquire(ctx context.Context, path string, mode LockMode, timeout time.Durat
 	if err := EnsureDir(filepath.Dir(path)); err != nil {
 		return nil, err
 	}
+	return acquireFile(ctx, path, mode, timeout)
+}
+
+// AcquireFile takes a filesystem lock without creating or changing its parent
+// directory. It is for a lock shared through a directory whose mode and
+// ownership are managed by another party (for example the Caddy route
+// directory); callers must ensure the directory and lock file permissions are
+// usable by every cooperating process.
+func AcquireFile(ctx context.Context, path string, mode LockMode, timeout time.Duration) (Release, error) {
+	return acquireFile(ctx, path, mode, timeout)
+}
+
+func acquireFile(ctx context.Context, path string, mode LockMode, timeout time.Duration) (Release, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600) //nolint:gosec // G304: fixed node state path.
 	if err != nil {
 		return nil, err

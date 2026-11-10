@@ -17,7 +17,7 @@ import (
 
 // nodeMetricsClient is the small read boundary for node-local metrics. It is
 // optional on Backend so an injected test backend can serve only the commands
-// it exercises; a real saved context always returns *nodeClient.
+// it exercises; a real saved workspace access always returns *nodeClient.
 type nodeMetricsClient interface {
 	NodeMetrics(context.Context) (telemetry.NodeSnapshot, error)
 }
@@ -27,7 +27,7 @@ func (a *app) metricsSpecs() []spec {
 		"eregion metrics show")
 	parentMeta.WhenToUse = []string{
 		"Read CPU, memory, filesystem, load and uptime from the node's local node_exporter through SSH.",
-		"Configure an authenticated Prometheus or Grafana Alloy scrape over WireGuard, and rotate its credential.",
+		"Configure an authenticated Prometheus or Grafana Alloy scrape over the main hostname's public HTTPS telemetry paths, and rotate its credential.",
 		"There is no central telemetry server, metric store, PromQL endpoint or retained history: the snapshot is one current sample and the endpoint serves current metrics only.",
 	}
 	parentMeta.Next = []string{"eregion doctor", "eregion server status --json"}
@@ -43,22 +43,23 @@ func (a *app) metricsSpecs() []spec {
 	showMeta.Next = []string{"eregion metrics endpoint", "eregion doctor"}
 	showMeta.OutputModes = []string{"plain", "json"}
 
-	endpointMeta := operationMeta("Show the authenticated WireGuard telemetry endpoint and its discovery path",
+	endpointMeta := operationMeta("Show the authenticated public HTTPS telemetry endpoint and its discovery path",
 		"eregion metrics endpoint --json")
 	endpointMeta.WhenToUse = []string{
-		"Inspect the WireGuard-only Caddy metrics endpoint and HTTP service-discovery URL before configuring a scraper.",
-		"It reports whether the endpoint credential is configured and whether this machine holds the matching local credential; no password or hash is printed.",
+		"Inspect the public HTTPS metrics and HTTP service-discovery URLs before configuring an external Prometheus or Grafana Alloy scraper.",
+		"It reports whether the gateway credential is configured and whether this machine holds the matching local credential; no password or hash is printed.",
+		"A missing public hostname is reported as unconfigured; it never falls back to a WireGuard or loopback target address.",
 	}
 	endpointMeta.Examples = []string{"eregion metrics endpoint", "eregion metrics endpoint --json"}
 	endpointMeta.Next = []string{"eregion metrics rotate", "eregion doctor"}
 	endpointMeta.OutputModes = []string{"plain", "json"}
 
-	configMeta := operationMeta("Generate Prometheus and Grafana Alloy scrape configs for the local endpoint",
+	configMeta := operationMeta("Generate Prometheus and Grafana Alloy scrape configs for the public HTTPS endpoint",
 		"eregion metrics config --format prometheus --out ./eregion-scrape.yml")
 	configMeta.WhenToUse = []string{
-		"Copy a scrape configuration that follows the endpoint's HTTP service discovery. Ordinary output uses a password placeholder.",
+		"Copy a scrape configuration that follows the endpoint's public HTTPS HTTP service discovery. Ordinary output uses a password placeholder.",
 		"With --format and --out, write one owner-only file containing the real credential; the file is written once and never printed.",
-		"Prometheus or Grafana Alloy must reach the node as a WireGuard peer. The endpoint is never public.",
+		"Both discovery and scrape use basic authentication, and TLS verification uses the system trust store by default.",
 	}
 	configMeta.Examples = []string{
 		"eregion metrics config",
@@ -72,7 +73,7 @@ func (a *app) metricsSpecs() []spec {
 	rotateMeta := operationMeta("Replace the authenticated telemetry credential",
 		"eregion metrics rotate --confirm main/metrics")
 	rotateMeta.WhenToUse = []string{
-		"Replace the basic-auth password used by every scraper. The node receives only a bcrypt hash; the new password is stored owner-only in this machine's context and is shown only through the protected handoff or an explicit metrics config --out file. The previous local credential is restored if the node request fails.",
+		"Replace the basic-auth password used by every scraper. The node receives only a bcrypt hash; the new password is stored owner-only in the resolved workspace credential directory and is shown only through the protected handoff or an explicit metrics config --out file. The previous local credential is restored if the node request fails.",
 		"Scrapers using the old password fail until they are updated. The command warns that the server handoff is stale.",
 	}
 	rotateMeta.Examples = []string{"eregion metrics rotate --dry-run --json", "eregion metrics rotate --confirm main/metrics"}
@@ -107,7 +108,7 @@ func (a *app) metricsShow(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	metrics, ok := client.(nodeMetricsClient)
 	if !ok {
-		return result{}, contract.NewFault(contract.Internal, "this client cannot read node metrics", "Use a saved context over SSH inside WireGuard, not an injected client.")
+		return result{}, contract.NewFault(contract.Internal, "this client cannot read node metrics", "Use a saved workspace over SSH inside WireGuard, not an injected client.")
 	}
 	snapshot, err := metrics.NodeMetrics(cmd.Context())
 	if err != nil {

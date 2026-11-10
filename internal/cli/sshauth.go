@@ -136,7 +136,7 @@ func expandHome(path string) string {
 	return path
 }
 
-// contextKnownHostsPath is the pinned host keys of one saved context. Every
+// contextKnownHostsPath is the pinned host keys of one workspace access record. Every
 // node is reached at the same WireGuard address, so a shared known_hosts file
 // cannot tell two nodes' host keys apart.
 func contextKnownHostsPath(name string) (string, error) {

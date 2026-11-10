@@ -1286,7 +1286,7 @@ func validateGitURLShape(raw string) error {
 }
 
 // domainDNSRecord returns the A record the operator must create for the
-// environment's public hostname, when the saved context exposes an IPv4.
+// environment's public hostname, when the saved workspace access exposes an IPv4.
 func domainDNSRecord(domain string, cmd *cobra.Command) (hostDNSRecord, bool) {
 	if domain == "" {
 		return hostDNSRecord{}, false

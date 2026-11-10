@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
 func TestPinnedCaddyArtifactsAndInputs(t *testing.T) {
@@ -36,7 +38,7 @@ func TestPinnedCaddyArtifactsAndInputs(t *testing.T) {
 				t.Fatalf("inputs lack %q: %s", want, raw)
 			}
 		}
-		if step.ID() != "host-ingress-v2" {
+		if step.ID() != "host-ingress-v3" {
 			t.Fatal("changed installation must use a new host step version")
 		}
 	}
@@ -371,17 +373,243 @@ func TestPublicAPIPathsReachTheHandlers(t *testing.T) {
 // A Caddyfile change on the pinned binary must reload, so a host upgrade does
 // not drop every site's connections; a changed binary must restart.
 func TestCaddyActivationRestartsOnlyForANewBinary(t *testing.T) {
-	reload := caddyActivateScript(false)
+	reload := caddyActivateScript("/etc/caddy/Caddyfile", false)
 	if !strings.Contains(reload, "systemctl reload-or-restart caddy.service") || strings.Contains(reload, "systemctl restart caddy.service") {
 		t.Fatalf("pinned binary does not reload:\n%s", reload)
 	}
-	restart := caddyActivateScript(true)
+	restart := caddyActivateScript("/etc/caddy/Caddyfile", true)
 	if !strings.Contains(restart, "systemctl restart caddy.service") || strings.Contains(restart, "reload-or-restart") {
 		t.Fatalf("new binary does not restart:\n%s", restart)
 	}
 	for _, script := range []string{reload, restart} {
-		if !strings.HasPrefix(script, "set -euo pipefail\n"+CaddyBinaryPath+" validate ") || !strings.HasSuffix(script, "systemctl is-active --quiet caddy.service") {
+		if !strings.HasPrefix(script, "set -euo pipefail\n"+CaddyBinaryPath+" validate --config '/etc/caddy/Caddyfile' ") ||
+			!strings.HasSuffix(script, "systemctl is-active --quiet caddy.service") {
 			t.Fatalf("activation must validate first and verify last:\n%s", script)
 		}
+	}
+}
+
+func TestPublicTelemetryPathsAreExactAndUnrelatedMetricsPathsStayDenied(t *testing.T) {
+	matches := func(requestPath string) bool {
+		for _, pattern := range []string{telemetry.MetricsPath, telemetry.DiscoveryPath} {
+			if caddyPathMatch(pattern, requestPath) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, public := range []string{"/metrics/node", "/metrics/targets.json"} {
+		if !matches(public) {
+			t.Errorf("%s is not owned by the public telemetry proxy", public)
+		}
+	}
+	for _, private := range []string{"/metrics", "/metrics/", "/metrics/node/", "/metrics/node/extra", "/metrics/targets.json/extra", "/metrics/other", "/node", "/targets.json"} {
+		if matches(private) {
+			t.Errorf("%s must not match a public telemetry route", private)
+		}
+	}
+}
+
+func TestIngressCaddyfileOwnsOnlyExactTelemetryPathsWithExplicitGatewayHost(t *testing.T) {
+	step := &ingressStep{cfg: Config{Hostname: "main.example.com", APIListen: "127.0.0.1:8080"}}
+	site := string(step.caddyfile())
+	for _, want := range []string{
+		"import /etc/caddy/eregion.d/*.caddy",
+		"@api path /readyz",
+		"handle /metrics/node {",
+		"rewrite * /node",
+		"handle /metrics/targets.json {",
+		"rewrite * /targets.json",
+		"reverse_proxy 127.0.0.1:9101",
+		"header_up Host 127.0.0.1:9101",
+		"dial_timeout 2s",
+		"handle {\n\t\trespond 404",
+	} {
+		if !strings.Contains(site, want) {
+			t.Fatalf("public Caddyfile missing %q:\n%s", want, site)
+		}
+	}
+	for _, unwanted := range []string{"handle /metrics/*", "path /metrics", "header_up -Authorization", "header_up -Cookie", "10.78.0.1", "127.0.0.1:9100", "eregion-telemetry"} {
+		if strings.Contains(site, unwanted) {
+			t.Fatalf("public Caddyfile contains %q:\n%s", unwanted, site)
+		}
+	}
+}
+
+func TestIngressCaddyfileAdaptsWithPinnedCaddy(t *testing.T) {
+	bin := os.Getenv("EREGION_CADDY_BIN")
+	if bin == "" {
+		t.Skip("set EREGION_CADDY_BIN to a pinned Caddy binary to adapt the generated public Caddyfile")
+	}
+	dir := t.TempDir()
+	routesDir := filepath.Join(dir, "eregion.d")
+	if err := os.MkdirAll(routesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A secret-free local application route; never touch the real
+	// /etc/caddy/eregion.d files.
+	fixture := filepath.Join(routesDir, "app.caddy")
+	if err := os.WriteFile(fixture, []byte("app.example.com {\n\treverse_proxy 127.0.0.1:40001\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	step := &ingressStep{cfg: Config{Hostname: "main.example.com", APIListen: "127.0.0.1:8080"}}
+	configPath := filepath.Join(dir, "Caddyfile")
+	if err := os.WriteFile(configPath, step.caddyfileForRoutesDir(routesDir), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "adapt", "--config", configPath, "--adapter", "caddyfile")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("public Caddyfile rejected by %s adapt: %v\n%s", bin, err, output)
+	}
+	for _, want := range []string{"main.example.com", "/metrics/node", "/metrics/targets.json", "127.0.0.1:9101", "app.example.com"} {
+		if !strings.Contains(string(output), want) {
+			t.Fatalf("adapted public Caddyfile output is missing %q:\n%s", want, output)
+		}
+	}
+}
+
+type caddyRollbackExec struct {
+	scripts          []string
+	activations      int
+	firstErr         error
+	cancel           context.CancelFunc
+	recoveryCtx      context.Context
+	recoveryLive     bool
+	recoveryDeadline bool
+	recoveryValue    any
+}
+
+func (e *caddyRollbackExec) Output(_ context.Context, script string) (string, error) {
+	if strings.Contains(script, "caddy version") {
+		return "v" + CaddyVersion, nil
+	}
+	return "", nil
+}
+
+func (e *caddyRollbackExec) Run(ctx context.Context, _ string, script string, _ map[string]string, _ engine.Reporter) error {
+	e.scripts = append(e.scripts, script)
+	if strings.Contains(script, "systemctl") {
+		e.activations++
+		if e.activations == 1 {
+			if e.cancel != nil {
+				e.cancel()
+			}
+			if e.firstErr != nil {
+				return e.firstErr
+			}
+			return errors.New("activation rejected")
+		}
+		e.recoveryCtx = ctx
+		e.recoveryLive = ctx.Err() == nil
+		_, e.recoveryDeadline = ctx.Deadline()
+		e.recoveryValue = ctx.Value(testContextKey("recovery"))
+	}
+	return nil
+}
+
+type testContextKey string
+
+func TestIngressApplyRollsBackOnlyTheRootCaddyfileUnderBothUMasks(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		umask int
+	}{
+		{name: "umask 077", umask: 0o077},
+		{name: "umask 022", umask: 0o022},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withUmaskTest(tc.umask, func() {
+				dir := t.TempDir()
+				configPath := filepath.Join(dir, "Caddyfile")
+				if err := os.WriteFile(configPath, []byte("old.example.com { respond ok }\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				// os.WriteFile applies the process umask. The fixture is meant to
+				// represent an existing 0644 root config, so set it explicitly.
+				if err := os.Chmod(configPath, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				exec := &caddyRollbackExec{}
+				cfg := DefaultConfig(RoleMain, "main")
+				cfg.Hostname = "main.example.com"
+				step := &ingressStep{cfg: cfg, exec: exec, configPath: configPath, lockPath: filepath.Join(dir, "ingress.lock")}
+				_, err := step.Apply(context.Background(), engine.Runtime{}, nil)
+				if err == nil || !strings.Contains(err.Error(), "activation rejected") {
+					t.Fatalf("apply = %v, want the activation failure", err)
+				}
+				raw, mode, exists, err := fileState(configPath)
+				if err != nil || !exists || mode != 0o644 || string(raw) != "old.example.com { respond ok }\n" {
+					t.Fatalf("previous root Caddyfile was not restored: %q mode=%04o exists=%t err=%v", raw, mode, exists, err)
+				}
+				if len(exec.scripts) < 3 || !strings.Contains(strings.Join(exec.scripts, "\n"), "caddy validate") {
+					t.Fatalf("activation/rollback scripts = %v", exec.scripts)
+				}
+				if exec.activations != 2 {
+					t.Fatalf("failed activation was not followed by exactly one rollback activation: %d", exec.activations)
+				}
+			})
+		})
+	}
+}
+
+func TestIngressRollbackUsesLiveRecoveryContextAfterCancellation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		firstErr  error
+		cancel    bool
+		wantCode  contract.Code
+		wantError error
+	}{
+		"cancelled": {
+			firstErr: context.Canceled, cancel: true,
+			wantCode: contract.Cancelled, wantError: context.Canceled,
+		},
+		"deadline": {
+			firstErr: context.DeadlineExceeded,
+			wantCode: contract.Unavailable, wantError: context.DeadlineExceeded,
+		},
+		"engine interrupted with canceled caller": {
+			firstErr: engine.ErrInterrupted, cancel: true,
+			wantCode: contract.Cancelled, wantError: context.Canceled,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "Caddyfile")
+			previous := []byte("old.example.com { respond ok }\n")
+			if err := os.WriteFile(configPath, previous, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(configPath, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			exec := &caddyRollbackExec{firstErr: tc.firstErr}
+			ctx := context.WithValue(context.Background(), testContextKey("recovery"), "preserved")
+			if tc.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				exec.cancel = cancel
+			}
+			cfg := DefaultConfig(RoleMain, "main")
+			cfg.Hostname = "main.example.com"
+			step := &ingressStep{cfg: cfg, exec: exec, configPath: configPath, lockPath: filepath.Join(dir, "ingress.lock")}
+			_, err := step.Apply(ctx, engine.Runtime{}, nil)
+			if !errors.Is(err, tc.wantError) || contract.Classify(err).Code != tc.wantCode {
+				t.Fatalf("apply error = %v class=%s, want %s", err, contract.Classify(err).Code, tc.wantCode)
+			}
+			if exec.recoveryCtx == nil || !exec.recoveryLive {
+				t.Fatalf("recovery ran with a cancelled context: %+v", exec.recoveryCtx)
+			}
+			if !exec.recoveryDeadline {
+				t.Fatal("recovery context has no finite deadline")
+			}
+			if exec.recoveryValue != "preserved" {
+				t.Fatal("recovery context lost the original values")
+			}
+			raw, err := os.ReadFile(configPath)
+			if err != nil || !bytes.Equal(raw, previous) {
+				t.Fatalf("previous root Caddyfile was not restored: %q err=%v", raw, err)
+			}
+		})
 	}
 }

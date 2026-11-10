@@ -48,17 +48,22 @@ func (b *metricsAccessBackend) MetricsRotate(_ context.Context, hash, confirm st
 	}
 	b.endpoint.Credential = true
 	return telemetry.Rotation{
-		Schema: telemetry.RotationSchema, Node: b.endpoint.Node, Username: telemetry.Username,
+		Schema: telemetry.RotationSchema, Node: b.endpoint.Node, Hostname: b.endpoint.Hostname, Username: telemetry.Username,
 		MetricsURL: b.endpoint.MetricsURL, Discovery: b.endpoint.DiscoveryURL,
 	}, nil
 }
 
 func newMetricsAccessBackend(configured bool) *metricsAccessBackend {
+	state := telemetry.EndpointStatePendingCredential
+	if configured {
+		state = telemetry.EndpointStateConfigured
+	}
 	return &metricsAccessBackend{endpoint: telemetry.EndpointInfo{
-		Schema: telemetry.EndpointSchema, Node: "main", Listen: "10.78.0.1:9101",
+		Schema: telemetry.EndpointSchema, Node: "main", Hostname: "main.example.com", State: state,
+		Listen:      telemetry.GatewayListenAddress,
 		MetricsPath: telemetry.MetricsPath, DiscoveryPath: telemetry.DiscoveryPath,
-		Access: "wireguard", Public: false, Authentication: "basic", Credential: configured,
-		MetricsURL: "http://10.78.0.1:9101/node", DiscoveryURL: "http://10.78.0.1:9101/targets.json",
+		Access: "public_https", Public: true, Authentication: "basic", Credential: configured,
+		MetricsURL: "https://main.example.com/metrics/node", DiscoveryURL: "https://main.example.com/metrics/targets.json",
 		Upstream: "http://127.0.0.1:9100",
 	}}
 }
@@ -101,7 +106,8 @@ func runMetricsAccessCLI(t *testing.T, backend *metricsAccessBackend, args ...st
 func TestMetricsConfigUsesPlaceholderAndWritesOwnerOnlyCredentialFile(t *testing.T) {
 	credential, backend := metricsAccessFixture(t, true)
 	exit, stdout, stderr := runMetricsAccessCLI(t, backend, "metrics", "endpoint", "--json")
-	if exit != 0 || stderr != "" || !strings.Contains(stdout, "10.78.0.1:9101") {
+	if exit != 0 || stderr != "" || !strings.Contains(stdout, "main.example.com") ||
+		!strings.Contains(stdout, "127.0.0.1:9101") || strings.Contains(stdout, "10.78.0.1") {
 		t.Fatalf("endpoint exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
 	}
 	exit, stdout, stderr = runMetricsAccessCLI(t, backend, "metrics", "config", "--json")
@@ -170,7 +176,7 @@ func TestMetricsConfigTargetsFileNeedsNoCredential(t *testing.T) {
 		t.Fatalf("targets out exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
 	}
 	raw, err := os.ReadFile(out)
-	if err != nil || !strings.Contains(string(raw), "10.78.0.1:9101") {
+	if err != nil || !strings.Contains(string(raw), "main.example.com:443") || strings.Contains(string(raw), "10.78.0.1") {
 		t.Fatalf("targets file = %s err=%v", raw, err)
 	}
 }
@@ -189,6 +195,27 @@ func TestMetricsConfigRefusesCredentialFileWithoutLocalCredential(t *testing.T) 
 	exit, stdout, _ := runMetricsAccessCLI(t, backend, "metrics", "config", "--format", "prometheus", "--out", filepath.Join(t.TempDir(), "scrape.yml"), "--json")
 	if exit == 0 {
 		t.Fatalf("config without a credential succeeded:\n%s", stdout)
+	}
+}
+
+func TestMetricsConfigRefusesAnUnconfiguredHostnameWithoutAFallback(t *testing.T) {
+	_, backend := metricsAccessFixture(t, true)
+	backend.endpoint.State = telemetry.EndpointStateUnconfigured
+	backend.endpoint.Hostname = ""
+	backend.endpoint.MetricsURL = ""
+	backend.endpoint.DiscoveryURL = ""
+	backend.endpoint.Public = false
+	backend.endpoint.Access = telemetry.EndpointStateUnconfigured
+	backend.endpoint.Authentication = "none"
+	backend.endpoint.Credential = false
+	exit, stdout, _ := runMetricsAccessCLI(t, backend, "metrics", "config", "--json")
+	if exit == 0 {
+		t.Fatalf("config invented a target for a hostname-less node:\n%s", stdout)
+	}
+	for _, forbidden := range []string{"10.78.0.1", "127.0.0.1:9101", "127.0.0.1:9100"} {
+		if strings.Contains(stdout, forbidden) {
+			t.Fatalf("config output contained fallback target %q:\n%s", forbidden, stdout)
+		}
 	}
 }
 
@@ -256,10 +283,13 @@ func TestMetricsEndpointDescribeIsSafe(t *testing.T) {
 	}
 	view := metricsEndpointView{EndpointInfo: info, LocalCredential: true}
 	text := metricsEndpointText(view)
-	for _, want := range []string{"10.78.0.1:9101", "targets.json", "WireGuard only", "credential", "present"} {
+	for _, want := range []string{"main.example.com", "https://main.example.com/metrics/node", "127.0.0.1:9101", "public HTTPS", "credential", "present"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("endpoint text missing %q:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "WireGuard only") || strings.Contains(text, "10.78.0.1") {
+		t.Fatalf("endpoint text retained the private endpoint:\n%s", text)
 	}
 	raw, _ := json.Marshal(view)
 	if strings.Contains(string(raw), credential.Password) || strings.Contains(string(raw), "$2") {

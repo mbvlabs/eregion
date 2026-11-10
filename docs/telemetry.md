@@ -2,18 +2,18 @@
 
 The product decision is MASTER D5: every node (currently the main node) runs
 node_exporter from setup on, bound to **loopback only**. Telemetry is
-**node-local**: one request-scoped snapshot for the operator, and one
-WireGuard-only authenticated endpoint for an external scraper. There is no
-central telemetry server, Prometheus/Grafana/Loki deployment, metric or log
-database, external backend, global PromQL query, public endpoint or retained
-metric history. Operation history is PostgreSQL data and never depends on
-telemetry.
+**node-local**: one request-scoped snapshot for the operator, and authenticated
+public HTTPS metrics/discovery paths for an external scraper, backed by the
+existing main hostname and public ingress. There is no central telemetry
+server, Prometheus/Grafana/Loki deployment, metric or log database, external
+backend, global PromQL query or retained metric history. Operation history is
+PostgreSQL data and never depends on telemetry.
 
 ## Operator read path
 
 ```text
 operator CLI
-  -> saved context: SSH in embedded userspace WireGuard
+  -> saved workspace access: SSH in embedded userspace WireGuard
   -> `eregion node rpc` on the node
   -> metrics.show: node_exporter on 127.0.0.1:9100
   -> bounded current NodeSnapshot (discarded when the command exits)
@@ -111,59 +111,93 @@ missing/ambiguous scrape-error sample or a non-zero/ambiguous one fails;
 duplicate, timestamped or malformed collector success samples are also
 ambiguous and fail closed. A down WireGuard interface does not hide the
 loopback exporter or its strict directory state. `telemetry.endpoint` probes
-`/targets.json` without a credential: 401 is healthy, 200 is an unauthenticated
-exposure and fails, a node without the telemetry Caddyfile warns until
-rotation, and WireGuard down leaves that external observation unobserved as
-warn. Neither check stores a sample, produces history or replaces `metrics
-show`. The total number of doctor rows is not a fixed contract: compare the
-reported summary and the named rows, not an assumed count.
+the public HTTPS discovery path through local Caddy with the real hostname:
+401 is healthy, 200 is an unauthenticated exposure and fails, a missing public
+hostname or gateway credential warns until configured, and WireGuard state does
+not gate the public HTTPS observation. Neither check stores a sample, produces
+history or replaces `metrics show`. The total number of doctor rows is not a
+fixed contract: compare the reported summary and the named rows, not an assumed
+count.
 
 ## Authenticated endpoint and discovery
 
-Eregion adapts vaire's nginx metrics endpoint to a **dedicated Caddy instance**,
-separate from the public ingress Caddy. `host-telemetry-v1` ensures
-`/etc/eregion-telemetry/targets.json` (`root:caddy 0640`, no secret), the
-`eregion-telemetry.service` unit and the WireGuard-only firewall rule. The
-Caddyfile is `/etc/eregion-telemetry/Caddyfile`, written by `metrics rotate`,
-not by `apply`, so an apply never replaces a newer credential with an older
-one. The dedicated instance has its own `admin off`, Caddyfile, autosave/data
-directories (isolated from public Caddy) and `StateDirectory`; public
-`caddy.service`, `/etc/caddy/Caddyfile` and `/etc/caddy/eregion.d/*.caddy` are
-never touched by telemetry. A missing `wg0`, an invalid telemetry Caddyfile or
-a failed telemetry restart therefore cannot stop public ingress.
+Eregion adapts vaire's nginx metrics endpoint to the **existing public ingress
+Caddy** plus a **dedicated loopback gateway**, separate from application route
+ownership. `host-telemetry-v2` ensures
+`/etc/eregion-telemetry/targets.json` (`root:caddy 0640`, no secret) and the
+`eregion-telemetry.service` unit on `127.0.0.1:9101`. The gateway Caddyfile is
+`/etc/eregion-telemetry/Caddyfile`, written by `metrics rotate` and by an apply
+that preserves its existing hash. The dedicated instance has its own `admin
+off`, Caddyfile, autosave/data directories and `StateDirectory`; public
+`caddy.service` and `/etc/caddy/eregion.d/*.caddy` application routes are
+separate, and telemetry never rewrites the worker's app fragment. A missing
+gateway credential, a stopped gateway or an absent `wg0` therefore cannot stop
+public ingress or application activation: the exact telemetry paths fail with a
+bounded gateway error while every other public route keeps serving.
 
-The unit runs the same pinned Caddy binary as `User=caddy`, waits for
-`network-online.target` and `wg-quick@wg0.service`, and requires the telemetry
-Caddyfile before starting. It is `BindsTo=wg-quick@wg0.service` and
-`WantedBy=multi-user.target wg-quick@wg0.service`, so every wg start/restart
-also starts the telemetry instance; a missing wg0 is not a permanent skip. It
-restarts on failure. The site uses an explicit `bind 10.78.0.1`; the site
-address alone is only a Host matcher. It listens only on `10.78.0.1:9101`; ufw
-opens 9101 only on `wg0`, a failing ufw rule fails host apply rather than being
-swallowed, and `host-telemetry-v1` Check compares `ufw show added` against the
-exact rule so drift is repaired on the next apply. If ufw is unavailable the
-check reports it as unobserved rather than failing the step, matching Apply's
-existing skip. It serves two basic-auth paths:
+The root `/etc/caddy/Caddyfile` is owned by the bootstrap step
+`host-ingress-v3` and imports the worker-owned application fragment. It owns
+only the existing API allowlist plus two exact telemetry paths. It does not use
+a `/metrics/*` catch-all:
 
-- `/node` reverse-proxies `http://127.0.0.1:9100/metrics` and strips the
-  scraper's `Authorization`/`Cookie` headers before the loopback request;
+- `/metrics/node` rewrites to the gateway's fixed `/node` path;
+- `/metrics/targets.json` rewrites to the gateway's fixed `/targets.json` path.
+
+Both proxy to the loopback gateway with an explicit upstream `Host:
+127.0.0.1:9101` (Caddy would otherwise preserve the public Host) and forward the
+scraper's `Authorization` header to the gateway. The gateway requires basic
+authentication and strips `Authorization`/`Cookie` before calling the raw
+exporter. The raw exporter remains `127.0.0.1:9100` and is never public.
+
+The gateway unit runs the same pinned Caddy binary as `User=caddy`, waits only
+for `network-online.target`, requires the gateway Caddyfile before starting and
+is `WantedBy=multi-user.target`. It has no `BindsTo`, `Wants`/`After` or
+`WantedBy` relationship with `wg-quick@wg0.service`, and it does not bind the
+WireGuard address. `host-telemetry-v2` removes only the exact legacy
+`ufw allow in on wg0 to 10.78.0.1 port 9101 proto tcp` rule when present; it
+never creates that rule and never deletes a foreign rule. A removal failure is
+surfaced rather than swallowed. On a hostname-less control plane the step
+verifies the old gateway is both disabled and inactive, not merely stopped. If
+ufw is unavailable the check reports it as unobserved rather than failing the
+step. The gateway serves two basic-auth paths:
+
+- `/node` reverse-proxies `http://127.0.0.1:9100/metrics`, rewrites the path to
+  `/metrics`, and strips the scraper's `Authorization`/`Cookie` headers before
+  the loopback request;
 - `/targets.json` serves the HTTP service-discovery document. One entry names
-  `10.78.0.1:9101` with `__metrics_path__: /node`, `__scheme__: http`,
-  `eregion_node`, `eregion_component: node`, `eregion_access: wireguard` and
-  `eregion_public: false`.
+  the main public hostname on port 443 with `__metrics_path__: /metrics/node`,
+  `__scheme__: https`, `eregion_node`, `eregion_component: node`,
+  `eregion_access: public_https` and `eregion_public: true`.
 
-The telemetry Caddyfile (`root:caddy 0640`) carries only the basic-auth
-username and a bcrypt hash, never the password. There is no TLS terminator
-because WireGuard encrypts the transport; there is no public listener. Caddy's
-own request handling and timeouts apply. The hash cost is 8, matching vaire; the
-generated password has 256 bits of entropy, so cost is not the protection.
+The gateway Caddyfile (`root:caddy 0640`) carries only the basic-auth username
+and a bcrypt hash, never the password. TLS ends at the existing public ingress;
+the gateway is HTTP on loopback. A normal apply takes the telemetry lock before
+any managed write, snapshots the gateway Caddyfile, discovery document and unit
+plus the gateway service's enabled/active state, validates the complete
+supported managed layout and extracts its single `metrics` bcrypt hash. It then
+writes the full loopback migration, validates and restarts only the gateway. A
+failure restores every snapshotted file and the prior service state. Recovery
+uses a bounded context detached from the cancelled request so rollback is not
+aborted with the activation, while the original cancelled/deadline
+classification is preserved. A malformed existing file fails closed before any
+mutation and never donates a hash; a genuinely absent file remains unconfigured
+until `metrics rotate` or setup configures it. The hash cost is 8, matching
+vaire; the generated password has 256 bits of entropy, so cost is not the
+protection.
 
 `metrics endpoint` reads the non-secret endpoint description over node RPC:
-listen address, URLs, access, basic-auth username, whether the telemetry
-Caddyfile exists, and whether this machine holds a local credential. `metrics
-config` generates a Prometheus `http_sd_configs` snippet and the equivalent
-Alloy `discovery.http` + `prometheus.scrape` snippet. Ordinary output, including
-`--json`, always uses `<metrics-password>`. `--format
+state, public hostname, desired public HTTPS URLs, loopback gateway address,
+access, basic-auth username, whether the gateway Caddyfile exists, and whether
+this machine holds a local credential. A missing hostname is reported as
+`unconfigured`; a managed credential whose file is not the current loopback
+render is `needs_apply`; no target is reconstructed from the listener, a
+request host, the WireGuard address or a parameter. The description says the
+URLs are the desired ingress paths, not a claim that DNS, certificate issuance,
+route activation or reachability has been observed. `metrics config` generates a
+Prometheus `http_sd_configs` snippet and the equivalent Alloy `discovery.http` +
+`prometheus.scrape` snippet; both use HTTPS and authenticate both discovery and
+scrape, and TLS verification remains at the system trust-store default. Ordinary
+output, including `--json`, always uses `<metrics-password>`. `--format
 prometheus|alloy|targets --out FILE` writes one new owner-only file (`0600`)
 with the real credential when the format needs one; it fails without a local
 credential. The `targets` file contains no secret and is also a valid
@@ -180,16 +214,19 @@ Caddy service is treated as unmanaged and the step refuses rather than
 overwriting or stopping it. On a fresh host it installs the pinned package,
 ensures the account, removes only the package-created default Caddyfile and
 disables only a package-started service, leaving no public Caddy config or
-listener.
+listener. A hostname-less control plane still installs the pinned binary for the
+loopback gateway, but its public telemetry endpoint stays unconfigured and there
+is no WireGuard fallback listener.
 
 `metrics rotate --confirm <node>/metrics` follows vaire's rotate path rather
 than a generation-fenced transaction. The operator generates a fresh 256-bit
-password, saves it owner-only in this machine's context *before* the node
-request, and sends only its bcrypt hash. The node takes a node-local telemetry
-lock, renders the telemetry Caddyfile, validates it with `caddy validate`,
-restarts only `eregion-telemetry.service`, and restores the previous Caddyfile
-if validation or restart fails. The public route writer's PostgreSQL advisory
-lock and public Caddy reload are not involved. If the RPC itself fails, the CLI
+password, saves it owner-only in the resolved workspace credential directory *before* the node
+request, and sends only its bcrypt hash. The node takes the same node-local
+telemetry lock used by apply, renders the loopback gateway Caddyfile, validates
+it with `caddy validate`, restarts only `eregion-telemetry.service`, and
+restores the previous Caddyfile if validation or restart fails. The worker's
+PostgreSQL desired-route lock and public Caddy reload are not involved. If the
+RPC itself fails, the CLI
 restores the previous local credential (removing a first credential it just
 generated). Rotation promises only that the node credential changed, not that
 every scraper or handoff has the new password; output warns that scrapers must
@@ -204,12 +241,15 @@ no compare-and-swap, pending file, generation, rate limiter or custom endpoint
 process.
 
 `server init` reuses the local credential when it exists, otherwise generates
-one, and performs the same rotate before its doctor gate; it includes only the
-username and password in the protected handoff, and `login` restores them.
-`secrets export` includes the local credential when present and reports an
-explicit omission when it is missing. A node upgraded from the older layout has
-no telemetry Caddyfile until `metrics rotate` is run or a fresh handoff is
-imported; `doctor` reports that as a warning, not a pass.
+one, and performs the same rotate before its doctor gate; the protected handoff
+includes the public metrics/discovery URLs, username and password, and `login`
+restores the local credential. `secrets export` includes the local credential
+when present and reports an explicit omission when it is missing. An apply on a
+node upgraded from the older WireGuard layout reads the existing managed gateway
+hash and rewrites only the gateway to loopback, so the credential is preserved;
+a genuinely unconfigured node has no gateway Caddyfile until `metrics rotate` is
+run or a fresh handoff is imported, and `doctor` reports that as a warning, not
+a pass.
 
 ## Local collector foundations
 
@@ -240,19 +280,22 @@ or unreadable.
 The systemd collector reads only the named unit set over D-Bus; it does not
 enumerate every host unit. `node-exporter.service` is loopback-only and has no
 `wg-quick@wg0.service` ordering or requirement, so it starts independently at
-boot. The dedicated telemetry Caddy waits for wg0 and binds its WireGuard
-address; the access setup opens 9101 on `wg0` and restarts only
-`eregion-telemetry.service` after WireGuard comes up. Public Caddy never loads
-the telemetry Caddyfile.
+boot. The dedicated telemetry gateway is also independent of WireGuard: it
+listens only on `127.0.0.1:9101`, public Caddy proxies two exact HTTPS paths to
+it, and the access setup neither opens 9101 on `wg0` nor restarts the gateway.
+Public Caddy never loads the gateway Caddyfile itself.
 
 ## Read-only external scrape
 
-The generated snippets are the supported scrape path. A host with a WireGuard
-route to the node configures Prometheus or Grafana Alloy with the
-`/targets.json` discovery URL and the basic-auth credential. The endpoint
-listens only on the node's WireGuard address; it is not a public listener and
-has no TLS terminator. Prometheus/Grafana Alloy are not installed or
-supervised by eregion, and the node stores no metrics.
+The generated snippets are the supported scrape path. An external Prometheus or
+Grafana Alloy configures the main hostname's
+`https://<hostname>/metrics/targets.json` discovery URL and basic auth, then
+scrapes `https://<hostname>/metrics/node` with the same credential. Both
+discovery and scrape require the credential; the raw exporter and gateway stay
+private on loopback, and TLS verification uses the system trust store by
+default. Public reachability, certificate issuance and authentication are
+separate observations, not implied by a reload. Prometheus/Grafana Alloy are not
+installed or supervised by eregion, and the node stores no metrics.
 
 A future separate telemetry node or Grafana is **not prohibited long-term**.
 Adding one needs its own WireGuard topology, retention and access decisions; it
@@ -265,19 +308,21 @@ and narrow systemd collector shape, but this is not vaire exporter parity.
 Missing today:
 
 - postgres/pgbouncer exporters and an exporter slice/memory budget;
-- vaire's nginx fail2ban jail, per-IP rate limit and separate rate-limit zone
-  (Caddy serves the endpoint; WireGuard peer access and basic auth are the
-  boundary);
+- vaire's nginx fail2ban jail, optional source-CIDR allowlist and per-IP rate
+  limit with a separate rate-limit zone. Standard Caddy basic authentication
+  protects the public HTTPS paths, but this track does not add a custom proxy, a
+  mandatory allowlist or rate limiting; do not claim full vaire nginx parity;
 - a central Prometheus/Grafana deployment, alerting, metric/log storage or
   retained history;
-- a public `https://<host>/metrics/...` endpoint or TLS terminator (the
-  endpoint is WireGuard-only and basic-auth protected);
 - cross-node aggregation; there is only the main node today.
 
+The endpoint is no longer WireGuard-only: `https://<hostname>/metrics/node` and
+`/metrics/targets.json` are public HTTPS paths behind basic authentication. They
+expose no public administration API, and the raw exporter remains private.
 None of these omissions is hidden by the `metrics show` snapshot or the doctor
-rows. `host-telemetry-v1`, the dedicated Caddy unit and the real systemd collector
-over D-Bus were host-qualified on `edge-2767500209f1`; MANUAL-TESTING records
-the run. A real `.prom` fixture and a separately deployed Prometheus/Alloy
+rows. The public HTTPS gateway integration replaces the earlier private-only
+endpoint; the service-boundary handoff is recorded separately from manual host
+qualification. A real `.prom` fixture and a separately deployed Prometheus/Alloy
 scraper remain manual acceptance.
 
 ## Verification
@@ -292,18 +337,22 @@ node-RPC method selection, CLI plain/JSON shape and the workspace adapter
 including explicit freshness, node-computed age/threshold, refresh re-query,
 node mismatch and the metrics-response generation fence.
 
-Endpoint tests cover credential generation/hash verification, the
-WireGuard-only HTTP discovery document, Prometheus/Alloy config generation, the
-password placeholder, owner-only `--out` writes, refusal to overwrite an
-existing output file, no plaintext password in ordinary or rotation output,
-local save-before-send, restoration of the previous local credential on a
-failed node request, and safe endpoint text/JSON. Host tests cover the
-discovery document, the dedicated Caddy unit, the Caddyfile's
-basic-auth/loopback-rewrite/header-strip/admin-off shape, the firewall rule and
-preservation of an existing rotation-owned Caddyfile across apply. Doctor tests
-cover 401 pass, 200 exposure fail, unconfigured warning, unreachable fail and
-WireGuard-down warning. They do not qualify a real server, exporter
-installation, WireGuard reachability, systemd D-Bus collection, a real `.prom`
-file, Caddy validation/restart, credential rotation on a live node or a real
-scrape. Record those runs in [MANUAL-TESTING](MANUAL-TESTING.md); never infer
-them from unit tests.
+Endpoint tests cover credential generation/hash verification, public HTTPS
+discovery that never derives a target from the loopback listener or WireGuard
+address, HTTPS discovery and scrape basic auth in both Prometheus and Alloy,
+TLS verification defaults, the password placeholder, owner-only `--out` writes,
+refusal to overwrite an existing output file, no plaintext password in ordinary
+or rotation output, local save-before-send, restoration of the previous local
+credential on a failed node request, and safe endpoint text/JSON. Host tests
+cover the exact public ingress paths and explicit gateway Host, the loopback
+gateway unit with no WireGuard dependency, the Caddyfile's
+basic-auth/loopback-rewrite/header-strip/admin-off shape, removal of only the
+exact legacy firewall rule, preservation of an existing hash on the loopback
+render, fail-closed malformed config and root-only rollback. Doctor tests cover
+public HTTPS 401 pass, 200 exposure fail, unconfigured hostname warning,
+unreachable fail and malformed config fail; WireGuard state no longer gates the
+public endpoint. They do not qualify a real server, exporter installation,
+public DNS/TLS, systemd D-Bus collection, a real `.prom` file, Caddy
+validation/restart, credential rotation on a live node or a real scrape. Record
+those runs in [MANUAL-TESTING](MANUAL-TESTING.md); never infer them from unit
+tests.

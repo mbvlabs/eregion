@@ -8,10 +8,12 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
 // CaddyfilePath is the distribution package's config, owned by eregion.
@@ -71,9 +73,10 @@ type ingressStep struct {
 	cfg        Config
 	exec       Exec
 	configPath string
+	lockPath   string
 }
 
-func (s *ingressStep) ID() string { return "host-ingress-v2" }
+func (s *ingressStep) ID() string { return "host-ingress-v3" }
 func (s *ingressStep) Describe() string {
 	if strings.TrimSpace(s.cfg.Hostname) == "" {
 		return "Install pinned Caddy " + CaddyVersion + " for the dedicated telemetry endpoint without a public hostname"
@@ -89,7 +92,36 @@ func (s *ingressStep) caddyConfigPath() string {
 	return CaddyfilePath
 }
 
+func (s *ingressStep) ingressLockPath() string {
+	if s.lockPath != "" {
+		return s.lockPath
+	}
+	return platform.CaddyIngressLockPath
+}
+
+// telemetryProxyBlock is one exact public telemetry path. It rewrites to the
+// gateway's fixed upstream path, names the loopback gateway Host explicitly
+// (Caddy would otherwise preserve the public Host) and leaves Authorization in
+// place for the gateway's basic authentication.
+func telemetryProxyBlock(publicPath, gatewayPath string) string {
+	return fmt.Sprintf(`	handle %s {
+		rewrite * %s
+		reverse_proxy %s {
+			header_up Host %s
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 30s
+			}
+		}
+	}
+`, publicPath, gatewayPath, telemetry.GatewayListenAddress, telemetry.GatewayListenAddress)
+}
+
 func (s *ingressStep) caddyfile() []byte {
+	return s.caddyfileForRoutesDir(platform.CaddyRoutesDir)
+}
+
+func (s *ingressStep) caddyfileForRoutesDir(routesDir string) []byte {
 	if strings.TrimSpace(s.cfg.Hostname) == "" {
 		return nil
 	}
@@ -101,11 +133,13 @@ import %s/*.caddy
 	handle @api {
 		reverse_proxy %s
 	}
-	handle {
+%s%s	handle {
 		respond 404
 	}
 }
-`, platform.CaddyRoutesDir, s.cfg.Hostname, strings.Join(PublicAPIPaths, " "), s.cfg.APIListen))
+`, routesDir, s.cfg.Hostname, strings.Join(PublicAPIPaths, " "), s.cfg.APIListen,
+		telemetryProxyBlock(telemetry.MetricsPath, telemetry.GatewayMetricsPath),
+		telemetryProxyBlock(telemetry.DiscoveryPath, telemetry.GatewayDiscoveryPath)))
 }
 
 // unmanagedCaddy returns a non-empty reason when a hostname-less control plane
@@ -285,27 +319,92 @@ install -d -m 0755 -o %[1]s -g %[2]s %[3]s
 	if err := s.exec.Run(ctx, s.ID(), routes, nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
+	// Serialize the root publish/activation with the worker's app-fragment
+	// publish/activation. The worker takes its PostgreSQL desired-route lock
+	// first and then this local lock; host bootstrap takes only this local lock.
+	if err := s.ensureIngressLock(); err != nil {
+		return engine.ApplyResult{}, err
+	}
+	release, err := engine.AcquireFile(ctx, s.ingressLockPath(), engine.LockExclusive, 30*time.Second)
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
+	defer release()
+	previous, previousMode, existed, err := fileState(s.caddyConfigPath())
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
 	if err := writePublicFile(s.caddyConfigPath(), s.caddyfile(), "root", "root"); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := s.exec.Run(ctx, s.ID(), caddyActivateScript(restart), nil, report); err != nil {
-		return engine.ApplyResult{}, err
+	if err := s.exec.Run(ctx, s.ID(), caddyActivateScript(s.caddyConfigPath(), restart), nil, report); err != nil {
+		// Roll back only the root Caddyfile. The current app fragment belongs
+		// to the worker and is deliberately never part of this snapshot.
+		activationErr := interruptedError(ctx, err)
+		recoveryCtx, cancel := managedRecoveryContext(ctx)
+		restoreErr := s.restoreRootCaddyfile(recoveryCtx, previous, previousMode, existed, report)
+		cancel()
+		return engine.ApplyResult{}, joinRecoveryError(activationErr, restoreErr)
 	}
 	return engine.ApplyResult{Notes: []string{"Caddy " + CaddyVersion + " serves " + s.cfg.Hostname}, Result: map[string]any{
-		"hostname": s.cfg.Hostname, "paths": PublicAPIPaths, "version": CaddyVersion, "sha256": checksum,
+		"hostname": s.cfg.Hostname, "paths": PublicAPIAndTelemetryPaths(), "version": CaddyVersion, "sha256": checksum,
 	}}, nil
+}
+
+// ensureIngressLock creates the shared local lock with permissions the worker
+// account can use. It never replaces an existing lock inode, which would
+// invalidate a lock another process already holds.
+func (s *ingressStep) ensureIngressLock() error {
+	path := s.ingressLockPath()
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o660) //nolint:gosec // G304: fixed node state path.
+	if errors.Is(err, os.ErrExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		return err
+	}
+	return chownIfRoot(path, s.cfg.Layout.User, s.cfg.Layout.Group)
+}
+
+// PublicAPIAndTelemetryPaths names the exact public paths the root Caddyfile
+// owns. It excludes the worker's application routes and describes no broad
+// /metrics proxy.
+func PublicAPIAndTelemetryPaths() []string {
+	paths := append([]string(nil), PublicAPIPaths...)
+	return append(paths, telemetry.MetricsPath, telemetry.DiscoveryPath)
+}
+
+func (s *ingressStep) restoreRootCaddyfile(ctx context.Context, previous []byte, mode os.FileMode, existed bool, report engine.Reporter) error {
+	path := s.caddyConfigPath()
+	if existed {
+		if err := writeFile(path, previous, mode, "root", "root"); err != nil {
+			return fmt.Errorf("restore the previous public Caddyfile: %w", err)
+		}
+	} else if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove the failed public Caddyfile: %w", err)
+	}
+	if err := s.exec.Run(ctx, s.ID()+"-rollback", caddyActivateScript(path, false), nil, report); err != nil {
+		return fmt.Errorf("reactivate the previous public Caddyfile: %w", interruptedError(ctx, err))
+	}
+	return nil
 }
 
 // caddyActivateScript validates the Caddyfile and activates it. A reload keeps
 // the old executable in memory after a package upgrade, so a changed binary
 // restarts; reload-or-restart also starts a stopped service.
-func caddyActivateScript(restart bool) string {
+func caddyActivateScript(configPath string, restart bool) string {
 	activate := "systemctl reload-or-restart caddy.service"
 	if restart {
 		activate = "systemctl restart caddy.service"
 	}
 	return `set -euo pipefail
-` + CaddyBinaryPath + ` validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
+` + CaddyBinaryPath + ` validate --config ` + shellQuote(configPath) + ` --adapter caddyfile >/dev/null
 systemctl enable caddy.service >/dev/null 2>&1
 ` + activate + `
 systemctl is-active --quiet caddy.service`

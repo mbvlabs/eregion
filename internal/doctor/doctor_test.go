@@ -218,7 +218,7 @@ func TestTelemetryEndpointHealth(t *testing.T) {
 	base := Facts{
 		WireGuardKnown: true, WireGuardActive: true,
 		Telemetry: TelemetryFacts{
-			Known: true, EndpointListen: "10.78.0.1:9101",
+			Known: true, EndpointState: "configured", EndpointListen: "127.0.0.1:9101",
 			EndpointConfigured: true,
 			EndpointAuthKnown:  true, EndpointAuthStatus: 401,
 		},
@@ -226,16 +226,31 @@ func TestTelemetryEndpointHealth(t *testing.T) {
 	if got := telemetryEndpoint(Facts{}); got[0].Status != Skip {
 		t.Fatalf("unconfigured endpoint = %+v, want skip", got)
 	}
-	if got := telemetryEndpoint(base); got[0].Status != Pass || !strings.Contains(got[0].Detail, "401") {
+	if got := telemetryEndpoint(base); got[0].Status != Pass || !strings.Contains(got[0].Detail, "public HTTPS") {
 		t.Fatalf("healthy endpoint = %+v", got)
 	}
 	unconfigured := base
+	unconfigured.Telemetry.EndpointState = "unconfigured"
 	unconfigured.Telemetry.EndpointConfigured = false
-	if got := telemetryEndpoint(unconfigured); got[0].Status != Warn || !strings.Contains(got[0].Detail, "no credential") {
+	unconfigured.Telemetry.EndpointAuthKnown = false
+	if got := telemetryEndpoint(unconfigured); got[0].Status != Warn || !strings.Contains(got[0].Detail, "no public hostname") {
+		t.Fatalf("missing hostname = %+v", got)
+	}
+	needsApply := base
+	needsApply.Telemetry.EndpointState = "needs_apply"
+	if got := telemetryEndpoint(needsApply); got[0].Status != Warn || !strings.Contains(got[0].Detail, "not the current loopback render") {
+		t.Fatalf("gateway awaiting apply = %+v", got)
+	}
+	missingCredential := base
+	missingCredential.Telemetry.EndpointState = "pending_credential"
+	missingCredential.Telemetry.EndpointConfigured = false
+	missingCredential.Telemetry.EndpointAuthKnown = false
+	if got := telemetryEndpoint(missingCredential); got[0].Status != Warn || !strings.Contains(got[0].Detail, "no credential") {
 		t.Fatalf("missing credential = %+v", got)
 	}
-	unconfigured.Telemetry.EndpointAuthStatus = 200
-	if got := telemetryEndpoint(unconfigured); got[0].Status != Fail || !strings.Contains(got[0].Detail, "without authentication") {
+	missingCredential.Telemetry.EndpointAuthStatus = 200
+	missingCredential.Telemetry.EndpointAuthKnown = true
+	if got := telemetryEndpoint(missingCredential); got[0].Status != Fail || !strings.Contains(got[0].Detail, "without authentication") {
 		t.Fatalf("unauthenticated endpoint with missing credential = %+v, want fail", got)
 	}
 	exposed := base
@@ -251,8 +266,13 @@ func TestTelemetryEndpointHealth(t *testing.T) {
 	}
 	wireGuardDown := base
 	wireGuardDown.WireGuardActive = false
-	if got := telemetryEndpoint(wireGuardDown); got[0].Status != Warn || !strings.Contains(got[0].Detail, "WireGuard is down") {
-		t.Fatalf("WireGuard down = %+v", got)
+	if got := telemetryEndpoint(wireGuardDown); got[0].Status != Pass {
+		t.Fatalf("WireGuard down made the public HTTPS endpoint unavailable: %+v", got)
+	}
+	malformed := base
+	malformed.Telemetry.EndpointConfigErr = "basic_auth is malformed"
+	if got := telemetryEndpoint(malformed); got[0].Status != Fail || !strings.Contains(got[0].Detail, "malformed") {
+		t.Fatalf("malformed gateway config = %+v", got)
 	}
 }
 

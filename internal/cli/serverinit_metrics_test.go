@@ -20,7 +20,7 @@ func TestInitGeneratesTelemetryCredentialAndSendsOnlyItsHash(t *testing.T) {
 	mainDir := prepareInitAccess(t, "main")
 	r := &serverInit{
 		a: &app{secrets: &secrets.Registry{}}, cmd: &cobra.Command{Use: "init"},
-		answers: serverInitAnswers{Context: "main", Node: "main"},
+		answers: serverInitAnswers{Context: "main", Node: "main", Hostname: "main.example.com"},
 		pending: &host.PendingInit{Server: "main", Phases: map[string]string{}},
 	}
 	wg, err := transport.GenerateWireGuardKey()
@@ -55,8 +55,9 @@ func TestInitGeneratesTelemetryCredentialAndSendsOnlyItsHash(t *testing.T) {
 			values[field.label] = field.value
 		}
 		if values["Username"] != telemetry.Username || values["Password"] != credential.Password ||
-			!strings.Contains(values["Metrics URL"], "10.78.0.1:9101/node") ||
-			!strings.Contains(values["Discovery URL"], "targets.json") {
+			values["Metrics URL"] != "https://main.example.com/metrics/node" ||
+			values["Discovery URL"] != "https://main.example.com/metrics/targets.json" ||
+			strings.Contains(values["Metrics URL"], "10.78.0.1") {
 			t.Fatalf("handoff metrics group = %+v", values)
 		}
 	}
@@ -77,7 +78,7 @@ func TestInitReusesAnExistingLocalTelemetryCredential(t *testing.T) {
 	}
 	r := &serverInit{
 		a: &app{secrets: &secrets.Registry{}}, cmd: &cobra.Command{Use: "init"},
-		answers: serverInitAnswers{Context: "main", Node: "main"},
+		answers: serverInitAnswers{Context: "main", Node: "main", Hostname: "main.example.com"},
 		pending: &host.PendingInit{Server: "main", Phases: map[string]string{}},
 	}
 	backend := newMetricsAccessBackend(false)
@@ -131,7 +132,7 @@ func TestLoginRestoresTelemetryCredentialFile(t *testing.T) {
 func TestLoginRecordRestoresTelemetryCredentialShape(t *testing.T) {
 	record := parseHandoffRecord(strings.Join([]string{
 		"## Node metrics",
-		"- Metrics URL: http://10.78.0.1:9101/node",
+		"- Metrics URL: https://main.example.com/metrics/node",
 		"- Username: metrics",
 		"- Password: abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
 	}, "\n"))

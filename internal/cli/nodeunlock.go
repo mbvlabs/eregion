@@ -13,7 +13,7 @@ import (
 
 // runNodeUnlockSSH is `eregion node unlock-ssh`, the break-glass command an
 // operator runs as root from the provider console. It is intentionally outside
-// the operator command tree: the saved context reaches the node over WireGuard,
+// the operator command tree: the saved workspace access reaches the node over WireGuard,
 // so this path exists only when that channel is unavailable.
 func runNodeUnlockSSH(args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("node unlock-ssh", flag.ContinueOnError)

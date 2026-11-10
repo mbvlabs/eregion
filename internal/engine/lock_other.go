@@ -27,6 +27,11 @@ func Acquire(context.Context, string, LockMode, time.Duration) (Release, error) 
 	return nil, errors.New("node locks require a Unix host")
 }
 
+// AcquireFile is unavailable outside Unix, like Acquire.
+func AcquireFile(context.Context, string, LockMode, time.Duration) (Release, error) {
+	return nil, errors.New("node locks require a Unix host")
+}
+
 func WithFileLock(string, func() error) error {
 	return errors.New("node locks require a Unix host")
 }

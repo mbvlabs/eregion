@@ -33,7 +33,7 @@ The binding, route, DNS record, certificate and public response are separate:
 | Certificate | `certificate_state` (`pending`/`valid`/`failed`), `certificate_not_after`, `certificate_error` | TLS handshake to the hostname through local Caddy with SNI, chain and name verified against system roots. |
 | Public response | `public_state` (`pending`/`ok`/`failed`), `public_status`, `public_error` | HTTP response through local Caddy with the real hostname, using that binding's check path (default: the environment revision's web health path). |
 
-`domain add` prints the exact A/AAAA record from the current context's WireGuard
+`domain add` prints the exact A/AAAA record from the selected workspace access record's WireGuard
 endpoint (the main node's public address) and records it as `expected_addresses`.
 The node does not infer a public address from its interfaces. `domain list` shows
 route, DNS, certificate, public and overall readiness separately.
@@ -46,6 +46,9 @@ Route path:
    desired domain rows to each environment's serving deployment web replicas, and
    renders `/etc/caddy/eregion.d/routes.caddy` (`hostname { reverse_proxy … }`).
    A deployment switch uses the same lock and writer with candidate upstreams.
+   The worker then takes the local ingress lock before publishing the fragment;
+   host bootstrap takes only that local lock when it publishes the root
+   Caddyfile, so the order is always worker database lock then local lock.
 3. The new fragment is adapted with Caddy's `/adapt` endpoint before it replaces
    the file. The file is written to a sibling temp file, fsynced and renamed; the
    importing `/etc/caddy/Caddyfile` is then loaded through loopback admin port

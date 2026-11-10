@@ -14,6 +14,11 @@ const (
 	CaddyfilePath   = "/etc/caddy/Caddyfile"
 	CaddyRoutesDir  = "/etc/caddy/eregion.d"
 	CaddyRoutesPath = CaddyRoutesDir + "/routes.caddy"
+	// CaddyIngressLockPath serializes the public root Caddyfile publish and
+	// activation with the worker's app-fragment publish and activation. The
+	// worker takes its PostgreSQL desired-route lock first, then this local
+	// lock; the host bootstrap takes only this local lock.
+	CaddyIngressLockPath = CaddyRoutesDir + "/.ingress.lock"
 	// CaddyAdmin is Caddy's loopback admin endpoint; the worker loads the
 	// Caddyfile through it, so it needs no root.
 	CaddyAdmin = "http://127.0.0.1:2019"

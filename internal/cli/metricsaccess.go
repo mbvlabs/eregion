@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -174,12 +173,26 @@ func metricsEndpointText(view metricsEndpointView) string {
 	var out strings.Builder
 	out.WriteString(ui.Header("Telemetry endpoint "+info.Node, 72))
 	field := func(name, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
 		fmt.Fprintf(&out, "\n  %s %s", ui.Dim(fmt.Sprintf("%-12s", name)), value)
 	}
-	field("listen", info.Listen)
-	field("metrics", info.MetricsURL)
-	field("discovery", info.DiscoveryURL)
-	field("access", "WireGuard only · basic authentication · no public listener")
+	field("state", info.State)
+	if info.Hostname != "" {
+		field("hostname", info.Hostname)
+	}
+	field("gateway", info.Listen)
+	metricsURL, discoveryURL := info.MetricsURL, info.DiscoveryURL
+	if metricsURL == "" {
+		metricsURL = "unconfigured: the node has no public hostname"
+	}
+	if discoveryURL == "" {
+		discoveryURL = "unconfigured: the node has no public hostname"
+	}
+	field("metrics", metricsURL)
+	field("discovery", discoveryURL)
+	field("access", "public HTTPS · basic authentication · raw exporter private")
 	if info.Credential {
 		field("credential", "configured on the node")
 	} else {
@@ -192,7 +205,7 @@ func metricsEndpointText(view metricsEndpointView) string {
 	}
 	field("upstream", info.Upstream)
 	out.WriteString("\n\n")
-	out.WriteString(ui.Note("Prometheus or Grafana Alloy must be a WireGuard peer. There is no central telemetry server, metric store or history on the node."))
+	out.WriteString(ui.Note("The URLs are the desired public HTTPS ingress paths; configured does not assert DNS, certificate issuance, route activation or reachability. Authentication is basic auth; this does not add vaire's optional nginx source-CIDR allowlist or per-IP rate limiting. There is no central telemetry server, metric store or history on the node."))
 	return out.String()
 }
 
@@ -239,27 +252,43 @@ func (a *app) metricsConfig(cmd *cobra.Command, _ []string) (result, error) {
 			"this machine has no telemetry credential to write",
 			"Import the protected handoff with eregion login, or run eregion metrics rotate.")
 	}
-	address, err := nodeAddressFromListen(info.Listen)
-	if err != nil {
-		return result{}, err
+	if info.State == telemetry.EndpointStateUnconfigured || strings.TrimSpace(info.Hostname) == "" {
+		return result{}, contract.NewFault(contract.PreconditionFailed,
+			"the node has no public hostname, so the telemetry endpoint is unconfigured",
+			"Configure the main node's public hostname and public ingress; there is no WireGuard or listener-address fallback target.")
 	}
 	password := telemetry.PasswordPlaceholder
 	if outPath != "" && credential != nil {
 		password = credential.Password
 	}
-	targets, err := telemetry.TargetsJSON(info.Node, address)
+	targets, err := telemetry.TargetsJSON(info.Node, info.Hostname)
+	if err != nil {
+		return result{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
+	}
+	prometheus, err := telemetry.PrometheusConfig(info.Node, info.Hostname, telemetry.Username, password)
+	if err != nil {
+		return result{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
+	}
+	alloy, err := telemetry.AlloyConfig(info.Node, info.Hostname, telemetry.Username, password)
+	if err != nil {
+		return result{}, contract.NewFault(contract.ValidationFailed, "the node reported an invalid telemetry hostname", "Re-run eregion apply with a valid main hostname.")
+	}
+	prometheusPlaceholder, err := telemetry.PrometheusConfig(info.Node, info.Hostname, telemetry.Username, telemetry.PasswordPlaceholder)
 	if err != nil {
 		return result{}, err
 	}
-	prometheus := telemetry.PrometheusConfig(info.Node, address, telemetry.Username, password)
-	alloy := telemetry.AlloyConfig(info.Node, address, telemetry.Username, password)
+	alloyPlaceholder, err := telemetry.AlloyConfig(info.Node, info.Hostname, telemetry.Username, telemetry.PasswordPlaceholder)
+	if err != nil {
+		return result{}, err
+	}
 	data := map[string]any{
-		"node": info.Node, "listen": info.Listen, "metrics_url": info.MetricsURL,
+		"node": info.Node, "hostname": info.Hostname, "state": info.State,
+		"listen": info.Listen, "metrics_url": info.MetricsURL,
 		"discovery_url": info.DiscoveryURL, "username": telemetry.Username,
 		"credential_available": credential != nil, "node_credential": info.Credential,
 		"password_in_output": false,
-		"prometheus_config":  telemetry.PrometheusConfig(info.Node, address, telemetry.Username, telemetry.PasswordPlaceholder),
-		"alloy_config":       telemetry.AlloyConfig(info.Node, address, telemetry.Username, telemetry.PasswordPlaceholder),
+		"prometheus_config":  prometheusPlaceholder,
+		"alloy_config":       alloyPlaceholder,
 		"targets_json":       string(targets),
 	}
 	var warnings []map[string]string
@@ -267,7 +296,9 @@ func (a *app) metricsConfig(cmd *cobra.Command, _ []string) (result, error) {
 	case credential == nil:
 		warnings = append(warnings, map[string]string{"code": "metrics_credential_missing", "message": "this machine has no telemetry credential; the snippets use a placeholder. Import the protected handoff or run eregion metrics rotate."})
 	case !info.Credential:
-		warnings = append(warnings, map[string]string{"code": "metrics_endpoint_unconfigured", "message": "the node has no telemetry endpoint yet; run eregion metrics rotate before relying on the snippets."})
+		warnings = append(warnings, map[string]string{"code": "metrics_endpoint_unconfigured", "message": "the node has no telemetry gateway credential yet; run eregion metrics rotate before relying on the snippets."})
+	case info.State == telemetry.EndpointStateNeedsApply:
+		warnings = append(warnings, map[string]string{"code": "metrics_endpoint_needs_apply", "message": "the node has a telemetry credential but its gateway file is not the current loopback render; run eregion apply before relying on the snippets."})
 	}
 	if len(warnings) > 0 {
 		data["warnings"] = warnings
@@ -331,14 +362,6 @@ func metricsConfigText(format string, data map[string]any) string {
 	return out.String()
 }
 
-func nodeAddressFromListen(listen string) (string, error) {
-	host, _, err := net.SplitHostPort(strings.TrimSpace(listen))
-	if err != nil || strings.TrimSpace(host) == "" {
-		return "", contract.NewFault(contract.Unavailable, "the node reported an invalid telemetry listen address", "Re-run eregion apply, then retry.")
-	}
-	return host, nil
-}
-
 func (a *app) metricsRotate(cmd *cobra.Command, _ []string) (result, error) {
 	client, err := a.client(cmd)
 	if err != nil {
@@ -384,7 +407,7 @@ func (a *app) metricsRotate(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	rotation.Warnings = append(rotation.Warnings, "scrapers using the old password now fail; update them, then run eregion secrets export to refresh the protected handoff")
 	data := map[string]any{
-		"rotated": true, "node": info.Node, "username": rotation.Username,
+		"rotated": true, "node": info.Node, "hostname": rotation.Hostname, "username": rotation.Username,
 		"metrics_url": rotation.MetricsURL, "discovery_url": rotation.Discovery,
 		"password_in_output": false, "handoff_stale": true,
 	}

@@ -145,18 +145,21 @@ terminal, some need a human, and a retry may need the same idempotency key.
   not prove DNS-write permission or a ready application.
 - A command that prints a secret once is a human handoff: ask the human to run
   it in their own terminal. Never capture the one-time value for them.
-- `metrics endpoint` reports whether the dedicated WireGuard-only Caddy
-  endpoint is configured and whether this machine holds a local credential. `metrics
-  config` ordinary output always uses a password placeholder.
-  `metrics config --format prometheus|alloy --out FILE` writes an owner-only
-  file with the real telemetry credential when one is held locally; never print
-  that file or pass it as a normal log. `metrics rotate` replaces the credential
-  behind exact `--confirm <node>/metrics`, prints no password or hash, and warns
-  that the protected handoff is stale. It saves the new password locally before
-  the request and restores the previous one if the request fails; a lost
-  successful response can leave the local password stale, so a later deliberate
-  rotation may be needed. It is a deliberate destructive rotation, not a retry
-  loop.
+- `metrics endpoint` reports the configured main hostname's public HTTPS
+  metrics and HTTP service-discovery URLs, the loopback gateway, and whether
+  this machine holds a local credential. The raw exporter and gateway stay
+  loopback-only; a missing hostname is unconfigured with no WireGuard fallback.
+  `metrics config` ordinary output always uses a password placeholder.
+  `metrics config --format prometheus|alloy|targets --out FILE` writes an
+  owner-only file with the real telemetry credential when one is held locally;
+  never print that file or pass it as a normal log. Both discovery and scrape
+  use basic auth and normal TLS verification. `metrics rotate` replaces the
+  credential behind exact `--confirm <node>/metrics`, prints no password or
+  hash, and warns that the protected handoff is stale. It saves the new
+  password in the resolved workspace credential directory before the request
+  and restores the previous one if the request fails; a lost successful
+  response can leave the local password stale, so a later deliberate rotation
+  may be needed. It is a deliberate destructive rotation, not a retry loop.
 - Token issuance needs a human factor at the human's terminal, such as a code
   from their authenticator app or a master password (MASTER D7). There is no
   flag, environment variable or stdin path that lets an agent mint its own

@@ -46,7 +46,7 @@ type app struct {
 	secrets *secrets.Registry
 	// nodeClients holds one client per resolved workspace access for the command's life.
 	nodeClients map[string]*nodeClient
-	// backend overrides the node transport in tests; nil uses the saved context.
+	// backend overrides the node transport in tests; nil uses the saved workspace access.
 	backend Backend
 	// loginSeams replaces the probe and readiness check in tests.
 	loginSeams loginSeams

@@ -2,9 +2,12 @@ package host
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -109,17 +112,29 @@ func telemetryFacts(ctx context.Context, role Role, textfileDir, endpoint string
 	if err != nil || !roleConfig.ControlPlane {
 		return doctor.TelemetryFacts{}
 	}
-	facts := doctor.TelemetryFacts{Known: true, Endpoint: endpoint, EndpointListen: TelemetryListenAddress(), EndpointConfigured: TelemetryConfigured()}
+	facts := doctor.TelemetryFacts{Known: true, Endpoint: endpoint, EndpointListen: TelemetryListenAddress()}
+	info, infoErr := TelemetryEndpointInfo()
+	if infoErr != nil {
+		facts.EndpointConfigErr = contract.Classify(infoErr).Message
+	} else {
+		facts.EndpointState = info.State
+		facts.EndpointConfigured = info.Credential
+		if info.State == telemetry.EndpointStateConfigured && strings.TrimSpace(info.Hostname) != "" {
+			probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			// Probe the public URL through loopback Caddy with the real TLS
+			// server name. This observes the route, certificate and 401
+			// challenge without claiming that public DNS resolves here.
+			endpointProbe := telemetry.ProbeEndpoint(probeCtx, info.DiscoveryURL, publicTelemetryHTTPClient(info.Hostname))
+			cancel()
+			facts.EndpointAuthKnown = endpointProbe.Reachable
+			facts.EndpointAuthStatus = endpointProbe.Status
+			facts.EndpointAuthError = endpointProbe.Error
+		}
+	}
 	parent := filepath.Dir(textfileDir)
 	facts.Parent = inspectNodeExporterDir(parent).doctorFacts()
 	facts.Textfile = inspectNodeExporterDir(textfileDir).doctorFacts()
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	endpointProbe := telemetry.ProbeEndpoint(probeCtx, TelemetryDiscoveryURL(), nil)
-	cancel()
-	facts.EndpointAuthKnown = endpointProbe.Reachable
-	facts.EndpointAuthStatus = endpointProbe.Status
-	facts.EndpointAuthError = endpointProbe.Error
-	probeCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	probe, err := telemetry.ProbeLocal(probeCtx, endpoint)
 	if err != nil {
@@ -132,6 +147,24 @@ func telemetryFacts(ctx context.Context, role Role, textfileDir, endpoint string
 	facts.TextfileScrapeError = probe.TextfileScrapeError
 	facts.TextfileScrapeErrorAmbiguous = probe.TextfileScrapeErrorAmbiguous
 	return facts
+}
+
+// publicTelemetryHTTPClient probes the public telemetry discovery URL through
+// local Caddy. It verifies the certificate presented for the real hostname
+// against the system trust store and does not follow redirects.
+func publicTelemetryHTTPClient(hostname string) *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				dialer := &net.Dialer{Timeout: 3 * time.Second}
+				return dialer.DialContext(ctx, "tcp", "127.0.0.1:443")
+			},
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, ServerName: hostname},
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // NodeStatus is `server status`'s node-side observation.

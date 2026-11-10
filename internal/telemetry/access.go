@@ -9,15 +9,27 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-// Authenticated local telemetry endpoint constants. The endpoint is a Caddy
-// site on the node's WireGuard address; node_exporter stays on loopback.
+// Authenticated telemetry endpoint constants. The public ingress terminates
+// HTTPS on the main hostname and proxies two exact paths to a loopback-only
+// authenticated gateway; node_exporter itself stays on loopback.
 const (
-	// Port is the endpoint's WireGuard-only TCP port.
+	// Port is the loopback gateway's TCP port.
 	Port = "9101"
-	// MetricsPath proxies node_exporter's /metrics.
-	MetricsPath = "/node"
-	// DiscoveryPath serves the Prometheus HTTP service-discovery document.
-	DiscoveryPath = "/targets.json"
+	// GatewayHost and GatewayListenAddress are the only gateway listener.
+	GatewayHost          = "127.0.0.1"
+	GatewayListenAddress = GatewayHost + ":" + Port
+	// MetricsPath is the public HTTPS path the gateway proxies to
+	// node_exporter's /metrics.
+	MetricsPath = "/metrics/node"
+	// DiscoveryPath serves the public HTTPS Prometheus HTTP service-discovery
+	// document.
+	DiscoveryPath = "/metrics/targets.json"
+	// GatewayMetricsPath is the gateway-local upstream path for MetricsPath.
+	GatewayMetricsPath = "/node"
+	// GatewayDiscoveryPath is the gateway-local path for DiscoveryPath.
+	GatewayDiscoveryPath = "/targets.json"
+	// PublicPort is the HTTPS port advertised by service discovery.
+	PublicPort = "443"
 	// Username is the only basic-auth principal the endpoint accepts.
 	Username = "metrics"
 	// PasswordPlaceholder is used by ordinary `metrics config` output. The
@@ -29,7 +41,7 @@ const (
 )
 
 // Credential is the operator-side endpoint credential, as vaire keeps it in
-// the context credentials. The node receives only its bcrypt hash.
+// the workspace credential directory. The node receives only its bcrypt hash.
 type Credential struct {
 	Username string `json:"username"`
 	Password string `json:"password"`

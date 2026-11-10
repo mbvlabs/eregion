@@ -71,10 +71,13 @@ type TelemetryFacts struct {
 	TextfileScrapeErrorAmbiguous bool
 	EndpointError                string
 
-	// Endpoint is the authenticated WireGuard-facing endpoint, separate from
-	// the loopback exporter read above.
+	// Endpoint is the public HTTPS telemetry endpoint, separate from the
+	// loopback exporter read above. State describes local configuration only;
+	// the auth observation is a separate probe.
+	EndpointState      string
 	EndpointListen     string
 	EndpointConfigured bool
+	EndpointConfigErr  string
 	EndpointAuthStatus int
 	EndpointAuthKnown  bool
 	EndpointAuthError  string
@@ -141,39 +144,42 @@ func telemetryLocal(facts Facts) []Result {
 	return one(Pass, detail, "")
 }
 
-// telemetryEndpoint checks the WireGuard-facing authenticated endpoint. It
-// probes discovery without a credential: a healthy endpoint answers 401, and a
-// 200 is an exposure rather than a pass. A missing Caddyfile means rotation has not
-// configured the endpoint yet and is a warning, not a pass.
+// telemetryEndpoint checks the public HTTPS authenticated endpoint. It probes
+// discovery without a credential: a healthy endpoint answers 401, and a 200 is
+// an exposure rather than a pass. A missing public hostname or gateway
+// credential is a warning until configuration exists.
 func telemetryEndpoint(facts Facts) []Result {
 	telemetry := facts.Telemetry
 	if !telemetry.Known {
 		return one(Skip, "local telemetry is not configured for this role", "")
 	}
+	if telemetry.EndpointConfigErr != "" {
+		return one(Fail, "the telemetry gateway configuration is malformed: "+telemetry.EndpointConfigErr, "repair or replace the managed telemetry gateway configuration, then re-run doctor")
+	}
 	// An observed unauthenticated 200 is a security failure regardless of the
 	// local configuration; do not downgrade it to a missing-credential warning.
 	if telemetry.EndpointAuthKnown && telemetry.EndpointAuthStatus == 200 {
-		return one(Fail, "the telemetry endpoint served discovery without authentication", "remove the public/unauthenticated route and run eregion metrics rotate; an unauthenticated telemetry endpoint is never healthy")
+		return one(Fail, "the telemetry endpoint served discovery without authentication", "remove the unauthenticated route and run eregion metrics rotate; an unauthenticated telemetry endpoint is never healthy")
+	}
+	if telemetry.EndpointState == "unconfigured" {
+		return one(Warn, "the public telemetry endpoint is unconfigured: the node has no public hostname", "configure the main node's public hostname; there is no WireGuard fallback target")
+	}
+	if telemetry.EndpointState == "needs_apply" {
+		return one(Warn, "the telemetry gateway credential exists but its configuration is not the current loopback render", "run eregion apply to migrate the gateway, then re-run doctor")
 	}
 	if !telemetry.EndpointConfigured {
 		return one(Warn, "the authenticated telemetry endpoint has no credential; external scrapers cannot connect", "run eregion metrics rotate --confirm <node>/metrics")
 	}
-	if facts.WireGuardKnown && !facts.WireGuardActive {
-		return one(Warn, "WireGuard is down; the authenticated telemetry endpoint was not observed", "bring wg0 up, then re-run doctor")
-	}
 	if telemetry.EndpointAuthError != "" {
-		if !facts.WireGuardKnown {
-			return one(Warn, "the telemetry endpoint was not observed and WireGuard state is unknown: "+telemetry.EndpointAuthError, "check wg0 and eregion-telemetry.service, then re-run doctor")
-		}
-		return one(Fail, "the telemetry endpoint does not answer on "+telemetry.EndpointListen+": "+telemetry.EndpointAuthError, "check eregion-telemetry.service and run eregion apply")
+		return one(Fail, "the telemetry endpoint does not answer on "+telemetry.EndpointListen+": "+telemetry.EndpointAuthError, "check public ingress, TLS and eregion-telemetry.service, then run eregion apply")
 	}
 	if !telemetry.EndpointAuthKnown {
-		return one(Fail, "the telemetry endpoint's authentication was not observed", "check eregion-telemetry.service and retry")
+		return one(Fail, "the telemetry endpoint's authentication was not observed", "check public ingress and eregion-telemetry.service, then retry")
 	}
 	if telemetry.EndpointAuthStatus != 401 {
-		return one(Fail, fmt.Sprintf("the telemetry endpoint answered HTTP %d without a credential; want 401", telemetry.EndpointAuthStatus), "check eregion-telemetry.service and run eregion metrics rotate")
+		return one(Fail, fmt.Sprintf("the telemetry endpoint answered HTTP %d without a credential; want 401", telemetry.EndpointAuthStatus), "check the public telemetry route and run eregion metrics rotate")
 	}
-	return one(Pass, "the authenticated telemetry endpoint answers 401 without a credential over WireGuard only", "")
+	return one(Pass, "the authenticated telemetry endpoint answers 401 without a credential on the public HTTPS path", "")
 }
 
 func formatTelemetryValue(value float64) string {

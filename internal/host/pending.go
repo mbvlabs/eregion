@@ -22,7 +22,7 @@ const pendingSchema = 1
 const PendingInitFile = "init.json"
 
 // PendingKnownHostsFile is the host-key pin of the init's public first-contact
-// address. The saved context pins the WireGuard address in its own
+// address. The saved workspace access pins the WireGuard address in its own
 // known_hosts, so --discard drops trust learned by an abandoned attempt.
 const PendingKnownHostsFile = "known_hosts"
 

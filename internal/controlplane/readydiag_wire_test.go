@@ -1163,8 +1163,6 @@ func TestReadinessWirePlanMigrationsRiverCancellation(t *testing.T) {
 		select {
 		case query := <-server.started:
 			if strings.Contains(query, "river_migration") && strings.Contains(query, "WHERE line =") {
-				cancel()
-				gate.Release()
 				started = true
 			}
 		case <-time.After(2 * time.Second):
@@ -1172,10 +1170,17 @@ func TestReadinessWirePlanMigrationsRiverCancellation(t *testing.T) {
 		}
 	}
 
+	// Cancel while the server query remains blocked on the gate. Wait for the
+	// client result before releasing the gate so a successful response cannot
+	// race the cancellation and make this test flaky. The gate is released on
+	// the bounded failure path and by cleanup for the success path.
+	cancel()
 	var err error
 	select {
 	case err = <-done:
+		gate.Release()
 	case <-time.After(2 * time.Second):
+		gate.Release()
 		t.Fatal("River cancellation did not return")
 	}
 	trace.finishContext(ctx, snapshotReadyPool(pool), err)

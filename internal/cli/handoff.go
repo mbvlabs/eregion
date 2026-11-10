@@ -298,7 +298,7 @@ func verifyWorkspaceIdentity(requested string, workspace controlplane.WorkspaceI
 	if workspace.Name != requested {
 		fault := contract.NewFault(contract.Conflict,
 			"the node workspace is "+workspace.Name+", not "+requested,
-			"The workspace name and ID are immutable. Resume with --workspace "+workspace.Name+", or restore the intended database.")
+			"The workspace name and ID are immutable. Run eregion server init --resume --workspace-name "+workspace.Name+" to continue with the existing workspace, or restore the intended database.")
 		fault.Details = map[string]any{"configured_workspace": workspace.Name, "requested_workspace": requested}
 		return fault
 	}
@@ -367,7 +367,7 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 		}},
 	}
 	if in.MetricsUsername != "" && in.MetricsPassword != "" {
-		groups = append(groups, metricsHandoffGroup(in.MetricsUsername, in.MetricsPassword))
+		groups = append(groups, metricsHandoffGroup(in.Hostname, in.MetricsUsername, in.MetricsPassword))
 	}
 	groups = append(groups, handoffGroup{title: "Break-glass", fields: []handoffField{
 		{"When", "Only when WireGuard or the node is unreachable."},
@@ -380,13 +380,18 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 
 // metricsHandoffGroup is added only when a credential exists. Its values are a
 // protected handoff exception, never ordinary output.
-func metricsHandoffGroup(username, password string) handoffGroup {
+func metricsHandoffGroup(hostname, username, password string) handoffGroup {
+	metricsURL, metricsErr := telemetry.PublicMetricsURL(hostname)
+	discoveryURL, discoveryErr := telemetry.PublicDiscoveryURL(hostname)
+	if metricsErr != nil || discoveryErr != nil {
+		metricsURL, discoveryURL = "unconfigured: the node has no public hostname", "unconfigured: the node has no public hostname"
+	}
 	return handoffGroup{title: "Node metrics", fields: []handoffField{
-		{"Metrics URL", telemetry.EndpointMetricsURL(access.NodeAddress)},
-		{"Discovery URL", telemetry.EndpointDiscoveryURL(access.NodeAddress)},
+		{"Metrics URL", metricsURL},
+		{"Discovery URL", discoveryURL},
 		{"Username", username},
 		{"Password", password},
-		{"Access", "WireGuard only; basic authentication; no public endpoint"},
+		{"Access", "Public HTTPS; basic authentication; raw exporter and gateway stay private"},
 	}}
 }
 

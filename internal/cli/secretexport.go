@@ -149,15 +149,15 @@ func loadHandoffExportIdentity(cmd *cobra.Command) (handoffExportIdentity, error
 	}
 	sshKey, err := readIdentityFile(filepath.Join(dir, "ssh_ed25519"))
 	if err != nil {
-		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator SSH key is missing", "The context file references keys that are no longer on this machine; restore them from the stored handoff.")
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator SSH key is missing", "The workspace credential directory references keys that are no longer on this machine; restore them from the stored handoff.")
 	}
 	wgKey, err := transport.ReadWireGuardKey(filepath.Join(dir, "wireguard.key"))
 	if err != nil {
-		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator WireGuard key is missing", "The context file references keys that are no longer on this machine; restore them from the stored handoff.")
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator WireGuard key is missing", "The workspace credential directory references keys that are no longer on this machine; restore them from the stored handoff.")
 	}
 	sudoPassword, err := readIdentityFile(filepath.Join(dir, "sudo-password"))
 	if err != nil {
-		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator sudo password is missing", "The context file references credentials that are no longer on this machine; restore them from the stored handoff.")
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator sudo password is missing", "The workspace credential directory references credentials that are no longer on this machine; restore them from the stored handoff.")
 	}
 	return handoffExportIdentity{access: current, sshKey: strings.TrimSpace(sshKey), wgKey: wgKey, sudoPassword: strings.TrimSpace(sudoPassword)}, nil
 }

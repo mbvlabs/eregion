@@ -34,8 +34,8 @@ func TestCredentialRoundTripAndHash(t *testing.T) {
 	}
 }
 
-func TestTargetsAndConfigsAreWireGuardOnlyAndUseHTTPDiscovery(t *testing.T) {
-	raw, err := TargetsJSON("main", "10.78.0.1")
+func TestTargetsAndConfigsUseOnlyThePublicHTTPSHostname(t *testing.T) {
+	raw, err := TargetsJSON("main", "main.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,41 +46,147 @@ func TestTargetsAndConfigsAreWireGuardOnlyAndUseHTTPDiscovery(t *testing.T) {
 	if err := json.Unmarshal(raw, &entries); err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Targets[0] != "10.78.0.1:9101" ||
+	if len(entries) != 1 || len(entries[0].Targets) != 1 || entries[0].Targets[0] != "main.example.com:443" ||
 		entries[0].Labels["__metrics_path__"] != MetricsPath ||
-		entries[0].Labels["__scheme__"] != "http" ||
-		entries[0].Labels["eregion_public"] != "false" ||
-		entries[0].Labels["eregion_access"] != "wireguard" {
+		entries[0].Labels["__scheme__"] != "https" ||
+		entries[0].Labels["eregion_node"] != "main" ||
+		entries[0].Labels["eregion_component"] != "node" ||
+		entries[0].Labels["eregion_public"] != "true" ||
+		entries[0].Labels["eregion_access"] != "public_https" {
 		t.Fatalf("targets = %s", raw)
 	}
-	for _, config := range []string{
-		PrometheusConfig("main", "10.78.0.1", Username, PasswordPlaceholder),
-		AlloyConfig("main", "10.78.0.1", Username, PasswordPlaceholder),
-	} {
-		if !strings.Contains(config, "http://10.78.0.1:9101/targets.json") || !strings.Contains(config, PasswordPlaceholder) {
-			t.Fatalf("config missing discovery or placeholder:\n%s", config)
+	for _, target := range entries[0].Targets {
+		for _, forbidden := range []string{"10.78.0.1", "127.0.0.1", ":9101", ":9100"} {
+			if strings.Contains(target, forbidden) {
+				t.Fatalf("target %q was reconstructed from a listener or WireGuard address", target)
+			}
 		}
-		if strings.Contains(config, "https://") {
-			t.Fatalf("config implied a public TLS endpoint:\n%s", config)
+	}
+
+	prometheus, err := PrometheusConfig("main", "main.example.com", Username, PasswordPlaceholder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alloy, err := AlloyConfig("main", "main.example.com", Username, PasswordPlaceholder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, config := range map[string]string{"prometheus": prometheus, "alloy": alloy} {
+		if !strings.Contains(config, "https://main.example.com/metrics/targets.json") ||
+			!strings.Contains(config, PasswordPlaceholder) {
+			t.Fatalf("%s config missing public HTTPS discovery or placeholder:\n%s", name, config)
+		}
+		if strings.Count(config, "basic_auth") < 2 {
+			t.Fatalf("%s config must authenticate both discovery and scrape:\n%s", name, config)
+		}
+		if !strings.Contains(config, `scheme`) || !strings.Contains(config, "https") {
+			t.Fatalf("%s config does not scrape with HTTPS:\n%s", name, config)
+		}
+		for _, forbidden := range []string{"10.78.0.1", "127.0.0.1:9101", "http://", "insecure_skip_verify"} {
+			if strings.Contains(config, forbidden) {
+				t.Fatalf("%s config contains %q:\n%s", name, forbidden, config)
+			}
 		}
 	}
 }
 
-func TestEndpointInfoIsNeverPublicOrUnauthenticated(t *testing.T) {
-	info := BuildEndpointInfo("main", "10.78.0.1", "http://127.0.0.1:9100", true)
+func TestMissingHostnameIsUnconfiguredWithoutAListenerFallback(t *testing.T) {
+	for name, call := range map[string]func() error{
+		"targets": func() error { _, err := TargetsJSON("main", ""); return err },
+		"prometheus": func() error {
+			_, err := PrometheusConfig("main", "", Username, PasswordPlaceholder)
+			return err
+		},
+		"alloy": func() error {
+			_, err := AlloyConfig("main", "", Username, PasswordPlaceholder)
+			return err
+		},
+		"metrics URL": func() error { _, err := PublicMetricsURL(""); return err },
+		"discovery URL": func() error {
+			_, err := PublicDiscoveryURL("")
+			return err
+		},
+	} {
+		if err := call(); err == nil || !strings.Contains(err.Error(), "unconfigured") {
+			t.Fatalf("%s without a hostname = %v, want unconfigured", name, err)
+		}
+	}
+	info, err := BuildEndpointInfo("main", "", "http://127.0.0.1:9100", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State != EndpointStateUnconfigured || info.MetricsURL != "" || info.DiscoveryURL != "" || info.Public {
+		t.Fatalf("unconfigured endpoint = %+v", info)
+	}
+	if err := info.Validate(); err != nil {
+		t.Fatalf("unconfigured endpoint did not validate: %v", err)
+	}
+}
+
+func TestEndpointInfoIsPublicHTTPSAuthenticatedAndExact(t *testing.T) {
+	info, err := BuildEndpointInfo("main", "main.example.com", "http://127.0.0.1:9100", true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := info.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if info.Credential != true || info.Access != "wireguard" || info.Authentication != "basic" {
+	if info.State != EndpointStateConfigured || !info.Credential || info.Access != "public_https" ||
+		!info.Public || info.Authentication != "basic" || info.Listen != GatewayListenAddress ||
+		info.MetricsURL != "https://main.example.com/metrics/node" ||
+		info.DiscoveryURL != "https://main.example.com/metrics/targets.json" {
 		t.Fatalf("endpoint = %+v", info)
 	}
-	info.Public = true
-	if info.Validate() == nil {
-		t.Fatal("a public endpoint was accepted")
+	if !strings.Contains(info.Note, "desired") || !strings.Contains(info.Note, "reachability") {
+		t.Fatalf("endpoint note overclaims configuration:\n%s", info.Note)
 	}
-	info = BuildEndpointInfo("main", "10.78.0.1", "http://127.0.0.1:9100", false)
-	info.Authentication = "none"
-	if info.Validate() == nil {
-		t.Fatal("an unauthenticated endpoint was accepted")
+
+	pending, err := BuildEndpointInfo("main", "main.example.com", "http://127.0.0.1:9100", false)
+	if err != nil || pending.State != EndpointStatePendingCredential || pending.Validate() != nil {
+		t.Fatalf("pending endpoint = %+v err=%v", pending, err)
+	}
+
+	needsApply := info
+	needsApply.State = EndpointStateNeedsApply
+	if err := needsApply.Validate(); err != nil {
+		t.Fatalf("a credentialed gateway awaiting apply did not validate: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*EndpointInfo){
+		"loopback target": func(e *EndpointInfo) {
+			e.MetricsURL = "https://127.0.0.1/metrics/node"
+		},
+		"WireGuard target": func(e *EndpointInfo) {
+			e.DiscoveryURL = "https://10.78.0.1/metrics/targets.json"
+		},
+		"listener port": func(e *EndpointInfo) {
+			e.MetricsURL = "https://main.example.com:9101/metrics/node"
+		},
+		"http scheme": func(e *EndpointInfo) {
+			e.MetricsURL = "http://main.example.com/metrics/node"
+		},
+		"unauthenticated": func(e *EndpointInfo) {
+			e.Authentication = "none"
+		},
+		"not public": func(e *EndpointInfo) {
+			e.Public = false
+		},
+		"wrong listen": func(e *EndpointInfo) {
+			e.Listen = "0.0.0.0:9101"
+		},
+		"configured without credential": func(e *EndpointInfo) {
+			e.Credential = false
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy := info
+			mutate(&copy)
+			if err := copy.Validate(); err == nil {
+				t.Fatalf("endpoint accepted unsafe mutation: %+v", copy)
+			}
+		})
+	}
+	if _, err := BuildEndpointInfo("main", "127.0.0.1", "http://127.0.0.1:9100", true); err == nil {
+		t.Fatal("a loopback hostname was accepted as the public endpoint")
 	}
 }

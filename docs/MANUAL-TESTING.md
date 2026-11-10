@@ -701,6 +701,50 @@ flow complete from the healthy exporter/snapshot check. The future optional
 telemetry-node concept remains in MASTER; no current managed collector or
 dashboard installation is implied.
 
+### Workspace-only targeting and HTTPS telemetry — integrated local verification
+
+The corrected operator contract uses one named target, workspace, throughout
+selection, management, setup/login presentation and machine output. Credentials
+remain in their existing private locations. Initialization and target selection
+have distinct flags; historical storage keys are not accepted as workspace
+identities. Independent review covered SSH/tunnel dispatch, interrupted setup,
+explicit stores, conservative local cleanup and verified atomic login
+publication. Identified defects were corrected before integration. Failed
+replacement tests now seed existing verified access and compare store, key and
+pin bytes, including the complete credential-directory set after failure.
+
+The HTTPS telemetry correction uses two exact paths on the configured hostname
+and loopback-only exporter/authentication backends. It preserves the existing
+credential during managed convergence, validates complete managed configuration,
+serializes ingress publication, and provides complete bounded recovery even when
+the initiating context is cancelled. External discovery and generated scrape
+configuration use authenticated HTTPS, not listener or WireGuard addresses.
+Independent review findings were corrected and re-reviewed; no live deployment
+or authenticated external scrape is claimed by these local checks.
+
+The integrated affected package suites passed normal/race testing, build, vet
+and Darwin amd64/arm64 cross-builds. Independent targeted verification passed
+**49 normal / 50 race test cases**, with zero failures or skips, metadata checks
+for **115 commands** and **100 visible commands**, and both real pinned-Caddy
+gateway validation/public-root adaptation checks. Two final presentation fixes
+removed setup's duplicate Context answer row and corrected the resume command;
+their focused normal/race tests, build, vet and metadata check passed.
+
+The final **627-file** production-asset manifest, including embedded guide,
+scripts and SQL, matched before/after the focused final checks:
+`9c11d890a563fa54196f802e4944f953295b0e8494c0adb77e887d725f9bc731`.
+The preceding independent integrated baseline was
+`2c4b2092aea6d751554c41bfd687d78a9906c9b91c9a4af190725b8e856e9bd0`;
+the retained manifest-provenance note distinguishes the two snapshots.
+Evidence is retained under `.local/qualification/workspace-only/`,
+`workspace-independent/`, `https-telemetry-track/`, `integrated-workspace-https/`,
+`integrated-final/` and `final-wording/`. The isolated telemetry source patch and
+84-entry evidence archive are retained; the implementation worktree was removed.
+
+Signed CI/publication and exact-candidate host/external-collector qualification
+are separate gates. Prepared verified Prometheus tooling is a test client, not
+a managed telemetry-node deployment. LABS-346's historical timeout remains open.
+
 ### Evidence retention correction (2026-11-10)
 
 Earlier qualification phases incorrectly retained detailed evidence under

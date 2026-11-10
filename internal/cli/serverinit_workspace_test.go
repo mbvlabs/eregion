@@ -292,6 +292,39 @@ func TestResumeRefusesAConflictingWorkspaceBeforeContact(t *testing.T) {
 	}
 }
 
+func TestServerInitAnswerRowsUseWorkspaceNotPrivateAccessKey(t *testing.T) {
+	const privateKey = "historical-private"
+	rows := serverInitAnswerRows(serverInitAnswers{
+		User: "root", Host: "203.0.113.10", Port: "22",
+		Node: "main", Workspace: "thelab", Context: privateKey,
+		Hostname: "app.example.com", AdminUser: "admin",
+	})
+	workspaceRows := 0
+	for _, row := range rows {
+		if row[0] == "Workspace" {
+			workspaceRows++
+			if row[1] != "thelab" {
+				t.Fatalf("workspace row = %+v", row)
+			}
+		}
+		if row[0] == "Context" || row[1] == privateKey {
+			t.Fatalf("private access key reached the human answer rows: %+v", rows)
+		}
+	}
+	if workspaceRows != 1 {
+		t.Fatalf("workspace rows = %d, want exactly one: %+v", workspaceRows, rows)
+	}
+	seen := map[string]bool{}
+	for _, row := range rows {
+		seen[row[0]] = true
+	}
+	for _, label := range []string{"Server", "Node", "Workspace", "Public hostname", "Admin user"} {
+		if !seen[label] {
+			t.Fatalf("answer rows are missing %s: %+v", label, rows)
+		}
+	}
+}
+
 func TestStatusTextShowsWorkspaceAndNode(t *testing.T) {
 	text := statusText(host.NodeStatus{
 		Node: "main", Role: "main", NodeVersion: "dev",
@@ -319,7 +352,15 @@ func TestVerifyWorkspaceIdentity(t *testing.T) {
 	if err := verifyWorkspaceIdentity("thelab", controlplane.WorkspaceIdentity{}); contract.Classify(err).Code != contract.PreconditionFailed {
 		t.Fatalf("requested workspace on an unconfigured node = %v", err)
 	}
-	if err := verifyWorkspaceIdentity("other", configured); contract.Classify(err).Code != contract.Conflict {
+	err := verifyWorkspaceIdentity("other", configured)
+	if contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("conflicting handoff = %v", err)
+	}
+	fault := contract.Classify(err)
+	if !strings.Contains(fault.Hint, "eregion server init --resume --workspace-name thelab") {
+		t.Fatalf("conflicting handoff hint lacks the actionable creation command: %q", fault.Hint)
+	}
+	if strings.Contains(fault.Hint, "Resume with --workspace ") {
+		t.Fatalf("conflicting handoff hint still uses the rejected global selector: %q", fault.Hint)
 	}
 }

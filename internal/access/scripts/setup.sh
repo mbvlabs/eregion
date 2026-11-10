@@ -91,10 +91,9 @@ for rule in "allow ${WG_PORT}/udp" "allow 80/tcp" "allow 443/tcp" "allow in on w
   read -r -a args <<< "${rule}"
   ufw "${args[@]}" >/dev/null
 done
-# The authenticated telemetry endpoint is reachable only from peers on wg0.
-# The default deny covers every other interface, so no public rule is ever
-# added for 9101. node_exporter itself stays on loopback.
-ufw allow in on wg0 to "${WG_ADDRESS%%/*}" port 9101 proto tcp >/dev/null
+# Telemetry is served through the existing public HTTPS ingress on the main
+# hostname. The dedicated authentication gateway stays on loopback; there is
+# no WireGuard-only telemetry listener or 9101 firewall rule.
 if [ ! -f "${STATE_DIR}/locked" ]; then
   ufw allow "${SSH_PORT}/tcp" >/dev/null
 fi
@@ -107,13 +106,9 @@ else
   systemctl restart wg-quick@wg0
 fi
 
-# The authenticated telemetry endpoint is a dedicated Caddy instance written
-# by `metrics rotate`. node_exporter is loopback-only and already started by
-# its own step; telemetry Caddy can bind the WireGuard address only once wg0
-# exists. Public Caddy remains independent.
-if [ -f /etc/eregion-telemetry/Caddyfile ] && systemctl cat eregion-telemetry.service >/dev/null 2>&1; then
-  systemctl restart eregion-telemetry.service >/dev/null 2>&1 || true
-fi
+# The telemetry authentication gateway is a loopback-only dedicated Caddy
+# instance started by its own host step/rotation. It has no WireGuard start
+# dependency and is independent of public caddy.service.
 
 install -d -m 0700 "${STATE_DIR}"
 printf '%s\n' "${SSH_PORT}" > "${STATE_DIR}/ssh-port"

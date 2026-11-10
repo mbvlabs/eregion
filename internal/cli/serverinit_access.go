@@ -25,7 +25,7 @@ import (
 
 // operatorIdentity is what server init generates for the operator, like
 // vaire: an SSH key for the admin user, a WireGuard key for the operator
-// peer, and the admin sudo password. It lives owner-only next to the context
+// peer, and the admin sudo password. It lives owner-only next to the private workspace store
 // file, so a re-run reuses it.
 type operatorIdentity struct {
 	dir          string
@@ -130,7 +130,7 @@ func (id *operatorIdentity) authorizedKey() string {
 	return strings.TrimSpace(string(ssh.MarshalAuthorizedKey(id.signer.PublicKey())))
 }
 
-// wireGuardRoute is the context route to a locked-down node: SSH as the admin
+// wireGuardRoute is the workspace access route to a locked-down node: SSH as the admin
 // user inside the embedded WireGuard tunnel.
 func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts, adminUser string) *host.WorkspaceSSH {
 	return &host.WorkspaceSSH{
@@ -149,7 +149,7 @@ func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts
 }
 
 // pinContextKnownHosts copies the host keys verified for the public
-// first-contact address into the context's own known_hosts under the
+// first-contact address into the workspace access record own known_hosts under the
 // WireGuard address. The pending known_hosts remains the public-address
 // record, so a first contact or resume still verifies that address on its
 // own.
@@ -173,7 +173,7 @@ func pinContextKnownHosts(pending, scoped, publicAddress, wireGuardAddress strin
 	return nil
 }
 
-// routeRemote opens a host.Remote for a context route.
+// routeRemote opens a host.Remote for a workspace access route.
 func routeRemote(route *host.WorkspaceSSH, prompt bool) (*host.Remote, error) {
 	auth, err := sshAuth(route.Identity, prompt)
 	if err != nil {
@@ -182,7 +182,7 @@ func routeRemote(route *host.WorkspaceSSH, prompt bool) (*host.Remote, error) {
 	cfg := host.RemoteConfig{Address: route.Address, User: route.User, KnownHosts: route.KnownHosts, Auth: auth, Timeout: 20 * time.Second}
 	if route.WireGuard != nil {
 		if cfg.Dial, err = wireGuardDial(route.WireGuard); err != nil {
-			return nil, contract.NewFault(contract.ValidationFailed, "the context's WireGuard route is not usable", err.Error())
+			return nil, contract.NewFault(contract.ValidationFailed, "the workspace SSH route is not usable", err.Error())
 		}
 	}
 	return host.NewRemote(cfg)
@@ -237,7 +237,7 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 		return nil, err
 	}
 	// The node presents the same host keys on every address. Pin the key
-	// verified over public SSH for the WireGuard address in this context's
+	// verified over public SSH for the WireGuard address in this workspace access record
 	// own known_hosts; on a resume that skipped first contact it comes from
 	// the pending known_hosts, which keeps verifying the public address.
 	publicAddress := net.JoinHostPort(publicHost, r.answers.Port)
@@ -288,7 +288,7 @@ func (r *serverInit) planRows(plan host.Plan) []host.PlanEntry {
 		if strings.Contains(lower(row), "node_exporter") {
 			hasExporter = true
 		}
-		if strings.Contains(lower(row), "telemetry endpoint") {
+		if strings.Contains(lower(row), "telemetry endpoint") || strings.Contains(lower(row), "telemetry gateway") {
 			hasTelemetry = true
 		}
 	}
@@ -296,7 +296,7 @@ func (r *serverInit) planRows(plan host.Plan) []host.PlanEntry {
 		rows = append(rows, host.PlanEntry{ID: "access-node-exporter", Description: "Install node_exporter on loopback"})
 	}
 	if !hasTelemetry {
-		rows = append(rows, host.PlanEntry{ID: "access-telemetry", Description: "Install the authenticated telemetry endpoint prerequisites on the WireGuard address"})
+		rows = append(rows, host.PlanEntry{ID: "access-telemetry", Description: "Install the authenticated HTTPS telemetry gateway behind the public ingress"})
 	}
 	return rows
 }

@@ -143,6 +143,27 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 		configPath := filepath.Join(t.TempDir(), "contexts.json")
 		t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 		fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
+		node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
+		if err := executeWorkspaceLogin(t, fixture, node, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		storeBefore, err := host.LoadWorkspaceStore(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeAccess, ok := storeBefore.AccessByName("thelab")
+		if !ok {
+			t.Fatal("existing verified access missing")
+		}
+		beforeDir, err := storeBefore.CredentialDirFor(beforeAccess)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeBytes := filesUnder(t, beforeDir)
+		storeBytes, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
 		_, otherKey, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			t.Fatal(err)
@@ -158,20 +179,25 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 			return rpcNodeInfoResult{}, nil
 		}
 		a.loginSeams.ready = func(context.Context, *host.WorkspaceSSH) error { readyCalled = true; return nil }
-		a.root.SetArgs(fixture.args())
+		a.root.SetArgs(fixture.args("--replace", "thelab"))
 		if err := a.root.Execute(); contract.Classify(err).Code != contract.PreconditionFailed {
 			t.Fatalf("wrong host key = %v, want precondition_failed", err)
 		}
 		if readyCalled {
 			t.Fatal("readiness ran after a host-key mismatch")
 		}
-		store, err := host.LoadWorkspaceStore(configPath)
+		storeAfter, err := host.LoadWorkspaceStore(configPath)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(store.Access) != 0 {
-			t.Fatalf("failed login published access: %+v", store.Access)
+		if len(storeAfter.Access) != 1 {
+			t.Fatalf("failed replacement changed access records: %+v", storeAfter.Access)
 		}
+		afterBytes, err := os.ReadFile(configPath)
+		if err != nil || string(afterBytes) != string(storeBytes) {
+			t.Fatalf("failed replacement changed store bytes: err=%v", err)
+		}
+		assertFilesEqual(t, beforeBytes, filesUnder(t, beforeDir))
 		for entry := range filesUnder(t, filepath.Dir(configPath)) {
 			if strings.Contains(entry, ".eregion-login-") {
 				t.Fatalf("staged login directory remains: %s", entry)
@@ -184,17 +210,42 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 		t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 		fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 		node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
-		err := executeWorkspaceLoginWith(t, fixture, node, nil, nil, contract.NewFault(contract.Unavailable, "readiness failed", "Retry."))
+		if err := executeWorkspaceLogin(t, fixture, node, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		storeBefore, err := host.LoadWorkspaceStore(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeAccess, ok := storeBefore.AccessByName("thelab")
+		if !ok {
+			t.Fatal("existing verified access missing")
+		}
+		beforeDir, err := storeBefore.CredentialDirFor(beforeAccess)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeBytes := filesUnder(t, beforeDir)
+		storeBytes, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = executeWorkspaceLoginWith(t, fixture, node, nil, nil, contract.NewFault(contract.Unavailable, "readiness failed", "Retry."), "--replace", "thelab")
 		if contract.Classify(err).Code != contract.Unavailable {
 			t.Fatalf("readiness failure = %v", err)
 		}
-		store, loadErr := host.LoadWorkspaceStore(configPath)
+		storeAfter, loadErr := host.LoadWorkspaceStore(configPath)
 		if loadErr != nil {
 			t.Fatal(loadErr)
 		}
-		if len(store.Access) != 0 {
-			t.Fatalf("readiness failure published access: %+v", store.Access)
+		if len(storeAfter.Access) != 1 {
+			t.Fatalf("readiness failure changed access records: %+v", storeAfter.Access)
 		}
+		afterBytes, readErr := os.ReadFile(configPath)
+		if readErr != nil || string(afterBytes) != string(storeBytes) {
+			t.Fatalf("readiness failure changed store bytes: err=%v", readErr)
+		}
+		assertFilesEqual(t, beforeBytes, filesUnder(t, beforeDir))
 	})
 
 	t.Run("publication failure after verification", func(t *testing.T) {
@@ -217,6 +268,11 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 			t.Fatal("initial verified access missing")
 		}
 		credentialDir, err := storeBefore.CredentialDirFor(accessBefore)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeServers := filesUnder(t, filepath.Dir(credentialDir))
+		beforeStoreBytes, err := os.ReadFile(configPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -250,6 +306,11 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 		if _, err := os.Stat(credentialDir); err != nil {
 			t.Fatalf("failed publication deleted the active credential directory: %v", err)
 		}
+		afterStoreBytes, readErr := os.ReadFile(configPath)
+		if readErr != nil || string(afterStoreBytes) != string(beforeStoreBytes) {
+			t.Fatalf("failed publication changed store bytes: err=%v", readErr)
+		}
+		assertFilesEqual(t, beforeServers, filesUnder(t, filepath.Dir(credentialDir)))
 		for entry := range filesUnder(t, filepath.Dir(configPath)) {
 			if strings.Contains(entry, ".eregion-login-") {
 				t.Fatalf("failed publication left a staged directory: %s", entry)

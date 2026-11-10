@@ -245,9 +245,9 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		steps = append(steps, newAPIService(r.Config, r.Exec), newWorkerService(r.Config, r.Exec))
 		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe})
 		// node_exporter listens on loopback only. It starts with its unit; the
-		// authenticated telemetry endpoint is a dedicated Caddy instance on
-		// the WireGuard address, enabled by credential rotation and separate
-		// from public ingress.
+		// authenticated telemetry gateway is a dedicated Caddy instance on
+		// 127.0.0.1:9101, reached through two exact public ingress paths and
+		// enabled by credential rotation. It is independent of WireGuard.
 		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec}, &telemetryStep{cfg: r.Config, exec: r.Exec})
 	}
 	// The main node also needs /etc/eregion/node.json: node RPC, the CI URLs,

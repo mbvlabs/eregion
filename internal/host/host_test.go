@@ -18,6 +18,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
 func put(t *testing.T, path, text string, mode os.FileMode) {
@@ -111,11 +112,14 @@ func TestMainServiceUnitsIncludeTheWireGuardExporter(t *testing.T) {
 	if got := NodeExporterMetricsURL(); got != "http://127.0.0.1:9100/metrics" {
 		t.Fatalf("exporter URL = %q", got)
 	}
-	if got := TelemetryListenAddress(); got != "10.78.0.1:9101" {
-		t.Fatalf("telemetry listen = %q", got)
+	if got := TelemetryListenAddress(); got != "127.0.0.1:9101" {
+		t.Fatalf("telemetry gateway listen = %q", got)
 	}
-	if got := TelemetryDiscoveryURL(); got != "http://10.78.0.1:9101/targets.json" {
-		t.Fatalf("telemetry discovery URL = %q", got)
+	if got, err := telemetry.PublicDiscoveryURL("main.example.com"); err != nil || got != "https://main.example.com/metrics/targets.json" {
+		t.Fatalf("telemetry discovery URL = %q err=%v", got, err)
+	}
+	if _, err := telemetry.PublicDiscoveryURL(""); err == nil {
+		t.Fatal("a missing hostname produced a telemetry target")
 	}
 }
 

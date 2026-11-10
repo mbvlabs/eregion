@@ -28,7 +28,7 @@ import (
 	"golang.org/x/term"
 )
 
-// Init phases recorded in pending/<context>/init.json. --resume continues
+// Init phases recorded in pending/<workspace>/init.json. --resume continues
 // after the last completed one.
 const (
 	phaseContact     = "first_contact"
@@ -167,7 +167,7 @@ type serverInit struct {
 	metricsCredential *telemetry.Credential
 	// hostDoctor is replaced by tests; production reads the node's report.
 	hostDoctor func(context.Context, bool) (doctor.Report, error)
-	// metricsClient is replaced by tests; production resolves the init context's
+	// metricsClient is replaced by tests; production resolves the init workspace access
 	// node client.
 	metricsClient metricsRotationClient
 }
@@ -545,7 +545,7 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		}
 		task.end(ui.EndOK, "eregion node rpc over SSH in WireGuard")
 
-		summary.Telemetry = r.checkTelemetryEndpoint(ctx, route)
+		summary.Telemetry = r.checkTelemetryEndpoint(ctx)
 		r.checkDNS(ctx)
 		r.waitForCertificate(ctx)
 		if err := ctx.Err(); err != nil {
@@ -622,7 +622,7 @@ func (r *serverInit) prepare() error {
 		}
 		if pending.Workspace == "" {
 			// Pre-alpha.7 unfinished init: continue explicitly unconfigured
-			// rather than inventing an identity from the context name.
+			// rather than inventing an identity from the private access key.
 			r.workspaceOptional = true
 		}
 		r.answers = answersFromPending(pending)
@@ -819,14 +819,23 @@ func (r *serverInit) collect() error {
 	}
 	r.answers = ans
 	if r.interactive {
-		r.live.Println(ui.Answered("Server", ans.User+"@"+ans.address()))
-		r.live.Println(ui.Answered("Node", ans.Node))
-		r.live.Println(ui.Answered("Workspace", ans.Workspace))
-		r.live.Println(ui.Answered("Context", ans.Context))
-		r.live.Println(ui.Answered("Public hostname", ans.Hostname))
-		r.live.Println(ui.Answered("Admin user", ans.AdminUser))
+		for _, row := range serverInitAnswerRows(ans) {
+			r.live.Println(ui.Answered(row[0], row[1]))
+		}
 	}
 	return nil
+}
+
+// serverInitAnswerRows is the current human answer presentation. The private
+// pending access key is not a user-facing identity and is never printed.
+func serverInitAnswerRows(ans serverInitAnswers) [][2]string {
+	return [][2]string{
+		{"Server", ans.User + "@" + ans.address()},
+		{"Node", ans.Node},
+		{"Workspace", ans.Workspace},
+		{"Public hostname", ans.Hostname},
+		{"Admin user", ans.AdminUser},
+	}
 }
 
 // validate checks every answer before anything is generated or contacted.

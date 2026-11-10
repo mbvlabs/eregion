@@ -63,6 +63,15 @@ func TestWriteFileAtomicReplacesContent(t *testing.T) {
 	}
 }
 
+func TestIngressLockStaysOutsideTheCaddyFragmentGlob(t *testing.T) {
+	if !strings.HasPrefix(CaddyIngressLockPath, CaddyRoutesDir+"/") {
+		t.Fatalf("ingress lock is outside the shared route directory: %s", CaddyIngressLockPath)
+	}
+	if strings.HasSuffix(CaddyIngressLockPath, ".caddy") {
+		t.Fatalf("ingress lock would be imported as a Caddy fragment: %s", CaddyIngressLockPath)
+	}
+}
+
 func TestWebUpstreamsUsesServingWebPorts(t *testing.T) {
 	upstreams := WebUpstreams([]DeploymentInstance{
 		{Kind: "web", HostPort: 40002},

@@ -621,7 +621,7 @@ func primaryMark(primary bool) string {
 
 // mainNodeAddresses is the address the domain's DNS record points at: the
 // selected context's WireGuard endpoint (the main node's public address), or
-// the SSH target when the context predates WireGuard. It follows --context /
+// the SSH target when the workspace access predates WireGuard. It follows --workspace /
 // EREGION_WORKSPACE through selectedWorkspaceAccess so a binding never records another
 // server's address.
 func mainNodeAddresses(cmd *cobra.Command) []string {

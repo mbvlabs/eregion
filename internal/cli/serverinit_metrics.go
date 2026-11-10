@@ -8,28 +8,27 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/cli/ui"
-	"github.com/mbvlabs/eregion/internal/host"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
-// checkTelemetryEndpoint is the init-side observation of D5: the loopback exporter
-// is installed with its host step, and the WireGuard-facing endpoint must
-// challenge an unauthenticated request. The client dials through WireGuard.
-func (r *serverInit) checkTelemetryEndpoint(ctx context.Context, route *host.WorkspaceSSH) string {
-	if route == nil || route.WireGuard == nil {
-		return "unknown"
-	}
-	task := r.start("telemetry", "Checking the authenticated telemetry endpoint over WireGuard")
-	dial, err := wireGuardDial(route.WireGuard)
+// checkTelemetryEndpoint is the init-side observation of D5: the loopback
+// exporter is installed with its host step, and the public HTTPS discovery
+// path must challenge an unauthenticated request. It observes the public URL,
+// not a WireGuard-only or loopback target.
+func (r *serverInit) checkTelemetryEndpoint(ctx context.Context) string {
+	url, err := telemetry.PublicDiscoveryURL(r.answers.Hostname)
 	if err != nil {
-		task.end(ui.EndWarn, "")
-		r.warnings = append(r.warnings, "the telemetry endpoint could not be checked: "+err.Error())
-		return "unknown"
+		r.warnings = append(r.warnings, "the telemetry endpoint is unconfigured because the node has no public hostname")
+		return "unconfigured"
 	}
+	task := r.start("telemetry", "Checking the authenticated telemetry endpoint over public HTTPS")
 	client := &http.Client{
 		Timeout:   10 * time.Second,
-		Transport: &http.Transport{DialContext: dial},
+		Transport: &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
-	url := host.TelemetryDiscoveryURL()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		task.end(ui.EndWarn, "")
@@ -38,7 +37,7 @@ func (r *serverInit) checkTelemetryEndpoint(ctx context.Context, route *host.Wor
 	response, err := client.Do(request)
 	if err != nil {
 		task.end(ui.EndWarn, "")
-		r.warnings = append(r.warnings, "the telemetry endpoint does not answer on "+url+" over WireGuard; run eregion metrics rotate and check eregion-telemetry.service on the server")
+		r.warnings = append(r.warnings, "the telemetry endpoint does not answer on "+url+"; run eregion metrics rotate and check public ingress and eregion-telemetry.service on the server")
 		return "unreachable"
 	}
 	defer response.Body.Close()
@@ -46,7 +45,7 @@ func (r *serverInit) checkTelemetryEndpoint(ctx context.Context, route *host.Wor
 	switch response.StatusCode {
 	case http.StatusUnauthorized:
 		task.end(ui.EndOK, "authenticated endpoint on "+url)
-		return "authenticated endpoint reachable on the WireGuard address"
+		return "authenticated endpoint reachable on public HTTPS"
 	case http.StatusOK:
 		task.end(ui.EndWarn, "")
 		r.warnings = append(r.warnings, "the telemetry endpoint answered discovery without authentication on "+url)

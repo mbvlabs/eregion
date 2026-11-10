@@ -16,6 +16,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -152,6 +153,17 @@ func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.
 	}
 	content := platform.RenderRoutes(routes)
 	now := time.Now().UTC()
+	// Keep the worker's PostgreSQL desired-route lock first, then serialize the
+	// fragment publish and activation with the host's root publish/activation.
+	// The host never takes a database lock, so this order cannot deadlock.
+	releaseIngress, err := engine.AcquireFile(ctx, platform.CaddyIngressLockPath, engine.LockExclusive, 30*time.Second)
+	if err != nil {
+		fault := contract.NewFault(contract.Unavailable,
+			"the local ingress is busy with another publish or activation",
+			"Wait for the other ingress operation to finish, then retry.")
+		return s.finishRouteWrite(ctx, tx, routed, unrouted, fault, now)
+	}
+	defer releaseIngress()
 	previous, err := os.ReadFile(platform.CaddyRoutesPath)
 	if err != nil {
 		fault := contract.NewFault(contract.PreconditionFailed, "Caddy is not set up on the main node ("+err.Error()+")", "Run eregion server init with a public hostname.")
