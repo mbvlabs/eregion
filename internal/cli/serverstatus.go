@@ -47,7 +47,7 @@ func statusText(status host.NodeStatus) string {
 	case status.WorkspaceError != "":
 		field("workspace", "unknown: "+status.WorkspaceError)
 	default:
-		field("workspace", "not configured (run eregion apply --assign-workspace NAME)")
+		field("workspace", "not configured")
 	}
 	field("role", status.Role)
 	field("eregion", status.NodeVersion)

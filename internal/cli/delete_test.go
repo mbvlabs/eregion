@@ -32,7 +32,7 @@ func pipeStdin(t *testing.T) {
 }
 
 func TestDeleteRefusesWithoutAHumanTerminal(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	pipeStdin(t)
 	for _, test := range []struct {
 		name    string
@@ -125,7 +125,7 @@ func TestEnvironmentDeleteFactorFollowsDurableProtection(t *testing.T) {
 }
 
 func TestDeleteDryRunNeedsNoFactorAndNoTerminal(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	pipeStdin(t)
 	code, stdout, stderr := invoke(t, "app", "delete", "api", "--confirm", "api", "--dry-run", "--json")
 	envelope := decodeOne(t, stdout)

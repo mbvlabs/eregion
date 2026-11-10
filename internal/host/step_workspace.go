@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 
@@ -13,8 +14,7 @@ import (
 
 // workspaceStep records the one-time portable installation workspace identity
 // after migrations exist. It only runs when an explicit workspace name was
-// supplied (new setup or `apply --assign-workspace`); a legacy apply without the flag
-// leaves the installation explicitly unconfigured and never guesses.
+// supplied; an apply without the name never guesses or assigns an identity.
 type workspaceStep struct {
 	cfg      Config
 	database Database
@@ -141,7 +141,20 @@ func (s *workspaceStep) Diff(context.Context, engine.Runtime) ([]string, error) 
 }
 
 func (s *workspaceStep) Plan(ctx context.Context, runtime engine.Runtime) (PlanEntry, error) {
-	return planEntry(ctx, s, runtime)
+	entry := PlanEntry{ID: s.ID(), Version: StepVersion(s.ID()), Description: s.Describe()}
+	check, err := s.Check(ctx, runtime)
+	if errors.Is(err, controlplane.ErrWorkspaceSchemaMissing) {
+		entry.Detail = "workspace initialization follows migration"
+	} else if err != nil {
+		entry.Error, entry.Hint = safeError(err), safeHint(err)
+		return entry, nil
+	} else {
+		entry.Complete, entry.Detail = check.Complete, check.Detail
+	}
+	if !entry.Complete {
+		entry.Diff, err = s.Diff(ctx, runtime)
+	}
+	return entry, err
 }
 
 // loadNodeConfigMap reads node.json as a generic object so writers preserve

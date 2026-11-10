@@ -150,8 +150,8 @@ func TestCloudflareConfigureJSONRefusalHasNoTokenPath(t *testing.T) {
 	}
 }
 
-func TestCloudflareConfigureMissingContextFailsBeforePrompts(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+func TestCloudflareConfigureMissingWorkspaceFailsBeforePrompts(t *testing.T) {
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "thelab")
 	cmd := &cobra.Command{}
 	cmd.Flags().String("zone", "", "")
@@ -176,12 +176,12 @@ func TestCloudflareConfigureMissingContextFailsBeforePrompts(t *testing.T) {
 	}
 	a := &app{secrets: &secrets.Registry{}}
 	if _, err := a.configureCloudflareCredential(cmd, seams); contract.Classify(err).Code != contract.NotFound {
-		t.Fatalf("missing context = %v, want not_found", err)
+		t.Fatalf("missing workspace = %v, want not_found", err)
 	} else if !strings.Contains(err.Error(), "workspace thelab") {
-		t.Fatalf("missing context fault does not name the context: %v", err)
+		t.Fatalf("missing workspace fault does not name the workspace: %v", err)
 	}
 	if len(prompts) != 0 {
-		t.Fatalf("missing context asked for %v before failing", prompts)
+		t.Fatalf("missing workspace asked for %v before failing", prompts)
 	}
 }
 

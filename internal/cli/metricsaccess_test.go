@@ -70,7 +70,7 @@ func newMetricsAccessBackend(configured bool) *metricsAccessBackend {
 
 func metricsAccessFixture(t *testing.T, configured bool) (telemetry.Credential, *metricsAccessBackend) {
 	t.Helper()
-	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "eregion", "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
@@ -158,7 +158,7 @@ func TestMetricsConfigRefusesPreexistingOutput(t *testing.T) {
 }
 
 func TestMetricsConfigTargetsFileNeedsNoCredential(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "eregion", "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
@@ -182,13 +182,13 @@ func TestMetricsConfigTargetsFileNeedsNoCredential(t *testing.T) {
 }
 
 func TestMetricsConfigRefusesCredentialFileWithoutLocalCredential(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "eregion", "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: "main", SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}); err != nil {
+	if _, err := store.PublishWorkspace("ws_0123456789abcdef01234567", "main", host.WorkspaceAccess{Name: "main", SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}, false); err != nil {
 		t.Fatal(err)
 	}
 	backend := newMetricsAccessBackend(true)

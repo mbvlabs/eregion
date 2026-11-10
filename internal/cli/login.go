@@ -150,7 +150,6 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	rec := parseHandoffRecord(string(plain))
 	get := func(section, label string) string { return rec.field(section, label) }
-	historicalName := strings.TrimSpace(get("Main node", "Context"))
 	nodeName := get("Main node", "Node name")
 	sshKey := get("Operator", "SSH private key")
 	wgKey := get("Operator", "WireGuard private key")
@@ -158,7 +157,6 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	adminUser := get("Operator", "Admin user")
 	workspaceName := strings.TrimSpace(get("Main node", "Workspace"))
 	workspaceID := strings.TrimSpace(get("Main node", "Workspace ID"))
-	workspaceDeclared := workspaceName != "" || workspaceID != ""
 	required := map[string]string{
 		"SSH private key": sshKey, "WireGuard private key": wgKey,
 		"WireGuard address":    wireGuardAddress,
@@ -172,16 +170,14 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 			return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has no "+label, "Use the bundle from eregion server init's secrets handoff.")
 		}
 	}
-	if workspaceDeclared {
-		if workspaceName == "" || workspaceID == "" {
-			return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has an incomplete workspace identity", "Use a current protected export with both the workspace name and ID.")
-		}
-		if err := controlplane.ValidateWorkspaceName(workspaceName); err != nil {
-			return result{}, err
-		}
-		if err := controlplane.ValidateWorkspaceID(workspaceID); err != nil {
-			return result{}, err
-		}
+	if workspaceName == "" || workspaceID == "" {
+		return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has an incomplete workspace identity", "Use a current protected export with both the workspace name and ID.")
+	}
+	if err := controlplane.ValidateWorkspaceName(workspaceName); err != nil {
+		return result{}, err
+	}
+	if err := controlplane.ValidateWorkspaceID(workspaceID); err != nil {
+		return result{}, err
 	}
 	for _, v := range []string{sshKey, wgKey, get("Operator", "Sudo password")} {
 		a.secrets.Add(v)
@@ -196,31 +192,12 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	replace, _ := cmd.Flags().GetString("replace")
 	replace = strings.TrimSpace(replace)
-	privateName := workspaceName
-	if workspaceDeclared {
-		if err := validateLoginWorkspaceTarget(store, workspaceName, workspaceID, replace); err != nil {
-			return result{}, err
-		}
-	} else {
-		if replace != "" {
-			return result{}, contract.NewFault(contract.Usage, "--replace names a verified workspace; this bundle has no workspace identity", "Refresh the protected export from the node and use its Workspace/Workspace ID fields.")
-		}
-		if len(store.Groups()) > 0 {
-			return result{}, contract.NewFault(contract.Conflict,
-				"this machine already has a verified workspace; this old bundle carries no portable identity",
-				"Refresh the protected export from the node and log in with its Workspace and Workspace ID fields.")
-		}
-		if historicalName == "" {
-			return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has neither a workspace identity nor a private access name", "Use a current protected export from eregion secrets export.")
-		}
-		if err := host.ValidateAccessName(historicalName); err != nil {
-			return result{}, err
-		}
-		privateName = historicalName
+	if err := validateLoginWorkspaceTarget(store, workspaceName, workspaceID, replace); err != nil {
+		return result{}, err
 	}
 	autoUpgrade := boolFlag(cmd, "auto-upgrade-nodes")
 	for _, group := range store.Groups() {
-		if workspaceDeclared && group.ID == workspaceID {
+		if group.ID == workspaceID {
 			for _, access := range group.Access {
 				autoUpgrade = autoUpgrade || access.AutoUpgradeNodes
 			}
@@ -229,12 +206,6 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	credentialDirName, err := store.CredentialDirName(workspaceID)
 	if err != nil {
 		return result{}, contract.NewFault(contract.PreconditionFailed, "could not allocate a private workspace credential directory", err.Error())
-	}
-	if !workspaceDeclared {
-		credentialDirName, err = store.CredentialDirName("legacy-" + historicalName)
-		if err != nil {
-			return result{}, contract.NewFault(contract.PreconditionFailed, "could not allocate a private workspace credential directory", err.Error())
-		}
 	}
 	dir := filepath.Join(filepath.Dir(store.Path), credentialDirName)
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
@@ -290,10 +261,8 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	stderr := cmd.ErrOrStderr()
-	// A portable-workspace bundle is proved against the node's authoritative
-	// identity before any local file is published. An old bundle has no
-	// workspace fields and remains an explicitly unconfigured access artifact.
-	if workspaceDeclared {
+	// Prove the bundle against the node before publishing local access.
+	{
 		verify := a.loginSeams.verify
 		if verify == nil {
 			verify = func(ctx context.Context, route *host.WorkspaceSSH) (rpcNodeInfoResult, error) {
@@ -312,7 +281,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		if !info.Workspace.Configured {
 			return result{}, contract.NewFault(contract.PreconditionFailed,
 				"the node's workspace identity is not configured",
-				"Run eregion apply --assign-workspace NAME on the node, then refresh the protected export with eregion secrets export.")
+				"Use a freshly initialized workspace and a current protected export from eregion secrets export on the correct node.")
 		}
 		if nodeName != "" && info.Node != "" && info.Node != nodeName {
 			fault := contract.NewFault(contract.Conflict,
@@ -354,14 +323,10 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		savedRoute.WireGuard = &wg
 	}
 	saved := host.WorkspaceAccess{
-		Name: privateName, SSH: &savedRoute, CredentialDir: credentialDirName,
+		Name: workspaceName, SSH: &savedRoute, CredentialDir: credentialDirName,
 		AutoUpgradeNodes: autoUpgrade,
 	}
-	if workspaceDeclared {
-		_, err = store.PublishWorkspace(workspaceID, workspaceName, saved, replace != "")
-	} else {
-		_, err = store.PublishUnconfiguredAccess(saved)
-	}
+	_, err = store.PublishWorkspace(workspaceID, workspaceName, saved, replace != "")
 	if err != nil {
 		// The published directory is new and never replaced an old credential
 		// directory. Removing it cannot touch existing workspace files.
@@ -369,8 +334,8 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	routeText := route.User + "@" + route.Address + " over WireGuard"
-	data := loginSuccessData(nodeName, routeText, workspaceName, workspaceID, workspaceDeclared)
-	title, rows, message := loginSuccessPresentation(nodeName, routeText, workspaceName, workspaceID, workspaceDeclared)
+	data := loginSuccessData(nodeName, routeText, workspaceName, workspaceID, true)
+	title, rows, message := loginSuccessPresentation(nodeName, routeText, workspaceName, workspaceID, true)
 	if interactive {
 		fmt.Fprintln(cmd.ErrOrStderr(), ui.Card(title, rows, nil))
 		return result{data: data, streamed: true}, nil

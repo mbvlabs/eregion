@@ -28,8 +28,8 @@ func testHostKey(t *testing.T) ssh.PublicKey {
 	return key
 }
 
-func TestInitPinsWireGuardKeyInTheContextKnownHosts(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+func TestInitPinsWireGuardKeyInTheWorkspaceKnownHosts(t *testing.T) {
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	pending, err := host.PendingKnownHosts("prod")
 	if err != nil {
 		t.Fatal(err)
@@ -48,11 +48,11 @@ func TestInitPinsWireGuardKeyInTheContextKnownHosts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scoped, err := contextKnownHostsPath("prod")
+	scoped, err := workspaceKnownHostsPath("prod")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pinContextKnownHosts(pending, scoped, publicAddress, wireGuardAddress); err != nil {
+	if err := pinWorkspaceKnownHosts(pending, scoped, publicAddress, wireGuardAddress); err != nil {
 		t.Fatal(err)
 	}
 	if after, err := os.ReadFile(pending); err != nil || string(after) != string(publicPin) {
@@ -60,10 +60,10 @@ func TestInitPinsWireGuardKeyInTheContextKnownHosts(t *testing.T) {
 	}
 
 	if !pinnedKeyMatches(scoped, wireGuardAddress, key) {
-		t.Fatal("the context known_hosts does not pin the WireGuard address")
+		t.Fatal("the workspace known_hosts does not pin the WireGuard address")
 	}
 	if hostKeyPinned(scoped, publicAddress) {
-		t.Fatal("the context known_hosts also pins the public first-contact address")
+		t.Fatal("the workspace known_hosts also pins the public first-contact address")
 	}
 	if !pinnedKeyMatches(pending, publicAddress, key) {
 		t.Fatal("the pending known_hosts no longer verifies the public address")
@@ -76,12 +76,12 @@ func TestInitPinsWireGuardKeyInTheContextKnownHosts(t *testing.T) {
 		t.Fatal(err)
 	}
 	if info.Mode().Perm() != 0o600 {
-		t.Fatalf("context known_hosts mode = %o, want 600", info.Mode().Perm())
+		t.Fatalf("workspace known_hosts mode = %o, want 600", info.Mode().Perm())
 	}
 }
 
 func TestInitResumeRebuildsScopedKnownHostsFromVerifiedPendingPin(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "eregion", "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	pending, err := host.PendingKnownHosts("prod")
 	if err != nil {
@@ -100,7 +100,7 @@ func TestInitResumeRebuildsScopedKnownHostsFromVerifiedPendingPin(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	scoped, err := contextKnownHostsPath("prod")
+	scoped, err := workspaceKnownHostsPath("prod")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,10 +108,10 @@ func TestInitResumeRebuildsScopedKnownHostsFromVerifiedPendingPin(t *testing.T) 
 		t.Fatalf("the fixture unexpectedly already has a scoped known_hosts: %v", err)
 	}
 
-	// This is the resumed state after access setup completed but the context
+	// This is the resumed state after access setup completed but the workspace
 	// was not saved: only the pending public-address pin survives.
 	r := &serverInit{
-		answers:    serverInitAnswers{Context: "prod", Host: "203.0.113.10", Port: "22", AdminUser: "admin"},
+		answers:    serverInitAnswers{AccessKey: "prod", Host: "203.0.113.10", Port: "22", AdminUser: "admin"},
 		pending:    &host.PendingInit{NodePublicKey: "node-public-key", Phases: map[string]string{phaseAccess: "done"}},
 		knownHosts: pending,
 	}
@@ -137,7 +137,7 @@ func TestInitResumeRebuildsScopedKnownHostsFromVerifiedPendingPin(t *testing.T) 
 }
 
 func TestInitResumeWithoutVerifiedPendingPinFailsClosed(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "eregion", "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	// A pin in the old shared location is not a verified first-contact source.
 	wireGuardAddress := net.JoinHostPort(access.NodeAddress, "22")
@@ -150,7 +150,7 @@ func TestInitResumeWithoutVerifiedPendingPinFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &serverInit{
-		answers:    serverInitAnswers{Context: "prod", Host: "203.0.113.10", Port: "22", AdminUser: "admin"},
+		answers:    serverInitAnswers{AccessKey: "prod", Host: "203.0.113.10", Port: "22", AdminUser: "admin"},
 		pending:    &host.PendingInit{NodePublicKey: "node-public-key", Phases: map[string]string{phaseAccess: "done"}},
 		knownHosts: pending,
 	}
@@ -164,7 +164,7 @@ func TestInitResumeWithoutVerifiedPendingPinFailsClosed(t *testing.T) {
 	if route != nil {
 		t.Fatalf("resume without a verified pending pin returned a route: %+v", route)
 	}
-	scoped, err := contextKnownHostsPath("prod")
+	scoped, err := workspaceKnownHostsPath("prod")
 	if err != nil {
 		t.Fatal(err)
 	}

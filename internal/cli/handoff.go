@@ -18,7 +18,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
-	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
@@ -195,23 +194,16 @@ func (r *serverInit) handoff(ctx context.Context, summary *serverInitSummary) er
 		task.end(ui.EndFail, "")
 		return err
 	}
+	if workspace.ID != r.pending.WorkspaceID {
+		task.end(ui.EndFail, "")
+		return contract.NewFault(contract.Conflict, "the node workspace identity changed during initialization", "Restore the intended database before resuming.")
+	}
 	r.workspace = workspace
 	summary.Workspace, summary.WorkspaceID = workspace.Name, workspace.ID
-	if workspace.Configured {
-		r.pending.Workspace, r.pending.WorkspaceID = workspace.Name, workspace.ID
-		if err := r.savePending(); err != nil {
-			task.end(ui.EndFail, "")
-			return err
-		}
-		if err := r.updateWorkspaceIdentity(workspace); err != nil {
-			task.end(ui.EndFail, "")
-			return err
-		}
-	}
 	// Register the actual secrets, not public labels: the JSON summary and
 	// ordinary output stay readable while credentials are redacted.
 	r.a.secrets.Add(r.identity.sudoPassword, r.identity.wg.Encode(), r.identity.sshKeyPEM, r.answers.DatabaseURL, r.vaultKeyring)
-	h, err := newSecretsHandoff(r.answers.Context, r.handoffGroups())
+	h, err := newSecretsHandoff(r.answers.AccessKey, r.handoffGroups())
 	if err != nil {
 		task.end(ui.EndFail, "")
 		return err
@@ -244,18 +236,6 @@ func (r *serverInit) handoff(ctx context.Context, summary *serverInitSummary) er
 	return nil
 }
 
-// updateWorkspaceIdentity stores the verified identity in the local workspace access
-// after the host apply and before the handoff is marked done. A failure keeps
-// the pending phase retryable and never guesses a different identity.
-func (r *serverInit) updateWorkspaceIdentity(workspace controlplane.WorkspaceIdentity) error {
-	store, err := loadWorkspaceStore(r.cmd)
-	if err != nil {
-		return err
-	}
-	_, err = store.SetWorkspaceIdentity(r.answers.Context, &host.WorkspaceIdentity{ID: workspace.ID, Name: workspace.Name}, nil)
-	return err
-}
-
 // resolveWorkspace reads the authoritative identity from the node before the
 // handoff. It never invents a generated ID locally and refuses a requested name
 // that differs from the database.
@@ -278,20 +258,21 @@ func (r *serverInit) resolveWorkspace(ctx context.Context) (controlplane.Workspa
 	if err := verifyWorkspaceIdentity(r.answers.Workspace, info.Workspace); err != nil {
 		return controlplane.WorkspaceIdentity{}, err
 	}
+	if !info.Workspace.Configured || controlplane.ValidateWorkspaceID(info.Workspace.ID) != nil {
+		return controlplane.WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed, "the node returned an invalid workspace identity", "Check the control database and retry server init --resume.")
+	}
 	return info.Workspace, nil
 }
 
-// verifyWorkspaceIdentity is the pure handoff/login check: an empty request
-// accepts the node's explicit unconfigured state, while a requested name must
-// match the authoritative configured identity.
+// verifyWorkspaceIdentity requires the requested identity to match the node.
 func verifyWorkspaceIdentity(requested string, workspace controlplane.WorkspaceIdentity) error {
 	if requested == "" {
-		return nil
+		return contract.NewFault(contract.PreconditionFailed, "the initialization has no requested workspace", "Start a fresh initialization with --workspace-name.")
 	}
 	if !workspace.Configured {
 		fault := contract.NewFault(contract.PreconditionFailed,
 			"the node did not record workspace "+requested,
-			"Run eregion apply --assign-workspace "+requested+" on the node, then refresh the protected export with eregion secrets export.")
+			"Check that initialization and database migrations completed, then resume server init.")
 		fault.Details = map[string]any{"requested_workspace": requested}
 		return fault
 	}
@@ -399,7 +380,7 @@ func metricsHandoffGroup(hostname, username, password string) handoffGroup {
 func (r *serverInit) handoffGroups() []handoffGroup {
 	credential := r.metricsCredential
 	if credential == nil {
-		if dir, dirErr := workspaceCredentialDirByName(r.cmd, r.answers.Context); dirErr == nil {
+		if dir, dirErr := workspaceCredentialDirByName(r.cmd, r.answers.AccessKey); dirErr == nil {
 			if loaded, err := loadMetricsCredential(dir); err == nil {
 				credential = loaded
 			}

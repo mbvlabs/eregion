@@ -20,16 +20,15 @@ import (
 
 // hostSpecs is `plan`, `apply`, `doctor` and `ssh`: the operator's convergence
 // and inspection surface. Every command runs on the node through the saved
-// context; no plaintext host secret travels in the request.
+// workspace; no plaintext host secret travels in the request.
 func (a *app) hostSpecs() []spec {
 	planMeta := operationMeta("Show the host steps an apply would change", "eregion plan --json")
 	planMeta.Next = []string{"eregion apply", "eregion doctor"}
 	applyMeta := operationMeta("Converge the node to its recorded host intent", "eregion apply --json")
 	applyMeta.Mutating, applyMeta.DryRun = true, true
 	applyMeta.NeedsRestart = "possible"
-	applyMeta.InputFlags = []string{"assign-workspace"}
 	applyMeta.WhenToUse = []string{
-		"Converge the node to its recorded host intent. On an existing alpha.6 installation, pass --assign-workspace NAME once to assign the portable workspace identity explicitly; a dry run previews it without writing. --workspace only selects an existing verified workspace.",
+		"Converge the node to its recorded host intent. --workspace selects an existing verified workspace.",
 	}
 	applyMeta.Next = []string{"eregion doctor", "eregion server status"}
 	doctorMeta := operationMeta("Check host drift, security, certificates, disk, versions and services", "eregion doctor --json")
@@ -44,7 +43,6 @@ func (a *app) hostSpecs() []spec {
 		{use: "plan", meta: planMeta, run: a.hostPlan},
 		{use: "apply", meta: applyMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Bool("dry-run", false, "Show the plan without changing the host")
-			cmd.Flags().String("assign-workspace", "", "Assign this portable workspace name once on a legacy installation; immutable after assignment")
 		}, run: a.hostApply},
 		{use: "doctor", meta: doctorMeta, run: a.hostDoctor},
 		{use: "ssh [node]", meta: sshMeta, args: cobra.MaximumNArgs(1), flags: func(cmd *cobra.Command) {
@@ -67,22 +65,11 @@ func (a *app) hostPlan(cmd *cobra.Command, _ []string) (result, error) {
 
 func (a *app) hostApply(cmd *cobra.Command, _ []string) (result, error) {
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	workspaceName := strings.TrimSpace(flagString(cmd, "assign-workspace"))
-	var client *nodeClient
-	var err error
-	if workspaceName != "" {
-		access, _, accessErr := currentInitializationAccess(cmd)
-		if accessErr != nil {
-			return result{}, accessErr
-		}
-		client, err = a.nodeClientForAccess(cmd, access)
-	} else {
-		client, err = a.nodeClient(cmd)
-	}
+	client, err := a.nodeClient(cmd)
 	if err != nil {
 		return result{}, err
 	}
-	report, plan, err := client.HostApply(cmd.Context(), dryRun, "", workspaceName)
+	report, plan, err := client.HostApply(cmd.Context(), dryRun, "")
 	if err != nil {
 		return result{}, err
 	}

@@ -39,24 +39,19 @@ type SubmissionResult struct {
 	WebhookSecretActivated bool               `json:"webhook_secret_activated,omitempty"`
 }
 
-// AtomicSubmitter is implemented by services that can also return the
-// admission receipt without a second database read. Submit remains the
-// operation-only compatibility surface.
-type AtomicSubmitter interface {
-	SubmitWithReceipt(context.Context, Submission) (SubmissionResult, error)
-}
-
 type EventPage struct {
 	Events []contract.Event `json:"events"`
 	Cursor contract.Cursor  `json:"cursor"`
 }
 
-// Service implementations must atomically commit domain state and River insertion.
+// Service implementations must atomically commit domain state and River insertion
+// and return the authoritative admission receipt from that transaction.
 // Get/Events return authorized state, never raw queue rows. Events are ascending,
 // After-exclusive and bounded by limit. An expired cursor is an explicit error.
 // A terminal viewer consumes this interface, not PostgreSQL, River, or SSH.
 type Service interface {
 	Submit(context.Context, Submission) (contract.Operation, error)
+	SubmitWithReceipt(context.Context, Submission) (SubmissionResult, error)
 	Get(context.Context, Authority, contract.OperationID) (contract.Operation, error)
 	Events(context.Context, Authority, contract.Cursor, int) (EventPage, error)
 	RequestCancel(context.Context, Authority, contract.OperationID) (contract.Operation, error)

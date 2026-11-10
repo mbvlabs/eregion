@@ -220,7 +220,7 @@ func newNDJSONBackend() *ndjsonFollowBackend {
 }
 
 // runWithBackend runs the real command tree with the in-memory operator
-// backend. It never resolves a saved context or touches a server.
+// backend. It never resolves a saved workspace or touches a server.
 func runWithBackend(t *testing.T, ctx context.Context, backend *ndjsonFollowBackend, args []string) (int, string, string) {
 	t.Helper()
 	a := newApp()

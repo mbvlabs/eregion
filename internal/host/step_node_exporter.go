@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
@@ -56,13 +57,17 @@ func nodeExporterURL(arch string) string {
 // endpoint is the only WireGuard-facing listener. The step is versioned and
 // idempotent like every other host step.
 type nodeExporterStep struct {
-	cfg  Config
-	exec Exec
+	cfg      Config
+	exec     Exec
+	database Database
 	// parentDir/textfileDir are normally the constants below. Tests set them
 	// to a temporary tree so the strict directory checks can be exercised
 	// without root-owned /var/lib paths.
 	parentDir   string
 	textfileDir string
+	// Tests inject directory checks for their unprivileged temporary tree.
+	applyDirectoryCheck  func(string, string) error
+	strictDirectoryCheck func(string, string) error
 }
 
 func (s *nodeExporterStep) dirs() (string, string) {
@@ -76,9 +81,9 @@ func (s *nodeExporterStep) dirs() (string, string) {
 	return parent, textfile
 }
 
-func (s *nodeExporterStep) ID() string { return "host-node-exporter-v2" }
+func (s *nodeExporterStep) ID() string { return "host-node-exporter-v3" }
 func (s *nodeExporterStep) Describe() string {
-	return "Install node_exporter " + nodeExporterVersion + " on loopback with textfile and narrow systemd collectors"
+	return "Install node_exporter " + nodeExporterVersion + " on loopback with Eregion identity, textfile and narrow systemd collectors"
 }
 func (s *nodeExporterStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 
@@ -103,6 +108,53 @@ func (s *nodeExporterStep) unitPath() string {
 
 func (s *nodeExporterStep) binaryPath() string {
 	return filepath.Join(s.cfg.Layout.BinDir, "node_exporter")
+}
+
+// identityMetric reads the authoritative database, not an operator's local
+// workspace alias or a potentially stale node.json mirror. Before workspace
+// assignment the observation contains only the known node name; it does not
+// claim that initialization is complete.
+func (s *nodeExporterStep) identityMetric(ctx context.Context) ([]byte, error) {
+	if s.database == nil {
+		return nil, fmt.Errorf("no database adapter is configured for telemetry identity")
+	}
+	if err := ValidateNodeName(s.cfg.Node); err != nil {
+		return nil, err
+	}
+	identity, err := s.database.ReadWorkspace(ctx, s.cfg.DatabaseURL)
+	if err != nil {
+		return nil, databaseError(s.cfg.DatabaseURL, err)
+	}
+	labels := fmt.Sprintf("eregion_node=%q", s.cfg.Node)
+	if identity.Configured {
+		if err := controlplane.ValidateWorkspaceID(identity.ID); err != nil {
+			return nil, err
+		}
+		if err := controlplane.ValidateWorkspaceName(identity.Name); err != nil {
+			return nil, err
+		}
+		labels += fmt.Sprintf(",eregion_workspace=%q,eregion_workspace_id=%q", identity.Name, identity.ID)
+	}
+	return []byte("# HELP eregion_node_info Eregion logical node and verified workspace identity.\n# TYPE eregion_node_info gauge\neregion_node_info{" + labels + "} 1\n"), nil
+}
+
+func (s *nodeExporterStep) writeIdentityMetric(metric []byte) error {
+	_, textfile := s.dirs()
+	return writePublicFile(filepath.Join(textfile, "eregion_node.prom"), metric, "root", "root")
+}
+
+func (s *nodeExporterStep) checkApplyDirectories(parent, textfile string) error {
+	if s.applyDirectoryCheck != nil {
+		return s.applyDirectoryCheck(parent, textfile)
+	}
+	return validateNodeExporterApplyDirectories(parent, textfile)
+}
+
+func (s *nodeExporterStep) checkStrictDirectories(parent, textfile string) error {
+	if s.strictDirectoryCheck != nil {
+		return s.strictDirectoryCheck(parent, textfile)
+	}
+	return nodeExporterStrictDirectoryState(parent, textfile)
 }
 
 func (s *nodeExporterStep) unit() []byte {
@@ -155,6 +207,7 @@ func (s *nodeExporterStep) Inputs() ([]byte, error) {
 	}
 	parent, textfile := s.dirs()
 	return canonicalInput(struct {
+		Node        string `json:"node"`
 		Version     string `json:"version"`
 		Arch        string `json:"arch"`
 		SHA256      string `json:"sha256"`
@@ -164,7 +217,7 @@ func (s *nodeExporterStep) Inputs() ([]byte, error) {
 		ParentDir   string `json:"parent_dir"`
 		TextfileDir string `json:"textfile_dir"`
 		Collectors  string `json:"collector_units"`
-	}{nodeExporterVersion, arch, nodeExporterSHA256[arch], string(s.unit()), s.unitPath(), s.binaryPath(), parent, textfile, nodeExporterCollectorUnits})
+	}{s.cfg.Node, nodeExporterVersion, arch, nodeExporterSHA256[arch], string(s.unit()), s.unitPath(), s.binaryPath(), parent, textfile, nodeExporterCollectorUnits})
 }
 
 func (s *nodeExporterStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
@@ -195,11 +248,20 @@ if systemctl is-active --quiet node-exporter.service; then echo active:ok; else 
 		}
 	}
 	parent, textfile := s.dirs()
-	if err := validateNodeExporterApplyDirectories(parent, textfile); err != nil {
+	if err := s.checkApplyDirectories(parent, textfile); err != nil {
 		return incomplete(err.Error())
 	}
-	if err := nodeExporterStrictDirectoryState(parent, textfile); err != nil {
+	if err := s.checkStrictDirectories(parent, textfile); err != nil {
 		return incomplete(err.Error())
+	}
+	metric, err := s.identityMetric(ctx)
+	if err != nil {
+		return engine.CheckResult{}, err
+	}
+	if ok, mode, err := sameFileContent(filepath.Join(textfile, "eregion_node.prom"), metric); err != nil {
+		return engine.CheckResult{}, err
+	} else if !ok || mode != 0o644 {
+		return incomplete("the Eregion node identity metric differs")
 	}
 	if !strings.Contains(output, "active:ok") {
 		return incomplete("node-exporter.service is not active")
@@ -250,7 +312,11 @@ func (s *nodeExporterStep) Apply(ctx context.Context, _ engine.Runtime, report e
 		return engine.ApplyResult{}, err
 	}
 	parent, textfile := s.dirs()
-	if err := validateNodeExporterApplyDirectories(parent, textfile); err != nil {
+	if err := s.checkApplyDirectories(parent, textfile); err != nil {
+		return engine.ApplyResult{}, err
+	}
+	metric, err := s.identityMetric(ctx)
+	if err != nil {
 		return engine.ApplyResult{}, err
 	}
 	directoryScript := nodeExporterDirectoryScript(parent, textfile)
@@ -270,6 +336,9 @@ fi`,
 		s.binaryPath(), nodeExporterVersion, nodeExporterArchive(arch), nodeExporterURL(arch),
 		nodeExporterSHA256[arch], arch, directoryScript)
 	if err := s.exec.Run(ctx, s.ID()+"-binary", script, nil, report); err != nil {
+		return engine.ApplyResult{}, err
+	}
+	if err := s.writeIdentityMetric(metric); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	if err := writePublicFile(s.unitPath(), s.unit(), "root", "root"); err != nil {
@@ -303,6 +372,7 @@ func (s *nodeExporterStep) Diff(context.Context, engine.Runtime) ([]string, erro
 		"+ install node_exporter " + nodeExporterVersion + " (" + arch + ", sha256 " + nodeExporterSHA256[arch] + ")",
 		"+ write " + s.unitPath() + " listening on " + NodeExporterListenAddress(),
 		"+ enable the textfile collector at " + textfile + " (root:root 0755, no symlink; trusted parent " + parent + ") and the narrow systemd unit set " + nodeExporterCollectorUnits,
+		"+ publish the node and database-verified workspace identity in the textfile collector",
 		"+ allow no WireGuard port for node_exporter; the authenticated telemetry endpoint is the only WireGuard listener",
 	}
 	if ok, _, _ := sameFileContent(s.unitPath(), s.unit()); !ok {

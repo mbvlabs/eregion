@@ -19,7 +19,7 @@ func TestHandoffGroupsCarryEverythingLoginNeeds(t *testing.T) {
 	}
 	init := &serverInit{
 		answers: serverInitAnswers{
-			Context: "prod", Node: "main", Hostname: "app.example.com", Host: "203.0.113.10",
+			AccessKey: "prod", Node: "main", Hostname: "app.example.com", Host: "203.0.113.10",
 			AdminUser: "admin", DatabaseURL: "postgres://user:pass@db.example.com/app",
 		},
 		pending:      &host.PendingInit{NodePublicKey: "node-public-key"},

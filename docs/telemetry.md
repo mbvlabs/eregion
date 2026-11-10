@@ -253,7 +253,7 @@ a pass.
 
 ## Local collector foundations
 
-`host-node-exporter-v2` is the versioned host step for the exporter primitives.
+`host-node-exporter-v3` is the versioned host step for the exporter primitives.
 It keeps node_exporter 1.11.1 on loopback and adds:
 
 - the root-owned `0755` textfile directory
@@ -270,9 +270,13 @@ It keeps node_exporter 1.11.1 on loopback and adds:
 - `--collector.systemd` with a narrow unit include:
   `(eregion-.+|caddy|docker|node-exporter|wg-quick@wg0)[.](service|timer)`.
 
-The textfile directory is a foundation, not a metrics source. No eregion
-self-metric is written today; a family must come from a real producer rather
-than a synthetic line. The doctor check separately requires
+The managed `eregion_node_info` gauge is produced from the configured node and
+the workspace identity read from the control database. Its labels are
+`eregion_node`, `eregion_workspace` and `eregion_workspace_id`; before assignment,
+only the known node label is emitted. It is available to direct public scrapers
+and HTTP-discovered scrapers alike. It does not rename the OS host or alter
+`node_uname_info`. Database errors do not replace a previously written identity
+file with guessed values. The doctor check separately requires
 `node_textfile_scrape_error` to be present exactly once and zero, because
 `node_scrape_collector_success` can be 1 even when a `.prom` file is malformed
 or unreadable.
@@ -296,6 +300,43 @@ private on loopback, and TLS verification uses the system trust store by
 default. Public reachability, certificate issuance and authentication are
 separate observations, not implied by a reload. Prometheus/Grafana Alloy are not
 installed or supervised by eregion, and the node stores no metrics.
+
+### Grafana Cloud and logical node display
+
+Grafana Cloud's Metrics Endpoint connection can scrape the public metrics URL
+directly with basic authentication. Select the stack's existing Prometheus data
+source, not a new data source pointing at the exporter. A connection test is not
+ingestion proof: save the job, then verify `node_uname_info` in Explore.
+
+Node Exporter Full (dashboard 1860, revision 46) normally displays the OS
+`nodename`. After the identity metric is present, a copy can display
+`thelab / main` without changing the underlying hostname filter:
+
+1. Edit the existing `nodename` variable, displayed as **Nodename**. Keep its
+   name and single-value selection, and select the same Prometheus data source.
+2. In the classic query editor, use:
+
+   ```promql
+   query_result(node_uname_info{job="$job"} * on(job, instance) group_left(eregion_display) label_join(eregion_node_info{job="$job"}, "eregion_display", " / ", "eregion_workspace", "eregion_node"))
+   ```
+
+   If using the **Query result** query type instead, enter the inner PromQL
+   expression without the `query_result(...)` wrapper.
+3. Set the variable regex to:
+
+   ```text
+   /eregion_display="(?<text>[^"]+)|nodename="(?<value>[^"]+)/g
+   ```
+
+4. Verify the preview shows the logical workspace/node as text and the original
+   OS nodename as value. Leave the dependent `node` (**Instance**) variable and
+   panel filters unchanged, then verify instance selection and panels.
+
+Both metrics must share `job` and `instance`, with one current identity series
+per pair. Missing identity samples or duplicate series make this join unsuitable;
+restore the original variable rather than inventing labels. This customization
+follows documented named text/value captures; it is not a claim that the stock
+dashboard or a particular live Grafana instance was automatically changed.
 
 A future separate telemetry node or Grafana is **not prohibited long-term**.
 Adding one needs its own WireGuard topology, retention and access decisions; it

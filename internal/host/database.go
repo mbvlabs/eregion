@@ -45,7 +45,7 @@ type Database interface {
 	Migrate(context.Context, string) (DatabaseState, error)
 	// ReadWorkspace is a read-only identity observation. It never creates the
 	// workspace row, so status, node.info and export remain safe on an
-	// unconfigured alpha.6 installation.
+	// unconfigured installation.
 	ReadWorkspace(context.Context, string) (controlplane.WorkspaceIdentity, error)
 	// AssignWorkspace is the explicit one-time assignment used by apply
 	// --workspace. Replaying the same name returns the existing identity; a
@@ -92,6 +92,9 @@ func (PostgresDatabase) ReadWorkspace(ctx context.Context, dsn string) (controlp
 	defer pool.Close()
 	identity, err := controlplane.ReadWorkspace(ctx, pool)
 	if err != nil {
+		if errors.Is(err, controlplane.ErrWorkspaceSchemaMissing) {
+			return controlplane.WorkspaceIdentity{}, controlplane.ErrWorkspaceSchemaMissing
+		}
 		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
 	}
 	return identity, nil

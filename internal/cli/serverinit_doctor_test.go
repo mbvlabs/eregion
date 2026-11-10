@@ -14,6 +14,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/rpc"
@@ -24,7 +25,7 @@ import (
 
 func doctorTestInit(t *testing.T) *serverInit {
 	t.Helper()
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	cmd := &cobra.Command{Use: "init"}
 	cmd.SetErr(&strings.Builder{})
 	return &serverInit{
@@ -134,7 +135,7 @@ func TestDoctorGateSkipWarnsAndMarksThePhase(t *testing.T) {
 
 func TestResumeAfterDoctorFailureRunsOnlyTheGateAndHandoff(t *testing.T) {
 	r := doctorTestInit(t)
-	for _, phase := range []string{phaseContact, phaseSecrets, phaseHost, phaseAccessSetup, phaseAccess, phaseContext} {
+	for _, phase := range []string{phaseContact, phaseSecrets, phaseHost, phaseAccessSetup, phaseAccess, phaseWorkspace} {
 		r.pending.Mark(phase)
 	}
 	tasks := strings.Join(r.resumeTasks(), "\n")
@@ -169,25 +170,27 @@ func TestDoctorGateNodeErrorIsNotADoctorFailure(t *testing.T) {
 	}
 }
 
-// initContextTransport answers the node protocol in-process and records the
+// initWorkspaceTransport answers the node protocol in-process and records the
 // methods that reached this context. It proves the init ready and doctor calls
-// use the context being initialized.
-type initContextTransport struct {
-	name    string
-	methods []string
+// use the workspace being initialized.
+type initWorkspaceTransport struct {
+	name      string
+	methods   []string
+	workspace controlplane.WorkspaceIdentity
+	failReady bool
 }
 
-func (*initContextTransport) Dial(context.Context) (*ssh.Client, error) {
+func (*initWorkspaceTransport) Dial(context.Context) (*ssh.Client, error) {
 	return nil, errors.New("the fake transport does not dial")
 }
 
-func (*initContextTransport) Upload(context.Context, string, []host.RemoteFile) error {
+func (*initWorkspaceTransport) Upload(context.Context, string, []host.RemoteFile) error {
 	return nil
 }
 
-func (*initContextTransport) Remove(context.Context, string) error { return nil }
+func (*initWorkspaceTransport) Remove(context.Context, string) error { return nil }
 
-func (t *initContextTransport) Run(_ context.Context, _ string, stdin io.Reader, stdout, _ io.Writer) error {
+func (t *initWorkspaceTransport) Run(_ context.Context, _ string, stdin io.Reader, stdout, _ io.Writer) error {
 	request, _, err := rpc.DecodeRequest(stdin)
 	if err != nil {
 		return err
@@ -198,7 +201,12 @@ func (t *initContextTransport) Run(_ context.Context, _ string, stdin io.Reader,
 	case methodVersion:
 		data = rpcVersionResult{Version: buildinfo.Version, Commit: buildinfo.Commit, OS: "linux", Arch: runtime.GOARCH}
 	case methodReady:
+		if t.failReady {
+			return errors.New("readiness failed")
+		}
 		data = map[string]bool{"ready": true}
+	case methodNodeInfo:
+		data = rpcNodeInfoResult{Node: "main", Hostname: "app.example.com", Workspace: t.workspace}
 	case methodHostDoctor:
 		data = doctor.BuildReport([]doctor.Result{{ID: "host.disk", Category: doctor.CatHost, Status: doctor.Pass, Detail: "ok"}})
 	default:
@@ -216,7 +224,7 @@ func (t *initContextTransport) Run(_ context.Context, _ string, stdin io.Reader,
 	return err
 }
 
-func (t *initContextTransport) called(method string) bool {
+func (t *initWorkspaceTransport) called(method string) bool {
 	for _, got := range t.methods {
 		if got == method {
 			return true
@@ -225,21 +233,10 @@ func (t *initContextTransport) called(method string) bool {
 	return false
 }
 
-func TestInitReadyAndDoctorUseTheContextBeingInitialized(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+func TestInitReadyAndDoctorUseTheWorkspaceBeingInitialized(t *testing.T) {
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "prod")
-	store, err := host.LoadWorkspaceStore("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"staging", "prod"} {
-		if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: name, SSH: &host.WorkspaceSSH{
-			Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null",
-		}}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	staging, prod := &initContextTransport{name: "staging"}, &initContextTransport{name: "prod"}
+	staging, prod := &initWorkspaceTransport{name: "staging"}, &initWorkspaceTransport{name: "prod"}
 	a := &app{secrets: &secrets.Registry{}, nodeClients: map[string]*nodeClient{
 		"staging": {remote: staging, operator: "admin", accessName: "staging", stderr: io.Discard},
 		"prod":    {remote: prod, operator: "admin", accessName: "prod", stderr: io.Discard},
@@ -247,8 +244,9 @@ func TestInitReadyAndDoctorUseTheContextBeingInitialized(t *testing.T) {
 	cmd := &cobra.Command{Use: "init"}
 	cmd.SetErr(&bytes.Buffer{})
 	r := &serverInit{
-		a: a, cmd: cmd, answers: serverInitAnswers{Context: "staging"},
-		pending: &host.PendingInit{Server: "staging", Phases: map[string]string{}},
+		a: a, cmd: cmd, answers: serverInitAnswers{AccessKey: "staging"},
+		initClient: a.nodeClients["staging"],
+		pending:    &host.PendingInit{Server: "staging", Phases: map[string]string{}},
 	}
 	if err := r.readyNode(context.Background()); err != nil {
 		t.Fatalf("init ready: %v", err)
@@ -258,7 +256,7 @@ func TestInitReadyAndDoctorUseTheContextBeingInitialized(t *testing.T) {
 	}
 
 	// Resume after the checks: the doctor gate still targets staging even
-	// though EREGION_WORKSPACE and the current context name prod.
+	// though EREGION_WORKSPACE and the current workspace name prod.
 	r.pending.Mark(phaseChecks)
 	summary := &serverInitSummary{}
 	if err := r.runDoctorGate(context.Background(), summary); err != nil {

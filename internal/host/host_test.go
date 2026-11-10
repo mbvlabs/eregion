@@ -145,7 +145,7 @@ func TestConfirmationBindingAndExpiry(t *testing.T) {
 
 func TestWorkspaceStore(t *testing.T) {
 	root := t.TempDir()
-	path := filepath.Join(root, "contexts.json")
+	path := filepath.Join(root, "workspaces.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)

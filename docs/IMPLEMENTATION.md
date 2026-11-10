@@ -116,13 +116,16 @@ eregion guide agents
 ```
 
 For a node operation, identify the selected **workspace** first. The default
-private store is the OS configuration directory's `eregion/contexts.json` (the
-historical file name is private storage, not a public identity); the
+private store is the OS configuration directory's `eregion/workspaces.json`; the
 `--workspace-file` flag or `EREGION_WORKSPACE_FILE` selects another existing
 store. `server init` requires an explicit store directory exclusive to that
 store file because the historical `servers/` and `pending/` roots live beside
 it; a second JSON store in the same directory is refused rather than sharing
-credentials or pending state. `workspace list`
+credentials or pending state. There is no old-filename/schema fallback or
+automatic alpha-store migration. A new init refuses a pre-existing credential
+directory rather than adopting keys from an unrelated or old installation;
+unsupported pending state never grants permission to discard those keys.
+`workspace list`
 describes saved workspaces, one entry per authoritative ID. `--workspace NAME`
 selects the verified portable workspace name; otherwise `EREGION_WORKSPACE`,
 then the saved current workspace applies. Historical local access aliases are
@@ -207,7 +210,7 @@ bin/eregion help app create --json
 | `server init` | Guided root first contact; Linux/macOS operator, arch-matching linux node binary, preflight, answer flags/TOML, plan/confirm, vault keyring, loopback node_exporter and telemetry endpoint prerequisites, pending-init resume/discard, the final doctor gate and guarded handoff. First contact requires SSH on port 22; another port is refused before any remote change. The plan lists the host steps and the setup.sh access changes (admin user, wg0, firewall, SSH lockdown switchover). A pending init stores the pinned SSH host key and fingerprint; `--dns-ready` skips the confirmation prompt interactively, non-interactively and on resume. `--skip-doctor` skips the gate with a warning; a failing check returns `doctor_failed` with the failed checks and resume hint. Declining the plan (or any exit that does not apply) removes the uploaded planning bundle from the server. |
 | `plan`, `apply [--dry-run]`, `doctor`, `ssh [node] [--command CMD]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. `ssh` opens a shell at a terminal or runs one command with `--command`; piped or JSON output runs without a PTY, a sudo password prompt becomes an `input_required` fault whose code and fix the runner still prints, and the remote exit status propagates. `--auto-upgrade-nodes` installs the operator's build on a mismatched node: a `dev` node accepts the caller's checksum, while a published node requires its own signed release manifest to match; `--dry-run` never installs. |
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
-| `login --file … --passphrase-file … [--replace WORKSPACE]` | Import an age transfer bundle into private workspace access (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle's Workspace/Workspace ID are the target identity; historical Context annotations are ignored. Login verifies the portable name/ID and node pins using a private staging directory before publishing it as the active credential directory. An existing workspace requires `--replace` with its exact canonical name; same name/different ID and same ID/different name are refused even with `--replace`. Under the store mutation lock, login reloads and replaces all local records for that ID with one verified record while preserving unrelated workspaces and their credentials. Old files are not deleted by canonicalization. Failures leave the store, old credentials and pins untouched. Old bundles without identity remain a bounded alpha access import only on a store with no verified workspace. |
+| `login --file … --passphrase-file … [--replace WORKSPACE]` | Import an age transfer bundle into private workspace access (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle's Workspace/Workspace ID are required target identity. Login verifies the portable name/ID and node pins using a private staging directory before publishing it as the active credential directory. An existing workspace requires `--replace` with its exact canonical name; same name/different ID and same ID/different name are refused even with `--replace`. Under the store mutation lock, login reloads and replaces all local records for that ID with one verified record while preserving unrelated workspaces and their credentials. Old files are not deleted by canonicalization. Failures leave the store, old credentials and pins untouched. Identityless bundles are refused rather than imported as unconfigured access. |
 | `workspace list/show/use/remove` | Saved workspaces, one entry per authoritative workspace ID. `show [NAME_OR_ID]`, `use NAME_OR_ID` and `remove NAME_OR_ID --confirm NAME_OR_ID` use the verified workspace name or generated ID; a private access alias is never a selector. Every node command accepts the root `--workspace NAME`; resolution is the flag, then `EREGION_WORKSPACE`, then the saved current workspace. Same-name/different-ID and same-ID/different-name groups are conflicts; exact IDs can address a name conflict; multiple access records for one ID are ambiguous unless one is current or only one exists. The node client, local identity reads (`secrets export`), DNS addresses, endpoint labels and telemetry credential reads use one resolved access-record snapshot so they cannot disagree. `login` and `server init` reject an explicit global `--workspace`; their creation/assignment inputs are separate. `workspace remove` deletes local access only, never the database identity, applications or server. |
 | `app create/list/status/delete` | Guided or flag-only creation of **production and staging in one submission**: source, Buildpacks settings, processes, plain config, vault secret names and production's optional domain. Both environments and their first revisions commit in the same transaction; both are protected by default, with `--unprotected` as the explicit creation-time opt-out. Supplied `--secret` values and the Git read credential are written before submission into every created environment namespace whose revision names them; a shared recipe therefore writes both production and staging, while an environment-specific name or credential is never copied into another namespace. `--github-auth` is an explicit opt-in alternative to `--git-credential-file`: for a github.com source it reads the local authenticated `gh` token with `gh auth token --hostname github.com` in memory and writes it through the same vault path. Dry runs and idempotent replays never call gh, non-GitHub sources, conflicting credential flags and credential names already used as runtime or webhook secrets are refused before any gh read or vault write, and the token never enters argv, operation input, output or an intermediate file. `create` accepts `platform.app.create` with an `environments` array, the first domain, primary flag and main-node addresses; the first environment's binding commits before its optional first deploy is queued, and the accepted operation exposes that deploy's ID as `first_deploy_operation_id`. A retry with the operator's `--idempotency-key` previews as a replay, writes no vault revision, and returns the original operation including that ID; without the key an existing name is a conflict. Duplicate hostnames across the two environments are refused before or inside the transaction. In a terminal with deploy requested and no `--detach`, `create` follows the create operation and then the first deploy with the deploy viewer and outcome; Ctrl-C detaches with the follow command. `--detach`, JSON and no-TTY return at accepted. List/status read inventory. `status` shows the serving release, processes, persistent protection, per-domain state and recent operations; `delete` always takes `--confirm <app>` and, unless `--dry-run`, a TOTP code typed at a human terminal (D7, D13, D33). The control plane verifies the code and confirmation against locked state in the submission transaction; dry-run preview needs neither and stays available to an agent. |
 | `env create/update/protect/unprotect/promote/list/status/delete` | `create` accepts an environment with its first revision, optional domain binding and its first deploy unless `--no-deploy`; the accepted operation exposes the queued deploy's `first_deploy_operation_id`, and a terminal follows create then the first deploy with the deploy viewer unless `--detach` is given. Protection defaults from the name (production and staging protected, every other name unprotected); `--protected`/`--unprotected` override it at creation. `--from FILE` applies the shared recipe to any name, including a PR name absent from the file. A retry with the operator's `--idempotency-key` replays the accepted operation including that ID without rewriting vault values; `update` merges source, placement, runtime and process changes into a new immutable revision. `--github-auth` replaces the read credential with the local authenticated `gh` token for a github.com source; it is refused for another host, with `--git-credential-file`, with `--from`, and when the selected name is already a runtime or webhook secret. The same role check applies to `--git-credential-file`, before that file is read, and shared revision normalization enforces it for `--from` and every API path using the effective desired revision, including an unchanged source binding and the preserved webhook name. On a dry run or replay it never calls gh. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. `protect` records durable protected state and is agent-safe; `unprotect` lowers protection and needs a TOTP code at a human terminal, refusing JSON/no-TTY. `promote <app> <source-environment>` is the dedicated D23 path: the target is the app's fixed `production` environment; it resolves and pins the source's current serving image digest, commit and source **inside the submission transaction** as a new production release without a build, then applies production's current revision, config, secret values and release command through the same blue/green path. It refuses a source without a ready serving release, **any** active production deployment (including a different artifact), an artifact already serving production, a different node, a non-production target, cross-app input and a target that fails the explicit-release deployability gate. It never copies domains, config, secrets or the source release command. Dry-run and interactive previews pass the supplied idempotency key, so an accepted same-key submission previews as a replay. List/status include revision, processes, protection and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>`; a protected or last environment also needs a TOTP code at a human terminal, while an unprotected non-last environment deletion is available to agents with the exact confirmation alone (D33). |
@@ -1156,9 +1159,12 @@ recovery, HA or recovery-time goals.
 
 ### Portable workspace identity
 
-Migration 028 adds `eregion_workspace` but seeds no row. `ReadWorkspace` reports
-both a missing pre-028 table and an empty table as unconfigured; reads never
-assign. `AssignWorkspace` takes an installation-specific transaction advisory
+Migration 028 adds `eregion_workspace` but seeds no row. `ReadWorkspace` treats
+missing schema as an error and an empty migrated table as not yet assigned;
+reads never assign. Fresh-init planning recognizes only the precise missing-schema
+prerequisite, then runs migrations before runtime identity checks and assignment.
+Connection, permission and malformed-identity failures are not prerequisites.
+`AssignWorkspace` takes an installation-specific transaction advisory
 lock and an insert CAS. Same-name assignment returns the existing `ws_…` ID;
 another name conflicts. The table refuses updates/deletes. Names are 1–64
 lowercase alphanumeric/hyphen characters, with alphanumeric ends; IDs are
@@ -1170,19 +1176,18 @@ workspace only and is rejected by init/login. Pending init stores the requested
 name before host apply on real execution, then the DB-authoritative ID before
 final handoff. A dry-run resume keeps a newly supplied name in memory only.
 Identical persisted input is valid on resume; a conflicting name fails before
-contact. A pre-alpha.7 pending init that already applied its host phase cannot
-introduce a workspace there: finish that flow, then use the ordinary explicit
-assignment path below.
+contact. Old pending formats are rejected, not resumed through an identityless
+transition. Current-format interrupted setup remains resumable.
 
-An existing alpha.6 installation initializes through
-`apply --assign-workspace NAME` after upgrading/migrating. `host-workspace-v1`,
-immediately after the database step, assigns the identity and mirrors only
+Fresh setup supplies the requested name to the bootstrap host configuration.
+`host-workspace-v1`, immediately after the database step, assigns the identity and mirrors only
 `workspace_id`/`workspace_name` into `node.json`, preserving node name and
 unknown keys. That file is not an authority or a DB-unavailable fallback. The
 recorded host intent keeps the requested name so future convergence checks the
 same identity. A conflicting request is checked again under the whole-apply lock
 before state, credentials, journals or host effects. Dry run plans but does not
-assign.
+assign. There is no public assignment-upgrade flag or host-RPC workspace override;
+ordinary `apply` selects an already verified workspace.
 
 Successful main-node apply reads the authoritative identity for local metadata.
 The refresh targets the private access record and route captured by the RPC, not
@@ -1201,9 +1206,9 @@ same name with different IDs and the same ID with different names conflict.
 Multiple access records for one ID are one workspace, resolved by the selected
 record or the sole record and otherwise refused as ambiguous. A verified login
 may replace all records for that ID with one canonical record while preserving
-unrelated workspaces. Legacy bundles remain explicitly unconfigured and are
-confined to the bounded alpha path; refresh the human-protected export to
-transfer portable identity.
+unrelated workspaces. A bundle without complete portable workspace identity is
+rejected before publishing access. Completed stored access must have a validated
+workspace identity; pending setup routes are not completed store records.
 
 `node.info` and server status read PostgreSQL, not the mirror. A failed identity
 read is unknown (`workspace_error`), not unconfigured; trust-sensitive login and
@@ -1213,11 +1218,14 @@ workspace separately from the SSH route, and shows unknown versus
 not-configured explicitly. No workspace membership, team ACL, multi-node
 lifecycle or server-sharing feature is introduced.
 
-The old-bundle/unfinished-setup and legacy submission-capability handling is an
-explicitly temporary alpha.7 transition, not a retained compatibility API. The operator's
-beta.1 decision requires removing those fallbacks and qualifying a fresh
-installation. This reference describes current alpha behavior; it does not
-promise an in-place alpha-to-beta upgrade or authorize resetting existing data.
+Beta removes old-bundle/unfinished-setup and optional submission-capability
+fallbacks. The application-service contract requires authoritative atomic
+submission receipts. Fresh setup verifies the node's configured workspace ID and
+name and its readiness over the pending pinned route before publishing local
+access. Publication can replay only an exactly matching initialization record;
+resume cannot overwrite concurrently changed access. Beta publication does not
+establish fresh-install qualification or promise an alpha-to-beta upgrade, and
+does not authorize resetting existing data.
 
 `server init` follows MASTER 6.1. A local preflight requires the OpenSSH client
 (`ssh`, `ssh-keygen`: `missing_tool` with the platform install command), checks
@@ -1419,7 +1427,7 @@ window.
 | `/usr/local/bin/node_exporter`, `/etc/systemd/system/node-exporter.service` | Pinned exporter and its unit, bound to loopback only; `host-node-exporter-v2` enables the textfile collector at `/var/lib/node_exporter/textfile` and the narrow systemd collector set. No WireGuard or public port is opened for the exporter. |
 | `/etc/eregion-telemetry/targets.json` | Root:caddy `0640` public HTTPS HTTP service-discovery document (no secret). `host-telemetry-v2` writes it; it names only `<main-hostname>:443` with `__scheme__=https` and `__metrics_path__=/metrics/node`. |
 | `/var/lib/node_exporter/`, `/var/lib/node_exporter/textfile/` | Root:root `0755` real directories (no symlinks) read by node_exporter's textfile collector. Apply refuses to follow or mutate a symlink/non-directory; no eregion self-metric is written without a real producer. |
-| OS config dir + `/eregion/contexts.json` | Owner-only private workspace store (verified workspace identity plus historical access keys/routes and `auto_upgrade_nodes`); overridden by `EREGION_WORKSPACE_FILE`. No API token. |
+| OS config dir + `/eregion/workspaces.json` | Owner-only private workspace store with verified workspace identity, routes and `auto_upgrade_nodes`; overridden by `EREGION_WORKSPACE_FILE`. No old-schema/filename fallback. No API token. |
 | Private workspace store parent + `/servers/<access>/` | Operator SSH key, WireGuard key and sudo password files for that private access record. |
 | Private workspace store parent + `/pending/<server>/` | Unfinished `server init`: answers, phases, pinned host keys and the captured vault keyring (0700 directory, 0600 files). |
 | `/etc/sudoers.d/eregion-node` | Admin's passwordless `/usr/local/bin/eregion node rpc` rule, validated by `visudo`. |

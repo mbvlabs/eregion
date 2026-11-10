@@ -55,7 +55,6 @@ func newWorkspaceLoginFixture(t *testing.T, name, workspace, id string) workspac
 		t.Fatal(err)
 	}
 	mainFields := []handoffField{
-		{"Context", name},
 		{"WireGuard address", "10.79.0.2"},
 		{"WireGuard endpoint", "203.0.113.20:51820"},
 		{"WireGuard public key", "node-public-key"},
@@ -63,6 +62,8 @@ func newWorkspaceLoginFixture(t *testing.T, name, workspace, id string) workspac
 	}
 	if workspace != "" || id != "" {
 		mainFields = append([]handoffField{{"Workspace", workspace}, {"Workspace ID", id}}, mainFields...)
+	} else {
+		mainFields = append([]handoffField{{"Context", name}}, mainFields...)
 	}
 	body := (&secretsHandoff{node: name, groups: []handoffGroup{
 		{"Main node", mainFields},
@@ -140,7 +141,7 @@ func executeWorkspaceLoginWith(t *testing.T, fixture workspaceLoginFixture, node
 
 func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T) {
 	t.Run("wrong host key after staging", func(t *testing.T) {
-		configPath := filepath.Join(t.TempDir(), "contexts.json")
+		configPath := filepath.Join(t.TempDir(), "workspaces.json")
 		t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 		fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 		node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -206,7 +207,7 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 	})
 
 	t.Run("readiness failure after verification", func(t *testing.T) {
-		configPath := filepath.Join(t.TempDir(), "contexts.json")
+		configPath := filepath.Join(t.TempDir(), "workspaces.json")
 		t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 		fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 		node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -252,7 +253,7 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 		if os.Geteuid() == 0 {
 			t.Skip("permission failure is not enforceable as root")
 		}
-		configPath := filepath.Join(t.TempDir(), "contexts.json")
+		configPath := filepath.Join(t.TempDir(), "workspaces.json")
 		t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 		fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 		node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -319,7 +320,7 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 	})
 
 	t.Run("unrelated store update during verification", func(t *testing.T) {
-		configPath := filepath.Join(t.TempDir(), "contexts.json")
+		configPath := filepath.Join(t.TempDir(), "workspaces.json")
 		t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 		fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 		node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -350,7 +351,7 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 	})
 
 	t.Run("target conflict during verification", func(t *testing.T) {
-		configPath := filepath.Join(t.TempDir(), "contexts.json")
+		configPath := filepath.Join(t.TempDir(), "workspaces.json")
 		t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 		fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 		node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -387,7 +388,7 @@ func TestLoginAtomicStagingAndPublicationFailuresPreserveOldAccess(t *testing.T)
 }
 
 func TestLoginPublishesVerifiedWorkspaceMetadata(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 	node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -509,7 +510,7 @@ func TestLoginSuccessDataKeepsWorkspaceFieldsWithoutContextKey(t *testing.T) {
 }
 
 func TestLoginReplacementLeavesOldCredentialFilesUntouched(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
@@ -551,7 +552,7 @@ func TestLoginReplacementLeavesOldCredentialFilesUntouched(t *testing.T) {
 }
 
 func TestLoginWorkspaceMismatchPreservesFilesAndPins(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	first := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 	node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -560,7 +561,7 @@ func TestLoginWorkspaceMismatchPreservesFilesAndPins(t *testing.T) {
 	}
 	before := filesUnder(t, filepath.Dir(configPath))
 
-	// Same context name, different workspace ID in the bundle. The node still
+	// Same workspace name, different workspace ID in the bundle. The node still
 	// reports the original identity, so an explicit --replace must not publish.
 	second := newWorkspaceLoginFixture(t, "main", "thelab", "ws_fedcba9876543210fedcba98")
 	err := executeWorkspaceLogin(t, second, node, nil, nil, "--replace", "thelab")
@@ -581,8 +582,8 @@ func TestLoginWorkspaceMismatchPreservesFilesAndPins(t *testing.T) {
 	}
 }
 
-func TestLoginConfiguredContextAcceptsOnlyTheSameWorkspace(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+func TestLoginConfiguredWorkspaceAcceptsOnlyTheSameWorkspace(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 	node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
@@ -591,12 +592,12 @@ func TestLoginConfiguredContextAcceptsOnlyTheSameWorkspace(t *testing.T) {
 	}
 	before := filesUnder(t, filepath.Dir(configPath))
 
-	// An old bundle cannot replace a configured context: it would discard the
+	// An old bundle cannot replace a configured workspace: it would discard the
 	// verified identity instead of requiring a refreshed export.
 	old := newLoginFixture(t, "main")
 	err := executeLogin(t, old, old.hostKey, nil)
-	if contract.Classify(err).Code != contract.Conflict {
-		t.Fatalf("old bundle alongside a verified workspace = %v, want conflict", err)
+	if contract.Classify(err).Code != contract.ValidationFailed {
+		t.Fatalf("old bundle alongside a verified workspace = %v, want validation_failed", err)
 	}
 	assertFilesEqual(t, before, filesUnder(t, filepath.Dir(configPath)))
 
@@ -606,8 +607,8 @@ func TestLoginConfiguredContextAcceptsOnlyTheSameWorkspace(t *testing.T) {
 	}
 }
 
-func TestLoginRefusesTheSameWorkspaceNameWithAnotherIDAcrossContexts(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+func TestLoginRefusesTheSameWorkspaceNameWithAnotherID(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	alpha := newWorkspaceLoginFixture(t, "alpha", "thelab", loginWorkspaceID)
 	if err := executeWorkspaceLogin(t, alpha, controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}, nil, nil); err != nil {
@@ -618,7 +619,7 @@ func TestLoginRefusesTheSameWorkspaceNameWithAnotherIDAcrossContexts(t *testing.
 	beta := newWorkspaceLoginFixture(t, "beta", "thelab", betaID)
 	err := executeWorkspaceLogin(t, beta, controlplane.WorkspaceIdentity{Configured: true, ID: betaID, Name: "thelab"}, nil, nil)
 	if contract.Classify(err).Code != contract.Conflict {
-		t.Fatalf("cross-context workspace collision = %v, want conflict", err)
+		t.Fatalf("workspace name collision = %v, want conflict", err)
 	}
 	assertFilesEqual(t, before, filesUnder(t, filepath.Dir(configPath)))
 	store, err := host.LoadWorkspaceStore(configPath)
@@ -631,11 +632,15 @@ func TestLoginRefusesTheSameWorkspaceNameWithAnotherIDAcrossContexts(t *testing.
 }
 
 func TestLoginRefusesWorkspaceBundleAgainstUnconfiguredNode(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 	err := executeWorkspaceLogin(t, fixture, controlplane.WorkspaceIdentity{}, nil, nil)
-	if contract.Classify(err).Code != contract.PreconditionFailed {
+	fault := contract.Classify(err)
+	if fault.Code != contract.PreconditionFailed {
 		t.Fatalf("unconfigured node = %v, want precondition_failed", err)
+	}
+	if strings.Contains(fault.Hint, "--assign-workspace") || !strings.Contains(fault.Hint, "fresh") || !strings.Contains(fault.Hint, "eregion secrets export") {
+		t.Fatalf("unconfigured node guidance = %q", fault.Hint)
 	}
 	store, loadErr := host.LoadWorkspaceStore("")
 	if loadErr != nil {
@@ -646,28 +651,24 @@ func TestLoginRefusesWorkspaceBundleAgainstUnconfiguredNode(t *testing.T) {
 	}
 }
 
-func TestLoginOldBundleStaysExplicitlyUnconfigured(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+func TestLoginRefusesOldBundleWithoutPublishing(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	old := newLoginFixture(t, "main")
-	if err := executeLogin(t, old, old.hostKey, nil); err != nil {
-		t.Fatal(err)
+	if err := executeLogin(t, old, old.hostKey, nil); contract.Classify(err).Code != contract.ValidationFailed {
+		t.Fatalf("old bundle = %v, want validation_failed", err)
 	}
 	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	saved, ok := store.AccessByName("main")
-	if !ok {
-		t.Fatal("legacy access missing")
-	}
-	if saved.Workspace != nil {
-		t.Fatalf("an old bundle invented workspace metadata: %+v", saved.Workspace)
+	if len(store.Access) != 0 {
+		t.Fatal("old bundle published access")
 	}
 }
 
 func TestLoginCanonicalReplacementPreservesUnrelatedWorkspace(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	node := controlplane.WorkspaceIdentity{Configured: true, ID: loginWorkspaceID, Name: "thelab"}
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
@@ -713,7 +714,7 @@ func TestLoginCanonicalReplacementPreservesUnrelatedWorkspace(t *testing.T) {
 }
 
 func TestLoginWorkspaceVerificationFailureDoesNotCallReady(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 	readyCalled := false
 	a := newApp()
@@ -735,12 +736,12 @@ func TestLoginWorkspaceVerificationFailureDoesNotCallReady(t *testing.T) {
 		t.Fatal("readiness ran after the workspace identity could not be verified")
 	}
 	if _, err := host.LoadWorkspaceStore(""); err != nil {
-		t.Fatalf("context store was corrupted: %v", err)
+		t.Fatalf("workspace store was corrupted: %v", err)
 	}
 }
 
 func TestLoginFailsClosedWhenTheWorkspaceReadIsUnknown(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", loginWorkspaceID)
 	a := newApp()
 	a.loginSeams.probe = func(context.Context, *host.WorkspaceSSH, string) (ssh.PublicKey, error) {
@@ -765,7 +766,7 @@ func TestLoginFailsClosedWhenTheWorkspaceReadIsUnknown(t *testing.T) {
 }
 
 func TestLoginWorkspaceBundleRequiresBothFields(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	fixture := newWorkspaceLoginFixture(t, "main", "thelab", "")
 	if err := executeWorkspaceLogin(t, fixture, controlplane.WorkspaceIdentity{}, nil, nil); contract.Classify(err).Code != contract.ValidationFailed {
 		t.Fatalf("incomplete workspace bundle = %v, want validation_failed", err)

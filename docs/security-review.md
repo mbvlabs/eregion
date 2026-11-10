@@ -2,7 +2,8 @@
 
 **Not an external audit.** Findings S1–S6 come from a 2026-10-20 review; the
 boundaries below were reconciled with source on 2026-10-28 without a penetration
-test or live host inspection. Work and status live in [MASTER](MASTER.md).
+test or live host inspection. [MASTER](MASTER.md) owns product decisions;
+Linear tracks execution status.
 
 ## Controls to preserve
 
@@ -10,7 +11,7 @@ test or live host inspection. Work and status live in [MASTER](MASTER.md).
   never a request body's actor. Transport scopes and exact action/target grants
   are separate. Preview uses authorization too. CI/webhook credentials without
   explicit platform grants do not gain general platform authority.
-- Operator contexts are token-free SSH/WireGuard identities. Their OS credential
+- Operator workspace access uses token-free SSH/WireGuard identities. Its OS credential
   holder is root-equivalent; the D7 factor is an application boundary, not OS
   isolation. CI tokens must remain scoped and expiring; internal administrative
   principals are not automation credentials.
@@ -42,7 +43,7 @@ test or live host inspection. Work and status live in [MASTER](MASTER.md).
   it, dry runs never need it, and the HTTP `/v1/operations` route refuses a real
   delete submission whatever the credential's grant. The factor stops an agent
   operating through eregion from reading secrets, minting tokens or deleting
-  apps; it is not a sandbox, because an OS account holding a context's files
+  apps; it is not a sandbox, because an OS account holding a workspace's access files
   (SSH key, sudo password) is root-equivalent on that server.
 
 ## Pre-publication credential review — 2026-10-28
@@ -130,10 +131,10 @@ release. Re-check against the build being shipped.
 2. **Handoff/login.** Current handoff includes the operator's SSH/WireGuard keys
    and the external DSN, not an API token; local identity/password files
    persist. Import now stages the identity and host pin, verifies readiness, then
-   replaces the named identity/context; replacing an existing name needs exact
+   replaces verified workspace access; replacing an existing workspace needs exact
    `--replace`. Isolated regressions cover failure preserving the old files.
-   Selected-context local identity reads and RPC routing share one resolver;
-   init readiness/doctor explicitly target the context being initialized.
+   Selected-workspace local identity reads and RPC routing share one resolver;
+   init readiness/doctor explicitly target the workspace being initialized.
    Real-host import, secret lifetime and prompting remain unqualified. Encrypted
    transport bundles are still credentials.
 3. **Destructive approval.** The node validates rollback's exact-target

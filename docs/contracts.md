@@ -14,7 +14,7 @@ metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
   in deterministic catalog order; no match is an empty array. `commands
   --check-meta --json` explicitly validates metadata. `--path`, `--search` and
   `--check-meta` are mutually exclusive. Overview/help/catalog/search/checks do
-  not contact a server or require a context.
+  not contact a server or require a saved workspace.
 - Catalog `terminal_only` describes commands that cannot execute in machine
   mode; `human_factor` describes conditional factor-gated effects without
   removing machine-safe previews. `durable_submission` distinguishes real
@@ -169,7 +169,7 @@ Responses are NDJSON: optional event lines, then exactly one `result` line with
 `schema`, `type: "result"`, `ok`, and either `data` or an `eregion/v1` fault.
 `secrets` values are never logged or persisted. Before the first non-exempt
 method the operator checks `version`; a different build fails with
-`node_version_mismatch` unless `--auto-upgrade-nodes` or the context's
+`node_version_mismatch` unless `--auto-upgrade-nodes` or the workspace's
 `auto_upgrade_nodes` permits pushing the operator's matching Linux binary.
 `version` and `upgrade.install` are exempt from the node-side build check.
 Their wire shape is frozen across builds because an older node runs them to

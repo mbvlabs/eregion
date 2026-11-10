@@ -1,7 +1,9 @@
 package host
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/doctor"
@@ -29,11 +31,38 @@ func TestPendingInitTransitions(t *testing.T) {
 	}
 }
 
+func TestPendingInitRejectsOldContextSchema(t *testing.T) {
+	store := filepath.Join(t.TempDir(), "workspaces.json")
+	p := &PendingInit{Server: "prod", AccessKey: "prod", Workspace: "prod"}
+	if err := p.SaveAt(store); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := PendingDirAt(store, "prod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, PendingInitFile)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"access_key"`) || strings.Contains(string(raw), `"context"`) {
+		t.Fatalf("unexpected pending schema: %s", raw)
+	}
+	old := strings.ReplaceAll(strings.ReplaceAll(string(raw), `"schema": 2`, `"schema": 1`), `"access_key"`, `"context"`)
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadPendingAt(store, "prod"); err == nil {
+		t.Fatal("old pending schema accepted")
+	}
+}
+
 func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	pending := &PendingInit{
 		Server: "prod", Host: "203.0.113.10", User: "root", Port: 22, Node: "main",
-		Context: "prod", Hostname: "app.example.com", AdminUser: "admin",
+		AccessKey: "prod", Workspace: "prod", Hostname: "app.example.com", AdminUser: "admin",
 		DatabaseURLFile: "/root/eregion-db.url", Phases: map[string]string{},
 		HostKey: "ssh-ed25519 SHA256:host", HostKeyFingerprint: "SHA256:host",
 	}
@@ -86,7 +115,7 @@ func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
 }
 
 func TestPendingNamesCannotEscapeThePendingRoot(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	for _, name := range []string{"../escape", "a/b", "Prod", ""} {
 		if _, err := PendingDir(name); err == nil {
 			t.Errorf("PendingDir(%q) accepted a path", name)

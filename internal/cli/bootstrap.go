@@ -185,6 +185,7 @@ func bootstrapInputFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
 	f.String("role", "main", "Placement: main, application, builder, or telemetry")
 	f.String("node", "main", "Node name; the host step writes it as EREGION_NODE_NAME")
+	f.String("workspace-name", "", "Portable workspace name to assign on the main node")
 	f.String("database-url-file", "", "Owner-only external PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
 	f.String("binary", "", "eregion binary to install on the host; defaults to this executable")
 	f.String("api-listen", "127.0.0.1:8080", "API listener; non-loopback apply is access-changing")
@@ -200,6 +201,7 @@ func (a *app) bootstrapConfig(cmd *cobra.Command) (host.Config, error) {
 	f := cmd.Flags()
 	get := func(name string) string { v, _ := f.GetString(name); return v }
 	cfg := host.DefaultConfig(host.Role(get("role")), get("node"))
+	cfg.Workspace = strings.TrimSpace(get("workspace-name"))
 	cfg.DatabaseURL = os.Getenv("EREGION_DATABASE_URL")
 	if path := get("database-url-file"); path != "" {
 		raw, err := host.ReadPrivateInput(path)
@@ -422,6 +424,9 @@ func remoteBundle(cfg host.Config, dir string) ([]host.RemoteFile, []string, err
 	}
 	files = append(files, host.RemoteFile{Name: "eregion", Data: raw, Mode: 0o755})
 	args := []string{"--role", string(cfg.Role), "--node", cfg.Node}
+	if cfg.Workspace != "" {
+		args = append(args, "--workspace-name", cfg.Workspace)
+	}
 	// The uploaded binary is the one the step installs at /usr/local/bin, so a
 	// macOS operator never tries to execute its own binary on the node.
 	args = append(args, "--binary", filepath.Join(dir, "eregion"))

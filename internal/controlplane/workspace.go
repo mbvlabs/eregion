@@ -14,12 +14,13 @@ import (
 
 // Workspace identity is installation metadata, not a tenant boundary. The
 // database owns the one configured identity; node configuration and operator
-// context files may mirror it but never decide it. An empty table is the
-// explicit unconfigured state of an alpha.6 installation and stays that way
-// until an operator runs `apply --assign-workspace NAME`.
+// access files may mirror it but never decide it. An empty migrated table is
+// explicitly unconfigured until initialization assigns its identity.
 var (
 	workspaceNamePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`)
 	workspaceIDPattern   = regexp.MustCompile(`^ws_[0-9a-f]{24}$`)
+	// ErrWorkspaceSchemaMissing signals that the workspace migration has not run.
+	ErrWorkspaceSchemaMissing = errors.New("workspace schema is missing")
 )
 
 // workspaceAssignmentLock serialises the singleton insert and replay without
@@ -45,7 +46,7 @@ func ValidateWorkspaceName(name string) error {
 	return nil
 }
 
-// ValidateWorkspaceID checks the generated portable ID in bundles and contexts.
+// ValidateWorkspaceID checks the generated portable ID in bundles and access records.
 func ValidateWorkspaceID(id string) error {
 	if !workspaceIDPattern.MatchString(id) {
 		return contract.NewFault(contract.ValidationFailed, "invalid workspace ID "+id,
@@ -67,7 +68,7 @@ type workspaceQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
 
-func workspaceTableExists(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+func workspaceTableExists(ctx context.Context, pool workspaceQuerier) (bool, error) {
 	var exists bool
 	if err := pool.QueryRow(ctx, "SELECT to_regclass('eregion_workspace') IS NOT NULL").Scan(&exists); err != nil {
 		return false, err
@@ -75,16 +76,19 @@ func workspaceTableExists(ctx context.Context, pool *pgxpool.Pool) (bool, error)
 	return exists, nil
 }
 
-// ReadWorkspace reads the one authoritative identity. A missing table (the
-// migration has not run yet) and an empty table are both unconfigured; a read
-// never inserts a row.
+// ReadWorkspace reads the authoritative identity without inserting a row.
+// A missing table is distinct from a migrated but empty table.
 func ReadWorkspace(ctx context.Context, pool *pgxpool.Pool) (WorkspaceIdentity, error) {
+	return readWorkspaceSchema(ctx, pool)
+}
+
+func readWorkspaceSchema(ctx context.Context, pool workspaceQuerier) (WorkspaceIdentity, error) {
 	exists, err := workspaceTableExists(ctx, pool)
 	if err != nil {
 		return WorkspaceIdentity{}, err
 	}
 	if !exists {
-		return WorkspaceIdentity{}, nil
+		return WorkspaceIdentity{}, ErrWorkspaceSchemaMissing
 	}
 	return readWorkspace(ctx, pool)
 }

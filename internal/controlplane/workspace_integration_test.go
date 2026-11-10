@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -125,8 +126,8 @@ func TestIntegrationConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner(
 func TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize(t *testing.T) {
 	pool, _ := testPool(t, false)
 	identity, err := ReadWorkspace(context.Background(), pool)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrWorkspaceSchemaMissing) {
+		t.Fatalf("missing schema error = %v", err)
 	}
 	if identity.Configured {
 		t.Fatalf("a pre-migration database was reported as configured: %+v", identity)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/pem"
 	"net"
 	"os"
@@ -76,7 +77,7 @@ func writeTestWorkspace(t *testing.T, store *host.WorkspaceStore, accessName, wo
 
 func workspaceFixture(t *testing.T) (*cobra.Command, *host.WorkspaceStore) {
 	t.Helper()
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "")
 	store, err := host.LoadWorkspaceStore("")
 	if err != nil {
@@ -232,7 +233,7 @@ func TestWorkspaceAliasIsNotAPublicSelector(t *testing.T) {
 }
 
 func TestWorkspaceFlagWorksBeforeAndAfterTheCommand(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "")
 	store, err := host.LoadWorkspaceStore("")
 	if err != nil {
@@ -272,7 +273,7 @@ func TestObsoleteWorkspaceEnvironmentFailsExplicitly(t *testing.T) {
 }
 
 func TestWorkspaceUseAndRemoveRequireWorkspaceIdentityNotAlias(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	store, err := host.LoadWorkspaceStore("")
 	if err != nil {
 		t.Fatal(err)
@@ -303,7 +304,7 @@ func TestWorkspaceUseAndRemoveRequireWorkspaceIdentityNotAlias(t *testing.T) {
 }
 
 func TestWorkspaceCredentialDirectoryUsesExistingPrivateFact(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "")
 	store, err := host.LoadWorkspaceStore("")
 	if err != nil {
@@ -345,7 +346,7 @@ func TestWorkspaceCredentialDirectoryUsesExistingPrivateFact(t *testing.T) {
 }
 
 func TestWorkspaceSnapshotIsStableWithinInvocation(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "")
 	store, err := host.LoadWorkspaceStore("")
 	if err != nil {
@@ -389,14 +390,14 @@ func TestWorkspaceSnapshotIsStableWithinInvocation(t *testing.T) {
 
 func TestTunnelSelectionUsesTheSharedVerifiedWorkspace(t *testing.T) {
 	cmd, _ := workspaceFixture(t)
-	cfg, err := tunnelContextConfig(cmd)
+	cfg, err := tunnelWorkspaceConfig(cmd)
 	if err != nil || cfg.Endpoint != "203.0.113.10:51820" {
 		t.Fatalf("default tunnel endpoint = %q, %v", cfg.Endpoint, err)
 	}
 	if err := cmd.PersistentFlags().Set("workspace", "second"); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err = tunnelContextConfig(cmd)
+	cfg, err = tunnelWorkspaceConfig(cmd)
 	if err != nil || cfg.Endpoint != "198.51.100.20:51820" {
 		t.Fatalf("flagged tunnel endpoint = %q, %v", cfg.Endpoint, err)
 	}
@@ -407,7 +408,7 @@ func TestTunnelSelectionUsesTheSharedVerifiedWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("EREGION_WORKSPACE", "third")
-	cfg, err = tunnelContextConfig(cmd)
+	cfg, err = tunnelWorkspaceConfig(cmd)
 	if err != nil || cfg.Endpoint != "203.0.113.30:51820" {
 		t.Fatalf("environment tunnel endpoint = %q, %v", cfg.Endpoint, err)
 	}
@@ -429,14 +430,19 @@ func TestWorkspaceLabelsNeverExposePrivateAlias(t *testing.T) {
 	if label := imagePushTarget(&nodeClient{accessName: unconfigured.Name, workspaceName: verifiedWorkspaceName(unconfigured)}); label == "historical-alias" {
 		t.Fatalf("unconfigured image push exposed private alias: %q", label)
 	}
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "")
 	unconfiguredStore, err := host.LoadWorkspaceStore("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := unconfiguredStore.PublishUnconfiguredAccess(unconfigured); err != nil {
-		t.Fatal(err)
+	unconfiguredStore.Access = []host.WorkspaceAccess{unconfigured}
+	unconfiguredStore.Current = unconfigured.Name
+	if err := unconfiguredStore.Save(); contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("unconfigured access was not refused before persistence: %v", err)
+	}
+	if _, err := os.Stat(unconfiguredStore.Path); !os.IsNotExist(err) {
+		t.Fatalf("unconfigured access created a store: %v", err)
 	}
 	unconfiguredCmd := &cobra.Command{}
 	unconfiguredCmd.Flags().String("workspace-file", "", "")
@@ -448,38 +454,62 @@ func TestWorkspaceLabelsNeverExposePrivateAlias(t *testing.T) {
 	}
 }
 
-func TestUnconfiguredAlphaAccessIsOnlyTheInitializationException(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+func TestApplyRejectsUnconfiguredWorkspace(t *testing.T) {
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	t.Setenv("EREGION_WORKSPACE", "")
 	store, err := host.LoadWorkspaceStore("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{
+	store.Access = []host.WorkspaceAccess{{
 		Name: "historical", SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"},
-	}); err != nil {
+	}}
+	store.Current = "historical"
+	if err := store.Save(); contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("unconfigured access was not refused before persistence: %v", err)
+	}
+	// Simulate a malformed on-disk record without weakening the publication
+	// validator merely to construct the fixture.
+	raw, err := json.Marshal(store)
+	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := &cobra.Command{}
-	cmd.Flags().String("workspace", "", "")
-	cmd.Flags().String("workspace-file", "", "")
-	if err := cmd.Flags().Set("workspace-file", store.Path); err != nil {
+	if err := os.WriteFile(store.Path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	access, _, err := currentInitializationAccess(cmd)
-	if err != nil || access.Name != "historical" || access.Workspace != nil {
-		t.Fatalf("initialization access = %+v, %v", access, err)
+	code, stdout, _ := invoke(t, "apply", "--json")
+	if code == 0 {
+		t.Fatal("apply accepted unconfigured workspace")
 	}
-	if err := cmd.Flags().Set("workspace", "thelab"); err != nil {
+	if envelope := decodeOne(t, stdout); envelope.Error == nil || envelope.Error.Code != contract.PreconditionFailed {
+		t.Fatalf("unconfigured workspace error = %+v", envelope.Error)
+	}
+	if after, err := os.ReadFile(store.Path); err != nil || !bytes.Equal(raw, after) {
+		t.Fatalf("refused apply changed the malformed store: %v", err)
+	}
+}
+
+func TestApplyTargetsSelectedVerifiedWorkspace(t *testing.T) {
+	cmd, _ := workspaceFixture(t)
+	cmd.Flags().Bool("dry-run", true, "")
+	if err := cmd.PersistentFlags().Set("workspace", "second"); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := currentInitializationAccess(cmd); contract.Classify(err).Code != contract.Usage {
-		t.Fatalf("global --workspace accepted for initialization: %v", err)
+	first, second := &workspaceApplyTransport{}, &workspaceApplyTransport{}
+	a := &app{nodeClients: map[string]*nodeClient{
+		"alpha": {remote: first, checked: true},
+		"beta":  {remote: second, checked: true},
+	}}
+	if _, err := a.hostApply(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if first.run != 0 || second.run != 1 || second.params.Method != methodHostApply {
+		t.Fatalf("apply calls: first=%d second=%d method=%q", first.run, second.run, second.params.Method)
 	}
 }
 
 func TestObsoleteContextCommandAndFlagAreRemoved(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	for _, args := range [][]string{
 		{"context", "list", "--json"},
 		{"--context", "thelab", "version", "--json"},

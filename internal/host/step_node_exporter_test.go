@@ -2,6 +2,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,12 +10,200 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
-func TestNodeExporterV2EnablesScopedLocalCollectors(t *testing.T) {
+type identityFailureDatabase struct{ fakeWorkspaceDatabase }
+
+func (d *identityFailureDatabase) ReadWorkspace(_ context.Context, dsn string) (controlplane.WorkspaceIdentity, error) {
+	return controlplane.WorkspaceIdentity{}, errors.New("database failure with " + dsn)
+}
+
+type identityStepExec struct{ runs int }
+
+func (e *identityStepExec) Run(context.Context, string, string, map[string]string, engine.Reporter) error {
+	e.runs++
+	return nil
+}
+func (*identityStepExec) Output(context.Context, string) (string, error) {
+	return "version:ok\nenabled:ok\nactive:ok\n", nil
+}
+
+func TestNodeExporterIdentityStepApplyAndNoop(t *testing.T) {
+	cfg := fixture(t, RoleMain)
+	cfg.Node = "node-actual"
+	cfg.Workspace = "local-alias"
+	database := &fakeWorkspaceDatabase{identity: controlplane.WorkspaceIdentity{Configured: true, Name: "thelab", ID: testWorkspaceID}}
+	parent := filepath.Join(t.TempDir(), "node_exporter")
+	textfile := filepath.Join(parent, "textfile")
+	if err := os.MkdirAll(textfile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	exec := &identityStepExec{}
+	step := &nodeExporterStep{cfg: cfg, database: database, exec: exec, parentDir: parent, textfileDir: textfile,
+		// Production always performs the root ownership and trusted-ancestor
+		// checks. Only this unprivileged, isolated fixture substitutes them.
+		applyDirectoryCheck: func(string, string) error { return nil }, strictDirectoryCheck: func(string, string) error { return nil },
+	}
+	if err := os.MkdirAll(cfg.Layout.SystemdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(step.unitPath(), step.unit(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	check, err := step.Check(ctx, engine.Runtime{})
+	if err != nil || check.Complete || !strings.Contains(check.Detail, "identity metric differs") {
+		t.Fatalf("initial check = %+v, %v", check, err)
+	}
+	eng, err := engine.New(t.TempDir(), cfg.Node, &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func() engine.TaskStatus {
+		t.Helper()
+		id, err := contract.NewOperationID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, err := eng.Run(ctx, step, engine.Execution{OperationID: id, Attempt: 1, Step: step.ID()}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return status
+	}
+	if status := run(); !status.Executed || exec.runs != 2 {
+		t.Fatalf("first apply = %+v, runs=%d", status, exec.runs)
+	}
+	path := filepath.Join(textfile, "eregion_node.prom")
+	before, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(before), `eregion_node="node-actual",eregion_workspace="thelab",eregion_workspace_id="`+testWorkspaceID+`"`) || strings.Contains(string(before), "local-alias") {
+		t.Fatalf("written identity = %q, %v", before, err)
+	}
+	check, err = step.Check(ctx, engine.Runtime{})
+	if err != nil || !check.Complete {
+		t.Fatalf("post-apply check = %+v, %v", check, err)
+	}
+	if status := run(); status.Executed || exec.runs != 2 {
+		t.Fatalf("new-operation no-op = %+v, runs=%d", status, exec.runs)
+	}
+	database.identity.Name = "otherlab"
+	check, err = step.Check(ctx, engine.Runtime{})
+	if err != nil || check.Complete || !strings.Contains(check.Detail, "identity metric differs") {
+		t.Fatalf("authoritative identity drift check = %+v, %v", check, err)
+	}
+	database.identity.Name = "thelab"
+	step.database = &identityFailureDatabase{}
+	check, err = step.Check(ctx, engine.Runtime{})
+	if err == nil || check.Complete || strings.Contains(err.Error(), "private-password") {
+		t.Fatalf("failed database check = %+v, %v", check, err)
+	}
+	_, err = step.Apply(ctx, engine.Runtime{}, nil)
+	if err == nil || strings.Contains(err.Error(), "private-password") || exec.runs != 2 {
+		t.Fatalf("failed database apply = %v, runs=%d", err, exec.runs)
+	}
+	id, err := contract.NewOperationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = eng.Run(ctx, step, engine.Execution{OperationID: id, Attempt: 1, Step: step.ID()}, nil); err == nil || strings.Contains(err.Error(), "private-password") {
+		t.Fatalf("failed engine run error = %v", err)
+	}
+	journal, err := os.ReadFile(eng.JournalPath())
+	if err != nil || strings.Contains(string(journal), "private-password") {
+		t.Fatalf("failure journal leaked a secret or was unreadable: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(after) != string(before) || strings.Contains(string(after), "private-password") {
+		t.Fatalf("database failure changed or leaked identity file: %q, %v", after, err)
+	}
+}
+
+func TestNodeExporterIdentityMetricUsesDatabaseAndCurrentNode(t *testing.T) {
+	cfg := fixture(t, RoleMain)
+	cfg.Node = "node-actual"
+	cfg.Workspace = "not-authoritative"
+	cfg.DatabaseURL = "credential-must-not-appear"
+	database := &fakeWorkspaceDatabase{identity: controlplane.WorkspaceIdentity{
+		Configured: true, ID: testWorkspaceID, Name: "thelab",
+	}}
+	dir := t.TempDir()
+	step := &nodeExporterStep{cfg: cfg, database: database, textfileDir: dir}
+	metric, err := step.identityMetric(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.writeIdentityMetric(metric); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "eregion_node.prom")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `eregion_node_info{eregion_node="node-actual",eregion_workspace="thelab",eregion_workspace_id="` + testWorkspaceID + `"} 1` + "\n"
+	if !strings.HasSuffix(string(raw), want) || database.reads != 1 {
+		t.Fatalf("identity metric = %q; reads = %d", raw, database.reads)
+	}
+	// Both a direct public scrape and an HTTP-discovered scrape reach the
+	// same exporter textfile; discovery does not need to inject these labels.
+	discovery, err := telemetry.TargetsJSON(cfg.Node, "main.example.com")
+	if err != nil || !strings.Contains(string(discovery), `"eregion_node": "node-actual"`) || !strings.Contains(string(discovery), telemetry.MetricsPath) {
+		t.Fatalf("discovery does not name this node and metrics path: %s, %v", discovery, err)
+	}
+	if gateway := string(telemetryCaddyfile("fixture-hash")); !strings.Contains(gateway, "handle "+telemetry.GatewayMetricsPath) || !strings.Contains(gateway, "reverse_proxy "+NodeExporterLoopbackAddress) || !strings.Contains(gateway, "rewrite /metrics") {
+		t.Fatal("public metrics route no longer proxies the exporter")
+	}
+	for _, forbidden := range []string{"not-authoritative", "credential-must-not-appear", "node_uname_info"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("metric contains %q", forbidden)
+		}
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("identity metric mode: %v %v", info, err)
+	}
+
+	// Before workspace assignment an observation must not reuse an earlier identity.
+	database.identity = controlplane.WorkspaceIdentity{}
+	metric, err = step.identityMetric(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := step.writeIdentityMetric(metric); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil || !strings.HasSuffix(string(raw), "eregion_node_info{eregion_node=\"node-actual\"} 1\n") || strings.Contains(string(raw), "eregion_workspace") {
+		t.Fatalf("unconfigured identity metric = %q, %v", raw, err)
+	}
+}
+
+func TestNodeExporterIdentityMetricRejectsInvalidLabels(t *testing.T) {
+	for _, tc := range []struct{ node, name, id string }{
+		{"node\"\nmalicious 1", "thelab", testWorkspaceID},
+		{"main", "thelab\"\nmalicious 1", testWorkspaceID},
+		{"main", "thelab", "ws_\"\\malicious"},
+	} {
+		cfg := fixture(t, RoleMain)
+		cfg.Node = tc.node
+		step := &nodeExporterStep{cfg: cfg, database: &fakeWorkspaceDatabase{identity: controlplane.WorkspaceIdentity{Configured: true, Name: tc.name, ID: tc.id}}}
+		if metric, err := step.identityMetric(context.Background()); err == nil {
+			t.Fatalf("accepted unsafe identity: %q", metric)
+		}
+	}
+	step := &nodeExporterStep{cfg: fixture(t, RoleMain)}
+	if metric, err := step.identityMetric(context.Background()); err == nil || metric != nil {
+		t.Fatalf("missing authority produced identity metric %q, %v", metric, err)
+	}
+}
+
+func TestNodeExporterV3EnablesScopedLocalCollectors(t *testing.T) {
 	step := &nodeExporterStep{cfg: DefaultConfig(RoleMain, "")}
-	if got := step.ID(); got != "host-node-exporter-v2" {
+	if got := step.ID(); got != "host-node-exporter-v3" {
 		t.Fatalf("step ID = %q", got)
 	}
 	unit := string(step.unit())
@@ -44,7 +233,7 @@ func TestNodeExporterV2EnablesScopedLocalCollectors(t *testing.T) {
 	}
 }
 
-func TestNodeExporterV2ReplacesTheV1Step(t *testing.T) {
+func TestNodeExporterV3ReplacesEarlierSteps(t *testing.T) {
 	steps, err := (&Runner{Config: fixture(t, RoleMain)}).steps(Credentials{})
 	if err != nil {
 		t.Fatal(err)
@@ -53,11 +242,11 @@ func TestNodeExporterV2ReplacesTheV1Step(t *testing.T) {
 	for _, step := range steps {
 		ids[step.ID()] = true
 	}
-	if !ids["host-node-exporter-v2"] {
-		t.Fatal("main role does not select host-node-exporter-v2")
+	if !ids["host-node-exporter-v3"] {
+		t.Fatal("main role does not select host-node-exporter-v3")
 	}
-	if ids["host-node-exporter-v1"] {
-		t.Fatal("old host-node-exporter-v1 is still selected")
+	if ids["host-node-exporter-v1"] || ids["host-node-exporter-v2"] {
+		t.Fatal("an older node exporter step is still selected")
 	}
 }
 
@@ -130,7 +319,7 @@ func TestFileModeBitsPreservesSpecialBits(t *testing.T) {
 	}
 }
 
-func TestNodeExporterV2CheckUsesStrictDirectoryState(t *testing.T) {
+func TestNodeExporterV3CheckUsesStrictDirectoryState(t *testing.T) {
 	cfg := fixture(t, RoleMain)
 	if err := os.MkdirAll(filepath.Dir(filepath.Join(cfg.Layout.SystemdDir, "node-exporter.service")), 0o755); err != nil {
 		t.Fatal(err)
@@ -158,7 +347,7 @@ func TestNodeExporterApplyRefusesAttackerWritableParentBeforeMutation(t *testing
 	exec := &nodeExporterApplyExec{}
 	step := &nodeExporterStep{cfg: cfg, exec: exec, parentDir: parent, textfileDir: filepath.Join(parent, "textfile")}
 	_, err := step.Apply(context.Background(), engine.Runtime{}, nil)
-	if err == nil {
+	if err == nil || !strings.Contains(err.Error(), "node_exporter") {
 		t.Fatal("apply accepted an attacker-writable/non-root parent")
 	}
 	if exec.runs != 0 {
@@ -241,7 +430,7 @@ func TestNodeExporterDirectoryModeClearRemovesSpecialBits(t *testing.T) {
 	}
 }
 
-func TestNodeExporterV2DiffNamesTextfileAndCollectorChanges(t *testing.T) {
+func TestNodeExporterV3DiffNamesTextfileAndCollectorChanges(t *testing.T) {
 	step := &nodeExporterStep{cfg: DefaultConfig(RoleMain, "")}
 	diff, err := step.Diff(context.Background(), engine.Runtime{})
 	if err != nil {

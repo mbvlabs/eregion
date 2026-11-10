@@ -164,7 +164,7 @@ func loadHandoffExportIdentity(cmd *cobra.Command) (handoffExportIdentity, error
 
 // handoffExportInput is the record's identity/route half. The exported half
 // (database URL, vault keyring, hostname) comes from the same node the selected
-// context reaches, so a mixed-context record cannot be built here.
+// workspace reaches, so a mixed-workspace record cannot be built here.
 func handoffExportInput(identity handoffExportIdentity, exported rpcHandoffExportResult) handoffRecordInput {
 	current := identity.access
 	publicHost, _, _ := net.SplitHostPort(current.SSH.WireGuard.Endpoint)

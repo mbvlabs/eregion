@@ -9,7 +9,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/host"
 )
 
-func TestBootstrapAndContextAreAttached(t *testing.T) {
+func TestBootstrapAndWorkspaceAreAttached(t *testing.T) {
 	for _, path := range [][]string{{"node"}, {"node", "bootstrap"}, {"node", "bootstrap", "plan"}, {"node", "bootstrap", "apply"}, {"node", "bootstrap", "confirm"}, {"node", "bootstrap", "remote"}, {"workspace"}} {
 		code, stdout, stderr := invoke(t, append([]string{"commands", "--path", strings.Join(path, " ")}, "--json")...)
 		if code != 0 {
@@ -23,7 +23,7 @@ func TestBootstrapAndContextAreAttached(t *testing.T) {
 }
 
 func TestWorkspaceClientRequiresSavedWorkspace(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
 	if code, _, _ := invoke(t, "operations", "get", string(followTestID), "--json"); code != 2 {
 		t.Fatalf("missing workspace: code=%d", code)
 	}
@@ -37,6 +37,7 @@ func TestRemoteBundleNeverPassesSecretsInArguments(t *testing.T) {
 	}
 	cfg := host.DefaultConfig(host.RoleMain, "main")
 	cfg.BinaryPath = binary
+	cfg.Workspace = "thelab"
 	cfg.DatabaseURL = "postgres://u:private-password@127.0.0.1/test?sslmode=disable"
 	files, args, err := remoteBundle(cfg, "/var/lib/eregion/bootstrap/remote/test")
 	if err != nil {
@@ -64,5 +65,8 @@ func TestRemoteBundleNeverPassesSecretsInArguments(t *testing.T) {
 	}
 	if !strings.Contains(command, "'--database-url-file'") {
 		t.Fatalf("database flag missing: %s", command)
+	}
+	if !strings.Contains(command, "'--workspace-name' 'thelab'") {
+		t.Fatalf("workspace assignment missing: %s", command)
 	}
 }

@@ -46,10 +46,10 @@ func (t *workspaceApplyTransport) Run(_ context.Context, _ string, stdin io.Read
 	return err
 }
 
-func TestHostApplySendsTheExplicitWorkspaceAssignment(t *testing.T) {
+func TestHostApplySendsNoWorkspaceOverride(t *testing.T) {
 	transport := &workspaceApplyTransport{}
 	client := &nodeClient{remote: transport, checked: true}
-	report, _, err := client.HostApply(context.Background(), false, "", "thelab")
+	report, _, err := client.HostApply(context.Background(), false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,12 +59,19 @@ func TestHostApplySendsTheExplicitWorkspaceAssignment(t *testing.T) {
 	if transport.params.Method != methodHostApply {
 		t.Fatalf("method = %q", transport.params.Method)
 	}
-	var params rpcHostApplyParams
+	var params map[string]json.RawMessage
 	if err := json.Unmarshal(transport.params.Params, &params); err != nil {
 		t.Fatal(err)
 	}
-	if params.Workspace != "thelab" {
-		t.Fatalf("workspace param = %q", params.Workspace)
+	if len(params) != 0 {
+		t.Fatalf("unexpected apply params = %s", transport.params.Params)
+	}
+}
+
+func TestHostApplyRejectsWorkspaceOverride(t *testing.T) {
+	_, err := dispatchHostMethod(context.Background(), rpc.Request{Method: methodHostApply, Params: json.RawMessage(`{"workspace":"thelab"}`)}, io.Discard, nil)
+	if contract.Classify(err).Code != contract.ValidationFailed {
+		t.Fatalf("workspace override error = %v, want validation_failed", err)
 	}
 }
 
@@ -74,8 +81,8 @@ func workspaceRoute(address string) *host.WorkspaceSSH {
 	}
 }
 
-func TestApplyRecordsVerifiedWorkspaceInTheCapturedContext(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+func TestApplyRecordsVerifiedWorkspaceInTheCapturedWorkspace(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
@@ -83,7 +90,7 @@ func TestApplyRecordsVerifiedWorkspaceInTheCapturedContext(t *testing.T) {
 	}
 	prodRoute := workspaceRoute("10.78.0.1:22")
 	otherRoute := workspaceRoute("10.78.0.2:22")
-	if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: "prod", SSH: prodRoute}); err != nil {
+	if _, err := store.PublishWorkspace("ws_0123456789abcdef01234567", "thelab", host.WorkspaceAccess{Name: "prod", SSH: prodRoute}, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.PublishWorkspace("ws_fedcba9876543210fedcba98", "other", host.WorkspaceAccess{Name: "other", SSH: otherRoute}, false); err != nil {
@@ -117,7 +124,7 @@ func TestApplyRecordsVerifiedWorkspaceInTheCapturedContext(t *testing.T) {
 		t.Fatalf("unrelated workspace was overwritten: %+v", other.Workspace)
 	}
 	if reloaded.Current != "other" {
-		t.Fatalf("current context = %q, want other", reloaded.Current)
+		t.Fatalf("current workspace = %q, want other", reloaded.Current)
 	}
 
 	// An unconfigured node must leave the explicit state alone.
@@ -127,14 +134,14 @@ func TestApplyRecordsVerifiedWorkspaceInTheCapturedContext(t *testing.T) {
 }
 
 func TestApplyWorkspaceRefreshRefusesAReplacedSameNameRoute(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	original := workspaceRoute("10.78.0.1:22")
-	if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: "prod", SSH: original}); err != nil {
+	if _, err := store.PublishWorkspace("ws_0123456789abcdef01234567", "thelab", host.WorkspaceAccess{Name: "prod", SSH: original}, false); err != nil {
 		t.Fatal(err)
 	}
 	// A concurrent login replaces the same private access name with another
@@ -163,20 +170,20 @@ func TestApplyWorkspaceRefreshRefusesAReplacedSameNameRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved.Workspace != nil || saved.SSH.Address != replacement.Address {
+	if saved.Workspace == nil || saved.Workspace.ID != workspace.ID || saved.SSH.Address != replacement.Address {
 		t.Fatalf("replacement was overwritten: %+v", saved)
 	}
 }
 
 func TestApplyWorkspaceRefreshRefusesToReplaceAConfiguredWorkspaceID(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	route := workspaceRoute("10.78.0.1:22")
-	if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: "prod", SSH: route}); err != nil {
+	if _, err := store.PublishWorkspace("ws_0123456789abcdef01234567", "thelab", host.WorkspaceAccess{Name: "prod", SSH: route}, false); err != nil {
 		t.Fatal(err)
 	}
 	first := controlplane.WorkspaceIdentity{Configured: true, ID: "ws_0123456789abcdef01234567", Name: "thelab"}
@@ -214,5 +221,16 @@ func TestApplyCommandExposesWorkspaceWithoutANewConfirmationFlag(t *testing.T) {
 	}
 	if cmd.Flags().Lookup("confirm") != nil {
 		t.Fatal("apply gained an unrelated confirmation flag; the existing apply semantics must be retained")
+	}
+}
+
+func TestApplyRejectsRemovedWorkspaceAssignmentFlag(t *testing.T) {
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "workspaces.json"))
+	code, stdout, _ := invoke(t, "apply", "--assign-workspace", "thelab", "--json")
+	if code != 2 {
+		t.Fatalf("exit = %d, want usage exit 2", code)
+	}
+	if envelope := decodeOne(t, stdout); envelope.Error == nil || envelope.Error.Code != contract.Usage {
+		t.Fatalf("error = %+v, want usage", envelope.Error)
 	}
 }

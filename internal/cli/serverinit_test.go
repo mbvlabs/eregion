@@ -41,11 +41,11 @@ func TestApplyProgressGivesEveryPlanStepALine(t *testing.T) {
 }
 
 func TestSavePendingCarriesPinnedHostKey(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	r := &serverInit{
 		answers: serverInitAnswers{
-			Context: "prod", Host: "203.0.113.10", User: "root", Port: "22",
-			Node: "main", Hostname: "app.example.com", AdminUser: "admin",
+			AccessKey: "prod", Host: "203.0.113.10", User: "root", Port: "22",
+			Node: "main", Workspace: "prod", Hostname: "app.example.com", AdminUser: "admin",
 		},
 		pending:    &host.PendingInit{Server: "prod", Phases: map[string]string{}},
 		hostKey:    "ssh-ed25519 SHA256:host",

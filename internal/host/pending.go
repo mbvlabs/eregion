@@ -3,6 +3,7 @@ package host
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -10,13 +11,14 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
 // pendingSchema versions the local unfinished-init state. It may change between
 // alphas; a binary that does not understand it refuses rather than guessing.
-const pendingSchema = 1
+const pendingSchema = 2
 
 // PendingInitFile is the unfinished init's answers and completed phases.
 const PendingInitFile = "init.json"
@@ -42,10 +44,10 @@ type PendingInit struct {
 	Node               string `json:"node"`
 	// Workspace is the requested portable identity; WorkspaceID is filled from
 	// the authoritative database read before the handoff. Neither is guessed
-	// from the context or node name.
+	// from the access key or node name.
 	Workspace       string `json:"workspace,omitempty"`
 	WorkspaceID     string `json:"workspace_id,omitempty"`
-	Context         string `json:"context"`
+	AccessKey       string `json:"access_key"`
 	Hostname        string `json:"hostname"`
 	DatabaseURLFile string `json:"database_url_file,omitempty"`
 	AdminUser       string `json:"admin_user"`
@@ -68,13 +70,13 @@ type PendingInit struct {
 	Phases        map[string]string `json:"phases"`
 }
 
-// PendingRoot is the directory of unfinished inits, beside the context file.
+// PendingRoot is the directory of unfinished inits, beside the workspace file.
 func PendingRoot() (string, error) {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
-	return PendingRootAt(contexts)
+	return PendingRootAt(workspacePath)
 }
 
 // PendingRootAt is PendingRoot for one resolved private store path.
@@ -88,11 +90,11 @@ func PendingRootAt(storePath string) (string, error) {
 // PendingDir is pending/<server>. The name is validated here so every caller
 // joins only a plain server name, never a path.
 func PendingDir(name string) (string, error) {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
-	return PendingDirAt(contexts, name)
+	return PendingDirAt(workspacePath, name)
 }
 
 // PendingDirAt is PendingDir for one resolved private store path.
@@ -109,11 +111,11 @@ func PendingDirAt(storePath, name string) (string, error) {
 
 // PendingKnownHosts is the init's private known_hosts file.
 func PendingKnownHosts(name string) (string, error) {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
-	return PendingKnownHostsAt(contexts, name)
+	return PendingKnownHostsAt(workspacePath, name)
 }
 
 // PendingKnownHostsAt is PendingKnownHosts for one resolved private store path.
@@ -127,11 +129,11 @@ func PendingKnownHostsAt(storePath, name string) (string, error) {
 
 // PendingExists reports whether an unfinished init is saved for name.
 func PendingExists(name string) bool {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return false
 	}
-	return PendingExistsAt(contexts, name)
+	return PendingExistsAt(workspacePath, name)
 }
 
 // PendingExistsAt is PendingExists for one resolved private store path.
@@ -146,11 +148,11 @@ func PendingExistsAt(storePath, name string) bool {
 
 // PendingNames lists unfinished inits, sorted.
 func PendingNames() ([]string, error) {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return nil, err
 	}
-	return PendingNamesAt(contexts)
+	return PendingNamesAt(workspacePath)
 }
 
 // PendingNamesAt lists unfinished inits for one resolved private store path.
@@ -178,11 +180,11 @@ func PendingNamesAt(storePath string) ([]string, error) {
 
 // LoadPending reads pending/<name>/init.json.
 func LoadPending(name string) (*PendingInit, error) {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return nil, err
 	}
-	return LoadPendingAt(contexts, name)
+	return LoadPendingAt(workspacePath, name)
 }
 
 // LoadPendingAt reads one unfinished init from a resolved private store path.
@@ -212,8 +214,11 @@ func LoadPendingAt(storePath, name string) (*PendingInit, error) {
 	var pending PendingInit
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&pending); err != nil || pending.Schema != pendingSchema || pending.Server != name {
-		fault := contract.NewFault(contract.PreconditionFailed, "the unfinished init is invalid", "Discard it with eregion server init --discard --workspace-name "+name+" and start again.")
+	decodeErr := decoder.Decode(&pending)
+	var extra any
+	trailingErr := decoder.Decode(&extra)
+	if decodeErr != nil || trailingErr != io.EOF || pending.Schema != pendingSchema || pending.Server != name || pending.AccessKey != name || ValidateWorkspaceName(pending.Workspace) != nil || (pending.WorkspaceID != "" && controlplane.ValidateWorkspaceID(pending.WorkspaceID) != nil) {
+		fault := contract.NewFault(contract.PreconditionFailed, "the unfinished init is invalid or unsupported", "Preserve its files and use a new workspace name or a separate private store directory.")
 		fault.Details = map[string]any{"pending_path": dir}
 		return nil, fault
 	}
@@ -225,11 +230,11 @@ func LoadPendingAt(storePath, name string) (*PendingInit, error) {
 
 // Save writes the unfinished init atomically, owner-only.
 func (p *PendingInit) Save() error {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return err
 	}
-	return p.SaveAt(contexts)
+	return p.SaveAt(workspacePath)
 }
 
 // SaveAt writes the unfinished init under one resolved private store path.
@@ -272,11 +277,11 @@ func (p *PendingInit) Mark(phase string) {
 // SavePendingFile writes one protected helper file (for example the vault
 // keyring captured for the handoff) under pending/<name>/.
 func SavePendingFile(name, file string, data []byte) error {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return err
 	}
-	return SavePendingFileAt(contexts, name, file, data)
+	return SavePendingFileAt(workspacePath, name, file, data)
 }
 
 // SavePendingFileAt is SavePendingFile for one resolved private store path.
@@ -296,11 +301,11 @@ func SavePendingFileAt(storePath, name, file string, data []byte) error {
 
 // LoadPendingFile reads a helper file saved by SavePendingFile.
 func LoadPendingFile(name, file string) ([]byte, error) {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return nil, err
 	}
-	return LoadPendingFileAt(contexts, name, file)
+	return LoadPendingFileAt(workspacePath, name, file)
 }
 
 // LoadPendingFileAt is LoadPendingFile for one resolved private store path.
@@ -328,11 +333,11 @@ func LoadPendingFileAt(storePath, name, file string) ([]byte, error) {
 
 // RemovePending deletes pending/<name>.
 func RemovePending(name string) error {
-	contexts, err := DefaultWorkspacePath()
+	workspacePath, err := DefaultWorkspacePath()
 	if err != nil {
 		return err
 	}
-	return RemovePendingAt(contexts, name)
+	return RemovePendingAt(workspacePath, name)
 }
 
 // RemovePendingAt deletes pending/<name> under one resolved private store path.

@@ -38,11 +38,11 @@ type operatorIdentity struct {
 }
 
 func identityDir(name string) (string, error) {
-	contexts, err := host.DefaultWorkspacePath()
+	workspacePath, err := host.DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
-	return identityDirAt(contexts, name), nil
+	return identityDirAt(workspacePath, name), nil
 }
 
 func identityDirAt(storePath, name string) string {
@@ -50,11 +50,11 @@ func identityDirAt(storePath, name string) string {
 }
 
 func loadOrCreateIdentity(name string) (*operatorIdentity, error) {
-	contexts, err := host.DefaultWorkspacePath()
+	workspacePath, err := host.DefaultWorkspacePath()
 	if err != nil {
 		return nil, err
 	}
-	return loadOrCreateIdentityAt(contexts, name)
+	return loadOrCreateIdentityAt(workspacePath, name)
 }
 
 func loadOrCreateIdentityAt(storePath, name string) (*operatorIdentity, error) {
@@ -148,12 +148,12 @@ func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts
 	}
 }
 
-// pinContextKnownHosts copies the host keys verified for the public
+// pinWorkspaceKnownHosts copies the host keys verified for the public
 // first-contact address into the workspace access record own known_hosts under the
 // WireGuard address. The pending known_hosts remains the public-address
 // record, so a first contact or resume still verifies that address on its
 // own.
-func pinContextKnownHosts(pending, scoped, publicAddress, wireGuardAddress string) error {
+func pinWorkspaceKnownHosts(pending, scoped, publicAddress, wireGuardAddress string) error {
 	keys, err := transport.LoadHostKeys(pending)
 	if err != nil {
 		return err
@@ -218,7 +218,7 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 		// when it returns. Record the phase before any remaining step can fail;
 		// a resume then reconnects as the admin user over WireGuard.
 		r.pending.Mark(phaseAccessSetup)
-		if err := r.pending.Save(); err != nil {
+		if err := r.savePendingRecord(r.pending); err != nil {
 			task.end(ui.EndFail, "")
 			return nil, err
 		}
@@ -232,7 +232,7 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 		return nil, contract.NewFault(contract.PreconditionFailed, "the pending init has no node WireGuard key", "Run server init --discard and start again; the access setup did not finish.")
 	}
 
-	knownHosts, err := r.knownHostsPath(r.answers.Context)
+	knownHosts, err := r.knownHostsPath(r.answers.AccessKey)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +241,7 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 	// own known_hosts; on a resume that skipped first contact it comes from
 	// the pending known_hosts, which keeps verifying the public address.
 	publicAddress := net.JoinHostPort(publicHost, r.answers.Port)
-	if err := pinContextKnownHosts(r.knownHosts, knownHosts, publicAddress, net.JoinHostPort(access.NodeAddress, "22")); err != nil {
+	if err := pinWorkspaceKnownHosts(r.knownHosts, knownHosts, publicAddress, net.JoinHostPort(access.NodeAddress, "22")); err != nil {
 		return nil, err
 	}
 	route := id.wireGuardRoute(publicHost, nodeKey, knownHosts, r.answers.AdminUser)

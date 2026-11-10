@@ -6,19 +6,17 @@ One Go binary sets up, secures, deploys and operates applications on servers
 you own. Agent-first JSON commands and a polished human terminal experience; no
 web UI.
 
-**Status: alpha.3 is published; alpha.4 is a source candidate and beta is not
-qualified.**
+**Status: beta.1 fresh-test prerelease; fresh-install qualification is pending.**
 Setup, the private operator channel, durable operations, builds, deployments,
 domain routes, extensions, staging-to-production promotion and upgrades have
-code. Node-local telemetry, its authenticated WireGuard-only endpoint,
-discovery/config/rotation primitives and local textfile/systemd collector
-foundations, plus Cloudflare DNS automation, are implemented in source; host
-qualification remains; see the work list in MASTER.
+code. Authenticated public HTTPS telemetry and external collection passed on the
+recorded signed edge build. Cloudflare automation has separate qualification
+gates. See MANUAL-TESTING for evidence and Linear for actionable work.
 
 ## Start here
 
 1. [MASTER](docs/MASTER.md): goal, decisions, the application model, the target
-   command tree, the v1 alpha/beta scope and the one work list with status.
+   command tree and the v1 alpha/beta scope. Linear tracks execution status.
 2. [IMPLEMENTATION](docs/IMPLEMENTATION.md): code map, current commands, database
    schema and execution boundaries.
 3. [MANUAL-TESTING](docs/MANUAL-TESTING.md): the alpha/beta acceptance checks and
@@ -37,7 +35,7 @@ bin/eregion help server init --json
 ```
 
 Discovery and help need no database or credentials. The operator surface is
-MASTER section 5: `server init`, `plan`, `apply`, `login`, `context`, `secrets
+MASTER section 5: `server init`, `plan`, `apply`, `login`, `workspace`, `secrets
 export`, `app`, `env`, `process`, `config`, `domain`, `deploy`, `rollback`,
 `restart`, `build`, `release list`, `logs`,
 `metrics show|endpoint|config|rotate`, `operations`,

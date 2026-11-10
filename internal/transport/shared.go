@@ -116,7 +116,7 @@ func IsNoDaemon(err error) bool {
 }
 
 // TunnelFingerprint identifies a tunnel configuration: a daemon serves only
-// clients whose context computes the same value. The private key enters only
+// clients whose workspace configuration computes the same value. The private key enters only
 // through its public half.
 func TunnelFingerprint(cfg WireGuardConfig) string {
 	pub := cfg.PrivateKey.PublicKey()
@@ -430,7 +430,7 @@ func (d *SharedDialer) check(ctx context.Context, st SharedStatus) (SharedStatus
 		return st, nil
 	}
 	fault := contract.NewFault(contract.PreconditionFailed,
-		"the running tunnel daemon serves another configuration of this context", "")
+		"the running tunnel daemon serves another configuration of this workspace", "")
 	fault.Details = map[string]any{"reason": "tunnel_config_changed", "daemon_pid": st.PID}
 	if clients := describeClients(st.Clients); clients != "" {
 		fault.Hint = "Another eregion command (" + clients + ") is using the old tunnel; wait for it, or run eregion tunnel stop --force."

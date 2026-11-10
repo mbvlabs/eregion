@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
@@ -248,7 +249,7 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		// authenticated telemetry gateway is a dedicated Caddy instance on
 		// 127.0.0.1:9101, reached through two exact public ingress paths and
 		// enabled by credential rotation. It is independent of WireGuard.
-		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec}, &telemetryStep{cfg: r.Config, exec: r.Exec})
+		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec, database: r.Database}, &telemetryStep{cfg: r.Config, exec: r.Exec})
 	}
 	// The main node also needs /etc/eregion/node.json: node RPC, the CI URLs,
 	// push-to-deploy and secrets export all read the node identity and main
@@ -343,8 +344,7 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 }
 
 // preflightWorkspace refuses an explicit workspace that is already configured
-// to a different immutable name. A missing migration/table is the legitimate
-// unconfigured legacy state, not a conflict.
+// to a different immutable name. A missing schema is allowed for fresh setup.
 func (r *Runner) preflightWorkspace(ctx context.Context) error {
 	if r.Config.Workspace == "" {
 		return nil
@@ -354,6 +354,9 @@ func (r *Runner) preflightWorkspace(ctx context.Context) error {
 	}
 	identity, err := r.Database.ReadWorkspace(ctx, r.Config.DatabaseURL)
 	if err != nil {
+		if errors.Is(err, controlplane.ErrWorkspaceSchemaMissing) {
+			return nil
+		}
 		return err
 	}
 	if identity.Configured && identity.Name != r.Config.Workspace {

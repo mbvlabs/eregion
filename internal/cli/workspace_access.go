@@ -78,21 +78,6 @@ func (a *app) nodeClientForAccess(cmd *cobra.Command, current host.WorkspaceAcce
 	return client, nil
 }
 
-// nodeClientForInitializationAccessName is used only by server init, where the
-// newly written private access record exists before the node RPC runs. It is
-// not a public selector.
-func (a *app) nodeClientForInitializationAccessName(cmd *cobra.Command, name string) (*nodeClient, error) {
-	store, err := loadWorkspaceStore(cmd)
-	if err != nil {
-		return nil, err
-	}
-	access, ok := store.AccessByName(name)
-	if !ok {
-		return nil, contract.NewFault(contract.NotFound, "workspace access "+name+" was not found", "Run eregion server init or login first.")
-	}
-	return a.nodeClientForAccess(cmd, access)
-}
-
 func workspaceIDOf(access host.WorkspaceAccess) string {
 	if access.Workspace == nil {
 		return ""
@@ -185,26 +170,6 @@ func selectedWorkspace(cmd *cobra.Command) (host.WorkspaceAccess, host.Workspace
 func selectedWorkspaceAccess(cmd *cobra.Command) (host.WorkspaceAccess, error) {
 	access, _, err := selectedWorkspace(cmd)
 	return access, err
-}
-
-// currentInitializationAccess is the bounded alpha exception: apply
-// --assign-workspace may address the saved current access before it has a
-// verified portable identity. It is not a general unconfigured selector.
-func currentInitializationAccess(cmd *cobra.Command) (host.WorkspaceAccess, *host.WorkspaceStore, error) {
-	if workspaceFlag(cmd) != "" || strings.TrimSpace(os.Getenv("EREGION_WORKSPACE")) != "" {
-		return host.WorkspaceAccess{}, nil, contract.NewFault(contract.Usage,
-			"--workspace selects an existing verified workspace and cannot initialize an unconfigured access",
-			"Run eregion apply --assign-workspace NAME for the bounded alpha.6 assignment flow.")
-	}
-	store, err := loadWorkspaceStore(cmd)
-	if err != nil {
-		return host.WorkspaceAccess{}, nil, err
-	}
-	access, err := store.CurrentAccess()
-	if err != nil {
-		return host.WorkspaceAccess{}, nil, err
-	}
-	return access, store, nil
 }
 
 // rejectWorkspaceSelection keeps import/create identity independent of ambient

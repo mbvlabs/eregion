@@ -42,7 +42,7 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Backend is the operator-side application surface. The saved-context
+// Backend is the operator-side application surface. The saved-workspace
 // implementation runs every method through `eregion node rpc` over SSH inside
 // WireGuard; the HTTP client remains only for CI/webhook/readyz.
 type Backend interface {
@@ -151,12 +151,6 @@ type rpcSubmitParams struct {
 
 type rpcDoctorParams struct {
 	Init bool `json:"init,omitempty"`
-}
-
-// rpcHostApplyParams carries only the explicit legacy workspace assignment.
-// An empty value leaves the recorded intent unchanged; it never means "guess".
-type rpcHostApplyParams struct {
-	Workspace string `json:"workspace,omitempty"`
 }
 
 type rpcOperationParams struct {
@@ -429,11 +423,11 @@ func (n *nodeClient) HostPlan(ctx context.Context) (host.Plan, error) {
 	return plan, err
 }
 
-func (n *nodeClient) HostApply(ctx context.Context, dryRun bool, confirm, workspace string) (host.ApplyReport, host.Plan, error) {
+func (n *nodeClient) HostApply(ctx context.Context, dryRun bool, confirm string) (host.ApplyReport, host.Plan, error) {
 	var report host.ApplyReport
 	var plan host.Plan
 	opts := rpcCallOptions{DryRun: dryRun, Confirm: confirm, OnEvent: n.progress}
-	raw, err := n.call(ctx, methodHostApply, rpcHostApplyParams{Workspace: workspace}, opts)
+	raw, err := n.call(ctx, methodHostApply, struct{}{}, opts)
 	if err != nil {
 		return report, plan, err
 	}
@@ -1293,12 +1287,27 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 		return writeRPCResult(stdout, nil, err)
 	}
 	defer closeRuntime()
-	data, err := dispatchNodeMethod(ctx, app, request)
+	data, err := dispatchStartedNodeMethod(ctx, app, request)
 	registerRPCMethodSecrets(registry, request.Method, data)
 	if err != nil {
 		return writeRPCResult(stdout, nil, err)
 	}
 	return writeRPCResult(stdout, data, nil)
+}
+
+// openNodeApp has already performed the full readiness check. Reuse that
+// result for this request instead of repeating the database checks.
+func dispatchStartedNodeMethod(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
+	if request.Method == methodReady {
+		if _, err := nodeOperator(request); err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ready": true}, nil
+	}
+	return dispatchNodeMethod(ctx, app, request)
 }
 
 func registerRPCMethodSecrets(registry *secrets.Registry, method string, data any) {

@@ -118,7 +118,7 @@ func telemetryLocal(facts Facts) []Result {
 	for _, collector := range []string{"textfile", "systemd"} {
 		success, present := telemetry.Collectors[collector]
 		if !present {
-			return one(Fail, "node_exporter does not report the "+collector+" collector", "run eregion apply to apply host-node-exporter-v2, then restart node-exporter.service")
+			return one(Fail, "node_exporter does not report the "+collector+" collector", "run eregion apply to apply host-node-exporter-v3, then restart node-exporter.service")
 		}
 		if !success {
 			return one(Fail, "node_exporter collector "+collector+" reported failure", "check node-exporter.service logs, the textfile directory and systemd D-Bus access")
@@ -128,7 +128,7 @@ func telemetryLocal(facts Facts) []Result {
 		return one(Fail, "node_exporter reported an ambiguous node_textfile_scrape_error sample", "keep one unlabelled, untimestamped node_textfile_scrape_error sample and retry; an ambiguous textfile error is not treated as healthy")
 	}
 	if telemetry.TextfileScrapeError == nil {
-		return one(Fail, "node_exporter did not report node_textfile_scrape_error", "apply host-node-exporter-v2 and restart node-exporter.service; collector success alone does not prove the textfile was readable")
+		return one(Fail, "node_exporter did not report node_textfile_scrape_error", "apply host-node-exporter-v3 and restart node-exporter.service; collector success alone does not prove the textfile was readable")
 	}
 	if *telemetry.TextfileScrapeError != 0 {
 		return one(Fail, "node_exporter reported node_textfile_scrape_error="+formatTelemetryValue(*telemetry.TextfileScrapeError), "inspect node_exporter logs and the textfile directory; a non-zero scrape error is a failed textfile read")

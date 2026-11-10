@@ -16,11 +16,11 @@ import (
 )
 
 func TestInitGeneratesTelemetryCredentialAndSendsOnlyItsHash(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	mainDir := prepareInitAccess(t, "main")
 	r := &serverInit{
 		a: &app{secrets: &secrets.Registry{}}, cmd: &cobra.Command{Use: "init"},
-		answers: serverInitAnswers{Context: "main", Node: "main", Hostname: "main.example.com"},
+		answers: serverInitAnswers{AccessKey: "main", Node: "main", Hostname: "main.example.com"},
 		pending: &host.PendingInit{Server: "main", Phases: map[string]string{}},
 	}
 	wg, err := transport.GenerateWireGuardKey()
@@ -67,7 +67,7 @@ func TestInitGeneratesTelemetryCredentialAndSendsOnlyItsHash(t *testing.T) {
 }
 
 func TestInitReusesAnExistingLocalTelemetryCredential(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "workspaces.json"))
 	mainDir := prepareInitAccess(t, "main")
 	existing, err := telemetry.NewCredential()
 	if err != nil {
@@ -78,7 +78,7 @@ func TestInitReusesAnExistingLocalTelemetryCredential(t *testing.T) {
 	}
 	r := &serverInit{
 		a: &app{secrets: &secrets.Registry{}}, cmd: &cobra.Command{Use: "init"},
-		answers: serverInitAnswers{Context: "main", Node: "main", Hostname: "main.example.com"},
+		answers: serverInitAnswers{AccessKey: "main", Node: "main", Hostname: "main.example.com"},
 		pending: &host.PendingInit{Server: "main", Phases: map[string]string{}},
 	}
 	backend := newMetricsAccessBackend(false)
@@ -152,7 +152,7 @@ func prepareInitAccess(t *testing.T, name string) string {
 	}
 	access := host.WorkspaceAccess{Name: name, SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}
 	if _, ok := store.AccessByName(name); !ok {
-		if _, err := store.PublishUnconfiguredAccess(access); err != nil {
+		if _, err := store.PublishWorkspace("ws_0123456789abcdef01234567", name, access, false); err != nil {
 			t.Fatal(err)
 		}
 	}

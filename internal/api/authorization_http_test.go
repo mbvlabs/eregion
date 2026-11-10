@@ -26,6 +26,11 @@ func (s *grantService) Submit(_ context.Context, sub operations.Submission) (con
 	return op, nil
 }
 
+func (s *grantService) SubmitWithReceipt(ctx context.Context, sub operations.Submission) (operations.SubmissionResult, error) {
+	op, err := s.Submit(ctx, sub)
+	return operations.SubmissionResult{Operation: op}, err
+}
+
 func (s *grantService) Get(context.Context, operations.Authority, contract.OperationID) (contract.Operation, error) {
 	return s.op, nil
 }
@@ -70,6 +75,27 @@ func TestHTTPGrantDenialPreventsSubmissionAndPreview(t *testing.T) {
 				t.Fatalf("cross-target dry_run=%t accepted: HTTP %d %+v", dryRun, w.Code, envelope)
 			}
 		}
+	}
+}
+
+func TestHTTPGrantAllowsExactTargetSubmission(t *testing.T) {
+	s := &grantService{}
+	body, _ := json.Marshal(map[string]any{
+		"kind": platform.KindDeploy, "target": "env/api/production",
+		"input": map[string]string{"release_id": "rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	})
+	w, envelope := request(t, grantHandler(t, s), http.MethodPost, "/v1/operations", string(body), token)
+	if w.Code != http.StatusAccepted || !envelope.OK || s.called != 1 {
+		t.Fatalf("authorized target submission failed: HTTP %d %+v, calls=%d", w.Code, envelope, s.called)
+	}
+	var result struct {
+		Data contract.Operation `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Data.Kind != platform.KindDeploy || result.Data.Target != "env/api/production" {
+		t.Fatalf("submission receipt lost target metadata: %+v", result.Data)
 	}
 }
 

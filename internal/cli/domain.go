@@ -99,7 +99,7 @@ func addDomainDNSFlags(cmd *cobra.Command, forAdd bool) {
 
 // applyDomainDNSFlags keeps manual DNS the default and requires every managed
 // DNS choice to be explicit. Public origins come only from --dns-origin, never
-// from the context's WireGuard management endpoint.
+// from the workspace's WireGuard management endpoint.
 func applyDomainDNSFlags(cmd *cobra.Command, input *platform.DomainInput, forAdd bool) error {
 	mode, _ := cmd.Flags().GetString("dns")
 	zone, _ := cmd.Flags().GetString("dns-zone")
@@ -159,7 +159,7 @@ func applyDomainDNSFlags(cmd *cobra.Command, input *platform.DomainInput, forAdd
 	return nil
 }
 
-// domainAddInput records the selected context's public addresses as the
+// domainAddInput records the selected workspace's public addresses as the
 // binding's expected DNS addresses. It follows --workspace / EREGION_WORKSPACE.
 func domainAddInput(cmd *cobra.Command, args []string, primary bool) platform.DomainInput {
 	checkPath, _ := cmd.Flags().GetString("check-path")
@@ -620,7 +620,7 @@ func primaryMark(primary bool) string {
 }
 
 // mainNodeAddresses is the address the domain's DNS record points at: the
-// selected context's WireGuard endpoint (the main node's public address), or
+// selected workspace's WireGuard endpoint (the main node's public address), or
 // the SSH target when the workspace access predates WireGuard. It follows --workspace /
 // EREGION_WORKSPACE through selectedWorkspaceAccess so a binding never records another
 // server's address.

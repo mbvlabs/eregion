@@ -19,6 +19,7 @@ const testWorkspaceID = "ws_0123456789abcdef01234567"
 
 type fakeWorkspaceDatabase struct {
 	identity controlplane.WorkspaceIdentity
+	readErr  error
 	reads    int
 	assigns  int
 }
@@ -31,7 +32,7 @@ func (f *fakeWorkspaceDatabase) Migrate(context.Context, string) (DatabaseState,
 }
 func (f *fakeWorkspaceDatabase) ReadWorkspace(context.Context, string) (controlplane.WorkspaceIdentity, error) {
 	f.reads++
-	return f.identity, nil
+	return f.identity, f.readErr
 }
 func (f *fakeWorkspaceDatabase) AssignWorkspace(_ context.Context, _, name string) (controlplane.WorkspaceIdentity, error) {
 	f.assigns++
@@ -43,6 +44,114 @@ func (f *fakeWorkspaceDatabase) AssignWorkspace(_ context.Context, _, name strin
 	}
 	f.identity = controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: name}
 	return f.identity, nil
+}
+
+func TestFreshWorkspacePreflightPlanAndRuntime(t *testing.T) {
+	cfg := fixture(t, RoleMain)
+	cfg.Workspace = "thelab"
+	db := &fakeWorkspaceDatabase{readErr: controlplane.ErrWorkspaceSchemaMissing}
+	runner := &Runner{Config: cfg, Database: db}
+	if err := runner.preflightWorkspace(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	step := &workspaceStep{cfg: cfg, database: db}
+	plan, err := step.Plan(context.Background(), engine.Runtime{})
+	if err != nil || plan.Complete || plan.Error != "" || !strings.Contains(plan.Detail, "follows migration") {
+		t.Fatalf("fresh plan = %+v, %v", plan, err)
+	}
+	if _, err := step.Check(context.Background(), engine.Runtime{}); !errors.Is(err, controlplane.ErrWorkspaceSchemaMissing) {
+		t.Fatalf("runtime check = %v", err)
+	}
+	if db.assigns != 0 {
+		t.Fatal("preflight or plan assigned workspace")
+	}
+	db.readErr = errors.New("permission denied")
+	if err := runner.preflightWorkspace(context.Background()); err == nil {
+		t.Fatal("permission error allowed")
+	}
+	db.readErr = nil
+	check, err := step.Check(context.Background(), engine.Runtime{})
+	if err != nil || check.Complete || db.assigns != 0 {
+		t.Fatalf("empty migrated table: %+v %v", check, err)
+	}
+	db.identity = controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: "other"}
+	if err := runner.preflightWorkspace(context.Background()); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("conflicting identity = %v", err)
+	}
+}
+
+func TestInitializedWorkspacePublicationIsAtomicAndExact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workspaces.json")
+	first, _ := LoadWorkspaceStore(path)
+	stale, _ := LoadWorkspaceStore(path)
+	other := WorkspaceAccess{Name: "other", CredentialDir: "servers/other", SSH: &WorkspaceSSH{Address: "other", KnownHosts: "other-key"}}
+	if _, err := first.PublishInitializedWorkspace("ws_fedcba9876543210fedcba98", "other", other); err != nil {
+		t.Fatal(err)
+	}
+	access := WorkspaceAccess{Name: "thelab", CredentialDir: "servers/thelab", SSH: &WorkspaceSSH{Address: "node", KnownHosts: "pin", WireGuard: &WorkspaceWireGuard{PrivateKeyFile: "private", NodePublicKey: "public"}}}
+	if _, err := stale.PublishInitializedWorkspace(testWorkspaceID, "thelab", access); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadWorkspaceStore(path)
+	if err != nil || len(loaded.Access) != 2 || loaded.Current != "thelab" {
+		t.Fatalf("reload = %+v %v", loaded, err)
+	}
+	savedOther, ok := loaded.AccessByName("other")
+	if !ok || savedOther.CredentialDir != other.CredentialDir || !SameWorkspaceRoute(savedOther.SSH, other.SSH) {
+		t.Fatal("unrelated concurrent record changed")
+	}
+	if _, err := first.PublishInitializedWorkspace(testWorkspaceID, "thelab", access); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+	changes := []WorkspaceAccess{access, access, access, access}
+	changes[0].CredentialDir = "servers/replaced"
+	changes[1].SSH = &WorkspaceSSH{Address: "different", KnownHosts: "pin"}
+	changes[2].Name = "different"
+	changes[3].AutoUpgradeNodes = true
+	for _, changed := range changes {
+		if _, err := stale.PublishInitializedWorkspace(testWorkspaceID, "thelab", changed); contract.Classify(err).Code != contract.Conflict {
+			t.Fatalf("changed access accepted: %v", err)
+		}
+		after, _ := os.ReadFile(path)
+		if string(after) != string(before) {
+			t.Fatal("conflict changed store bytes")
+		}
+	}
+	if _, err := stale.PublishInitializedWorkspace("ws_aaaaaaaaaaaaaaaaaaaaaaaa", "other", access); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("name collision: %v", err)
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("name conflict changed store bytes")
+	}
+	replacement := access
+	replacement.CredentialDir = "servers/replacement"
+	if _, err := first.PublishWorkspace(testWorkspaceID, "thelab", replacement, true); err != nil {
+		t.Fatal(err)
+	}
+	before, _ = os.ReadFile(path)
+	if _, err := stale.PublishInitializedWorkspace(testWorkspaceID, "thelab", access); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("concurrent replacement accepted: %v", err)
+	}
+	after, _ = os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("stale initialization changed replacement bytes")
+	}
+}
+
+func TestWorkspaceStoreRejectsMissingIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workspaces.json")
+	store := &WorkspaceStore{Path: path, Access: []WorkspaceAccess{{Name: "pending"}}}
+	if err := store.Save(); err == nil {
+		t.Fatal("saved missing identity")
+	}
+	if err := os.WriteFile(path, []byte(`{"schema":2,"workspaces":[{"name":"pending"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadWorkspaceStore(path); err == nil {
+		t.Fatal("loaded missing identity")
+	}
 }
 
 func TestWorkspaceStepAssignsOnceMirrorsAndPreservesNode(t *testing.T) {
@@ -196,17 +305,17 @@ func TestRecordedIntentCarriesTheWorkspaceRequestButNoIdentityRow(t *testing.T) 
 }
 
 func TestWorkspaceStorePersistsAndDisplaysWorkspaceMetadata(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "contexts.json")
+	path := filepath.Join(t.TempDir(), "workspaces.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PublishUnconfiguredAccess(WorkspaceAccess{
+	if _, err := store.PublishInitializedWorkspace(testWorkspaceID, "thelab", WorkspaceAccess{
 		Name: "prod", SSH: &WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: filepath.Join(t.TempDir(), "known_hosts")},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.PublishUnconfiguredAccess(WorkspaceAccess{
+	if _, err := store.PublishInitializedWorkspace("ws_fedcba9876543210fedcba98", "other", WorkspaceAccess{
 		Name: "other", SSH: &WorkspaceSSH{Address: "10.78.0.2:22", User: "admin", KnownHosts: filepath.Join(t.TempDir(), "known_hosts")},
 	}); err != nil {
 		t.Fatal(err)
@@ -215,7 +324,7 @@ func TestWorkspaceStorePersistsAndDisplaysWorkspaceMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	if store.Current != "other" {
-		t.Fatalf("SetWorkspace changed the current context to %q", store.Current)
+		t.Fatalf("SetWorkspace changed the current workspace to %q", store.Current)
 	}
 	loaded, err := LoadWorkspaceStore(path)
 	if err != nil {
@@ -229,33 +338,33 @@ func TestWorkspaceStorePersistsAndDisplaysWorkspaceMetadata(t *testing.T) {
 		t.Fatalf("workspace view = %+v", view)
 	}
 	// An invalid ID is refused on load rather than silently trusted.
-	raw := `{"schema":2,"contexts":[{"name":"prod","workspace":{"id":"ws_short","name":"thelab"},"ssh":{"address":"10.78.0.1:22","user":"admin","known_hosts":"/tmp/kh"}}]}`
+	raw := `{"schema":2,"workspaces":[{"name":"prod","workspace":{"id":"ws_short","name":"thelab"},"ssh":{"address":"10.78.0.1:22","user":"admin","known_hosts":"/tmp/kh"}}]}`
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadWorkspaceStore(path); contract.Classify(err).Code != contract.PreconditionFailed {
-		t.Fatalf("invalid context workspace = %v", err)
+		t.Fatalf("invalid workspace = %v", err)
 	}
 }
 
 func TestWorkspaceStoreMutationReloadsLatestStateUnderTheSharedLock(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "contexts.json")
+	path := filepath.Join(t.TempDir(), "workspaces.json")
 	first, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := first.PublishUnconfiguredAccess(WorkspaceAccess{
+	if _, err := first.PublishInitializedWorkspace(testWorkspaceID, "thelab", WorkspaceAccess{
 		Name: "alpha", SSH: &WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: filepath.Join(t.TempDir(), "alpha-known_hosts")},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	// A second process loads before alpha's workspace update, adds another
-	// context, and selects it.
+	// workspace, and selects it.
 	second, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := second.PublishUnconfiguredAccess(WorkspaceAccess{
+	if _, err := second.PublishInitializedWorkspace("ws_fedcba9876543210fedcba98", "other", WorkspaceAccess{
 		Name: "beta", SSH: &WorkspaceSSH{Address: "10.78.0.2:22", User: "admin", KnownHosts: filepath.Join(t.TempDir(), "beta-known_hosts")},
 	}); err != nil {
 		t.Fatal(err)
@@ -283,7 +392,7 @@ func TestWorkspaceStoreMutationReloadsLatestStateUnderTheSharedLock(t *testing.T
 }
 
 func TestWorkspaceStoreGroupsDuplicateAccessAndRefusesNameConflicts(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "contexts.json")
+	path := filepath.Join(t.TempDir(), "workspaces.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
@@ -334,7 +443,7 @@ func TestWorkspaceStoreGroupsDuplicateAccessAndRefusesNameConflicts(t *testing.T
 }
 
 func TestWorkspaceGroupWithDifferentNamesIsConflictButIDIsAddressable(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "contexts.json")
+	path := filepath.Join(t.TempDir(), "workspaces.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
@@ -373,7 +482,7 @@ func TestCredentialDirNamePropagatesNonENOENTErrors(t *testing.T) {
 	if err := os.WriteFile(parentFile, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store := &WorkspaceStore{Path: filepath.Join(parentFile, "contexts.json")}
+	store := &WorkspaceStore{Path: filepath.Join(parentFile, "workspaces.json")}
 	if _, err := store.CredentialDirName(testWorkspaceID); err == nil {
 		t.Fatal("a non-directory parent was accepted")
 	}
@@ -387,41 +496,10 @@ func TestCredentialDirNamePropagatesNonENOENTErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
-		store := &WorkspaceStore{Path: filepath.Join(locked, "contexts.json")}
+		store := &WorkspaceStore{Path: filepath.Join(locked, "workspaces.json")}
 		if _, err := store.CredentialDirName(testWorkspaceID); err == nil {
 			t.Fatal("a permission error was treated as a free directory")
 		}
-	}
-}
-
-func TestInitializationAccessSelectionIsPrivateAndRouteChecked(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "contexts.json")
-	store, err := LoadWorkspaceStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	route := &WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/tmp/kh"}
-	if _, err := store.PublishUnconfiguredAccess(WorkspaceAccess{Name: "historical-private", SSH: route}); err != nil {
-		t.Fatal(err)
-	}
-	store.Current = ""
-	if err := store.Save(); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := store.ResolveWorkspace("historical-private"); err == nil {
-		t.Fatal("an unconfigured private name resolved as a public workspace")
-	}
-	if err := store.SelectInitializationAccess("historical-private", route); err != nil {
-		t.Fatalf("initialization selection: %v", err)
-	}
-	if store.Current != "historical-private" {
-		t.Fatalf("initialization current = %q", store.Current)
-	}
-	if _, _, err := store.ResolveWorkspace(""); err == nil {
-		t.Fatal("unconfigured access became a normal workspace selector")
-	}
-	if err := store.SelectInitializationAccess("historical-private", &WorkspaceSSH{Address: "10.78.0.9:22", User: "admin", KnownHosts: "/tmp/kh"}); contract.Classify(err).Code != contract.Conflict {
-		t.Fatalf("changed initialization route = %v, want conflict", err)
 	}
 }
 
@@ -439,7 +517,7 @@ func workspaceCleanupTestRoot(t *testing.T) string {
 
 func TestWorkspaceRemovalCleanupRetainsSharedNestedAndSymlinkedDirs(t *testing.T) {
 	root := workspaceCleanupTestRoot(t)
-	path := filepath.Join(root, "contexts.json")
+	path := filepath.Join(root, "workspaces.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
@@ -499,7 +577,7 @@ func TestWorkspaceRemovalCleanupRetainsSharedNestedAndSymlinkedDirs(t *testing.T
 
 func TestWorkspaceRemovalCleanupRechecksUnrelatedConcurrentPublication(t *testing.T) {
 	root := workspaceCleanupTestRoot(t)
-	path := filepath.Join(root, "contexts.json")
+	path := filepath.Join(root, "workspaces.json")
 	first, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
@@ -537,7 +615,7 @@ func TestWorkspaceRemovalCleanupRechecksUnrelatedConcurrentPublication(t *testin
 
 func TestWorkspaceRemovalCleanupRetainsNestedAndSymlinkAncestors(t *testing.T) {
 	root := workspaceCleanupTestRoot(t)
-	path := filepath.Join(root, "contexts.json")
+	path := filepath.Join(root, "workspaces.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
@@ -606,7 +684,7 @@ func TestWorkspaceRemovalCleanupRetainsSymlinkedStoreRoot(t *testing.T) {
 	if err := os.Symlink(realRoot, alias); err != nil {
 		t.Fatal(err)
 	}
-	store, err := LoadWorkspaceStore(filepath.Join(alias, "contexts.json"))
+	store, err := LoadWorkspaceStore(filepath.Join(alias, "workspaces.json"))
 	if err != nil {
 		t.Fatal(err)
 	}

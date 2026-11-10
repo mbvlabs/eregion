@@ -45,6 +45,10 @@ func (s *fakeService) Submit(_ context.Context, sub operations.Submission) (cont
 	s.actor = sub.Actor
 	return fakeOperation(contract.Queued), nil
 }
+func (s *fakeService) SubmitWithReceipt(ctx context.Context, sub operations.Submission) (operations.SubmissionResult, error) {
+	op, err := s.Submit(ctx, sub)
+	return operations.SubmissionResult{Operation: op}, err
+}
 func (s *fakeService) Get(ctx context.Context, authority operations.Authority, _ contract.OperationID) (contract.Operation, error) {
 	if s.panicOnGet {
 		panic("untrusted internal panic")

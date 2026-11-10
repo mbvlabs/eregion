@@ -274,11 +274,11 @@ func tunnelSocketPath(identity string) (string, error) {
 
 // tunnelStateDir is the operator's private tunnel directory.
 func tunnelStateDir() (string, error) {
-	contexts, err := host.DefaultWorkspacePath()
+	workspacePath, err := host.DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(filepath.Dir(contexts), "tunnels")
+	dir := filepath.Join(filepath.Dir(workspacePath), "tunnels")
 	if err := privateDir(dir); err != nil {
 		return "", err
 	}
@@ -574,7 +574,7 @@ type tunnelStatusData struct {
 }
 
 func runTunnelStatus(cmd *cobra.Command, _ []string) (result, error) {
-	cfg, err := tunnelContextConfig(cmd)
+	cfg, err := tunnelWorkspaceConfig(cmd)
 	if err != nil {
 		return result{}, err
 	}
@@ -617,7 +617,7 @@ func tunnelStatusMessage(d tunnelStatusData) string {
 }
 
 func runTunnelStop(cmd *cobra.Command, _ []string) (result, error) {
-	cfg, err := tunnelContextConfig(cmd)
+	cfg, err := tunnelWorkspaceConfig(cmd)
 	if err != nil {
 		return result{}, err
 	}
@@ -641,7 +641,7 @@ func runTunnelStop(cmd *cobra.Command, _ []string) (result, error) {
 	return result{data: data, plain: fmt.Sprintf("stopped the tunnel daemon (pid %d)", pid)}, nil
 }
 
-func tunnelContextConfig(cmd *cobra.Command) (transport.WireGuardConfig, error) {
+func tunnelWorkspaceConfig(cmd *cobra.Command) (transport.WireGuardConfig, error) {
 	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
 		return transport.WireGuardConfig{}, err

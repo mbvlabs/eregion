@@ -30,9 +30,8 @@ type WorkspaceAccess struct {
 	// SSH reaches the node through a pinned SSH tunnel inside the embedded
 	// userspace WireGuard tunnel.
 	SSH *WorkspaceSSH `json:"ssh,omitempty"`
-	// Workspace is the verified portable installation identity. Nil means an
-	// explicitly unconfigured legacy access record; it is never guessed from
-	// the local access key or node name.
+	// Workspace is the verified portable installation identity. It may be nil
+	// for an in-memory pending route, but never in the persisted store.
 	Workspace *WorkspaceIdentity `json:"workspace,omitempty"`
 	// CredentialDir is a store-relative private directory. Empty means the
 	// historical servers/<Name> path.
@@ -83,12 +82,11 @@ type WorkspaceView struct {
 	UpdatedAt        time.Time `json:"updated_at,omitempty"`
 }
 
-// WorkspaceStore is the private on-disk local access store. The JSON field that
-// historically held contexts remains the sole storage format.
+// WorkspaceStore is the private on-disk local access store.
 type WorkspaceStore struct {
 	Schema  int               `json:"schema"`
 	Current string            `json:"current,omitempty"`
-	Access  []WorkspaceAccess `json:"contexts"`
+	Access  []WorkspaceAccess `json:"workspaces"`
 	Path    string            `json:"-"`
 	Now     func() time.Time  `json:"-"`
 }
@@ -105,7 +103,7 @@ func DefaultWorkspacePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "eregion", "contexts.json"), nil
+	return filepath.Join(dir, "eregion", "workspaces.json"), nil
 }
 
 func CheckObsoleteWorkspaceEnvironment() error {
@@ -172,6 +170,9 @@ func validateWorkspaceAccess(access WorkspaceAccess) error {
 	if !accessNamePattern.MatchString(access.Name) {
 		return contract.NewFault(contract.ValidationFailed, "invalid private access name", "Use lowercase letters, digits, hyphens, or underscores.")
 	}
+	if access.Workspace == nil {
+		return contract.NewFault(contract.PreconditionFailed, "the workspace access record has no verified identity", "Initialize or import a verified workspace.")
+	}
 	return validateWorkspaceIdentity(access.Workspace)
 }
 
@@ -210,6 +211,11 @@ func (s *WorkspaceStore) Save() error {
 }
 
 func (s *WorkspaceStore) saveLocked() error {
+	for _, access := range s.Access {
+		if err := validateWorkspaceAccess(access); err != nil {
+			return err
+		}
+	}
 	s.Schema = workspaceStoreSchema
 	raw, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
@@ -378,7 +384,7 @@ func (s *WorkspaceStore) ResolveWorkspace(selector string) (WorkspaceAccess, Wor
 			return WorkspaceAccess{}, WorkspaceGroup{}, contract.NewFault(contract.PreconditionFailed, "the saved current workspace access is missing", "Run eregion workspace use NAME_OR_ID to select a saved workspace.")
 		}
 		if access.Workspace == nil {
-			return WorkspaceAccess{}, WorkspaceGroup{}, contract.NewFault(contract.PreconditionFailed, "the current access record has no verified workspace identity", "Run eregion apply --assign-workspace NAME on the node, or log in with a current protected export.")
+			return WorkspaceAccess{}, WorkspaceGroup{}, contract.NewFault(contract.PreconditionFailed, "the current access record has no verified workspace identity", "Initialize a workspace or log in with a current protected export.")
 		}
 		group, err := s.groupByID(access.Workspace.ID)
 		if err != nil {
@@ -453,9 +459,7 @@ func (s *WorkspaceStore) accessByName(name string) (WorkspaceAccess, bool) {
 	return WorkspaceAccess{}, false
 }
 
-// CurrentAccess returns the saved current access record even when it has no
-// verified workspace identity. Only the bounded alpha.6 assignment flow may use
-// an unconfigured record.
+// CurrentAccess returns the saved current access record.
 func (s *WorkspaceStore) CurrentAccess() (WorkspaceAccess, error) {
 	if s.Current == "" {
 		return WorkspaceAccess{}, contract.NewFault(contract.NotFound, "no current workspace access is saved", "Run eregion login or server init first.")
@@ -493,7 +497,7 @@ func (s *WorkspaceStore) ShowWorkspace(selector string) (WorkspaceView, error) {
 			return WorkspaceView{}, err
 		}
 		if access.Workspace == nil {
-			return WorkspaceView{}, contract.NewFault(contract.PreconditionFailed, "the current access record has no verified workspace identity", "Run eregion apply --assign-workspace NAME on the node, or log in with a current protected export.")
+			return WorkspaceView{}, contract.NewFault(contract.PreconditionFailed, "the current access record has no verified workspace identity", "Initialize a workspace or log in with a current protected export.")
 		}
 		for index := range groups {
 			if groups[index].ID == access.Workspace.ID {
@@ -511,26 +515,6 @@ func (s *WorkspaceStore) ShowWorkspace(selector string) (WorkspaceView, error) {
 		}
 	}
 	return WorkspaceView{}, contract.NewFault(contract.NotFound, "workspace "+selector+" was not found", "List saved workspaces with eregion workspace list.")
-}
-
-// SelectInitializationAccess selects the exact private access record written by
-// the bounded server-init flow, including before it has a verified workspace
-// identity. It is not a public alias selector; the pending route must match.
-func (s *WorkspaceStore) SelectInitializationAccess(name string, expected *WorkspaceSSH) error {
-	return s.withMutation(func(fresh *WorkspaceStore) error {
-		access, ok := fresh.accessByName(name)
-		if !ok {
-			return contract.NewFault(contract.NotFound, "the initialization access record is missing", "Resume server init or discard the pending state.")
-		}
-		if expected != nil && !SameWorkspaceRoute(access.SSH, expected) {
-			return contract.NewFault(contract.Conflict,
-				"the initialization access route changed while resuming",
-				"Discard the unfinished init and start again; the pending route no longer matches the saved access.")
-		}
-		fresh.Current = access.Name
-		fresh.Access = append([]WorkspaceAccess(nil), fresh.Access...)
-		return fresh.saveLocked()
-	})
 }
 
 // UseWorkspace selects a workspace's resolved local access record.
@@ -871,11 +855,6 @@ func (s *WorkspaceStore) PublishWorkspace(id, name string, access WorkspaceAcces
 		}
 		for _, existing := range fresh.Access {
 			if existing.Name == access.Name {
-				if existing.Workspace == nil && replace {
-					// An unconfigured legacy access record may be replaced by a
-					// verified canonical record; its old credentials are untouched.
-					continue
-				}
 				return contract.NewFault(contract.Conflict,
 					"the private workspace access key is already in use",
 					"Remove the conflicting local access explicitly; names are never arbitrary aliases for another workspace.")
@@ -900,32 +879,47 @@ func (s *WorkspaceStore) PublishWorkspace(id, name string, access WorkspaceAcces
 	return view, err
 }
 
-// PublishUnconfiguredAccess writes a bounded legacy access record without
-// inferring any workspace identity from its private name.
-func (s *WorkspaceStore) PublishUnconfiguredAccess(access WorkspaceAccess) (WorkspaceView, error) {
+// PublishInitializedWorkspace publishes verified initialization access, or
+// reselects the exact same access on replay. It never replaces another record.
+func (s *WorkspaceStore) PublishInitializedWorkspace(id, name string, access WorkspaceAccess) (WorkspaceView, error) {
 	var view WorkspaceView
 	err := s.withMutation(func(fresh *WorkspaceStore) error {
 		access.Name = strings.TrimSpace(access.Name)
+		if access.Name == "" {
+			access.Name = name
+		}
+		identity := &WorkspaceIdentity{ID: id, Name: name}
+		if access.Workspace != nil && !sameWorkspaceIdentity(access.Workspace, identity) {
+			return contract.NewFault(contract.Conflict, "the initialization workspace identity changed", "Retry initialization with the verified identity.")
+		}
+		access.Workspace = identity
 		if err := validateWorkspaceAccess(access); err != nil {
 			return err
 		}
-		if access.Workspace != nil {
-			return contract.NewFault(contract.Internal, "an unconfigured access publication carried a workspace identity", "Report the command and binary version.")
-		}
+		found := false
 		for _, existing := range fresh.Access {
-			if existing.Name == access.Name {
+			if existing.Name == access.Name || existing.Workspace.ID == id || existing.Workspace.Name == name {
+				old, incoming := existing, access
+				old.CreatedAt, old.UpdatedAt = time.Time{}, time.Time{}
+				incoming.CreatedAt, incoming.UpdatedAt = time.Time{}, time.Time{}
+				if !found && reflect.DeepEqual(old, incoming) {
+					found = true
+					continue
+				}
 				return contract.NewFault(contract.Conflict,
-					"a local access record with this private key already exists",
-					"Refresh the protected export to login with a verified workspace identity.")
+					"workspace initialization conflicts with saved access",
+					"Reload the workspace; initialization never replaces existing access.")
 			}
 		}
-		fresh.Access = append(fresh.Access, access)
+		if !found {
+			fresh.Access = append(fresh.Access, access)
+		}
 		sort.Slice(fresh.Access, func(i, j int) bool { return fresh.Access[i].Name < fresh.Access[j].Name })
 		fresh.Current = access.Name
 		if err := fresh.saveLocked(); err != nil {
 			return err
 		}
-		view = fresh.viewOfAccess(access)
+		view = fresh.viewOfGroup(id)
 		return nil
 	})
 	return view, err

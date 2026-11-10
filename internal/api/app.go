@@ -136,10 +136,10 @@ func (s AppService) SubmitNormalizedWithFactor(ctx context.Context, actor contra
 	if err != nil {
 		return nil, err
 	}
-	if receipt, ok := result.(operations.SubmissionResult); ok {
-		return receipt.Operation, nil
+	if dryRun {
+		return result, nil
 	}
-	return result, nil
+	return result.(operations.SubmissionResult).Operation, nil
 }
 
 // PreviewOrSubmitWithReceipt is the node transport entry point. It returns a
@@ -155,8 +155,7 @@ func (s AppService) PreviewOrSubmitWithReceipt(ctx context.Context, actor contra
 }
 
 // SubmitNormalizedWithReceipt previews or atomically submits an already
-// normalized action and returns the admission receipt when the service
-// supports it.
+// normalized action and returns the authoritative admission receipt.
 func (s AppService) SubmitNormalizedWithReceipt(ctx context.Context, actor contract.Actor, normalized platform.Normalized, idempotencyKey string, dryRun bool, humanFactor string, webhookSecret []byte) (any, error) {
 	if dryRun {
 		if s.Operations != nil {
@@ -181,23 +180,7 @@ func (s AppService) SubmitNormalizedWithReceipt(ctx context.Context, actor contr
 		IdempotencyKey: idempotencyKey, Input: normalized.Canonical, HumanFactor: humanFactor,
 		WebhookSecret: webhookSecret,
 	}
-	if submitter, ok := s.Operations.(operations.AtomicSubmitter); ok {
-		return submitter.SubmitWithReceipt(ctx, submission)
-	}
-	if len(webhookSecret) > 0 || normalizedRequestsWebhook(normalized) {
-		return nil, contract.NewFault(contract.Unavailable,
-			"the operation service cannot report webhook admission atomically",
-			"Start a node control plane with transactional webhook admission; do not use a preview-only or legacy service.")
-	}
-	return s.Operations.Submit(ctx, submission)
-}
-
-func normalizedRequestsWebhook(normalized platform.Normalized) bool {
-	input, ok := normalized.Input.(*platform.EnvironmentUpdateInput)
-	if !ok {
-		return false
-	}
-	return input.RotateWebhookSecret || (input.AutoDeploy != nil && *input.AutoDeploy)
+	return s.Operations.SubmitWithReceipt(ctx, submission)
 }
 
 // SubmitDiagnostic previews or submits the diagnostic test action.

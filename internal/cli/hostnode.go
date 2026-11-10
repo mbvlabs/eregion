@@ -29,6 +29,11 @@ func isHostMethod(method string) bool {
 // need the application service, so plan and doctor still work while the
 // control database has pending migrations or the API is down.
 func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Writer, registry *secrets.Registry) (any, error) {
+	if request.Method == methodHostApply {
+		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
+			return nil, err
+		}
+	}
 	if registry == nil {
 		registry = &secrets.Registry{}
 	}
@@ -54,17 +59,6 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 	case methodHostPlan, methodHostApply:
 		if cfgErr != nil {
 			return nil, cfgErr
-		}
-		if request.Method == methodHostApply {
-			var params rpcHostApplyParams
-			if err := decodeRPCParams(request.Params, &params); err != nil {
-				return nil, err
-			}
-			if params.Workspace != "" {
-				// The explicit flag initializes a legacy installation; the
-				// recorded intent has no identity to guess from.
-				cfg.Workspace = params.Workspace
-			}
 		}
 		runner, err := host.NewRunner(cfg, registry)
 		if err != nil {

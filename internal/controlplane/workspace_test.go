@@ -1,9 +1,13 @@
 package controlplane
 
 import (
+	"context"
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestWorkspaceNameAndIDValidation(t *testing.T) {
@@ -63,5 +67,50 @@ func TestWorkspaceMigrationIsForwardOnlyAndDoesNotSeedAnIdentity(t *testing.T) {
 	}
 	if m, ok := migrationByVersion(28); !ok || m.name != "028_workspace_identity.sql" {
 		t.Fatal("migration 028 is not registered")
+	}
+}
+
+type workspaceTestRow struct {
+	exists bool
+	err    error
+}
+
+func (r workspaceTestRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	*(dest[0].(*bool)) = r.exists
+	return nil
+}
+
+type workspaceTestQuerier struct {
+	exists           bool
+	tableErr, rowErr error
+	calls            int
+}
+
+func (q *workspaceTestQuerier) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+	q.calls++
+	if q.calls == 1 {
+		return workspaceTestRow{exists: q.exists, err: q.tableErr}
+	}
+	return workspaceTestRow{err: q.rowErr}
+}
+
+func TestReadWorkspaceSchemaDistinguishesMissingAndEmpty(t *testing.T) {
+	missing := &workspaceTestQuerier{}
+	identity, err := readWorkspaceSchema(context.Background(), missing)
+	if !errors.Is(err, ErrWorkspaceSchemaMissing) || identity.Configured || missing.calls != 1 {
+		t.Fatalf("missing = %+v %v calls=%d", identity, err, missing.calls)
+	}
+	empty := &workspaceTestQuerier{exists: true, rowErr: pgx.ErrNoRows}
+	identity, err = readWorkspaceSchema(context.Background(), empty)
+	if err != nil || identity.Configured || identity.ID != "" || identity.Name != "" || empty.calls != 2 {
+		t.Fatalf("empty = %+v %v calls=%d", identity, err, empty.calls)
+	}
+	denied := errors.New("permission denied")
+	_, err = readWorkspaceSchema(context.Background(), &workspaceTestQuerier{tableErr: denied})
+	if !errors.Is(err, denied) {
+		t.Fatalf("permission = %v", err)
 	}
 }

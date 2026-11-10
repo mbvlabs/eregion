@@ -72,15 +72,15 @@ func (a *app) domainCloudflareConfigure(cmd *cobra.Command, _ []string) (result,
 
 // cloudflarePrompts is the terminal interaction this flow needs. It is a
 // parameter rather than a package variable so the regression test can prove a
-// missing context fails before any prompt without touching global state.
+// missing workspace fails before any prompt without touching global state.
 type cloudflarePrompts struct {
 	input   func(title, description, def string) (string, error)
 	secret  func(title string) (string, error)
 	confirm func(title, description string, def bool) (bool, error)
 }
 
-// configureCloudflareCredential resolves the selected context and client before
-// any prompt: a missing context or unusable route must fail before the operator
+// configureCloudflareCredential resolves the selected workspace and client before
+// any prompt: a missing workspace or unusable route must fail before the operator
 // types a zone or a token. The read-only provider validation still comes only
 // after the token is read.
 func (a *app) configureCloudflareCredential(cmd *cobra.Command, prompts cloudflarePrompts) (result, error) {

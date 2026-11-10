@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/bundle"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/transport"
 	"golang.org/x/crypto/ssh"
@@ -147,13 +148,14 @@ func executeLogin(t *testing.T, fixture loginFixture, key ssh.PublicKey, readyEr
 	return a.root.Execute()
 }
 
-func TestLoginKeepsHostPinsScopedToEachContext(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "contexts.json")
+func TestLoginKeepsHostPinsScopedToEachWorkspace(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "workspaces.json")
 	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
-	first := newLoginFixtureAt(t, "alpha", "10.78.0.1")
-	second := newLoginFixtureAt(t, "beta", "10.78.0.1")
-	for _, fixture := range []loginFixture{first, second} {
-		if err := executeLogin(t, fixture, fixture.hostKey, nil); err != nil {
+	first := newWorkspaceLoginFixture(t, "alpha", "alpha", "ws_000000000000000000000001")
+	second := newWorkspaceLoginFixture(t, "beta", "beta", "ws_000000000000000000000002")
+	for _, fixture := range []workspaceLoginFixture{first, second} {
+		identity := controlplane.WorkspaceIdentity{Configured: true, ID: fixture.id, Name: fixture.workspace}
+		if err := executeWorkspaceLogin(t, fixture, identity, nil, nil); err != nil {
 			t.Fatalf("login %s: %v", fixture.name, err)
 		}
 	}
@@ -178,12 +180,12 @@ func TestLoginKeepsHostPinsScopedToEachContext(t *testing.T) {
 	firstPath := firstSaved.SSH.KnownHosts
 	secondPath := secondSaved.SSH.KnownHosts
 	if firstSaved.SSH.KnownHosts != firstPath || secondSaved.SSH.KnownHosts != secondPath {
-		t.Fatalf("saved known_hosts paths are not context-scoped: %q, %q", firstSaved.SSH.KnownHosts, secondSaved.SSH.KnownHosts)
+		t.Fatalf("saved known_hosts paths are not workspace-scoped: %q, %q", firstSaved.SSH.KnownHosts, secondSaved.SSH.KnownHosts)
 	}
 	if firstPath == secondPath {
-		t.Fatal("both contexts share one known_hosts file")
+		t.Fatal("both workspaces share one known_hosts file")
 	}
-	address := net.JoinHostPort(first.wireGuardAddress, "22")
+	address := net.JoinHostPort("10.79.0.2", "22")
 	if !pinnedKeyMatches(firstPath, address, first.hostKey) || pinnedKeyMatches(firstPath, address, second.hostKey) {
 		t.Fatal("alpha's known_hosts does not pin only alpha's host key")
 	}

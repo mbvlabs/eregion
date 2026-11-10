@@ -26,8 +26,8 @@ func decodeCommands(t *testing.T, raw string) []Command {
 }
 
 func TestRootOverviewIsOfflineAndKeepsCatalogData(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "missing", "contexts.json"))
-	t.Setenv("EREGION_WORKSPACE", "missing-context")
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "missing", "workspaces.json"))
+	t.Setenv("EREGION_WORKSPACE", "missing-workspace")
 
 	code, stdout, stderr := invoke(t)
 	if code != 0 || stderr != "" {
@@ -251,9 +251,9 @@ func TestUnknownCommandSuggestions(t *testing.T) {
 	}
 }
 
-func TestDiscoveryDoesNotNeedAContextOrTerminal(t *testing.T) {
-	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "missing", "contexts.json"))
-	t.Setenv("EREGION_WORKSPACE", "missing-context")
+func TestDiscoveryDoesNotNeedAWorkspaceOrTerminal(t *testing.T) {
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "missing", "workspaces.json"))
+	t.Setenv("EREGION_WORKSPACE", "missing-workspace")
 	for _, args := range [][]string{
 		{"commands", "--search", "deploy", "--json"},
 		{"commands", "--check-meta", "--json"},
@@ -266,7 +266,7 @@ func TestDiscoveryDoesNotNeedAContextOrTerminal(t *testing.T) {
 			t.Fatalf("%v: discovery failed", args)
 		}
 	}
-	code, stdout, _ := invoke(t, "--context", "missing-context", "commands", "--search", "deploy", "--json")
+	code, stdout, _ := invoke(t, "--context", "missing-workspace", "commands", "--search", "deploy", "--json")
 	if code != 2 {
 		t.Fatalf("obsolete --context was not refused: code=%d stdout=%q", code, stdout)
 	}

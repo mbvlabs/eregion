@@ -82,3 +82,26 @@ func TestAppServiceHTTPSubmissionReceivesOperationNotTransientSecret(t *testing.
 		t.Fatal("the HTTP operation boundary carried a transient secret")
 	}
 }
+
+func TestAppServiceReturnsAuthoritativeReplayForOrdinarySubmission(t *testing.T) {
+	operation := contract.Operation{ID: id, Kind: platform.KindEnvironmentUpdate, Target: "env/api/production"}
+	service := &atomicReceiptService{result: operations.SubmissionResult{Operation: operation, Replay: true}}
+	app := AppService{Operations: service}
+	actor := contract.Actor{Kind: "operator", Subject: "integration"}
+	result, err := app.PreviewOrSubmitWithReceipt(context.Background(), actor,
+		platform.KindEnvironmentUpdate, "env/api/production", json.RawMessage(`{"auto_deploy":false}`),
+		"stable-key", false, "factor", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, ok := result.(operations.SubmissionResult)
+	if !ok || !receipt.Replay || receipt.Operation.ID != operation.ID {
+		t.Fatalf("result = %#v", result)
+	}
+	if service.submission.Actor != actor || service.submission.IdempotencyKey != "stable-key" || service.submission.HumanFactor != "factor" {
+		t.Fatalf("submission metadata was not forwarded: %+v", service.submission)
+	}
+	if service.fakeService.called != 0 {
+		t.Fatal("ordinary submission used the operation-only path")
+	}
+}

@@ -38,6 +38,20 @@ the signing family, independently of the installer channel. Without an explicit
 the rc installer accepts only an rc release; an explicit version is the
 snapshot pin path.
 
+### Beta.1 fresh-install boundary
+
+Beta.1 is a fresh-install test prerelease, not an alpha-to-beta upgrade promise.
+Its operator store is `~/.config/eregion/workspaces.json`; it does not import the
+old filename or private schema, identityless handoffs, or old unfinished setup.
+Keep existing alpha access files, host and database intact. A reused credential
+directory is refused for a new init rather than silently adopting its keys.
+Use a separately authorized fresh server and control database for qualification.
+
+The immutable installer path is
+`https://eregion.mbvlabs.com/releases/1.0.0-beta.1/install.sh` once publication
+has succeeded. Publication and signature verification do not establish a
+fresh-install pass; MANUAL-TESTING records the remaining acceptance evidence.
+
 Immutable artifacts live under `/releases/<version>/<os>/<arch>/eregion`, with
 `.sha256` and `.sigstore.json` sidecars. Supported platforms are linux/amd64,
 linux/arm64, darwin/amd64 and darwin/arm64; there are no Windows builds.

@@ -670,7 +670,7 @@ func domainDNSDesired(zone DNSZone, req DomainDNSRequest) (string, []DNSRecord, 
 		})
 	}
 	if len(desired) == 0 {
-		return "", nil, "", contract.NewFault(contract.ValidationFailed, "Cloudflare DNS needs at least one usable address", "Run domain add from a context whose main node has a public address.")
+		return "", nil, "", contract.NewFault(contract.ValidationFailed, "Cloudflare DNS needs at least one usable address", "Run domain add from a workspace whose main node has a public address.")
 	}
 	sort.Slice(desired, func(i, j int) bool {
 		if desired[i].Type == desired[j].Type {

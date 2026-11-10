@@ -41,6 +41,10 @@ and was not an alpha.1 gate. No evidence is reconstructed or backfilled.
 
 ## Alpha.7 incremental acceptance
 
+This matrix describes the alpha candidate and its recorded transition behavior,
+not beta command syntax. Beta removes the public assignment transition and the
+old local formats; use the beta fresh-install boundary below for new testing.
+
 These are acceptance criteria, **not a pass record** or a parallel work list.
 Linear tracks execution and blockers. Reuse alpha.6's recorded evidence for
 unchanged behavior; do not repeat a full baseline by default. Record the exact
@@ -74,6 +78,13 @@ acceptance or a readiness fix.
 
 ### Beta.1, RC and final gates
 
+**Publication versus qualification (operator authorization, 2026-11-10):** the
+operator requests a reviewed, signed `v1.0.0-beta.1` prerelease for a fresh test
+tomorrow. Publishing that test artifact is authorized; it does not mark the
+acceptance gates below as passed. Record pending fresh-host, provider adverse
+cases and readiness findings in the release handoff. No reset or repurposing of
+the existing alpha node/database, or use of an ambient database, is implied.
+
 - **Beta.1:** alpha.7 delta acceptance plus authorized real multi-workspace/server
   SSH-pin qualification in a single store (shared WireGuard management IP,
   alternating workspaces, wrong-key refusal without damaged saved access). Complete
@@ -98,6 +109,71 @@ acceptance or a readiness fix.
 
 Historical alpha.6 evidence below remains valid for its recorded builds and
 unchanged behavior. It does not establish these new candidate checks as passed.
+
+## 2026-11-10 — beta.1 source verification for fresh testing
+
+The operator authorized publishing `v1.0.0-beta.1` for a fresh test tomorrow,
+separately from qualification. Existing alpha hosts, databases, operator access
+files, services and the live Grafana dashboard were not changed by this work.
+
+The beta cleanup uses `workspaces.json` and current workspace-named private
+state, with no old-filename/schema fallback. Identityless handoff import,
+old unfinished setup, persisted unconfigured access, public workspace-assignment
+upgrade input and optional atomic-submission capability fallbacks were removed.
+Fresh setup verifies identity/readiness over its pinned pending route before
+publishing completed access. Exact publication replay is fenced against changed
+identity/routes. New setup refuses occupied credential/pending paths; unsupported
+pending state cannot authorize deletion of old credentials. Missing workspace
+schema is an error except for the precise migration prerequisite during fresh
+planning/preflight; migration still precedes assignment and runtime checking.
+
+The exporter produces verified workspace/node identity through
+`eregion_node_info`; it does not alter OS hostname metadata. Step v3 covers
+producer application, no-op, drift and error preservation. A documented Grafana
+display join passed an offline promtool query test, not a live dashboard test.
+The ready RPC no longer repeats its successful startup readiness check; this
+bounded redundancy fix does not establish LABS-346's historical HTTP cause.
+
+Independent source review cleared setup trust/ownership, store publication and
+schema discrimination, login, atomic receipts and telemetry production. A final
+semantic audit classified remaining context strings as Go cancellation/build
+contexts, unrelated technical uses, historical evidence, or intentional negative
+tests and fail-closed obsolete-input refusals—not an operator context feature.
+Two stale assignment remnants found by that audit were removed rather than
+retained as an unused alpha path.
+
+Independent frozen-tree verification passed:
+
+- Full inspected offline suite: **2,027 passed / 199 skipped / 0 failed** test
+  events, including subtests; top-level **1,213 passed / 171 skipped**. Skipped
+  events were database integration and guarded node-task helpers. Docker-backed
+  fixture cases were explicitly excluded before execution.
+- Focused race suite across eight affected packages: **1,508 passed / 0 skipped /
+  0 failed**, **833 top-level** cases and zero race reports.
+- Both real pinned-Caddy tests passed with **zero skips**. Build, vet, example
+  checks, formatting and Darwin amd64/arm64 cross-builds passed. Cross-build is
+  not Mac host acceptance.
+- Offline metadata checked **115** commands, with **100** visible commands.
+  Synthetic old filename data remained unchanged and was not adopted; old JSON
+  fields, missing stored identity and removed assignment input refused safely.
+
+The independent **630-file** before/after production manifest matched:
+`55405a65e23a632183336f97c11aa88d89cbb2e1863d6a54edd9401308fc2cca`.
+After that batch, the unused assignment helper and stale status hint were
+removed and presentation regression coverage extended. Focused race checks,
+build and vet passed; the final 630-file manifest is
+`d9236dd3e136275f1d61a7b7e637e068095e83c0861fe8fd7c23dc8ef55b6172`.
+The original baseline manifests were retained without overwriting them.
+
+Evidence: `.local/qualification/beta-independent/`, `beta-final-cleanup/`,
+`beta-final-naming/` and the scoped workspace/bootstrap/submission/telemetry
+evidence directories. User-owned untracked qualification code and `specs/`
+were excluded, not inspected or edited. No local Docker or ambient/test database
+was used. The six workspace and eight platform beta-related DB cases, the
+adjacent target-lock case and broader integration suite require disposable CI
+PostgreSQL evidence. Signed publication is a separate release gate. Fresh-host,
+provider adverse-case, multi-workspace SSH-pin and actual Mac host qualification
+remain pending; LABS-346 is not closed and no acceptance is invented.
 
 ## 2026-11-10 — alpha.7 local verification and signed-edge live upgrade
 
@@ -757,6 +833,63 @@ test skipped. The replacement candidate still requires actual macOS CI success
 before deployment. Evidence: `.local/qualification/macos-cleanup-portability/`;
 updated 627-file manifest
 `b2b4b8628c4d5104bde2cc24f3ada60514e0de717938ceefa27b9ceb2843edbc`.
+
+### Workspace-only targeting and public HTTPS telemetry — live qualification (2026-11-10)
+
+Exact signed candidate `edge-e6abe9577a04` (commit
+`e6abe9577a04d09abd94dc877c84c7e22aaf71a7`) passed CI `42878869663`,
+including macOS, and publication `42878869544` on attempt one. The immutable
+manifest and all four binaries passed pinned-workflow signature and checksum
+verification. Installed Linux/amd64 SHA-256:
+`ebc755b8fbd3d342c0cadba82925d704e42670700bd54ff0a83d432ee523d2bb`.
+
+The initial local upgrade failed before installation because b047's downloaded
+binary version probe inherited obsolete context environment settings. Offline
+differential checks reproduced the refusal with dummy paths and passed without
+those settings. One corrected normal local-only upgrade with selectors unset
+succeeded; no manual binary replacement or release-verification bypass occurred.
+The prior b047 binary is retained as `.prev`.
+
+On the authorized `thelab` node, apply
+`op_613553c7e40df2806e882b877897db0b` completed with **5 applied / 17 skipped**,
+including managed ingress and telemetry convergence. CLI and node now report
+`edge-e6abe9577a04`; workspace identity remains
+`thelab` / `ws_779004d145462c0fd7f48868`, schema **28/28**, River **7/7**.
+Doctor passed **23/0/0**, all six services were healthy, queues **0/0/0**.
+Default and explicit workspace selection matched; a wrong workspace refused
+without fallback. Removed context flags/commands and obsolete environment
+settings refused explicitly. Workspace-selected SSH dispatch passed.
+
+Verified public URLs, with normal TLS verification and basic-auth user `metrics`:
+
+- `https://eregrion-alpha5.mbvlabs.com/metrics/node`
+- `https://eregrion-alpha5.mbvlabs.com/metrics/targets.json`
+
+Both paths denied anonymous and incorrect authentication with **401**; unrelated
+and suffix paths returned **404**. Exporter and gateway listened only on
+`127.0.0.1:9100/9101`; bounded public-origin probes could not reach those ports.
+Normal `metrics config --format prometheus --out` generated an owner-only file
+for a temporary native Prometheus 3.16.0 client. Promtool validation passed;
+the collector discovered the public HTTPS target and reported **health=up**,
+empty scrape error and **up=1**. The wrapper's final jq assertion initially
+misinterpreted the captured JSON shape; the original failure and corrected
+safe proof are both retained. No protected config contents were read by the
+agent. The owned collector exited and its config and TSDB were removed.
+
+The existing telemetry credential was not rotated: mode, inode, size and mtime
+were unchanged across apply, collection and repeat apply; successful collection
+used that existing credential. Public readiness remained **200** and production
+v1/staging v3 retained their environment and secret-match markers. Acceptance
+repeat apply `op_31cafe6e38745802db3a554f2fd3b6f6` completed with
+**0 applied / 22 skipped**. No reset, foreign-resource cleanup, DNS/provider
+change or permanent collector/dashboard deployment occurred.
+
+Evidence: `.local/qualification/edge-e6abe9577a04-artifacts/` and
+`.local/qualification/edge-e6abe9577a04-live/`, including the initial failure,
+offline differential proof, raw safe collector results and cleanup records.
+The live 161-entry evidence manifest passed checksum verification.
+This qualifies the changed workspace/telemetry flows, not the entire alpha:
+LABS-346 remains unresolved, and no alpha tag or beta promotion is implied.
 
 ### Evidence retention correction (2026-11-10)
 
