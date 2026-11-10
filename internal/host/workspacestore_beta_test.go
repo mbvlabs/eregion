@@ -15,9 +15,14 @@ func TestWorkspaceStoreDefaultPathAndFormat(t *testing.T) {
 	t.Setenv("EREGION_CONTEXT", "")
 	t.Setenv("EREGION_CONTEXT_FILE", "")
 	root := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", root)
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	configRoot, err := os.UserConfigDir()
+	if err != nil {
+		t.Fatal(err)
+	}
 	path, err := DefaultWorkspacePath()
-	if err != nil || path != filepath.Join(root, "eregion", "workspaces.json") {
+	if err != nil || path != filepath.Join(configRoot, "eregion", "workspaces.json") {
 		t.Fatalf("default path = %q, %v", path, err)
 	}
 	store, err := LoadWorkspaceStore(path)

@@ -46,13 +46,18 @@ func TestInitPublishesOnlyVerifiedWorkspaceAndResumesIdempotently(t *testing.T) 
 
 func TestFreshInitDoesNotAdoptOrDiscardOldCredentials(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
 	t.Setenv("XDG_CONFIG_HOME", root)
 	t.Setenv("EREGION_WORKSPACE_FILE", "")
 	t.Setenv("EREGION_CONTEXT", "")
 	t.Setenv("EREGION_CONTEXT_FILE", "")
 	t.Setenv("EREGION_WORKSPACE", "")
 	t.Setenv("EREGION_DATABASE_URL", "postgres://user:password@db.example.com/db?sslmode=verify-full")
-	base := filepath.Join(root, "eregion")
+	storePath, err := host.DefaultWorkspacePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Dir(storePath)
 	credential := filepath.Join(base, "servers", "old", "ssh_ed25519")
 	pending := filepath.Join(base, "pending", "old", host.PendingInitFile)
 	for _, path := range []string{credential, pending} {

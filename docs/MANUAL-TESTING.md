@@ -176,6 +176,17 @@ cleared the two-file correction. The updated final 630-file manifest is
 Evidence: `.local/qualification/beta-store-json/`. Release CI must cover the
 corrected commit, not just the preceding candidate.
 
+CI for `a839215` passed Linux checks but found one stale pre-migration assertion
+and two Linux-only default-config fixture assumptions on macOS. The tests now
+require the missing-schema sentinel and prove the read creates no table; default
+path fixtures isolate both HOME and XDG and use the native OS config directory.
+Production behavior and refusal/preservation checks were not relaxed. Ten normal
+and ten race repetitions passed locally; the DB case remained explicitly skipped
+without a DSN. Independent review cleared the corrections. The updated 630-file
+manifest is `40e159984e49d7a8200b9e47cb934c6a24c5bfc12c69176be7fb2b2274526635`.
+Evidence: `.local/qualification/beta-ci-fixtures/` and the preserved failed CI
+artifact record. Actual macOS and PostgreSQL 17 CI must pass before tagging.
+
 Evidence: `.local/qualification/beta-independent/`, `beta-final-cleanup/`,
 `beta-final-naming/` and the scoped workspace/bootstrap/submission/telemetry
 evidence directories. User-owned untracked qualification code and `specs/`

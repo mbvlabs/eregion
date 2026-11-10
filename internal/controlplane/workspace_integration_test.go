@@ -201,11 +201,18 @@ func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIden
 	// Reading before the forward migration must neither create the table nor
 	// add an identity row.
 	before, err := ReadWorkspace(ctx, pool)
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrWorkspaceSchemaMissing) {
+		t.Fatalf("027 read = %+v, %v; want missing schema", before, err)
 	}
 	if before.Configured {
 		t.Fatalf("027 read reported a workspace: %+v", before)
+	}
+	var tableExists bool
+	if err := pool.QueryRow(ctx, `SELECT to_regclass('eregion_workspace') IS NOT NULL`).Scan(&tableExists); err != nil {
+		t.Fatal(err)
+	}
+	if tableExists {
+		t.Fatal("pre-migration identity read created the workspace table")
 	}
 
 	if _, err := Migrate(ctx, pool); err != nil {
