@@ -745,6 +745,19 @@ Signed CI/publication and exact-candidate host/external-collector qualification
 are separate gates. Prepared verified Prometheus tooling is a test client, not
 a managed telemetry-node deployment. LABS-346's historical timeout remains open.
 
+**CI portability correction.** The first combined candidate `96c10c6` passed
+Linux check/integration and publication, but macOS CI failed a unique credential
+directory cleanup assertion. The conservative production policy retains paths
+with symlink ancestors; the fixture had not canonicalized macOS's temporary-root
+alias. Only the tests were changed: use physical roots for the happy paths and
+explicitly verify that an aliased store root still retains its pin bytes.
+Independent review cleared the correction; four cases passed ten normal and ten
+race repetitions locally. No production deletion policy was relaxed or platform
+test skipped. The replacement candidate still requires actual macOS CI success
+before deployment. Evidence: `.local/qualification/macos-cleanup-portability/`;
+updated 627-file manifest
+`b2b4b8628c4d5104bde2cc24f3ada60514e0de717938ceefa27b9ceb2843edbc`.
+
 ### Evidence retention correction (2026-11-10)
 
 Earlier qualification phases incorrectly retained detailed evidence under

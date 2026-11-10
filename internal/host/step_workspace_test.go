@@ -425,8 +425,20 @@ func TestInitializationAccessSelectionIsPrivateAndRouteChecked(t *testing.T) {
 	}
 }
 
+func workspaceCleanupTestRoot(t *testing.T) string {
+	t.Helper()
+	// macOS temporary paths can contain the system /var symlink. Successful
+	// cleanup fixtures need a physical root; explicit symlink cases below
+	// separately verify that the conservative production policy retains them.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 func TestWorkspaceRemovalCleanupRetainsSharedNestedAndSymlinkedDirs(t *testing.T) {
-	root := t.TempDir()
+	root := workspaceCleanupTestRoot(t)
 	path := filepath.Join(root, "contexts.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
@@ -486,7 +498,7 @@ func TestWorkspaceRemovalCleanupRetainsSharedNestedAndSymlinkedDirs(t *testing.T
 }
 
 func TestWorkspaceRemovalCleanupRechecksUnrelatedConcurrentPublication(t *testing.T) {
-	root := t.TempDir()
+	root := workspaceCleanupTestRoot(t)
 	path := filepath.Join(root, "contexts.json")
 	first, err := LoadWorkspaceStore(path)
 	if err != nil {
@@ -524,7 +536,7 @@ func TestWorkspaceRemovalCleanupRechecksUnrelatedConcurrentPublication(t *testin
 }
 
 func TestWorkspaceRemovalCleanupRetainsNestedAndSymlinkAncestors(t *testing.T) {
-	root := t.TempDir()
+	root := workspaceCleanupTestRoot(t)
 	path := filepath.Join(root, "contexts.json")
 	store, err := LoadWorkspaceStore(path)
 	if err != nil {
@@ -576,6 +588,38 @@ func TestWorkspaceRemovalCleanupRetainsNestedAndSymlinkAncestors(t *testing.T) {
 	}
 	if _, err := os.Lstat(link); err != nil {
 		t.Fatal("symlink target was deleted")
+	}
+}
+
+func TestWorkspaceRemovalCleanupRetainsSymlinkedStoreRoot(t *testing.T) {
+	root := workspaceCleanupTestRoot(t)
+	realRoot := filepath.Join(root, "real-store")
+	dir := filepath.Join(realRoot, "servers", "unique")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pin := filepath.Join(dir, "known_hosts")
+	if err := os.WriteFile(pin, []byte("pin"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "store-alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Fatal(err)
+	}
+	store, err := LoadWorkspaceStore(filepath.Join(alias, "contexts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Access = []WorkspaceAccess{{Name: "unique", CredentialDir: filepath.Join("servers", "unique"), Workspace: &WorkspaceIdentity{ID: testWorkspaceID, Name: "unique"}}}
+	store.Current = "unique"
+	if err := store.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, retained, err := store.RemoveWorkspaceWithCleanup("unique", nil); err != nil || len(retained) != 1 {
+		t.Fatalf("symlinked store cleanup = retained %v err %v", retained, err)
+	}
+	if content, err := os.ReadFile(pin); err != nil || string(content) != "pin" {
+		t.Fatalf("symlinked store credential was changed: %q, %v", content, err)
 	}
 }
 
