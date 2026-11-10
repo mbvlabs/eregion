@@ -72,10 +72,6 @@ grep -Fq '1.x/manifest.json' "${work}/aws"
 bash "${root}/scripts/upload-release.sh" "${work}/final" stable "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel >/dev/null
 grep -Fq 's3 cp' "${work}/aws"
 make_tree "${work}/rcok" rc stable 1.0.0-rc.2
-make_tree "${work}/snapshot-ok" "" stable 1.0.0-alpha.3
-: >"${work}/aws"
-bash "${root}/scripts/upload-release.sh" "${work}/snapshot-ok" snapshot "${RELEASE_BUCKET}" "${R2_ENDPOINT}" artifacts >/dev/null
-grep -Fq 'releases' "${work}/aws"
 : >"${work}/aws"
 bash "${root}/scripts/upload-release.sh" "${work}/rcok" rc "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel >/dev/null
 grep -Fq 'rc/manifest.json' "${work}/aws"

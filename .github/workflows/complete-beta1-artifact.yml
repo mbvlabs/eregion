@@ -1,0 +1,97 @@
+name: Complete beta.1 artifact
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-stable
+  cancel-in-progress: false
+
+jobs:
+  complete:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    environment: edge
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/v1.0.0-beta.1
+          fetch-depth: 0
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: Verify source and rebuild before downloading evidence
+        run: |
+          set -euo pipefail
+          source=6316199b3f7502347bb25cc824dcf132794a0e20
+          test "$(git rev-parse HEAD)" = "${source}"
+          test "$(git rev-parse 'refs/tags/v1.0.0-beta.1^{commit}')" = "${source}"
+          git fetch --no-tags origin refs/tags/v1.0.0-beta.1
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "${source}"
+          git fetch --no-tags origin 1.x
+          git merge-base --is-ancestor "${source}" FETCH_HEAD
+          test -z "$(git status --porcelain)"
+          test "$(go env GOVERSION)" = go1.27.1
+          scripts/build-release.sh 1.0.0-beta.1 snapshot https://eregion.mbvlabs.com
+      - name: Verify the original signed release and all rebuilt binaries
+        run: |
+          set -euo pipefail
+          expected_manifest_sha=35adc53f1d98d2dbc087a82bd3a54c1efc955ed481a62dbb1d50e8db47c31ec5
+          [[ "${expected_manifest_sha}" =~ ^[0-9a-f]{64}$ ]]
+          base=https://eregion.mbvlabs.com/releases/1.0.0-beta.1
+          evidence=dist/original-beta1
+          mkdir -p "${evidence}"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "${base}/manifest.json" -o "${evidence}/manifest.json"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "${base}/manifest.json.sigstore.json" -o "${evidence}/manifest.json.sigstore.json"
+          test "$(sha256sum "${evidence}/manifest.json" | cut -d' ' -f1)" = "${expected_manifest_sha}"
+          identity='https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0-beta.1'
+          issuer=https://token.actions.githubusercontent.com
+          cosign verify-blob "${evidence}/manifest.json" --bundle "${evidence}/manifest.json.sigstore.json" --certificate-identity "${identity}" --certificate-oidc-issuer "${issuer}"
+          jq -e --arg base "${base}" '
+            .schemaVersion == 1 and .version == "1.0.0-beta.1" and .channel == "stable" and .releaseBaseUrl == $base and
+            (.artifacts | keys == ["darwin/amd64", "darwin/arm64", "linux/amd64", "linux/arm64"]) and
+            ([.artifacts | to_entries[] | (.value.url == ($base + "/" + .key + "/eregion") and (.value.sha256 | test("^[0-9a-f]{64}$")))] | all)
+          ' "${evidence}/manifest.json" >/dev/null
+          jq -e -s '.[0] == .[1]' "${evidence}/manifest.json" dist/release-snapshot/releases/1.0.0-beta.1/manifest.json >/dev/null
+          test "$(jq -r '.artifacts["linux/amd64"].sha256' "${evidence}/manifest.json")" = db99c46051d5deffe22977f7d5723c89df6e46d7f926abd8e0e5ca0d87c21f3b
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "${base}/install.sh" -o "${evidence}/install.sh"
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            mkdir -p "${evidence}/${platform}"
+            for suffix in sha256 sigstore.json; do
+              curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "${base}/${platform}/eregion.${suffix}" -o "${evidence}/${platform}/eregion.${suffix}"
+            done
+            binary="dist/release-snapshot/releases/1.0.0-beta.1/${platform}/eregion"
+            hash="$(jq -r --arg p "${platform}" '.artifacts[$p].sha256' "${evidence}/manifest.json")"
+            test "$(sha256sum "${binary}" | cut -d' ' -f1)" = "${hash}"
+            printf '%s  eregion\n' "${hash}" | cmp - "${evidence}/${platform}/eregion.sha256"
+            cosign verify-blob "${binary}" --bundle "${evidence}/${platform}/eregion.sigstore.json" --certificate-identity "${identity}" --certificate-oidc-issuer "${issuer}"
+          done
+      - name: Conditionally fill the one missing object and verify it
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_PAGER: ''
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          test "${RELEASE_BUCKET}" = eregion
+          [[ "${R2_ENDPOINT}" == https://* ]]
+          aws s3api put-object --generate-cli-skeleton input | jq -e 'has("IfNoneMatch")' >/dev/null
+          key=releases/1.0.0-beta.1/linux/amd64/eregion
+          binary=dist/release-snapshot/releases/1.0.0-beta.1/linux/amd64/eregion
+          evidence=dist/original-beta1
+          test "$(wc -c < "${binary}")" -lt 4294967296
+          hash="$(jq -r '.artifacts["linux/amd64"].sha256' "${evidence}/manifest.json")"
+          if aws s3api head-object --bucket "${RELEASE_BUCKET}" --key "${key}" --endpoint-url "${R2_ENDPOINT}" >"${evidence}/head.out" 2>"${evidence}/head.err"; then
+            echo 'object already exists; refusing to write' >&2; exit 1
+          fi
+          grep -Eq 'An error occurred \((404|NoSuchKey|NotFound)\) when calling the HeadObject operation' "${evidence}/head.err" || { echo 'head failed for a reason other than absence' >&2; exit 1; }
+          if ! aws s3api put-object --bucket "${RELEASE_BUCKET}" --key "${key}" --body "${binary}" --if-none-match '*' --content-type application/octet-stream --cache-control 'public,max-age=31536000,immutable' --endpoint-url "${R2_ENDPOINT}" >"${evidence}/put.out"; then
+            echo 'conditional PUT failed or was ambiguous; checking existing bytes' >&2
+          fi
+          aws s3api get-object --bucket "${RELEASE_BUCKET}" --key "${key}" --endpoint-url "${R2_ENDPOINT}" "${evidence}/stored-binary" >/dev/null
+          test "$(sha256sum "${evidence}/stored-binary" | cut -d' ' -f1)" = "${hash}" || { echo 'stored object differs from signed original' >&2; exit 1; }
+          echo 'Authenticated object matches the original signed bytes.'

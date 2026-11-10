@@ -95,9 +95,33 @@ These do not change the manifest schema or make alpha.2 artifacts invalid:
   requires the tag commit to be an ancestor of that major line. The stable job
   additionally accepts only a final tag, while alpha/beta/rc tags are handled by
   the prerelease job in the `edge` environment.
+- Immutable files use bounded single-object conditional PUTs, never recursive
+  multipart copies. Existing keys cannot be replaced; each write is read back
+  and checked, and the version manifest is published last. The tagged workflow's
+  nonempty-prefix refusal remains in force.
+- Release builds start from clean source, ignore generated `dist/` output and
+  check every platform binary's clean VCS metadata and exact source revision.
 - `promote` accepts only a final candidate on a stable pointer, moves only
   forward, and fails closed if the current pointer is not a final release; RC
   promotion accepts only newer rc versions.
+
+### Beta.1 publication exception and provenance
+
+The first beta.1 upload failed multipart completion for its Linux/amd64 binary
+after other immutable objects had been published. Its original signed manifest
+remains authoritative. A narrowly bounded completion workflow may create only
+that absent binary, after checking the fixed tag/source, pinned original manifest
+hash, all four reproduced binary hashes and their original tag signatures.
+Authenticated absence, atomic create-if-absent and verified readback are required;
+the workflow cannot overwrite objects, re-sign, move the tag or promote channels.
+
+Beta.1's Linux/amd64 binary reports clean VCS metadata. The other three binaries
+report dirty metadata because the original release script generated unignored
+output between platform builds. Clean tagged application source reproduced all
+four original hashes and the manifest exactly. Existing authenticated artifacts
+are preserved; the build-output isolation/checks above correct subsequent builds.
+This explained metadata caveat is not a claim of all-platform or fresh-install
+qualification.
 
 ## Trust
 

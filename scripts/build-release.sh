@@ -90,10 +90,16 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
+# Refuse real source changes rather than hiding them by disabling VCS stamping.
+# dist is ignored so earlier output from this same build is not source dirt.
+status="$(git status --porcelain --untracked-files=normal)"
+[ -z "${status}" ] || { echo 'release build requires a clean source tree' >&2; exit 1; }
+
 rm -rf "${out}"
 mkdir -p "${out}/releases/${version}"
 
 pkg="github.com/mbvlabs/eregion/internal/buildinfo"
+revision="$(git rev-parse HEAD)"
 commit="$(git rev-parse --short=12 HEAD)"
 ldflags="-s -w -X ${pkg}.Version=${version} -X ${pkg}.Commit=${commit} -X ${pkg}.Channel=${signing_channel}"
 build_args=(go build -trimpath -ldflags "${ldflags}")
@@ -109,6 +115,14 @@ build_one() {
   local platform_dir="${out}/releases/${version}/${os}/${arch}"
   mkdir -p "${platform_dir}"
   CGO_ENABLED=0 GOOS="${os}" GOARCH="${arch}" "${build_args[@]}" -o "${platform_dir}/eregion" ./cmd/eregion
+  local metadata
+  metadata="$(go version -m "${platform_dir}/eregion")"
+  printf '%s\n' "${metadata}" | grep -Eq '[[:space:]]vcs\.modified=false$' || {
+    echo "release binary has missing or dirty VCS metadata: ${os}/${arch}" >&2; exit 1;
+  }
+  printf '%s\n' "${metadata}" | grep -Eq "[[:space:]]vcs[.]revision=${revision}$" || {
+    echo "release binary has missing or incorrect source revision: ${os}/${arch}" >&2; exit 1;
+  }
   local hex
   hex="$(sha256_hex "${platform_dir}/eregion")"
   printf '%s  eregion\n' "${hex}" >"${platform_dir}/eregion.sha256"

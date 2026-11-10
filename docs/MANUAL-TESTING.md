@@ -197,6 +197,46 @@ PostgreSQL evidence. Signed publication is a separate release gate. Fresh-host,
 provider adverse-case, multi-workspace SSH-pin and actual Mac host qualification
 remain pending; LABS-346 is not closed and no acceptance is invented.
 
+### Beta.1 initial publication and immutable completion evidence
+
+The exact `6316199b3f7502347bb25cc824dcf132794a0e20` candidate passed source CI
+`42900238079`, edge publication `42900237969`, line CI `42902575348` and tag CI
+`42902579682`, including PostgreSQL 17 and macOS. `1.x` was fast-forwarded and
+annotated tag `v1.0.0-beta.1` points to that same commit. No tag was moved.
+
+Tagged publication `42902579661` failed `CompleteMultipartUpload` with
+`InvalidPart` for Linux/amd64. The manifest, its signature, installer, binary
+sidecars and other three binaries were already present; the incomplete release
+was not advertised as ready. The underlying provider cause is not established.
+Future publishing now avoids that multipart path, uses conditional single PUTs
+with readback verification and publishes the manifest last. Eight offline
+script suites, ShellCheck, actionlint and independent review cleared the changes.
+
+A clean tagged-source rebuild using the original Go 1.27.1 script reproduced all
+four binary hashes and the original manifest byte-for-byte. The reproduced
+Linux/amd64 bytes verified against the already-published original signature:
+`db99c46051d5deffe22977f7d5723c89df6e46d7f926abd8e0e5ca0d87c21f3b`,
+**41,922,720 bytes**, version `1.0.0-beta.1`, commit `6316199b3f75`, dirty=false.
+The authoritative manifest SHA-256 is
+`35adc53f1d98d2dbc087a82bd3a54c1efc955ed481a62dbb1d50e8db47c31ec5`.
+Original manifest and all binary signatures were authenticated under the exact
+original tag workflow identity, not re-signed by recovery.
+
+The other three original binaries report dirty metadata from unignored generated
+output between builds, not a source discrepancy: all hashes reproduced exactly.
+This caveat is retained explicitly; future builds now isolate output and check
+clean metadata and exact source revision per binary. Preserving original signed
+bytes takes precedence over changing those immutable metadata flags.
+
+Guarded completion is limited to creating the one missing key with the original
+authenticated bytes. It requires actual new-prefix upload verification and an
+authenticated create-only workflow, followed by independent public verification;
+read-only reproduction is not completion or fresh-install acceptance. Execution
+status and final publication evidence are tracked in LABS-352.
+Evidence: `.local/qualification/1.0.0-beta.1-artifacts/`,
+`beta1-reproduction/` and `release-upload/`. The initial failure and subsequent
+proof manifests are retained separately, without overwriting their records.
+
 ## 2026-11-10 — alpha.7 local verification and signed-edge live upgrade
 
 ### Working-tree local verification

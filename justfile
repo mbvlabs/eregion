@@ -74,9 +74,11 @@ test-release-scripts:
     bash scripts/test-install-pins.sh
     bash scripts/test-install-routing.sh
     bash scripts/test-release-channels.sh
+    bash scripts/test-release-build-clean.sh
     bash scripts/test-release-environments.sh
     bash scripts/test-sign-release.sh
     bash scripts/test-upload-guard.sh
+    bash scripts/test-upload-immutable.sh
 
 # Check formatting, static analysis, and tests.
 check: fmt-check lint test test-release-scripts
