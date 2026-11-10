@@ -2,13 +2,17 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 )
@@ -18,7 +22,114 @@ const (
 	// interval bounds how many such summaries one process emits.
 	defaultReadinessSlow     = time.Second
 	defaultReadinessInterval = 10 * time.Second
+
+	// Only the first queries in a stage retain ordinal timing. The cap keeps a
+	// report small even if a driver or schema step issues an unexpected batch.
+	maxReadyStageQueryDetails = 8
 )
+
+// ReadinessRuntime identifies the process that owns a readiness check. Unknown
+// is the safe default: a new call site must opt in rather than be mislabelled
+// as an API request.
+type ReadinessRuntime string
+
+const (
+	ReadinessRuntimeAPI     ReadinessRuntime = "api"
+	ReadinessRuntimeWorker  ReadinessRuntime = "worker"
+	ReadinessRuntimeNodeRPC ReadinessRuntime = "node_rpc"
+	ReadinessRuntimeUnknown ReadinessRuntime = "unknown"
+)
+
+// ReadinessPhase distinguishes process startup from a request-triggered check.
+type ReadinessPhase string
+
+const (
+	ReadinessPhaseStartup ReadinessPhase = "startup"
+	ReadinessPhaseRequest ReadinessPhase = "request"
+	ReadinessPhaseUnknown ReadinessPhase = "unknown"
+)
+
+const (
+	readinessErrorCanceled       = "canceled"
+	readinessErrorDeadline       = "deadline"
+	readinessErrorPostgres       = "postgres"
+	readinessErrorNetworkTimeout = "network_timeout"
+	readinessErrorNetworkIO      = "network_io"
+	readinessErrorOther          = "other"
+
+	readinessContextActive   = "active"
+	readinessContextCanceled = "canceled"
+	readinessContextDeadline = "deadline"
+)
+
+func normalizeReadinessRuntime(runtime ReadinessRuntime) ReadinessRuntime {
+	switch runtime {
+	case ReadinessRuntimeAPI, ReadinessRuntimeWorker, ReadinessRuntimeNodeRPC:
+		return runtime
+	default:
+		return ReadinessRuntimeUnknown
+	}
+}
+
+func normalizeReadinessPhase(phase ReadinessPhase) ReadinessPhase {
+	switch phase {
+	case ReadinessPhaseStartup, ReadinessPhaseRequest:
+		return phase
+	default:
+		return ReadinessPhaseUnknown
+	}
+}
+
+// classifyReadinessError reduces an error chain to a fixed diagnostic token.
+// It inspects the actual error, not the context state: a canceled request that
+// also received a PostgreSQL error is reported as postgres, with the separate
+// context_state saying canceled. No error text is retained.
+func classifyReadinessError(err error) string {
+	if err == nil {
+		return ""
+	}
+	// Fixed priority: cancellation, deadline, server error, network timeout,
+	// network I/O, then an explicit other.
+	if errors.Is(err, context.Canceled) {
+		return readinessErrorCanceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return readinessErrorDeadline
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return readinessErrorPostgres
+	}
+	if pgconn.Timeout(err) {
+		return readinessErrorNetworkTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return readinessErrorNetworkTimeout
+		}
+		return readinessErrorNetworkIO
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return readinessErrorNetworkIO
+	}
+	return readinessErrorOther
+}
+
+func readinessContextState(ctx context.Context) string {
+	if ctx == nil {
+		return readinessContextActive
+	}
+	switch {
+	case errors.Is(ctx.Err(), context.Canceled):
+		return readinessContextCanceled
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return readinessContextDeadline
+	default:
+		return readinessContextActive
+	}
+}
 
 type (
 	readyTraceKey   struct{}
@@ -104,41 +215,59 @@ func readyTraceFrom(ctx context.Context) *readyTrace {
 	return trace
 }
 
+type readyQuery struct {
+	ordinal int
+	elapsed time.Duration
+	failed  bool
+}
+
 type readyStage struct {
-	name      string
-	started   time.Time
-	elapsed   time.Duration
-	queries   int
-	queryTime time.Duration
-	failed    bool
-	ended     bool
+	name           string
+	started        time.Time
+	elapsed        time.Duration
+	queries        int
+	queryTime      time.Duration
+	queryDetails   []readyQuery
+	omittedQueries int
+	failed         bool
+	ended          bool
 }
 
 type readyTrace struct {
-	now func() time.Time
+	now     func() time.Time
+	runtime ReadinessRuntime
+	phase   ReadinessPhase
 
-	mu          sync.Mutex
-	started     time.Time
-	finishedAt  time.Time
-	stages      []*readyStage
-	acquires    int
-	acquireTime time.Duration
-	acquireErrs int
-	queries     int
-	queryTime   time.Duration
-	queryErrs   int
-	leases      int
-	released    int
-	poolBefore  readyPoolSnapshot
-	poolAfter   readyPoolSnapshot
-	failed      bool
+	mu           sync.Mutex
+	started      time.Time
+	finishedAt   time.Time
+	stages       []*readyStage
+	acquires     int
+	acquireTime  time.Duration
+	acquireErrs  int
+	queries      int
+	queryTime    time.Duration
+	queryErrs    int
+	leases       int
+	released     int
+	poolBefore   readyPoolSnapshot
+	poolAfter    readyPoolSnapshot
+	failed       bool
+	errorClass   string
+	contextState string
 }
 
 func newReadyTrace(now func() time.Time) *readyTrace {
 	if now == nil {
 		now = time.Now
 	}
-	return &readyTrace{now: now, started: now()}
+	return &readyTrace{
+		now:          now,
+		started:      now(),
+		runtime:      ReadinessRuntimeUnknown,
+		phase:        ReadinessPhaseUnknown,
+		contextState: readinessContextActive,
+	}
 }
 
 // beginReadyStage labels the queries made inside one top-level readiness step.
@@ -191,6 +320,15 @@ func (t *readyTrace) recordQuery(stage *readyStage, elapsed time.Duration, faile
 	if stage != nil {
 		stage.queries++
 		stage.queryTime += elapsed
+		if len(stage.queryDetails) < maxReadyStageQueryDetails {
+			stage.queryDetails = append(stage.queryDetails, readyQuery{
+				ordinal: stage.queries,
+				elapsed: elapsed,
+				failed:  failed,
+			})
+		} else {
+			stage.omittedQueries++
+		}
 	}
 	if failed {
 		t.queryErrs++
@@ -210,36 +348,68 @@ func (t *readyTrace) recordRelease() {
 }
 
 func (t *readyTrace) finish(after readyPoolSnapshot, failed bool) {
+	errorClass := ""
+	if failed {
+		errorClass = readinessErrorOther
+	}
+	t.finishResult(after, failed, errorClass, readinessContextActive)
+}
+
+func (t *readyTrace) finishContext(ctx context.Context, after readyPoolSnapshot, err error) {
+	t.finishResult(after, err != nil, classifyReadinessError(err), readinessContextState(ctx))
+}
+
+func (t *readyTrace) finishResult(after readyPoolSnapshot, failed bool, errorClass, contextState string) {
+	if failed && errorClass == "" {
+		errorClass = readinessErrorOther
+	}
+	if contextState == "" {
+		contextState = readinessContextActive
+	}
 	t.mu.Lock()
 	t.finishedAt = t.now()
 	t.poolAfter = after
 	t.failed = failed
+	t.errorClass = errorClass
+	t.contextState = contextState
 	t.mu.Unlock()
 }
 
+type readyQueryReport struct {
+	ordinal int
+	elapsed time.Duration
+	failed  bool
+}
+
 type readyStageReport struct {
-	name      string
-	elapsed   time.Duration
-	queries   int
-	queryTime time.Duration
-	failed    bool
+	name           string
+	elapsed        time.Duration
+	queries        int
+	queryTime      time.Duration
+	queryDetails   []readyQueryReport
+	omittedQueries int
+	failed         bool
 }
 
 type readyReport struct {
-	total       time.Duration
-	stages      []readyStageReport
-	acquires    int
-	acquireTime time.Duration
-	acquireErrs int
-	queries     int
-	queryTime   time.Duration
-	queryErrs   int
-	leases      int
-	released    int
-	poolBefore  readyPoolSnapshot
-	poolAfter   readyPoolSnapshot
-	failed      bool
-	failedStage string
+	total        time.Duration
+	stages       []readyStageReport
+	acquires     int
+	acquireTime  time.Duration
+	acquireErrs  int
+	queries      int
+	queryTime    time.Duration
+	queryErrs    int
+	leases       int
+	released     int
+	poolBefore   readyPoolSnapshot
+	poolAfter    readyPoolSnapshot
+	failed       bool
+	failedStage  string
+	errorClass   string
+	contextState string
+	runtime      ReadinessRuntime
+	phase        ReadinessPhase
 }
 
 func (t *readyTrace) report() readyReport {
@@ -250,27 +420,46 @@ func (t *readyTrace) report() readyReport {
 		finishedAt = t.now()
 	}
 	report := readyReport{
-		total:       finishedAt.Sub(t.started),
-		acquires:    t.acquires,
-		acquireTime: t.acquireTime,
-		acquireErrs: t.acquireErrs,
-		queries:     t.queries,
-		queryTime:   t.queryTime,
-		queryErrs:   t.queryErrs,
-		leases:      t.leases,
-		released:    t.released,
-		poolBefore:  t.poolBefore,
-		poolAfter:   t.poolAfter,
-		failed:      t.failed,
+		total:        finishedAt.Sub(t.started),
+		acquires:     t.acquires,
+		acquireTime:  t.acquireTime,
+		acquireErrs:  t.acquireErrs,
+		queries:      t.queries,
+		queryTime:    t.queryTime,
+		queryErrs:    t.queryErrs,
+		leases:       t.leases,
+		released:     t.released,
+		poolBefore:   t.poolBefore,
+		poolAfter:    t.poolAfter,
+		failed:       t.failed,
+		errorClass:   t.errorClass,
+		contextState: t.contextState,
+		runtime:      normalizeReadinessRuntime(t.runtime),
+		phase:        normalizeReadinessPhase(t.phase),
+	}
+	if report.failed && report.errorClass == "" {
+		report.errorClass = readinessErrorOther
+	}
+	if report.contextState == "" {
+		report.contextState = readinessContextActive
 	}
 	for _, stage := range t.stages {
-		report.stages = append(report.stages, readyStageReport{
-			name:      stage.name,
-			elapsed:   stage.elapsed,
-			queries:   stage.queries,
-			queryTime: stage.queryTime,
-			failed:    stage.failed,
-		})
+		stageReport := readyStageReport{
+			name:           stage.name,
+			elapsed:        stage.elapsed,
+			queries:        stage.queries,
+			queryTime:      stage.queryTime,
+			omittedQueries: stage.omittedQueries,
+			failed:         stage.failed,
+		}
+		for _, query := range stage.queryDetails {
+			stageReport.queryDetails = append(stageReport.queryDetails, readyQueryReport{
+				ordinal: query.ordinal,
+				elapsed: query.elapsed,
+				failed:  query.failed,
+			})
+		}
+		report.stages = append(report.stages, stageReport)
 		if stage.failed && report.failedStage == "" {
 			report.failedStage = stage.name
 		}
@@ -317,7 +506,8 @@ func (s readyPoolSnapshot) String() string {
 }
 
 // ReadinessLog rate-limits one bounded slow/failure summary per process. It
-// never receives SQL, arguments, DSNs or raw driver errors.
+// logs only fixed timings, counts, stage names and attribution/error-class
+// tokens, never SQL, arguments, DSNs or raw driver errors.
 type ReadinessLog struct {
 	logger   *slog.Logger
 	now      func() time.Time
@@ -370,7 +560,20 @@ func (l *ReadinessLog) report(report readyReport) {
 	l.last = now
 	l.mu.Unlock()
 
+	runtime := normalizeReadinessRuntime(report.runtime)
+	phase := normalizeReadinessPhase(report.phase)
+	contextState := report.contextState
+	if contextState == "" {
+		contextState = readinessContextActive
+	}
+	errorClass := report.errorClass
+	if report.failed && errorClass == "" {
+		errorClass = readinessErrorOther
+	}
 	attrs := []any{
+		"runtime", string(runtime),
+		"phase", string(phase),
+		"context_state", contextState,
 		"total_ms", report.total.Milliseconds(),
 		"stages", report.stageSummary(),
 		"acquires", report.acquires,
@@ -386,7 +589,10 @@ func (l *ReadinessLog) report(report readyReport) {
 		attrs = append(attrs, "suppressed", suppressed)
 	}
 	if report.failed {
-		attrs = append(attrs, "failed_stage", report.failedStage)
+		attrs = append(attrs, "error_class", errorClass)
+		if report.failedStage != "" {
+			attrs = append(attrs, "failed_stage", report.failedStage)
+		}
 		l.logger.Warn("control-plane readiness failed", attrs...)
 		return
 	}
@@ -400,6 +606,9 @@ func (r readyReport) stageSummary() string {
 	parts := make([]string, 0, len(r.stages))
 	for _, stage := range r.stages {
 		part := fmt.Sprintf("%s:queries=%d,ms=%d", stage.name, stage.queries, stage.elapsed.Milliseconds())
+		if details := stage.queryDetailSummary(); details != "" {
+			part += "," + details
+		}
 		if stage.failed {
 			part += ",failed"
 		}
@@ -408,9 +617,29 @@ func (r readyReport) stageSummary() string {
 	return strings.Join(parts, ";")
 }
 
+func (s readyStageReport) queryDetailSummary() string {
+	if len(s.queryDetails) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(s.queryDetails)+1)
+	for _, query := range s.queryDetails {
+		outcome := "ok"
+		if query.failed {
+			outcome = "failed"
+		}
+		parts = append(parts, fmt.Sprintf("q%d=%dms/%s", query.ordinal, query.elapsed.Milliseconds(), outcome))
+	}
+	if s.omittedQueries > 0 {
+		parts = append(parts, fmt.Sprintf("more=%d", s.omittedQueries))
+	}
+	return strings.Join(parts, ",")
+}
+
 type readyConfig struct {
-	log *ReadinessLog
-	now func() time.Time
+	log     *ReadinessLog
+	now     func() time.Time
+	runtime ReadinessRuntime
+	phase   ReadinessPhase
 }
 
 // ReadyOption configures the diagnostics around one readiness check. Public
@@ -421,10 +650,20 @@ func WithReadinessLog(log *ReadinessLog) ReadyOption {
 	return func(config *readyConfig) { config.log = log }
 }
 
+// WithReadinessAttribution names the actual source call site. Omit it only
+// when the runtime or phase is genuinely unknown; unknown is reported as such
+// rather than guessed as an API request.
+func WithReadinessAttribution(runtime ReadinessRuntime, phase ReadinessPhase) ReadyOption {
+	return func(config *readyConfig) {
+		config.runtime = runtime
+		config.phase = phase
+	}
+}
+
 // Ready remains the migration/schema check. The tracing is context-scoped:
 // requests without a readiness trace are untouched.
 func Ready(ctx context.Context, pool *pgxpool.Pool, opts ...ReadyOption) error {
-	config := readyConfig{now: time.Now}
+	config := readyConfig{now: time.Now, runtime: ReadinessRuntimeUnknown, phase: ReadinessPhaseUnknown}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&config)
@@ -438,13 +677,15 @@ func runReady(ctx context.Context, pool *pgxpool.Pool, config readyConfig, plan 
 		config.now = time.Now
 	}
 	trace := newReadyTrace(config.now)
+	trace.runtime = normalizeReadinessRuntime(config.runtime)
+	trace.phase = normalizeReadinessPhase(config.phase)
 	trace.poolBefore = snapshotReadyPool(pool)
 	ctx = context.WithValue(ctx, readyTraceKey{}, trace)
 	migrationPlan, err := plan(ctx, pool)
 	if err == nil && (migrationPlan.Current != migrationPlan.Required || migrationPlan.RiverCurrent != migrationPlan.RiverRequired) {
 		err = contract.NewFault(contract.PreconditionFailed, "database migrations are pending", "Run eregion node migrate before starting API or workers.")
 	}
-	trace.finish(snapshotReadyPool(pool), err != nil)
+	trace.finishContext(ctx, snapshotReadyPool(pool), err)
 	report := trace.report()
 	if config.log != nil {
 		config.log.report(report)

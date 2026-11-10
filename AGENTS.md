@@ -33,6 +33,11 @@ sketches as the design reference; `docs/workspace.md` describes current views.
   (MASTER D1). The token-bearing HTTP-over-SSH adapter is current transitional
   code; build new commands as node-mode commands, not on that adapter.
 - Pre-v1: delete old paths and surfaces; no compatibility aliases or shims.
+  Narrow alpha.7 exception (operator decision, 2026-11-10): existing transition
+  fallbacks may remain for this alpha's upgrade qualification, including legacy
+  handoff/pending-init and submission-capability handling. Remove legacy
+  fallbacks before beta.1 and qualify beta on a fresh installation;
+  do not add more compatibility paths or promise an alpha-to-beta upgrade.
 - Keep human and agent commands on the same application services. Every prompt
   needs a flag/input equivalent; JSON and no-TTY use must never prompt.
 - Never put plaintext secrets in operation input, River arguments, events,

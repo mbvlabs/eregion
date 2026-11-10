@@ -66,6 +66,10 @@ Alpha.7 acceptance requires the operator's explicit acceptance of its candidate
 delta evidence. An unexplained readiness timeout remains blocking. Publication,
 live mutation and beta promotion each need separate authorization.
 
+The 2026-11-10 signed-edge record below covers the candidate-upgrade row for
+`edge-079363faf394` on `thelab`/`main`. That is delta evidence, not alpha.7
+acceptance or a readiness fix.
+
 ### Beta.1, RC and final gates
 
 - **Beta.1:** alpha.7 delta acceptance plus authorized real multi-context/server
@@ -76,6 +80,11 @@ live mutation and beta promotion each need separate authorization.
   Preview refusal is not apply refusal. Preserve foreign resources and serving
   apps, retain retryable ledger evidence, and distinguish partial effects from
   successful cleanup. No automatic alpha → beta promotion.
+  The operator additionally requires a fresh beta installation: remove alpha.7's
+  legacy bundle/unfinished-setup fallbacks before beta.1, then qualify bootstrap
+  and the main app workflow on a separately authorized fresh server and dedicated
+  control database. Do not carry alpha state forward as proof of fresh-install
+  acceptance, and do not erase the existing alpha server or database.
 - **Before RC:** review replacement-VPS recovery documentation against the same
   surviving control DB/external services. Inventory protected vault keys,
   pinned node/transport identity, placement/in-flight work, exact artifacts,
@@ -88,11 +97,14 @@ live mutation and beta promotion each need separate authorization.
 Historical alpha.6 evidence below remains valid for its recorded builds and
 unchanged behavior. It does not establish these new candidate checks as passed.
 
-## 2026-11-10 — alpha.7 working-tree local verification
+## 2026-11-10 — alpha.7 local verification and signed-edge live upgrade
 
-**Local verification, not publication or host acceptance.** Source was the dirty
-`master` checkout at `c9f0a12f3ce3f7f0ccbf68051187aef36ef36108`, including the
-new untracked implementation files and embedded guide. Before/after source
+### Working-tree local verification
+
+**This working-tree pass was local verification, not publication or host
+acceptance.** Source was the dirty `master` checkout at
+`c9f0a12f3ce3f7f0ccbf68051187aef36ef36108`, including the new untracked
+implementation files and embedded guide. Before/after source
 manifests match:
 
 ```text
@@ -147,18 +159,179 @@ passed, with concurrency/rollback/lock-order repeats and race runs. This was a
 test/schema mismatch, not a production mutation or an unexplained discarded
 failure. The final schema-028 allowlist above includes the corrected case.
 
-**Not run:** live server init/apply/upgrade, real second-machine workspace
-handoff/login, actual multi-server/shared-IP SSH-pin qualification, live
-gh/GitHub enable/rotation/push checks, changed TUI terminal acceptance,
-Cloudflare adverse cases, and actual macOS installation/upgrade. No signed
-alpha.7 artifact was published or installed. Existing alpha.6 evidence remains
-the unchanged-behavior baseline, not a pass for these changed candidate flows.
+**Not run in this working-tree pass:** live server init, real second-machine
+workspace handoff/login, actual multi-server/shared-IP SSH-pin qualification,
+live gh/GitHub hook enable/rotation/push checks, changed TUI terminal
+acceptance, Cloudflare adverse cases, and actual macOS installation/upgrade.
+No signed alpha.7 artifact was published or installed *in this pass*; the
+signed-edge record below later published and installed the candidate. Existing
+alpha.6 evidence remains the unchanged-behavior baseline, not a pass for these
+changed candidate flows.
 
-**Exact release blocker:** LABS-346's intermittent live readiness timeout still
-has no established cause-specific fix. The four-second HTTP budget and safe
-stage/pool diagnostics are containment and triage, not root-cause qualification.
-Alpha.7 acceptance and beta promotion remain unclaimed; the incremental live
-matrix and explicit operator acceptance are still required.
+**Status at this local stage:** LABS-346's intermittent live readiness timeout
+had no established cause-specific fix. The four-second HTTP budget and safe
+stage/pool diagnostics are containment and triage, not root-cause
+qualification. The signed-edge run below did not establish a cause either.
+Alpha.7 acceptance and beta promotion remain unclaimed; explicit operator
+acceptance and the remaining unqualified gates are still required.
+
+### Signed-edge publication and live upgrade (`edge-079363faf394`)
+
+**Signed publication and artifact verification — pass.** Candidate
+`079363faf39450da1410e587f8c6123a4bc7cbfa` (`edge-079363faf394`) was verified at
+the exact commit. CI `42816902095` (`check`, `portable-cli (macos-latest)` and
+PostgreSQL integration job `129832169184`) and Publish edge `42816901789` both
+succeeded. The commit is test-only: six function renames in
+`internal/controlplane/workspace_integration_test.go`, no runtime change. The
+exact-commit PostgreSQL 17.11 integration command
+`go test -race -count=1 ./internal/controlplane -run TestIntegration -timeout
+600s` passed (`ok`, 279.703s). CI does not pass `-v`, so its log shows the
+package result, not individual test lines; selector coverage and the configured
+database fixture establish that the six workspace cases executed. The immutable
+manifest returned HTTP 200 with immutable caching and reported schema 1, channel
+`edge`, version `edge-079363faf394`, and four valid artifact URLs and SHA-256
+fields. The manifest and all four binaries verified with cosign against
+`https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master`
+and issuer `https://token.actions.githubusercontent.com` (six `Verified OK`
+results, including the edge pointer). Each downloaded binary matched both the
+manifest and its published sidecar SHA-256:
+
+| Platform | SHA-256 |
+| --- | --- |
+| linux/amd64 | `824e3a1040d57026f6a6bed64a1aeb298d930e1c91d4d8b3979f41c3ea0c5e77` |
+| linux/arm64 | `7275cce04daa57c6cbaff73ff029ea2ee69d17d26d5f35517b7909b5daaad51a` |
+| darwin/amd64 | `4ac5190cdafd1b6cd78c8239a2f707e729af8082d322f3a0f9080b2b65bb81f7` |
+| darwin/arm64 | `b29749927166466432d9a2a3cadc7f67064b9d0c46ab8156fa3414d16d6bff0c` |
+
+The linux/amd64 binary is 41,787,552 bytes and reports `edge-079363faf394`,
+channel `edge`, commit `079363faf394`, `dirty=false`, go1.27.1. Its offline
+isolated-HOME smoke passed nine commands with rc 0 and no ANSI, without a
+context store, RPC, install, apply or upgrade; `commands --check-meta --json`
+reported 115 checked commands and valid metadata. Root, `1.x` and `rc`
+manifests returned HTTP 404, the edge channel manifest was byte-identical to
+the immutable version manifest, and no stable pointer moved. Evidence:
+`/tmp/opencode/edge-079363faf394-verify.20261110-123455/`.
+
+**Authorized live target.** Context `thelab`, node `main`, route
+`mbv@10.78.0.1:22` over WireGuard via `46.224.129.96:51820`, 2026-11-10
+12:59–13:09 UTC. Every CLI call used the isolated
+`EREGION_CONTEXT_FILE=/home/mbv/.config/eregion-fresh-test/contexts.json`;
+node calls used `--context thelab`. Queued/running/cancelling operations were
+zero before the CLI upgrade and again immediately before apply.
+
+**CLI upgrade and lockstep — pass.** `upgrade` planned `1.0.0-alpha.6` (stable)
+to `edge-079363faf394`, `changed=true`, `nodes="not upgraded"`. The real
+upgrade exited 0, kept `eregion.prev` at alpha.6 / `b8211a2c44f6`, and installed
+the exact linux/amd64 SHA-256 above. With the new CLI against the old node,
+`apply --workspace thelab --auto-upgrade-nodes --dry-run` refused with exit 5
+`node_version_mismatch` (client `edge-079363faf394`, node `1.0.0-alpha.6`) and
+did not install the node; the old CLI then confirmed the node unchanged at
+alpha.6, schema 27/27 and River 7/7.
+
+**Node converge, migration and workspace — pass.** Real apply
+`op_03d29b225ee072f8ba8d373fa1e604b3` exited 0 with **5 applied / 17 skipped**
+of 22 steps, generation 6, completed 2026-11-10T13:00:33.046279798Z. It executed
+`host-database-v1` (schema 27/28), `host-workspace-v1`,
+`host-api-service-v1`, `host-worker-service-v1` and `host-readiness-v1`. The
+first readiness probe in that apply hit loopback connection refused while the
+API restarted; the apply still completed successfully. Workspace configured
+true as **thelab** / `ws_779004d145462c0fd7f48868`, and local context metadata
+refreshed to the same name and ID. `server status` reported CLI and node both
+`edge-079363faf394`, node commit `079363faf394`, schema **28/28**, River
+**7/7**, workspace `thelab` and all six services true. API and worker were
+active/running with `NRestarts=0`.
+
+**Post-upgrade convergence — pass.** `doctor` was **23 pass / 0 warn / 0 fail /
+0 skip**. A second real apply `op_53b59db7479547a5b30bdd2de551af7d` was
+**0 applied / 22 skipped** with no executed steps. Before and after the
+readiness window, production
+`https://eregion-test1.mbvlabs.com/qualification` and staging
+`https://eregion-test2.mbvlabs.com/qualification` both returned HTTP 200 with
+`ssl_verify_result=0`, preserving production v1/production/secret match and
+staging v3/staging/secret match. Final queued/running/cancelling counts were
+zero.
+
+**Readiness diagnosis — still unresolved.** All bodies were discarded; only
+status and timing were retained. In the bounded exercise, the four valid
+readiness samples returned HTTP 200 in 0.319–0.598s, with no non-200, timeout
+or operator-read failure; they do not establish a fix. Two earlier overlap
+attempts were invalid because a shell command-substitution bug delayed the
+operator read until after the request completed (0.684s and 0.424s, both 200).
+They are not overlap samples, but they mean the bounded exercise sent six
+readiness requests, over the specified maximum of four; they were harness
+failures, not retries of a slow or failed result. At 13:07:10.713Z, after
+convergence, the new candidate emitted a safe `control-plane readiness slow`
+summary on CLI stderr during a read-only operator RPC
+(`operations list --state running`): total 1454 ms, stages
+`schema_table=239`, `schema_migrations=203`, `river_table=207`,
+`river_versions=804`, 6 acquires / 6 queries, query 1454 ms, pool max 12, idle
+1, query_errors 0. This came from the CLI's node-side `NodeApp` short-lived
+control-plane pool, not the API pool, and is **not** a reproduction of the API
+pool timeout; no saturation cause is claimed. The
+fail-closed API journal whitelist found exactly one failed summary at
+13:00:29.063Z during the service-start window: `control-plane readiness failed`,
+total 660 ms, failed stage `river_versions` (stages 139/130/135/255 ms),
+query_errors 1. Its cause is unknown and no PID or pool-class evidence was
+retained; the service became healthy afterward. The same whitelist found zero
+slow summaries in `eregion-api.service` since 13:00:29Z; the 1454 ms summary
+came through normal CLI stderr, not a raw journal read. No general or raw
+journal, environment, DSN, SQL or driver error was read or emitted, and no
+apply, restart, pool/timeout change or journal dump was used as a repair.
+Startup and steady-state evidence are reported separately.
+
+**Timestamp correction.** The apparent start/end reversals in the readiness
+samples are explained by a local harness formatting bug, not by an established
+wall-clock step. The local harness uses uutils `date` 0.8.0,
+whose `%3N` drops leading fractional zeros; local reproductions prove the local
+public-readyz reversal is a formatting bug. The remote node implementation was
+not rechecked, so the same explanation there is only numerically consistent,
+not directly code-proven. No clock/NTP step is established or implied. Raw
+timing files are preserved and hashed in `raw-timing-sha256.txt`;
+`ERRATUM-timestamp-format.md` and `corrected-timestamps.txt` in the same live
+evidence root record the correction, and the live summary was updated. Other
+findings above are unchanged, and no further target calls were made.
+
+**Safety and remaining gates.** No tag, beta promotion, fresh-server init,
+app/environment/resource/domain deletion, DNS mutation, secret read or export,
+GitHub push or hook rotation was performed. No direct database connection,
+migration reset, source edit, commit or push occurred; raw HTTP bodies were
+discarded and the evidence directory is mode 0700 with mode-0600 files. The new
+tunnel daemon was left running. Evidence:
+`/tmp/opencode/alpha7-live-qual.preflight/live-20261110-125853/`. This run
+covers the candidate-upgrade row and the unchanged production/staging markers
+for this delta only. Still unqualified: live hook rotation/push, protected
+handoff/login, changed TUI terminal acceptance, real second-machine workspace
+handoff/login, multi-server/shared-IP SSH-pin qualification, Cloudflare adverse
+cases, live server init and macOS installation/upgrade. The persistent API-pool
+timeout LABS-346 remains unreproduced and unresolved; no cause-specific fix is
+claimed. Alpha.7 is not complete, no tag or beta promotion is implied, and
+explicit operator acceptance of this delta evidence is still required.
+
+### Readiness attribution follow-up — local verification
+
+The follow-up adds fixed failure classification, independent context state,
+runtime/startup/request attribution and bounded per-query timing to slow or
+failed readiness summaries. It does not change timeout budgets, pool sizes,
+readiness decisions or logging thresholds, and it is not a cause-specific fix.
+Independent review found no actionable defects.
+
+Targeted offline verification passed 36 top-level tests (94 including subtests),
+both normally and with the race detector, with no failures or skips. Build and
+vet passed. The tracked Go source manifest covered 556 files and matched before
+and after testing: `c53bd8e7253ce754c6016819bc44f5a3309cc50a069d13d9bc7b59ec10f4bc3b`.
+An earlier independent workflow pass covered another 107 top-level tests
+(191 including subtests), normally and with the race detector, for webhook,
+terminal-model and agent-discovery behavior. Their affected sources remained
+unchanged during final verification. No external database or Docker was used;
+the readiness regression tests use an in-process loopback PostgreSQL wire fake.
+The user-owned untracked qualification test was excluded without reading or
+modifying it. Full unrestricted test-suite execution was deliberately skipped
+because some existing tests can start Docker or use an integration database.
+
+Evidence: `/tmp/opencode/offline-alpha7-final-followup.summary.md` and
+`/tmp/opencode/offline-alpha7-followup.summary.md`. These are local implementation
+checks, not signed publication or host qualification of this follow-up.
+LABS-346 remains open pending classified live evidence and a verified correction.
 
 ## Historical run evidence
 

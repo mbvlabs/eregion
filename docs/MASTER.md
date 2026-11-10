@@ -149,6 +149,18 @@ management or tenant isolation. The TUI renders it; the TUI is not the identity.
 Implementation details belong in IMPLEMENTATION and qualification in
 MANUAL-TESTING; Linear tracks execution.
 
+**Alpha.7-only transition (operator decision, 2026-11-10):** the existing
+old-bundle/unconfigured-access, unfinished-setup and legacy submission-capability
+fallbacks may remain for this alpha's upgrade qualification. This is not a
+compatibility commitment. Remove legacy format/behavior fallbacks before beta.1
+and qualify beta on a fresh installation rather than relying on alpha state or
+an in-place alpha-to-beta upgrade. Normal schema creation/migrations are not
+permission to retain old
+command aliases or parallel behavior. Do not add further compatibility paths.
+The fresh beta server and its dedicated control database need explicit target
+authorization; this decision does not authorize wiping, deleting or repurposing
+the current alpha server/database.
+
 ## 4. The application model
 
 The application nouns follow deploycrate-ce. Names are lowercase slugs.

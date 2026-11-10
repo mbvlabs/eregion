@@ -249,7 +249,7 @@ func (a *app) logger(cmd *cobra.Command) *slog.Logger {
 // startRuntime opens the database and builds the runtime. The returned
 // closer releases the node transport (a WireGuard tunnel and its key lock);
 // call it after the workers stopped.
-func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, *controlplane.Runtime, extensionRuntime, func(), error) {
+func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime controlplane.ReadinessRuntime) (*pgxpool.Pool, *controlplane.Runtime, extensionRuntime, func(), error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
 	defer cancel()
 	logger := a.logger(cmd)
@@ -257,7 +257,10 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 	if err != nil {
 		return nil, nil, extensionRuntime{}, nil, err
 	}
-	if err := controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(controlplane.NewReadinessLog(logger))); err != nil {
+	if err := controlplane.Ready(ctx, pool,
+		controlplane.WithReadinessLog(controlplane.NewReadinessLog(logger)),
+		controlplane.WithReadinessAttribution(readinessRuntime, controlplane.ReadinessPhaseStartup),
+	); err != nil {
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
@@ -486,7 +489,7 @@ func (a *app) worker(cmd *cobra.Command, _ []string) (result, error) {
 	if concurrency < 1 {
 		return result{}, contract.NewFault(contract.ValidationFailed, "worker concurrency must be positive", "Use --concurrency 1–16.")
 	}
-	pool, run, _, closeTransport, err := a.startRuntime(cmd, concurrency)
+	pool, run, _, closeTransport, err := a.startRuntime(cmd, concurrency, controlplane.ReadinessRuntimeWorker)
 	if err != nil {
 		return result{}, err
 	}
@@ -532,7 +535,7 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	if !withWorkers {
 		concurrency = 0
 	}
-	pool, run, parts, closeTransport, err := a.startRuntime(cmd, concurrency)
+	pool, run, parts, closeTransport, err := a.startRuntime(cmd, concurrency, controlplane.ReadinessRuntimeAPI)
 	if err != nil {
 		return result{}, err
 	}
@@ -557,7 +560,10 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	logger := a.logger(cmd)
 	readyLog := controlplane.NewReadinessLog(logger)
 	base := api.NewHandler(auth, run.Service, func(ctx context.Context) error {
-		return controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(readyLog))
+		return controlplane.Ready(ctx, pool,
+			controlplane.WithReadinessLog(readyLog),
+			controlplane.WithReadinessAttribution(controlplane.ReadinessRuntimeAPI, controlplane.ReadinessPhaseRequest),
+		)
 	})
 	handler, err := a.buildMux(cmd, logger, auth, base, run.Service, parts)
 	if err != nil {

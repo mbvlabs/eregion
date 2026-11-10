@@ -973,14 +973,22 @@ six logical SQL executions, not just four. The API's pool maximum remains 12;
 worker connections belong to a separate process/pool in the installed layout.
 
 Request-scoped pgx acquire/query/release traces record fixed stage names,
-durations and counts, including row lifetime. **Acquire time is not pure queue
-wait:** idle validation, ping and reconnection can contribute. Before/after
-whole-pool counts are not attributed exclusively to the readiness request.
-A process-local reporter emits one safe summary for slow (at least one second)
-or failed probes, rate-limited to one per ten seconds with suppression counts.
-SQL, arguments, connection strings, URLs and raw driver errors are not retained
-in the report. These thresholds are diagnostic defaults, not an established
-latency SLO. No new telemetry backend is introduced.
+durations and counts, including row lifetime. Each stage also retains bounded
+per-query ordinal timing (first eight queries, fixed `ok`/`failed` outcomes);
+these details appear only in the existing slow or failed summary. **Acquire
+time is not pure queue wait:** idle validation, ping and reconnection can
+contribute. Before/after whole-pool counts are not attributed exclusively to the
+readiness request. A process-local reporter emits one safe summary for slow (at
+least one second) or failed probes, rate-limited to one per ten seconds with
+suppression counts. A failed summary carries one fixed `error_class` (`canceled`,
+`deadline`, `postgres`, `network_timeout`, `network_io` or `other`) derived from
+the wrapped error chain, plus a separate `context_state` (`active`, `canceled` or
+`deadline`) so a canceled caller does not relabel the actual error. Probes are
+attributed from their call site as runtime `api`, `worker` or `node_rpc` and
+phase `startup` or `request`; an unattributed path reports `unknown` rather than
+guessing. SQL, arguments, connection strings, URLs and raw driver errors are not
+retained in the report. These thresholds are diagnostic defaults, not an
+established latency SLO. No new telemetry backend is introduced.
 
 Instrumented healthy samples alone cannot close LABS-346. A cause-specific fix
 still needs causal timing evidence under an explicitly authorized workload and
@@ -1124,6 +1132,12 @@ available without a workspace DB read. The TUI labels actual node identity,
 workspace and captured local context separately from the SSH route, and shows
 unknown versus not-configured explicitly. No workspace membership, team ACL,
 multi-node lifecycle or server-sharing feature is introduced.
+
+The old-bundle/unfinished-setup and legacy submission-capability handling is an
+explicitly temporary alpha.7 transition, not a retained compatibility API. The operator's
+beta.1 decision requires removing those fallbacks and qualifying a fresh
+installation. This reference describes current alpha behavior; it does not
+promise an in-place alpha-to-beta upgrade or authorize resetting existing data.
 
 `server init` follows MASTER 6.1. A local preflight requires the OpenSSH client
 (`ssh`, `ssh-keygen`: `missing_tool` with the platform install command), checks

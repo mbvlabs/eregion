@@ -1520,7 +1520,10 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		return api.AppService{}, nil, err
 	}
 	readyLog := controlplane.NewReadinessLog(logger)
-	if err := controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(readyLog)); err != nil {
+	if err := controlplane.Ready(ctx, pool,
+		controlplane.WithReadinessLog(readyLog),
+		controlplane.WithReadinessAttribution(controlplane.ReadinessRuntimeNodeRPC, controlplane.ReadinessPhaseStartup),
+	); err != nil {
 		pool.Close()
 		return api.AppService{}, nil, err
 	}
@@ -1543,7 +1546,10 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		return api.AppService{}, nil, err
 	}
 	appService := api.NewAppService(run.Service, parts.Vault, func(ctx context.Context) error {
-		return controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(readyLog))
+		return controlplane.Ready(ctx, pool,
+			controlplane.WithReadinessLog(readyLog),
+			controlplane.WithReadinessAttribution(controlplane.ReadinessRuntimeNodeRPC, controlplane.ReadinessPhaseRequest),
+		)
 	})
 	appService.Retention = run.Service
 	if parts.Cloudflare != nil {
