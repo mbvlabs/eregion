@@ -3,6 +3,7 @@ package host
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -146,7 +147,10 @@ func LoadWorkspaceStore(path string) (*WorkspaceStore, error) {
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(store); err != nil {
+	decodeErr := decoder.Decode(store)
+	var extra any
+	trailingErr := decoder.Decode(&extra)
+	if decodeErr != nil || trailingErr != io.EOF {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the workspace store is invalid", "Fix or move "+path+" aside; the file contains credentials and is never printed.")
 	}
 	if store.Schema != workspaceStoreSchema {

@@ -165,6 +165,17 @@ build and vet passed; the final 630-file manifest is
 `d9236dd3e136275f1d61a7b7e637e068095e83c0861fe8fd7c23dc8ef55b6172`.
 The original baseline manifests were retained without overwriting them.
 
+A final strict-store review reproduced a pre-existing parser defect: a valid
+JSON object followed by another value or garbage was accepted. The loader now
+requires end-of-file after the first object, matching pending-state validation.
+The new regression failed before the fix, passes afterward, accepts trailing
+whitespace and proves input bytes remain unchanged. Ten normal and ten race
+repetitions of workspace-store tests, build and vet passed; independent review
+cleared the two-file correction. The updated final 630-file manifest is
+`4ae7b213d15f93fa610726c817369b0cd4c0e8767335eb9a2b0a55a5a02610d8`.
+Evidence: `.local/qualification/beta-store-json/`. Release CI must cover the
+corrected commit, not just the preceding candidate.
+
 Evidence: `.local/qualification/beta-independent/`, `beta-final-cleanup/`,
 `beta-final-naming/` and the scoped workspace/bootstrap/submission/telemetry
 evidence directories. User-owned untracked qualification code and `specs/`
