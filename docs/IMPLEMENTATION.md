@@ -1,10 +1,12 @@
 # Implementation reference
 
-Checked against the integrated source on 2026-11-09; the managed-resource
-comparison with deploycrate-ce was checked on 2026-11-07. This describes
+Baseline checked against the integrated source on 2026-11-09; alpha.7's changed
+mechanisms were updated on 2026-11-10. The managed-resource comparison with
+deploycrate-ce was checked on 2026-11-07. This describes
 **current code**, not the target command tree or a real-host certification.
-Product decisions and all work status belong in [MASTER](MASTER.md); run
-evidence belongs in [MANUAL-TESTING](MANUAL-TESTING.md).
+Product decisions belong in [MASTER](MASTER.md); actionable work and execution
+status belong in the [Linear project](https://linear.app/mbvlabs/project/eregion-2ff1d2e4d199).
+Run evidence belongs in [MANUAL-TESTING](MANUAL-TESTING.md).
 
 ## Execution and control boundaries
 
@@ -102,6 +104,69 @@ re-queue the older one's live platform jobs.
 
 ## Current command surface
 
+### Operator and agent quick reference
+
+Start with offline discovery, without choosing a server or reading credentials:
+
+```sh
+eregion
+eregion commands --json
+eregion help env update --json
+eregion guide agents
+```
+
+For a node operation, identify the local **store** and selected **context** first.
+The default store is the OS configuration directory's `eregion/contexts.json`;
+`EREGION_CONTEXT_FILE` selects another store, not another server in the same
+store. `context list` describes that store. `--context NAME` chooses a context
+in it; otherwise `EREGION_CONTEXT`, then the saved current context applies.
+Names that exist only in a different store cannot resolve here. A workspace
+identifies the installation; a node name identifies its server; a context holds
+this operator machine's route/keys. None is an application environment.
+
+```sh
+eregion context list --json
+eregion --context lab server status --json
+eregion --context lab domain cloudflare status --json
+```
+
+Use explicit context selection in automation rather than relying on a human's
+last `context use`. Do not copy secret-containing context stores into evidence
+or use the handoff as an ordinary configuration file. `login` imports protected
+access material and verifies node trust before publishing it locally; exact
+`--replace NAME` does not waive fingerprint verification.
+
+| Authority / credential | Role and supported flow |
+| --- | --- |
+| Operator SSH + WireGuard | Privileged node-mode control via a context. No operator bearer token is required. The OS account holding context keys is effectively privileged on that server. |
+| Git read credential / `--github-auth` | Clone a private repository. Local authenticated `gh` can supply it explicitly; this is not the webhook HMAC or a CI deploy token. |
+| GitHub webhook HMAC | Authenticate signed pushes for one environment. Generated and stored through the webhook setup/rotation flow; repository hook administration is a distinct gh permission. |
+| CI deploy token | Scoped, expiring deploy authority for the narrow HTTP deploy endpoint. Minting requires the human factor; possession does not grant general operator/DNS authority. |
+| Cloudflare provider credential | Hidden human terminal input, read-validated and encrypted in the typed provider/zone vault scope. Agents can inspect non-secret status and use explicitly authorized DNS actions, not export the token. |
+| TOTP human factor | Protects token minting, secret/handoff export and protected destructive actions. `--yes`, JSON and stdin do not satisfy it. |
+| Telemetry credential | WireGuard-only authenticated scrape access, distinct from operator control. Ordinary config output uses a placeholder; explicit protected files contain the real credential. |
+
+Cloudflare setup needs the **zone ID**, not the account ID: select the DNS zone
+in Cloudflare and use its zone identity with the matching zone name. A rejected
+read validation activates no credential and is not repaired by repeated apply.
+An accepted credential proves read validation, not write permission, DNS
+reconciliation, valid TLS or public reachability. Missing context must be fixed
+before entering the token.
+
+Human flows may prompt only at a real terminal; agent flows need explicit
+flags and JSON/NDJSON and must not prompt. Human-only factor/secret-display
+operations are deliberate exceptions, not missing agent inputs to bypass.
+A submission result means **accepted**. Follow its operation to terminal state,
+then inspect serving, DNS/route/TLS and the external response separately.
+
+Keep the protected handoff current after changes to workspace identity,
+recoverable host/access material, vault keyring or telemetry credentials. A
+successful rotation does not update old exports. A human runs `secrets export`
+with the factor and stores the refreshed protected artifact; an agent records
+only confirmation/metadata, never its contents. Local GitHub authentication,
+provider credentials and application secrets retain their separate scopes and
+must not be assumed interchangeable or all recoverable from a local context.
+
 Use the **built binary**, not a stale `bin/eregion`, to inspect exact arguments:
 
 ```sh
@@ -145,7 +210,7 @@ All of MASTER section 5's app, environment, deployment and observation surface
 exists. The `platform` command group is deleted: `app`, `env` (including
 `env promote`), `process`, `config`, `domain`, `deploy`, `rollback`, `restart`,
 `build`, `release`, `logs` and `operations` are the operator commands. Token/
-protect commands remain for work list row 8. The old plural `resources …`
+protect commands serve CI and human-factor flows (MASTER D7/D28). The old plural `resources …`
 surface and the backup code are deleted (MASTER D19); alpha.2's singular
 `resource apply|attach|detach|list|status|destroy` lifecycle is registered.
 The Docker Compose telemetry stack install is deleted (D5); the local textfile
@@ -155,7 +220,7 @@ telemetry stack. `dns …`,
 (D6, D19, D22, D26); `metrics show`, `metrics endpoint`, `metrics config` and
 `metrics rotate` are registered as the node-local read/config primitives
 described above. The DNS/access internal packages remain for the after-v1
-phases where the work list says they return. `bootstrap …`, `serve`, `worker`
+phases only after a product scope decision. `bootstrap …`, `serve`, `worker`
 and `system migrate` are not operator commands; they live under the hidden
 Linux-only `node` group (`node rpc`, `node unlock-ssh`, `node serve`,
 `node worker`, `node migrate`, `node bootstrap …`) and `commands --json` lists
@@ -426,9 +491,10 @@ two separately published objects, so the existing publication race can
 temporarily fail verification; an interrupted tagged upload can leave a partial
 prefix that blocks retry. These are follow-up risks, not a change to the
 channel model.
-The alpha.3 worktree adds the container resolver and these schema-1 release
-safety guards. Its source is offline-tested but not tagged, published or
-host-qualified; the orchestrator owns commit, push, PR, tag and release.
+The container resolver and these schema-1 safety guards were introduced for
+alpha.3. Publication and qualification provenance is in MANUAL-TESTING; this
+mechanism reference is not a release-status tracker or permission to publish.
+Commit, push, branch, tag and release actions still require operator authority.
 
 `internal/upgrade` holds the local-only plan/preflight/atomic swap. `upgrade`
 downloads the verified binary, checks its reported version and channel, and
@@ -453,7 +519,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 027
+## Database: embedded schema 028
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -488,12 +554,14 @@ node protocol version and database migration version are independent.
 | `025_domain_dns_ownership.sql` | Immutable `eregion_platform_domains.id` (`dom_…`) and the `eregion_platform_domain_dns` ledger. The ledger stores provider, zone, exact ownership marker, generation, desired origins/proxy, state, last operation and cleanup status. It is written atomically with the operation/River job before provider effects and is retained until exact owned provider cleanup is verified; `domain_id` restricts domain deletion while it exists. |
 | `026_deployment_lifecycle_owner.sql` | One durable deployment lifecycle owner per environment. Stores owner operation/deployment/attempt, phase, exclusive route target, frozen restore release/deployment and timestamps. Route writers read this row exclusively. The cutover is fail closed with no legacy backfill: it refuses while a deploy/rollback/restart/promote operation is queued, running or cancelling, or while any deployment row is pending/running. Finish or cancel old work before upgrading; a safe upgrade creates the empty owner table. |
 | `027_provider_credentials.sql` | Installation-wide provider/zone metadata and immutable encrypted credential revisions in the existing vault. Separate from app/environment secret namespaces; uses the existing keyring with provider-bound AAD and revision hashes. Credential activation uses a revision CAS and commits its sanitized audit entry atomically. No token-file import/backfill is performed. |
+| `028_workspace_identity.sql` | Empty singleton installation identity table, generated immutable workspace ID/name and creation time, with update/delete refusal. Migration does not infer or seed identity; setup or explicit `apply --workspace NAME` performs assignment under an advisory transaction lock and insert CAS. |
 
 Tables below have the literal `eregion_` prefix:
 
 | Table(s) | Key and authoritative facts |
 | --- | --- |
 | `schema_migrations` | Version/checksum/application time. River maintains its own schema history. |
+| `workspace` | Singleton workspace ID/name (`ws_…`, slug) and creation time. Authoritative installation identity, not a tenant, team or multi-node boundary; an absent row is explicitly unconfigured. |
 | `operations` | `op_…` ID; actor, kind, target, normalized input/hash, idempotency key, state, attempt, step count, cursor, River job ID and error code. |
 | `operation_events` | `(operation_id, sequence)`; JSON event. |
 | `operation_steps` | `(operation_id, step)`; inputs hash, execution identity, attempt, state, timestamps and result/error. |
@@ -516,7 +584,7 @@ Tables below have the literal `eregion_` prefix:
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
 | `webhook_deliveries` | Hashed delivery ID and exact-body hash, actor/kind/target, sanitized repository/branch/commit, non-secret environment/revision/secret-revision identities, admitted/submitted/failed state, River job ID, operation ID and terminal sanitized error code. Legacy pending/submitted rows remain valid; pending legacy rows are reconciled only on authenticated redelivery. |
 
-Boundaries around the MASTER app-model work (work list rows 4–5):
+Application-model execution boundaries (MASTER sections 4 and 6):
 
 - The environment revision and the deployment's recorded process instances are
   the deploy worker's source of truth. The legacy stable/candidate columns are
@@ -531,7 +599,7 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
   rollback resolves the target deployment's recorded exact revisions.
 - Deploying from the revision's bound source (including a private HTTPS git
   read credential) now records the build and deployment. Auto-deploy/push and
-  the per-environment webhook remain work list row 8.
+  the per-environment webhook follow MASTER D28.
 - Deletion is deliberate, not SQL cascade alone. The submission transaction
   locks the app row (and the environment row) and decides the human factor from
   durable state: app delete is always gated; environment delete is gated when
@@ -579,7 +647,7 @@ Boundaries around the MASTER app-model work (work list rows 4–5):
 
 ## Disk retention schema (D30)
 
-Migration 017 adds the durable state for work list row 17 (an alpha.1 gate);
+Migration 017 adds D30's durable retention state (an alpha.1 gate);
 migration 018 adds the durable Buildpacks cache measurement and the node-wide
 registry GC follow-up without rewriting the published 017.
 `internal/retention`
@@ -889,7 +957,91 @@ not auto-migrate; readiness fails until both are current. A newer schema, gap or
 changed applied checksum fails closed. Never edit an applied SQL file, forge
 history or reset a database to make an upgrade pass. Add the next migration.
 
+### Readiness budget and diagnostics
+
+The HTTP `/readyz` handler uses one four-second child context, respecting any
+earlier caller deadline. Other API routes retain their existing ten-second
+context budget. This leaves headroom before the host probe's five-second HTTP
+timeout; it is cancellation containment, not a demonstrated fix for the
+intermittent alpha.6 timeout. The handler remains synchronous and public errors
+are generic. HTTP server `ReadTimeout` is not the handler-execution deadline.
+
+Readiness still validates Eregion migration history/checksums and River
+versions through the persistent API pool. Four top-level read stages include
+River's internal table/column/version queries: the initialized path involves
+six logical SQL executions, not just four. The API's pool maximum remains 12;
+worker connections belong to a separate process/pool in the installed layout.
+
+Request-scoped pgx acquire/query/release traces record fixed stage names,
+durations and counts, including row lifetime. **Acquire time is not pure queue
+wait:** idle validation, ping and reconnection can contribute. Before/after
+whole-pool counts are not attributed exclusively to the readiness request.
+A process-local reporter emits one safe summary for slow (at least one second)
+or failed probes, rate-limited to one per ten seconds with suppression counts.
+SQL, arguments, connection strings, URLs and raw driver errors are not retained
+in the report. These thresholds are diagnostic defaults, not an established
+latency SLO. No new telemetry backend is introduced.
+
+Instrumented healthy samples alone cannot close LABS-346. A cause-specific fix
+still needs causal timing evidence under an explicitly authorized workload and
+its regression; current instrumentation does not establish the live cause.
+
 ## External control-state recovery
+
+### Replacement VPS: current recovery boundary
+
+The recovery objective is to reuse the **same surviving external control
+database and external application services** on a replacement VPS. This is not
+currently a supported one-command replacement-node flow. Merely supplying the
+old DSN to `server init` does not reconstruct trusted access, placement or lost
+artifacts. Do not run init against an existing database as an undocumented repair.
+
+Under D4, managed local volumes hold expendable data. Put serious application
+state in external services with their own backup/durability policy. The control
+database is not a backup of local volume contents. Eregion currently represents
+external dependencies through config and vault secret names; it does **not**
+provide first-class external-resource records equivalent to its managed Docker
+resource lifecycle. That product-model gap requires a separate decision.
+Expendable-for-recovery is not permission to delete data: D19's default volume
+retention and exact-owned `resource destroy --delete-data` contract are unchanged.
+Do not close a resource-retention qualification ticket merely from this policy.
+
+Before any attempted recovery, inventory these protected prerequisites without
+putting their values into tickets, logs or ordinary command output:
+
+| Asset | Why it is needed / current limitation |
+| --- | --- |
+| Surviving control PostgreSQL | Desired revisions, operations, releases, domain ledgers and encrypted secrets live here. Verify schema/checksums/River against the selected signed binary. |
+| Original vault keyring, including old keys | Ciphertext in PostgreSQL is unusable without the matching host-local keys. A fresh keyring cannot decrypt it. Retain a current protected handoff outside the lost VPS. |
+| Node and transport identities | Node attestation is pinned in PostgreSQL; SSH/WireGuard identities and operator keys also have local state. A newly created VPS identity is not automatically the old trusted node. There is no supported replacement-node enrollment/rebinding flow yet. |
+| Protection and deploy-token state | Root-only TOTP/replay state and deploy-token hashes are host files, not control-DB rows. Account for their protected recovery separately; never reset the human factor or mint replacement tokens as an undocumented shortcut. |
+| Runtime placement and in-flight work | Deployments refer to their recorded node. Worker repair restarts missing containers on that node; it is not a general migration to a different node. An unreachable old node is not proof its containers are gone. Fence the old writers before replacement. |
+| Immutable images and source | Local registry loss can remove the only copy of an exact release digest. An external digest-addressable image can be recovered if still available; rebuilding source may create a different image and does not recover historical rollback artifacts. |
+| Host intent, DNS and access configuration | Public IP/DNS, TLS routing, service configuration and pinned operator routes must match the replacement deliberately. Never disable host-key verification to make access work. |
+| External application services | Keep the same external data endpoints and correct credentials. Their consistency, backups and recovery objectives are operator/provider responsibilities. |
+
+A current handoff is essential for the material it explicitly contains, but do
+not assume it is a complete host image or contains every attestation, SSH-host,
+WireGuard-server and protection-state file. Verify recovery coverage against
+the export implementation without exposing the private artifact. Missing
+host-local identity material is an unsupported recovery gap, not something the
+surviving database can regenerate safely.
+
+The safe sequence is a **recovery design/checklist**, not an executable promise:
+fence the lost/old node and writers; verify DB and protected recovery assets;
+establish replacement host and trusted identities through a reviewed supported
+mechanism; reconcile placement and in-flight effects; restore available exact
+artifacts or explicitly create new releases; restore routes/access; verify
+readiness, serving HTTPS and secret-match markers. Stop where a required
+replacement/identity/placement mechanism is unsupported. Do not substitute SQL
+edits, forged journals, ad-hoc repair commands or assumed successful operations.
+
+Before RC this inventory, procedure and unsupported-gap disclosure must be
+reviewed. A live replacement-VPS rehearsal is **not required** by the current
+release policy and has not been established by documenting these steps. There
+is no scheduled backup/volume-backup product or recovery-time/data-loss guarantee.
+
+### Control database restore (different failure mode)
 
 The control database is the PostgreSQL provider's recovery responsibility (D4,
 D9); eregion has no backup product or resource backup/restore commands. A
@@ -921,6 +1073,58 @@ recovery, HA or recovery-time goals.
 
 ## Bootstrap and local state
 
+### Portable workspace identity
+
+Migration 028 adds `eregion_workspace` but seeds no row. `ReadWorkspace` reports
+both a missing pre-028 table and an empty table as unconfigured; reads never
+assign. `AssignWorkspace` takes an installation-specific transaction advisory
+lock and an insert CAS. Same-name assignment returns the existing `ws_…` ID;
+another name conflicts. The table refuses updates/deletes. Names are 1–64
+lowercase alphanumeric/hyphen characters, with alphanumeric ends; IDs are
+generated non-secret identifiers, not authorization capabilities.
+
+Fresh setup accepts `--workspace NAME` or answers-file `workspace`, independently
+of `--node` and `--context-name`. Pending init stores the name before host apply on
+real execution, then the DB-authoritative ID before final handoff. A dry-run
+resume keeps a newly supplied name in memory only. Identical persisted input is
+valid on resume; a conflicting name fails before contact. A pre-alpha.7 pending
+init that already applied its host phase cannot introduce a workspace there:
+finish that flow, then use the ordinary explicit assignment path below.
+
+An existing alpha.6 installation initializes through `apply --workspace NAME`
+after upgrading/migrating. `host-workspace-v1`, immediately after the database
+step, assigns the identity and mirrors only `workspace_id`/`workspace_name` into
+`node.json`, preserving node name and unknown keys. That file is not an
+authority or a DB-unavailable fallback. The recorded host intent keeps the
+requested name so future convergence checks the same identity. A conflicting
+request is checked again under the whole-apply lock before state, credentials,
+journals or host effects. Dry run plans but does not assign.
+
+Successful main-node apply reads the authoritative identity for local metadata.
+The refresh targets the context and route captured by the RPC, not whatever
+context another terminal has since selected. Context-store mutation uses a
+shared lock and reload; a replaced route or configured identity conflicts rather
+than being overwritten. A local refresh failure is a warning after successful
+host convergence, not a claim that the host rolled back. Other contexts and the
+latest current selection are preserved.
+
+The protected handoff carries `Workspace` and `Workspace ID`; imported context
+metadata carries `workspace:{id,name}` alongside its own route and credentials.
+Login verifies declared workspace and node identity before publishing files,
+retaining exact replacement confirmation and scoped host-key pins. Within one
+local store, the same workspace name with different IDs conflicts; multiple
+context aliases for the same ID are allowed. A configured context's identity
+cannot be replaced by a different/absent one. Legacy bundles remain explicitly
+unconfigured; refresh the human-protected export to transfer portable identity.
+
+`node.info` and server status read PostgreSQL, not the mirror. A failed identity
+read is unknown (`workspace_error`), not unconfigured; trust-sensitive login and
+setup refuse it. The separate version RPC and host-control dispatch remain
+available without a workspace DB read. The TUI labels actual node identity,
+workspace and captured local context separately from the SSH route, and shows
+unknown versus not-configured explicitly. No workspace membership, team ACL,
+multi-node lifecycle or server-sharing feature is introduced.
+
 `server init` follows MASTER 6.1. A local preflight requires the OpenSSH client
 (`ssh`, `ssh-keygen`: `missing_tool` with the platform install command), checks
 that the target answers, and requires an SSH credential. First contact is root:
@@ -934,14 +1138,15 @@ a missing `tar` (`missing_tool` with the apt command), and existing eregion
 state. A pending init continues its own state; a new init never adopts a host
 that already has eregion state.
 
-Answers are defaulted and each has a flag and an `--answers` TOML key: node
-name, server/context name, public hostname (used exactly as given, only the
+Answers have a flag and an `--answers` TOML key: workspace name (required on
+fresh setup), node name, server/local context name, public hostname (used exactly as given, only the
 trailing dot is trimmed), external DSN file (owner-only; `EREGION_DATABASE_URL`
 is the environment fallback) and admin user. A terminal is asked only for what
 no flag or answer supplied.
 
 ```toml
 host = "root@203.0.113.10"
+workspace = "lab"
 node = "main"
 context = "prod"
 hostname = "app.example.com"
@@ -1134,6 +1339,53 @@ across workers; River queue concurrency is not that lock. Journal compaction
 does not automatically delete durable effect records. Corruption fails closed.
 
 ## Current application actions
+
+### Webhook activation and replay
+
+`env update --auto-deploy --github-webhook --json` explicitly opts into local
+authenticated gh assistance without displaying the generated HMAC secret.
+`--rotate-webhook-secret --github-webhook` replaces the active secret. Without
+explicit gh assistance, enable/rotation remains a human-terminal flow. This is
+distinct from `--github-auth`, which supplies a repository clone credential.
+
+The canonical environment-update input includes non-secret
+`rotate_webhook_secret` intent. Explicit enable retains its requested intent
+even when the environment is already enabled, so the same key/input can replay
+after the first submission changes current state. Known replay is resolved
+before gh offers/preflight, candidate generation or writes. Dry run performs
+none of those effects. gh preflight verifies local authentication and repository
+admin access before generating a candidate; it is not a guarantee that a later
+GitHub write or signed push will succeed.
+
+The node transport carries candidate bytes only in transient request secrets.
+The shared admission service inserts the operation's unique key before
+activation; only the winning transaction activates a revision through
+`vault.Store.Set(ctx, tx, ...)`. Ciphertext activation, applicable desired-state
+revision, operation/events and River enqueue commit together. A rotation-only
+operation has real rotation semantics without fabricating an unchanged desired
+revision. Plaintext is excluded from canonical input/hash, stored operations,
+events, River arguments and ordinary results. HTTP cannot supply that transient
+channel; a fresh rotation without material is refused.
+
+Concurrent first invocations can prepare candidate bytes after their previews;
+the authoritative admission receipt, not the preview, decides who is fresh.
+A loser activates no candidate and never installs a hook or displays a secret.
+Do not describe this as preventing all concurrent candidate generation.
+
+GitHub installation runs **after** the transaction and outside PostgreSQL using
+stdin, never secret-bearing argv. Only a fresh admission may install or manually
+display the value. A failure after activation returns sanitized partial state
+(`platform_activation`, `secret_rotated`, operation ID when present, and the gh
+result), not a false rollback or a fallback secret display. The same key returns
+the original acceptance and explicitly does not retry/verify hook installation.
+After inspecting state and fixing gh, deliberate recovery is another rotation
+with a **new** key. Hook existence is not proof the current HMAC works, a signed
+push was admitted, or a deployment completed.
+
+This boundary covers explicit enable/rotation. It is not a claim that every
+pre-existing direct-service edit of a webhook secret-name reference verifies
+the existence of an active vault namespace. Use the supported activation flow
+rather than changing names to invent a configured secret.
 
 All use the shared action registry and transactional River submission. Operators
 reach these services through node RPC; the HTTP adapter is not the operator

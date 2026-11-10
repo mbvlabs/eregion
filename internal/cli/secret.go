@@ -42,11 +42,12 @@ func (a *app) secretSpecs() []spec {
 	archiveMeta.Confirmation = "plan-bound"
 	archiveMeta.DryRunReason = "Archival is a CAS-guarded state transition whose current revision is read from metadata."
 
-	exportMeta := secretMeta("Write one secret value to an explicitly protected destination file", "eregion secret export --app api --environment production --name DATABASE_URL --dest /run/secrets/database-url --json")
+	exportMeta := secretMeta("Write one secret value to an explicitly protected destination file", "eregion secret export --app api --environment production --name DATABASE_URL --dest /run/secrets/database-url")
 	exportMeta.Mutating = true
 	exportMeta.Prompts = true
 	exportMeta.InputFlags = []string{"dest"}
 	exportMeta.DryRunReason = "Export writes only to the explicitly named destination; values are never printed, so there is no preview output."
+	exportMeta = terminalOnlyMeta(exportMeta)
 
 	parentMeta := secretMeta("Manage revisioned encrypted secrets", "eregion secret list --app api --environment production --json")
 

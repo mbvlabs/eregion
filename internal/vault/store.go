@@ -185,6 +185,19 @@ func (s *Store) Get(ctx context.Context, namespace Namespace) (Metadata, error) 
 	return metadataQuery(ctx, s.pool, namespace)
 }
 
+// GetTx reads secret-free metadata inside a caller-owned transaction. Secret
+// activation uses this to choose the CAS revision under the same lock order as
+// the subsequent Set.
+func (s *Store) GetTx(ctx context.Context, tx pgx.Tx, namespace Namespace) (Metadata, error) {
+	if tx == nil {
+		return Metadata{}, contract.NewFault(contract.Internal, "secret read has no transaction", "Integrate secret reads through an explicit PostgreSQL transaction.")
+	}
+	if err := namespace.Validate(); err != nil {
+		return Metadata{}, err
+	}
+	return metadataQuery(ctx, tx, namespace)
+}
+
 // List reads secret-free metadata for one environment. Archived namespaces are
 // included so operators can see and rotate them.
 func (s *Store) List(ctx context.Context, app, environment string, limit int) ([]Metadata, error) {

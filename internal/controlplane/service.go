@@ -65,6 +65,10 @@ type Service struct {
 	// secrets resolves environment secret references into transient values. Nil
 	// means referenced secrets fail honestly instead of being injected.
 	secrets SecretResolver
+	// vault seals submission-time webhook secrets in the operation admission
+	// transaction. Nil fails that activation closed; ordinary submissions still
+	// work without a vault.
+	vault *vault.Service
 	// sourceRoots is the symlink-resolved directory-build allowlist.
 	sourceRoots []string
 	// resolveGitRef resolves a git branch or tag to an exact commit before a
@@ -143,7 +147,14 @@ func scanOperation(row pgx.Row) (contract.Operation, error) {
 }
 
 func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contract.Operation, error) {
-	var zero contract.Operation
+	result, err := s.SubmitWithReceipt(ctx, sub)
+	return result.Operation, err
+}
+
+// SubmitWithReceipt returns the authoritative admission receipt. A replay
+// never performs first-submission effects and WebhookSecretActivated is false.
+func (s *Service) SubmitWithReceipt(ctx context.Context, sub operations.Submission) (operations.SubmissionResult, error) {
+	var zero operations.SubmissionResult
 	if err := sub.Actor.Validate(); err != nil {
 		return zero, err
 	}
@@ -151,7 +162,7 @@ func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contra
 		return zero, err
 	}
 	if platform.IsKind(sub.Kind) {
-		return s.submitPlatform(ctx, sub)
+		return s.submitPlatformWithReceipt(ctx, sub)
 	}
 	if sub.Kind != operations.TestKind || sub.Target != operations.TestTarget || sub.Confirmation != "" {
 		return zero, contract.NewFault(contract.ValidationFailed, "unsupported operation or target", "Only diagnostic.test on control-plane is implemented; it needs no confirmation.")
@@ -192,7 +203,11 @@ func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contra
 		if existingHash != inputHash {
 			return zero, idempotencyInputConflict()
 		}
-		return scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
+		op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
+		if err != nil {
+			return zero, unavailable()
+		}
+		return operations.SubmissionResult{Operation: op, Replay: true}, nil
 	}
 	jobID, err := s.enqueue(ctx, tx, id)
 	if err != nil {
@@ -211,7 +226,7 @@ func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contra
 	if err := tx.Commit(ctx); err != nil {
 		return zero, unavailable()
 	}
-	return op, nil
+	return operations.SubmissionResult{Operation: op}, nil
 }
 
 func (s *Service) Get(ctx context.Context, authority operations.Authority, id contract.OperationID) (contract.Operation, error) {

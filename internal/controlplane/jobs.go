@@ -22,6 +22,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 )
@@ -323,6 +324,9 @@ type WorkerConfig struct {
 	// SecretResolver resolves environment secret references at deployment time.
 	// Nil means referenced secrets fail honestly instead of being injected.
 	SecretResolver SecretResolver
+	// Vault seals webhook secrets inside the operation admission transaction.
+	// Nil fails that activation closed; ordinary submissions remain available.
+	Vault *vault.Service
 	// SourceRoots is the directory-build allowlist. Empty uses
 	// EREGION_BUILD_SOURCE_ROOTS (or /srv/eregion/sources).
 	SourceRoots []string
@@ -354,7 +358,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS}
+	service := &Service{pool: pool, secrets: config.SecretResolver, vault: config.Vault, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS}
 	service.redaction = config.Redaction
 	if service.redaction == nil {
 		service.redaction = &secrets.Registry{}

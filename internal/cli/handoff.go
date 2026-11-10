@@ -16,7 +16,9 @@ import (
 	"github.com/mbvlabs/eregion/internal/bundle"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
@@ -186,8 +188,26 @@ func osc52(s string) string {
 
 // handoff builds and delivers the record. Without a terminal the early gate has
 // already required --secrets-out; with one, init waits for 'stored'.
-func (r *serverInit) handoff(_ context.Context, summary *serverInitSummary) error {
+func (r *serverInit) handoff(ctx context.Context, summary *serverInitSummary) error {
 	task := r.start("handoff", "Building the secrets handoff")
+	workspace, err := r.resolveWorkspace(ctx)
+	if err != nil {
+		task.end(ui.EndFail, "")
+		return err
+	}
+	r.workspace = workspace
+	summary.Workspace, summary.WorkspaceID = workspace.Name, workspace.ID
+	if workspace.Configured {
+		r.pending.Workspace, r.pending.WorkspaceID = workspace.Name, workspace.ID
+		if err := r.savePending(); err != nil {
+			task.end(ui.EndFail, "")
+			return err
+		}
+		if err := r.updateContextWorkspace(workspace); err != nil {
+			task.end(ui.EndFail, "")
+			return err
+		}
+	}
 	// Register the actual secrets, not public labels: the JSON summary and
 	// ordinary output stay readable while credentials are redacted.
 	r.a.secrets.Add(r.identity.sudoPassword, r.identity.wg.Encode(), r.identity.sshKeyPEM, r.answers.DatabaseURL, r.vaultKeyring)
@@ -224,6 +244,67 @@ func (r *serverInit) handoff(_ context.Context, summary *serverInitSummary) erro
 	return nil
 }
 
+// updateContextWorkspace stores the verified identity in the local context
+// after the host apply and before the handoff is marked done. A failure keeps
+// the pending phase retryable and never guesses a different identity.
+func (r *serverInit) updateContextWorkspace(workspace controlplane.WorkspaceIdentity) error {
+	store, err := host.LoadContextStore("")
+	if err != nil {
+		return err
+	}
+	_, err = store.SetWorkspace(r.answers.Context, &host.ContextWorkspace{ID: workspace.ID, Name: workspace.Name})
+	return err
+}
+
+// resolveWorkspace reads the authoritative identity from the node before the
+// handoff. It never invents a generated ID locally and refuses a requested name
+// that differs from the database.
+func (r *serverInit) resolveWorkspace(ctx context.Context) (controlplane.WorkspaceIdentity, error) {
+	client, err := r.initNodeClient()
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, err
+	}
+	info, err := client.NodeInfo(ctx)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, err
+	}
+	if info.WorkspaceError != "" {
+		fault := contract.NewFault(contract.Unavailable,
+			"the node workspace identity could not be read: "+info.WorkspaceError,
+			"Check the control database and its migrations on the node, then retry the handoff.")
+		fault.Details = map[string]any{"workspace_error": info.WorkspaceError}
+		return controlplane.WorkspaceIdentity{}, fault
+	}
+	if err := verifyWorkspaceIdentity(r.answers.Workspace, info.Workspace); err != nil {
+		return controlplane.WorkspaceIdentity{}, err
+	}
+	return info.Workspace, nil
+}
+
+// verifyWorkspaceIdentity is the pure handoff/login check: an empty request
+// accepts the node's explicit unconfigured state, while a requested name must
+// match the authoritative configured identity.
+func verifyWorkspaceIdentity(requested string, workspace controlplane.WorkspaceIdentity) error {
+	if requested == "" {
+		return nil
+	}
+	if !workspace.Configured {
+		fault := contract.NewFault(contract.PreconditionFailed,
+			"the node did not record workspace "+requested,
+			"Run eregion apply --workspace "+requested+" on the node, then refresh the protected export with eregion secrets export.")
+		fault.Details = map[string]any{"requested_workspace": requested}
+		return fault
+	}
+	if workspace.Name != requested {
+		fault := contract.NewFault(contract.Conflict,
+			"the node workspace is "+workspace.Name+", not "+requested,
+			"The workspace name and ID are immutable. Resume with --workspace "+workspace.Name+", or restore the intended database.")
+		fault.Details = map[string]any{"configured_workspace": workspace.Name, "requested_workspace": requested}
+		return fault
+	}
+	return nil
+}
+
 func samePath(left, right string) bool {
 	l, err1 := filepath.Abs(expandHome(left))
 	r, err2 := filepath.Abs(expandHome(right))
@@ -234,6 +315,8 @@ func samePath(left, right string) bool {
 // secrets export build the same groups from it.
 type handoffRecordInput struct {
 	NodeName                 string
+	WorkspaceName            string
+	WorkspaceID              string
 	Context                  string
 	Hostname                 string
 	PublicAddress            string
@@ -259,6 +342,8 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 	groups := []handoffGroup{
 		{title: "Main node " + in.NodeName, fields: []handoffField{
 			{"Node name", in.NodeName},
+			{"Workspace", in.WorkspaceName},
+			{"Workspace ID", in.WorkspaceID},
 			{"Context", in.Context},
 			{"Hostname", in.Hostname},
 			{"Public address", in.PublicAddress},
@@ -317,7 +402,8 @@ func (r *serverInit) handoffGroups() []handoffGroup {
 		}
 	}
 	return handoffGroups(handoffRecordInput{
-		NodeName: r.answers.Node, Context: r.answers.Context, Hostname: r.answers.Hostname,
+		NodeName: r.answers.Node, WorkspaceName: r.workspace.Name, WorkspaceID: r.workspace.ID,
+		Context: r.answers.Context, Hostname: r.answers.Hostname,
 		PublicAddress: r.answers.Host, Platform: r.platform.String(), SSHHostKey: r.hostKey,
 		WireGuardEndpoint:    net.JoinHostPort(r.answers.Host, strconv.Itoa(access.ListenPort)),
 		WireGuardNodeAddress: access.NodeAddress, WireGuardNodePublicKey: r.pending.NodePublicKey,

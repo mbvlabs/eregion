@@ -30,13 +30,14 @@ func deleteMeta(summary, example string) CommandMeta {
 	meta.DryRun = true
 	meta.Confirmation = "target"
 	meta.Prompts = true
+	meta.HumanFactor = true
 	meta.InputFlags = []string{"confirm"}
 	return meta
 }
 
 func (a *app) appDeleteSpec() spec {
 	meta := deleteMeta("Delete an application and every environment it owns",
-		"eregion app delete api --confirm api --json")
+		"eregion app delete api --confirm api")
 	meta.WhenToUse = []string{
 		"Remove an app after workload cleanup. The confirmation token must name the current app; --yes is never accepted.",
 		"A real deletion also needs a TOTP code typed at a human terminal (D7). A dry run needs neither the code nor a terminal.",
@@ -44,7 +45,7 @@ func (a *app) appDeleteSpec() spec {
 	}
 	meta.Examples = []string{
 		"eregion app delete api --dry-run --json",
-		"eregion app delete api --confirm api --json",
+		"eregion app delete api --confirm api",
 		"eregion app delete api --confirm api --detach",
 	}
 	meta.Next = []string{"eregion operations list --app <app> --json", "eregion app list --json"}

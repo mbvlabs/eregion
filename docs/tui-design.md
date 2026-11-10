@@ -1,8 +1,8 @@
 # Terminal interface direction
 
 **Design reference, retained for ongoing implementation.** Product scope and
-completion status live in [MASTER](MASTER.md); the current presentation code is
-described in [workspace](workspace.md). This document defines the intended
+contracts live in [MASTER](MASTER.md); Linear tracks execution. Current
+presentation code is described in [workspace](workspace.md). This document defines the intended
 experience, not a claim that every screen or interaction is complete.
 
 Open the [interactive sketches](design/tui-sketches.html) to review the visual

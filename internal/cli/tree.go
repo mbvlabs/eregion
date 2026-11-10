@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/buildinfo"
@@ -68,9 +69,10 @@ func newApp() *app {
 			[]string{"Discover the implemented CLI surface before choosing an operation."},
 			[]string{"eregion commands --json", "eregion --help"}, "eregion commands --json"),
 		run: func(cmd *cobra.Command, _ []string) (result, error) {
+			commands := a.meta.catalog(a.root)
 			return result{
-				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "experimental application platform", "commands": a.meta.catalog(a.root)},
-				plain: "eregion — experimental application platform\n\nAuthenticated platform clients, durable operations, and opt-in terminal workspaces.\nInspect command contracts and dry-run plans before changing host or application state.\n\nNext: eregion commands --json",
+				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "experimental application platform", "commands": commands},
+				plain: a.overview(commands),
 			}, nil
 		},
 	}
@@ -118,7 +120,7 @@ func (a *app) command(s spec) *cobra.Command {
 			if errors.As(err, &fault) {
 				return err
 			}
-			return contract.NewFault(contract.Usage, err.Error(), "Inspect the command with --help --json.")
+			return unknownCommandFault(err.Error(), suggestCommandPaths(cmd, unknownCommandToken(err)))
 		}
 		return nil
 	}
@@ -178,9 +180,11 @@ func (a *app) specs() []spec {
 		},
 		{
 			use:  "commands",
-			meta: readMeta("List implemented commands, flags, and safety metadata", []string{"Discover available commands and their machine-readable contracts. The entire catalog is validated before execution."}, []string{"eregion commands --json", "eregion commands --path version --json"}, "eregion help --json"),
+			meta: readMeta("List implemented commands, flags, and safety metadata", []string{"Discover available commands and their machine-readable contracts. The entire catalog is validated before execution, and discovery never contacts a server or prompts."}, []string{"eregion commands --json", "eregion commands --search deploy", "eregion commands --search rollback --json", "eregion commands --check-meta", "eregion commands --path version --json"}, "eregion help --json"),
 			flags: func(cmd *cobra.Command) {
+				cmd.Flags().Bool("check-meta", false, "Validate every command's metadata and report the result")
 				cmd.Flags().String("path", "", "Restrict discovery to an exact command path, such as version")
+				cmd.Flags().String("search", "", "Search visible command paths, summaries, and examples")
 			},
 			run: a.commands,
 		},
@@ -202,22 +206,96 @@ func (a *app) specs() []spec {
 func (a *app) commands(cmd *cobra.Command, _ []string) (result, error) {
 	commands := a.meta.catalog(a.root)
 	path, _ := cmd.Flags().GetString("path")
-	if cmd.Flags().Changed("path") {
+	search, _ := cmd.Flags().GetString("search")
+	check, _ := cmd.Flags().GetBool("check-meta")
+	pathSet, searchSet := cmd.Flags().Changed("path"), cmd.Flags().Changed("search")
+	active := 0
+	for _, enabled := range []bool{pathSet, searchSet, check} {
+		if enabled {
+			active++
+		}
+	}
+	if active > 1 {
+		return result{}, &contract.Fault{
+			Code:    contract.Usage,
+			Message: "choose only one of --path, --search or --check-meta",
+			Hint:    "Run one discovery mode at a time.",
+			Details: map[string]any{"flags": []string{"--path", "--search", "--check-meta"}},
+		}
+	}
+	if check {
+		report := a.meta.check(a.root)
+		if !report.OK {
+			return result{}, metadataCheckFault(report)
+		}
+		return result{data: report, plain: fmt.Sprintf("Command metadata is complete (%d commands).", report.Checked)}, nil
+	}
+	if searchSet {
+		if strings.TrimSpace(search) == "" {
+			return result{}, &contract.Fault{Code: contract.InputRequired, Message: "--search requires search text", Hint: "Use --search deploy, or omit --search to list all commands.", Details: map[string]any{"flag": "--search"}}
+		}
+		matches := searchCatalog(commands, search)
+		plain := ""
+		if len(matches) > 0 {
+			plain = fmt.Sprintf("Commands matching %q\n\n", strings.TrimSpace(search)) + plainCommandList(matches)
+		}
+		return result{data: map[string]any{"commands": matches}, plain: plain}, nil
+	}
+	if pathSet {
 		if strings.TrimSpace(path) == "" {
 			return result{}, &contract.Fault{Code: contract.InputRequired, Message: "--path requires a command path", Hint: "Use --path version, or omit --path to list all commands.", Details: map[string]any{"flag": "--path"}}
 		}
-		selected, err := a.resolve(strings.Fields(path))
+		target, err := a.resolve(strings.Fields(path))
 		if err != nil {
 			return result{}, err
 		}
-		commands = []Command{a.meta.describe(selected)}
+		commands = []Command{a.meta.describe(target)}
 	}
+	return result{data: map[string]any{"commands": commands}, plain: "Implemented commands (metadata validated)\n\n" + plainCommandList(commands)}, nil
+}
+
+// overview is the no-argument operator map. It is generated from the same
+// catalog as `commands --json`, so it never needs a context, server, or TUI.
+func (a *app) overview(commands []Command) string {
 	var plain strings.Builder
-	plain.WriteString("Implemented commands (metadata validated)\n\n")
+	fmt.Fprintf(&plain, "eregion — experimental application platform\nversion: %s\n\n", buildinfo.Current().Version)
+	plain.WriteString("Top-level commands:\n")
+	children := make([]*cobra.Command, 0, len(a.root.Commands()))
+	for _, child := range a.root.Commands() {
+		if !commandHidden(child) {
+			children = append(children, child)
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].CommandPath() < children[j].CommandPath() })
+	for _, child := range children {
+		visible := 0
+		for _, command := range commands {
+			if command.Path == child.CommandPath() || strings.HasPrefix(command.Path, child.CommandPath()+" ") {
+				visible++
+			}
+		}
+		meta := a.meta[child]
+		if visible > 1 {
+			fmt.Fprintf(&plain, "  %-22s %s (%d commands)\n", child.CommandPath(), meta.Summary, visible)
+		} else {
+			fmt.Fprintf(&plain, "  %-22s %s\n", child.CommandPath(), meta.Summary)
+		}
+	}
+	plain.WriteString("\nOffline discovery:\n")
+	plain.WriteString("  eregion commands --json                 full catalog with flags and safety metadata\n")
+	plain.WriteString("  eregion commands --search TEXT          search paths, summaries and examples\n")
+	plain.WriteString("  eregion commands --check-meta           validate the catalog\n")
+	plain.WriteString("  eregion help <command> --json           one command contract\n")
+	plain.WriteString("\nAccepted work is not completed work: follow the returned operation before reporting success.\n")
+	return plain.String()
+}
+
+func plainCommandList(commands []Command) string {
+	var plain strings.Builder
 	for _, command := range commands {
 		fmt.Fprintf(&plain, "  %-20s %s\n", command.Path, command.Summary)
 	}
-	return result{data: map[string]any{"commands": commands}, plain: plain.String()}, nil
+	return plain.String()
 }
 
 func (a *app) resolve(args []string) (*cobra.Command, error) {
@@ -226,7 +304,18 @@ func (a *app) resolve(args []string) (*cobra.Command, error) {
 	}
 	cmd, remaining, err := a.root.Find(args)
 	if err != nil || len(remaining) != 0 {
-		return nil, contract.NewFault(contract.Usage, "unknown command path", "Discover exact paths with eregion commands --json.")
+		parent := cmd
+		if parent == nil {
+			parent = a.root
+		}
+		token := ""
+		for _, value := range remaining {
+			if !strings.HasPrefix(value, "-") {
+				token = value
+				break
+			}
+		}
+		return nil, unknownCommandFault("unknown command path", suggestCommandPaths(parent, token))
 	}
 	return cmd, nil
 }

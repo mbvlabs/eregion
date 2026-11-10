@@ -23,6 +23,27 @@ type Submission struct {
 	// the submission transaction. It is never persisted in the operation input,
 	// events or River arguments. HTTP submissions leave it empty.
 	HumanFactor string `json:"-"`
+	// WebhookSecret is transient request data for an environment update that
+	// enables or rotates push-to-deploy. It is sealed into the vault inside the
+	// winning submission transaction and never enters operation input, its
+	// canonical hash, events or River arguments. HTTP submissions leave it empty.
+	WebhookSecret []byte `json:"-"`
+}
+
+// SubmissionResult reports the authoritative admission outcome. Replay is true
+// only when an existing operation owns the idempotency key; callers must not
+// perform first-submission effects such as hook installation in that case.
+type SubmissionResult struct {
+	Operation              contract.Operation `json:"operation"`
+	Replay                 bool               `json:"replay,omitempty"`
+	WebhookSecretActivated bool               `json:"webhook_secret_activated,omitempty"`
+}
+
+// AtomicSubmitter is implemented by services that can also return the
+// admission receipt without a second database read. Submit remains the
+// operation-only compatibility surface.
+type AtomicSubmitter interface {
+	SubmitWithReceipt(context.Context, Submission) (SubmissionResult, error)
 }
 
 type EventPage struct {

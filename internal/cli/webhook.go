@@ -3,39 +3,46 @@ package cli
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
-	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/spf13/cobra"
 )
 
-// defaultWebhookSecretName is the vault name used when a revision does not
-// record one. The name, never the value, is part of the revision.
-const defaultWebhookSecretName = "EREGION_WEBHOOK_SECRET"
-
-// webhookUpdate is the push-to-deploy part of env update. The secret is kept
-// out of the revision and shown once at a terminal unless gh installed it.
+// webhookUpdate is the push-to-deploy part of env update. The candidate secret
+// is transient request data until a fresh admission seals it; it is shown once
+// only on the manual human-terminal path.
 type webhookUpdate struct {
 	// Enabled is nil when --auto-deploy was not passed.
-	Enabled        *bool
-	SecretName     string
-	Secret         []byte
-	URL            string
-	Branch         string
-	Repository     string
-	AlreadyEnabled bool
-	Rotated        bool
+	Enabled    *bool
+	SecretName string
+	Secret     []byte
+	URL        string
+	Branch     string
+	Repository string
+	Rotated    bool
+	// NeedsSecret reports that a fresh enable or rotation needs a candidate
+	// secret. Generation waits for replay resolution and gh preflight.
+	NeedsSecret bool
+	// Replay marks an authoritative idempotent admission: the original operation
+	// already installed every effect, so no secret is generated, printed or
+	// installed and the hook is not retried or verified.
+	Replay bool
 	// GitHub opts in to creating or updating the repository webhook with an
 	// authenticated gh CLI. The secret still travels only on stdin.
 	GitHub bool
+	// GitHubAccess is the preflight result reused by the post-admission
+	// installer so it does not repeat an unverified access decision.
+	GitHubAccess githubWebhookAccess
 }
 
 // readWebhookUpdate validates --auto-deploy/--rotate-webhook-secret against
 // the current revision and the effective source after the other update flags.
-// It generates a secret only for a real (non-dry-run) enable or rotation.
+// It records that an effectful enable or rotation needs a secret but never
+// generates one; replay detection and gh preflight must resolve first.
 func (a *app) readWebhookUpdate(cmd *cobra.Command, appName, environment string, current platform.Environment, patch platform.EnvironmentUpdateInput) (webhookUpdate, error) {
 	update := webhookUpdate{GitHub: boolFlag(cmd, "github-webhook")}
 	autoSet := flagChanged(cmd, "auto-deploy")
@@ -73,23 +80,7 @@ func (a *app) readWebhookUpdate(cmd *cobra.Command, appName, environment string,
 	if rotate && (!currentEnabled || currentName == "") {
 		return update, contract.NewFault(contract.PreconditionFailed, "push to deploy is not enabled, so there is no secret to rotate", "Enable it with eregion env update "+appName+" "+environment+" --auto-deploy.")
 	}
-	if autoSet && enabled && !rotate && currentEnabled && currentName != "" {
-		update.Enabled = nil
-		update.AlreadyEnabled = true
-		update.SecretName = currentName
-		update.Branch = strings.TrimPrefix(strings.TrimSpace(source.Ref), "refs/heads/")
-		update.Repository, _ = platform.GitHubRepository(source.URL)
-		url, err := a.webhookURL(cmd, appName, environment)
-		if err != nil {
-			return update, err
-		}
-		update.URL = url
-		return update, nil
-	}
-	if !dryRun(cmd) && !humanInteractive(cmd) {
-		return update, contract.NewFault(contract.InputRequired, "enabling or rotating push to deploy needs a human at a terminal",
-			"Run it yourself in a terminal, without --json, --yes, or a pipe: the generated secret is shown once and cannot be recovered.")
-	}
+	needsSecret := rotate || (autoSet && enabled && (!currentEnabled || currentName == ""))
 	if source.Kind != "git" {
 		return update, contract.NewFault(contract.PreconditionFailed, "push to deploy needs a git source", "Set a git source with --git-url and a branch ref first.")
 	}
@@ -108,22 +99,76 @@ func (a *app) readWebhookUpdate(cmd *cobra.Command, appName, environment string,
 	update.URL = url
 	update.SecretName = currentName
 	if update.SecretName == "" {
-		update.SecretName = defaultWebhookSecretName
+		update.SecretName = platform.DefaultWebhookSecretName
 	}
 	update.Branch, update.Repository = branch, repository
 	update.Rotated = rotate
-	if !dryRun(cmd) {
-		secret, err := newWebhookSecret()
-		if err != nil {
-			return update, err
-		}
-		update.Secret = secret
-	}
+	update.NeedsSecret = needsSecret
+	// A dry run describes the effect but must not generate, preflight or store
+	// a secret; prepare handles that after authoritative replay resolution.
 	return update, nil
+}
+
+// generateWebhookSecret is a test seam for proving that replay and dry-run
+// paths never generate a candidate.
+var generateWebhookSecret = newWebhookSecret
+
+// prepareWebhookUpdate resolves replay, preflights gh when the operator chose
+// it, and only then generates the candidate secret. A preflight failure
+// therefore leaves generation, the vault, desired state and repository
+// untouched. On a known replay it performs none of those interactions.
+func (a *app) prepareWebhookUpdate(cmd *cobra.Command, update *webhookUpdate, replay bool) error {
+	if update == nil {
+		return nil
+	}
+	update.Replay = replay
+	if replay || dryRun(cmd) {
+		return nil
+	}
+	if !update.GitHub && update.NeedsSecret && webhookHumanInteractive(cmd) {
+		if err := a.offerGitHubWebhook(cmd, update); err != nil {
+			return err
+		}
+	}
+	if err := a.preflightWebhookUpdate(cmd, update); err != nil {
+		return err
+	}
+	if !update.NeedsSecret {
+		return nil
+	}
+	if !update.GitHub && !webhookHumanInteractive(cmd) {
+		// readWebhookUpdate already refused this; keep the guard at the point
+		// where a secret would be created in case a caller reaches it another way.
+		return contract.NewFault(contract.InputRequired, "generating a push-to-deploy secret needs a human at a terminal or an explicit --github-webhook",
+			"Run it yourself in a terminal, or add --github-webhook with an authenticated gh.")
+	}
+	secret, err := generateWebhookSecret()
+	if err != nil {
+		return err
+	}
+	update.Secret = secret
+	return nil
+}
+
+// preflightWebhookUpdate verifies the exact repository's admin permission
+// before an effectful run. Callers that already know a replay may skip it.
+func (a *app) preflightWebhookUpdate(cmd *cobra.Command, update *webhookUpdate) error {
+	if update == nil || !update.GitHub || update.GitHubAccess.OK || dryRun(cmd) || update.Replay {
+		return nil
+	}
+	access := inspectGitHubWebhookAccess(cmd.Context(), update.Repository)
+	if !access.OK {
+		return githubWebhookPreflightFault(access)
+	}
+	update.GitHubAccess = access
+	return nil
 }
 
 // applyWebhookPatch puts the push-to-deploy fields into the revision patch.
 func applyWebhookPatch(patch *platform.EnvironmentUpdateInput, update webhookUpdate) {
+	if update.Rotated {
+		patch.RotateWebhookSecret = true
+	}
 	if update.Enabled == nil {
 		return
 	}
@@ -132,24 +177,60 @@ func applyWebhookPatch(patch *platform.EnvironmentUpdateInput, update webhookUpd
 	patch.WebhookSecretName = &name
 }
 
-// writeWebhookSecret stores the generated secret before the revision names it.
-func (a *app) writeWebhookSecret(cmd *cobra.Command, appName, environment string, update webhookUpdate) error {
-	if len(update.Secret) == 0 {
-		return nil
-	}
-	namespace, err := vault.NewNamespace(appName, environment, update.SecretName)
+// submitWebhookUpdate submits the canonical environment intent and a transient
+// candidate secret through the protected node request. The returned receipt is
+// authoritative: only a fresh admission may print a secret or run gh. The CLI
+// generates the candidate only after a non-replay preview; an unknown
+// concurrent loser may have generated one, but it cannot activate or install it
+// and the replay receipt reports that the candidate was discarded. Known
+// replays never generate. This is the accepted alternative to returning a
+// server-generated secret through the transport.
+func (a *app) submitWebhookUpdate(cmd *cobra.Command, appName, environment string, patch platform.EnvironmentUpdateInput, update webhookUpdate) (contract.Operation, submissionReceipt, error) {
+	var zero contract.Operation
+	client, err := a.client(cmd)
 	if err != nil {
-		return err
+		return zero, submissionReceipt{}, err
 	}
-	a.registerSecretValue(update.Secret)
-	_, err = a.putSecret(cmd, namespace, update.Secret)
-	return err
+	submitter, ok := client.(webhookSubmitter)
+	if !ok {
+		return zero, submissionReceipt{}, contract.NewFault(contract.Unavailable,
+			"this client cannot submit a webhook secret atomically",
+			"Use a matching released CLI and node binary; do not retry through a preview-only path.")
+	}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return zero, submissionReceipt{}, contract.NewFault(contract.Internal, "could not encode the environment update", "Report the command and binary version.")
+	}
+	secrets := map[string]string{}
+	if len(update.Secret) > 0 {
+		a.registerSecretValue(update.Secret)
+		secrets[rpcWebhookSecretKey] = base64Encode(update.Secret)
+	}
+	key := flagString(cmd, "idempotency-key")
+	if key == "" {
+		key = "cli:" + strings.TrimPrefix(platform.KindEnvironmentUpdate, "platform.") + ":" + randomHex(8)
+	}
+	if err := contract.ValidateIdempotencyKey(key); err != nil {
+		return zero, submissionReceipt{}, err
+	}
+	data, receipt, err := submitter.SubmitWebhookAction(cmd.Context(), platform.KindEnvironmentUpdate,
+		"env/"+appName+"/"+environment, raw, key, "", false, secrets)
+	if err != nil {
+		return zero, submissionReceipt{}, err
+	}
+	var op contract.Operation
+	if json.Unmarshal(data, &op) != nil || op.Validate() != nil ||
+		op.Kind != platform.KindEnvironmentUpdate || op.Target != "env/"+appName+"/"+environment {
+		return zero, submissionReceipt{}, invalidNodeData("accepted operation")
+	}
+	return op, receipt, nil
 }
 
-// printWebhookOnce shows the URL and secret on stderr. The result envelope
-// never contains the secret.
+// printWebhookOnce shows the URL and secret on stderr only for the manual
+// human-terminal path. The result envelope and machine/gh paths never contain
+// the secret, and a gh failure never falls back to printing it.
 func printWebhookOnce(cmd *cobra.Command, update webhookUpdate) {
-	if len(update.Secret) == 0 {
+	if update.Replay || update.GitHub || !webhookHumanInteractive(cmd) || len(update.Secret) == 0 {
 		return
 	}
 	action := "Enabling push to deploy"

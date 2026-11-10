@@ -18,6 +18,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/buildinfo"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/telemetry"
@@ -47,13 +48,13 @@ const (
 func (a *app) serverSpecs() []spec {
 	parent := readMeta("Set up and manage eregion servers",
 		[]string{"Set up a fresh Debian 13 or Ubuntu 26.04 server as an eregion main node. The operator CLI runs on Linux or macOS; the node receives a matching linux binary."},
-		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --hostname app.example.com --database-url-file /root/eregion-db.url --context-name prod --accept-new-host-key --secrets-out ./prod-secrets.md --confirm prod --json"})
+		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --workspace thelab --hostname app.example.com --database-url-file /root/eregion-db.url --context-name prod --accept-new-host-key --secrets-out ./prod-secrets.md --confirm prod --json"})
 	parent.Platforms = []string{"linux", "darwin"}
 	meta := parent
 	meta.Summary = "Set up a fresh server as the main node (control plane)"
 	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass every answer, a host key decision, --secrets-out and --confirm <server>; JSON and no-TTY use never prompt."}
 	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
-	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "hostname", "database-url-file", "context-name", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm", "skip-doctor"}
+	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "workspace", "hostname", "database-url-file", "context-name", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm", "skip-doctor"}
 	meta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_CONTEXT_FILE"}
 	meta.NeedsRestart = "never"
 	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.DoctorFailed, contract.ConfirmationRequired, contract.MissingTool, contract.RemoteUnreachable, contract.NotFound)
@@ -70,6 +71,7 @@ func (a *app) serverSpecs() []spec {
 				f.String("identity", "", "SSH private key for first contact; default: ssh-agent and ~/.ssh keys")
 				f.Bool("password-stdin", false, "Read the root SSH password from the first line of standard input")
 				f.String("node", "", "Main node name (default main)")
+				f.String("workspace", "", "Portable workspace name (e.g. thelab); separate from the node and local context")
 				f.String("hostname", "", "Public hostname of the main node, used exactly as given (e.g. app.example.com)")
 				f.String("database-url-file", "", "External PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
 				f.String("context-name", "", "Server and local context name (default: the node name)")
@@ -99,6 +101,7 @@ type serverInitAnswers struct {
 	Identity        string
 	PasswordStdin   bool
 	Node            string
+	Workspace       string
 	Hostname        string
 	DatabaseURLFile string
 	DatabaseURL     string
@@ -109,6 +112,8 @@ type serverInitAnswers struct {
 type serverInitSummary struct {
 	Server        string         `json:"server"`
 	Node          string         `json:"node"`
+	Workspace     string         `json:"workspace,omitempty"`
+	WorkspaceID   string         `json:"workspace_id,omitempty"`
 	Platform      string         `json:"platform"`
 	Hostname      string         `json:"hostname"`
 	Context       string         `json:"context"`
@@ -148,6 +153,13 @@ type serverInit struct {
 	operationID  string
 	vaultKeyring string
 	warnings     []string
+	// workspace is the authoritative identity read from the node before the
+	// handoff. The generated ID is never invented locally.
+	workspace controlplane.WorkspaceIdentity
+	// workspaceOptional allows resuming a pre-alpha.7 unfinished init that has
+	// no workspace answer; it stays explicitly unconfigured rather than
+	// guessing a name.
+	workspaceOptional bool
 	// metricsCredential is loaded or generated after WireGuard access exists.
 	// The node receives only its bcrypt hash.
 	metricsCredential *telemetry.Credential
@@ -189,6 +201,12 @@ func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error)
 		return result{data: summary, streamed: true}, nil
 	}
 	plain := "server " + summary.Server + " is ready; context " + summary.Context + " is current"
+	if summary.Workspace != "" {
+		plain += "; workspace " + summary.Workspace
+		if summary.WorkspaceID != "" {
+			plain += " (" + summary.WorkspaceID + ")"
+		}
+	}
 	if boolFlag(cmd, "discard") {
 		plain = "dropped the unfinished init of " + summary.Server
 		if summary.DryRun {
@@ -222,14 +240,14 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	if r.pending.Done(phaseHandoff) {
 		_ = host.RemovePending(r.answers.Context)
 		return serverInitSummary{
-			Server: r.answers.Context, Node: r.answers.Node, Context: r.answers.Context,
-			Hostname: r.answers.Hostname, AdminUser: r.answers.AdminUser,
+			Server: r.answers.Context, Node: r.answers.Node, Workspace: r.pending.Workspace, WorkspaceID: r.pending.WorkspaceID,
+			Context: r.answers.Context, Hostname: r.answers.Hostname, AdminUser: r.answers.AdminUser,
 			PublicAddress: r.answers.Host, Platform: r.platform.String(), Resumed: boolFlag(r.cmd, "resume"),
 		}, nil
 	}
 	summary := serverInitSummary{
-		Server: r.answers.Context, Node: r.answers.Node, Context: r.answers.Context,
-		Hostname: r.answers.Hostname, AdminUser: r.answers.AdminUser,
+		Server: r.answers.Context, Node: r.answers.Node, Workspace: r.answers.Workspace, WorkspaceID: r.pending.WorkspaceID,
+		Context: r.answers.Context, Hostname: r.answers.Hostname, AdminUser: r.answers.AdminUser,
 		PublicAddress: r.answers.Host, Resumed: boolFlag(r.cmd, "resume"),
 	}
 	if r.dryRun {
@@ -307,6 +325,14 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 
 	// Plan, then confirm, before any host change.
 	if !r.pending.Done(phaseHost) {
+		// A resume may have supplied the workspace on this invocation after
+		// first contact was already recorded; persist it before an apply so a
+		// later resume cannot silently fall back to unconfigured.
+		if r.answers.Workspace != "" && r.pending.Workspace != r.answers.Workspace {
+			if err := r.savePending(); err != nil {
+				return err
+			}
+		}
 		if err := r.ensureRootConnection(ctx); err != nil {
 			return err
 		}
@@ -437,6 +463,44 @@ func (r *serverInit) prepare() error {
 			return err
 		}
 		r.pending = pending
+		if v := flagString(r.cmd, "workspace"); v != "" {
+			if err := host.ValidateWorkspaceName(v); err != nil {
+				return err
+			}
+			if pending.Workspace != "" {
+				if pending.Workspace != v {
+					fault := contract.NewFault(contract.Conflict,
+						"the unfinished init already requested workspace "+pending.Workspace,
+						"Resume with --workspace "+pending.Workspace+", or discard the unfinished init before choosing another workspace.")
+					fault.Details = map[string]any{"pending_workspace": pending.Workspace, "requested_workspace": v}
+					return fault
+				}
+				// The same persisted answer is a replay, including after the
+				// host phase completed.
+			} else {
+				if pending.Done(phaseHost) {
+					fault := contract.NewFault(contract.PreconditionFailed,
+						"the unfinished init already applied its host plan without a workspace; a workspace cannot be introduced on resume",
+						"Finish it with eregion server init --resume without --workspace, then run eregion apply --workspace "+v+" and refresh the protected export.")
+					fault.Details = map[string]any{"requested_workspace": v}
+					return fault
+				}
+				pending.Workspace = v
+				// A preview keeps the choice in memory only. Real execution
+				// must persist before effects even when contact and secrets
+				// are already complete and execute will not save them again.
+				if !dryRun(r.cmd) {
+					if err := pending.Save(); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if pending.Workspace == "" {
+			// Pre-alpha.7 unfinished init: continue explicitly unconfigured
+			// rather than inventing an identity from the context name.
+			r.workspaceOptional = true
+		}
 		r.answers = answersFromPending(pending)
 		if v := flagString(r.cmd, "identity"); v != "" {
 			r.answers.Identity = v
@@ -497,7 +561,7 @@ func answersFromPending(p *host.PendingInit) serverInitAnswers {
 	}
 	return serverInitAnswers{
 		Host: p.Host, User: p.User, Port: strconv.Itoa(port), Identity: p.Identity,
-		Node: p.Node, Context: p.Context, Hostname: p.Hostname,
+		Node: p.Node, Workspace: p.Workspace, Context: p.Context, Hostname: p.Hostname,
 		DatabaseURLFile: p.DatabaseURLFile, AdminUser: p.AdminUser,
 	}
 }
@@ -540,6 +604,7 @@ func (r *serverInit) collect() error {
 	take("host", "host", &ans.Host)
 	take("identity", "identity", &ans.Identity)
 	take("node", "node", &ans.Node)
+	take("workspace", "workspace", &ans.Workspace)
 	take("hostname", "hostname", &ans.Hostname)
 	take("database_url_file", "database-url-file", &ans.DatabaseURLFile)
 	take("context", "context-name", &ans.Context)
@@ -619,6 +684,16 @@ func (r *serverInit) collect() error {
 		}
 		ans.Node = v
 	}
+	if ans.Workspace == "" {
+		if !r.interactive {
+			return contract.NewFault(contract.InputRequired, "a new setup needs --workspace NAME", "Pass --workspace thelab. The workspace is portable identity, separate from --node and --context-name.")
+		}
+		v, err := ui.Input("Workspace name", "Portable installation identity, for example thelab; separate from the node and local context", "")
+		if err != nil {
+			return err
+		}
+		ans.Workspace = strings.TrimSpace(v)
+	}
 	if !given["admin_user"] && r.interactive {
 		v, err := ui.Input("Admin user", "The unprivileged operator account", ans.AdminUser)
 		if err != nil {
@@ -630,6 +705,7 @@ func (r *serverInit) collect() error {
 	if r.interactive {
 		r.live.Println(ui.Answered("Server", ans.User+"@"+ans.address()))
 		r.live.Println(ui.Answered("Node", ans.Node))
+		r.live.Println(ui.Answered("Workspace", ans.Workspace))
 		r.live.Println(ui.Answered("Context", ans.Context))
 		r.live.Println(ui.Answered("Public hostname", ans.Hostname))
 		r.live.Println(ui.Answered("Admin user", ans.AdminUser))
@@ -657,6 +733,14 @@ func (r *serverInit) validate() error {
 	}
 	if err := host.ValidateNodeName(ans.Node); err != nil {
 		return err
+	}
+	if ans.Workspace == "" && !r.workspaceOptional {
+		return contract.NewFault(contract.InputRequired, "a new setup needs a workspace name", "Pass --workspace thelab. Existing alpha.6 installations use eregion apply --workspace instead.")
+	}
+	if ans.Workspace != "" {
+		if err := host.ValidateWorkspaceName(ans.Workspace); err != nil {
+			return err
+		}
 	}
 	if err := host.ValidateAccountName(ans.AdminUser); err != nil {
 		return err
@@ -944,6 +1028,7 @@ func (r *serverInit) resolveNodeBinary(ctx context.Context) error {
 func (r *serverInit) hostConfig() (host.Config, error) {
 	cfg := host.DefaultConfig(host.RoleMain, r.answers.Node)
 	cfg.DatabaseURL = r.answers.DatabaseURL
+	cfg.Workspace = r.answers.Workspace
 	cfg.Hostname = r.answers.Hostname
 	cfg.AdminUser = r.answers.AdminUser
 	cfg.BinaryPath = r.binaryPath
@@ -1115,7 +1200,12 @@ func (r *serverInit) savePending() error {
 	if n, err := strconv.Atoi(r.answers.Port); err == nil {
 		p.Port = n
 	}
-	p.Node, p.Hostname = r.answers.Node, r.answers.Hostname
+	workspace := r.answers.Workspace
+	if r.workspace.Configured {
+		workspace = r.workspace.Name
+		p.WorkspaceID = r.workspace.ID
+	}
+	p.Node, p.Workspace, p.Hostname = r.answers.Node, workspace, r.answers.Hostname
 	p.DatabaseURLFile, p.AdminUser = r.answers.DatabaseURLFile, r.answers.AdminUser
 	if r.hostKey != "" {
 		p.HostKey = r.hostKey
@@ -1321,6 +1411,9 @@ func (r *serverInit) showPlan(plan host.Plan) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "server        %s (%s)\n", r.answers.Context, r.answers.Host)
 	fmt.Fprintf(&b, "node          %s\n", r.answers.Node)
+	if r.answers.Workspace != "" {
+		fmt.Fprintf(&b, "workspace     %s (portable identity)\n", r.answers.Workspace)
+	}
 	fmt.Fprintf(&b, "hostname      %s\n", r.answers.Hostname)
 	fmt.Fprintf(&b, "admin user    %s\n", r.answers.AdminUser)
 	fmt.Fprintf(&b, "node binary   %s\n", r.binaryPath)
@@ -1679,14 +1772,22 @@ func (r *serverInit) finish(s serverInitSummary) {
 		return
 	}
 	rows := [][2]string{
-		{"server", s.Server},
+		{"context", s.Server},
 		{"node", s.Node},
-		{"hostname", s.Hostname},
-		{"platform", s.Platform},
-		{"admin user", s.AdminUser},
-		{"route", s.API},
-		{"database", "external PostgreSQL"},
 	}
+	if s.Workspace != "" {
+		rows = append(rows, [2]string{"workspace", s.Workspace})
+	}
+	if s.WorkspaceID != "" {
+		rows = append(rows, [2]string{"workspace id", s.WorkspaceID})
+	}
+	rows = append(rows,
+		[2]string{"hostname", s.Hostname},
+		[2]string{"platform", s.Platform},
+		[2]string{"admin user", s.AdminUser},
+		[2]string{"route", s.API},
+		[2]string{"database", "external PostgreSQL"},
+	)
 	if s.Telemetry != "" {
 		rows = append(rows, [2]string{"telemetry", s.Telemetry})
 	}

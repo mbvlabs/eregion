@@ -3,9 +3,10 @@
 ## Read first
 
 Read `docs/MASTER.md`, then `docs/IMPLEMENTATION.md`. Use
-`docs/MANUAL-TESTING.md` for acceptance and evidence. MASTER is the only product
-status and work-list authority; focused references explain mechanisms, not
-separate plans.
+`docs/MANUAL-TESTING.md` for acceptance and evidence. MASTER owns product vision,
+scope and decisions; Linear owns actionable work and execution status in the
+[Eregion project](https://linear.app/mbvlabs/project/eregion-2ff1d2e4d199).
+Focused references explain mechanisms, not competing work lists.
 
 For terminal/UI work also read `docs/tui-design.md`. Keep it and its interactive
 sketches as the design reference; `docs/workspace.md` describes current views.
@@ -15,10 +16,12 @@ sketches as the design reference; `docs/workspace.md` describes current views.
   conventions, and the release model come from `../vaire`. Inspect the relevant
   source, not just their READMEs. Do not copy vaire's database-specific
   architecture wholesale.
-- No milestone tree, parallel plan or new handoff/spec document by default.
-  Update the existing three core docs. Old plans are available in Git history;
-  they are not active instructions. Root `scratchpad.md` is an ignored historical
-  session log, not current requirements or authorization.
+- No milestone tree, parallel work list or new handoff/spec document by default.
+  Keep product contracts and mechanisms in the existing core docs; track specific
+  implementation tasks and qualification blockers in Linear. Old plans are
+  available in Git history; they are not active instructions. Root
+  `scratchpad.md` is an ignored historical session log, not current requirements
+  or authorization.
 
 ## Product rules
 
@@ -37,13 +40,19 @@ sketches as the design reference; `docs/workspace.md` describes current views.
 - A submission is accepted, not completed. A domain binding is desired state,
   not proof of an applied route, valid TLS or a reachable application.
 - Do not add fleet/HA/backup scope to evade finishing the alpha app workflow.
+  Durable application data belongs in external services under the current
+  recovery policy; managed local volumes are expendable, never implicitly backed
+  up by the control database. Before RC, document replacement-VPS recovery
+  prerequisites and unsupported gaps. No backup product or live recovery
+  rehearsal is implied by that documentation gate.
 - Release model (MASTER D14): `master` is edge, `1.x` is the v1 line, alphas are
   `v1.0.0-alpha.N`. Never cut a branch or push a tag without the user.
 
 ## Implement and verify
 
-- Work through MASTER's ordered outcomes, completing a user-visible flow rather
-  than isolated handlers. Record implementation and manual qualification separately.
+- Work through the approved scope and its Linear tasks, completing a user-visible
+  flow rather than isolated handlers. Repository product decisions constrain the
+  implementation. Record implementation and manual qualification separately.
 - Fix root causes in the release; do not add ad-hoc repair commands as substitutes.
 - Add isolated unit/regression tests, build and vet. No new Docker, Incus or
   scratch-VM harnesses. Host qualification is manual on an authorized real server.

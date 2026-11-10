@@ -252,11 +252,12 @@ func (a *app) logger(cmd *cobra.Command) *slog.Logger {
 func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, *controlplane.Runtime, extensionRuntime, func(), error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
 	defer cancel()
+	logger := a.logger(cmd)
 	pool, err := a.database(ctx)
 	if err != nil {
 		return nil, nil, extensionRuntime{}, nil, err
 	}
-	if err := controlplane.Ready(ctx, pool); err != nil {
+	if err := controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(controlplane.NewReadinessLog(logger))); err != nil {
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
@@ -287,7 +288,6 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 			nodeTransport = local
 		}
 	}
-	logger := a.logger(cmd)
 	// One resolver serves extension dispatch and the worker. Sharing it keeps
 	// one transport cache and one WireGuard key lock per node.
 	nodes := controlplane.NewNodeResolver(pool, a.fleetResolverConfig(logger), func() node.Transport { return nodeTransport })
@@ -301,6 +301,7 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int) (*pgxpool.Pool, 
 	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
+		Vault:         parts.Vault,
 		LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		Nodes:         a.fleetResolverConfig(logger), Resolver: nodes, Redaction: a.secrets,
 		DomainDNS: parts.DomainDNS,
@@ -554,7 +555,10 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 		}()
 	}
 	logger := a.logger(cmd)
-	base := api.NewHandler(auth, run.Service, func(ctx context.Context) error { return controlplane.Ready(ctx, pool) })
+	readyLog := controlplane.NewReadinessLog(logger)
+	base := api.NewHandler(auth, run.Service, func(ctx context.Context) error {
+		return controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(readyLog))
+	})
 	handler, err := a.buildMux(cmd, logger, auth, base, run.Service, parts)
 	if err != nil {
 		return result{}, err

@@ -40,10 +40,15 @@ type PendingInit struct {
 	Identity           string `json:"identity,omitempty"`
 	HostKeyFingerprint string `json:"host_key_fingerprint,omitempty"`
 	Node               string `json:"node"`
-	Context            string `json:"context"`
-	Hostname           string `json:"hostname"`
-	DatabaseURLFile    string `json:"database_url_file,omitempty"`
-	AdminUser          string `json:"admin_user"`
+	// Workspace is the requested portable identity; WorkspaceID is filled from
+	// the authoritative database read before the handoff. Neither is guessed
+	// from the context or node name.
+	Workspace       string `json:"workspace,omitempty"`
+	WorkspaceID     string `json:"workspace_id,omitempty"`
+	Context         string `json:"context"`
+	Hostname        string `json:"hostname"`
+	DatabaseURLFile string `json:"database_url_file,omitempty"`
+	AdminUser       string `json:"admin_user"`
 	// Facts learned during init, so --resume does not need first contact.
 	PublicIPv4    string `json:"public_ipv4,omitempty"`
 	Platform      string `json:"platform,omitempty"`

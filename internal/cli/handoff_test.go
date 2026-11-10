@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/transport"
 )
@@ -26,11 +27,14 @@ func TestHandoffGroupsCarryEverythingLoginNeeds(t *testing.T) {
 		hostKey:      "ssh-ed25519 SHA256:host",
 		vaultKeyring: `{"format":"eregion/vault-keyring/v1"}`,
 		platform:     host.Platform{ID: "debian", VersionID: "13", PrettyName: "Debian 13", Arch: "amd64"},
+		workspace:    controlplane.WorkspaceIdentity{Configured: true, ID: "ws_0123456789abcdef01234567", Name: "thelab"},
 	}
 	h := &secretsHandoff{node: "prod", groups: init.handoffGroups()}
 	rec := parseHandoffRecord(h.body())
 	for _, want := range []struct{ section, label, value string }{
 		{"Main node", "Context", "prod"},
+		{"Main node", "Workspace", "thelab"},
+		{"Main node", "Workspace ID", "ws_0123456789abcdef01234567"},
 		{"Main node", "WireGuard endpoint", "203.0.113.10:51820"},
 		{"Main node", "WireGuard address", "10.78.0.1"},
 		{"Main node", "WireGuard public key", "node-public-key"},

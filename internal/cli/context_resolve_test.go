@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/transport"
@@ -184,9 +185,10 @@ func TestServerInitRefusesADisagreeingContext(t *testing.T) {
 	cmd.Flags().String("host", "", "")
 	cmd.Flags().String("hostname", "", "")
 	cmd.Flags().String("context-name", "", "")
+	cmd.Flags().String("workspace", "", "")
 	cmd.PersistentFlags().String("context", "", "")
 	for name, value := range map[string]string{
-		"host": "root@203.0.113.10", "hostname": "app.example.com", "context-name": "main", "context": "other",
+		"host": "root@203.0.113.10", "hostname": "app.example.com", "context-name": "main", "workspace": "thelab", "context": "other",
 	} {
 		flags := cmd.Flags()
 		if name == "context" {
@@ -337,11 +339,14 @@ func TestHandoffExportUsesTheSelectedContextIdentity(t *testing.T) {
 	exported := rpcHandoffExportResult{
 		Node: "b", Hostname: "b.example.com", Platform: "debian/amd64", SSHHostKey: "ssh-ed25519 AAAA",
 		DatabaseURL: "postgres://b", VaultKeyring: "vault-keyring-b",
+		Workspace: controlplane.WorkspaceIdentity{Configured: true, ID: "ws_0123456789abcdef01234567", Name: "thelab"},
 	}
 	input := handoffExportInput(identity, exported)
 	for name, pair := range map[string][2]string{
 		"context":             {input.Context, "b"},
 		"node":                {input.NodeName, "b"},
+		"workspace":           {input.WorkspaceName, "thelab"},
+		"workspace id":        {input.WorkspaceID, "ws_0123456789abcdef01234567"},
 		"hostname":            {input.Hostname, "b.example.com"},
 		"public address":      {input.PublicAddress, "198.51.100.20"},
 		"wireguard endpoint":  {input.WireGuardEndpoint, "198.51.100.20:51820"},

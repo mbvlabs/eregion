@@ -137,6 +137,7 @@ func (a *app) envProtectionSpec(protected bool) spec {
 	meta := followingMeta(operationMeta(summary, example))
 	meta.Mutating, meta.DryRun = true, true
 	meta.Prompts = !protected
+	meta.HumanFactor = !protected
 	meta.InputFlags = []string{"detach"}
 	meta.WhenToUse = when
 	meta.Next = []string{"eregion env status <app> <environment> --json", "eregion env delete <app> <environment> --confirm <app>/<environment>"}
@@ -471,13 +472,20 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 			clearBytes(credential)
 			return result{}, err
 		}
-		if err := a.offerGitHubWebhook(cmd, &webhook); err != nil {
-			clearBytes(credential)
-			return result{}, setupPromptError("env update", err)
-		}
 		applyWebhookPatch(&patch, webhook)
 		if webhook.Enabled != nil {
-			changed = append(changed, "auto_deploy")
+			enabled := *webhook.Enabled
+			currentAutoDeploy := current.Revision != nil && current.Revision.AutoDeploy
+			currentName := ""
+			if current.Revision != nil {
+				currentName = current.Revision.WebhookSecretName
+			}
+			if current.Revision == nil || currentAutoDeploy != enabled || (enabled && currentName != webhook.SecretName) {
+				changed = append(changed, "auto_deploy")
+			}
+		}
+		if webhook.Rotated {
+			changed = append(changed, "webhook_secret_rotation")
 		}
 	}
 	defer func() { clearBytes(credential) }()
@@ -498,18 +506,17 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 			return result{}, err
 		}
 	}
-	rotateOnly := webhook.Rotated && len(changed) == 0
 	if len(changed) == 0 {
 		if guided {
 			fmt.Fprintln(os.Stderr, ui.Note("No changes; nothing was submitted."))
 			return result{streamed: true}, nil
 		}
-		if !rotateOnly && !webhook.AlreadyEnabled {
+		if !webhookRequested {
 			return result{}, contract.NewFault(contract.InputRequired, "nothing to update", "Pass at least one of --node, --build-node, a source flag, --health-type, --health-path, --health-timeout, --release-command, --process, --auto-deploy or --rotate-webhook-secret.")
 		}
 	}
 	var preview platform.Preview
-	if len(changed) > 0 {
+	if len(changed) > 0 || webhookRequested {
 		preview, err = a.previewAction(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch)
 		if err != nil {
 			return result{}, err
@@ -525,20 +532,14 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		WebhookURL           string                          `json:"webhook_url,omitempty"`
 		WebhookBranch        string                          `json:"webhook_branch,omitempty"`
 		WebhookRotated       bool                            `json:"webhook_rotated,omitempty"`
+		WebhookReplay        bool                            `json:"webhook_replay,omitempty"`
+		WebhookActivated     bool                            `json:"webhook_secret_activated,omitempty"`
+		WebhookMessage       string                          `json:"webhook_message,omitempty"`
 		GitHubWebhook        *githubWebhookReport            `json:"github_webhook,omitempty"`
 		Patch                platform.EnvironmentUpdateInput `json:"patch"`
 		DryRun               bool                            `json:"dry_run,omitempty"`
 	}{App: appName, Environment: environment, Changed: changed, CredentialSecretName: credentialName,
 		WebhookSecretName: webhook.SecretName, WebhookURL: webhook.URL, WebhookBranch: webhook.Branch, WebhookRotated: webhook.Rotated, Patch: patch}
-	if webhook.AlreadyEnabled && len(changed) == 0 {
-		report := a.setupWebhookWithGitHub(cmd, webhook)
-		resultData.GitHubWebhook = report
-		plain := "Push to deploy is already enabled for " + appName + "/" + environment + " at " + webhook.URL + ".\nUse --rotate-webhook-secret to replace the secret.\n"
-		if report != nil {
-			plain += report.summary() + "\n"
-		}
-		return result{data: resultData, plain: plain}, nil
-	}
 	if guided {
 		body := strings.Join(diff, "\n")
 		if body == "" {
@@ -579,6 +580,18 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		return result{data: resultData, plain: plain.String()}, nil
 	}
 
+	if err := a.prepareWebhookUpdate(cmd, &webhook, preview.Replay); err != nil {
+		return result{}, err
+	}
+	if !preview.Replay && flagChanged(cmd, "git-credential-file") {
+		value, err := readProtectedSecretFile(flagString(cmd, "git-credential-file"))
+		if err != nil {
+			return result{}, err
+		}
+		clearBytes(credential)
+		credential = value
+		a.registerSecretValue(credential)
+	}
 	if githubAuthRequested(cmd) && credentialName != "" && !preview.Replay {
 		token, err := acquireGitHubAuthToken(cmd.Context())
 		if err != nil {
@@ -587,7 +600,7 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		a.registerSecretValue(token)
 		credential = token
 	}
-	if credentialName != "" && len(credential) > 0 {
+	if !preview.Replay && credentialName != "" && len(credential) > 0 {
 		namespace, err := vault.NewNamespace(appName, environment, credentialName)
 		if err != nil {
 			return result{}, err
@@ -596,30 +609,57 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 			return result{}, err
 		}
 	}
-	if err := a.writeWebhookSecret(cmd, appName, environment, webhook); err != nil {
-		return result{}, err
+	var op contract.Operation
+	receipt := submissionReceipt{}
+	if webhookRequested {
+		op, receipt, err = a.submitWebhookUpdate(cmd, appName, environment, patch, webhook)
+	} else {
+		op, err = a.submitAccepted(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch, "")
 	}
-	if rotateOnly {
-		report := a.setupWebhookWithGitHub(cmd, webhook)
-		resultData.GitHubWebhook = report
-		if report == nil || !report.configured() {
-			printWebhookOnce(cmd, webhook)
-		}
-		plain := "Rotated the push-to-deploy secret for " + appName + "/" + environment + "; the new value is active immediately.\n" + webhook.URL + "\n"
-		if report != nil {
-			plain += report.summary() + "\n"
-		}
-		return result{data: resultData, plain: plain}, nil
-	}
-	op, err := a.submitAccepted(cmd, platform.KindEnvironmentUpdate, "env/"+appName+"/"+environment, patch, "")
 	if err != nil {
 		return result{}, err
 	}
 	resultData.OperationID = op.ID
-	report := a.setupWebhookWithGitHub(cmd, webhook)
-	resultData.GitHubWebhook = report
-	if report == nil || !report.configured() {
-		printWebhookOnce(cmd, webhook)
+	var report *githubWebhookReport
+	if webhookRequested {
+		resultData.WebhookReplay = receipt.Replay
+		resultData.WebhookRotated = webhook.Rotated && !receipt.Replay
+		resultData.WebhookActivated = receipt.WebhookSecretActivated
+		if receipt.Replay {
+			resultData.WebhookRotated = false
+			switch {
+			case len(webhook.Secret) > 0:
+				clearBytes(webhook.Secret)
+				webhook.Secret = nil
+				resultData.WebhookMessage = "Concurrent admission replay: a local candidate secret was generated but was not activated, printed or installed; the winning submission owns the secret. The GitHub webhook was NOT retried or verified."
+				plain := fmt.Sprintf("Concurrent admission replay: returned the accepted operation %s. The local candidate secret was discarded and not printed; the winning submission owns the secret, and the GitHub webhook was NOT retried or verified.\nnext: eregion env status %s %s --json\n",
+					op.ID, appName, environment)
+				return result{data: resultData, plain: plain}, nil
+			default:
+				resultData.WebhookMessage = "Idempotent replay: the original operation is returned; the GitHub webhook was NOT retried or verified."
+				plain := fmt.Sprintf("Idempotent replay: returned the original accepted operation %s; no secret was generated and the GitHub webhook was NOT retried or verified.\nnext: eregion env status %s %s --json\n",
+					op.ID, appName, environment)
+				return result{data: resultData, plain: plain}, nil
+			}
+		}
+		if len(webhook.Secret) > 0 && !receipt.WebhookSecretActivated {
+			return result{}, contract.NewFault(contract.Internal,
+				"the operation was admitted without activating the requested webhook secret",
+				"Do not retry with the same key; inspect the operation and report the command and binary version.")
+		}
+		if webhook.GitHub {
+			report = a.setupWebhookWithGitHub(cmd, webhook)
+			resultData.GitHubWebhook = report
+			if report != nil && !report.configured() {
+				activation := "accepted"
+				if len(changed) == 0 && !webhook.Rotated {
+					activation = "already_enabled"
+				}
+				return result{}, webhookPartialFault(appName, environment, op.ID, activation, webhook.Rotated, *report)
+			}
+		} else if len(webhook.Secret) > 0 {
+			printWebhookOnce(cmd, webhook)
+		}
 	}
 	if guided {
 		fmt.Fprintln(os.Stderr, "")
@@ -633,17 +673,43 @@ func (a *app) envUpdate(cmd *cobra.Command, args []string) (result, error) {
 		}))
 		return result{streamed: true}, nil
 	}
+	rotationOnly := webhook.Rotated
+	for _, field := range changed {
+		if field != "webhook_secret_rotation" {
+			rotationOnly = false
+			break
+		}
+	}
+	if rotationOnly {
+		plain := fmt.Sprintf("Rotated the push-to-deploy webhook secret for %s/%s; desired state is unchanged.\noperation: %s\nnext: eregion env status %s %s --json\n",
+			appName, environment, op.ID, appName, environment)
+		if report != nil && report.configured() {
+			plain += "push to deploy: " + webhook.URL + "\n" + report.summary() + "\n"
+		}
+		return result{data: resultData, plain: plain}, nil
+	}
+	if webhookRequested && len(changed) == 0 {
+		state := "enabled"
+		if webhook.Enabled != nil && !*webhook.Enabled {
+			state = "disabled"
+		}
+		plain := fmt.Sprintf("Push to deploy is already %s for %s/%s; no desired state changed.\noperation: %s\nnext: eregion env status %s %s --json\n",
+			state, appName, environment, op.ID, appName, environment)
+		if report != nil && report.configured() {
+			plain += "push to deploy: " + webhook.URL + "\n" + report.summary() + "\n"
+		}
+		return result{data: resultData, plain: plain}, nil
+	}
 	plain := fmt.Sprintf("Updated %s/%s desired state.\noperation: %s\nchanged: %s\nnext: eregion env status %s %s --json\n",
 		appName, environment, op.ID, strings.Join(changed, ", "), appName, environment)
 	if webhook.URL != "" {
 		if report != nil && report.configured() {
 			plain += "push to deploy: " + webhook.URL + "\n" + report.summary() + "\n"
-		} else {
+		} else if len(webhook.Secret) > 0 {
 			plain += "push to deploy: " + webhook.URL + " (secret shown once on stderr)\n"
+		} else {
+			plain += "push to deploy: " + webhook.URL + "\n"
 		}
-	}
-	if report != nil && !report.configured() {
-		plain += "warning: " + report.summary() + "\n"
 	}
 	return result{data: resultData, plain: plain}, nil
 }
@@ -1213,13 +1279,10 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding, 
 		if err := validateGitCredentialRole(name, runtimeSecrets, webhookSecret); err != nil {
 			return platform.SourceBinding{}, false, nil, "", err
 		}
-		value, err := readProtectedSecretFile(flagString(cmd, "git-credential-file"))
-		if err != nil {
-			return platform.SourceBinding{}, false, nil, "", err
-		}
-		a.registerSecretValue(value)
+		// The value is read only after an authoritative preview says this is a
+		// fresh submission. A known replay never opens the secret file.
 		source.CredentialSecretName = name
-		return source, true, value, name, nil
+		return source, true, nil, name, nil
 	}
 	return source, true, nil, "", nil
 }

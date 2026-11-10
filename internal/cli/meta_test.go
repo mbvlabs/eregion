@@ -27,6 +27,14 @@ func TestMetadataGate(t *testing.T) {
 		{"node", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Audience = []string{"node"} }, "Linux-only"},
 		{"restart", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.NeedsRestart = "maybe" }, "needs_restart"},
 		{"output", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Output = "text" }, "output"},
+		{"terminal-output", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.TerminalOnly = true }, "terminal-only commands must not advertise machine output"},
+		{"terminal-audience", func(_ *app, _ *cobra.Command, m *CommandMeta) {
+			m.TerminalOnly = true
+			m.Audience = []string{"agent"}
+			m.OutputModes = []string{"plain"}
+		}, "terminal-only commands require human-only audience"},
+		{"durable-submission", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.DurableSubmission = true }, "durable submissions must be mutating"},
+		{"human-factor", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.HumanFactor = true }, "human-factor commands must be mutating"},
 		{"errors", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.ErrorCodes = []contract.Code{"made_up"} }, "error code"},
 		{"mutation", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.Mutating = true }, "dry-run"},
 		{"dry-run", func(_ *app, _ *cobra.Command, m *CommandMeta) { m.DryRun = true }, "dry-run"},

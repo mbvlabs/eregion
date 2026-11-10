@@ -33,6 +33,7 @@ type fakeService struct {
 	called     int
 	actor      contract.Actor
 	panicOnGet bool
+	deadline   time.Duration
 }
 
 func fakeOperation(state contract.State) contract.Operation {
@@ -44,9 +45,12 @@ func (s *fakeService) Submit(_ context.Context, sub operations.Submission) (cont
 	s.actor = sub.Actor
 	return fakeOperation(contract.Queued), nil
 }
-func (s *fakeService) Get(_ context.Context, authority operations.Authority, _ contract.OperationID) (contract.Operation, error) {
+func (s *fakeService) Get(ctx context.Context, authority operations.Authority, _ contract.OperationID) (contract.Operation, error) {
 	if s.panicOnGet {
 		panic("untrusted internal panic")
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		s.deadline = time.Until(deadline)
 	}
 	s.actor, _ = authority.OperationAuthority()
 	return fakeOperation(contract.Running), nil
@@ -228,6 +232,70 @@ func TestClientTransportAndProtocol(t *testing.T) {
 	client, _ = NewClient(redirect.URL, token)
 	if _, err := client.Get(context.Background(), id); err == nil || redirectCalls != 0 {
 		t.Fatal("followed a credential-bearing redirect")
+	}
+}
+
+func TestReadinessBudgetOnlyOnReadyRoute(t *testing.T) {
+	auth, _ := NewAuth([]Principal{principal("operations:read")})
+	var remaining time.Duration
+	h := NewHandler(auth, &fakeService{}, func(ctx context.Context) error {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return errors.New("readiness has no deadline")
+		}
+		remaining = time.Until(deadline)
+		return nil
+	})
+	w, envelope := request(t, h, http.MethodGet, "/readyz", "", "")
+	if w.Code != http.StatusOK || !envelope.OK {
+		t.Fatalf("ready request failed: %d %+v", w.Code, envelope)
+	}
+	if remaining <= 3*time.Second || remaining > 4*time.Second {
+		t.Fatalf("readiness deadline = %v, want the 4s child budget", remaining)
+	}
+
+	service := &fakeService{}
+	h = NewHandler(auth, service, func(context.Context) error {
+		t.Fatal("a non-readiness route consulted readiness")
+		return nil
+	})
+	w, envelope = request(t, h, http.MethodGet, "/v1/operations/"+string(id), "", token)
+	if w.Code != http.StatusOK || !envelope.OK {
+		t.Fatalf("operation read failed: %d %+v", w.Code, envelope)
+	}
+	if service.deadline <= 4*time.Second {
+		t.Fatalf("non-readiness deadline = %v, want the ordinary 10s budget", service.deadline)
+	}
+}
+
+func TestReadinessHonorsEarlierParentAndDoesNotDetach(t *testing.T) {
+	auth, _ := NewAuth([]Principal{principal("operations:read")})
+	parent, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	completed := make(chan struct{})
+	h := NewHandler(auth, &fakeService{}, func(ctx context.Context) error {
+		defer close(completed)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	r := httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(parent)
+	w := httptest.NewRecorder()
+	started := time.Now()
+	h.ServeHTTP(w, r)
+	elapsed := time.Since(started)
+	select {
+	case <-completed:
+	default:
+		t.Fatal("handler returned before the readiness check completed")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("earlier parent deadline was not honored: %v", elapsed)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("canceled readiness status = %d, want 503", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "context deadline exceeded") || strings.Contains(w.Body.String(), token) {
+		t.Fatal("readiness failure leaked internal detail")
 	}
 }
 

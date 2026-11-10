@@ -1,7 +1,8 @@
 # Machine and operation contracts
 
-Reference for current mechanisms. Product requirements and gaps are tracked only
-in [MASTER](MASTER.md). Authority: `internal/contract`, `internal/output`, command
+Reference for current mechanisms. Product contracts are in [MASTER](MASTER.md);
+actionable work and gaps are tracked in Linear. Mechanism authority:
+`internal/contract`, `internal/output`, command
 metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
 
 ## Discovery and output
@@ -9,6 +10,16 @@ metadata/tests and [the JSON Schema](../schema/eregion-v1.json).
 - `eregion commands --json` lists implemented commands, their flags, platforms,
   safety declarations, error codes, examples and next steps. `help <path> --json`
   describes one command. Metadata validation runs before normal dispatch.
+- `commands --search TEXT --json` filters visible paths, summaries and examples
+  in deterministic catalog order; no match is an empty array. `commands
+  --check-meta --json` explicitly validates metadata. `--path`, `--search` and
+  `--check-meta` are mutually exclusive. Overview/help/catalog/search/checks do
+  not contact a server or require a context.
+- Catalog `terminal_only` describes commands that cannot execute in machine
+  mode; `human_factor` describes conditional factor-gated effects without
+  removing machine-safe previews. `durable_submission` distinguishes real
+  operation submission from synchronous mutations or event streaming. Do not
+  infer those contracts from audience or `remote`/`mutating` alone.
 - Plain is append-only by default. JSON (`--json` or `--output json`) returns one
   newline-terminated `eregion/v1` envelope. Help and expected errors use it too.
 - Streaming commands opt into NDJSON; ordinary commands do not accept an arbitrary

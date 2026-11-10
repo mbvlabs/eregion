@@ -25,6 +25,7 @@ func (a *app) secretsSpecs() []spec {
 	exportMeta.Prompts = true
 	exportMeta.InputFlags = []string{"secrets-out"}
 	exportMeta.Examples = []string{"eregion secrets export", "eregion secrets export --secrets-out ./prod-secrets.md"}
+	exportMeta = terminalOnlyMeta(exportMeta)
 	return []spec{{
 		use:  "secrets",
 		meta: readMeta("Export the server handoff behind the human factor", []string{"Reproduce the protected server record after init."}, []string{"eregion secrets export"}),
@@ -87,6 +88,7 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	data := map[string]any{
 		"node": exported.Node, "hostname": exported.Hostname, "context": input.Context, "exported": true,
+		"workspace": exported.Workspace,
 	}
 	plain := "Re-exported the server handoff to the terminal"
 	if record.path != "" {
@@ -164,7 +166,8 @@ func handoffExportInput(identity handoffExportIdentity, exported rpcHandoffExpor
 	current := identity.context
 	publicHost, _, _ := net.SplitHostPort(current.SSH.WireGuard.Endpoint)
 	return handoffRecordInput{
-		NodeName: exported.Node, Context: current.Name, Hostname: exported.Hostname,
+		NodeName: exported.Node, WorkspaceName: exported.Workspace.Name, WorkspaceID: exported.Workspace.ID,
+		Context: current.Name, Hostname: exported.Hostname,
 		PublicAddress: publicHost, Platform: exported.Platform, SSHHostKey: exported.SSHHostKey,
 		WireGuardEndpoint: current.SSH.WireGuard.Endpoint, WireGuardNodeAddress: current.SSH.WireGuard.NodeAddress,
 		WireGuardNodePublicKey: current.SSH.WireGuard.NodePublicKey,

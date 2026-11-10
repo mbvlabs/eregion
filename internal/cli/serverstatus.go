@@ -31,14 +31,43 @@ func (a *app) serverStatus(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	return result{data: status, plain: statusText(status)}, nil
+	contextName := ""
+	if current, err := selectedContext(cmd); err == nil {
+		contextName = current.Name
+	}
+	view := serverStatusView{NodeStatus: status, Context: contextName}
+	return result{data: view, plain: statusTextWithContext(status, contextName)}, nil
+}
+
+// serverStatusView adds the caller's local selection to the node observation.
+// The embedded fields keep the existing JSON envelope shape; workspace and
+// context are additive non-secret identity fields.
+type serverStatusView struct {
+	host.NodeStatus
+	Context string `json:"context,omitempty"`
 }
 
 func statusText(status host.NodeStatus) string {
+	return statusTextWithContext(status, "")
+}
+
+func statusTextWithContext(status host.NodeStatus, contextName string) string {
 	var out strings.Builder
 	out.WriteString(ui.Header("Server "+status.Node, 72))
 	field := func(name, value string) {
 		fmt.Fprintf(&out, "\n  %s %s", ui.Dim(fmt.Sprintf("%-8s", name)), value)
+	}
+	field("node", status.Node)
+	if contextName != "" {
+		field("context", contextName)
+	}
+	switch {
+	case status.Workspace.Configured:
+		field("workspace", status.Workspace.Name+" ("+status.Workspace.ID+")")
+	case status.WorkspaceError != "":
+		field("workspace", "unknown: "+status.WorkspaceError)
+	default:
+		field("workspace", "not configured (run eregion apply --workspace NAME)")
 	}
 	field("role", status.Role)
 	field("eregion", status.NodeVersion)

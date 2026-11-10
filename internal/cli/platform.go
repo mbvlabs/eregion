@@ -27,7 +27,7 @@ func platformMeta(summary, example string) CommandMeta {
 
 func platformMutationMeta(summary, example string) CommandMeta {
 	meta := platformMeta(summary, example)
-	meta.Mutating, meta.DryRun = true, true
+	meta.Mutating, meta.DryRun, meta.DurableSubmission = true, true, true
 	return meta
 }
 

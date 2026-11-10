@@ -30,6 +30,7 @@ func (a *app) domainCloudflareSpec() spec {
 	configure.Examples = []string{
 		"eregion domain cloudflare configure --zone 0123456789abcdef0123456789abcdef --zone-name example.com",
 	}
+	configure = terminalOnlyMeta(configure)
 	configure.Next = []string{"eregion domain cloudflare status --json"}
 	configure.ErrorCodes = []contract.Code{
 		contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed,
@@ -64,13 +65,35 @@ func (a *app) domainCloudflareConfigure(cmd *cobra.Command, _ []string) (result,
 	if !humanAtTerminal(cmd) {
 		return result{}, contract.NewFault(contract.InputRequired, "Cloudflare credential configuration needs a human at an interactive terminal", "Run it yourself in a terminal without --json, --output json/ndjson, or a pipe. There is no token flag, environment variable, file or stdin fallback.")
 	}
+	return a.configureCloudflareCredential(cmd, cloudflarePrompts{
+		input: ui.Input, secret: ui.Secret, confirm: ui.YesNoDefault,
+	})
+}
+
+// cloudflarePrompts is the terminal interaction this flow needs. It is a
+// parameter rather than a package variable so the regression test can prove a
+// missing context fails before any prompt without touching global state.
+type cloudflarePrompts struct {
+	input   func(title, description, def string) (string, error)
+	secret  func(title string) (string, error)
+	confirm func(title, description string, def bool) (bool, error)
+}
+
+// configureCloudflareCredential resolves the selected context and client before
+// any prompt: a missing context or unusable route must fail before the operator
+// types a zone or a token. The read-only provider validation still comes only
+// after the token is read.
+func (a *app) configureCloudflareCredential(cmd *cobra.Command, prompts cloudflarePrompts) (result, error) {
+	client, err := a.client(cmd)
+	if err != nil {
+		return result{}, err
+	}
 	zoneID, _ := cmd.Flags().GetString("zone")
 	zoneName, _ := cmd.Flags().GetString("zone-name")
 	zoneID = strings.ToLower(strings.TrimSpace(zoneID))
 	zoneName = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zoneName), "."))
-	var err error
 	if zoneID == "" {
-		zoneID, err = ui.Input("Cloudflare zone ID", "The lowercase 32-character zone identifier", "")
+		zoneID, err = prompts.input("Cloudflare zone ID", "The lowercase 32-character zone identifier", "")
 		if err != nil {
 			return result{}, err
 		}
@@ -80,7 +103,7 @@ func (a *app) domainCloudflareConfigure(cmd *cobra.Command, _ []string) (result,
 		return result{}, err
 	}
 	if zoneName == "" {
-		zoneName, err = ui.Input("Cloudflare zone name", "For example example.com", "")
+		zoneName, err = prompts.input("Cloudflare zone name", "For example example.com", "")
 		if err != nil {
 			return result{}, err
 		}
@@ -89,7 +112,7 @@ func (a *app) domainCloudflareConfigure(cmd *cobra.Command, _ []string) (result,
 	if err := vault.ValidateProviderZoneName(zoneName); err != nil {
 		return result{}, err
 	}
-	token, err := ui.Secret("Cloudflare API token for " + zoneName + " (input hidden)")
+	token, err := prompts.secret("Cloudflare API token for " + zoneName + " (input hidden)")
 	if err != nil {
 		return result{}, err
 	}
@@ -100,10 +123,6 @@ func (a *app) domainCloudflareConfigure(cmd *cobra.Command, _ []string) (result,
 	tokenBytes := []byte(token)
 	defer clearSecretBytes(tokenBytes)
 
-	client, err := a.client(cmd)
-	if err != nil {
-		return result{}, err
-	}
 	preview, err := client.PreviewCloudflareCredential(cmd.Context(), zoneID, zoneName, tokenBytes)
 	if err != nil {
 		return result{}, err
@@ -115,7 +134,7 @@ func (a *app) domainCloudflareConfigure(cmd *cobra.Command, _ []string) (result,
 	} else {
 		fmt.Fprintf(cmd.ErrOrStderr(), "  status:           replaces revision %d only if it is still current\n", preview.CurrentRevision)
 	}
-	confirmed, err := ui.YesNoDefault("Save this Cloudflare credential?", "The token was read-validated. A concurrent replacement will be refused rather than overwritten.", false)
+	confirmed, err := prompts.confirm("Save this Cloudflare credential?", "The token was read-validated. A concurrent replacement will be refused rather than overwritten.", false)
 	if err != nil {
 		return result{}, err
 	}

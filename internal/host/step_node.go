@@ -36,11 +36,17 @@ func (s *nodeConfigStep) keysPath() string { return filepath.Join(s.sshDir(), "a
 // file as the service user, so bootstrap must not try to chown it to a user it
 // never created. A node-agent role owns it as the node account.
 func (s *nodeConfigStep) ownership() (string, string) {
-	role, err := s.cfg.RoleConfig()
+	return nodeConfigOwnership(s.cfg)
+}
+
+// nodeConfigOwnership is shared by the node configuration and workspace mirror
+// writers so both keep the same owner on a real host.
+func nodeConfigOwnership(cfg Config) (string, string) {
+	role, err := cfg.RoleConfig()
 	if err == nil && role.NodeAgent {
-		return s.cfg.Layout.NodeUser, s.cfg.Layout.NodeGroup
+		return cfg.Layout.NodeUser, cfg.Layout.NodeGroup
 	}
-	user, group := s.cfg.Layout.User, s.cfg.Layout.Group
+	user, group := cfg.Layout.User, cfg.Layout.Group
 	if user == "" {
 		user = "root"
 	}

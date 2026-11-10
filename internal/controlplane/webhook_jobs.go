@@ -113,7 +113,7 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, deliveryIDHash str
 	if err != nil {
 		return err
 	}
-	op, _, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.DeliveryIDHash, resolved, "")
+	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.DeliveryIDHash, resolved, "", nil)
 	if err != nil {
 		code, detail, retry := webhookAdmissionFailure(err)
 		if retry {
@@ -126,6 +126,7 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, deliveryIDHash str
 		rollback(tx)
 		return s.markWebhookAdmissionFailed(ctx, record.DeliveryIDHash, code, detail)
 	}
+	op := result.Operation
 	tag, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
         SET state='submitted', operation_id=$2, submitted_at=clock_timestamp()
         WHERE delivery_id_hash=$1 AND state='admitted'`, record.DeliveryIDHash, op.ID)

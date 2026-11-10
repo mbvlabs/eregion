@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"reflect"
 	"strings"
 	"time"
 
@@ -26,8 +27,8 @@ const portAllocationLock int64 = 0x657265706f727473 // "ereports"
 
 const platformColumns = `id, kind, target, actor_kind, actor_subject, state, attempt, last_sequence, error_code, created_at, updated_at`
 
-func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission) (contract.Operation, error) {
-	var zero contract.Operation
+func (s *Service) submitPlatformWithReceipt(ctx context.Context, sub operations.Submission) (operations.SubmissionResult, error) {
+	var zero operations.SubmissionResult
 	if sub.Confirmation != "" {
 		return zero, contract.NewFault(contract.ValidationFailed, "platform actions do not accept confirmation text", "Omit confirmation; destructive actions are guarded by their inputs and operation state.")
 	}
@@ -41,12 +42,12 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 	// git ref needs the remote, and an unreachable remote must not turn an
 	// identical replay of an already-accepted operation into `unavailable`.
 	if existing, found, err := s.replaySubmission(ctx, sub.Kind, normalized.Target.String(), sub.Actor, sub.IdempotencyKey, inputHash); err != nil {
-		return existing, err
+		return zero, err
 	} else if found {
 		if err := attachFirstDeployOperation(ctx, s.pool, &existing); err != nil {
-			return contract.Operation{}, err
+			return zero, err
 		}
-		return existing, nil
+		return operations.SubmissionResult{Operation: existing, Replay: true}, nil
 	}
 	resolved, err := s.resolveSubmissionGitRef(ctx, normalized)
 	if err != nil {
@@ -64,14 +65,14 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 		return zero, unavailable()
 	}
 	defer rollback(tx)
-	op, _, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, sub.Actor, sub.IdempotencyKey, resolved, sub.HumanFactor)
+	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, sub.Actor, sub.IdempotencyKey, resolved, sub.HumanFactor, sub.WebhookSecret)
 	if err != nil {
 		return zero, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return zero, unavailable()
 	}
-	return op, nil
+	return result, nil
 }
 
 // recordPlatformSubmissionTx records one ordinary platform submission in the
@@ -80,8 +81,8 @@ func (s *Service) submitPlatform(ctx context.Context, sub operations.Submission)
 // and by the webhook worker, so a webhook can commit its operation and its
 // delivery link atomically without calling Service.Submit (which opens a
 // transaction) or nesting one.
-func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, key string, resolved *resolvedGitRef, humanFactor string) (contract.Operation, bool, error) {
-	var zero contract.Operation
+func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, key string, resolved *resolvedGitRef, humanFactor string, webhookSecret []byte) (operations.SubmissionResult, error) {
+	var zero operations.SubmissionResult
 	inputHash := hashInput(normalized.Canonical)
 	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
         (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
@@ -89,52 +90,53 @@ func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id 
         ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`,
 		id, normalized.Kind, normalized.Target.String(), actor.Kind, actor.Subject, key, inputHash, normalized.Canonical)
 	if err != nil {
-		return zero, false, unavailable()
+		return zero, unavailable()
 	}
 	if inserted.RowsAffected() == 0 {
 		var existingID contract.OperationID
 		var existingHash string
 		if err := tx.QueryRow(ctx, `SELECT id,input_hash FROM eregion_operations WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5`,
 			actor.Kind, actor.Subject, normalized.Kind, normalized.Target.String(), key).Scan(&existingID, &existingHash); err != nil {
-			return zero, false, unavailable()
+			return zero, unavailable()
 		}
 		if existingHash != inputHash {
-			return zero, false, idempotencyInputConflict()
+			return zero, idempotencyInputConflict()
 		}
 		existing, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
 		if err != nil {
-			return zero, false, err
+			return zero, err
 		}
 		if err := attachFirstDeployOperation(ctx, tx, &existing); err != nil {
-			return zero, false, err
+			return zero, err
 		}
-		return existing, false, nil
+		return operations.SubmissionResult{Operation: existing, Replay: true}, nil
 	}
-	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved, humanFactor); err != nil {
-		return zero, false, err
+	var activated bool
+	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved, humanFactor, webhookSecret, &activated); err != nil {
+		return zero, err
 	}
 	if s.enqueuePlatform == nil {
-		return zero, false, unavailable()
+		return zero, unavailable()
 	}
 	op := contract.Operation{ID: id, Kind: normalized.Kind, Target: normalized.Target.String(), Actor: actor}
 	jobID, err := s.enqueuePlatform(ctx, tx, op)
 	if err != nil {
-		return zero, false, unavailable()
+		return zero, unavailable()
 	}
 	if _, err := tx.Exec(ctx, "UPDATE eregion_operations SET job_id=$2 WHERE id=$1", id, jobID); err != nil {
-		return zero, false, unavailable()
+		return zero, unavailable()
 	}
 	op, err = scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
 	if err != nil {
-		return zero, false, unavailable()
+		return zero, unavailable()
 	}
 	if err := attachFirstDeployOperation(ctx, tx, &op); err != nil {
-		return zero, false, err
+		return zero, err
 	}
-	if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: platformAcceptedMessage(normalized.Kind)}); err != nil {
-		return zero, false, unavailable()
+	if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: platformAcceptedMessageFor(normalized)}); err != nil {
+		return zero, unavailable()
 	}
-	return op, true, nil
+	return operations.SubmissionResult{Operation: op, WebhookSecretActivated: activated}, nil
 }
 
 func hashInput(canonical json.RawMessage) string {
@@ -256,7 +258,14 @@ func platformAcceptedMessage(kind string) string {
 	}
 }
 
-func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef, humanFactor string) error {
+func platformAcceptedMessageFor(normalized platform.Normalized) string {
+	if input, ok := normalized.Input.(*platform.EnvironmentUpdateInput); ok && input.RotateWebhookSecret {
+		return "Environment update and push-to-deploy secret rotation accepted durably; no deploy was queued."
+	}
+	return platformAcceptedMessage(normalized.Kind)
+}
+
+func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef, humanFactor string, webhookSecret []byte, webhookActivated *bool) error {
 	switch input := normalized.Input.(type) {
 	case *platform.AppCreateInput:
 		appID, err := platform.NewAppID()
@@ -330,12 +339,17 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			return err
 		}
 		state := platform.ApplyEnvironmentPatch(base, *input)
+		platform.ResolveWebhookSecretName(&state)
+		if err := platform.ValidatePushToDeploy(state); err != nil {
+			return err
+		}
 		if platform.EnvironmentUpdateRemovesState(base, state) {
 			if err := platform.ValidateTargetConfirmation(input.Target(), input.Confirm); err != nil {
 				return err
 			}
 		}
 		var buildNode *string
+		buildNodeChanged := false
 		if input.BuildNode != nil {
 			value := *input.BuildNode
 			buildNode = &value
@@ -350,6 +364,7 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 				value = builder.Name
 				buildNode = &value
 			}
+			buildNodeChanged = *buildNode != env.BuildNode
 		}
 		if state.Runtime.Node != env.Node {
 			node, err := nodeByNameTx(ctx, tx, state.Runtime.Node)
@@ -361,9 +376,17 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			}
 			state.Runtime.Node = node.Name
 		}
-		if _, err := publishEnvironmentRevisionTx(ctx, tx, env, id, actor, "environment.updated",
-			"Updated environment "+env.Name+" desired state.", state, buildNode); err != nil {
+		activated, err := s.activateWebhookSecretTx(ctx, tx, actor, input, state, webhookSecret)
+		if err != nil {
 			return err
+		}
+		*webhookActivated = activated
+		rotationOnly := input.RotateWebhookSecret && !buildNodeChanged && reflect.DeepEqual(base, state)
+		if !rotationOnly {
+			if _, err := publishEnvironmentRevisionTx(ctx, tx, env, id, actor, "environment.updated",
+				"Updated environment "+env.Name+" desired state.", state, buildNode); err != nil {
+				return err
+			}
 		}
 	case *platform.ProcessScaleInput:
 		// Scale publishes a revision and queues a restart during submission.
@@ -1409,7 +1432,7 @@ func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind
 	if err != nil {
 		return err
 	}
-	_, _, err = s.recordPlatformSubmissionTx(ctx, tx, id, normalized, actor, key, resolved, "")
+	_, err = s.recordPlatformSubmissionTx(ctx, tx, id, normalized, actor, key, resolved, "", nil)
 	return err
 }
 

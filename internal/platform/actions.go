@@ -21,6 +21,9 @@ const (
 	DefaultHealthTimeout = 30
 	DefaultBind          = "127.0.0.1"
 	DefaultBuilder       = "paketobuildpacks/builder-jammy-base"
+	// DefaultWebhookSecretName is the stable vault name for an enabled
+	// push-to-deploy webhook when the caller does not name one.
+	DefaultWebhookSecretName = "EREGION_WEBHOOK_SECRET"
 )
 
 var (
@@ -133,13 +136,17 @@ type EnvironmentUpdateInput struct {
 	Node        *string `json:"node,omitempty"`
 	BuildNode   *string `json:"build_node,omitempty"`
 
-	Source            *SourceBinding     `json:"source,omitempty"`
-	AutoDeploy        *bool              `json:"auto_deploy,omitempty"`
-	WebhookSecretName *string            `json:"webhook_secret_name,omitempty"`
-	Runtime           *RuntimeSpec       `json:"runtime,omitempty"`
-	Processes         *[]ProcessSpec     `json:"processes,omitempty"`
-	Config            *map[string]string `json:"config,omitempty"`
-	SecretNames       *[]string          `json:"secret_names,omitempty"`
+	Source            *SourceBinding `json:"source,omitempty"`
+	AutoDeploy        *bool          `json:"auto_deploy,omitempty"`
+	WebhookSecretName *string        `json:"webhook_secret_name,omitempty"`
+	// RotateWebhookSecret requests a new encrypted webhook secret revision in
+	// the same submission transaction. It is request intent, not desired state:
+	// it changes no revision field and is omitted from exported state.
+	RotateWebhookSecret bool               `json:"rotate_webhook_secret,omitempty"`
+	Runtime             *RuntimeSpec       `json:"runtime,omitempty"`
+	Processes           *[]ProcessSpec     `json:"processes,omitempty"`
+	Config              *map[string]string `json:"config,omitempty"`
+	SecretNames         *[]string          `json:"secret_names,omitempty"`
 	// Resources replaces the revision's managed-resource dependency set;
 	// omitted preserves the current set (D32 merge rule).
 	Resources *[]string `json:"resources,omitempty"`
@@ -685,6 +692,15 @@ func normalizeEnvironmentUpdate(target Target, raw json.RawMessage) (ActionInput
 		}
 		input.WebhookSecretName = &name
 	}
+	if input.RotateWebhookSecret && input.AutoDeploy != nil && !*input.AutoDeploy {
+		return nil, invalid("rotate_webhook_secret", "Webhook rotation requires push to deploy to remain enabled.")
+	}
+	if input.AutoDeploy != nil && *input.AutoDeploy && input.WebhookSecretName == nil {
+		// Resolve the default before hashing so the requested auto-enable
+		// intent is stable across callers and retries.
+		name := DefaultWebhookSecretName
+		input.WebhookSecretName = &name
+	}
 	if input.Retention != nil {
 		if err := input.Retention.Validate(); err != nil {
 			return nil, err
@@ -898,6 +914,39 @@ func validateSourceCredentialRole(source SourceBinding, runtimeSecretNames []str
 
 func normalizeRevisionState(state *RevisionState) error {
 	return normalizeRevisionStateWithHosts(state, true)
+}
+
+// ValidatePushToDeploy validates the effective push-to-deploy binding shared by
+// every submission path. It requires a GitHub HTTPS source and an explicit
+// branch because the webhook deploys the bound branch, not an arbitrary push.
+func ValidatePushToDeploy(state RevisionState) error {
+	if !state.AutoDeploy {
+		if state.WebhookSecretName != "" {
+			return invalid("webhook_secret_name", "A webhook secret name requires push to deploy to be enabled.")
+		}
+		return nil
+	}
+	if state.Source.Kind != "git" {
+		return invalid("auto_deploy", "Automatic deployment requires a git source binding.")
+	}
+	if _, ok := GitHubRepository(state.Source.URL); !ok {
+		return invalid("auto_deploy", "Automatic deployment requires an https://github.com/owner/repository source.")
+	}
+	if strings.TrimPrefix(strings.TrimSpace(state.Source.Ref), "refs/heads/") == "" {
+		return invalid("auto_deploy", "Automatic deployment requires a bound branch.")
+	}
+	if state.WebhookSecretName == "" {
+		return invalid("webhook_secret_name", "Automatic deployment requires a webhook secret name.")
+	}
+	return nil
+}
+
+// ResolveWebhookSecretName applies the stable default after a patch is merged.
+// It is admission-side because a rotation can preserve a custom current name.
+func ResolveWebhookSecretName(state *RevisionState) {
+	if state.AutoDeploy && state.WebhookSecretName == "" {
+		state.WebhookSecretName = DefaultWebhookSecretName
+	}
 }
 
 func normalizeSourceBinding(source *SourceBinding, enforceGitHosts bool) error {
@@ -1239,6 +1288,11 @@ func ApplyEnvironmentPatch(base RevisionState, patch EnvironmentUpdateInput) Rev
 	}
 	if patch.WebhookSecretName != nil {
 		out.WebhookSecretName = *patch.WebhookSecretName
+	}
+	if !out.AutoDeploy {
+		// Disabling push to deploy clears the recorded name in every caller.
+		// The vault revision is retained.
+		out.WebhookSecretName = ""
 	}
 	if patch.Runtime != nil {
 		runtime := *patch.Runtime

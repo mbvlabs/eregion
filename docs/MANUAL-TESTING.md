@@ -1,8 +1,9 @@
 # Manual testing
 
 Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
-[MASTER](MASTER.md) owns scope, decisions (D-numbers below) and order; this file
-says what must work on a real server and what has been observed.
+[MASTER](MASTER.md) owns product scope and decisions (D-numbers below); Linear
+tracks execution. This file says what must work on a real server and what has
+been observed.
 
 ## Alpha.1 qualification
 
@@ -37,6 +38,129 @@ and was not an alpha.1 gate. No evidence is reconstructed or backfilled.
   markers suffice.
 - An existing server is not disposable. Get authorization before mutating a
   host, DNS, a database or a release.
+
+## Alpha.7 incremental acceptance
+
+These are acceptance criteria, **not a pass record** or a parallel work list.
+Linear tracks execution and blockers. Reuse alpha.6's recorded evidence for
+unchanged behavior; do not repeat a full baseline by default. Record the exact
+candidate version/commit and expand this matrix when shared-service changes
+affect more than the named surfaces. No live target is authorized by this list.
+
+| Changed surface | Required candidate evidence |
+| --- | --- |
+| Cloudflare prompt order | Wrong/missing context/store fails before zone/token input; machine mode still refuses before token entry. Correct context reaches the human flow; do not rotate a credential solely to retest prompt ordering. |
+| Explicit gh-assisted webhook automation | JSON/no-TTY enable and rotation require `--github-webhook`; missing gh/auth/permission refuses before secret/vault/desired-state mutation. Dry-run and same-key replay do not rotate or mutate hooks. Real authorized fixture: signed push succeeds, duplicate is suppressed, other branch ignored, old HMAC rejected after rotation. No plaintext in output/argv/events. Partial hook failure reports activation separately and never prints the secret. |
+| Portable workspace identity | New setup distinguishes workspace/node/context. Alpha.6 upgrade requires explicit identity initialization, not inference during reads/migration. Refreshed human export/login across a second machine/store preserves workspace ID and node. Conflicting name/ID import preserves existing credentials/pins; same ID under another local context name remains valid access. |
+| Agent discovery and human presentation | No-argument overview, help, metadata checks and search work offline with no context, including JSON/no-TTY/no-ANSI. Hidden node commands stay hidden. Changed TUI discovery supports keyboard search/help and exact command equivalents without generic unsafe execution. Exercise narrow/wide resize, no-color/plain, detach and terminal restoration. |
+| Readiness | Stage/acquisition/query timings and safe pool snapshots distinguish slow acquisition from query work. Deterministic offline cancellation/resource-release regressions pass. Authorized candidate idle/representative-workload observations must establish a cause-specific fix; a shorter handler budget or healthy subsequent probes alone do not resolve LABS-346. |
+| Candidate upgrade | Verify signed artifacts; CLI-only alpha.6 upgrade; mismatch dry-run changes nothing; real node converge reaches expected schema/River; repeat apply is a no-op; doctor has no unexplained failure/warning; existing production/staging retain HTTPS version/environment/secret-match markers. |
+
+Supporting offline checks include inspected isolated unit/regression/race tests,
+build, vet and Darwin cross-build. Disposable-DB tests need an explicitly
+authorized isolated database; never use an ambient DSN or an automatically
+started Docker fixture without authorization. Cross-build/CI is not Mac host
+acceptance. Record failures, not-run checks and build provenance separately.
+
+Alpha.7 acceptance requires the operator's explicit acceptance of its candidate
+delta evidence. An unexplained readiness timeout remains blocking. Publication,
+live mutation and beta promotion each need separate authorization.
+
+### Beta.1, RC and final gates
+
+- **Beta.1:** alpha.7 delta acceptance plus authorized real multi-context/server
+  SSH-pin qualification in a single store (shared WireGuard management IP,
+  alternating contexts, wrong-key refusal without damaged contexts). Complete
+  Cloudflare provider failure/interruption, multi-binding deletion and actual
+  foreign-record **apply** refusal against disposable authorized bindings.
+  Preview refusal is not apply refusal. Preserve foreign resources and serving
+  apps, retain retryable ledger evidence, and distinguish partial effects from
+  successful cleanup. No automatic alpha → beta promotion.
+- **Before RC:** review replacement-VPS recovery documentation against the same
+  surviving control DB/external services. Inventory protected vault keys,
+  pinned node/transport identity, placement/in-flight work, exact artifacts,
+  routing and external-service prerequisites. State unsupported replacement
+  mechanisms and expendable local-volume policy explicitly. Documentation-only
+  is the agreed gate; no live rehearsal or backup product is implied.
+- **Before final:** actual macOS install/upgrade acceptance remains required.
+  A separate fresh-server final rehearsal remains an operator decision.
+
+Historical alpha.6 evidence below remains valid for its recorded builds and
+unchanged behavior. It does not establish these new candidate checks as passed.
+
+## 2026-11-10 — alpha.7 working-tree local verification
+
+**Local verification, not publication or host acceptance.** Source was the dirty
+`master` checkout at `c9f0a12f3ce3f7f0ccbf68051187aef36ef36108`, including the
+new untracked implementation files and embedded guide. Before/after source
+manifests match:
+
+```text
+4ee5addccfd22864eeb419c9118766eaaf58109b7a3e23dbfc7e7fe7f90831e6
+```
+
+Evidence root: `/tmp/opencode/eregion-final-verify.20261110-113148`.
+`evidence/source-before.sha256` and `source-after.sha256` cover source, tests,
+schema, embedded guide and build inputs, including untracked source; ordinary
+repository docs are excluded so evidence updates do not change the tested-code
+identity. HEAD and branch did not change. The pre-existing Cloudflare test,
+metrics qualification test and user-owned spec retain their original hashes;
+the spec's contents were not used as requirements.
+
+| Check | Observed result |
+| --- | --- |
+| Inspected offline unit/regression suite | **1,121 pass / 9 expected skip / 0 fail**. Docker SSH/WireGuard/bootstrap fixtures and live metrics qualification were explicitly excluded; all ambient database/context/credential settings were neutralized. |
+| Same offline suite with race detector | **1,121 pass / 9 expected skip / 0 fail**, no race report. |
+| Build/vet | CGO-disabled Linux build and binary, `go vet ./...`, example test/vet passed. Formatting and `git diff --check` clean. |
+| Darwin cross-build | amd64 and arm64 passed; artifacts identified as Mach-O for the intended architectures. This is not Mac host acceptance. |
+| Authorized disposable PostgreSQL 18, schema 028 | **18/18 pass**, exact allowlist in `evidence/schema028-allowlist.txt`: six workspace cases, migration test, seven platform webhook admission/worker cases and four delivery/fresh-secret regressions. |
+| Workspace concurrency/migration race repeats | Four selected cases, `-race -count=3`: **12/12 pass**. |
+| Shared admission/delivery race repeats | Five selected cases, `-race -count=3`: **15/15 pass**. |
+| Offline binary smoke | Nine commands passed with valid JSON/no ANSI where applicable: version, root JSON/plain, catalog, search, metadata check, command help and apply flag help. **115 commands** passed explicit metadata validation. Missing test context store remained absent. No init/apply/upgrade/RPC mutation was invoked. |
+
+Expected offline skips were six DB-gated workspace cases (run separately on the
+authorized fixture), two node-task helper/runner cases, and the pinned-Caddy
+validation case with `EREGION_CADDY_BIN` unset. These are skips, not offline
+passes. Excluded Docker/live fixtures are not counted as passed or qualified.
+
+`TestIntegrationWebhookAdmissionAndDeletionLockOrder` was not in the 18-case
+non-race allowlist, but passed all three executions in
+`logs/shared-admission-race-count3.log` (lines 9–10, 19–20, 29–30). It was not
+silently skipped or unnecessarily rerun; the clarification is retained in
+`evidence/missing-lock-regression.txt`.
+
+The operator authorized a new disposable local PostgreSQL 18 target and private
+package extraction only. The fixture used a loopback-only listener and private
+data/module directories, never an ambient DSN or production context. The
+PostgreSQL 18.6 package matched its apt metadata SHA256; no system package was
+installed and no existing service was changed. Fixture databases, listener,
+postmaster, data directory and extracted package stage were removed after the
+run. Sanitized package/cluster facts are retained under `evidence/pg18-package/`
+and `evidence/pg18-cluster/`. No Docker was used.
+
+Earlier targeted webhook evidence is retained at
+`/tmp/opencode/eregion-webhook-phase.20261110-111609` and
+`/tmp/opencode/eregion-webhook-rerun.20261110-111930`. The initial run found a
+test querying a nonexistent `message` column; the assertion was corrected to
+scan the actual complete `event` JSON. Its formerly unexecuted assertions then
+passed, with concurrency/rollback/lock-order repeats and race runs. This was a
+test/schema mismatch, not a production mutation or an unexplained discarded
+failure. The final schema-028 allowlist above includes the corrected case.
+
+**Not run:** live server init/apply/upgrade, real second-machine workspace
+handoff/login, actual multi-server/shared-IP SSH-pin qualification, live
+gh/GitHub enable/rotation/push checks, changed TUI terminal acceptance,
+Cloudflare adverse cases, and actual macOS installation/upgrade. No signed
+alpha.7 artifact was published or installed. Existing alpha.6 evidence remains
+the unchanged-behavior baseline, not a pass for these changed candidate flows.
+
+**Exact release blocker:** LABS-346's intermittent live readiness timeout still
+has no established cause-specific fix. The four-second HTTP budget and safe
+stage/pool diagnostics are containment and triage, not root-cause qualification.
+Alpha.7 acceptance and beta promotion remain unclaimed; the incremental live
+matrix and explicit operator acceptance are still required.
+
+## Historical run evidence
 
 ### 2026-11-06 measured GC and post-GC deployment (`edge-527592419f06`)
 
@@ -1056,7 +1180,7 @@ sanitized operation evidence. Alpha.1 remains operator-qualified.
   manual fallback when it is unavailable or lacks permission. Check failure
   and retry behavior, JSON/no-TTY operation, and secret-safe output.
 
-## Beta acceptance — Cloudflare DNS automation (not run)
+## Beta acceptance — Cloudflare DNS automation (core alpha.6 flow qualified)
 
 ### Alpha.6 publication and alpha.5 upgrade — pass (2026-11-09)
 
@@ -1096,7 +1220,209 @@ sanitized operation evidence. Alpha.1 remains operator-qualified.
   and the release tree; MASTER D14 and `docs/upgrades.md` describe the new
   fast-forward policy. This is release/upgrade evidence, not beta qualification.
 
-### Requested CLI credential setup follow-up (provider/human checks pending)
+### Alpha.6 credential setup follow-up and qualification continuation
+
+**Human setup succeeded (2026-11-09).** The operator confirmed the earlier ID
+was the account ID, not the zone ID. With zone
+`5d6f2c3ad6873d803a5a670120661afc` / `mbvlabs.com`, the hidden-token flow
+read-validated, displayed current revision 0/next revision 1, and saved only
+after the human confirmed. Output reports revision 1 at
+`2026-11-09T20:04:20Z`, actor `mbv`, and honestly states this does not prove
+write permission. Agent metadata status independently confirmed revision 1;
+no token value was read into chat/output. This supersedes the failed-attempt
+blocker below, not the remaining provider acceptance checks.
+
+**Fresh app/provider run (2026-11-09, alpha.6, in progress).**
+
+- `app create --github-auth --no-deploy` completed as
+  `op_aa9e061b8e3f6b3cb00c00bc512a8c26`, creating `alpha-five` with protected
+  production and staging atomically. The private source is
+  `https://github.com/mbvlabs/alpha-five-eregion`, branch `master`, health
+  `/healthz`, container port 8080. The source credential is `GIT_READ_TOKEN`,
+  separate from the empty runtime-secret list; no token file was created.
+- Staging plain config `APP_ENV=staging` completed as
+  `op_b5b802de11d5ff2a11d13161d0c07cb1`; production keeps
+  `APP_ENV=production`. Neither create nor config mutation deployed an app.
+- Real provider previews for the initially designated `git-test2`/`git-test3`
+  hostnames found foreign A records and warned that apply would fail closed.
+  Neither record was modified. The operator chose fresh hostnames and then
+  explicitly named production `eregion-test1.mbvlabs.com` and staging
+  `eregion-test2.mbvlabs.com`; earlier proposed alpha6 names were previewed
+  only, never applied.
+- Both final previews showed no existing records and exactly one new proxied
+  A record each to `46.224.129.96`. Managed adds completed:
+  production `op_8b7d5482c87dc9265e6c8cfc1adda068`, staging
+  `op_1d16943947c27e1be9bc552aefef16d1`. Post-apply provider snapshots show
+  the exact origin/proxy/ownership marker, no changes, and `unchanged=1` for
+  each. Both ledgers report generation/applied-generation 1 and state applied.
+  This qualifies real provider creation/readback and no-op planning, not
+  managed cleanup or a real repeat apply.
+- Routes/certificates/public readiness remain pending with `no serving web
+  upstream yet`, as expected before deployment; provider success is not public
+  HTTPS success. Production deploy preview passed; real deployment
+  `op_44d64f9d23c4a773ba02fa9dfe138482` is accepted and being followed. No
+  deployment subsequently succeeded. Public HTTPS returned
+  `alpha-five-eregion v1`, `environment: production`, and `/healthz` returned
+  `ok`. Production status reported applied route, proxied DNS, valid certificate
+  and public 200. Release `rel_4424cec854240d4349defcd8ee7b1a49` came from private
+  commit `3a5893fdc8b0d024ba92ea16562bec6f29025237` via Buildpacks. The same-key
+  create replay returned the original create operation and left production's
+  Git credential at revision 1; no token was exported. LABS-337 is qualified.
+- With explicit operator approval for fixture-only commits/pushes, added a
+  `/qualification` endpoint that reports version/environment and only runtime
+  secret `match`/`missing`/`mismatch`, never values or hashes. Unit tests/vet/build
+  passed. Production baseline commit `5022dc2dacb01dbc81040640ef157b23468af3f1`
+  keeps visible v1; staging commit `edb1eb461007b8e7baf3f34c9c5ea3dfb17677e0`
+  is v2. Different random synthetic `QUALIFICATION_SECRET` values were written
+  into each environment through the ordinary vault path using automatically
+  removed 0600 temporary inputs; plaintext never entered output/argv. Only
+  nonsecret expected hashes were configured for the safe match probe.
+- Production baseline deploy `op_06830de07ee75f2e93b1abfd504c6012` succeeded
+  (attempt 2), serving `rel_7e5930ed6f4595943f87f341e14df402`, image
+  `sha256:9ef2a022f05313a6aa6c8b0b976ddeadc37b1fdba76c49bf43d4dda10511cc0b`.
+  Its public probe returned v1 / production / secret match.
+- Staging v2 deploy `op_78fa776960ca08541492a0a97abe9021` succeeded, serving
+  `rel_a4e0fe22c55ddcc64d671845752e249c`, image
+  `sha256:c408dda71125d9e41fe060ed52991a208a7c3c9d2f003eb9d8896a081d3c4798`.
+  Public root/probe returned v2 / staging / secret match; curl verified TLS
+  (`ssl_verify_result=0`) and health HTTP 200. Status still showed a pre-serving
+  TLS failure observed at 21:37:28, before deployment completed at 21:39:41.
+  Source inspection confirmed domain observations refresh independently every
+  five minutes, not on status reads or successful deployment verification;
+  the next ordinary observation cycle refreshed both domains at 21:42:28 to
+  valid certificates, public 200 and ready=true without a repair command.
+- Promotion preview identified the exact staging release/digest/commit and
+  fixed production target/current revision, without a build. Real promotion
+  `op_575e312067e0f4293559c973a010e657` succeeded. Production release
+  `rel_7c0cd04f892a9d1e7e0a0eae39e99b3e` has the exact staging image digest and
+  commit, with no build ID; public probe returned v2 / production / secret
+  match while staging remained v2 / staging / match. Same-key replay returned
+  the original succeeded promotion operation.
+- Exact-target rollback to production's v1 probe baseline completed as
+  `op_2ab5dffd4364714e688af47cc96bfbde`. Public probes independently confirmed
+  production v1 / production / secret match, staging still v2 / staging / match.
+  This passes the visible version/config/secret-isolation promotion/rollback
+  checks; release-command once-only and concurrent host variants were not
+  repeated in this fresh run.
+- A real production DNS repeat apply completed as
+  `op_217183d1a6526396d3e7a7119eb670de`; its durable DNS event records generation
+  2 with **0 changed / 1 unchanged**, and the binding remained ready. This
+  adds real provider idempotence evidence beyond the earlier no-op previews.
+  Owned cleanup was qualified in the continuation below; provider-failure
+  variants remain pending.
+- **Owned cleanup continuation (2026-11-10): pass.** The operator explicitly
+  authorized temporary alias `eregion-test-cleanup.mbvlabs.com`. Its add preview
+  showed no existing records and one proxied A create to the explicit origin.
+  Add `op_686e907acaf27a9f5571c6a4c3b6a3c2` succeeded. Removal preview targeted
+  only record `ecf611903256f1db01ab064a7b917074` with that binding's exact
+  ownership marker; no primary or foreign record was selected. Ordinary
+  `domain remove` without DNS flags used the durable ledger and completed as
+  `op_64fe66bec1b9d9742fd7cb3ffebf4b9b` at 09:01:07Z. Domain inventory returned
+  to the two primary bindings; a fresh read-only add preview reported an empty
+  provider record set for the deleted alias. Both serving domains retained
+  valid TLS/public 200 and probes v1/production/match and v2/staging/match.
+  The alias was not recreated after the cleanup verification. Provider-failure,
+  interrupted/multi-binding deletion and foreign-record actual-apply refusal
+  variants were not injected in this live pass.
+- `env update --auto-deploy --github-webhook --json` refused before mutation
+  with `input_required` (human terminal required). No guard was bypassed. A
+  human was asked to run the existing terminal command without JSON and not
+  share any one-time secret. Agent-safe gh-assisted setup is tracked as
+  LABS-344. The human subsequently completed the terminal flow as
+  `op_a2e9ab5f64c9ddb1d6447616e62a5699`, creating GitHub hook `709788240` with
+  push events, JSON content, verified HTTPS and staging bound to `master`.
+- **Push-to-deploy continuation (2026-11-10): pass.** Fixture commit
+  `6fceddac583aac6603682a5bcb1a8b7a98b8fdb4` (v3) was pushed to `master`.
+  GitHub push delivery `3853233692285599744`, GUID
+  `68cbbc58-dce6-11f1-9e09-e07155fdb6c7`, received HTTP 202. Without a manual
+  deploy command, webhook actor `github:mbvlabs/alpha-five-eregion` created
+  `op_8477cb078dc50b12cd7069f65fa1bfa9`, which succeeded and served
+  `rel_68dbdab224272c27fe60fbc6119260a4` from the exact pushed commit, image
+  `sha256:c7c677574a0ba34c23484548260945611fafc869943090fc9eeb7d9c94cff4df`.
+  Public probes returned staging v3 / staging / secret match and production
+  remained v1 / production / match; staging reports valid TLS/public 200.
+- GitHub redelivery `3853234485426397184` reused that GUID and received 202;
+  the operation list still contained exactly the original single webhook deploy
+  and the serving release stayed unchanged. No duplicate deployment occurred.
+- With explicit operator approval, remote temporary branch
+  `alpha6-webhook-ignore` pointed to the existing v3 commit, without a new
+  commit or `master` change. Its push delivery `3853234790897549312` named that
+  non-bound ref and returned HTTP 200; no deployment was created and staging's
+  release stayed unchanged. The temporary branch was then removed and its
+  remote absence verified. Large delivery IDs above were taken from raw JSON,
+  not rounded through numeric jq conversion.
+- **Telemetry rotation/authentication continuation (2026-11-10): pass.** A
+  review-cleared explicit-opt-in qualification test used the installed alpha.6
+  binary and product credential/tunnel APIs against only `thelab`/`main` at
+  `46.224.129.96`. Before rotation both `/node` and `/targets.json` returned 401
+  anonymously and 200 with the current credential. One real rotation changed
+  the old credential to 401 on both paths; the new credential returned 200,
+  while anonymous requests still returned 401. Discovery labels/target matched.
+  The run was 09:10:30–09:10:34Z (2.83 seconds, not skipped); output asserted
+  `rotated=true`, `handoff_stale=true`, `password_in_output=false` and contained
+  neither password, hashes, bodies nor authorization headers. Normal shared
+  tunnel leases were closed without killing the existing daemon.
+  Sanitized evidence: `/tmp/opencode/metrics-qualification.hLxNht/`.
+- The post-rotation public app probes remained production v1/match and staging
+  v3/match. Initial protect status reported unconfigured, so the human was
+  asked to run `protect init`, then protected `secrets export` privately with
+  a fresh authenticator code. The operator subsequently confirmed both steps
+  passed (2026-11-10), including the handoff file export. This is operator-reported
+  evidence; no handoff or authenticator secret was read by the agent.
+- A post-rotation doctor check returned 22 pass / 1 fail (`drift.pending`,
+  `host-readiness-v1`): loopback `/readyz` exceeded the five-second HTTP timeout.
+  Public readiness and both apps remained available. Read-only timed probes
+  later returned loopback health 200 in 0.001s, loopback readiness 200 in 1.363s
+  and public readiness 200 in 1.350s; API service has zero restarts since the
+  alpha.6 upgrade. No apply/repair was used to hide the finding.
+- **Final read-only health verification (2026-11-10, 09:31–09:32Z): pass.**
+  Installed CLI and node remain alpha.6 / `b8211a2c44f6`; doctor at 09:31:14Z
+  passed **23/0/0**, including `drift.pending`. Server status reported schema
+  **27/27**, River **7/7** and all six service checks true. Protection status
+  reported configured, confirmed at 09:27:46Z, pending false and zero failures;
+  private export remains operator-confirmed, not agent-inspected. Metrics were
+  fresh (age 0.030s). Public HTTPS qualification probes returned 200 with verified
+  TLS: production v1/production/match and staging v3/staging/match.
+  In one bounded five-sample window (09:32:04–09:32:24Z), all loopback health,
+  loopback readiness and public readiness probes returned 200. Loopback readiness
+  was 0.334–0.628s; public readiness was 0.421–1.221s. API and worker remained
+  active/running with zero restarts since the upgrade. No apply, restart,
+  rotation, direct database query or raw journal read was performed.
+  Sanitized evidence: `/tmp/opencode/alpha6-live-verify.JBLCbI/summary.md`.
+  The earlier intermittent timeout was not reproduced or root-caused; LABS-346
+  remains open. Source review identifies four sequential database reads through
+  the persistent API pool without stage timing or pool-wait diagnostics. The
+  server's 10s `ReadTimeout` limits request reading, not handler execution.
+  This spot check does not establish that the intermittent fault is resolved or
+  qualify the skipped provider/deletion variants or beta as a whole.
+
+**Human attempt after upgrade (2026-11-09, alpha.6).** The operator reported
+entering a zone ID and hidden token, then receiving `not_found: context thelab
+was not found`. This failed during local client/context resolution before any
+provider request or credential save. Diagnosis: this agent session selects
+`/home/mbv/.config/eregion-fresh-test/contexts.json` through
+`EREGION_CONTEXT_FILE`; that store lists `thelab`. With the store override
+unset, the default store lists only `main`. The human shell had not selected
+the separate fresh-test store. The supplied workaround is to export that
+nonsecret context-store path, verify `context list`, then rerun configure.
+
+The premature secret prompt is a confirmed UX defect (LABS-343): resolve the
+context before collecting zone/token input, while retaining no-TTY/JSON
+refusal. Its source correction is implemented and review-cleared: missing-context
+regression, safe CLI suite, repeated targeted tests, build and vet pass. It is
+uncommitted/unpublished; no follow-up release is yet authorized. The store/name
+confusion also informs naming design LABS-340.
+No token value was provided to the agent or recorded here; provider
+qualification remains pending.
+
+**Second human attempt:** after selecting the fresh-test store, `context list`
+showed `thelab` and configure reached provider read validation, which returned
+`forbidden: Cloudflare rejected the API token`. No configuration was saved and
+no DNS mutation occurred. The current client deliberately maps both provider
+HTTP 401 and 403 to that sanitized fault, so this output does not distinguish
+an invalid token from denied/wrong-zone access. The human was asked to verify
+API-token permissions, zone scope and the zone ID (not account ID). No token
+was requested in chat or read by the agent; success is not yet reported.
 
 **Integrated source/database evidence (2026-11-09).** Independent verification
 of the combined tree passed the six provider/migration tests (including 026→027
@@ -1194,9 +1520,12 @@ below are acceptance requirements, not evidence of implementation or success.
   fresh production/staging deploy, promotion/rollback and signed GitHub webhook
   checks. Release publication and source tests alone do not qualify beta.
 
-This is the beta acceptance definition for MASTER D26. **No real-host or real
-Cloudflare run is recorded for this change.** The isolated checks below are not
-host qualification, and no zone, token or DNS record was read or mutated.
+This is the beta acceptance definition for MASTER D26. The original isolated
+checks below did not touch a real zone/token/record and are not host
+qualification. The later alpha.6 continuation above records real human setup,
+create/readback/no-op/repeat apply and exact-owned alias cleanup. Failure and
+interruption, multi-binding deletion and actual foreign-record apply refusal
+remain unqualified live; this is not a beta acceptance claim.
 
 | Check | Pass means |
 | --- | --- |
@@ -1218,8 +1547,9 @@ host qualification, and no zone, token or DNS record was read or mutated.
 order integration tests were run against a disposable local PostgreSQL 18.6
 cluster under `/tmp/opencode` and passed. Migration 025 was applied to the
 authorized main node on 2026-11-08 as part of the telemetry beta candidate
-(schema 25/25). No provider token or real DNS record was read or mutated, and
-the Cloudflare flow remains not host-qualified. Pre-ledger name-based ownership
+(schema 25/25). No provider token or real DNS record was read or mutated in
+that run, so the Cloudflare flow was not host-qualified then. See the alpha.6
+continuation above for later core provider evidence. Pre-ledger name-based ownership
 markers are not migrated or adopted; only the new immutable domain-ID ledger is
 used. The existing Cloudflare no-CAS external-writer race remains documented,
 not claimed solved.
@@ -1263,8 +1593,9 @@ zone, token or DNS was used or mutated.
 
 This is the beta acceptance definition for MASTER D5. The host run below records
 the authorized main-node check; it is a targeted telemetry qualification, not a
-full fresh-server baseline or a beta release. Cloudflare DNS automation remains
-not host-qualified.
+full fresh-server baseline or a beta release. Cloudflare DNS automation was not
+host-qualified at that historical run; the later alpha.6 continuation records
+the qualified core flow and remaining adverse-case gaps.
 
 | Check | Pass means |
 | --- | --- |

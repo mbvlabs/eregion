@@ -14,27 +14,41 @@ import (
 // CommandMeta is the agent-facing safety/discovery contract. Values describe
 // implemented behavior, not promises about commands planned for later milestones.
 type CommandMeta struct {
-	Summary          string          `json:"summary"`
-	WhenToUse        []string        `json:"when_to_use"`
-	Examples         []string        `json:"examples"`
-	Next             []string        `json:"next,omitempty"`
-	Audience         []string        `json:"audience"`
-	Platforms        []string        `json:"platforms"`
-	Mutating         bool            `json:"mutating"`
-	MutatingFlags    []string        `json:"mutating_flags,omitempty"`
-	Destructive      bool            `json:"destructive"`
-	DestructiveFlags []string        `json:"destructive_flags,omitempty"`
-	DryRun           bool            `json:"supports_dry_run"`
-	DryRunReason     string          `json:"dry_run_unavailable_reason,omitempty"`
-	Confirmation     string          `json:"confirmation,omitempty"`
-	Prompts          bool            `json:"prompts"`
-	InputFlags       []string        `json:"input_flags,omitempty"`
-	Remote           bool            `json:"remote"`
-	Environment      []string        `json:"environment,omitempty"`
-	NeedsRestart     string          `json:"needs_restart"`
-	Output           string          `json:"output"`
-	OutputModes      []string        `json:"output_modes"`
-	ErrorCodes       []contract.Code `json:"error_codes"`
+	Summary           string          `json:"summary"`
+	WhenToUse         []string        `json:"when_to_use"`
+	Examples          []string        `json:"examples"`
+	Next              []string        `json:"next,omitempty"`
+	Audience          []string        `json:"audience"`
+	TerminalOnly      bool            `json:"terminal_only,omitempty"`
+	HumanFactor       bool            `json:"human_factor,omitempty"`
+	Platforms         []string        `json:"platforms"`
+	Mutating          bool            `json:"mutating"`
+	MutatingFlags     []string        `json:"mutating_flags,omitempty"`
+	Destructive       bool            `json:"destructive"`
+	DestructiveFlags  []string        `json:"destructive_flags,omitempty"`
+	DryRun            bool            `json:"supports_dry_run"`
+	DryRunReason      string          `json:"dry_run_unavailable_reason,omitempty"`
+	Confirmation      string          `json:"confirmation,omitempty"`
+	Prompts           bool            `json:"prompts"`
+	InputFlags        []string        `json:"input_flags,omitempty"`
+	Remote            bool            `json:"remote"`
+	Environment       []string        `json:"environment,omitempty"`
+	NeedsRestart      string          `json:"needs_restart"`
+	Output            string          `json:"output"`
+	OutputModes       []string        `json:"output_modes"`
+	DurableSubmission bool            `json:"durable_submission,omitempty"`
+	ErrorCodes        []contract.Code `json:"error_codes"`
+}
+
+// terminalOnlyMeta marks a command that is executed by a person at an
+// interactive terminal. Audience describes who can use it, while OutputModes
+// describes what output the implementation can actually produce; a terminal
+// command has no machine mode even though every command inherits --json.
+func terminalOnlyMeta(meta CommandMeta) CommandMeta {
+	meta.Audience = []string{"human"}
+	meta.TerminalOnly = true
+	meta.OutputModes = []string{"plain"}
+	return meta
 }
 
 type Flag struct {
@@ -103,8 +117,24 @@ func (r registry) validate(root *cobra.Command) error {
 		if !slices.Contains([]string{"result", "events"}, meta.Output) {
 			add("output must be result or events")
 		}
-		if !allIn(meta.OutputModes, []string{"plain", "json", "ndjson"}) || !slices.Contains(meta.OutputModes, "plain") || !slices.Contains(meta.OutputModes, "json") {
-			add("output_modes must list plain and json, and only additionally ndjson")
+		if !nonempty(meta.OutputModes) || !allIn(meta.OutputModes, []string{"plain", "json", "ndjson"}) || !slices.Contains(meta.OutputModes, "plain") {
+			add("output_modes must list plain, and only additionally json or ndjson")
+		}
+		if meta.TerminalOnly {
+			if slices.Contains(meta.OutputModes, "json") || slices.Contains(meta.OutputModes, "ndjson") {
+				add("terminal-only commands must not advertise machine output")
+			}
+			if len(meta.Audience) != 1 || meta.Audience[0] != "human" {
+				add("terminal-only commands require human-only audience")
+			}
+		} else if !slices.Contains(meta.OutputModes, "json") {
+			add("non-terminal commands must list plain and json output")
+		}
+		if meta.DurableSubmission && !meta.Mutating {
+			add("durable submissions must be mutating")
+		}
+		if meta.HumanFactor && !meta.Mutating {
+			add("human-factor commands must be mutating")
 		}
 		if len(meta.ErrorCodes) == 0 {
 			add("error_codes are required")
@@ -245,13 +275,77 @@ func allIn(items, allowed []string) bool {
 
 func plainHelp(command Command) string {
 	var out strings.Builder
-	fmt.Fprintf(&out, "%s\n\n%s\n\nUsage: %s\n\nFlags:\n", command.Path, command.Summary, command.Use)
+	fmt.Fprintf(&out, "%s\n\n%s\n\n", command.Path, command.Summary)
+	if len(command.WhenToUse) > 0 {
+		out.WriteString("When to use:\n")
+		for _, when := range command.WhenToUse {
+			fmt.Fprintf(&out, "  %s\n", when)
+		}
+		out.WriteString("\n")
+	}
+	fmt.Fprintf(&out, "Usage: %s\n\n", command.Use)
+	fmt.Fprintf(&out, "Audience: %s\n", strings.Join(command.Audience, ", "))
+	if command.TerminalOnly {
+		out.WriteString("Machine output: not supported (requires an interactive terminal)\n")
+	} else {
+		fmt.Fprintf(&out, "Machine output: %s\n", strings.Join(command.OutputModes, ", "))
+	}
+	if command.HumanFactor {
+		out.WriteString("Human factor: effectful execution may require a code from the authenticator app at a terminal")
+		if command.DryRun {
+			out.WriteString("; --dry-run remains machine-safe")
+		}
+		out.WriteString(".\n")
+	}
+	var safety []string
+	if command.Mutating {
+		safety = append(safety, "mutating")
+	}
+	if command.Destructive {
+		safety = append(safety, "destructive")
+	}
+	if command.DryRun {
+		safety = append(safety, "supports --dry-run preview")
+	}
+	if command.Confirmation != "" {
+		safety = append(safety, "confirmation "+command.Confirmation+" via --confirm")
+	}
+	if command.Prompts {
+		safety = append(safety, "prompts at a terminal")
+	}
+	if len(command.InputFlags) > 0 {
+		names := make([]string, 0, len(command.InputFlags))
+		for _, name := range command.InputFlags {
+			names = append(names, "--"+name)
+		}
+		safety = append(safety, "noninteractive inputs "+strings.Join(names, ", "))
+	}
+	if len(safety) > 0 {
+		fmt.Fprintf(&out, "Safety: %s\n", strings.Join(safety, "; "))
+	}
+	if command.DurableSubmission {
+		out.WriteString("Result: accepted work is a durable operation; follow it to observe completion.\n")
+	}
+	if command.Output == "events" {
+		out.WriteString("Result: an event stream over durable operation state; this command does not submit work.\n")
+	}
+	out.WriteString("\nFlags:\n")
 	for _, flag := range command.Flags {
-		fmt.Fprintf(&out, "  --%-12s %s\n", flag.Name, flag.Usage)
+		required := ""
+		if flag.Required {
+			required = " (required)"
+		}
+		fmt.Fprintf(&out, "  --%-12s %s%s\n", flag.Name, flag.Usage, required)
 	}
 	out.WriteString("\nExamples:\n")
 	for _, example := range command.Examples {
 		fmt.Fprintf(&out, "  %s\n", example)
+	}
+	if len(command.Next) > 0 {
+		out.WriteString("\nNext:\n")
+		for _, next := range command.Next {
+			fmt.Fprintf(&out, "  %s\n", next)
+		}
 	}
 	return out.String()
 }

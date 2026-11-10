@@ -1,6 +1,7 @@
 # Routes, DNS and private access
 
-Mechanism reference; [MASTER](MASTER.md) owns scope and status. Three different
+Mechanism reference; [MASTER](MASTER.md) owns product scope and decisions;
+Linear owns execution tracking. Three different
 things must not be conflated: **domain binding**, **Caddy route**, **DNS record**.
 
 ## Environment domains

@@ -109,6 +109,9 @@ var migration026 string
 //go:embed migrations/027_provider_credentials.sql
 var migration027 string
 
+//go:embed migrations/028_workspace_identity.sql
+var migration028 string
+
 type migration struct {
 	version int
 	name    string
@@ -146,6 +149,7 @@ var migrations = []migration{
 	{version: 25, name: "025_domain_dns_ownership.sql", sql: migration025},
 	{version: 26, name: "026_deployment_lifecycle_owner.sql", sql: migration026},
 	{version: 27, name: "027_provider_credentials.sql", sql: migration027},
+	{version: 28, name: "028_workspace_identity.sql", sql: migration028},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.
@@ -175,6 +179,9 @@ func ParseDatabaseConfig(dsn string) (*pgxpool.Config, error) {
 	config.MaxConns = 12
 	config.ConnConfig.ConnectTimeout = 5 * time.Second
 	config.ConnConfig.RuntimeParams["application_name"] = "eregion"
+	// Readiness diagnostics are context-scoped on this shared pool. Attaching
+	// the tracer before pool creation keeps ordinary queries untouched.
+	config.ConnConfig.Tracer = &readinessTracer{}
 	return config, nil
 }
 
@@ -222,42 +229,17 @@ func migrationByVersion(version int) (migration, bool) {
 }
 
 // PlanMigrations performs no DDL. Newer/inconsistent schemas fail closed.
+// Each top-level read is labelled for readiness diagnostics; River's
+// ExistingVersions performs several queries inside the river_versions stage.
 func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
 	plan := MigrationPlan{Required: requiredVersion()}
-	var exists bool
-	if err := pool.QueryRow(ctx, "SELECT to_regclass('eregion_schema_migrations') IS NOT NULL").Scan(&exists); err != nil {
+	exists, err := schemaMigrationsTableExists(ctx, pool)
+	if err != nil {
 		return plan, unavailable(err)
 	}
 	if exists {
-		rows, err := pool.Query(ctx, "SELECT version, checksum FROM eregion_schema_migrations ORDER BY version")
-		if err != nil {
-			return plan, unavailable(err)
-		}
-		defer rows.Close()
-		expected := 1
-		for rows.Next() {
-			var version int
-			var checksum string
-			if err := rows.Scan(&version, &checksum); err != nil {
-				return plan, unavailable(err)
-			}
-			applied, known := migrationByVersion(version)
-			if !known || version > requiredVersion() {
-				return plan, contract.NewFault(contract.PreconditionFailed, "database schema is newer than this binary", "Upgrade the binary before using this database; never rewrite applied migrations.")
-			}
-			if version != expected {
-				return plan, contract.NewFault(contract.PreconditionFailed, "database migration history has a gap", "Restore the missing migration history from a backup; do not guess at applied versions.")
-			}
-			if checksum != migrationHash(applied) {
-				return plan, contract.NewFault(contract.PreconditionFailed, "applied migration content differs", "Use a compatible binary; never rewrite applied migrations.")
-			}
-			if version > plan.Current {
-				plan.Current = version
-			}
-			expected++
-		}
-		if err := rows.Err(); err != nil {
-			return plan, unavailable(err)
+		if err := readSchemaMigrations(ctx, pool, &plan); err != nil {
+			return plan, err
 		}
 	}
 	m, err := migrator(pool)
@@ -266,33 +248,83 @@ func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, err
 	}
 	versions := m.AllVersions()
 	plan.RiverRequired = versions[len(versions)-1].Version
-	if err := pool.QueryRow(ctx, "SELECT to_regclass('river_migration') IS NOT NULL").Scan(&exists); err != nil {
+	exists, err = riverMigrationTableExists(ctx, pool)
+	if err != nil {
 		return plan, unavailable(err)
 	}
 	if exists {
-		applied, err := m.ExistingVersions(ctx)
-		if err != nil {
-			return plan, unavailable(err)
-		}
-		for _, version := range applied {
-			if version.Version > plan.RiverCurrent {
-				plan.RiverCurrent = version.Version
-			}
-		}
-		if plan.RiverCurrent > plan.RiverRequired {
-			return plan, contract.NewFault(contract.PreconditionFailed, "River schema is newer than this binary", "Upgrade the binary before using this database.")
+		if err := readRiverMigrations(ctx, m, &plan); err != nil {
+			return plan, err
 		}
 	}
 	return plan, nil
 }
 
-func Ready(ctx context.Context, pool *pgxpool.Pool) error {
-	plan, err := PlanMigrations(ctx, pool)
+func schemaMigrationsTableExists(ctx context.Context, pool *pgxpool.Pool) (exists bool, err error) {
+	ctx, end := beginReadyStage(ctx, "schema_table")
+	defer func() { end(err) }()
+	err = pool.QueryRow(ctx, "SELECT to_regclass('eregion_schema_migrations') IS NOT NULL").Scan(&exists)
+	return exists, err
+}
+
+func readSchemaMigrations(ctx context.Context, pool *pgxpool.Pool, plan *MigrationPlan) (err error) {
+	ctx, end := beginReadyStage(ctx, "schema_migrations")
+	defer func() { end(err) }()
+	rows, err := pool.Query(ctx, "SELECT version, checksum FROM eregion_schema_migrations ORDER BY version")
 	if err != nil {
-		return err
+		return unavailable(err)
 	}
-	if plan.Current != plan.Required || plan.RiverCurrent != plan.RiverRequired {
-		return contract.NewFault(contract.PreconditionFailed, "database migrations are pending", "Run eregion node migrate before starting API or workers.")
+	// The stage ends after rows.Close so the query trace includes row lifetime.
+	defer rows.Close()
+	expected := 1
+	for rows.Next() {
+		var version int
+		var checksum string
+		if scanErr := rows.Scan(&version, &checksum); scanErr != nil {
+			return unavailable(scanErr)
+		}
+		applied, known := migrationByVersion(version)
+		if !known || version > requiredVersion() {
+			return contract.NewFault(contract.PreconditionFailed, "database schema is newer than this binary", "Upgrade the binary before using this database; never rewrite applied migrations.")
+		}
+		if version != expected {
+			return contract.NewFault(contract.PreconditionFailed, "database migration history has a gap", "Restore the missing migration history from a backup; do not guess at applied versions.")
+		}
+		if checksum != migrationHash(applied) {
+			return contract.NewFault(contract.PreconditionFailed, "applied migration content differs", "Use a compatible binary; never rewrite applied migrations.")
+		}
+		if version > plan.Current {
+			plan.Current = version
+		}
+		expected++
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return unavailable(rowsErr)
+	}
+	return nil
+}
+
+func riverMigrationTableExists(ctx context.Context, pool *pgxpool.Pool) (exists bool, err error) {
+	ctx, end := beginReadyStage(ctx, "river_table")
+	defer func() { end(err) }()
+	err = pool.QueryRow(ctx, "SELECT to_regclass('river_migration') IS NOT NULL").Scan(&exists)
+	return exists, err
+}
+
+func readRiverMigrations(ctx context.Context, m *rivermigrate.Migrator[pgx.Tx], plan *MigrationPlan) (err error) {
+	ctx, end := beginReadyStage(ctx, "river_versions")
+	defer func() { end(err) }()
+	applied, err := m.ExistingVersions(ctx)
+	if err != nil {
+		return unavailable(err)
+	}
+	for _, version := range applied {
+		if version.Version > plan.RiverCurrent {
+			plan.RiverCurrent = version.Version
+		}
+	}
+	if plan.RiverCurrent > plan.RiverRequired {
+		return contract.NewFault(contract.PreconditionFailed, "River schema is newer than this binary", "Upgrade the binary before using this database.")
 	}
 	return nil
 }

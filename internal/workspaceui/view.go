@@ -87,6 +87,21 @@ func (m Model) infoStyle() lipgloss.Style { return m.paletteFor().info }
 func (m Model) boldStyle() lipgloss.Style { return m.paletteFor().bold }
 func (m Model) selStyle() lipgloss.Style  { return m.paletteFor().sel }
 
+// workspaceLabel renders the authoritative workspace state. Known=false is an
+// unknown read, never the explicit unconfigured state.
+func (m Model) workspaceLabel() string {
+	if !m.opts.WorkspaceKnown {
+		return "workspace unknown"
+	}
+	if !m.opts.WorkspaceConfigured {
+		return "workspace not configured"
+	}
+	if workspace := m.clean(strings.TrimSpace(m.opts.Workspace)); workspace != "" {
+		return "workspace " + workspace
+	}
+	return "workspace unknown"
+}
+
 func (m Model) glyphSeparator() string {
 	if m.opts.ASCII {
 		return " | "
@@ -147,7 +162,26 @@ func (m Model) renderHeader(width int) string {
 	if host == "" {
 		host = "API host unknown"
 	}
-	line1 := strings.Join([]string{m.boldStyle().Render("eregion"), m.dim().Render(host), m.boldStyle().Render(m.tab.String())}, m.glyphSeparator())
+	parts := []string{m.boldStyle().Render("eregion")}
+	if m.opts.Node != "" {
+		node := m.clean(strings.TrimSpace(m.opts.Node))
+		if node == "" {
+			node = "unknown"
+		}
+		if workspace := m.workspaceLabel(); workspace != "" {
+			parts = append(parts, m.dim().Render(workspace))
+		}
+		if contextName := m.clean(strings.TrimSpace(m.opts.Context)); contextName != "" {
+			parts = append(parts, m.dim().Render("context "+contextName))
+		}
+		parts = append(parts, m.dim().Render("node "+node))
+	} else {
+		// Tests and injected clients that do not supply a node identity keep
+		// the previous route label rather than inventing a node name.
+		parts = append(parts, m.dim().Render(host))
+	}
+	parts = append(parts, m.boldStyle().Render(m.tab.String()))
+	line1 := strings.Join(parts, m.glyphSeparator())
 	status := m.stateLabel()
 	if m.filterText != "" {
 		status += m.glyphSeparator() + m.infoStyle().Render("/"+m.clean(m.filterText))
@@ -447,9 +481,16 @@ func (m Model) renderFooter(width int) string {
 
 func (m Model) renderCompact(width, height int) string {
 	item, ok := m.selectedItem()
+	target := m.clean(m.opts.Host)
+	if m.opts.Node != "" {
+		target = "node " + m.clean(strings.TrimSpace(m.opts.Node))
+		if workspace := m.workspaceLabel(); workspace != "" {
+			target += m.glyphSeparator() + workspace
+		}
+	}
 	lines := []string{
 		m.boldStyle().Render("eregion") + " " + m.boldStyle().Render(m.tab.String()),
-		m.dim().Render(truncate(m.clean(m.opts.Host), width)),
+		m.dim().Render(truncate(target, width)),
 		m.stateLabel(),
 	}
 	if ok {

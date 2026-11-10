@@ -14,6 +14,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
 )
 
@@ -89,6 +90,10 @@ func (l Layout) Validate() error {
 type Config struct {
 	Node string `json:"node"`
 	Role Role   `json:"role"`
+	// Workspace is the requested portable installation workspace name. It is
+	// identity metadata, separate from the node name and never a tenant scope.
+	// It is empty on an alpha.6 installation until apply --workspace assigns it.
+	Workspace string `json:"workspace,omitempty"`
 
 	Layout Layout `json:"layout"`
 
@@ -170,6 +175,12 @@ func ValidateAccountName(name string) error {
 	return nil
 }
 
+// ValidateWorkspaceName checks the portable workspace slug before it reaches
+// any configuration, RPC request, or database transaction.
+func ValidateWorkspaceName(name string) error {
+	return controlplane.ValidateWorkspaceName(name)
+}
+
 // ValidateNodeName checks a node name before bootstrap records it.
 func ValidateNodeName(name string) error {
 	if err := engine.ValidateNodeName(name); err != nil {
@@ -191,6 +202,14 @@ func (c Config) Validate() error {
 	}
 	if err := c.Layout.Validate(); err != nil {
 		return contract.NewFault(contract.ValidationFailed, err.Error(), "Use absolute, non-root host paths.")
+	}
+	if c.Workspace != "" && !role.ControlPlane {
+		return contract.NewFault(contract.ValidationFailed, "a workspace identity belongs to the main control-plane node", "Omit --workspace on application, builder, or telemetry roles.")
+	}
+	if c.Workspace != "" {
+		if err := ValidateWorkspaceName(c.Workspace); err != nil {
+			return err
+		}
 	}
 	if role.ControlPlane {
 		if strings.TrimSpace(c.DatabaseURL) == "" {
@@ -311,6 +330,7 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 	type canonical struct {
 		Node               string `json:"node"`
 		Role               Role   `json:"role"`
+		Workspace          string `json:"workspace,omitempty"`
 		Layout             Layout `json:"layout"`
 		PlatformPath       string `json:"platform_path"`
 		Arch               string `json:"arch"`
@@ -325,7 +345,7 @@ func (c Config) CanonicalInputs() ([]byte, error) {
 		NodeAuthorizedKeys string `json:"node_authorized_keys"`
 	}
 	value := canonical{
-		Node: c.Node, Role: c.Role, Layout: c.Layout, PlatformPath: c.PlatformPath, Arch: c.Arch,
+		Node: c.Node, Role: c.Role, Workspace: c.Workspace, Layout: c.Layout, PlatformPath: c.PlatformPath, Arch: c.Arch,
 		APIListen: c.APIListen, APITLSCert: c.APITLSCert, APITLSKey: c.APITLSKey,
 		AdminUser:         c.AdminUser,
 		WorkerConcurrency: c.WorkerConcurrency, RegistryListen: c.RegistryListen,

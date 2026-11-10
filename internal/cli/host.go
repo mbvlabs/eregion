@@ -10,6 +10,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/doctor"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/spf13/cobra"
@@ -26,6 +27,10 @@ func (a *app) hostSpecs() []spec {
 	applyMeta := operationMeta("Converge the node to its recorded host intent", "eregion apply --json")
 	applyMeta.Mutating, applyMeta.DryRun = true, true
 	applyMeta.NeedsRestart = "possible"
+	applyMeta.InputFlags = []string{"workspace"}
+	applyMeta.WhenToUse = []string{
+		"Converge the node to its recorded host intent. On an existing alpha.6 installation, pass --workspace NAME once to assign the portable workspace identity explicitly; a dry run previews it without writing.",
+	}
 	applyMeta.Next = []string{"eregion doctor", "eregion server status"}
 	doctorMeta := operationMeta("Check host drift, security, certificates, disk, versions and services", "eregion doctor --json")
 	doctorMeta.Next = []string{"eregion plan", "eregion apply"}
@@ -39,6 +44,7 @@ func (a *app) hostSpecs() []spec {
 		{use: "plan", meta: planMeta, run: a.hostPlan},
 		{use: "apply", meta: applyMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Bool("dry-run", false, "Show the plan without changing the host")
+			cmd.Flags().String("workspace", "", "Assign this portable workspace name once on a legacy installation; immutable after assignment")
 		}, run: a.hostApply},
 		{use: "doctor", meta: doctorMeta, run: a.hostDoctor},
 		{use: "ssh [node]", meta: sshMeta, args: cobra.MaximumNArgs(1), flags: func(cmd *cobra.Command) {
@@ -65,14 +71,57 @@ func (a *app) hostApply(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	report, plan, err := client.HostApply(cmd.Context(), dryRun, "")
+	workspaceName, _ := cmd.Flags().GetString("workspace")
+	report, plan, err := client.HostApply(cmd.Context(), dryRun, "", strings.TrimSpace(workspaceName))
 	if err != nil {
 		return result{}, err
 	}
 	if dryRun {
 		return result{data: plan, plain: planText(plan)}, nil
 	}
-	return result{data: report, plain: applyText(report)}, nil
+	// The main host converged. Read the authoritative identity once and mirror
+	// it into the selected local context; a local failure is reported as a
+	// warning, never as a host apply failure. Non-main roles have no workspace.
+	var identity *controlplane.WorkspaceIdentity
+	if report.Role == host.RoleMain {
+		info, infoErr := client.NodeInfo(cmd.Context())
+		switch {
+		case infoErr != nil:
+			report.Warnings = append(report.Warnings, "the host applied but its workspace identity could not be read for the local context: "+infoErr.Error())
+		case info.WorkspaceError != "":
+			report.Warnings = append(report.Warnings, "the host applied but its workspace identity is unknown: "+info.WorkspaceError)
+		default:
+			identity = &info.Workspace
+			if err := recordContextWorkspace(client.contextName, client.route, info.Workspace); err != nil {
+				report.Warnings = append(report.Warnings, "the host applied but the local context workspace metadata could not be saved: "+err.Error())
+			}
+		}
+	}
+	return result{data: applyResult{ApplyReport: report, Workspace: identity}, plain: applyText(report)}, nil
+}
+
+type applyResult struct {
+	host.ApplyReport
+	Workspace *controlplane.WorkspaceIdentity `json:"workspace,omitempty"`
+}
+
+// recordContextWorkspace stores only the verified, configured identity in the
+// exact context whose route the node RPC used. It refuses to overwrite a
+// context replaced by a concurrent login. A context-use change merely selects
+// another context and is preserved.
+func recordContextWorkspace(contextName string, expectedRoute *host.ContextSSH, workspace controlplane.WorkspaceIdentity) error {
+	if !workspace.Configured {
+		return nil
+	}
+	if contextName == "" {
+		return contract.NewFault(contract.Internal, "the node client has no context name", "Retry the command; the workspace metadata was not written.")
+	}
+	store, err := host.LoadContextStore("")
+	if err != nil {
+		return err
+	}
+	_, err = store.SetWorkspaceIfRoute(contextName, &host.ContextWorkspace{ID: workspace.ID, Name: workspace.Name}, expectedRoute)
+	return err
 }
 
 func (a *app) hostDoctor(cmd *cobra.Command, _ []string) (result, error) {
@@ -170,6 +219,9 @@ func applyText(report host.ApplyReport) string {
 			continue
 		}
 		fmt.Fprintf(&out, "\n  applied %s", entry.ID)
+	}
+	for _, warning := range report.Warnings {
+		fmt.Fprintf(&out, "\nwarning: %s", warning)
 	}
 	return out.String()
 }

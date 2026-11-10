@@ -25,15 +25,24 @@ Use `--json` (or `--output json`) for every call. It returns one
 Run `eregion commands --json` before choosing flags. Every catalog entry has a
 path, usage, flags, examples and safety metadata: `mutating`, `destructive`,
 `supports_dry_run`, `confirmation`, `prompts`, `input_flags`, `needs_restart`,
-`remote`, `audience`, `platforms` and `error_codes`.
+`remote`, `audience`, `platforms` and `error_codes`. `terminal_only` marks an
+interactive-only command; `human_factor` marks effectful operations that may
+need a human code (dry-run remains machine-safe); `durable_submission` identifies
+commands that actually submit an operation. Audience alone is not a machine-mode
+capability or proof of durable work.
+
+Use `eregion commands --search TEXT --json` to find tasks by command path,
+summary or examples, and `eregion commands --check-meta --json` to validate the
+catalog. Overview, help, search and metadata checks are offline and need no
+context. Do not combine `--search`, `--path` and `--check-meta`.
 
 Use `eregion help <command...> --json` or
 `eregion commands --path <command> --json` for one command. The catalog is
 authoritative: a command that is not listed does not exist in this build.
 `eregion node …` commands are server-side plumbing: they are hidden from the
-operator catalog and are not an operator workflow. The target command tree in
-`docs/MASTER.md` grows a row at a time, so this guide describes the implemented
-surface rather than promising commands that are not here yet.
+operator catalog and are not an operator workflow. `docs/MASTER.md` records
+product decisions and scope; Linear tracks actionable work. Discover commands
+from the current binary, not an old ticket, historical work table or target tree.
 
 ## Confirmation
 
@@ -79,8 +88,9 @@ eregion operations follow <operation_id> --output ndjson
 eregion operations get <operation_id> --json
 ```
 
-`follow --json` waits for a final snapshot. Its exit code does not by itself
-mean success: read `data.state` and any error code. `follow --output ndjson`
+`follow --json` waits for a final snapshot. A failed operation returns a failure
+envelope and nonzero status; inspect its error details and operation state.
+`follow --output ndjson`
 replays the bounded event history and then streams new events; sequences, not
 timestamps, order events. Cancellation is explicit (`operations cancel`);
 detaching or a timeout does not cancel accepted work.
@@ -105,7 +115,7 @@ terminal, some need a human, and a retry may need the same idempotency key.
 
 ## Secrets and tokens
 
-- Never ask a human to paste a secret into a prompt, an operation input, an
+- Never ask a human to paste a secret into chat, an operation input, an
   idempotency key or a log.
 - `config set` is for plain, non-sensitive values only. Credentials and other
   sensitive values belong in `secret set`, never in `config set`.
@@ -133,8 +143,8 @@ terminal, some need a human, and a retry may need the same idempotency key.
   metadata-only read an agent may use after the human finishes. Then preview
   exact DNS changes before applying them; saved/read-validated credentials do
   not prove DNS-write permission or a ready application.
-- A command that prints a secret once is a human handoff: show it to the human
-  and do not retain it.
+- A command that prints a secret once is a human handoff: ask the human to run
+  it in their own terminal. Never capture the one-time value for them.
 - `metrics endpoint` reports whether the dedicated WireGuard-only Caddy
   endpoint is configured and whether this machine holds a local credential. `metrics
   config` ordinary output always uses a password placeholder.
@@ -151,9 +161,15 @@ terminal, some need a human, and a retry may need the same idempotency key.
   from their authenticator app or a master password (MASTER D7). There is no
   flag, environment variable or stdin path that lets an agent mint its own
   token; do not look for a way around this.
-- Application-database backup is operator-owned (MASTER D4, D19). eregion does
-  not provision, back up or restore an application's database; the app reaches
-  the operator's database through a secret such as `DATABASE_URL`.
+- Serious durable application state belongs in external services under the
+  current recovery policy (MASTER D4/D19). Optional managed Docker resources
+  can provision local dependencies, but their volume data is expendable and not
+  backed up by eregion or the control database. External dependencies currently
+  use config/secrets such as `DATABASE_URL`, not first-class external-resource
+  records. Default volume retention still applies; expendable is not deletion
+  authorization. Replacement-VPS recovery requires keys/identities and artifacts
+  as well as the surviving database; reconnecting a DSN is not a supported full
+  recovery procedure.
 
 ## Workflows
 
@@ -167,9 +183,10 @@ database URL is a protected file, never an argument.
 
 ```sh
 eregion server init --host root@203.0.113.10 --hostname app.example.com \
-  --database-url-file /protected/database-url --context-name prod \
-  --accept-new-host-key --secrets-out /protected/prod-secrets.md \
-  --confirm prod --json
+  --workspace lab --node main \
+  --database-url-file /protected/database-url --context-name lab \
+  --accept-new-host-key --secrets-out /protected/lab-secrets.md \
+  --confirm lab --json
 ```
 
 An interrupted init is resumed with `--resume --context-name <server>` and a
@@ -179,6 +196,29 @@ context. Use `--file` and `--passphrase-file` when no terminal is available.
 `eregion context list|show|use` inspects and selects contexts without printing
 credentials; `context remove <name> --confirm <name>` deletes one with its key
 files.
+
+Workspace identity names the installation; node name names its server. A
+context is this machine's access to that workspace's one node, not a team or
+tenant boundary. `EREGION_CONTEXT_FILE` selects a local **store**;
+`--context NAME`, then `EREGION_CONTEXT`, then the saved current context selects
+access within that store. Use an explicit context in automation. A missing name
+in the selected store is not evidence that the server is missing.
+
+Workspace identity travels through a refreshed protected handoff and login;
+never infer it from a local context name or waive a conflicting ID/fingerprint.
+A human must refresh `secrets export` after identity or recoverable credential
+changes; old exports do not update themselves. Agents inspect only metadata and
+human confirmation, never the exported content.
+
+Fresh setup requires `--workspace NAME` independently of `--node`. An upgraded
+alpha.6 installation remains unconfigured until explicitly assigned through
+`apply --workspace NAME`; preview first and obtain authorization for that target.
+Reads and migration never assign a workspace from a context name. Old bundles
+remain unconfigured access artifacts; ask for a human-refreshed export to carry
+the portable identity. If an old pending init already applied its host phase,
+finish that pending flow before assigning through `apply`; do not edit its
+private JSON. Repeating an existing workspace choice on resume must not change
+its identity.
 
 ### Deploy, rollback and promotion
 
@@ -205,6 +245,25 @@ certificate and public response are separate observations, and only an all-ok
 `ready` is proof. Use `eregion domain list --json` to see each state and
 `eregion domain remove` (plan-bound `--confirm`) to remove an alias. Promote
 another hostname with `--primary` before removing the primary.
+
+### Push to deploy
+
+Explicit `env update <app> <env> --auto-deploy --github-webhook --json` uses
+authenticated local `gh` to install the hook without showing the HMAC secret.
+`--rotate-webhook-secret --github-webhook` deliberately replaces it. This is
+different from `--github-auth`, which supplies a repository clone credential.
+Repository hook administration must pass preflight before any secret write.
+Without explicit gh assistance, enabling/rotating is a human-terminal flow;
+never request the manually displayed secret from the human.
+
+GitHub and the platform are not one transaction. If hook installation fails
+after activation, read the safe partial-failure details: a new secret may already
+be active. Do not claim rollback or print the value; fix gh and request explicit
+rotation recovery with a **new** key. A same-key replay returns the original
+acceptance; it does not retry or verify hook installation. This explicit recovery
+is not permission to blindly retry an unknown outcome. A signed push's 202
+response means admitted, not deployed;
+follow the resulting operation and inspect serving state.
 
 ### Secrets
 

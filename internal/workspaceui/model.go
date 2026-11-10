@@ -125,20 +125,29 @@ type tabState struct {
 // the UI never probes or prompts unless the caller has opened an interactive
 // terminal deliberately.
 type Options struct {
-	API           API
-	Metrics       MetricsSource
-	Host          string
-	Secrets       *secrets.Registry
-	ASCII         bool
-	NoColor       bool
-	ReducedMotion bool
-	InitialTab    Tab
-	Now           func() time.Time
-	Key           func() string
-	In            io.Reader
-	Out           io.Writer
-	Width         int
-	Height        int
+	API     API
+	Metrics MetricsSource
+	Host    string
+	// Node, Workspace and Context are separate target labels. The selected
+	// context still owns the route; the workspace identity never changes which
+	// server a command addresses. WorkspaceKnown distinguishes an authoritative
+	// unconfigured state from a failed/unknown read.
+	Node                string
+	Workspace           string
+	WorkspaceKnown      bool
+	WorkspaceConfigured bool
+	Context             string
+	Secrets             *secrets.Registry
+	ASCII               bool
+	NoColor             bool
+	ReducedMotion       bool
+	InitialTab          Tab
+	Now                 func() time.Time
+	Key                 func() string
+	In                  io.Reader
+	Out                 io.Writer
+	Width               int
+	Height              int
 }
 
 func (o Options) normalized() Options {

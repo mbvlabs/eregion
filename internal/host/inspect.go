@@ -147,6 +147,27 @@ type NodeStatus struct {
 	Services      map[string]bool            `json:"services"`
 	UptimeSeconds int64                      `json:"uptime_seconds"`
 	Disk          DiskStatus                 `json:"disk"`
+	// Workspace is read from PostgreSQL. Configured=false is the explicit
+	// legacy/unconfigured state; WorkspaceError means the authoritative read
+	// failed and the unconfigured state must not be inferred.
+	Workspace      controlplane.WorkspaceIdentity `json:"workspace"`
+	WorkspaceError string                         `json:"workspace_error,omitempty"`
+}
+
+// ReadWorkspaceStatus returns the authoritative workspace identity for status.
+// It never creates a row, so a read on an alpha.6 installation remains
+// unconfigured and changes nothing.
+func ReadWorkspaceStatus(ctx context.Context, dsn string) (controlplane.WorkspaceIdentity, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return controlplane.WorkspaceIdentity{}, contract.NewFault(contract.InputRequired,
+			"the node has no control database URL", "Set EREGION_DATABASE_URL in the node's protected service environment, then run eregion apply.")
+	}
+	pool, err := controlplane.Open(ctx, dsn)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, err
+	}
+	defer pool.Close()
+	return controlplane.ReadWorkspace(ctx, pool)
 }
 
 // DiskStatus is one filesystem's observation.

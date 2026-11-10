@@ -16,10 +16,14 @@ import (
 
 // NodeConfig is the non-secret part of /etc/eregion/node.json. Bootstrap owns
 // the node name, state directory and main hostname; other keys are preserved.
+// The workspace fields are a mirror for diagnostics only: PostgreSQL remains
+// authoritative and node.info/status/export read it rather than this file.
 type NodeConfig struct {
-	Node     string `json:"node"`
-	StateDir string `json:"state_dir"`
-	Hostname string `json:"hostname,omitempty"`
+	Node          string `json:"node"`
+	StateDir      string `json:"state_dir"`
+	Hostname      string `json:"hostname,omitempty"`
+	WorkspaceID   string `json:"workspace_id,omitempty"`
+	WorkspaceName string `json:"workspace_name,omitempty"`
 }
 
 // DefaultNodeConfigPath is the production node configuration file.

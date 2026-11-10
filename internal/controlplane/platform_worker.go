@@ -309,6 +309,25 @@ func (w *platformWorker) runRecordAction(ctx context.Context, id contract.Operat
 			return recordRevisionChange(ctx, tx, op, "environment.created", input.App, input.Name,
 				"Created environment "+input.Name+" on node "+input.Node+" with its first desired-state revision.")
 		case *platform.EnvironmentUpdateInput:
+			hasRevision, err := revisionCreatedByOperation(ctx, tx, op.ID)
+			if err != nil {
+				return err
+			}
+			if !hasRevision {
+				if !input.RotateWebhookSecret {
+					return contract.NewFault(contract.Internal, "environment update has neither a revision nor a webhook rotation", "Report the command and binary version.")
+				}
+				return insertPlatformChange(ctx, tx, op, "environment.webhook.rotated", input.App, input.Environment,
+					"Rotated the push-to-deploy webhook secret; desired state is unchanged.",
+					map[string]any{"app": input.App, "environment": input.Environment}, nil)
+			}
+			if input.RotateWebhookSecret {
+				if err := insertPlatformChange(ctx, tx, op, "environment.webhook.rotated", input.App, input.Environment,
+					"Rotated the push-to-deploy webhook secret with the desired-state update.",
+					map[string]any{"app": input.App, "environment": input.Environment}, nil); err != nil {
+					return err
+				}
+			}
 			return recordRevisionChange(ctx, tx, op, "environment.updated", input.App, input.Environment,
 				"Updated environment "+input.Environment+" desired state as a new revision.")
 		case *platform.ProcessScaleInput:
@@ -353,6 +372,17 @@ func recordRevisionChange(ctx context.Context, tx pgx.Tx, op *contract.Operation
 		desired["revision_number"] = number
 	}
 	return insertPlatformChange(ctx, tx, op, kind, app, environment, summary, desired, nil)
+}
+
+// revisionCreatedByOperation distinguishes a combined desired-state update
+// from an admitted rotation-only operation, whose semantics do not fabricate an
+// unchanged environment revision.
+func revisionCreatedByOperation(ctx context.Context, tx pgx.Tx, id contract.OperationID) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, id).Scan(&exists); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func (w *platformWorker) runNodeCheck(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
@@ -1149,6 +1179,11 @@ func (s *Service) recordActionExists(ctx context.Context, op contract.Operation)
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND e.name=$2)`, input.App, input.Name).Scan(&exists)
 	case *platform.EnvironmentUpdateInput:
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
+		if err == nil && !exists && input.RotateWebhookSecret {
+			// Rotation-only admissions intentionally publish no new revision;
+			// the accepted operation and sealed secret revision are the state.
+			exists = true
+		}
 	case *platform.ProcessScaleInput:
 		err = s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE operation_id=$1)`, op.ID).Scan(&exists)
 	case *platform.ConfigSetInput:

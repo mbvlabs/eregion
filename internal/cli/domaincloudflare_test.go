@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +82,41 @@ func TestCloudflareConfigureJSONRefusalHasNoTokenPath(t *testing.T) {
 				t.Fatalf("configure exposes an input flag for the token: %s", forbidden)
 			}
 		}
+	}
+}
+
+func TestCloudflareConfigureMissingContextFailsBeforePrompts(t *testing.T) {
+	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_CONTEXT", "thelab")
+	cmd := &cobra.Command{}
+	cmd.Flags().String("zone", "", "")
+	cmd.Flags().String("zone-name", "", "")
+	cmd.SetContext(context.Background())
+
+	var prompts []string
+	record := func(name string) { prompts = append(prompts, name) }
+	seams := cloudflarePrompts{
+		input: func(string, string, string) (string, error) {
+			record("zone")
+			return "0123456789abcdef0123456789abcdef", nil
+		},
+		secret: func(string) (string, error) {
+			record("token")
+			return "cf-token-one-0123456789", nil
+		},
+		confirm: func(string, string, bool) (bool, error) {
+			record("confirm")
+			return false, nil
+		},
+	}
+	a := &app{secrets: &secrets.Registry{}}
+	if _, err := a.configureCloudflareCredential(cmd, seams); contract.Classify(err).Code != contract.NotFound {
+		t.Fatalf("missing context = %v, want not_found", err)
+	} else if !strings.Contains(err.Error(), "context thelab") {
+		t.Fatalf("missing context fault does not name the context: %v", err)
+	}
+	if len(prompts) != 0 {
+		t.Fatalf("missing context asked for %v before failing", prompts)
 	}
 }
 

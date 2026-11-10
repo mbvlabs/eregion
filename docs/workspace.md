@@ -2,7 +2,8 @@
 
 [tui-design.md](tui-design.md) remains the dedicated **design specification** and
 links to the synthetic interactive sketches. [MASTER](MASTER.md) owns product
-scope/status. This file maps the existing views, not another UI plan.
+scope/contracts; Linear tracks execution. This file maps the existing views,
+not another UI plan.
 
 ## Presentation boundaries
 
@@ -11,12 +12,18 @@ scope/status. This file maps the existing views, not another UI plan.
 - `internal/tui`: explicit interactive operation view.
 - `internal/workspaceui`: `eregion ui` full-screen platform workspace.
 
-Views consume shared clients/services. They do not enqueue River jobs, query
-PostgreSQL or own the lifetime of server work. The current API adapter may use
-private SSH/WireGuard forwarding; transport belongs below presentation.
-Opening the workspace is not required for future guided app/env commands.
+Views consume shared clients/services through node RPC over pinned SSH inside
+WireGuard. They do not enqueue River jobs, query PostgreSQL or own the lifetime
+of server work; transport belongs below presentation.
+Opening the TUI is not required for guided app/env commands. The full-screen
+view is not itself a workspace identity or an authorization boundary; it renders
+the workspace/node selected through this operator's local context.
 
-## Current workspace
+## Current TUI
+
+The header distinguishes the actual node name, portable workspace and captured
+local context from the SSH route. A failed authoritative workspace read is
+shown as unknown, separately from a genuinely unconfigured installation.
 
 Tabs: `1` Fleet, `2` Apps, `3` Envs, `4` Releases, `5` Deployments. Keys:
 arrows/`j/k`, `g/G`, `/` filter, `enter` details, `r` refresh, `:` discovery,
@@ -30,7 +37,7 @@ App and environment setup is not a workspace form: use the guided
 `eregion app create` and `eregion env create` commands. These views do not
 provide app/env deletion. The former app/env and image-release forms, Resources
 and Backups tabs, node-check action and their forms are deleted with the surface
-cleanup (MASTER D19, work list rows 4, 5 and 9).
+cleanup (MASTER D6/D19; historical acceptance reference).
 
 ## Honest observations
 
@@ -53,9 +60,12 @@ invents request metrics. Unavailable/stale/no data is never a zero-valued
 healthy graph.
 
 Detach never cancels work. `operations follow <id> --interactive` reattaches;
-machine output takes precedence and must not launch Bubble Tea. Current follow
-exit 0 means the observation reached terminal state, not that deployment succeeded;
-read the state. See [contracts](contracts.md).
+machine output takes precedence and must not launch Bubble Tea. A followed
+failed operation returns its recorded error code (fallback `precondition_failed`),
+not exit 0 merely because polling succeeded. Remote cancellation and viewer
+detach both return cancellation status with distinct messages; detach explicitly
+says the operation was not cancelled. Accepted-only submissions still do not
+claim completion. See [contracts](contracts.md).
 
 Qualification must include narrow/tiny/wide layouts, NO_COLOR, ASCII/TERM=dumb,
 reduced motion, hostile log escapes, keyboard help/resize and terminal restoration.

@@ -10,6 +10,65 @@ import (
 	"github.com/mbvlabs/eregion/internal/retention"
 )
 
+func TestEnvironmentUpdateWebhookIntentIsCanonicalAndNonsecret(t *testing.T) {
+	normalize := func(input map[string]any) Normalized {
+		t.Helper()
+		raw, _ := json.Marshal(input)
+		normalized, err := Default().Normalize(KindEnvironmentUpdate, "env/api/production", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return normalized
+	}
+	enabled := normalize(map[string]any{"auto_deploy": true})
+	var update EnvironmentUpdateInput
+	if err := json.Unmarshal(enabled.Canonical, &update); err != nil {
+		t.Fatal(err)
+	}
+	if update.WebhookSecretName == nil || *update.WebhookSecretName != DefaultWebhookSecretName {
+		t.Fatalf("default webhook name = %+v", update.WebhookSecretName)
+	}
+	if update.RotateWebhookSecret {
+		t.Fatal("enable unexpectedly requested rotation")
+	}
+	rotated := normalize(map[string]any{"rotate_webhook_secret": true})
+	if !strings.Contains(string(rotated.Canonical), `"rotate_webhook_secret":true`) {
+		t.Fatalf("rotation intent missing from canonical input: %s", rotated.Canonical)
+	}
+	raw, _ := json.Marshal(map[string]any{"auto_deploy": false, "rotate_webhook_secret": true})
+	if _, err := Default().Normalize(KindEnvironmentUpdate, "env/api/production", raw); err == nil {
+		t.Fatal("rotation with auto_deploy=false was accepted")
+	}
+}
+
+func TestValidatePushToDeployRequiresGitHubBranchAndSecretName(t *testing.T) {
+	valid := RevisionState{
+		Source:            SourceBinding{Kind: "git", URL: "https://github.com/acme/api", Ref: "main"},
+		AutoDeploy:        true,
+		WebhookSecretName: DefaultWebhookSecretName,
+	}
+	if err := ValidatePushToDeploy(valid); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*RevisionState){
+		"non-git source": func(state *RevisionState) { state.Source = SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"} },
+		"non-github source": func(state *RevisionState) {
+			state.Source.URL = "https://gitlab.com/acme/api"
+		},
+		"missing branch": func(state *RevisionState) { state.Source.Ref = "" },
+		"missing secret": func(state *RevisionState) { state.WebhookSecretName = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			state := valid
+			mutate(&state)
+			err := ValidatePushToDeploy(state)
+			if err == nil || contract.Classify(err).Code != contract.ValidationFailed {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
 func TestEnvironmentRevisionNormalizers(t *testing.T) {
 	registry := NewRegistry()
 	normalize := func(kind, target string, input map[string]any) (Normalized, error) {

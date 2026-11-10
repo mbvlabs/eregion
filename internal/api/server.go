@@ -22,6 +22,16 @@ type Server struct {
 	ready   func(context.Context) error
 }
 
+const (
+	// requestTimeout bounds every API handler independently of connection and
+	// server lifetimes.
+	requestTimeout = 10 * time.Second
+	// readinessTimeout is the request budget for /readyz. It stays below the
+	// host readiness probe's 5s HTTP timeout so a slow database is reported as
+	// one bounded generic failure instead of outliving the probe.
+	readinessTimeout = 4 * time.Second
+)
+
 type testRequest struct {
 	Kind   string          `json:"kind"`
 	Target string          `json:"target"`
@@ -33,7 +43,7 @@ func NewHandler(auth *Auth, service operations.Service, ready func(context.Conte
 	s := &Server{auth: auth, service: service, ready: ready}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Bound handlers independently from connection/server lifetimes.
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 		defer cancel()
 		r = r.WithContext(ctx)
 		w.Header().Set("Content-Type", "application/json")
@@ -78,8 +88,12 @@ func (s *Server) dispatch(r *http.Request) (any, int, error) {
 		return map[string]bool{"alive": true}, http.StatusOK, nil
 	}
 	// Readiness is public (Caddy exposes it): it says ready or not, nothing else.
+	// Only this route gets the tighter 4s child budget; an earlier parent
+	// deadline is inherited rather than extended.
 	if r.Method == http.MethodGet && r.URL.Path == "/readyz" {
-		if err := s.ready(r.Context()); err != nil {
+		readyCtx, readyCancel := context.WithTimeout(r.Context(), readinessTimeout)
+		defer readyCancel()
+		if err := s.ready(readyCtx); err != nil {
 			return nil, 0, contract.NewFault(contract.Unavailable, "control plane is not ready", "Check database connectivity, migration versions, and binary compatibility.")
 		}
 		return map[string]bool{"ready": true}, http.StatusOK, nil

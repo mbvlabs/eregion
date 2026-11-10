@@ -24,6 +24,7 @@ func (a *app) protectSpecs() []spec {
 	initMeta.Mutating = true
 	initMeta.DryRunReason = "Two-factor setup is an interactive one-time exchange: a dry run cannot show a usable secret or confirm a code."
 	initMeta.Prompts = false
+	initMeta = terminalOnlyMeta(initMeta)
 	statusMeta := protectMeta("Show whether the node's TOTP human factor is set up", "eregion protect status --json")
 	statusMeta.Next = []string{"eregion protect init"}
 	return []spec{{

@@ -132,6 +132,32 @@ func (s AppService) SubmitNormalized(ctx context.Context, actor contract.Actor, 
 // code. The control plane verifies it inside the submission transaction when
 // the locked target state requires it.
 func (s AppService) SubmitNormalizedWithFactor(ctx context.Context, actor contract.Actor, normalized platform.Normalized, idempotencyKey string, dryRun bool, humanFactor string) (any, error) {
+	result, err := s.SubmitNormalizedWithReceipt(ctx, actor, normalized, idempotencyKey, dryRun, humanFactor, nil)
+	if err != nil {
+		return nil, err
+	}
+	if receipt, ok := result.(operations.SubmissionResult); ok {
+		return receipt.Operation, nil
+	}
+	return result, nil
+}
+
+// PreviewOrSubmitWithReceipt is the node transport entry point. It returns a
+// preview for dry runs and operations.SubmissionResult for accepted work, so
+// the caller can distinguish a fresh admission from an authoritative replay
+// before installing or printing a webhook secret.
+func (s AppService) PreviewOrSubmitWithReceipt(ctx context.Context, actor contract.Actor, kind, target string, input json.RawMessage, idempotencyKey string, dryRun bool, humanFactor string, webhookSecret []byte) (any, error) {
+	normalized, err := NormalizeAction(kind, target, input)
+	if err != nil {
+		return nil, err
+	}
+	return s.SubmitNormalizedWithReceipt(ctx, actor, normalized, idempotencyKey, dryRun, humanFactor, webhookSecret)
+}
+
+// SubmitNormalizedWithReceipt previews or atomically submits an already
+// normalized action and returns the admission receipt when the service
+// supports it.
+func (s AppService) SubmitNormalizedWithReceipt(ctx context.Context, actor contract.Actor, normalized platform.Normalized, idempotencyKey string, dryRun bool, humanFactor string, webhookSecret []byte) (any, error) {
 	if dryRun {
 		if s.Operations != nil {
 			if previewer, ok := s.Operations.(platformPreviewService); ok {
@@ -150,10 +176,28 @@ func (s AppService) SubmitNormalizedWithFactor(ctx context.Context, actor contra
 	if strings.TrimSpace(idempotencyKey) == "" {
 		return nil, contract.NewFault(contract.InputRequired, "an idempotency key is required", "Reuse one stable key for retries of this submission.")
 	}
-	return s.Operations.Submit(ctx, operations.Submission{
+	submission := operations.Submission{
 		Kind: normalized.Kind, Target: normalized.Target.String(), Actor: actor,
 		IdempotencyKey: idempotencyKey, Input: normalized.Canonical, HumanFactor: humanFactor,
-	})
+		WebhookSecret: webhookSecret,
+	}
+	if submitter, ok := s.Operations.(operations.AtomicSubmitter); ok {
+		return submitter.SubmitWithReceipt(ctx, submission)
+	}
+	if len(webhookSecret) > 0 || normalizedRequestsWebhook(normalized) {
+		return nil, contract.NewFault(contract.Unavailable,
+			"the operation service cannot report webhook admission atomically",
+			"Start a node control plane with transactional webhook admission; do not use a preview-only or legacy service.")
+	}
+	return s.Operations.Submit(ctx, submission)
+}
+
+func normalizedRequestsWebhook(normalized platform.Normalized) bool {
+	input, ok := normalized.Input.(*platform.EnvironmentUpdateInput)
+	if !ok {
+		return false
+	}
+	return input.RotateWebhookSecret || (input.AutoDeploy != nil && *input.AutoDeploy)
 }
 
 // SubmitDiagnostic previews or submits the diagnostic test action.

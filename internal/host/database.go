@@ -43,6 +43,14 @@ func (s DatabaseState) Detail() string {
 type Database interface {
 	Inspect(context.Context, string) (DatabaseState, error)
 	Migrate(context.Context, string) (DatabaseState, error)
+	// ReadWorkspace is a read-only identity observation. It never creates the
+	// workspace row, so status, node.info and export remain safe on an
+	// unconfigured alpha.6 installation.
+	ReadWorkspace(context.Context, string) (controlplane.WorkspaceIdentity, error)
+	// AssignWorkspace is the explicit one-time assignment used by apply
+	// --workspace. Replaying the same name returns the existing identity; a
+	// different name is a conflict.
+	AssignWorkspace(context.Context, string, string) (controlplane.WorkspaceIdentity, error)
 }
 
 // PostgresDatabase uses controlplane.Open/PlanMigrations/Migrate.
@@ -74,6 +82,32 @@ func (PostgresDatabase) Migrate(ctx context.Context, dsn string) (DatabaseState,
 		return before, databaseError(dsn, err)
 	}
 	return inspectDatabase(ctx, pool, dsn)
+}
+
+func (PostgresDatabase) ReadWorkspace(ctx context.Context, dsn string) (controlplane.WorkspaceIdentity, error) {
+	pool, err := controlplane.Open(ctx, dsn)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
+	}
+	defer pool.Close()
+	identity, err := controlplane.ReadWorkspace(ctx, pool)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
+	}
+	return identity, nil
+}
+
+func (PostgresDatabase) AssignWorkspace(ctx context.Context, dsn, name string) (controlplane.WorkspaceIdentity, error) {
+	pool, err := controlplane.Open(ctx, dsn)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
+	}
+	defer pool.Close()
+	identity, err := controlplane.AssignWorkspace(ctx, pool, name)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
+	}
+	return identity, nil
 }
 
 func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (DatabaseState, error) {

@@ -90,6 +90,9 @@ type ApplyReport struct {
 	Pending        bool           `json:"pending,omitempty"`
 	CommitDeadline time.Time      `json:"commit_deadline,omitempty"`
 	AccessChanges  []AccessChange `json:"access_changes,omitempty"`
+	// Warnings are local, non-secret observations added by the CLI after the
+	// node report (for example, a local context metadata write that failed).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // ApplyEntry reports one step's engine outcome. Executed is false when a
@@ -217,6 +220,13 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 			steps = append(steps, &tlsStep{cfg: r.Config})
 		}
 		steps = append(steps, &databaseStep{cfg: r.Config, database: r.Database})
+		// After migrations, before the vault and services. A legacy apply
+		// without --workspace adds no step, so it neither guesses nor records an
+		// identity; status remains explicitly unconfigured until an explicit
+		// assignment.
+		if r.Config.Workspace != "" {
+			steps = append(steps, &workspaceStep{cfg: r.Config, database: r.Database})
+		}
 		// Before the credentials file that names EREGION_VAULT_KEY_FILE and
 		// before the services that load it.
 		steps = append(steps, &vaultKeyringStep{cfg: r.Config})
@@ -332,6 +342,26 @@ func (r *Runner) Plan(ctx context.Context) (Plan, error) {
 	return plan, nil
 }
 
+// preflightWorkspace refuses an explicit workspace that is already configured
+// to a different immutable name. A missing migration/table is the legitimate
+// unconfigured legacy state, not a conflict.
+func (r *Runner) preflightWorkspace(ctx context.Context) error {
+	if r.Config.Workspace == "" {
+		return nil
+	}
+	if r.Database == nil {
+		return contractError("no database adapter is configured for the workspace identity")
+	}
+	identity, err := r.Database.ReadWorkspace(ctx, r.Config.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	if identity.Configured && identity.Name != r.Config.Workspace {
+		return workspaceNameConflict(identity.Name, r.Config.Workspace)
+	}
+	return nil
+}
+
 // Apply converges the host after validating the exact plan token. The engine
 // journal is written before the database step, so an interrupted first contact
 // resumes without the platform store. An access-changing apply also arms a
@@ -369,7 +399,10 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 	if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, risks), r.now()); err != nil {
 		return ApplyReport{}, err
 	}
-	if err := ensureState(r.Config); err != nil {
+	// Fail early on a conflicting explicit workspace before waiting for an
+	// active apply. This is advisory only; the authoritative read happens
+	// under the whole-apply lock below.
+	if err := r.preflightWorkspace(ctx); err != nil {
 		return ApplyReport{}, err
 	}
 	releaseApply, err := engine.Acquire(ctx, filepath.Join(r.Config.Layout.StateDir, "apply.lock"), engine.LockExclusive, 30*time.Second)
@@ -383,6 +416,15 @@ func (r *Runner) Apply(ctx context.Context, confirmation string, acceptAccessRis
 		return ApplyReport{}, err
 	}
 	if err := verifyConfirmation(confirmation, "host.apply", r.Config.Node+"/"+string(r.Config.Role), configHash, planInputs(configHash, projected.Generation, risks), r.now()); err != nil {
+		return ApplyReport{}, err
+	}
+	// The first read may be stale if another apply changed the workspace while
+	// this call waited. Re-read and refuse before credentials, state, journal,
+	// rollback reconciliation or any host step can mutate.
+	if err := r.preflightWorkspace(ctx); err != nil {
+		return ApplyReport{}, err
+	}
+	if err := ensureState(r.Config); err != nil {
 		return ApplyReport{}, err
 	}
 	if err := r.reconcileCommits(projected.OperationID); err != nil {

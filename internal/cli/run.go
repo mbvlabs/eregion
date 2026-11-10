@@ -91,7 +91,8 @@ func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Wri
 		err = executeErr
 		var fault *contract.Fault
 		if err != nil && !a.started && !errors.As(err, &fault) {
-			err = contract.NewFault(contract.Usage, err.Error(), "Discover available commands with eregion commands --json.")
+			suggestions := suggestCommandPaths(cmd, unknownCommandToken(err))
+			err = unknownCommandFault(err.Error(), suggestions)
 		}
 	}
 	var envelope contract.Envelope

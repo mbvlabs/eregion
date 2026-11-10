@@ -21,7 +21,11 @@ func tokenMeta(summary, example string) CommandMeta {
 // tokenSpecs is included in the command tree by tree.go.
 func (a *app) tokenSpecs() []spec {
 	createMeta := tokenMeta("Mint a per-use deploy token for one environment", "eregion token create --app api --environment production --expires 24h")
-	createMeta.Mutating, createMeta.DryRun = true, true
+	createMeta.Mutating, createMeta.DryRun, createMeta.HumanFactor = true, true, true
+	createMeta.Examples = []string{
+		"eregion token create --app api --environment production --expires 24h --dry-run --json",
+		"eregion token create --app api --environment production --expires 24h",
+	}
 	revokeMeta := tokenMeta("Revoke a deploy token by name", "eregion token revoke deploy-api-production-a1b2c3 --confirm deploy-api-production-a1b2c3 --json")
 	revokeMeta.Mutating, revokeMeta.Destructive = true, true
 	revokeMeta.Confirmation = "plan-bound"

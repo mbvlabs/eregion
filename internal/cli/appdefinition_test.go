@@ -2,6 +2,9 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -313,6 +316,17 @@ type definitionInventoryBackend struct {
 	secretPayloads   map[string]string
 	submissions      []definitionSubmission
 	previewReplay    bool
+	// webhookStateful models the control plane's canonical-hash operation
+	// table for first-call-then-repeat CLI tests.
+	webhookStateful       bool
+	webhookOps            map[string]storedWebhookOperation
+	webhookForceReplay    bool
+	webhookSkipActivation bool
+}
+
+type storedWebhookOperation struct {
+	hash string
+	op   contract.Operation
 }
 
 func (f *definitionInventoryBackend) PlatformInventory(_ context.Context, collection string, _ url.Values) (json.RawMessage, error) {
@@ -349,13 +363,19 @@ func (f *definitionInventoryBackend) preview(kind, target string) (json.RawMessa
 	return json.Marshal(preview)
 }
 
-func (f *definitionInventoryBackend) SubmitAction(_ context.Context, kind, target string, input json.RawMessage, _, confirm string, dryRun bool) (json.RawMessage, error) {
+func (f *definitionInventoryBackend) SubmitAction(_ context.Context, kind, target string, input json.RawMessage, key, confirm string, dryRun bool) (json.RawMessage, error) {
 	f.record(kind, target, input, confirm, dryRun)
+	if dryRun && f.webhookStateful && kind == platform.KindEnvironmentUpdate {
+		return f.previewWebhook(kind, target, input, key)
+	}
 	return f.preview(kind, target)
 }
 
-func (f *definitionInventoryBackend) SubmitActionWithSecrets(_ context.Context, kind, target string, input json.RawMessage, _, confirm string, dryRun bool, _ map[string]string) (json.RawMessage, error) {
+func (f *definitionInventoryBackend) SubmitActionWithSecrets(_ context.Context, kind, target string, input json.RawMessage, key, confirm string, dryRun bool, _ map[string]string) (json.RawMessage, error) {
 	f.record(kind, target, input, confirm, dryRun)
+	if dryRun && f.webhookStateful && kind == platform.KindEnvironmentUpdate {
+		return f.previewWebhook(kind, target, input, key)
+	}
 	if dryRun {
 		return f.preview(kind, target)
 	}
@@ -371,6 +391,133 @@ func (f *definitionInventoryBackend) SubmitActionWithSecrets(_ context.Context, 
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	})
+}
+
+func (f *definitionInventoryBackend) SubmitWebhookAction(_ context.Context, kind, target string, input json.RawMessage, key, _ string, dryRun bool, secretValues map[string]string) (json.RawMessage, submissionReceipt, error) {
+	f.record(kind, target, input, "", dryRun)
+	if dryRun {
+		data, err := f.previewWebhook(kind, target, input, key)
+		return data, submissionReceipt{}, err
+	}
+	if kind != platform.KindEnvironmentUpdate {
+		return nil, submissionReceipt{}, contract.NewFault(contract.ValidationFailed, "test backend only models environment webhook updates", "Report the command and binary version.")
+	}
+	normalized, err := platform.Default().Normalize(kind, target, input)
+	if err != nil {
+		return nil, submissionReceipt{}, err
+	}
+	hash := webhookInputHash(normalized.Canonical)
+	if key == "" {
+		return nil, submissionReceipt{}, contract.NewFault(contract.InputRequired, "an idempotency key is required", "Reuse one stable key for retries.")
+	}
+	if f.webhookOps == nil {
+		f.webhookOps = map[string]storedWebhookOperation{}
+	}
+	if stored, ok := f.webhookOps[key]; ok {
+		if stored.hash != hash {
+			return nil, submissionReceipt{}, contract.NewFault(contract.Conflict, "idempotency key already binds different inputs", "Use the original inputs to recover the existing operation; use a new key only for deliberately new work.")
+		}
+		raw, err := json.Marshal(stored.op)
+		return raw, submissionReceipt{Replay: true}, err
+	}
+	if f.webhookForceReplay {
+		op := f.webhookOperation(kind, target, key)
+		return mustWebhookJSON(op), submissionReceipt{Replay: true}, nil
+	}
+	activated := false
+	if encoded := secretValues[rpcWebhookSecretKey]; encoded != "" {
+		secret, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(secret) == 0 {
+			return nil, submissionReceipt{}, contract.NewFault(contract.ValidationFailed, "invalid test webhook secret", "Report the command and binary version.")
+		}
+		if !f.webhookSkipActivation {
+			update, _ := normalized.Input.(*platform.EnvironmentUpdateInput)
+			name := platform.DefaultWebhookSecretName
+			if update != nil && update.WebhookSecretName != nil && *update.WebhookSecretName != "" {
+				name = *update.WebhookSecretName
+			}
+			namespace := vault.Namespace{App: "api", Environment: "production", Name: name}
+			f.secretWrite++
+			f.secretNamespaces = append(f.secretNamespaces, namespace)
+			if f.secretPayloads == nil {
+				f.secretPayloads = map[string]string{}
+			}
+			f.secretPayloads[namespace.String()] = string(secret)
+			activated = true
+		}
+	}
+	op := f.webhookOperation(kind, target, key)
+	f.webhookOps[key] = storedWebhookOperation{hash: hash, op: op}
+	if update, ok := normalized.Input.(*platform.EnvironmentUpdateInput); ok {
+		f.applyWebhookEnvironment(update)
+	}
+	raw, err := json.Marshal(op)
+	return raw, submissionReceipt{WebhookSecretActivated: activated}, err
+}
+
+func (f *definitionInventoryBackend) webhookOperation(kind, target, key string) contract.Operation {
+	now := time.Unix(1700000000, 0).UTC()
+	return contract.Operation{
+		ID: contract.OperationID(fmt.Sprintf("op_%032x", len(f.submissions))), Kind: kind, Target: target,
+		Actor: contract.Actor{Kind: "operator", Subject: "definition-test"},
+		State: contract.Succeeded, Attempt: 1, LastSequence: 1, CreatedAt: now, UpdatedAt: now,
+	}
+}
+
+func webhookInputHash(canonical json.RawMessage) string {
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
+func (f *definitionInventoryBackend) previewWebhook(kind, target string, input json.RawMessage, key string) (json.RawMessage, error) {
+	normalized, err := platform.Default().Normalize(kind, target, input)
+	if err != nil {
+		return nil, err
+	}
+	if key != "" {
+		if stored, ok := f.webhookOps[key]; ok {
+			if stored.hash != webhookInputHash(normalized.Canonical) {
+				return nil, contract.NewFault(contract.Conflict, "idempotency key already binds different inputs", "Use the original inputs to recover the existing operation; use a new key only for deliberately new work.")
+			}
+			preview := platform.Preview{
+				Kind: kind, Target: target, DryRun: true, Replay: true, Operation: &stored.op,
+				Summary: "Replay the accepted operation " + string(stored.op.ID) + "; the same submission already exists.",
+			}
+			return json.Marshal(preview)
+		}
+	}
+	return f.preview(kind, target)
+}
+
+func (f *definitionInventoryBackend) applyWebhookEnvironment(update *platform.EnvironmentUpdateInput) {
+	if update == nil {
+		return
+	}
+	var envelope struct {
+		Items []platform.Environment `json:"items"`
+	}
+	if err := json.Unmarshal(f.inventory["environments"], &envelope); err != nil {
+		return
+	}
+	for index := range envelope.Items {
+		env := &envelope.Items[index]
+		if env.App != update.App || env.Name != update.Environment || env.Revision == nil {
+			continue
+		}
+		next := platform.ApplyEnvironmentPatch(env.Revision.RevisionState, *update)
+		platform.ResolveWebhookSecretName(&next)
+		env.Revision.RevisionState = next
+		env.Revision.Number++
+		if data, err := json.Marshal(map[string]any{"items": envelope.Items}); err == nil {
+			f.inventory["environments"] = data
+		}
+		return
+	}
+}
+
+func mustWebhookJSON(value any) json.RawMessage {
+	raw, _ := json.Marshal(value)
+	return raw
 }
 
 func (f *definitionInventoryBackend) SetSecret(_ context.Context, namespace vault.Namespace, value []byte, _ uint64) (vault.Metadata, error) {

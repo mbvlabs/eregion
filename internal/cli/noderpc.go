@@ -153,6 +153,12 @@ type rpcDoctorParams struct {
 	Init bool `json:"init,omitempty"`
 }
 
+// rpcHostApplyParams carries only the explicit legacy workspace assignment.
+// An empty value leaves the recorded intent unchanged; it never means "guess".
+type rpcHostApplyParams struct {
+	Workspace string `json:"workspace,omitempty"`
+}
+
 type rpcOperationParams struct {
 	OperationID string `json:"operation_id"`
 }
@@ -215,6 +221,31 @@ type rpcSecretExportResult struct {
 
 const rpcCloudflareTokenSecret = "cloudflare_token"
 
+// rpcWebhookSecretKey carries a candidate push-to-deploy secret as protected
+// request data. The node admits it only if the operation insert wins; it never
+// enters operation input, the canonical hash, events or River arguments.
+const rpcWebhookSecretKey = "webhook.secret_base64"
+
+// submissionReceipt is the authoritative fresh/replay outcome of an accepted
+// API or node submission. Replay callers must not perform first-submission
+// effects such as generating a secret or installing a webhook.
+type submissionReceipt struct {
+	Replay                 bool
+	WebhookSecretActivated bool
+}
+
+// webhookSubmitter is the optional backend surface for environment updates
+// that carry a transient webhook secret and need the admission receipt.
+type webhookSubmitter interface {
+	SubmitWebhookAction(context.Context, string, string, json.RawMessage, string, string, bool, map[string]string) (json.RawMessage, submissionReceipt, error)
+}
+
+type rpcSubmitResult struct {
+	Operation              contract.Operation `json:"operation"`
+	Replay                 bool               `json:"replay,omitempty"`
+	WebhookSecretActivated bool               `json:"webhook_secret_activated,omitempty"`
+}
+
 type rpcCloudflareConfigureParams struct {
 	ZoneID           string `json:"zone_id"`
 	ZoneName         string `json:"zone_name"`
@@ -265,18 +296,24 @@ type rpcTokenRevokeParams struct {
 }
 
 type rpcNodeInfoResult struct {
-	Node     string `json:"node"`
-	Hostname string `json:"hostname"`
-	Platform string `json:"platform"`
+	Node      string                         `json:"node"`
+	Hostname  string                         `json:"hostname"`
+	Platform  string                         `json:"platform"`
+	Workspace controlplane.WorkspaceIdentity `json:"workspace"`
+	// WorkspaceError separates "the authoritative read failed" from the
+	// explicit unconfigured state. Node identity stays available without the
+	// control database; workspace callers that need trust must fail closed.
+	WorkspaceError string `json:"workspace_error,omitempty"`
 }
 
 type rpcHandoffExportResult struct {
-	Node         string `json:"node"`
-	Hostname     string `json:"hostname"`
-	Platform     string `json:"platform"`
-	SSHHostKey   string `json:"ssh_host_key"`
-	DatabaseURL  string `json:"database_url"`
-	VaultKeyring string `json:"vault_keyring"`
+	Node         string                         `json:"node"`
+	Hostname     string                         `json:"hostname"`
+	Platform     string                         `json:"platform"`
+	SSHHostKey   string                         `json:"ssh_host_key"`
+	DatabaseURL  string                         `json:"database_url"`
+	VaultKeyring string                         `json:"vault_keyring"`
+	Workspace    controlplane.WorkspaceIdentity `json:"workspace"`
 }
 
 type rpcCallOptions struct {
@@ -352,9 +389,32 @@ func (n *nodeClient) SubmitAction(ctx context.Context, kind, target string, inpu
 }
 
 func (n *nodeClient) SubmitActionWithSecrets(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool, secretValues map[string]string) (json.RawMessage, error) {
-	return n.call(ctx, methodSubmit, rpcSubmitParams{Kind: kind, Target: target, Input: input}, rpcCallOptions{
+	raw, _, err := n.submitAction(ctx, kind, target, input, idempotencyKey, confirm, dryRun, secretValues)
+	return raw, err
+}
+
+// SubmitWebhookAction submits an environment update with a transient webhook
+// secret and returns the authoritative fresh/replay receipt.
+func (n *nodeClient) SubmitWebhookAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool, secretValues map[string]string) (json.RawMessage, submissionReceipt, error) {
+	return n.submitAction(ctx, kind, target, input, idempotencyKey, confirm, dryRun, secretValues)
+}
+
+func (n *nodeClient) submitAction(ctx context.Context, kind, target string, input json.RawMessage, idempotencyKey, confirm string, dryRun bool, secretValues map[string]string) (json.RawMessage, submissionReceipt, error) {
+	raw, err := n.call(ctx, methodSubmit, rpcSubmitParams{Kind: kind, Target: target, Input: input}, rpcCallOptions{
 		Secrets: secretValues, DryRun: dryRun, IdempotencyKey: idempotencyKey, Confirm: confirm,
 	})
+	if err != nil || dryRun {
+		return raw, submissionReceipt{}, err
+	}
+	var result rpcSubmitResult
+	if err := json.Unmarshal(raw, &result); err != nil || result.Operation.ID == "" || result.Operation.Validate() != nil {
+		return nil, submissionReceipt{}, invalidNodeData("accepted operation")
+	}
+	operation, err := json.Marshal(result.Operation)
+	if err != nil {
+		return nil, submissionReceipt{}, invalidNodeData("accepted operation")
+	}
+	return operation, submissionReceipt{Replay: result.Replay, WebhookSecretActivated: result.WebhookSecretActivated}, nil
 }
 
 func (n *nodeClient) PlatformInventory(ctx context.Context, collection string, filters url.Values) (json.RawMessage, error) {
@@ -367,11 +427,11 @@ func (n *nodeClient) HostPlan(ctx context.Context) (host.Plan, error) {
 	return plan, err
 }
 
-func (n *nodeClient) HostApply(ctx context.Context, dryRun bool, confirm string) (host.ApplyReport, host.Plan, error) {
+func (n *nodeClient) HostApply(ctx context.Context, dryRun bool, confirm, workspace string) (host.ApplyReport, host.Plan, error) {
 	var report host.ApplyReport
 	var plan host.Plan
 	opts := rpcCallOptions{DryRun: dryRun, Confirm: confirm, OnEvent: n.progress}
-	raw, err := n.call(ctx, methodHostApply, struct{}{}, opts)
+	raw, err := n.call(ctx, methodHostApply, rpcHostApplyParams{Workspace: workspace}, opts)
 	if err != nil {
 		return report, plan, err
 	}
@@ -1121,6 +1181,21 @@ func base64Decode(value string) ([]byte, error) {
 	return base64.StdEncoding.Strict().DecodeString(value)
 }
 
+func decodeWebhookSecret(value string) ([]byte, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	decoded, err := base64Decode(value)
+	if err != nil || len(decoded) == 0 {
+		return nil, contract.NewFault(contract.ValidationFailed, "the webhook secret request value is invalid", "Do not retry with handcrafted values; rerun the webhook enable or rotation command.")
+	}
+	if len(decoded) > 32*1024 {
+		clearBytes(decoded)
+		return nil, contract.NewFault(contract.ValidationFailed, "the webhook secret request value is too large", "Rerun the webhook enable or rotation command.")
+	}
+	return decoded, nil
+}
+
 // serveNodeRPC is `eregion node rpc`: one request on stdin, NDJSON on stdout,
 // ending in exactly one result. It is hidden from the operator command tree.
 func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) (code int) {
@@ -1145,6 +1220,12 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	}
 	if request.Method == methodCloudflareConfigure {
 		if decoded, err := base64Decode(request.Secrets[rpcCloudflareTokenSecret]); err == nil && len(decoded) > 0 {
+			registry.Add(string(decoded))
+			clearBytes(decoded)
+		}
+	}
+	if request.Method == methodSubmit {
+		if decoded, err := decodeWebhookSecret(request.Secrets[rpcWebhookSecretKey]); err == nil && len(decoded) > 0 {
 			registry.Add(string(decoded))
 			clearBytes(decoded)
 		}
@@ -1333,7 +1414,14 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		if strings.TrimSpace(config.Hostname) == "" {
 			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node has no recorded main hostname", "Run eregion apply to record it before using CI or push-to-deploy URLs.")
 		}
-		return rpcNodeInfoResult{Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary()}, true, nil
+		workspace, workspaceErr := readNodeWorkspace(ctx)
+		result := rpcNodeInfoResult{Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary(), Workspace: workspace}
+		if workspaceErr != nil {
+			// The node name remains available for read-only UI labels, but the
+			// workspace read is explicitly unknown rather than unconfigured.
+			result.WorkspaceError = contract.Classify(workspaceErr).Message
+		}
+		return result, true, nil
 	case methodImagePush:
 		var params rpcImagePushParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1369,6 +1457,10 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		if strings.TrimSpace(dsn) == "" {
 			return nil, true, contract.NewFault(contract.InputRequired, "the node has no control database URL", "Check "+host.ServiceEnvPath+" on the node.")
 		}
+		workspace, err := readWorkspaceFromDSN(ctx, dsn)
+		if err != nil {
+			return nil, true, err
+		}
 		keyring, err := os.ReadFile(filepath.Join(host.DefaultLayout().ConfigDir, host.VaultKeyringName)) //nolint:gosec // G304: the fixed root-only keyring path.
 		if err != nil {
 			return nil, true, contract.NewFault(contract.PreconditionFailed, "the node's vault keyring is not readable", "Check "+host.VaultKeyringName+" under the configuration directory.")
@@ -1376,9 +1468,35 @@ func dispatchLocalMethod(ctx context.Context, request rpc.Request, payload io.Re
 		return rpcHandoffExportResult{
 			Node: config.Node, Hostname: config.Hostname, Platform: host.PlatformSummary(),
 			SSHHostKey: hostKey, DatabaseURL: dsn, VaultKeyring: strings.TrimSpace(string(keyring)),
+			Workspace: workspace,
 		}, true, nil
 	}
 	return nil, false, nil
+}
+
+// readNodeWorkspace reads the authoritative identity from the node's service
+// database. An unconfigured table is returned explicitly, never replaced by a
+// local node.json mirror.
+func readNodeWorkspace(ctx context.Context) (controlplane.WorkspaceIdentity, error) {
+	if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
+		return controlplane.WorkspaceIdentity{}, contract.NewFault(contract.Unavailable,
+			"the node service configuration is not readable", err.Error())
+	}
+	dsn := strings.TrimSpace(os.Getenv("EREGION_DATABASE_URL"))
+	if dsn == "" {
+		return controlplane.WorkspaceIdentity{}, contract.NewFault(contract.InputRequired,
+			"the node has no control database URL", "Check "+host.ServiceEnvPath+" on the node.")
+	}
+	return readWorkspaceFromDSN(ctx, dsn)
+}
+
+func readWorkspaceFromDSN(ctx context.Context, dsn string) (controlplane.WorkspaceIdentity, error) {
+	pool, err := controlplane.Open(ctx, dsn)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, err
+	}
+	defer pool.Close()
+	return controlplane.ReadWorkspace(ctx, pool)
 }
 
 func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry) (api.AppService, func(), error) {
@@ -1401,7 +1519,8 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 	if err != nil {
 		return api.AppService{}, nil, err
 	}
-	if err := controlplane.Ready(ctx, pool); err != nil {
+	readyLog := controlplane.NewReadinessLog(logger)
+	if err := controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(readyLog)); err != nil {
 		pool.Close()
 		return api.AppService{}, nil, err
 	}
@@ -1413,7 +1532,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
-		Redaction: registry,
+		Redaction: registry, Vault: parts.Vault,
 		DomainDNS: parts.DomainDNS,
 		HumanFactor: func(code string) error {
 			return protect.NewStore().Verify(code)
@@ -1423,7 +1542,9 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		pool.Close()
 		return api.AppService{}, nil, err
 	}
-	appService := api.NewAppService(run.Service, parts.Vault, func(ctx context.Context) error { return controlplane.Ready(ctx, pool) })
+	appService := api.NewAppService(run.Service, parts.Vault, func(ctx context.Context) error {
+		return controlplane.Ready(ctx, pool, controlplane.WithReadinessLog(readyLog))
+	})
 	appService.Retention = run.Service
 	if parts.Cloudflare != nil {
 		appService.Cloudflare = parts.Cloudflare
@@ -1470,10 +1591,30 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 				return nil, err
 			}
 		}
+		webhookSecret, err := decodeWebhookSecret(request.Secrets[rpcWebhookSecretKey])
+		if err != nil {
+			return nil, err
+		}
+		defer clearBytes(webhookSecret)
 		// The control plane verifies the factor inside the submission
 		// transaction against locked environment state. The code is transient
 		// request data, never operation input, an event or a River argument.
-		return app.PreviewOrSubmitWithFactor(ctx, actor, params.Kind, params.Target, params.Input, request.IdempotencyKey, request.DryRun, request.Secrets[protect.CodeSecret])
+		result, err := app.PreviewOrSubmitWithReceipt(ctx, actor, params.Kind, params.Target, params.Input,
+			request.IdempotencyKey, request.DryRun, request.Secrets[protect.CodeSecret], webhookSecret)
+		if err != nil {
+			return nil, err
+		}
+		if request.DryRun {
+			return result, nil
+		}
+		receipt, ok := result.(operations.SubmissionResult)
+		if !ok {
+			return nil, contract.NewFault(contract.Internal, "the control plane returned no admission receipt", "Report the command and binary version.")
+		}
+		return rpcSubmitResult{
+			Operation: receipt.Operation, Replay: receipt.Replay,
+			WebhookSecretActivated: receipt.WebhookSecretActivated,
+		}, nil
 	case methodGet:
 		var params rpcOperationParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {

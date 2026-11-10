@@ -30,6 +30,15 @@ const (
 	githubWebhookAmbiguous = "ambiguous"
 )
 
+// The webhook flow keeps its terminal and prompt seams explicit so regression
+// tests can prove replay and preflight ordering without a real TTY.
+var (
+	webhookHumanInteractive = humanInteractive
+	confirmGitHubWebhook    = func(title, description string, def bool) (bool, error) {
+		return ui.YesNoDefault(title, description, def)
+	}
+)
+
 // githubWebhookReport is safe for JSON results and ordinary output: it never
 // contains a secret value.
 type githubWebhookReport struct {
@@ -78,8 +87,19 @@ func (r githubWebhookReport) summary() string {
 
 type githubWebhookAccess struct {
 	OK      bool
+	Code    contract.Code
 	Message string
 	Next    string
+}
+
+// githubWebhookPreflightFault turns a failed preflight into a stable, safe
+// contract error. The message never includes gh output or a secret.
+func githubWebhookPreflightFault(access githubWebhookAccess) error {
+	code := access.Code
+	if code == "" {
+		code = contract.PreconditionFailed
+	}
+	return contract.NewFault(code, access.Message, access.Next)
 }
 
 type githubHook struct {
@@ -119,19 +139,20 @@ func validateGitHubWebhookFlags(cmd *cobra.Command) error {
 // prompts when gh is missing or cannot reach an admin account, and it defaults
 // to the existing manual path.
 func (a *app) offerGitHubWebhook(cmd *cobra.Command, update *webhookUpdate) error {
-	if update == nil || update.GitHub || flagChanged(cmd, "github-webhook") || dryRun(cmd) || !humanInteractive(cmd) || len(update.Secret) == 0 {
+	if update == nil || update.GitHub || !update.NeedsSecret || update.Replay || flagChanged(cmd, "github-webhook") || dryRun(cmd) || !webhookHumanInteractive(cmd) {
 		return nil
 	}
 	access := inspectGitHubWebhookAccess(cmd.Context(), update.Repository)
 	if !access.OK {
 		return nil
 	}
-	use, err := ui.YesNoDefault("Create the GitHub webhook with gh?",
+	use, err := confirmGitHubWebhook("Create the GitHub webhook with gh?",
 		"gh is signed in with repository admin access. The webhook secret is sent over stdin, never in process arguments. Choose No to paste the URL and secret manually.", false)
 	if err != nil {
 		return err
 	}
 	update.GitHub = use
+	update.GitHubAccess = access
 	return nil
 }
 
@@ -139,7 +160,7 @@ func (a *app) offerGitHubWebhook(cmd *cobra.Command, update *webhookUpdate) erro
 // present) the accepted environment operation, so an external failure cannot
 // pretend that desired state was not saved.
 func (a *app) setupWebhookWithGitHub(cmd *cobra.Command, update webhookUpdate) *githubWebhookReport {
-	if !update.GitHub || dryRun(cmd) {
+	if !update.GitHub || update.Replay || dryRun(cmd) {
 		return nil
 	}
 	if update.Repository == "" || update.URL == "" {
@@ -154,7 +175,10 @@ func (a *app) setupWebhookWithGitHub(cmd *cobra.Command, update webhookUpdate) *
 	if len(update.Secret) == 0 {
 		report = ensureGitHubWebhook(cmd.Context(), update.Repository, update.URL)
 	} else {
-		access := inspectGitHubWebhookAccess(cmd.Context(), update.Repository)
+		access := update.GitHubAccess
+		if !access.OK {
+			access = inspectGitHubWebhookAccess(cmd.Context(), update.Repository)
+		}
 		report = configureGitHubWebhook(cmd.Context(), access, update.Repository, update.URL, update.Secret)
 	}
 	return &report
@@ -163,27 +187,31 @@ func (a *app) setupWebhookWithGitHub(cmd *cobra.Command, update webhookUpdate) *
 func inspectGitHubWebhookAccess(ctx context.Context, repository string) githubWebhookAccess {
 	if _, err := exec.LookPath("gh"); err != nil {
 		return githubWebhookAccess{
+			Code:    contract.MissingTool,
 			Message: "the GitHub CLI (gh) is not installed",
-			Next:    "Install gh and sign in, or paste the webhook URL and secret into GitHub manually.",
+			Next:    "Install gh and sign in, or rerun in a human terminal without --github-webhook to generate and show the secret manually.",
 		}
 	}
 	if _, err := runGH(ctx, nil, "auth", "status", "--hostname", "github.com"); err != nil {
 		return githubWebhookAccess{
+			Code:    contract.PreconditionFailed,
 			Message: "gh is not signed in to github.com or its session could not be verified",
-			Next:    "Run gh auth login, or paste the webhook URL and secret into GitHub manually.",
+			Next:    "Run gh auth login, or rerun in a human terminal without --github-webhook to generate and show the secret manually.",
 		}
 	}
 	out, err := runGH(ctx, nil, "api", "--hostname", "github.com", "--jq", ".permissions.admin", "repos/"+repository)
 	if err != nil {
 		return githubWebhookAccess{
+			Code:    contract.PreconditionFailed,
 			Message: "gh could not confirm repository access or admin permission for " + repository,
-			Next:    "Check that gh can read the repository, that the account can administer it, and that its token can manage hooks; or paste the webhook URL and secret into GitHub manually.",
+			Next:    "Check that gh can read the repository, that the account can administer it, and that its token can manage hooks; or rerun in a human terminal without --github-webhook to generate and show the secret manually.",
 		}
 	}
 	if !strings.EqualFold(strings.TrimSpace(string(out)), "true") {
 		return githubWebhookAccess{
+			Code:    contract.PreconditionFailed,
 			Message: "the gh account does not have repository admin permission for " + repository,
-			Next:    "Use an account that can administer the repository, or paste the webhook URL and secret into GitHub manually.",
+			Next:    "Use an account that can administer the repository, or rerun in a human terminal without --github-webhook to generate and show the secret manually.",
 		}
 	}
 	return githubWebhookAccess{OK: true}
@@ -399,6 +427,36 @@ func githubWebhookFailure(message string, err error) githubWebhookReport {
 		Message: message + exit,
 		Next:    "Paste the webhook URL and secret into GitHub manually, or fix gh and rerun with --rotate-webhook-secret --github-webhook.",
 	}
+}
+
+// webhookPartialFault reports the non-atomic split between platform activation
+// (or rotation) and hook installation. The report and details contain no
+// secret; the operator must recover with an explicit rotation because the
+// activated value can no longer be printed.
+func webhookPartialFault(appName, environment string, operationID contract.OperationID, activation string, rotated bool, report githubWebhookReport) error {
+	message := "the environment update was accepted, but the GitHub webhook was not installed for " + appName + "/" + environment
+	hint := "Platform activation succeeded; fix gh, then rerun `eregion env update " + appName + " " + environment + " --rotate-webhook-secret --github-webhook` with a NEW --idempotency-key (or omit the key) to install the hook with a fresh secret. The activated secret stays in the vault and was not printed."
+	if operationID != "" {
+		message = "the environment update was accepted as operation " + string(operationID) + ", but the GitHub webhook was not installed for " + appName + "/" + environment
+	}
+	if rotated {
+		message = "the push-to-deploy secret was rotated, but the GitHub webhook was not updated for " + appName + "/" + environment
+		hint = "The new secret is active in the vault and was not printed. Fix gh, then rerun `eregion env update " + appName + " " + environment + " --rotate-webhook-secret --github-webhook` with a NEW --idempotency-key (or omit the key) to update the hook with another fresh secret."
+	} else if activation == "already_enabled" {
+		message = "push to deploy is already enabled, but the GitHub webhook was not confirmed for " + appName + "/" + environment
+		hint = "No secret was changed. Fix gh, then rerun with --rotate-webhook-secret --github-webhook and a NEW --idempotency-key (or omit the key) to install the hook with a fresh secret."
+	}
+	fault := contract.NewFault(contract.Unavailable, message, hint)
+	report.Next = ""
+	fault.Details = map[string]any{
+		"platform_activation": activation,
+		"secret_rotated":      rotated,
+		"github_webhook":      report,
+	}
+	if operationID != "" {
+		fault.Details["operation_id"] = string(operationID)
+	}
+	return fault
 }
 
 func runGH(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {

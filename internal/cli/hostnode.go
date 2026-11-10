@@ -55,6 +55,17 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 		if cfgErr != nil {
 			return nil, cfgErr
 		}
+		if request.Method == methodHostApply {
+			var params rpcHostApplyParams
+			if err := decodeRPCParams(request.Params, &params); err != nil {
+				return nil, err
+			}
+			if params.Workspace != "" {
+				// The explicit flag initializes a legacy installation; the
+				// recorded intent has no identity to guess from.
+				cfg.Workspace = params.Workspace
+			}
+		}
 		runner, err := host.NewRunner(cfg, registry)
 		if err != nil {
 			return nil, err
@@ -94,7 +105,18 @@ func dispatchHostMethod(ctx context.Context, request rpc.Request, progress io.Wr
 		return doctor.BuildReport(doctor.Run(doctor.Checks(), facts)), nil
 	case methodHostStatus:
 		facts := host.GatherFacts(ctx, cfg, cfgErr, host.Plan{}, nil, request.ClientVersion, request.ClientCommit, registry)
-		return host.StatusFromFacts(facts), nil
+		status := host.StatusFromFacts(facts)
+		if cfg.DatabaseURL != "" {
+			workspace, err := host.ReadWorkspaceStatus(ctx, cfg.DatabaseURL)
+			if err != nil {
+				status.WorkspaceError = registry.Redact(contract.Classify(err).Message)
+			} else {
+				status.Workspace = workspace
+			}
+		} else {
+			status.WorkspaceError = "the node has no control database URL"
+		}
+		return status, nil
 	case methodRetentionInventory:
 		if err := decodeRPCParams(request.Params, &struct{}{}); err != nil {
 			return nil, err

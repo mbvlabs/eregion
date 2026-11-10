@@ -37,6 +37,7 @@ func (a *app) workspaceSpecs() []spec {
 		"eregion ui --tab deployments",
 		"eregion ui --tab fleet",
 	}
+	meta = terminalOnlyMeta(meta)
 	return []spec{{
 		use:  "ui",
 		meta: meta,
@@ -77,17 +78,23 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	noColor, _ := cmd.Flags().GetBool("no-color")
 	reduced, _ := cmd.Flags().GetBool("reduced-motion")
 	metrics := a.workspaceMetricsSource(client)
+	nodeName, workspaceName, workspaceKnown, workspaceConfigured, contextName := workspaceTarget(cmd.Context(), cmd, client)
 	summary, err := workspaceui.Run(cmd.Context(), workspaceui.Options{
-		API:           workspaceAPI,
-		Metrics:       metrics,
-		Host:          workspaceHost(cmd),
-		Secrets:       a.secrets,
-		ASCII:         ascii || strings.EqualFold(os.Getenv("TERM"), "dumb"),
-		NoColor:       noColor || os.Getenv("NO_COLOR") != "",
-		ReducedMotion: reduced || os.Getenv("EREGION_REDUCED_MOTION") == "1",
-		InitialTab:    tab,
-		In:            streams.in,
-		Out:           streams.out,
+		API:                 workspaceAPI,
+		Metrics:             metrics,
+		Host:                workspaceHost(cmd),
+		Node:                nodeName,
+		Workspace:           workspaceName,
+		WorkspaceKnown:      workspaceKnown,
+		WorkspaceConfigured: workspaceConfigured,
+		Context:             contextName,
+		Secrets:             a.secrets,
+		ASCII:               ascii || strings.EqualFold(os.Getenv("TERM"), "dumb"),
+		NoColor:             noColor || os.Getenv("NO_COLOR") != "",
+		ReducedMotion:       reduced || os.Getenv("EREGION_REDUCED_MOTION") == "1",
+		InitialTab:          tab,
+		In:                  streams.in,
+		Out:                 streams.out,
 	})
 	if err != nil {
 		return result{}, err
@@ -125,6 +132,27 @@ func workspaceHost(cmd *cobra.Command) string {
 		return ""
 	}
 	return current.SSH.User + "@" + current.SSH.Address
+}
+
+// workspaceTarget reads the actual node and authoritative workspace identity.
+// The selected context and SSH route remain separate labels. A failed identity
+// read is shown as unknown; it is never presented as unconfigured.
+func workspaceTarget(ctx context.Context, cmd *cobra.Command, client Backend) (node, workspace string, known, configured bool, contextName string) {
+	if current, err := selectedContext(cmd); err == nil {
+		contextName = current.Name
+	}
+	info, err := client.NodeInfo(ctx)
+	if err != nil {
+		return "unknown", "", false, false, contextName
+	}
+	node = info.Node
+	if node == "" {
+		node = "unknown"
+	}
+	if info.WorkspaceError != "" {
+		return node, "", false, false, contextName
+	}
+	return node, info.Workspace.Name, true, info.Workspace.Configured, contextName
 }
 
 type workspaceLiveAPI struct {
