@@ -15,10 +15,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// workspaceSpecs returns the interactive workspace commands. They are kept in
+// uiSpecs returns the interactive workspace UI command. They are kept in
 // their own list so the command tree can attach them without pulling Charm into
 // the noninteractive command path.
-func (a *app) workspaceSpecs() []spec {
+func (a *app) uiSpecs() []spec {
 	meta := operationMeta("Browse and act on the platform in an interactive terminal",
 		"eregion ui --tab fleet")
 	meta.Audience = []string{"human"}
@@ -78,7 +78,7 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 	noColor, _ := cmd.Flags().GetBool("no-color")
 	reduced, _ := cmd.Flags().GetBool("reduced-motion")
 	metrics := a.workspaceMetricsSource(client)
-	nodeName, workspaceName, workspaceKnown, workspaceConfigured, contextName := workspaceTarget(cmd.Context(), cmd, client)
+	nodeName, workspaceName, workspaceKnown, workspaceConfigured := workspaceTarget(cmd.Context(), client)
 	summary, err := workspaceui.Run(cmd.Context(), workspaceui.Options{
 		API:                 workspaceAPI,
 		Metrics:             metrics,
@@ -87,7 +87,6 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 		Workspace:           workspaceName,
 		WorkspaceKnown:      workspaceKnown,
 		WorkspaceConfigured: workspaceConfigured,
-		Context:             contextName,
 		Secrets:             a.secrets,
 		ASCII:               ascii || strings.EqualFold(os.Getenv("TERM"), "dumb"),
 		NoColor:             noColor || os.Getenv("NO_COLOR") != "",
@@ -127,7 +126,7 @@ func (a *app) workspaceUI(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 func workspaceHost(cmd *cobra.Command) string {
-	current, err := selectedContext(cmd)
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil || current.SSH == nil {
 		return ""
 	}
@@ -135,24 +134,21 @@ func workspaceHost(cmd *cobra.Command) string {
 }
 
 // workspaceTarget reads the actual node and authoritative workspace identity.
-// The selected context and SSH route remain separate labels. A failed identity
+// The node and SSH route remain separate labels. A failed identity
 // read is shown as unknown; it is never presented as unconfigured.
-func workspaceTarget(ctx context.Context, cmd *cobra.Command, client Backend) (node, workspace string, known, configured bool, contextName string) {
-	if current, err := selectedContext(cmd); err == nil {
-		contextName = current.Name
-	}
+func workspaceTarget(ctx context.Context, client Backend) (node, workspace string, known, configured bool) {
 	info, err := client.NodeInfo(ctx)
 	if err != nil {
-		return "unknown", "", false, false, contextName
+		return "unknown", "", false, false
 	}
 	node = info.Node
 	if node == "" {
 		node = "unknown"
 	}
 	if info.WorkspaceError != "" {
-		return node, "", false, false, contextName
+		return node, "", false, false
 	}
-	return node, info.Workspace.Name, true, info.Workspace.Configured, contextName
+	return node, info.Workspace.Name, true, info.Workspace.Configured
 }
 
 type workspaceLiveAPI struct {

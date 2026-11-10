@@ -34,7 +34,7 @@ capability or proof of durable work.
 Use `eregion commands --search TEXT --json` to find tasks by command path,
 summary or examples, and `eregion commands --check-meta --json` to validate the
 catalog. Overview, help, search and metadata checks are offline and need no
-context. Do not combine `--search`, `--path` and `--check-meta`.
+workspace access. Do not combine `--search`, `--path` and `--check-meta`.
 
 Use `eregion help <command...> --json` or
 `eregion commands --path <command> --json` for one command. The catalog is
@@ -136,7 +136,7 @@ terminal, some need a human, and a retry may need the same idempotency key.
   the effective desired revision of a definition-file update, even when its
   source binding is unchanged. A dry run or idempotent replay does not read gh.
 - Cloudflare provider setup is a human handoff: ask the operator to run
-  `eregion --context NAME domain cloudflare configure` in their own terminal.
+  `eregion --workspace NAME domain cloudflare configure` in their own terminal.
   They enter the zone and token through its hidden prompt; never request the
   token in chat, a file, flags or service-environment edits. The command stores
   it encrypted in the provider vault. `domain cloudflare status --json` is a
@@ -183,37 +183,39 @@ database URL is a protected file, never an argument.
 
 ```sh
 eregion server init --host root@203.0.113.10 --hostname app.example.com \
-  --workspace lab --node main \
-  --database-url-file /protected/database-url --context-name lab \
+  --workspace-name lab --node main \
+  --database-url-file /protected/database-url \
   --accept-new-host-key --secrets-out /protected/lab-secrets.md \
   --confirm lab --json
 ```
 
-An interrupted init is resumed with `--resume --context-name <server>` and a
-first-contact credential; `--discard --confirm <server>` drops only the local
-state. `eregion login` imports the transfer bundle from the handoff into a local
-context. Use `--file` and `--passphrase-file` when no terminal is available.
-`eregion context list|show|use` inspects and selects contexts without printing
-credentials; `context remove <name> --confirm <name>` deletes one with its key
+An interrupted init is resumed with `--resume --workspace-name <workspace>` and a
+first-contact credential; `--discard --workspace-name <workspace>` drops only the local
+state. `eregion login` imports the transfer bundle from the handoff into private
+workspace access. Use `--file` and `--passphrase-file` when no terminal is available.
+`eregion workspace list|show|use` inspects and selects workspaces without printing
+credentials; `workspace remove <name-or-id> --confirm <name-or-id>` deletes local access and its owned key
 files.
 
 Workspace identity names the installation; node name names its server. A
-context is this machine's access to that workspace's one node, not a team or
-tenant boundary. `EREGION_CONTEXT_FILE` selects a local **store**;
-`--context NAME`, then `EREGION_CONTEXT`, then the saved current context selects
-access within that store. Use an explicit context in automation. A missing name
+workspace is the only named operator target; local keys and routes are private access
+data, not another identity. `--workspace-file` or `EREGION_WORKSPACE_FILE` selects a local **store**.
+For `server init`, use a directory exclusive to that store so servers/ and
+pending/ cannot mix with another store;
+`--workspace NAME`, then `EREGION_WORKSPACE`, then the saved current workspace selects
+access within that store. Use an explicit workspace in automation. A missing name
 in the selected store is not evidence that the server is missing.
 
 Workspace identity travels through a refreshed protected handoff and login;
-never infer it from a local context name or waive a conflicting ID/fingerprint.
+never infer it from a private access alias or waive a conflicting ID/fingerprint.
 A human must refresh `secrets export` after identity or recoverable credential
 changes; old exports do not update themselves. Agents inspect only metadata and
 human confirmation, never the exported content.
 
-Fresh setup requires `--workspace NAME` independently of `--node`. An upgraded
+Fresh setup requires `--workspace-name NAME` independently of `--node`. An upgraded
 alpha.6 installation remains unconfigured until explicitly assigned through
-`apply --workspace NAME`; preview first and obtain authorization for that target.
-Reads and migration never assign a workspace from a context name. Old bundles
+`apply --assign-workspace NAME`; preview first and obtain authorization for that target.
+Reads and migration never assign a workspace from a private access alias. Old bundles
 remain unconfigured access artifacts; ask for a human-refreshed export to carry
 the portable identity. If an old pending init already applied its host phase,
 finish that pending flow before assigning through `apply`; do not edit its

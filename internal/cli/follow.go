@@ -423,7 +423,7 @@ func followError(summary viewer.Summary, err error) error {
 }
 
 func apiEndpoint(cmd *cobra.Command) string {
-	current, err := selectedContext(cmd)
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil || current.SSH == nil {
 		return ""
 	}

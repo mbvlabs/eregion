@@ -18,16 +18,12 @@ import (
 
 const metricsCredentialFile = "metrics-credential.json"
 
-func metricsCredentialPath(contextName string) (string, error) {
-	dir, err := identityDir(contextName)
-	if err != nil {
-		return "", err
-	}
+func metricsCredentialPath(dir string) (string, error) {
 	return filepath.Join(dir, metricsCredentialFile), nil
 }
 
-func loadMetricsCredential(contextName string) (*telemetry.Credential, error) {
-	path, err := metricsCredentialPath(contextName)
+func loadMetricsCredential(dir string) (*telemetry.Credential, error) {
+	path, err := metricsCredentialPath(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -55,11 +51,11 @@ func loadMetricsCredential(contextName string) (*telemetry.Credential, error) {
 	return &credential, nil
 }
 
-func saveMetricsCredential(contextName string, credential telemetry.Credential) error {
+func saveMetricsCredential(dir string, credential telemetry.Credential) error {
 	if err := credential.Validate(); err != nil {
 		return err
 	}
-	path, err := metricsCredentialPath(contextName)
+	path, err := metricsCredentialPath(dir)
 	if err != nil {
 		return err
 	}
@@ -73,8 +69,8 @@ func saveMetricsCredential(contextName string, credential telemetry.Credential) 
 	return engine.WriteFileAtomic(path, append(raw, '\n'), 0o600)
 }
 
-func removeMetricsCredential(contextName string) error {
-	path, err := metricsCredentialPath(contextName)
+func removeMetricsCredential(dir string) error {
+	path, err := metricsCredentialPath(dir)
 	if err != nil {
 		return err
 	}
@@ -97,7 +93,7 @@ type metricsEndpointClient interface {
 // before the node request (a node holding a hash of a password this machine
 // lost would lock every scraper out), and restores the previous local value if
 // the request fails, as vaire does. Only the bcrypt hash is sent.
-func rotateMetricsCredential(ctx context.Context, client metricsRotationClient, contextName, nodeName, confirm string, credential *telemetry.Credential, registerSecret func(string)) (telemetry.Rotation, error) {
+func rotateMetricsCredential(ctx context.Context, client metricsRotationClient, credentialDir, nodeName, confirm string, credential *telemetry.Credential, registerSecret func(string)) (telemetry.Rotation, error) {
 	token := nodeName + "/metrics"
 	if strings.TrimSpace(confirm) != token {
 		fault := contract.NewFault(contract.ConfirmationRequired,
@@ -117,11 +113,11 @@ func rotateMetricsCredential(ctx context.Context, client metricsRotationClient, 
 	if err != nil {
 		return telemetry.Rotation{}, err
 	}
-	previous, err := loadMetricsCredential(contextName)
+	previous, err := loadMetricsCredential(credentialDir)
 	if err != nil {
 		return telemetry.Rotation{}, err
 	}
-	if err := saveMetricsCredential(contextName, *credential); err != nil {
+	if err := saveMetricsCredential(credentialDir, *credential); err != nil {
 		return telemetry.Rotation{}, err
 	}
 	if registerSecret != nil {
@@ -130,9 +126,9 @@ func rotateMetricsCredential(ctx context.Context, client metricsRotationClient, 
 	rotation, err := client.MetricsRotate(ctx, hash, token, false)
 	if err != nil {
 		if previous != nil {
-			_ = saveMetricsCredential(contextName, *previous)
+			_ = saveMetricsCredential(credentialDir, *previous)
 		} else {
-			_ = removeMetricsCredential(contextName)
+			_ = removeMetricsCredential(credentialDir)
 		}
 		return telemetry.Rotation{}, err
 	}
@@ -151,9 +147,9 @@ func (a *app) metricsEndpoint(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	backend, ok := client.(metricsEndpointClient)
 	if !ok {
-		return result{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved context over SSH inside WireGuard.")
+		return result{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved workspace over SSH inside WireGuard.")
 	}
-	current, err := selectedContext(cmd)
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
 		return result{}, err
 	}
@@ -161,7 +157,11 @@ func (a *app) metricsEndpoint(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	local, err := loadMetricsCredential(current.Name)
+	credentialDir, err := workspaceCredentialDir(cmd, current)
+	if err != nil {
+		return result{}, err
+	}
+	local, err := loadMetricsCredential(credentialDir)
 	if err != nil {
 		return result{}, err
 	}
@@ -203,9 +203,9 @@ func (a *app) metricsConfig(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	backend, ok := client.(metricsEndpointClient)
 	if !ok {
-		return result{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved context over SSH inside WireGuard.")
+		return result{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved workspace over SSH inside WireGuard.")
 	}
-	current, err := selectedContext(cmd)
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
 		return result{}, err
 	}
@@ -213,7 +213,11 @@ func (a *app) metricsConfig(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	credential, err := loadMetricsCredential(current.Name)
+	credentialDir, err := workspaceCredentialDir(cmd, current)
+	if err != nil {
+		return result{}, err
+	}
+	credential, err := loadMetricsCredential(credentialDir)
 	if err != nil {
 		return result{}, err
 	}
@@ -342,11 +346,11 @@ func (a *app) metricsRotate(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	backend, ok := client.(metricsRotationClient)
 	if !ok {
-		return result{}, contract.NewFault(contract.Internal, "this client cannot rotate the telemetry credential", "Use a saved context over SSH inside WireGuard.")
+		return result{}, contract.NewFault(contract.Internal, "this client cannot rotate the telemetry credential", "Use a saved workspace over SSH inside WireGuard.")
 	}
 	endpointClient, ok := client.(metricsEndpointClient)
 	if !ok {
-		return result{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved context over SSH inside WireGuard.")
+		return result{}, contract.NewFault(contract.Internal, "this client cannot read the telemetry endpoint", "Use a saved workspace over SSH inside WireGuard.")
 	}
 	info, err := endpointClient.MetricsEndpoint(cmd.Context())
 	if err != nil {
@@ -366,11 +370,15 @@ func (a *app) metricsRotate(cmd *cobra.Command, _ []string) (result, error) {
 		return result{data: data, plain: plain}, nil
 	}
 	confirm, _ := cmd.Flags().GetString("confirm")
-	current, err := selectedContext(cmd)
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
 		return result{}, err
 	}
-	rotation, err := rotateMetricsCredential(cmd.Context(), backend, current.Name, info.Node, confirm, nil, func(value string) { a.secrets.Add(value) })
+	credentialDir, err := workspaceCredentialDir(cmd, current)
+	if err != nil {
+		return result{}, err
+	}
+	rotation, err := rotateMetricsCredential(cmd.Context(), backend, credentialDir, info.Node, confirm, nil, func(value string) { a.secrets.Add(value) })
 	if err != nil {
 		return result{}, err
 	}

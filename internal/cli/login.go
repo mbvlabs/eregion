@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
+
 	"fmt"
 	"io"
 	"net"
@@ -26,13 +26,13 @@ import (
 
 // loginSpecs is `eregion login`, as vaire login: decrypt the transfer bundle
 // from server init's secrets handoff with its passphrase and turn it into a
-// working context on this machine.
+// working workspace access on this machine.
 func (a *app) loginSpecs() []spec {
 	meta := readMeta("Log in to a main node with its transfer bundle",
 		[]string{"Paste the transfer bundle from server init's secrets handoff (or the whole copied handoff), then its passphrase."},
 		[]string{"eregion login", "eregion login --file main-secrets.md --passphrase-file pass.txt --json"})
 	meta.Mutating, meta.Prompts, meta.Remote = true, true, true
-	meta.DryRunReason = "Login only writes the local context store and identity files."
+	meta.DryRunReason = "Login only writes the private workspace store and identity files."
 	meta.InputFlags = []string{"file", "passphrase-file", "replace"}
 	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.Conflict)
 	return []spec{{
@@ -41,7 +41,7 @@ func (a *app) loginSpecs() []spec {
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("file", "", "File with the transfer bundle (or the whole handoff); otherwise it is read from standard input")
 			cmd.Flags().String("passphrase-file", "", "File whose first line is the bundle passphrase; asked for in a terminal")
-			cmd.Flags().String("replace", "", "Replace this existing context; must name the context in the bundle exactly")
+			cmd.Flags().String("replace", "", "Replace the saved local access for this verified workspace; must match its canonical name")
 		},
 		run: a.login,
 	}}
@@ -50,9 +50,9 @@ func (a *app) loginSpecs() []spec {
 // loginSeams replace the network probe and readiness check in tests. The zero
 // value uses the real WireGuard probe and node RPC.
 type loginSeams struct {
-	probe  func(context.Context, *host.ContextSSH, string) (ssh.PublicKey, error)
-	verify func(context.Context, *host.ContextSSH) (rpcNodeInfoResult, error)
-	ready  func(context.Context, *host.ContextSSH) error
+	probe  func(context.Context, *host.WorkspaceSSH, string) (ssh.PublicKey, error)
+	verify func(context.Context, *host.WorkspaceSSH) (rpcNodeInfoResult, error)
+	ready  func(context.Context, *host.WorkspaceSSH) error
 }
 
 // handoffRecord is the parsed secrets record: section title → label → value.
@@ -150,7 +150,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	rec := parseHandoffRecord(string(plain))
 	get := func(section, label string) string { return rec.field(section, label) }
-	name := get("Main node", "Context")
+	historicalName := strings.TrimSpace(get("Main node", "Context"))
 	nodeName := get("Main node", "Node name")
 	sshKey := get("Operator", "SSH private key")
 	wgKey := get("Operator", "WireGuard private key")
@@ -160,7 +160,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	workspaceID := strings.TrimSpace(get("Main node", "Workspace ID"))
 	workspaceDeclared := workspaceName != "" || workspaceID != ""
 	required := map[string]string{
-		"context": name, "SSH private key": sshKey, "WireGuard private key": wgKey,
+		"SSH private key": sshKey, "WireGuard private key": wgKey,
 		"WireGuard address":    wireGuardAddress,
 		"admin user":           adminUser,
 		"WireGuard endpoint":   get("Main node", "WireGuard endpoint"),
@@ -187,70 +187,62 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		a.secrets.Add(v)
 	}
 
-	if err := host.ValidateContextName(name); err != nil {
+	if err := rejectWorkspaceSelection(cmd, "login"); err != nil {
 		return result{}, err
 	}
-	if err := requireAgreedContext(cmd, name); err != nil {
-		return result{}, err
-	}
-	store, err := host.LoadContextStore("")
+	store, err := loadWorkspaceStore(cmd)
 	if err != nil {
 		return result{}, err
 	}
 	replace, _ := cmd.Flags().GetString("replace")
 	replace = strings.TrimSpace(replace)
-	if replace != "" && replace != name {
-		return result{}, contract.NewFault(contract.Conflict, "--replace must name the context in the bundle ("+name+")", "Use --replace "+name+", or omit --replace to keep the existing context.")
-	}
-	existing, lookupErr := store.Get(name)
-	exists := lookupErr == nil
-	if lookupErr != nil {
-		var fault *contract.Fault
-		if !errors.As(lookupErr, &fault) || fault.Code != contract.NotFound {
-			return result{}, lookupErr
-		}
-	}
-	if exists && existing.Workspace != nil {
-		// A configured context may only be replaced by a bundle for the same
-		// immutable workspace. --replace names the context, not a permission
-		// to move it to another workspace or discard its identity.
-		if !workspaceDeclared {
-			fault := contract.NewFault(contract.Conflict,
-				"context "+name+" belongs to workspace "+existing.Workspace.Name,
-				"Refresh the protected export from the node and import it; the old bundle carries no workspace identity.")
-			fault.Details = map[string]any{"context": name, "workspace": existing.Workspace.Name, "workspace_id": existing.Workspace.ID}
-			return result{}, fault
-		}
-		if existing.Workspace.ID != workspaceID || existing.Workspace.Name != workspaceName {
-			fault := contract.NewFault(contract.Conflict,
-				"context "+name+" belongs to a different workspace",
-				"The workspace ID is immutable. Remove the context explicitly with eregion context remove before importing another workspace.")
-			fault.Details = map[string]any{
-				"context": name, "existing_workspace": existing.Workspace.Name, "existing_workspace_id": existing.Workspace.ID,
-				"bundle_workspace": workspaceName, "bundle_workspace_id": workspaceID,
-			}
-			return result{}, fault
-		}
-	}
+	privateName := workspaceName
 	if workspaceDeclared {
-		if err := store.CheckWorkspaceAlias(name, &host.ContextWorkspace{ID: workspaceID, Name: workspaceName}); err != nil {
+		if err := validateLoginWorkspaceTarget(store, workspaceName, workspaceID, replace); err != nil {
 			return result{}, err
 		}
+	} else {
+		if replace != "" {
+			return result{}, contract.NewFault(contract.Usage, "--replace names a verified workspace; this bundle has no workspace identity", "Refresh the protected export from the node and use its Workspace/Workspace ID fields.")
+		}
+		if len(store.Groups()) > 0 {
+			return result{}, contract.NewFault(contract.Conflict,
+				"this machine already has a verified workspace; this old bundle carries no portable identity",
+				"Refresh the protected export from the node and log in with its Workspace and Workspace ID fields.")
+		}
+		if historicalName == "" {
+			return result{}, contract.NewFault(contract.ValidationFailed, "the transfer bundle has neither a workspace identity nor a private access name", "Use a current protected export from eregion secrets export.")
+		}
+		if err := host.ValidateAccessName(historicalName); err != nil {
+			return result{}, err
+		}
+		privateName = historicalName
 	}
-	if exists && replace != name {
-		return result{}, contract.NewFault(contract.Conflict, "context "+name+" already exists", "Use eregion login --replace "+name+" to replace it, or choose another server.")
+	autoUpgrade := boolFlag(cmd, "auto-upgrade-nodes")
+	for _, group := range store.Groups() {
+		if workspaceDeclared && group.ID == workspaceID {
+			for _, access := range group.Access {
+				autoUpgrade = autoUpgrade || access.AutoUpgradeNodes
+			}
+		}
 	}
-
-	dir, err := identityDir(name)
+	credentialDirName, err := store.CredentialDirName(workspaceID)
 	if err != nil {
-		return result{}, err
+		return result{}, contract.NewFault(contract.PreconditionFailed, "could not allocate a private workspace credential directory", err.Error())
 	}
+	if !workspaceDeclared {
+		credentialDirName, err = store.CredentialDirName("legacy-" + historicalName)
+		if err != nil {
+			return result{}, contract.NewFault(contract.PreconditionFailed, "could not allocate a private workspace credential directory", err.Error())
+		}
+	}
+	dir := filepath.Join(filepath.Dir(store.Path), credentialDirName)
 	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
 		return result{}, err
 	}
 	// Build and prove the identity in a sibling directory first; the existing
-	// context is swapped only after probe and ready both succeed.
-	tempDir, err := os.MkdirTemp(filepath.Dir(dir), ".eregion-login-"+name+"-")
+	// workspace access is swapped only after probe and ready both succeed.
+	tempDir, err := os.MkdirTemp(filepath.Dir(dir), ".eregion-login-workspace-")
 	if err != nil {
 		return result{}, err
 	}
@@ -270,17 +262,17 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, contract.NewFault(contract.ValidationFailed, "the record's WireGuard key is not usable", err.Error())
 	}
 	tempKnownHosts := filepath.Join(tempDir, "known_hosts")
-	route := &host.ContextSSH{
+	route := &host.WorkspaceSSH{
 		Address: net.JoinHostPort(wireGuardAddress, "22"), User: adminUser,
 		Identity: sshPath, KnownHosts: tempKnownHosts,
-		WireGuard: &host.ContextWireGuard{
+		WireGuard: &host.WorkspaceWireGuard{
 			PrivateKeyFile: wgPath, Address: get("Operator", "WireGuard address"),
 			NodeAddress: wireGuardAddress, NodePublicKey: get("Main node", "WireGuard public key"),
 			Endpoint: get("Main node", "WireGuard endpoint"),
 		},
 	}
 	// The import is fresh, so always prove the key through the tunnel against
-	// the record before writing anything the context will trust.
+	// the record before writing anything the workspace access will trust.
 	want := get("Main node", "SSH host key")
 	keyType, _, _ := strings.Cut(want, " ")
 	probe := a.loginSeams.probe
@@ -297,10 +289,6 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	if err := pinHostKey(tempKnownHosts, route.Address, key); err != nil {
 		return result{}, err
 	}
-	autoUpgrade := boolFlag(cmd, "auto-upgrade-nodes")
-	if exists {
-		autoUpgrade = autoUpgrade || existing.AutoUpgradeNodes
-	}
 	stderr := cmd.ErrOrStderr()
 	// A portable-workspace bundle is proved against the node's authoritative
 	// identity before any local file is published. An old bundle has no
@@ -308,7 +296,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	if workspaceDeclared {
 		verify := a.loginSeams.verify
 		if verify == nil {
-			verify = func(ctx context.Context, route *host.ContextSSH) (rpcNodeInfoResult, error) {
+			verify = func(ctx context.Context, route *host.WorkspaceSSH) (rpcNodeInfoResult, error) {
 				return infoRoute(ctx, route, autoUpgrade, stderr)
 			}
 		}
@@ -324,7 +312,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		if !info.Workspace.Configured {
 			return result{}, contract.NewFault(contract.PreconditionFailed,
 				"the node's workspace identity is not configured",
-				"Run eregion apply --workspace on the node, then refresh the protected export with eregion secrets export.")
+				"Run eregion apply --assign-workspace NAME on the node, then refresh the protected export with eregion secrets export.")
 		}
 		if nodeName != "" && info.Node != "" && info.Node != nodeName {
 			fault := contract.NewFault(contract.Conflict,
@@ -346,7 +334,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	ready := a.loginSeams.ready
 	if ready == nil {
-		ready = func(ctx context.Context, route *host.ContextSSH) error {
+		ready = func(ctx context.Context, route *host.WorkspaceSSH) error {
 			return readyRoute(ctx, route, autoUpgrade, stderr)
 		}
 	}
@@ -354,33 +342,7 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 
-	// Swap atomically: the old identity is the backup until the new context,
-	// directory and pinned key are all in place.
-	backup := dir + ".replace-" + randomHex(6)
-	hadOld := false
-	if _, statErr := os.Stat(dir); statErr == nil {
-		hadOld = true
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return result{}, statErr
-	}
-	restoreStore := *store
-	restoreStore.Contexts = append([]host.Context(nil), store.Contexts...)
-	restore := func() {
-		_ = os.RemoveAll(dir)
-		if hadOld {
-			_ = os.Rename(backup, dir)
-		}
-		_ = restoreStore.Save()
-	}
-	if hadOld {
-		if err := os.Rename(dir, backup); err != nil {
-			return result{}, err
-		}
-	}
 	if err := os.Rename(tempDir, dir); err != nil {
-		if hadOld {
-			_ = os.Rename(backup, dir)
-		}
 		return result{}, err
 	}
 	savedRoute := *route
@@ -391,46 +353,117 @@ func (a *app) login(cmd *cobra.Command, _ []string) (result, error) {
 		wg.PrivateKeyFile = filepath.Join(dir, "wireguard.key")
 		savedRoute.WireGuard = &wg
 	}
-	saved := host.Context{Name: name, SSH: &savedRoute}
-	if workspaceDeclared {
-		saved.Workspace = &host.ContextWorkspace{ID: workspaceID, Name: workspaceName}
+	saved := host.WorkspaceAccess{
+		Name: privateName, SSH: &savedRoute, CredentialDir: credentialDirName,
+		AutoUpgradeNodes: autoUpgrade,
 	}
-	if _, err := store.SaveContext(saved); err != nil {
-		restore()
+	if workspaceDeclared {
+		_, err = store.PublishWorkspace(workspaceID, workspaceName, saved, replace != "")
+	} else {
+		_, err = store.PublishUnconfiguredAccess(saved)
+	}
+	if err != nil {
+		// The published directory is new and never replaced an old credential
+		// directory. Removing it cannot touch existing workspace files.
+		_ = os.RemoveAll(dir)
 		return result{}, err
 	}
-	if hadOld {
-		_ = os.RemoveAll(backup)
+	routeText := route.User + "@" + route.Address + " over WireGuard"
+	data := loginSuccessData(nodeName, routeText, workspaceName, workspaceID, workspaceDeclared)
+	title, rows, message := loginSuccessPresentation(nodeName, routeText, workspaceName, workspaceID, workspaceDeclared)
+	if interactive {
+		fmt.Fprintln(cmd.ErrOrStderr(), ui.Card(title, rows, nil))
+		return result{data: data, streamed: true}, nil
 	}
+	return result{data: data, plain: message}, nil
+}
+
+func validateLoginWorkspaceTarget(store *host.WorkspaceStore, workspaceName, workspaceID, replace string) error {
+	foundID := false
+	for _, access := range store.Access {
+		if access.Workspace == nil {
+			continue
+		}
+		if access.Workspace.ID == workspaceID {
+			foundID = true
+			if access.Workspace.Name != workspaceName {
+				fault := contract.NewFault(contract.Conflict,
+					"workspace "+workspaceID+" is saved with another name",
+					"The workspace name and ID are immutable. Refresh the correct protected export; same ID with another name is refused even with --replace.")
+				fault.Details = map[string]any{"workspace_id": workspaceID, "saved_workspace": access.Workspace.Name, "bundle_workspace": workspaceName}
+				return fault
+			}
+		}
+		if access.Workspace.ID != workspaceID && access.Workspace.Name == workspaceName {
+			fault := contract.NewFault(contract.Conflict,
+				"workspace name "+workspaceName+" is already used by workspace "+access.Workspace.ID,
+				"A workspace name identifies one immutable ID. Import the correct export, or remove the conflicting local access explicitly.")
+			fault.Details = map[string]any{"workspace": workspaceName, "workspace_id": access.Workspace.ID, "bundle_workspace_id": workspaceID}
+			return fault
+		}
+	}
+	if !foundID {
+		if replace != "" && replace != workspaceName {
+			return contract.NewFault(contract.Conflict,
+				"--replace must name the verified workspace ("+workspaceName+")",
+				"Pass --replace "+workspaceName+", or omit --replace.")
+		}
+		return nil
+	}
+	if replace == "" {
+		fault := contract.NewFault(contract.Conflict,
+			"workspace "+workspaceName+" is already saved on this machine",
+			"Pass --replace "+workspaceName+" to replace its local access records.")
+		fault.Details = map[string]any{"workspace": workspaceName, "workspace_id": workspaceID}
+		return fault
+	}
+	if replace != workspaceName {
+		fault := contract.NewFault(contract.Conflict,
+			"--replace must name the verified workspace ("+workspaceName+")",
+			"Pass --replace "+workspaceName+".")
+		fault.Details = map[string]any{"workspace": workspaceName}
+		return fault
+	}
+	return nil
+}
+
+// loginSuccessData keeps the public login payload independent of the human
+// card. The local private access key is not a public identity.
+func loginSuccessData(nodeName, route string, workspaceName, workspaceID string, workspaceDeclared bool) map[string]any {
 	data := map[string]any{
-		"context": name, "route": route.User + "@" + route.Address + " over WireGuard",
-		"workspace_configured": workspaceDeclared,
+		"route": route, "workspace_configured": workspaceDeclared,
 	}
 	if nodeName != "" {
 		data["node"] = nodeName
 	}
-	rows := [][2]string{{"context", name + " (current)"}}
+	if workspaceDeclared {
+		data["workspace"] = map[string]string{"name": workspaceName, "id": workspaceID}
+	}
+	return data
+}
+
+// loginSuccessPresentation leads with the verified portable workspace, not
+// the local private access key. An old unconfigured bundle says so explicitly and
+// never presents the alias as a workspace.
+func loginSuccessPresentation(nodeName, route, workspaceName, workspaceID string, workspaceDeclared bool) (title string, rows [][2]string, message string) {
+	rows = make([][2]string, 0, 4)
+	if workspaceDeclared {
+		title = "Logged in to workspace"
+		rows = append(rows,
+			[2]string{"workspace", workspaceName + " (current)"},
+			[2]string{"workspace id", workspaceID},
+		)
+		message = "logged in to workspace " + workspaceName + " (" + workspaceID + ")"
+	} else {
+		title = "Logged in"
+		rows = append(rows, [2]string{"workspace", "not configured (older bundle)"})
+		message = "logged in; workspace identity not configured; refresh the protected export from a current node"
+	}
 	if nodeName != "" {
 		rows = append(rows, [2]string{"node", nodeName})
 	}
-	rows = append(rows, [2]string{"route", data["route"].(string)})
-	if workspaceDeclared {
-		data["workspace"] = map[string]string{"name": workspaceName, "id": workspaceID}
-		rows = append(rows, [2]string{"workspace", workspaceName}, [2]string{"workspace id", workspaceID})
-	} else {
-		rows = append(rows, [2]string{"workspace", "not configured (older bundle)"})
-	}
-	if interactive {
-		fmt.Fprintln(cmd.ErrOrStderr(), ui.Card("Logged in to "+name, rows, nil))
-		return result{data: data, streamed: true}, nil
-	}
-	message := "logged in to " + name
-	if workspaceDeclared {
-		message += " (workspace " + workspaceName + ", " + workspaceID + ")"
-	} else {
-		message += " (workspace identity not configured; refresh the protected export from a current node)"
-	}
-	return result{data: data, plain: message}, nil
+	rows = append(rows, [2]string{"route", route})
+	return title, rows, message
 }
 
 // restoreMetricsCredential writes the handoff's Node metrics credential into
@@ -456,8 +489,8 @@ func restoreMetricsCredential(dir string, record handoffRecord) (string, error) 
 	return password, nil
 }
 
-// readyRoute checks a not-yet-saved route without touching the context store.
-func readyRoute(ctx context.Context, route *host.ContextSSH, autoUpgrade bool, stderr io.Writer) error {
+// readyRoute checks a not-yet-saved route without touching the workspace store.
+func readyRoute(ctx context.Context, route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Writer) error {
 	client, err := routeNodeClient(route, autoUpgrade, stderr)
 	if err != nil {
 		return err
@@ -466,7 +499,7 @@ func readyRoute(ctx context.Context, route *host.ContextSSH, autoUpgrade bool, s
 }
 
 // infoRoute reads the node's authoritative identity over a not-yet-saved route.
-func infoRoute(ctx context.Context, route *host.ContextSSH, autoUpgrade bool, stderr io.Writer) (rpcNodeInfoResult, error) {
+func infoRoute(ctx context.Context, route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Writer) (rpcNodeInfoResult, error) {
 	client, err := routeNodeClient(route, autoUpgrade, stderr)
 	if err != nil {
 		return rpcNodeInfoResult{}, err
@@ -474,17 +507,17 @@ func infoRoute(ctx context.Context, route *host.ContextSSH, autoUpgrade bool, st
 	return client.NodeInfo(ctx)
 }
 
-func routeNodeClient(route *host.ContextSSH, autoUpgrade bool, stderr io.Writer) (*nodeClient, error) {
+func routeNodeClient(route *host.WorkspaceSSH, autoUpgrade bool, stderr io.Writer) (*nodeClient, error) {
 	remote, err := routeRemote(route, false)
 	if err != nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "the context's SSH route is not usable", err.Error())
+		return nil, contract.NewFault(contract.ValidationFailed, "the workspace SSH route is not usable", err.Error())
 	}
 	return &nodeClient{remote: remote, route: route, operator: route.User, autoUpgrade: autoUpgrade, stderr: stderr}, nil
 }
 
 // probeOverWireGuard reads the node's SSH host key of keyType through the
 // tunnel; the node offers several types and the record names one.
-func probeOverWireGuard(ctx context.Context, route *host.ContextSSH, keyType string) (ssh.PublicKey, error) {
+func probeOverWireGuard(ctx context.Context, route *host.WorkspaceSSH, keyType string) (ssh.PublicKey, error) {
 	dial, err := wireGuardDial(route.WireGuard)
 	if err != nil {
 		return nil, err

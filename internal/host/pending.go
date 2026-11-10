@@ -26,7 +26,7 @@ const PendingInitFile = "init.json"
 // known_hosts, so --discard drops trust learned by an abandoned attempt.
 const PendingKnownHostsFile = "known_hosts"
 
-// PendingInit is one unfinished `server init`, saved under the context store's
+// PendingInit is one unfinished `server init`, saved under the private workspace store's
 // directory with mode 0600. It holds answers and progress, never the external
 // DSN or a generated key: the DSN stays in the operator's protected file and
 // the operator identity lives in servers/<name>/ (already 0600).
@@ -70,20 +70,37 @@ type PendingInit struct {
 
 // PendingRoot is the directory of unfinished inits, beside the context file.
 func PendingRoot() (string, error) {
-	contexts, err := DefaultContextPath()
+	contexts, err := DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(contexts), "pending"), nil
+	return PendingRootAt(contexts)
+}
+
+// PendingRootAt is PendingRoot for one resolved private store path.
+func PendingRootAt(storePath string) (string, error) {
+	if strings.TrimSpace(storePath) == "" {
+		return PendingRoot()
+	}
+	return filepath.Join(filepath.Dir(storePath), "pending"), nil
 }
 
 // PendingDir is pending/<server>. The name is validated here so every caller
 // joins only a plain server name, never a path.
 func PendingDir(name string) (string, error) {
-	if !contextNamePattern.MatchString(name) {
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return "", err
+	}
+	return PendingDirAt(contexts, name)
+}
+
+// PendingDirAt is PendingDir for one resolved private store path.
+func PendingDirAt(storePath, name string) (string, error) {
+	if !accessNamePattern.MatchString(name) {
 		return "", invalidPendingName()
 	}
-	root, err := PendingRoot()
+	root, err := PendingRootAt(storePath)
 	if err != nil {
 		return "", err
 	}
@@ -92,7 +109,16 @@ func PendingDir(name string) (string, error) {
 
 // PendingKnownHosts is the init's private known_hosts file.
 func PendingKnownHosts(name string) (string, error) {
-	dir, err := PendingDir(name)
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return "", err
+	}
+	return PendingKnownHostsAt(contexts, name)
+}
+
+// PendingKnownHostsAt is PendingKnownHosts for one resolved private store path.
+func PendingKnownHostsAt(storePath, name string) (string, error) {
+	dir, err := PendingDirAt(storePath, name)
 	if err != nil {
 		return "", err
 	}
@@ -101,7 +127,16 @@ func PendingKnownHosts(name string) (string, error) {
 
 // PendingExists reports whether an unfinished init is saved for name.
 func PendingExists(name string) bool {
-	dir, err := PendingDir(name)
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return false
+	}
+	return PendingExistsAt(contexts, name)
+}
+
+// PendingExistsAt is PendingExists for one resolved private store path.
+func PendingExistsAt(storePath, name string) bool {
+	dir, err := PendingDirAt(storePath, name)
 	if err != nil {
 		return false
 	}
@@ -111,7 +146,16 @@ func PendingExists(name string) bool {
 
 // PendingNames lists unfinished inits, sorted.
 func PendingNames() ([]string, error) {
-	root, err := PendingRoot()
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return nil, err
+	}
+	return PendingNamesAt(contexts)
+}
+
+// PendingNamesAt lists unfinished inits for one resolved private store path.
+func PendingNamesAt(storePath string) ([]string, error) {
+	root, err := PendingRootAt(storePath)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +168,7 @@ func PendingNames() ([]string, error) {
 	}
 	var names []string
 	for _, entry := range entries {
-		if entry.IsDir() && PendingExists(entry.Name()) {
+		if entry.IsDir() && PendingExistsAt(storePath, entry.Name()) {
 			names = append(names, entry.Name())
 		}
 	}
@@ -134,10 +178,19 @@ func PendingNames() ([]string, error) {
 
 // LoadPending reads pending/<name>/init.json.
 func LoadPending(name string) (*PendingInit, error) {
-	if !contextNamePattern.MatchString(name) {
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return nil, err
+	}
+	return LoadPendingAt(contexts, name)
+}
+
+// LoadPendingAt reads one unfinished init from a resolved private store path.
+func LoadPendingAt(storePath, name string) (*PendingInit, error) {
+	if !accessNamePattern.MatchString(name) {
 		return nil, invalidPendingName()
 	}
-	dir, err := PendingDir(name)
+	dir, err := PendingDirAt(storePath, name)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +213,7 @@ func LoadPending(name string) (*PendingInit, error) {
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&pending); err != nil || pending.Schema != pendingSchema || pending.Server != name {
-		fault := contract.NewFault(contract.PreconditionFailed, "the unfinished init is invalid", "Discard it with eregion server init --discard --context-name "+name+" and start again.")
+		fault := contract.NewFault(contract.PreconditionFailed, "the unfinished init is invalid", "Discard it with eregion server init --discard --workspace-name "+name+" and start again.")
 		fault.Details = map[string]any{"pending_path": dir}
 		return nil, fault
 	}
@@ -172,14 +225,23 @@ func LoadPending(name string) (*PendingInit, error) {
 
 // Save writes the unfinished init atomically, owner-only.
 func (p *PendingInit) Save() error {
-	if !contextNamePattern.MatchString(p.Server) {
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return err
+	}
+	return p.SaveAt(contexts)
+}
+
+// SaveAt writes the unfinished init under one resolved private store path.
+func (p *PendingInit) SaveAt(storePath string) error {
+	if !accessNamePattern.MatchString(p.Server) {
 		return invalidPendingName()
 	}
 	if p.Phases == nil {
 		p.Phases = map[string]string{}
 	}
 	p.Schema = pendingSchema
-	dir, err := PendingDir(p.Server)
+	dir, err := PendingDirAt(storePath, p.Server)
 	if err != nil {
 		return err
 	}
@@ -210,10 +272,19 @@ func (p *PendingInit) Mark(phase string) {
 // SavePendingFile writes one protected helper file (for example the vault
 // keyring captured for the handoff) under pending/<name>/.
 func SavePendingFile(name, file string, data []byte) error {
-	if !contextNamePattern.MatchString(name) || strings.ContainsAny(file, "/\\\x00\r\n") {
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return err
+	}
+	return SavePendingFileAt(contexts, name, file, data)
+}
+
+// SavePendingFileAt is SavePendingFile for one resolved private store path.
+func SavePendingFileAt(storePath, name, file string, data []byte) error {
+	if !accessNamePattern.MatchString(name) || strings.ContainsAny(file, "/\\\x00\r\n") {
 		return invalidPendingName()
 	}
-	dir, err := PendingDir(name)
+	dir, err := PendingDirAt(storePath, name)
 	if err != nil {
 		return err
 	}
@@ -225,10 +296,19 @@ func SavePendingFile(name, file string, data []byte) error {
 
 // LoadPendingFile reads a helper file saved by SavePendingFile.
 func LoadPendingFile(name, file string) ([]byte, error) {
-	if !contextNamePattern.MatchString(name) || strings.ContainsAny(file, "/\\\x00\r\n") {
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return nil, err
+	}
+	return LoadPendingFileAt(contexts, name, file)
+}
+
+// LoadPendingFileAt is LoadPendingFile for one resolved private store path.
+func LoadPendingFileAt(storePath, name, file string) ([]byte, error) {
+	if !accessNamePattern.MatchString(name) || strings.ContainsAny(file, "/\\\x00\r\n") {
 		return nil, invalidPendingName()
 	}
-	dir, err := PendingDir(name)
+	dir, err := PendingDirAt(storePath, name)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +328,16 @@ func LoadPendingFile(name, file string) ([]byte, error) {
 
 // RemovePending deletes pending/<name>.
 func RemovePending(name string) error {
-	dir, err := PendingDir(name)
+	contexts, err := DefaultWorkspacePath()
+	if err != nil {
+		return err
+	}
+	return RemovePendingAt(contexts, name)
+}
+
+// RemovePendingAt deletes pending/<name> under one resolved private store path.
+func RemovePendingAt(storePath, name string) error {
+	dir, err := PendingDirAt(storePath, name)
 	if err != nil {
 		return err
 	}

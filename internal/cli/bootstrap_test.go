@@ -10,7 +10,7 @@ import (
 )
 
 func TestBootstrapAndContextAreAttached(t *testing.T) {
-	for _, path := range [][]string{{"node"}, {"node", "bootstrap"}, {"node", "bootstrap", "plan"}, {"node", "bootstrap", "apply"}, {"node", "bootstrap", "confirm"}, {"node", "bootstrap", "remote"}, {"context"}} {
+	for _, path := range [][]string{{"node"}, {"node", "bootstrap"}, {"node", "bootstrap", "plan"}, {"node", "bootstrap", "apply"}, {"node", "bootstrap", "confirm"}, {"node", "bootstrap", "remote"}, {"workspace"}} {
 		code, stdout, stderr := invoke(t, append([]string{"commands", "--path", strings.Join(path, " ")}, "--json")...)
 		if code != 0 {
 			t.Fatalf("%v: code=%d stdout=%q stderr=%q", path, code, stdout, stderr)
@@ -22,10 +22,10 @@ func TestBootstrapAndContextAreAttached(t *testing.T) {
 	}
 }
 
-func TestContextClientRequiresSavedContext(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
-	if code, _, _ := invoke(t, "operations", "get", string(followTestID), "--json"); code != 3 {
-		t.Fatalf("missing context: code=%d", code)
+func TestWorkspaceClientRequiresSavedWorkspace(t *testing.T) {
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	if code, _, _ := invoke(t, "operations", "get", string(followTestID), "--json"); code != 2 {
+		t.Fatalf("missing workspace: code=%d", code)
 	}
 }
 

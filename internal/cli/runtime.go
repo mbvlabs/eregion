@@ -30,9 +30,9 @@ import (
 )
 
 func operationMeta(summary, example string) CommandMeta {
-	meta := readMeta(summary, []string{summary + ". Runs on the node through the active context over SSH inside WireGuard; operations belong to the named operator."}, []string{example})
+	meta := readMeta(summary, []string{summary + ". Runs on the node through the selected workspace over SSH inside WireGuard; operations belong to the named operator."}, []string{example})
 	meta.Remote = true
-	meta.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_CONTEXT"}
+	meta.Environment = []string{"EREGION_WORKSPACE_FILE", "EREGION_WORKSPACE"}
 	meta.ErrorCodes = []contract.Code{contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.Conflict, contract.PreconditionFailed, contract.NodeVersionMismatch, contract.Unavailable, contract.Internal, contract.Cancelled}
 	return meta
 }
@@ -80,7 +80,7 @@ func (a *app) nodeSpecs() []spec {
 	nodeMeta.Audience = []string{"node"}
 	nodeMeta.Platforms = []string{"linux"}
 	nodeMeta.Remote = false
-	nodeMeta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_CONTEXT_FILE"}
+	nodeMeta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_WORKSPACE_FILE"}
 	nodeMeta.ErrorCodes = append(nodeMeta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.ConfirmationRequired, contract.Forbidden, contract.NotFound)
 	children := append(a.nodeServiceSpecs(), a.bootstrapSpecs()...)
 	return []spec{{
@@ -172,7 +172,7 @@ func (a *app) client(cmd *cobra.Command) (Backend, error) {
 	if a.backend != nil {
 		return a.backend, nil
 	}
-	return a.contextClient(cmd)
+	return a.nodeClient(cmd)
 }
 
 func (a *app) database(ctx context.Context) (*pgxpool.Pool, error) {

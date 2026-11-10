@@ -66,19 +66,24 @@ func newMetricsAccessBackend(configured bool) *metricsAccessBackend {
 func metricsAccessFixture(t *testing.T, configured bool) (telemetry.Credential, *metricsAccessBackend) {
 	t.Helper()
 	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
-	t.Setenv("EREGION_CONTEXT_FILE", configPath)
-	store, err := host.LoadContextStore(configPath)
+	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
+	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SaveContext(host.Context{Name: "main", SSH: &host.ContextSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}); err != nil {
+	access := host.WorkspaceAccess{Name: "thelab", SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}
+	if _, err := store.PublishWorkspace("ws_0123456789abcdef01234567", "thelab", access, false); err != nil {
+		t.Fatal(err)
+	}
+	credentialDir, err := store.CredentialDirFor(access)
+	if err != nil {
 		t.Fatal(err)
 	}
 	credential, err := telemetry.NewCredential()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := saveMetricsCredential("main", credential); err != nil {
+	if err := saveMetricsCredential(credentialDir, credential); err != nil {
 		t.Fatal(err)
 	}
 	return credential, newMetricsAccessBackend(configured)
@@ -148,12 +153,14 @@ func TestMetricsConfigRefusesPreexistingOutput(t *testing.T) {
 
 func TestMetricsConfigTargetsFileNeedsNoCredential(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
-	t.Setenv("EREGION_CONTEXT_FILE", configPath)
-	store, err := host.LoadContextStore(configPath)
+	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
+	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SaveContext(host.Context{Name: "main", SSH: &host.ContextSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}); err != nil {
+	if _, err := store.PublishWorkspace("ws_0123456789abcdef01234567", "thelab", host.WorkspaceAccess{
+		Name: "thelab", SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"},
+	}, false); err != nil {
 		t.Fatal(err)
 	}
 	backend := newMetricsAccessBackend(true)
@@ -170,12 +177,12 @@ func TestMetricsConfigTargetsFileNeedsNoCredential(t *testing.T) {
 
 func TestMetricsConfigRefusesCredentialFileWithoutLocalCredential(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
-	t.Setenv("EREGION_CONTEXT_FILE", configPath)
-	store, err := host.LoadContextStore(configPath)
+	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
+	store, err := host.LoadWorkspaceStore(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SaveContext(host.Context{Name: "main", SSH: &host.ContextSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}); err != nil {
+	if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: "main", SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}); err != nil {
 		t.Fatal(err)
 	}
 	backend := newMetricsAccessBackend(true)
@@ -187,7 +194,7 @@ func TestMetricsConfigRefusesCredentialFileWithoutLocalCredential(t *testing.T) 
 
 func TestMetricsRotateSendsOnlyHashSavesBeforeSendingAndNeverPrintsPassword(t *testing.T) {
 	_, backend := metricsAccessFixture(t, true)
-	argv := []string{"metrics", "rotate", "--confirm", "main/metrics", "--json", "--context", "main"}
+	argv := []string{"metrics", "rotate", "--confirm", "main/metrics", "--json", "--workspace", "thelab"}
 	exit, stdout, stderr := runMetricsAccessCLI(t, backend, argv...)
 	if exit != 0 || stderr != "" {
 		t.Fatalf("rotate exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
@@ -198,7 +205,7 @@ func TestMetricsRotateSendsOnlyHashSavesBeforeSendingAndNeverPrintsPassword(t *t
 	if !telemetry.ValidHash(backend.hash) {
 		t.Fatalf("rotate hash = %q", backend.hash)
 	}
-	credential, err := loadMetricsCredential("main")
+	credential, err := loadMetricsCredential(metricsTestCredentialDir(t))
 	if err != nil || credential == nil || !telemetry.VerifyPassword(backend.hash, credential.Password) {
 		t.Fatalf("local credential does not match the sent hash: %+v err=%v", credential, err)
 	}
@@ -213,11 +220,11 @@ func TestMetricsRotateSendsOnlyHashSavesBeforeSendingAndNeverPrintsPassword(t *t
 func TestMetricsRotateFailureRestoresThePreviousLocalCredential(t *testing.T) {
 	old, backend := metricsAccessFixture(t, true)
 	backend.rotateErr = contract.NewFault(contract.Unavailable, "node did not answer", "")
-	exit, stdout, _ := runMetricsAccessCLI(t, backend, "metrics", "rotate", "--confirm", "main/metrics", "--json", "--context", "main")
+	exit, stdout, _ := runMetricsAccessCLI(t, backend, "metrics", "rotate", "--confirm", "main/metrics", "--json", "--workspace", "thelab")
 	if exit == 0 {
 		t.Fatalf("failed rotation reported success:\n%s", stdout)
 	}
-	credential, err := loadMetricsCredential("main")
+	credential, err := loadMetricsCredential(metricsTestCredentialDir(t))
 	if err != nil || credential == nil || credential.Password != old.Password {
 		t.Fatalf("previous credential was not restored: %+v err=%v", credential, err)
 	}
@@ -228,14 +235,14 @@ func TestMetricsRotateFailureRestoresThePreviousLocalCredential(t *testing.T) {
 
 func TestMetricsRotateDryRunDoesNotChangeTheCredential(t *testing.T) {
 	old, backend := metricsAccessFixture(t, true)
-	exit, stdout, stderr := runMetricsAccessCLI(t, backend, "metrics", "rotate", "--dry-run", "--json", "--context", "main")
+	exit, stdout, stderr := runMetricsAccessCLI(t, backend, "metrics", "rotate", "--dry-run", "--json", "--workspace", "thelab")
 	if exit != 0 || stderr != "" {
 		t.Fatalf("dry run exit=%d stderr=%q stdout=%q", exit, stderr, stdout)
 	}
 	if !backend.dryRun || backend.hash != "" || backend.rotations != 1 {
 		t.Fatalf("dry run call = hash %q dry %t calls %d", backend.hash, backend.dryRun, backend.rotations)
 	}
-	credential, err := loadMetricsCredential("main")
+	credential, err := loadMetricsCredential(metricsTestCredentialDir(t))
 	if err != nil || credential == nil || credential.Password != old.Password {
 		t.Fatalf("dry run changed the local credential: %+v err=%v", credential, err)
 	}
@@ -258,4 +265,21 @@ func TestMetricsEndpointDescribeIsSafe(t *testing.T) {
 	if strings.Contains(string(raw), credential.Password) || strings.Contains(string(raw), "$2") {
 		t.Fatalf("endpoint JSON exposed a credential: %s", raw)
 	}
+}
+
+func metricsTestCredentialDir(t *testing.T) string {
+	t.Helper()
+	store, err := host.LoadWorkspaceStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, ok := store.AccessByName("thelab")
+	if !ok {
+		t.Fatal("thelab access missing")
+	}
+	dir, err := store.CredentialDirFor(access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

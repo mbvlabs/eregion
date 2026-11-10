@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -44,7 +45,7 @@ func TestServerInitValidateRequiresAndValidatesAWorkspace(t *testing.T) {
 }
 
 func TestSavePendingCarriesWorkspaceWithoutInventingAnID(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
 	r := &serverInit{
 		answers: serverInitAnswers{
 			Context: "prod", Host: "203.0.113.10", User: "root", Port: "22",
@@ -82,8 +83,8 @@ func serverInitResumeCommand(t *testing.T, workspace string) *cobra.Command {
 	flags := cmd.Flags()
 	flags.Bool("resume", true, "")
 	flags.Bool("dry-run", false, "")
-	flags.String("workspace", workspace, "")
-	flags.String("context-name", "a", "")
+	flags.String("workspace-name", "", "")
+
 	flags.String("identity", "", "")
 	flags.Bool("password-stdin", false, "")
 	flags.String("host-key-fingerprint", "", "")
@@ -91,14 +92,16 @@ func serverInitResumeCommand(t *testing.T, workspace string) *cobra.Command {
 	if err := flags.Set("resume", "true"); err != nil {
 		t.Fatal(err)
 	}
-	if err := flags.Set("context-name", "a"); err != nil {
-		t.Fatal(err)
+	if workspace != "" {
+		if err := flags.Set("workspace-name", workspace); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return cmd
 }
 
 func TestResumePersistsChosenWorkspaceBeforeAnyPlanOrApply(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
 	t.Setenv("EREGION_DATABASE_URL", "postgres://user:password@127.0.0.1:5432/db")
 	pending := &host.PendingInit{
 		Server: "a", Host: "203.0.113.10", User: "root", Port: 22,
@@ -132,7 +135,7 @@ func TestResumePersistsChosenWorkspaceBeforeAnyPlanOrApply(t *testing.T) {
 }
 
 func TestResumeDryRunDoesNotPersistAWorkspaceChoice(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
 	t.Setenv("EREGION_DATABASE_URL", "postgres://user:password@127.0.0.1:5432/db")
 	pending := &host.PendingInit{
 		Server: "a", Host: "203.0.113.10", User: "root", Port: 22,
@@ -174,7 +177,7 @@ func TestResumeDryRunDoesNotPersistAWorkspaceChoice(t *testing.T) {
 }
 
 func TestResumeAllowsTheSameWorkspaceAfterTheHostPhase(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
 	t.Setenv("EREGION_DATABASE_URL", "postgres://user:password@127.0.0.1:5432/db")
 	pending := &host.PendingInit{
 		Server: "a", Host: "203.0.113.10", User: "root", Port: 22,
@@ -191,7 +194,7 @@ func TestResumeAllowsTheSameWorkspaceAfterTheHostPhase(t *testing.T) {
 }
 
 func TestResumeRefusesIntroducingAWorkspaceAfterTheHostPhase(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
 	t.Setenv("EREGION_DATABASE_URL", "postgres://user:password@127.0.0.1:5432/db")
 	pending := &host.PendingInit{
 		Server: "a", Host: "203.0.113.10", User: "root", Port: 22,
@@ -215,8 +218,60 @@ func TestResumeRefusesIntroducingAWorkspaceAfterTheHostPhase(t *testing.T) {
 	}
 }
 
+func TestServerInitThreadsOneExplicitStoreThroughInitPaths(t *testing.T) {
+	envPath := filepath.Join(t.TempDir(), "env", "contexts.json")
+	flagPath := filepath.Join(t.TempDir(), "flag", "contexts.json")
+	t.Setenv("EREGION_WORKSPACE_FILE", envPath)
+	cmd := &cobra.Command{}
+	cmd.Flags().String("workspace-file", "", "")
+	if err := cmd.Flags().Set("workspace-file", flagPath); err != nil {
+		t.Fatal(err)
+	}
+	store, err := loadWorkspaceStore(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Path != flagPath {
+		t.Fatalf("resolved store = %q, want flag path %q", store.Path, flagPath)
+	}
+	r := &serverInit{a: &app{secrets: &secrets.Registry{}}, cmd: cmd, storePath: store.Path}
+	dir, err := r.identityDir("thelab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(filepath.Dir(flagPath), "servers", "thelab"); dir != want {
+		t.Fatalf("identity dir = %q, want %q", dir, want)
+	}
+	pending := &host.PendingInit{Server: "thelab", Node: "main", Context: "thelab", Phases: map[string]string{}}
+	if err := r.savePendingRecord(pending); err != nil {
+		t.Fatal(err)
+	}
+	if !host.PendingExistsAt(flagPath, "thelab") {
+		t.Fatal("pending init was not stored under the explicit flag store")
+	}
+	if host.PendingExistsAt(envPath, "thelab") {
+		t.Fatal("pending init leaked into the environment-selected store")
+	}
+}
+
+func TestServerInitRejectsSharedStoreDirectories(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"one.json", "two.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rejectSharedInitStoreRoot(filepath.Join(dir, "one.json")); contract.Classify(err).Code != contract.ValidationFailed {
+		t.Fatalf("shared store directory = %v, want validation_failed", err)
+	}
+	isolated := filepath.Join(t.TempDir(), "one.json")
+	if err := rejectSharedInitStoreRoot(isolated); err != nil {
+		t.Fatalf("isolated store directory refused: %v", err)
+	}
+}
+
 func TestResumeRefusesAConflictingWorkspaceBeforeContact(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
 	t.Setenv("EREGION_DATABASE_URL", "")
 	pending := &host.PendingInit{
 		Server: "a", Host: "203.0.113.10", User: "root", Port: 22,
@@ -227,7 +282,7 @@ func TestResumeRefusesAConflictingWorkspaceBeforeContact(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := newApp()
-	a.root.SetArgs([]string{"server", "init", "--resume", "--workspace", "other", "--json"})
+	a.root.SetArgs([]string{"server", "init", "--resume", "--workspace-name", "other", "--json"})
 	err := a.root.Execute()
 	if contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("conflicting resume = %v, want conflict before contact", err)
@@ -237,12 +292,12 @@ func TestResumeRefusesAConflictingWorkspaceBeforeContact(t *testing.T) {
 	}
 }
 
-func TestStatusTextShowsWorkspaceNodeAndSelectedContext(t *testing.T) {
-	text := statusTextWithContext(host.NodeStatus{
+func TestStatusTextShowsWorkspaceAndNode(t *testing.T) {
+	text := statusText(host.NodeStatus{
 		Node: "main", Role: "main", NodeVersion: "dev",
 		Workspace: controlplane.WorkspaceIdentity{Configured: true, ID: "ws_0123456789abcdef01234567", Name: "thelab"},
-	}, "prod")
-	for _, want := range []string{"node", "main", "context", "prod", "workspace", "thelab", "ws_0123456789abcdef01234567"} {
+	})
+	for _, want := range []string{"node", "main", "workspace", "thelab", "ws_0123456789abcdef01234567"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("status lacks %q:\n%s", want, text)
 		}

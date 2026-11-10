@@ -10,8 +10,7 @@ func TestAnswersFileParsesEveryQuestion(t *testing.T) {
 host = "root@203.0.113.10:2222"
 identity = "~/.ssh/id_ed25519"
 node = "main"
-workspace = "thelab"
-context = "prod"
+workspace-name = "thelab"
 hostname = "app.example.com"
 database_url_file = "/root/eregion-db.url"
 admin_user = "deploy"
@@ -22,11 +21,11 @@ admin_user = "deploy"
 	}
 	answers := file.answers()
 	if answers.Host != "root@203.0.113.10:2222" || answers.Identity != "~/.ssh/id_ed25519" ||
-		answers.Node != "main" || answers.Workspace != "thelab" || answers.Context != "prod" || answers.Hostname != "app.example.com" ||
+		answers.Node != "main" || answers.Workspace != "thelab" || answers.Hostname != "app.example.com" ||
 		answers.DatabaseURLFile != "/root/eregion-db.url" || answers.AdminUser != "deploy" {
 		t.Fatalf("answers: %+v", answers)
 	}
-	for _, key := range []string{"host", "identity", "node", "workspace", "context", "hostname", "database_url_file", "admin_user"} {
+	for _, key := range []string{"host", "identity", "node", "workspace_name", "hostname", "database_url_file", "admin_user"} {
 		if !file.supplied()[key] {
 			t.Fatalf("%s was not reported as supplied", key)
 		}

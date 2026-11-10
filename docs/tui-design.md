@@ -33,8 +33,8 @@ The full-screen workspace must not be required to complete ordinary work.
   caution; red failure. Always pair color with words and distinct glyphs.
 - Consistent left alignment, compact typographic hierarchy, whitespace, and thin
   separators. Use borders for meaningful regions, not every field.
-- Keep operation identity, context, environment, and serving release visible.
-  Never hide a production context behind a generic dashboard title.
+- Keep operation identity, workspace, environment, and serving release visible.
+  Never hide a production workspace behind a generic dashboard title.
 - Avoid giant ASCII logos, decorative animation, emoji, Nerd Font requirements,
   excessive rounded boxes, or mouse-only actions.
 - Respect terminal light/dark backgrounds and downsample color. `NO_COLOR` disables
@@ -79,7 +79,7 @@ from events. See [workspace](workspace.md) for current behavior and limits.
 
 The main question is **“What is happening, and what can I safely do next?”**
 
-- Header: context, application/environment, operation ID, operation status.
+- Header: workspace, application/environment, operation ID, operation status.
 - Stage list: completed, active, pending, failed, skipped. Stage changes come from
   events or an explicit server plan, not a client-side timer or guessed duration.
 - Detail pane: bounded, redacted, terminal-safe event/log viewport; target/server
@@ -112,7 +112,7 @@ instead of “0”. Durable operation history remains available and independent.
 
 ### Plan and confirmation
 
-Show target context, exact proposed changes, destructive effects, affected workloads,
+Show target workspace and access, exact proposed changes, destructive effects, affected workloads,
 and a revision-bound confirmation token. A form can help supply inputs but cannot
 bypass server-side checks. Never use a generic “yes” action as blanket authorization.
 

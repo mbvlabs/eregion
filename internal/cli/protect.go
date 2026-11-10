@@ -57,7 +57,7 @@ func (a *app) protectInit(cmd *cobra.Command, _ []string) (result, error) {
 			return result{}, err
 		}
 	}
-	setup, err := client.ProtectInit(cmd.Context(), rotate, currentContextName(cmd), current)
+	setup, err := client.ProtectInit(cmd.Context(), rotate, currentWorkspaceName(cmd), current)
 	if err != nil {
 		return result{}, err
 	}
@@ -167,11 +167,15 @@ func readProtectCode(cmd *cobra.Command, label string) (string, error) {
 	}
 }
 
-// currentContextName is a best-effort label for the authenticator entry.
-func currentContextName(cmd *cobra.Command) string {
-	current, err := selectedContext(cmd)
+// currentWorkspaceName is the verified workspace label for the authenticator
+// entry. It never exposes a private access alias.
+func currentWorkspaceName(cmd *cobra.Command) string {
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
-		return ""
+		return "unconfigured workspace"
 	}
-	return current.Name
+	if name := verifiedWorkspaceName(current); name != "" {
+		return name
+	}
+	return "unconfigured workspace"
 }

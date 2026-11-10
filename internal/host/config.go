@@ -92,7 +92,7 @@ type Config struct {
 	Role Role   `json:"role"`
 	// Workspace is the requested portable installation workspace name. It is
 	// identity metadata, separate from the node name and never a tenant scope.
-	// It is empty on an alpha.6 installation until apply --workspace assigns it.
+	// It is empty on an alpha.6 installation until apply --assign-workspace assigns it.
 	Workspace string `json:"workspace,omitempty"`
 
 	Layout Layout `json:"layout"`

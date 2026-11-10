@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/nodeagent"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -49,6 +50,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer
 // runApp is run with a caller-supplied app, so tests can add a command that
 // exercises runner presentation without a network transport.
 func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Writer, registry *secrets.Registry, a *app) int {
+	obsoleteEnvErr := host.CheckObsoleteWorkspaceEnvironment()
 	registerEnvironmentSecrets(registry)
 	a.secrets = registry
 	selection := a.followSelection(args)
@@ -71,8 +73,12 @@ func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Wri
 		followMode = string(output.JSON)
 	}
 	ctx = context.WithValue(ctx, followIOKey{}, &followIO{in: in, out: out, err: stderr, mode: followMode})
+	ctx = context.WithValue(ctx, workspaceSnapshotKey{}, &workspaceSnapshot{})
 	writer := output.Writer{Out: out, Err: stderr, Mode: mode, Secrets: registry}
 	command := "eregion"
+	if err == nil {
+		err = obsoleteEnvErr
+	}
 	if err == nil {
 		err = a.meta.validate(a.root)
 	}

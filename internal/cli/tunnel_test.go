@@ -17,7 +17,7 @@ func TestTunnelSocketPathIsPrivateAndStable(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(dir, "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(dir, "contexts.json"))
 	got, err := tunnelSocketPath("fingerprint-one")
 	if err != nil {
 		t.Fatal(err)

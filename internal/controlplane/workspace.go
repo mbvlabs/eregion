@@ -16,7 +16,7 @@ import (
 // database owns the one configured identity; node configuration and operator
 // context files may mirror it but never decide it. An empty table is the
 // explicit unconfigured state of an alpha.6 installation and stays that way
-// until an operator runs `apply --workspace NAME`.
+// until an operator runs `apply --assign-workspace NAME`.
 var (
 	workspaceNamePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`)
 	workspaceIDPattern   = regexp.MustCompile(`^ws_[0-9a-f]{24}$`)

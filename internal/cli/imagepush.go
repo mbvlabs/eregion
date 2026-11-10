@@ -150,10 +150,7 @@ func (a *app) imagePush(cmd *cobra.Command, args []string) (result, error) {
 		return result{}, contract.NewFault(contract.Unavailable, "local docker save failed", detail)
 	}
 
-	node := client.contextName
-	if node == "" {
-		node = client.remoteTarget()
-	}
+	node := imagePushTarget(client)
 	plain := fmt.Sprintf("Pushed %s to %s\nreference: %s\ntag: %s\nsize: %s\nnext: eregion env update %s <environment> --image %s",
 		localImage, node, pushed.Reference, pushed.TagReference, imageSize(pushed.SizeBytes), appName, pushed.Reference)
 	next := []string{fmt.Sprintf("eregion env update %s <environment> --image %s", appName, pushed.Reference)}
@@ -196,13 +193,20 @@ func defaultImageTag(imageID string) string {
 	return time.Now().UTC().Format("20060102-150405")
 }
 
+func imagePushTarget(n *nodeClient) string {
+	if n.workspaceName != "" {
+		return n.workspaceName
+	}
+	if n.remoteTarget() != "" {
+		return n.remoteTarget()
+	}
+	return "unconfigured workspace"
+}
+
 // PushImage streams a docker save tar after the request line and returns the
 // digest the node read back from its local registry.
 func (n *nodeClient) PushImage(ctx context.Context, repository, tag string, payload io.Reader, localImage string) (rpcImagePushResult, error) {
-	node := n.contextName
-	if node == "" {
-		node = n.remoteTarget()
-	}
+	node := imagePushTarget(n)
 	raw, err := n.call(ctx, methodImagePush, rpcImagePushParams{Repository: repository, Tag: tag}, rpcCallOptions{
 		Payload: payload, Stream: true, Progress: true,
 		Label: "Pushing " + localImage + " to " + node + "…",

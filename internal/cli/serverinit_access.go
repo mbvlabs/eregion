@@ -38,18 +38,27 @@ type operatorIdentity struct {
 }
 
 func identityDir(name string) (string, error) {
-	contexts, err := host.DefaultContextPath()
+	contexts, err := host.DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(contexts), "servers", name), nil
+	return identityDirAt(contexts, name), nil
+}
+
+func identityDirAt(storePath, name string) string {
+	return filepath.Join(filepath.Dir(storePath), "servers", name)
 }
 
 func loadOrCreateIdentity(name string) (*operatorIdentity, error) {
-	dir, err := identityDir(name)
+	contexts, err := host.DefaultWorkspacePath()
 	if err != nil {
 		return nil, err
 	}
+	return loadOrCreateIdentityAt(contexts, name)
+}
+
+func loadOrCreateIdentityAt(storePath, name string) (*operatorIdentity, error) {
+	dir := identityDirAt(storePath, name)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
@@ -123,13 +132,13 @@ func (id *operatorIdentity) authorizedKey() string {
 
 // wireGuardRoute is the context route to a locked-down node: SSH as the admin
 // user inside the embedded WireGuard tunnel.
-func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts, adminUser string) *host.ContextSSH {
-	return &host.ContextSSH{
+func (id *operatorIdentity) wireGuardRoute(publicHost, nodePublicKey, knownHosts, adminUser string) *host.WorkspaceSSH {
+	return &host.WorkspaceSSH{
 		Address:    net.JoinHostPort(access.NodeAddress, "22"),
 		User:       adminUser,
 		Identity:   id.sshKeyPath,
 		KnownHosts: knownHosts,
-		WireGuard: &host.ContextWireGuard{
+		WireGuard: &host.WorkspaceWireGuard{
 			PrivateKeyFile: id.wgKeyPath,
 			Address:        access.OperatorAddress,
 			NodeAddress:    access.NodeAddress,
@@ -165,7 +174,7 @@ func pinContextKnownHosts(pending, scoped, publicAddress, wireGuardAddress strin
 }
 
 // routeRemote opens a host.Remote for a context route.
-func routeRemote(route *host.ContextSSH, prompt bool) (*host.Remote, error) {
+func routeRemote(route *host.WorkspaceSSH, prompt bool) (*host.Remote, error) {
 	auth, err := sshAuth(route.Identity, prompt)
 	if err != nil {
 		return nil, err
@@ -182,7 +191,7 @@ func routeRemote(route *host.ContextSSH, prompt bool) (*host.Remote, error) {
 // secureAccess hardens the server and moves SSH onto WireGuard (vaire §5.2):
 // setup over public SSH as root, a login as the admin user over WireGuard,
 // then the commit-confirm lockdown confirmed from a fresh connection.
-func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, publicHost string) (*host.ContextSSH, error) {
+func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, publicHost string) (*host.WorkspaceSSH, error) {
 	nodeKey := r.pending.NodePublicKey
 	if !r.pending.Done(phaseAccessSetup) {
 		root := r.remote
@@ -223,7 +232,7 @@ func (r *serverInit) secureAccess(ctx context.Context, id *operatorIdentity, pub
 		return nil, contract.NewFault(contract.PreconditionFailed, "the pending init has no node WireGuard key", "Run server init --discard and start again; the access setup did not finish.")
 	}
 
-	knownHosts, err := contextKnownHostsPath(r.answers.Context)
+	knownHosts, err := r.knownHostsPath(r.answers.Context)
 	if err != nil {
 		return nil, err
 	}
@@ -292,7 +301,7 @@ func (r *serverInit) planRows(plan host.Plan) []host.PlanEntry {
 	return rows
 }
 
-func runWithRetry(ctx context.Context, route *host.ContextSSH, command string, within time.Duration) error {
+func runWithRetry(ctx context.Context, route *host.WorkspaceSSH, command string, within time.Duration) error {
 	deadline := time.Now().Add(within)
 	var last error
 	for time.Now().Before(deadline) {

@@ -32,7 +32,7 @@ func pipeStdin(t *testing.T) {
 }
 
 func TestDeleteRefusesWithoutAHumanTerminal(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
 	pipeStdin(t)
 	for _, test := range []struct {
 		name    string
@@ -125,11 +125,11 @@ func TestEnvironmentDeleteFactorFollowsDurableProtection(t *testing.T) {
 }
 
 func TestDeleteDryRunNeedsNoFactorAndNoTerminal(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "contexts.json"))
 	pipeStdin(t)
 	code, stdout, stderr := invoke(t, "app", "delete", "api", "--confirm", "api", "--dry-run", "--json")
 	envelope := decodeOne(t, stdout)
-	if code != 3 || envelope.OK || envelope.Error == nil || envelope.Error.Code != contract.NotFound {
-		t.Fatalf("dry run = code %d error %+v stderr %q; it must pass the factor and reach context resolution", code, envelope.Error, stderr)
+	if code != 2 || envelope.OK || envelope.Error == nil || envelope.Error.Code != contract.InputRequired {
+		t.Fatalf("dry run = code %d error %+v stderr %q; it must pass the factor and reach workspace resolution", code, envelope.Error, stderr)
 	}
 }

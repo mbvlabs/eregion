@@ -91,7 +91,7 @@ type ApplyReport struct {
 	CommitDeadline time.Time      `json:"commit_deadline,omitempty"`
 	AccessChanges  []AccessChange `json:"access_changes,omitempty"`
 	// Warnings are local, non-secret observations added by the CLI after the
-	// node report (for example, a local context metadata write that failed).
+	// node report (for example, a local workspace metadata write that failed).
 	Warnings []string `json:"warnings,omitempty"`
 }
 

@@ -16,8 +16,7 @@ type answersFile struct {
 	Port            int    `toml:"port"`
 	Identity        string `toml:"identity"`
 	Node            string `toml:"node"`
-	Workspace       string `toml:"workspace"`
-	Context         string `toml:"context"`
+	Workspace       string `toml:"workspace-name"`
 	Hostname        string `toml:"hostname"`
 	DatabaseURLFile string `toml:"database_url_file"`
 	AdminUser       string `toml:"admin_user"`
@@ -45,7 +44,7 @@ func (a answersFile) answers() serverInitAnswers {
 	}
 	return serverInitAnswers{
 		Host: a.Host, Port: port, Identity: strings.TrimSpace(a.Identity),
-		Node: strings.TrimSpace(a.Node), Workspace: strings.TrimSpace(a.Workspace), Context: strings.TrimSpace(a.Context),
+		Node: strings.TrimSpace(a.Node), Workspace: strings.TrimSpace(a.Workspace),
 		Hostname: strings.TrimSpace(a.Hostname), DatabaseURLFile: strings.TrimSpace(a.DatabaseURLFile),
 		AdminUser: strings.TrimSpace(a.AdminUser),
 	}
@@ -57,8 +56,7 @@ func (a answersFile) supplied() map[string]bool {
 		"host":              a.Host != "",
 		"identity":          a.Identity != "",
 		"node":              a.Node != "",
-		"workspace":         a.Workspace != "",
-		"context":           a.Context != "",
+		"workspace_name":    a.Workspace != "",
 		"hostname":          a.Hostname != "",
 		"database_url_file": a.DatabaseURLFile != "",
 		"admin_user":        a.AdminUser != "",

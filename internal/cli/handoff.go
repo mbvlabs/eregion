@@ -37,7 +37,7 @@ type handoffGroup struct {
 
 // secretsHandoff is the record server init hands to the operator: every server
 // secret in plain text plus an armored age transfer bundle. eregion keeps only
-// the operator's SSH and WireGuard keys in the local context, so this is the
+// the operator SSH and WireGuard keys in the local workspace access, so this is the
 // copy that survives losing this machine.
 type secretsHandoff struct {
 	node       string
@@ -162,7 +162,7 @@ func (h *secretsHandoff) show(w io.Writer) error {
 		case "done":
 			if err := ui.TypeWord("Type 'stored' once the record is in your password manager", "", "stored"); err != nil {
 				if errors.Is(err, ui.ErrAborted) {
-					return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the context is saved locally; run server init --resume to show the handoff again.")
+					return contract.NewFault(contract.InputRequired, "the secrets handoff was not confirmed as stored", "The server is set up and the workspace access is saved locally; run server init --resume to show the handoff again.")
 				}
 				return err
 			}
@@ -203,7 +203,7 @@ func (r *serverInit) handoff(ctx context.Context, summary *serverInitSummary) er
 			task.end(ui.EndFail, "")
 			return err
 		}
-		if err := r.updateContextWorkspace(workspace); err != nil {
+		if err := r.updateWorkspaceIdentity(workspace); err != nil {
 			task.end(ui.EndFail, "")
 			return err
 		}
@@ -244,15 +244,15 @@ func (r *serverInit) handoff(ctx context.Context, summary *serverInitSummary) er
 	return nil
 }
 
-// updateContextWorkspace stores the verified identity in the local context
+// updateWorkspaceIdentity stores the verified identity in the local workspace access
 // after the host apply and before the handoff is marked done. A failure keeps
 // the pending phase retryable and never guesses a different identity.
-func (r *serverInit) updateContextWorkspace(workspace controlplane.WorkspaceIdentity) error {
-	store, err := host.LoadContextStore("")
+func (r *serverInit) updateWorkspaceIdentity(workspace controlplane.WorkspaceIdentity) error {
+	store, err := loadWorkspaceStore(r.cmd)
 	if err != nil {
 		return err
 	}
-	_, err = store.SetWorkspace(r.answers.Context, &host.ContextWorkspace{ID: workspace.ID, Name: workspace.Name})
+	_, err = store.SetWorkspaceIdentity(r.answers.Context, &host.WorkspaceIdentity{ID: workspace.ID, Name: workspace.Name}, nil)
 	return err
 }
 
@@ -291,7 +291,7 @@ func verifyWorkspaceIdentity(requested string, workspace controlplane.WorkspaceI
 	if !workspace.Configured {
 		fault := contract.NewFault(contract.PreconditionFailed,
 			"the node did not record workspace "+requested,
-			"Run eregion apply --workspace "+requested+" on the node, then refresh the protected export with eregion secrets export.")
+			"Run eregion apply --assign-workspace "+requested+" on the node, then refresh the protected export with eregion secrets export.")
 		fault.Details = map[string]any{"requested_workspace": requested}
 		return fault
 	}
@@ -317,7 +317,6 @@ type handoffRecordInput struct {
 	NodeName                 string
 	WorkspaceName            string
 	WorkspaceID              string
-	Context                  string
 	Hostname                 string
 	PublicAddress            string
 	Platform                 string
@@ -344,7 +343,6 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 			{"Node name", in.NodeName},
 			{"Workspace", in.WorkspaceName},
 			{"Workspace ID", in.WorkspaceID},
-			{"Context", in.Context},
 			{"Hostname", in.Hostname},
 			{"Public address", in.PublicAddress},
 			{"Platform", in.Platform},
@@ -355,7 +353,6 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 		}},
 		{title: "Operator", fields: []handoffField{
 			{"Admin user", in.AdminUser},
-			{"Context", in.Context},
 			{"SSH user", in.AdminUser},
 			{"Sudo password", in.SudoPassword},
 			{"WireGuard address", in.OperatorWireGuardAddress},
@@ -376,7 +373,7 @@ func handoffGroups(in handoffRecordInput) []handoffGroup {
 		{"When", "Only when WireGuard or the node is unreachable."},
 		{"How", "Use the provider console as root and run `eregion node unlock-ssh`. It reopens public SSH for its fixed window."},
 		{"Public SSH", "Closed after server init; sshd accepts the admin user over WireGuard only."},
-		{"Recovery", "The transfer bundle above rebuilds the context on another machine. Without it, use the provider console and this record."},
+		{"Recovery", "The transfer bundle above rebuilds the workspace access on another machine. Without it, use the provider console and this record."},
 	}})
 	return groups
 }
@@ -397,13 +394,15 @@ func metricsHandoffGroup(username, password string) handoffGroup {
 func (r *serverInit) handoffGroups() []handoffGroup {
 	credential := r.metricsCredential
 	if credential == nil {
-		if loaded, err := loadMetricsCredential(r.answers.Context); err == nil {
-			credential = loaded
+		if dir, dirErr := workspaceCredentialDirByName(r.cmd, r.answers.Context); dirErr == nil {
+			if loaded, err := loadMetricsCredential(dir); err == nil {
+				credential = loaded
+			}
 		}
 	}
 	return handoffGroups(handoffRecordInput{
 		NodeName: r.answers.Node, WorkspaceName: r.workspace.Name, WorkspaceID: r.workspace.ID,
-		Context: r.answers.Context, Hostname: r.answers.Hostname,
+		Hostname:      r.answers.Hostname,
 		PublicAddress: r.answers.Host, Platform: r.platform.String(), SSHHostKey: r.hostKey,
 		WireGuardEndpoint:    net.JoinHostPort(r.answers.Host, strconv.Itoa(access.ListenPort)),
 		WireGuardNodeAddress: access.NodeAddress, WireGuardNodePublicKey: r.pending.NodePublicKey,

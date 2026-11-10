@@ -171,9 +171,6 @@ func (m Model) renderHeader(width int) string {
 		if workspace := m.workspaceLabel(); workspace != "" {
 			parts = append(parts, m.dim().Render(workspace))
 		}
-		if contextName := m.clean(strings.TrimSpace(m.opts.Context)); contextName != "" {
-			parts = append(parts, m.dim().Render("context "+contextName))
-		}
 		parts = append(parts, m.dim().Render("node "+node))
 	} else {
 		// Tests and injected clients that do not supply a node identity keep
@@ -369,7 +366,7 @@ func (m Model) renderUnreachable(width, height int) string {
 	switch tab.errCode {
 	case contract.Unauthenticated:
 		title = "Authentication required"
-		detail = "Select a saved context with eregion context use before opening the workspace."
+		detail = "Select a saved workspace with eregion workspace use before opening the workspace."
 	}
 	lines := []string{
 		m.riskStyle().Render(title),

@@ -14,7 +14,7 @@ import (
 // checkTelemetryEndpoint is the init-side observation of D5: the loopback exporter
 // is installed with its host step, and the WireGuard-facing endpoint must
 // challenge an unauthenticated request. The client dials through WireGuard.
-func (r *serverInit) checkTelemetryEndpoint(ctx context.Context, route *host.ContextSSH) string {
+func (r *serverInit) checkTelemetryEndpoint(ctx context.Context, route *host.WorkspaceSSH) string {
 	if route == nil || route.WireGuard == nil {
 		return "unknown"
 	}

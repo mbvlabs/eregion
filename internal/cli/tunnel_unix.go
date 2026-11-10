@@ -75,10 +75,10 @@ func (a *app) tunnelSpecs() []spec {
 	serveMeta := meta("Run the shared WireGuard tunnel daemon",
 		"Every eregion command spawns this itself; it owns the tunnel's only WireGuard device and serves its unix socket.",
 		"eregion tunnel serve --json", false)
-	statusMeta := meta("Show the context's shared tunnel daemon",
+	statusMeta := meta("Show the selected workspace's shared tunnel daemon",
 		"See whether the tunnel daemon runs, which eregion commands use it, and when it exits idle.",
 		"eregion tunnel status --json", false)
-	stopMeta := meta("Stop the context's shared tunnel daemon",
+	stopMeta := meta("Stop the selected workspace's shared tunnel daemon",
 		"Without --force the daemon takes no new commands and exits once the running ones finish; the next command starts a new one.",
 		"eregion tunnel stop --force --json", true)
 	return []spec{{
@@ -88,21 +88,20 @@ func (a *app) tunnelSpecs() []spec {
 		run:    func(cmd *cobra.Command, _ []string) (result, error) { return a.help(cmd), nil },
 		children: []spec{
 			{use: "serve", meta: serveMeta, flags: func(cmd *cobra.Command) {
-				cmd.Flags().String("name", "", "Context name; otherwise the daemon reads its route from the environment")
 			}, run: runTunnelServe},
-			{use: "status", meta: statusMeta, flags: contextNameFlag, run: runTunnelStatus},
+			{use: "status", meta: statusMeta, run: runTunnelStatus},
 			{use: "stop", meta: stopMeta, flags: func(cmd *cobra.Command) {
-				contextNameFlag(cmd)
+				// no workspace selector: the current saved workspace is used
 				cmd.Flags().Bool("force", false, "Close the tunnel now, dropping the streams of running commands (they re-attach)")
 			}, run: runTunnelStop},
 		},
 	}}
 }
 
-// wireGuardDial is the dial function for a context's WireGuard route. Every
+// wireGuardDial is the dial function for a workspace's WireGuard route. Every
 // route with the same tunnel configuration shares one daemon, so concurrent
 // eregion commands never bring up competing devices with one operator key.
-func wireGuardDial(wg *host.ContextWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
+func wireGuardDial(wg *host.WorkspaceWireGuard) (func(context.Context, string, string) (net.Conn, error), error) {
 	if os.Getenv(envTunnel) == "inprocess" {
 		return inProcessWireGuardDial(wg)
 	}
@@ -162,10 +161,10 @@ var (
 	wireGuardDialers = map[string]*sharedRoute{}
 )
 
-// closeWireGuardRoute stops the daemon for a removed context and drops this
+// closeWireGuardRoute stops the daemon for a removed workspace and drops this
 // process's cache entry, so nothing keeps the node peer alive after its key
 // files are gone.
-func closeWireGuardRoute(route *host.ContextSSH) {
+func closeWireGuardRoute(route *host.WorkspaceSSH) {
 	if route == nil || route.WireGuard == nil {
 		return
 	}
@@ -192,7 +191,7 @@ func closeWireGuardRoute(route *host.ContextSSH) {
 }
 
 // wireGuardConfig builds the userspace tunnel configuration for a saved route.
-func wireGuardConfig(wg *host.ContextWireGuard) (transport.WireGuardConfig, error) {
+func wireGuardConfig(wg *host.WorkspaceWireGuard) (transport.WireGuardConfig, error) {
 	key, err := transport.ReadWireGuardKey(wg.PrivateKeyFile)
 	if err != nil {
 		return transport.WireGuardConfig{}, err
@@ -275,7 +274,7 @@ func tunnelSocketPath(identity string) (string, error) {
 
 // tunnelStateDir is the operator's private tunnel directory.
 func tunnelStateDir() (string, error) {
-	contexts, err := host.DefaultContextPath()
+	contexts, err := host.DefaultWorkspacePath()
 	if err != nil {
 		return "", err
 	}
@@ -463,7 +462,7 @@ func runTunnelServe(cmd *cobra.Command, _ []string) (result, error) {
 		return fail(err)
 	}
 	if !held {
-		ready(daemonReady{Code: "already_running", Message: "a tunnel daemon is already running for this context"})
+		ready(daemonReady{Code: "already_running", Message: "a tunnel daemon is already running for this workspace"})
 		return result{}, nil
 	}
 	defer release()
@@ -517,21 +516,17 @@ func runTunnelServe(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 // tunnelServeConfig reads the route from the spawn environment, or from the
-// named saved context when the daemon is run by hand.
+// named saved workspace when the daemon is run by hand.
 func tunnelServeConfig(cmd *cobra.Command) (transport.WireGuardConfig, error) {
 	if os.Getenv(envTunnelPrivateKeyFile) != "" {
 		return tunnelEnvConfig()
 	}
-	store, err := host.LoadContextStore("")
-	if err != nil {
-		return transport.WireGuardConfig{}, err
-	}
-	current, err := store.Get(flagString(cmd, "name"))
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
 		return transport.WireGuardConfig{}, err
 	}
 	if current.SSH == nil || current.SSH.WireGuard == nil {
-		return transport.WireGuardConfig{}, contract.NewFault(contract.PreconditionFailed, "context "+current.Name+" has no WireGuard route",
+		return transport.WireGuardConfig{}, contract.NewFault(contract.PreconditionFailed, "workspace "+current.Name+" has no WireGuard route",
 			"Import a server init handoff with eregion login, or re-run server init.")
 	}
 	return wireGuardConfig(current.SSH.WireGuard)
@@ -647,16 +642,12 @@ func runTunnelStop(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 func tunnelContextConfig(cmd *cobra.Command) (transport.WireGuardConfig, error) {
-	store, err := host.LoadContextStore("")
-	if err != nil {
-		return transport.WireGuardConfig{}, err
-	}
-	current, err := store.Get(flagString(cmd, "name"))
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
 		return transport.WireGuardConfig{}, err
 	}
 	if current.SSH == nil || current.SSH.WireGuard == nil {
-		return transport.WireGuardConfig{}, contract.NewFault(contract.PreconditionFailed, "context "+current.Name+" has no WireGuard route",
+		return transport.WireGuardConfig{}, contract.NewFault(contract.PreconditionFailed, "workspace "+current.Name+" has no WireGuard route",
 			"Import a server init handoff with eregion login, or re-run server init.")
 	}
 	return wireGuardConfig(current.SSH.WireGuard)

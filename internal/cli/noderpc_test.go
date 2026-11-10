@@ -78,6 +78,7 @@ type fakeNodeTransport struct {
 	fresh    rpcVersionResult
 	metrics  any
 	rotation any
+	info     rpcNodeInfoResult
 	methods  []string
 	uploads  int
 	installs int
@@ -134,6 +135,11 @@ func (f *fakeNodeTransport) Run(_ context.Context, _ string, stdin io.Reader, st
 			return fmt.Errorf("no rotation fixture")
 		}
 		data = f.rotation
+	case methodNodeInfo:
+		if f.info.Node == "" {
+			return fmt.Errorf("no node info fixture")
+		}
+		data = f.info
 	default:
 		return fmt.Errorf("unexpected method %q", request.Method)
 	}

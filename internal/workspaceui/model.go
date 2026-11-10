@@ -128,15 +128,14 @@ type Options struct {
 	API     API
 	Metrics MetricsSource
 	Host    string
-	// Node, Workspace and Context are separate target labels. The selected
-	// context still owns the route; the workspace identity never changes which
+	// Node and Workspace are separate target labels. The selected
+	// workspace owns the route; the workspace identity never changes which
 	// server a command addresses. WorkspaceKnown distinguishes an authoritative
 	// unconfigured state from a failed/unknown read.
 	Node                string
 	Workspace           string
 	WorkspaceKnown      bool
 	WorkspaceConfigured bool
-	Context             string
 	Secrets             *secrets.Registry
 	ASCII               bool
 	NoColor             bool

@@ -30,7 +30,7 @@ func TestPendingInitTransitions(t *testing.T) {
 }
 
 func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
 	pending := &PendingInit{
 		Server: "prod", Host: "203.0.113.10", User: "root", Port: 22, Node: "main",
 		Context: "prod", Hostname: "app.example.com", AdminUser: "admin",
@@ -86,7 +86,7 @@ func TestPendingInitSaveLoadRoundTrip(t *testing.T) {
 }
 
 func TestPendingNamesCannotEscapeThePendingRoot(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
 	for _, name := range []string{"../escape", "a/b", "Prod", ""} {
 		if _, err := PendingDir(name); err == nil {
 			t.Errorf("PendingDir(%q) accepted a path", name)

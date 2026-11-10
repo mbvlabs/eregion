@@ -82,11 +82,11 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 
 | # | Topic | Decision |
 | --- | --- | --- |
-| D1 | Control model | The CLI talks to a node through SSH over embedded userspace WireGuard, always. Each operator command resolves the context, opens SSH in WireGuard and runs `eregion node <cmd> --json` there, which calls the same application services the API uses. Contexts hold a WireGuard identity and an SSH key, not a bearer token. |
+| D1 | Control model | The CLI talks to a node through SSH over embedded userspace WireGuard, always. Each operator command resolves the selected workspace, opens SSH in WireGuard and runs `eregion node <cmd> --json` there, which calls the same application services the API uses. Local workspace connection data holds a WireGuard identity and an SSH key, not a bearer token. |
 | D2 | Hardening | vaire's: admin user with a sudo password, root login and SSH passwords off, firewall, commit-confirm switchover of SSH to WireGuard with automatic revert, break-glass via the provider console and `eregion node unlock-ssh`. |
 | D3 | Ingress | Caddy on the main node. The main hostname is used exactly as entered. App domains are environment bindings. DNS records, direct or Cloudflare-proxied, and ACME. |
 | D4 | Recovery and backups | Revised 2026-11-10: serious durable application state belongs in external services; managed local-volume data is expendable under the current policy. There is no scheduled backup or volume-backup product. External PostgreSQL holds control-plane state and operation history, but is **not** a backup of Docker volumes, local registry artifacts or host-local vault keys and identities. Before RC, document replacement-VPS recovery with the same surviving control DB/external services, including protected key/identity recovery, artifact availability and unsupported replacement-node gaps. A live recovery rehearsal is not a release gate; documentation is not proof of working recovery. External-provider backup and durability remain the provider/operator's responsibility. |
-| D5 | Telemetry (beta) | Every node (currently the main node) runs node_exporter from setup on, bound to **loopback only**. Telemetry is **node-local and request-scoped**: `metrics show` (over `eregion node rpc` through SSH in WireGuard) reads one bounded current snapshot with CPU, memory, filesystem, load, uptime, identity, timestamps, freshness and explicit missing values. CPU utilization is computed from a second counter read and a checked delta; a missing or reset counter is unavailable, never zero. Eregion adapts vaire's nginx metrics endpoint to a dedicated Caddy instance, separate from the public ingress Caddy: `host-telemetry-v1` writes the HTTP service-discovery document, the telemetry unit and the WireGuard-only firewall rule, and `metrics rotate` writes a rotation-owned telemetry Caddyfile on the node's WireGuard address at `9101`. The instance explicitly binds `10.78.0.1`, is triggered by each `wg-quick@wg0` start, and proxies loopback node_exporter at `/node` and serves `/targets.json` with basic authentication; it is never public and Caddy is not a telemetry store. A missing wg0 or a bad telemetry config cannot stop the public ingress. `metrics endpoint` describes it, `metrics config` generates Prometheus and Grafana Alloy scrape configurations (HTTP discovery plus basic auth, password placeholder in ordinary output, owner-only `--out` file for the real credential), and `metrics rotate --confirm <node>/metrics` generates a 256-bit password, saves it locally before the request, and sends only its bcrypt hash. Under a node-local telemetry lock the node validates the rendered telemetry Caddyfile and restarts only the dedicated telemetry unit, restoring the previous file if validation or restart fails; public Caddy and its route writer are untouched. A failed RPC restores the previous local credential. This is vaire's simple rotate model, not a generation compare-and-swap or recovery journal: a lost successful response can leave the local password stale until the next rotation. The credential is stored owner-only in the operator context and appears only in the protected server handoff or an explicit `metrics config --out` file; the node receives only its bcrypt hash. The exporter also has a root-owned textfile collector directory at `/var/lib/node_exporter/textfile` (with its root-owned `/var/lib/node_exporter` parent, both root:root 0755 with no special mode bits and refused as symlinks) and a **narrow** systemd collector include for `eregion-*`, `caddy`, `docker`, `node-exporter` and `wg-quick@wg0` service/timer units. No eregion self-metric is written without a real producer. `doctor` checks exporter reachability, both collectors with unambiguous success samples, `node_textfile_scrape_error` exactly once with value zero, and a `telemetry.endpoint` row that requires 401 without a credential, fails an unauthenticated 200 and warns until rotation configures the site. Collector success alone is not treated as proof that a `.prom` file was readable, and duplicate/timestamped collector success is ambiguous fail-closed. These are local primitives, not a telemetry service. There is no telemetry server, Prometheus/Grafana/Loki deployment, metric or log store, external backend, global PromQL, retained history, public telemetry endpoint or central scrape target. Operation history lives in PostgreSQL and never depends on telemetry. User clarification 2026-11-08: a later optional separate telemetry node or Grafana is **not prohibited long-term**; neither is in beta/v1 scope now, and adding one would need its own decisions for topology, retention and access. |
+| D5 | Telemetry (beta) | Follow vaire's exporter-and-scrape-configuration model. The main node runs loopback-only node_exporter; its existing HTTPS hostname exposes exactly `/metrics/node` and `/metrics/targets.json`, both authenticated through a separate loopback gateway. Discovery advertises reachable HTTPS targets, and generated Prometheus/Alloy configurations authenticate discovery and scraping with normal TLS verification. Raw exporter/gateway ports are not public. `metrics show` provides a bounded current snapshot with checked CPU deltas, freshness and explicit missing values; it does not define or restrict the external collection model. `metrics endpoint` distinguishes desired configuration from observed readiness. `metrics config` uses placeholders in ordinary output and owner-only `--out` files for actual credentials. Rotation retains vaire's simple model: save the generated password locally before sending only its bcrypt hash, restore the local credential on failed RPC, and acknowledge that a lost successful response may require another rotation. Normal apply must preserve the existing credential, serialize with rotation, and restore all managed files/service state on failure with bounded recovery independent of caller cancellation. Telemetry failure must not prevent serving applications. Keep the exporter textfile directory and parent root-owned 0755, nonsymlink and without special mode bits; restrict the systemd collector to eregion, Caddy, Docker, exporter and WireGuard units, and require real producers for self-metrics. Doctor retains fail-closed collector/scrape checks and distinguishes anonymous denial from authenticated success. Operation history remains in PostgreSQL and never depends on telemetry. No managed Prometheus/Grafana/Alloy/Loki deployment or retained metrics/log store is required for beta/v1. Retain the future optional telemetry-node concept described below. |
 
 | D6 | Command tree | [Section 5](#5-command-tree). `platform …`, operator-facing `bootstrap …`, `serve`/`worker`, `platform submit` and bearer-token `context login` are removed from the operator surface; the service, migration and bootstrap entry points live under the hidden Linux-only `node` group. The old resource surface was removed, but alpha.2 adds a new node-mode resource lifecycle under D19. Pre-v1: delete old paths, no aliases or compatibility shims. |
 | D7 | Tokens and the human factor | API tokens are per use, scoped, expiring, listed and revocable, and shown once. Creating one needs a human factor (a TOTP code from `eregion protect init`, or a master password) read without echo at a terminal, so an agent cannot mint its own. No token is minted at setup or handed off. The same factor gates **token create, secret export (`secret export`, `secrets export`), every `app delete`, a protected `env delete`, deletion of the last environment (which deletes the app), and `env unprotect`**. An unprotected non-last environment deletion needs only exact target confirmation (D33). The control plane verifies the code inside the submission transaction that locks the target state; a separate pre-check is UX only. `--yes`, `--json`, stdin and pipes never satisfy it. The factor stops an agent operating through `eregion` from reading secrets, minting tokens or deleting apps; it is not a sandbox: an OS account holding a context's files (SSH key, sudo password) is root-equivalent on that server. |
@@ -126,23 +126,81 @@ predecessor; reconciliation without a worker lease fails it. |
 | D32 | App definition file (planned for alpha.2) | Adopt a Fly-style `eregion.toml` **as input only**, never as a store: `app create --from FILE`, `env create|update --from FILE` and `app export <app> <env>` turn it into ordinary desired state. Existing guided and flag-only workflows remain usable without a file; PostgreSQL stays authoritative. The file is a **shared recipe plus optional overrides**, not an exhaustive environment inventory: `[environments.staging]`, `[environments.production]` and `[environments.<name>]` override the shared fields when present, and `env create --from FILE --name pr-42` applies the shared recipe without adding `pr-42` to the file. The selected name is a command argument, not a document identity. The file names processes, health, source and build settings, non-secret config, secret **names** (never values), domains and optional generic Docker resources (D19). Domains are environment-specific; export places them under the selected environment's override so a shared recipe cannot make production and staging claim the same hostname. Explicit apply previews and provisions declared resources; an ordinary deploy or push never reads the file. `--dry-run` shows changes, removals require target confirmation, and resource data is retained unless separately destroyed. |
 | D33 | Environment protection (alpha.2 redesign) | Every environment has persistent `protected` state. `app create` creates **production and staging atomically from one recipe**; both are protected by default, and creation itself never asks for a TOTP code. Other environment names are unprotected by default; `--protected` / `--unprotected` make one creation-time choice explicit. `app delete` always requires the D7 TOTP factor. `env delete` requires it when the environment is protected or when it is the app's **last** environment (that deletion removes the app); an unprotected non-last environment deletion needs only exact `--confirm <app>/<env>` and works with agents, `--json` and no-TTY. `env protect` is agent-safe; `env unprotect` requires the factor. The decision and TOTP verification run in the control-plane submission transaction against locked environment/application rows, so node RPC, HTTP and direct service callers cannot bypass it; HTTP refuses actions whose current state needs the factor because it cannot carry a code. Migration 024 backfills every pre-existing environment as protected (fail closed); an operator may lower it with the factor. |
 
+### D5 clarification — vaire telemetry model
+
+The agreed model is exporters, an authenticated scrape endpoint and generated
+Prometheus/Alloy configuration, as implemented in vaire. Vaire does not install
+the collector or dashboards either. Eregion's existing exporter and private
+Caddy endpoint are implemented and configured; that alone does not qualify the
+external integration below.
+
+**Reachable HTTPS endpoint (operator correction, 2026-11-10):** provide proper
+authenticated HTTPS metrics and discovery URLs that an external collector can
+use, as in vaire. A private WireGuard address alone does not meet this contract.
+Use the configured main hostname with exact `/metrics/node` and
+`/metrics/targets.json` paths. Both endpoints require authentication, and
+discovery advertises that hostname on HTTPS port 443. The raw exporter and
+dedicated authentication gateway remain loopback-only; there is no retained
+WireGuard-listener alias. Public ingress proxies only those fixed telemetry
+paths and remains independently operable if telemetry is unavailable. Integrate
+through owned ingress rendering/reconciliation and preserve serving application
+routes. Reuse the existing credential rather than
+rotate it merely for the URL correction. This supersedes the private-only/no
+public telemetry endpoint wording in the earlier D5 row; it does not expose a
+public management API or introduce a managed collector.
+
+The earlier phrase **node-local and request-scoped** describes the CLI's bounded
+current snapshot, not the telemetry architecture or a restriction on external
+collection. A WireGuard-peer Prometheus/Alloy collector can scrape the endpoint
+for retained history and dashboards without the operator workstation remaining
+online. This clarification does not introduce a managed collector, a second
+telemetry node or a new deployment requirement; the existing collector/topology
+scope decision is unchanged. Do not reopen or reimplement the exporter setup
+because of that wording.
+
+**Future telemetry node (operator reconfirmation, 2026-11-10):** retain the
+concept of an optional telemetry node that users can add to the workspace's
+private network. It can provide centralized collection, retained history and
+dashboards in place of a separately operated Grafana-style stack. It is future
+scope, not a beta.1 prerequisite; its implementation and topology are not being
+added by the current exporter work.
+
 ### D34 — Portable workspace identity (alpha.7 contract)
 
 One installation has an immutable generated workspace ID and a slug name,
-authoritatively recorded once in external PostgreSQL. Setup asks for workspace
-name separately from node name; a local context is this machine's access to
-that workspace's single node. Same workspace/name initialization reuses its ID;
-a conflicting name is refused. Reads and migration do not guess or assign it.
+authoritatively recorded once in external PostgreSQL. **Workspace is the only
+named operator target** (operator clarification, 2026-11-10). There is no separate
+context or named access/profile concept. Local keys, pins and connection details
+are access data for that workspace's single node, not another identity. Setup
+asks for workspace name separately from node name. Same workspace/name
+initialization reuses its ID; a conflicting name is refused. Reads and migration
+do not guess or assign it.
 
-An alpha.6 installation initializes explicitly through `apply --workspace NAME`
-after the forward migration; dry-run only previews. Existing access remains
-usable with identity reported unconfigured until then. Handoff/export carry the
-portable identity; login checks it against the node before atomically publishing
-local access. Same name/different ID is a conflict; the same ID under another
-local context name is not another workspace. Exact replacement confirmation and
-host-key verification are never waived. Old bundles without identity remain
-unconfigured access artifacts; refresh the protected export for portable
-workspace login. Workspace labels do not add another implicit target selector.
+`--workspace NAME` selects the verified workspace name, never a historical
+local alias. Selection precedence is the explicit flag, `EREGION_WORKSPACE`, then
+the saved current workspace. `workspace list|show|use|remove` manages workspaces
+known to this machine; remove deletes local access only, never the installation,
+database identity or applications. Old context commands/flags are removed, not
+retained as aliases. Obsolete targeting environment settings fail explicitly
+rather than silently selecting another store or target. `EREGION_WORKSPACE_FILE`
+selects the private store; existing credential paths and its single storage
+format need not change merely because historical persistence labels are private.
+
+Creation and assignment are distinct from selection: setup uses
+`server init --workspace-name NAME`, and the alpha.6 transition initializes
+explicitly through `apply --assign-workspace NAME` after the forward migration;
+dry-run only previews. Existing unconfigured alpha access is confined to its
+already approved initialization flow and never gains identity from a local
+alias. Handoff/export carry the portable identity; login verifies it against the
+node before atomically publishing access. Same name/different ID and same
+ID/different name are conflicts. Historical duplicate access records for one ID
+are one workspace, not additional named targets; resolution uses its selected
+record or sole record and otherwise refuses ambiguity. Verified login replacement
+may replace that workspace's local records without disturbing unrelated
+workspaces or deleting their credential files. Exact replacement confirmation
+and host-key verification are never waived. Old bundles without identity remain
+only within the existing bounded alpha exception below; refresh the protected
+export for portable workspace login.
 
 This is an identity contract, not team authorization, server sharing, multi-node
 management or tenant isolation. The TUI renders it; the TUI is not the identity.
@@ -173,11 +231,12 @@ decision after inspecting deploycrate's resource/source/attachment behavior;
 it is not alpha.7 scope. D4's expendable-volume recovery policy does not change
 D19's default retention or authorize deletion.
 
-- **Workspace.** Portable installation ID/name, separate from its node name and
-  from each operator machine's local context (D34). One node for current v1
+- **Workspace.** Portable installation ID/name, separate from its node name;
+  each operator machine stores its connection data directly for that workspace
+  (D34). One node for current v1
   scope, not a tenancy or team boundary.
 - **Server / node.** A VPS. The first one `server init` sets up is the **main
-  node**. A context names a server.
+  node**. The selected workspace identifies which installation to operate.
 - **App.** A named group of environments. Owns nothing at runtime by itself.
 - **Environment.** The unit of deployment (`staging`, `production`, …). It also
   carries persistent deletion **protection** (D33), separate from its desired
@@ -215,10 +274,10 @@ dry-run where it mutates, and appears in `eregion commands --json`. Node-only
 commands are marked Linux-only and hidden from the operator listing.
 
 ```
-eregion server init [--workspace NAME] [--node NAME] [--resume | --discard] [--answers FILE] | status
-eregion plan | apply [--auto-upgrade-nodes] [--workspace NAME] | doctor  # explicit legacy workspace assignment; converge/check host steps
-eregion login [--replace NAME] | context list|show|use|remove
-                                                       # every node command: --context NAME / EREGION_CONTEXT
+eregion server init [--workspace-name NAME] [--node NAME] [--resume | --discard] [--answers FILE] | status
+eregion plan | apply [--auto-upgrade-nodes] [--assign-workspace NAME] | doctor  # explicit alpha workspace assignment; converge/check host steps
+eregion login [--replace WORKSPACE] | workspace list|show|use|remove
+                                                       # every node command: --workspace NAME / EREGION_WORKSPACE
 eregion secrets export                                 # server handoff, human factor
 eregion app create|list|status|delete             # create: production + staging atomically
 eregion env create|update|protect|unprotect|list|status|delete
@@ -262,7 +321,7 @@ telemetry node or Grafana is not prohibited long-term (D5).
    fingerprint confirmation, `--host-key-fingerprint` or `--accept-new-host-key`.
 3. **Remote preflight**: OS, architecture, resources, existing state.
 4. **Questions**, each defaulted and each also a flag or an `--answers` TOML
-   key: workspace, node and local context name, public hostname (used as given), external DSN
+   key: workspace name, node name, public hostname (used as given), external DSN
    file, admin user.
 5. **Plan**, then confirm; non-interactive needs `--confirm <server>`.
 6. **Apply** versioned steps with live progress: install the binary once,
@@ -276,16 +335,16 @@ telemetry node or Grafana is not prohibited long-term (D5).
    until the operator confirms it is stored. No API token is in it.
 
 A pending init is saved locally. `--resume` continues it, `--discard` drops it,
-and init refuses while a context or pending init for that server exists.
+and init refuses while workspace access or pending init for that server exists.
 
 ### 6.2 Operator session
 
-`login` imports a bundle into a context; it validates the bundle against the
-node before it replaces anything, and an existing context name needs
-`--replace <name>`. Every node command targets `--context`, then
-`EREGION_CONTEXT`, then the current context, as in vaire. Every command checks the node's
+`login` imports verified workspace access; it validates the bundle against the
+node before publishing anything, and replacing existing access requires
+`--replace <workspace-name>`. Every node command selects `--workspace`, then
+`EREGION_WORKSPACE`, then the current workspace. Every command checks the node's
 eregion version first and refuses with `node_version_mismatch` unless
-`--auto-upgrade-nodes` is given or set on the context. `upgrade` replaces only
+`--auto-upgrade-nodes` is given or saved for the workspace. `upgrade` replaces only
 the local CLI and says so; `apply --auto-upgrade-nodes` upgrades the node and
 converges its steps; `doctor` reports drift, security, certificates, disk,
 retention and versions. `eregion ssh` opens a shell over WireGuard.

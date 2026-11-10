@@ -32,7 +32,6 @@ func TestHandoffGroupsCarryEverythingLoginNeeds(t *testing.T) {
 	h := &secretsHandoff{node: "prod", groups: init.handoffGroups()}
 	rec := parseHandoffRecord(h.body())
 	for _, want := range []struct{ section, label, value string }{
-		{"Main node", "Context", "prod"},
 		{"Main node", "Workspace", "thelab"},
 		{"Main node", "Workspace ID", "ws_0123456789abcdef01234567"},
 		{"Main node", "WireGuard endpoint", "203.0.113.10:51820"},

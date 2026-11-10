@@ -13,7 +13,7 @@ import (
 
 // workspaceStep records the one-time portable installation workspace identity
 // after migrations exist. It only runs when an explicit workspace name was
-// supplied (new setup or `apply --workspace`); a legacy apply without the flag
+// supplied (new setup or `apply --assign-workspace`); a legacy apply without the flag
 // leaves the installation explicitly unconfigured and never guesses.
 type workspaceStep struct {
 	cfg      Config

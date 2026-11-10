@@ -17,10 +17,10 @@ import (
 
 func secretMeta(summary, example string) CommandMeta {
 	meta := readMeta(summary,
-		[]string{summary + ". Runs on the node through the active context; the operator is the SSH-authenticated admin, never the payload."},
+		[]string{summary + ". Runs on the node through the selected workspace; the operator is the SSH-authenticated admin, never the payload."},
 		[]string{example}, "eregion secret list --app <app> --environment <env> --json")
 	meta.Remote = true
-	meta.Environment = []string{"EREGION_CONTEXT_FILE", "EREGION_CONTEXT"}
+	meta.Environment = []string{"EREGION_WORKSPACE_FILE", "EREGION_WORKSPACE"}
 	meta.ErrorCodes = []contract.Code{
 		contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed,
 		contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.Conflict,

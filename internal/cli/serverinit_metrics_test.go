@@ -16,7 +16,8 @@ import (
 )
 
 func TestInitGeneratesTelemetryCredentialAndSendsOnlyItsHash(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	mainDir := prepareInitAccess(t, "main")
 	r := &serverInit{
 		a: &app{secrets: &secrets.Registry{}}, cmd: &cobra.Command{Use: "init"},
 		answers: serverInitAnswers{Context: "main", Node: "main"},
@@ -38,7 +39,7 @@ func TestInitGeneratesTelemetryCredentialAndSendsOnlyItsHash(t *testing.T) {
 	if gotConfirm != "main/metrics" || !telemetry.ValidHash(gotHash) {
 		t.Fatalf("rotate received hash=%q confirm=%q", gotHash, gotConfirm)
 	}
-	credential, err := loadMetricsCredential("main")
+	credential, err := loadMetricsCredential(mainDir)
 	if err != nil || credential == nil || !telemetry.VerifyPassword(gotHash, credential.Password) {
 		t.Fatalf("local credential = %+v err=%v", credential, err)
 	}
@@ -65,12 +66,13 @@ func TestInitGeneratesTelemetryCredentialAndSendsOnlyItsHash(t *testing.T) {
 }
 
 func TestInitReusesAnExistingLocalTelemetryCredential(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	mainDir := prepareInitAccess(t, "main")
 	existing, err := telemetry.NewCredential()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := saveMetricsCredential("main", existing); err != nil {
+	if err := saveMetricsCredential(mainDir, existing); err != nil {
 		t.Fatal(err)
 	}
 	r := &serverInit{
@@ -139,4 +141,26 @@ func TestLoginRecordRestoresTelemetryCredentialShape(t *testing.T) {
 	if got := record.field("Node metrics", "Password"); len(got) < 32 {
 		t.Fatalf("password = %q", got)
 	}
+}
+
+func prepareInitAccess(t *testing.T, name string) string {
+	t.Helper()
+	store, err := host.LoadWorkspaceStore("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	access := host.WorkspaceAccess{Name: name, SSH: &host.WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null"}}
+	if _, ok := store.AccessByName(name); !ok {
+		if _, err := store.PublishUnconfiguredAccess(access); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir, err := store.CredentialDirFor(access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

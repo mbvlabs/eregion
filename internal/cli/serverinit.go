@@ -48,14 +48,14 @@ const (
 func (a *app) serverSpecs() []spec {
 	parent := readMeta("Set up and manage eregion servers",
 		[]string{"Set up a fresh Debian 13 or Ubuntu 26.04 server as an eregion main node. The operator CLI runs on Linux or macOS; the node receives a matching linux binary."},
-		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --workspace thelab --hostname app.example.com --database-url-file /root/eregion-db.url --context-name prod --accept-new-host-key --secrets-out ./prod-secrets.md --confirm prod --json"})
+		[]string{"eregion server init", "eregion server init --host root@203.0.113.10 --workspace-name thelab --hostname app.example.com --database-url-file /root/eregion-db.url --accept-new-host-key --secrets-out ./thelab-secrets.md --confirm thelab --json"})
 	parent.Platforms = []string{"linux", "darwin"}
 	meta := parent
 	meta.Summary = "Set up a fresh server as the main node (control plane)"
 	meta.WhenToUse = []string{"Run it bare in a terminal for the guided setup. Agents pass every answer, a host key decision, --secrets-out and --confirm <server>; JSON and no-TTY use never prompt."}
 	meta.Mutating, meta.DryRun, meta.Prompts, meta.Remote = true, true, true, true
-	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "workspace", "hostname", "database-url-file", "context-name", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm", "skip-doctor"}
-	meta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_CONTEXT_FILE"}
+	meta.InputFlags = []string{"host", "identity", "password-stdin", "node", "workspace-name", "hostname", "database-url-file", "admin-user", "answers", "host-key-fingerprint", "accept-new-host-key", "secrets-out", "confirm", "skip-doctor"}
+	meta.Environment = []string{"EREGION_DATABASE_URL", "EREGION_WORKSPACE_FILE"}
 	meta.NeedsRestart = "never"
 	meta.ErrorCodes = append(meta.ErrorCodes, contract.ValidationFailed, contract.PreconditionFailed, contract.DoctorFailed, contract.ConfirmationRequired, contract.MissingTool, contract.RemoteUnreachable, contract.NotFound)
 	return []spec{{
@@ -71,10 +71,9 @@ func (a *app) serverSpecs() []spec {
 				f.String("identity", "", "SSH private key for first contact; default: ssh-agent and ~/.ssh keys")
 				f.Bool("password-stdin", false, "Read the root SSH password from the first line of standard input")
 				f.String("node", "", "Main node name (default main)")
-				f.String("workspace", "", "Portable workspace name (e.g. thelab); separate from the node and local context")
+				f.String("workspace-name", "", "Portable workspace name (e.g. thelab); separate from the node name")
 				f.String("hostname", "", "Public hostname of the main node, used exactly as given (e.g. app.example.com)")
 				f.String("database-url-file", "", "External PostgreSQL URL file; otherwise EREGION_DATABASE_URL")
-				f.String("context-name", "", "Server and local context name (default: the node name)")
 				f.String("admin-user", "admin", "Unprivileged operator account on the server")
 				f.String("answers", "", "TOML file with the answers; flags override it")
 				f.String("host-key-fingerprint", "", "Expected SHA256 host key fingerprint")
@@ -116,7 +115,7 @@ type serverInitSummary struct {
 	WorkspaceID   string         `json:"workspace_id,omitempty"`
 	Platform      string         `json:"platform"`
 	Hostname      string         `json:"hostname"`
-	Context       string         `json:"context"`
+	Context       string         `json:"-"`
 	AdminUser     string         `json:"admin_user"`
 	PublicAddress string         `json:"public_address"`
 	API           string         `json:"api"`
@@ -153,6 +152,9 @@ type serverInit struct {
 	operationID  string
 	vaultKeyring string
 	warnings     []string
+	// storePath is the one resolved private store for this init. Pending state,
+	// identity files and publication all use its parent.
+	storePath string
 	// workspace is the authoritative identity read from the node before the
 	// handoff. The generated ID is never invented locally.
 	workspace controlplane.WorkspaceIdentity
@@ -180,6 +182,19 @@ func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error)
 	jsonMode, _ := cmd.Flags().GetBool("json")
 	outputMode, _ := cmd.Flags().GetString("output")
 	r := &serverInit{a: a, cmd: cmd}
+	if err := rejectWorkspaceSelection(cmd, "server init"); err != nil {
+		return result{}, err
+	}
+	store, err := loadWorkspaceStore(cmd)
+	if err != nil {
+		return result{}, err
+	}
+	r.storePath = store.Path
+	if workspaceFileExplicit(cmd) {
+		if err := rejectSharedInitStoreRoot(store.Path); err != nil {
+			return result{}, err
+		}
+	}
 	r.dryRun = boolFlag(cmd, "dry-run")
 	r.interactive = !jsonMode && outputMode != "json" && term.IsTerminal(int(os.Stdin.Fd())) && ui.Enabled(os.Stderr) //nolint:gosec // G115: file descriptors fit in int.
 	if r.interactive {
@@ -200,7 +215,7 @@ func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error)
 	if r.interactive {
 		return result{data: summary, streamed: true}, nil
 	}
-	plain := "server " + summary.Server + " is ready; context " + summary.Context + " is current"
+	plain := "server " + summary.Server + " is ready"
 	if summary.Workspace != "" {
 		plain += "; workspace " + summary.Workspace
 		if summary.WorkspaceID != "" {
@@ -227,6 +242,128 @@ func (a *app) serverInit(cmd *cobra.Command, _ []string) (res result, err error)
 	return result{data: summary, plain: plain}, nil
 }
 
+func workspaceFileExplicit(cmd *cobra.Command) bool {
+	if strings.TrimSpace(os.Getenv("EREGION_WORKSPACE_FILE")) != "" {
+		return true
+	}
+	return cmd != nil && flagString(cmd, "workspace-file") != ""
+}
+
+// rejectSharedInitStoreRoot keeps init's historical servers/ and pending/
+// layout from being shared by two different store files in one directory.
+// Existing default-store layouts are unchanged; an explicit additional store
+// must use its own directory rather than silently share credential paths.
+func rejectSharedInitStoreRoot(storePath string) error {
+	dir := filepath.Dir(storePath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") || entry.Name() == filepath.Base(storePath) {
+			continue
+		}
+		fault := contract.NewFault(contract.ValidationFailed,
+			"server init needs an exclusive private store directory",
+			"Another workspace store file is in the same directory. Use a separate directory for this store so servers/ and pending/ cannot be shared.")
+		fault.Details = map[string]any{"store": filepath.Base(storePath), "conflicting_store": entry.Name()}
+		return fault
+	}
+	return nil
+}
+
+func (r *serverInit) workspaceStorePath() (string, error) {
+	if r.storePath != "" {
+		return r.storePath, nil
+	}
+	store, err := host.LoadWorkspaceStore("")
+	if err != nil {
+		return "", err
+	}
+	r.storePath = store.Path
+	return r.storePath, nil
+}
+
+func (r *serverInit) pendingNames() ([]string, error) {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return nil, err
+	}
+	return host.PendingNamesAt(storePath)
+}
+
+func (r *serverInit) loadPending(name string) (*host.PendingInit, error) {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return nil, err
+	}
+	return host.LoadPendingAt(storePath, name)
+}
+
+func (r *serverInit) pendingExists(name string) bool {
+	storePath, err := r.workspaceStorePath()
+	return err == nil && host.PendingExistsAt(storePath, name)
+}
+
+func (r *serverInit) removePending(name string) error {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return err
+	}
+	return host.RemovePendingAt(storePath, name)
+}
+
+func (r *serverInit) pendingKnownHosts(name string) (string, error) {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return "", err
+	}
+	return host.PendingKnownHostsAt(storePath, name)
+}
+
+func (r *serverInit) loadPendingFile(name, file string) ([]byte, error) {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return nil, err
+	}
+	return host.LoadPendingFileAt(storePath, name, file)
+}
+
+func (r *serverInit) savePendingFile(name, file string, data []byte) error {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return err
+	}
+	return host.SavePendingFileAt(storePath, name, file, data)
+}
+
+func (r *serverInit) loadOrCreateIdentity(name string) (*operatorIdentity, error) {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return nil, err
+	}
+	return loadOrCreateIdentityAt(storePath, name)
+}
+
+func (r *serverInit) identityDir(name string) (string, error) {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return "", err
+	}
+	return identityDirAt(storePath, name), nil
+}
+
+func (r *serverInit) knownHostsPath(name string) (string, error) {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return "", err
+	}
+	return knownHostsPathAt(storePath, name), nil
+}
+
 func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 	if boolFlag(r.cmd, "discard") {
 		if boolFlag(r.cmd, "resume") {
@@ -238,7 +375,7 @@ func (r *serverInit) run(ctx context.Context) (serverInitSummary, error) {
 		return serverInitSummary{}, err
 	}
 	if r.pending.Done(phaseHandoff) {
-		_ = host.RemovePending(r.answers.Context)
+		_ = r.removePending(r.answers.Context)
 		return serverInitSummary{
 			Server: r.answers.Context, Node: r.answers.Node, Workspace: r.pending.Workspace, WorkspaceID: r.pending.WorkspaceID,
 			Context: r.answers.Context, Hostname: r.answers.Hostname, AdminUser: r.answers.AdminUser,
@@ -302,7 +439,7 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 	if r.pending.Done(phaseAccessSetup) {
 		// The node already trusts the generated SSH key. Regenerating it would
 		// silently break the only operator login.
-		if dir, dirErr := identityDir(r.answers.Context); dirErr == nil {
+		if dir, dirErr := r.identityDir(r.answers.Context); dirErr == nil {
 			for _, name := range []string{"ssh_ed25519", "wireguard.key"} {
 				if _, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil {
 					return contract.NewFault(contract.PreconditionFailed, "the operator identity for "+r.answers.Context+" is missing ("+name+")", "The server already trusts the old keys. Restore "+dir+" or run server init --discard and rebuild.")
@@ -310,7 +447,7 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 			}
 		}
 	}
-	id, err := loadOrCreateIdentity(r.answers.Context)
+	id, err := r.loadOrCreateIdentity(r.answers.Context)
 	if err != nil {
 		return err
 	}
@@ -363,7 +500,7 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		return err
 	}
 
-	var route *host.ContextSSH
+	var route *host.WorkspaceSSH
 	if !r.pending.Done(phaseAccess) {
 		if route, err = r.secureAccess(ctx, r.identity, r.answers.Host); err != nil {
 			return err
@@ -390,8 +527,8 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 		if err := r.mark(phaseContext); err != nil {
 			return err
 		}
-	} else if store, err := host.LoadContextStore(""); err == nil {
-		if _, err := store.Use(r.answers.Context); err != nil {
+	} else if store, err := loadWorkspaceStore(r.cmd); err == nil {
+		if err := store.SelectInitializationAccess(r.answers.Context, route); err != nil {
 			return err
 		}
 	}
@@ -430,40 +567,27 @@ func (r *serverInit) execute(ctx context.Context, summary *serverInitSummary) er
 			return err
 		}
 	}
-	if err := host.RemovePending(r.answers.Context); err != nil {
+	if err := r.removePending(r.answers.Context); err != nil {
 		r.warnings = append(r.warnings, "the local pending state could not be removed: "+err.Error())
 	}
 	return nil
 }
 
 // prepare collects and validates the answers, loads a pending init on
-// --resume, and refuses a server that already has a context or an unfinished
+// --resume, and refuses a server that already has local workspace access or an unfinished
 // init.
 func (r *serverInit) prepare() error {
 	if boolFlag(r.cmd, "resume") {
-		name := flagString(r.cmd, "context-name")
-		if name == "" {
-			names, err := host.PendingNames()
-			if err != nil {
-				return err
-			}
-			switch len(names) {
-			case 0:
-				return contract.NewFault(contract.PreconditionFailed, "there is no unfinished init to resume", "Start one with eregion server init.")
-			case 1:
-				name = names[0]
-			default:
-				fault := contract.NewFault(contract.ValidationFailed, "several unfinished inits exist", "Pass --context-name with one of details.pending.")
-				fault.Details = map[string]any{"pending": names}
-				return fault
-			}
+		name, err := r.pendingNameFor(flagString(r.cmd, "workspace-name"), true)
+		if err != nil {
+			return err
 		}
-		pending, err := host.LoadPending(name)
+		pending, err := r.loadPending(name)
 		if err != nil {
 			return err
 		}
 		r.pending = pending
-		if v := flagString(r.cmd, "workspace"); v != "" {
+		if v := flagString(r.cmd, "workspace-name"); v != "" {
 			if err := host.ValidateWorkspaceName(v); err != nil {
 				return err
 			}
@@ -471,7 +595,7 @@ func (r *serverInit) prepare() error {
 				if pending.Workspace != v {
 					fault := contract.NewFault(contract.Conflict,
 						"the unfinished init already requested workspace "+pending.Workspace,
-						"Resume with --workspace "+pending.Workspace+", or discard the unfinished init before choosing another workspace.")
+						"Resume with --workspace-name "+pending.Workspace+", or discard the unfinished init before choosing another workspace.")
 					fault.Details = map[string]any{"pending_workspace": pending.Workspace, "requested_workspace": v}
 					return fault
 				}
@@ -481,7 +605,7 @@ func (r *serverInit) prepare() error {
 				if pending.Done(phaseHost) {
 					fault := contract.NewFault(contract.PreconditionFailed,
 						"the unfinished init already applied its host plan without a workspace; a workspace cannot be introduced on resume",
-						"Finish it with eregion server init --resume without --workspace, then run eregion apply --workspace "+v+" and refresh the protected export.")
+						"Finish it with eregion server init --resume, then run eregion apply --assign-workspace "+v+" and refresh the protected export.")
 					fault.Details = map[string]any{"requested_workspace": v}
 					return fault
 				}
@@ -490,7 +614,7 @@ func (r *serverInit) prepare() error {
 				// must persist before effects even when contact and secrets
 				// are already complete and execute will not save them again.
 				if !dryRun(r.cmd) {
-					if err := pending.Save(); err != nil {
+					if err := r.savePendingRecord(pending); err != nil {
 						return err
 					}
 				}
@@ -515,7 +639,7 @@ func (r *serverInit) prepare() error {
 		if v := flagString(r.cmd, "secrets-out"); v != "" {
 			r.pending.SecretsOut = v
 		}
-		known, err := host.PendingKnownHosts(name)
+		known, err := r.pendingKnownHosts(name)
 		if err != nil {
 			return err
 		}
@@ -528,24 +652,24 @@ func (r *serverInit) prepare() error {
 			return err
 		}
 		name := r.answers.Context
-		store, err := host.LoadContextStore("")
+		store, err := loadWorkspaceStore(r.cmd)
 		if err != nil {
 			return err
 		}
-		for _, saved := range store.Contexts {
+		for _, saved := range store.Access {
 			if saved.Name == name {
-				fault := contract.NewFault(contract.PreconditionFailed, "a context named "+name+" already exists on this machine", "Use another --context-name, or remove it with eregion context remove "+name+" --confirm "+name+".")
-				fault.Details = map[string]any{"reason": "context_exists", "context": name}
+				fault := contract.NewFault(contract.PreconditionFailed, "workspace "+name+" already has local access on this machine", "Use another --workspace-name, or remove the saved workspace access with eregion workspace remove "+name+" --confirm "+name+".")
+				fault.Details = map[string]any{"reason": "workspace_access_exists", "workspace": name}
 				return fault
 			}
 		}
-		if host.PendingExists(name) {
-			fault := contract.NewFault(contract.PreconditionFailed, "an unfinished init for "+name+" exists", "Continue it with eregion server init --resume --context-name "+name+", or drop it with eregion server init --discard --context-name "+name+".")
+		if r.pendingExists(name) {
+			fault := contract.NewFault(contract.PreconditionFailed, "an unfinished init for "+name+" exists", "Continue it with eregion server init --resume --workspace-name "+name+", or drop it with eregion server init --discard --workspace-name "+name+".")
 			fault.Details = map[string]any{"reason": "init_pending", "server": name}
 			return fault
 		}
 		r.pending = &host.PendingInit{Server: name, Phases: map[string]string{}}
-		known, err := host.PendingKnownHosts(name)
+		known, err := r.pendingKnownHosts(name)
 		if err != nil {
 			return err
 		}
@@ -604,10 +728,9 @@ func (r *serverInit) collect() error {
 	take("host", "host", &ans.Host)
 	take("identity", "identity", &ans.Identity)
 	take("node", "node", &ans.Node)
-	take("workspace", "workspace", &ans.Workspace)
+	take("workspace_name", "workspace-name", &ans.Workspace)
 	take("hostname", "hostname", &ans.Hostname)
 	take("database_url_file", "database-url-file", &ans.DatabaseURLFile)
-	take("context", "context-name", &ans.Context)
 	take("admin_user", "admin-user", &ans.AdminUser)
 	ans.PasswordStdin = boolFlag(cmd, "password-stdin")
 
@@ -632,16 +755,6 @@ func (r *serverInit) collect() error {
 
 	if ans.Node == "" {
 		ans.Node = "main"
-	}
-	if !given["context"] && r.interactive {
-		v, err := ui.Input("Server and context name", "Names the server locally and in the secrets handoff", ans.Node)
-		if err != nil {
-			return err
-		}
-		ans.Context = v
-	}
-	if ans.Context == "" {
-		ans.Context = ans.Node
 	}
 	if ans.AdminUser == "" {
 		ans.AdminUser = access.AdminUser
@@ -686,13 +799,16 @@ func (r *serverInit) collect() error {
 	}
 	if ans.Workspace == "" {
 		if !r.interactive {
-			return contract.NewFault(contract.InputRequired, "a new setup needs --workspace NAME", "Pass --workspace thelab. The workspace is portable identity, separate from --node and --context-name.")
+			return contract.NewFault(contract.InputRequired, "a new setup needs --workspace-name NAME", "Pass --workspace-name thelab. The workspace identity is separate from --node.")
 		}
-		v, err := ui.Input("Workspace name", "Portable installation identity, for example thelab; separate from the node and local context", "")
+		v, err := ui.Input("Workspace name", "Portable installation identity, for example thelab; separate from the node name", "")
 		if err != nil {
 			return err
 		}
 		ans.Workspace = strings.TrimSpace(v)
+	}
+	if ans.Context == "" {
+		ans.Context = ans.Workspace
 	}
 	if !given["admin_user"] && r.interactive {
 		v, err := ui.Input("Admin user", "The unprivileged operator account", ans.AdminUser)
@@ -725,17 +841,17 @@ func (r *serverInit) validate() error {
 	if ans.PasswordStdin && ans.Identity != "" {
 		return contract.NewFault(contract.Usage, "--password-stdin and --identity cannot be combined", "Use one first-contact credential.")
 	}
-	if err := host.ValidateContextName(ans.Context); err != nil {
+	if err := host.ValidateAccessName(ans.Context); err != nil {
 		return err
 	}
-	if err := requireAgreedContext(r.cmd, ans.Context); err != nil {
+	if err := rejectWorkspaceSelection(r.cmd, "server init"); err != nil {
 		return err
 	}
 	if err := host.ValidateNodeName(ans.Node); err != nil {
 		return err
 	}
 	if ans.Workspace == "" && !r.workspaceOptional {
-		return contract.NewFault(contract.InputRequired, "a new setup needs a workspace name", "Pass --workspace thelab. Existing alpha.6 installations use eregion apply --workspace instead.")
+		return contract.NewFault(contract.InputRequired, "a new setup needs --workspace-name NAME", "Pass --workspace-name thelab. Existing alpha.6 installations use eregion apply --assign-workspace instead.")
 	}
 	if ans.Workspace != "" {
 		if err := host.ValidateWorkspaceName(ans.Workspace); err != nil {
@@ -1100,7 +1216,7 @@ func (r *serverInit) readVaultKeyring(ctx context.Context) error {
 	path := filepath.Join(host.DefaultLayout().ConfigDir, host.VaultKeyringName)
 	task := r.start("keyring", "Reading the vault keyring for the handoff")
 	var ring string
-	if raw, err := host.LoadPendingFile(r.answers.Context, host.VaultKeyringName); err == nil {
+	if raw, err := r.loadPendingFile(r.answers.Context, host.VaultKeyringName); err == nil {
 		ring = strings.TrimSpace(string(raw))
 	} else if r.remote == nil {
 		task.end(ui.EndFail, "")
@@ -1112,7 +1228,7 @@ func (r *serverInit) readVaultKeyring(ctx context.Context) error {
 			return contract.NewFault(contract.Unavailable, "could not read the vault keyring on the server", err.Error())
 		}
 		ring = strings.TrimSpace(string(raw))
-		if err := host.SavePendingFile(r.answers.Context, host.VaultKeyringName, []byte(strings.TrimRight(ring, "\n")+"\n")); err != nil {
+		if err := r.savePendingFile(r.answers.Context, host.VaultKeyringName, []byte(strings.TrimRight(ring, "\n")+"\n")); err != nil {
 			task.end(ui.EndFail, "")
 			return err
 		}
@@ -1150,11 +1266,11 @@ func (r *serverInit) loadDatabaseURL() error {
 	return nil
 }
 
-// routeFromPending rebuilds the context route on a resume that already locked
+// routeFromPending rebuilds the workspace route on a resume that already locked
 // the host down.
-func (r *serverInit) routeFromPending() (*host.ContextSSH, error) {
+func (r *serverInit) routeFromPending() (*host.WorkspaceSSH, error) {
 	if r.identity == nil {
-		id, err := loadOrCreateIdentity(r.answers.Context)
+		id, err := r.loadOrCreateIdentity(r.answers.Context)
 		if err != nil {
 			return nil, err
 		}
@@ -1163,12 +1279,12 @@ func (r *serverInit) routeFromPending() (*host.ContextSSH, error) {
 	if r.pending.NodePublicKey == "" {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the pending init has no node WireGuard key", "Run server init --discard and start again; the host may need a rebuild.")
 	}
-	known, err := contextKnownHostsPath(r.answers.Context)
+	known, err := r.knownHostsPath(r.answers.Context)
 	if err != nil {
 		return nil, err
 	}
-	// The saved route always uses the context's own known_hosts. A resume can
-	// reach this point after access setup but before the context was saved, so
+	// The saved route always uses the workspace access own known_hosts. A resume can
+	// reach this point after access setup but before the workspace access was saved, so
 	// rebuild that file from the verified public first-contact pin instead of
 	// relying on a pin left by an earlier run or on the shared store.
 	if err := pinContextKnownHosts(r.knownHosts, known, r.answers.address(), net.JoinHostPort(access.NodeAddress, "22")); err != nil {
@@ -1177,19 +1293,27 @@ func (r *serverInit) routeFromPending() (*host.ContextSSH, error) {
 	return r.identity.wireGuardRoute(r.answers.Host, r.pending.NodePublicKey, known, r.answers.AdminUser), nil
 }
 
-func (r *serverInit) saveContext(route *host.ContextSSH) error {
-	task := r.start("context", "Saving context "+r.answers.Context)
-	store, err := host.LoadContextStore("")
+func (r *serverInit) saveContext(route *host.WorkspaceSSH) error {
+	task := r.start("workspace", "Saving workspace access "+r.answers.Context)
+	store, err := loadWorkspaceStore(r.cmd)
 	if err != nil {
 		task.end(ui.EndFail, "")
 		return err
 	}
-	if _, err := store.SaveContext(host.Context{Name: r.answers.Context, SSH: route}); err != nil {
+	if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: r.answers.Context, SSH: route}); err != nil {
 		task.end(ui.EndFail, "")
 		return err
 	}
 	task.end(ui.EndOK, "SSH over WireGuard, no API token")
 	return nil
+}
+
+func (r *serverInit) savePendingRecord(p *host.PendingInit) error {
+	storePath, err := r.workspaceStorePath()
+	if err != nil {
+		return err
+	}
+	return p.SaveAt(storePath)
 }
 
 func (r *serverInit) savePending() error {
@@ -1222,38 +1346,79 @@ func (r *serverInit) savePending() error {
 	if r.platform.Arch != "" {
 		p.Arch = r.platform.Arch
 	}
-	return p.Save()
+	return r.savePendingRecord(p)
 }
 
 func (r *serverInit) mark(phase string) error {
 	r.pending.Mark(phase)
-	return r.pending.Save()
+	return r.savePendingRecord(r.pending)
+}
+
+// pendingNameFor resolves a private pending-init directory from a public
+// workspace name, or the sole unfinished init when no selector is given.
+func (r *serverInit) pendingNameFor(selection string, resume bool) (string, error) {
+	names, err := r.pendingNames()
+	if err != nil {
+		return "", err
+	}
+	if selection == "" {
+		switch len(names) {
+		case 0:
+			if resume {
+				return "", contract.NewFault(contract.PreconditionFailed, "there is no unfinished init to resume", "Start one with eregion server init.")
+			}
+			return "", contract.NewFault(contract.PreconditionFailed, "there is no unfinished init to discard", "Start one with eregion server init.")
+		case 1:
+			return names[0], nil
+		default:
+			fault := contract.NewFault(contract.InputRequired, "several unfinished inits exist", "Pass --workspace-name with one of details.pending.")
+			fault.Details = map[string]any{"flag": "--workspace-name", "pending": names}
+			return "", fault
+		}
+	}
+	for _, name := range names {
+		if name == selection {
+			return name, nil
+		}
+	}
+	matched := ""
+	for _, name := range names {
+		pending, err := r.loadPending(name)
+		if err != nil {
+			continue
+		}
+		if pending.Workspace != selection {
+			continue
+		}
+		if matched != "" {
+			return "", contract.NewFault(contract.Conflict, "several unfinished inits match workspace "+selection, "Use the binary's pending details to complete or discard the intended init.")
+		}
+		matched = name
+	}
+	if matched == "" {
+		if len(names) == 1 {
+			return names[0], nil
+		}
+		return "", contract.NewFault(contract.NotFound, "no unfinished init matches "+selection, "Inspect unfinished inits with eregion server init status.")
+	}
+	return matched, nil
 }
 
 // discard drops the local pending state. It never touches the server.
 func (r *serverInit) discard() (serverInitSummary, error) {
-	name := flagString(r.cmd, "context-name")
-	if name == "" {
-		names, err := host.PendingNames()
-		if err != nil {
-			return serverInitSummary{}, err
-		}
-		if len(names) != 1 {
-			fault := contract.NewFault(contract.InputRequired, "--discard needs --context-name", "Pass the server whose unfinished init to drop.")
-			fault.Details = map[string]any{"flag": "--context-name", "pending": names}
-			return serverInitSummary{}, fault
-		}
-		name = names[0]
-	}
-	if err := host.ValidateContextName(name); err != nil {
+	name, err := r.pendingNameFor(flagString(r.cmd, "workspace-name"), false)
+	if err != nil {
 		return serverInitSummary{}, err
 	}
-	if !host.PendingExists(name) {
+	if err := host.ValidateAccessName(name); err != nil {
+		return serverInitSummary{}, err
+	}
+	if !r.pendingExists(name) {
 		fault := contract.NewFault(contract.PreconditionFailed, "there is no unfinished init for "+name, "Start one with eregion server init.")
-		fault.Details = map[string]any{"reason": "nothing_to_discard", "pending": pendingNamesOrNil()}
+		fault.Details = map[string]any{"reason": "nothing_to_discard", "pending": r.pendingNamesOrNil()}
 		return serverInitSummary{}, fault
 	}
-	pending, err := host.LoadPending(name)
+	pending, err := r.loadPending(name)
 	if err != nil {
 		// A corrupt pending state must still be discardable; that is the
 		// recovery path for a bad file.
@@ -1276,26 +1441,26 @@ func (r *serverInit) discard() (serverInitSummary, error) {
 	if err := r.confirmDiscard(name); err != nil {
 		return summary, err
 	}
-	if err := host.RemovePending(name); err != nil {
+	if err := r.removePending(name); err != nil {
 		return summary, err
 	}
-	// Keep the identity when a context already references it; dropping the
+	// Keep the identity when a workspace access record already references it; dropping the
 	// files would break that context.
-	store, err := host.LoadContextStore("")
+	store, err := loadWorkspaceStore(r.cmd)
 	switch {
 	case err != nil:
-		r.warnings = append(r.warnings, "the context store is unreadable, so the generated identity files were kept: "+err.Error())
-	case contextSaved(store, name):
+		r.warnings = append(r.warnings, "the workspace store is unreadable, so the generated identity files were kept: "+err.Error())
+	case workspaceAccessSaved(store, name):
 	default:
-		if dir, err := identityDir(name); err == nil {
+		if dir, err := r.identityDir(name); err == nil {
 			_ = os.RemoveAll(dir)
 		}
 	}
 	return summary, nil
 }
 
-func contextSaved(store *host.ContextStore, name string) bool {
-	for _, saved := range store.Contexts {
+func workspaceAccessSaved(store *host.WorkspaceStore, name string) bool {
+	for _, saved := range store.Access {
 		if saved.Name == name {
 			return true
 		}
@@ -1303,8 +1468,8 @@ func contextSaved(store *host.ContextStore, name string) bool {
 	return false
 }
 
-func pendingNamesOrNil() []string {
-	names, _ := host.PendingNames()
+func (r *serverInit) pendingNamesOrNil() []string {
+	names, _ := r.pendingNames()
 	return names
 }
 
@@ -1377,7 +1542,7 @@ func (r *serverInit) confirm() error {
 // as the implementation reference says.
 func (r *serverInit) preview(ctx context.Context) error {
 	if !boolFlag(r.cmd, "resume") {
-		defer func() { _ = host.RemovePending(r.answers.Context) }()
+		defer func() { _ = r.removePending(r.answers.Context) }()
 	}
 	if !r.pending.Done(phaseContact) {
 		if err := r.localPreflight(ctx); err != nil {
@@ -1507,11 +1672,11 @@ func (r *serverInit) runDoctorGate(ctx context.Context, summary *serverInitSumma
 	return nil
 }
 
-// initNodeClient selects the context this init created. The ambient
-// --context/EREGION_CONTEXT selection is for ordinary commands; the readiness
+// initNodeClient selects the workspace access this init created. The ambient
+// --workspace/EREGION_WORKSPACE selection is for ordinary commands; the readiness
 // check and doctor gate must inspect the server being initialized.
 func (r *serverInit) initNodeClient() (*nodeClient, error) {
-	return r.a.nodeClientFor(r.cmd, r.answers.Context)
+	return r.a.nodeClientForInitializationAccessName(r.cmd, r.answers.Context)
 }
 
 // ensureTelemetryCredential reuses or generates the operator-side credential
@@ -1526,14 +1691,18 @@ func (r *serverInit) ensureTelemetryCredential(ctx context.Context) error {
 			return err
 		}
 	}
-	credential, err := loadMetricsCredential(r.answers.Context)
+	credentialDir, err := workspaceCredentialDirByName(r.cmd, r.answers.Context)
 	if err != nil {
 		return err
 	}
-	if _, err := rotateMetricsCredential(ctx, client, r.answers.Context, r.answers.Node, r.answers.Node+"/metrics", credential, func(value string) { r.a.secrets.Add(value) }); err != nil {
+	credential, err := loadMetricsCredential(credentialDir)
+	if err != nil {
 		return err
 	}
-	credential, err = loadMetricsCredential(r.answers.Context)
+	if _, err := rotateMetricsCredential(ctx, client, credentialDir, r.answers.Node, r.answers.Node+"/metrics", credential, func(value string) { r.a.secrets.Add(value) }); err != nil {
+		return err
+	}
+	credential, err = loadMetricsCredential(credentialDir)
 	if err != nil {
 		return err
 	}
@@ -1562,7 +1731,7 @@ func (r *serverInit) resumeTasks() []string {
 	}
 	remaining = append(remaining, "confirm access over WireGuard and close public SSH")
 	if !r.pending.Done(phaseContext) {
-		remaining = append(remaining, "save the local context")
+		remaining = append(remaining, "save the local workspace access")
 	}
 	if !r.pending.Done(phaseChecks) {
 		remaining = append(remaining, "check node readiness, node_exporter, DNS and the certificate")
@@ -1772,7 +1941,6 @@ func (r *serverInit) finish(s serverInitSummary) {
 		return
 	}
 	rows := [][2]string{
-		{"context", s.Server},
 		{"node", s.Node},
 	}
 	if s.Workspace != "" {
@@ -1831,7 +1999,7 @@ func withResumeHint(err error, server string) error {
 	var fault *contract.Fault
 	if errors.As(err, &fault) {
 		copy := *fault
-		hint := "Fix the reported step, then continue with eregion server init --resume --context-name " + server + "."
+		hint := "Fix the reported step, then continue with eregion server init --resume --workspace-name " + server + "."
 		if copy.Hint != "" {
 			hint = copy.Hint + " " + hint
 		}

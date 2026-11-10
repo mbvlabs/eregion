@@ -17,12 +17,12 @@ WireGuard. They do not enqueue River jobs, query PostgreSQL or own the lifetime
 of server work; transport belongs below presentation.
 Opening the TUI is not required for guided app/env commands. The full-screen
 view is not itself a workspace identity or an authorization boundary; it renders
-the workspace/node selected through this operator's local context.
+the workspace/node selected through this operator's private workspace access.
 
 ## Current TUI
 
-The header distinguishes the actual node name, portable workspace and captured
-local context from the SSH route. A failed authoritative workspace read is
+The header distinguishes the node name, portable workspace and private access
+route. A failed authoritative workspace read is
 shown as unknown, separately from a genuinely unconfigured installation.
 
 Tabs: `1` Fleet, `2` Apps, `3` Envs, `4` Releases, `5` Deployments. Keys:

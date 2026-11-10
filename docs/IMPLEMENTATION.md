@@ -12,7 +12,7 @@ Run evidence belongs in [MANUAL-TESTING](MANUAL-TESTING.md).
 
 ```text
 operator CLI
-  -> saved context: embedded userspace WireGuard -> pinned SSH -> sudo -n eregion node rpc
+  -> saved workspace access: embedded userspace WireGuard -> pinned SSH -> sudo -n eregion node rpc
   -> NDJSON request/events/result -> shared application services (api.AppService)
   -> external PostgreSQL: domain intent + operation + River job, one transaction
   -> River worker -> local or pinned-SSH node transport -> Check/Apply effects
@@ -21,7 +21,7 @@ operator CLI
 
 Every operator command uses node-mode dispatch: the CLI writes one
 `eregion-rpc/v1` request to `eregion node rpc` on stdin over SSH inside
-WireGuard and reads NDJSON back. Contexts carry the WireGuard identity and SSH
+WireGuard and reads NDJSON back. Saved workspace access records carry the WireGuard identity and SSH
 key, not a bearer token. The HTTP API remains for the narrow CI/webhook path and
 the public `/readyz` endpoint; the operator CLI does not configure or use it.
 Before the first service call the CLI compares the node build with its own and
@@ -82,7 +82,7 @@ re-queue the older one's live platform jobs.
 | `cmd/eregion` | One executable entry point: the operator surface, hidden `node` mode (`rpc`, `serve`, `worker`, `migrate`, `bootstrap`) and hidden `node-agent`. |
 | `internal/cli/tree.go`, `meta.go`, `run.go`, `deploy.go`, `promote.go` | Command catalog, safety metadata, output selection, dispatch and the deploy/rollback/promote/build/release pipeline commands. |
 | `internal/cli/serverinit*.go`, `sshauth.go`, `handoff.go`, `login.go` | Guided setup (preflight, answers/pending, plan/confirm, apply, guarded handoff), first contact, DNS, private access and token-free age handoff/import. |
-| `internal/cli/context.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/contextstore.go` | Context resolution, node RPC client/server, version lockstep, host and local RPC, Docker workload/log reads, SSH/WireGuard route. |
+| `internal/cli/workspace_access.go`, `internal/cli/noderpc.go`, `internal/cli/hostnode.go`, `internal/cli/observe_rpc.go`, `internal/host/workspacestore.go` | Workspace resolution, node RPC client/server, version lockstep, host and local RPC, Docker workload/log reads, SSH/WireGuard route. |
 | `internal/cli/observe.go`, `internal/cli/logs.go`, `internal/cli/delete.go`, `internal/cli/operations.go` | Extended app/environment status, container logs over the operator channel, target-confirmed deletion and operation-history filters. |
 | `internal/cli/host.go`, `internal/cli/serverstatus.go`, `internal/cli/nodeunlock.go` | `plan`, `apply`, `doctor`, `ssh`, `server status` and hidden `node unlock-ssh`. |
 | `internal/protect`, `internal/totp`, `internal/tokens` | Root-only TOTP gate on the node and hashed per-use deploy tokens in `/etc/eregion/auth.json`. Every protect-state mutation (`Init`/rotate, `Confirm`, `Verify`) takes an exclusive `flock` on the stable `<protect.json>.lock` file before its load-verify-save sequence, so independent node RPC processes cannot replay a code step, lose failure counts or confirm/rotate twice. `Status` stays lock-free because `save` publishes a complete file by rename; the lock file is never renamed and is released by the kernel on process death. |
@@ -115,30 +115,36 @@ eregion help env update --json
 eregion guide agents
 ```
 
-For a node operation, identify the local **store** and selected **context** first.
-The default store is the OS configuration directory's `eregion/contexts.json`;
-`EREGION_CONTEXT_FILE` selects another store, not another server in the same
-store. `context list` describes that store. `--context NAME` chooses a context
-in it; otherwise `EREGION_CONTEXT`, then the saved current context applies.
-Names that exist only in a different store cannot resolve here. A workspace
-identifies the installation; a node name identifies its server; a context holds
-this operator machine's route/keys. None is an application environment.
+For a node operation, identify the selected **workspace** first. The default
+private store is the OS configuration directory's `eregion/contexts.json` (the
+historical file name is private storage, not a public identity); the
+`--workspace-file` flag or `EREGION_WORKSPACE_FILE` selects another existing
+store. `server init` requires an explicit store directory exclusive to that
+store file because the historical `servers/` and `pending/` roots live beside
+it; a second JSON store in the same directory is refused rather than sharing
+credentials or pending state. `workspace list`
+describes saved workspaces, one entry per authoritative ID. `--workspace NAME`
+selects the verified portable workspace name; otherwise `EREGION_WORKSPACE`,
+then the saved current workspace applies. Historical local access aliases are
+never selectors. A workspace identifies the installation and its node access;
+a node name identifies that server. Neither is an application environment.
 
 ```sh
-eregion context list --json
-eregion --context lab server status --json
-eregion --context lab domain cloudflare status --json
+eregion workspace list --json
+eregion --workspace thelab server status --json
+eregion --workspace thelab domain cloudflare status --json
 ```
 
-Use explicit context selection in automation rather than relying on a human's
-last `context use`. Do not copy secret-containing context stores into evidence
-or use the handoff as an ordinary configuration file. `login` imports protected
-access material and verifies node trust before publishing it locally; exact
-`--replace NAME` does not waive fingerprint verification.
+Use explicit workspace selection in automation rather than relying on a human's
+last `workspace use`. Do not copy secret-containing workspace stores into
+evidence or use the handoff as an ordinary configuration file. `login` imports
+protected access material and verifies portable workspace identity and node
+trust before publishing it; exact `--replace WORKSPACE` does not waive
+fingerprint verification.
 
 | Authority / credential | Role and supported flow |
 | --- | --- |
-| Operator SSH + WireGuard | Privileged node-mode control via a context. No operator bearer token is required. The OS account holding context keys is effectively privileged on that server. |
+| Operator SSH + WireGuard | Privileged node-mode control via saved workspace access. No operator bearer token is required. The OS account holding workspace access keys is effectively privileged on that server. |
 | Git read credential / `--github-auth` | Clone a private repository. Local authenticated `gh` can supply it explicitly; this is not the webhook HMAC or a CI deploy token. |
 | GitHub webhook HMAC | Authenticate signed pushes for one environment. Generated and stored through the webhook setup/rotation flow; repository hook administration is a distinct gh permission. |
 | CI deploy token | Scoped, expiring deploy authority for the narrow HTTP deploy endpoint. Minting requires the human factor; possession does not grant general operator/DNS authority. |
@@ -159,7 +165,7 @@ Cloudflare setup needs the **zone ID**, not the account ID: select the DNS zone
 in Cloudflare and use its zone identity with the matching zone name. A rejected
 read validation activates no credential and is not repaired by repeated apply.
 An accepted credential proves read validation, not write permission, DNS
-reconciliation, valid TLS or public reachability. Missing context must be fixed
+reconciliation, valid TLS or public reachability. Missing workspace access must be fixed
 before entering the token.
 
 For setup followed by DNS changes, create a Cloudflare API token with
@@ -186,7 +192,7 @@ successful rotation does not update old exports. A human runs `secrets export`
 with the factor and stores the refreshed protected artifact; an agent records
 only confirmation/metadata, never its contents. Local GitHub authentication,
 provider credentials and application secrets retain their separate scopes and
-must not be assumed interchangeable or all recoverable from a local context.
+must not be assumed interchangeable or all recoverable from private workspace access.
 
 Use the **built binary**, not a stale `bin/eregion`, to inspect exact arguments:
 
@@ -201,8 +207,8 @@ bin/eregion help app create --json
 | `server init` | Guided root first contact; Linux/macOS operator, arch-matching linux node binary, preflight, answer flags/TOML, plan/confirm, vault keyring, loopback node_exporter and telemetry endpoint prerequisites, pending-init resume/discard, the final doctor gate and guarded handoff. First contact requires SSH on port 22; another port is refused before any remote change. The plan lists the host steps and the setup.sh access changes (admin user, wg0, firewall, SSH lockdown switchover). A pending init stores the pinned SSH host key and fingerprint; `--dns-ready` skips the confirmation prompt interactively, non-interactively and on resume. `--skip-doctor` skips the gate with a warning; a failing check returns `doctor_failed` with the failed checks and resume hint. Declining the plan (or any exit that does not apply) removes the uploaded planning bundle from the server. |
 | `plan`, `apply [--dry-run]`, `doctor`, `ssh [node] [--command CMD]`, `server status` | Node-mode host convergence and inspection. `apply` records the host intent, streams step progress on stderr and skips completed steps; `doctor` exits non-zero on a failing finding. `ssh` opens a shell at a terminal or runs one command with `--command`; piped or JSON output runs without a PTY, a sudo password prompt becomes an `input_required` fault whose code and fix the runner still prints, and the remote exit status propagates. `--auto-upgrade-nodes` installs the operator's build on a mismatched node: a `dev` node accepts the caller's checksum, while a published node requires its own signed release manifest to match; `--dry-run` never installs. |
 | `node unlock-ssh [--minutes N]` | Hidden node-only break-glass command, run as root from the provider console; reopens public SSH for a bounded window and schedules the re-lock. |
-| `login --file … --passphrase-file … [--replace NAME]` | Import an age transfer bundle into a token-free context (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle must carry the context, operator keys, admin user, WireGuard address/public key/endpoint and SSH host key. Login builds and proves the identity in a sibling temporary directory, always probes the node against the bundle fingerprint, pins that key in the temporary identity's own `known_hosts` and runs readiness there; only then does it swap the directory and save the context. Saved pins live at `servers/<context>/known_hosts`, so distinct nodes sharing `10.78.0.1` cannot collide. Init preserves its verified pending public-address pin separately and derives the scoped WireGuard pin from it, including on resume. An existing context name is refused with `conflict` unless `--replace` names it exactly, and any failure leaves the old context and pinned key byte-for-byte unchanged. Existing saved routes are not rewritten automatically; reimport with `login --replace NAME` establishes scoped trust. |
-| `context list/show/use/remove` | Saved contexts, target-confirmed removal with its key files. `use` takes `--name`; `remove <name>` takes `--confirm <name>`. Every node command accepts the root `--context NAME`; resolution is the flag, then `EREGION_CONTEXT`, then the current context, and an unknown name is `not_found` with `eregion context list`. The node client, local identity reads (`secrets export`), DNS addresses and endpoint labels all use that one selected context, so they cannot disagree; only `context show/use` with no `--name` read the current context on purpose. `login` and `server init` keep their own naming inputs and refuse a `--context` that disagrees, including on `server init --resume`. `context credential add` is removed: tokens are minted only through `token create` with the human factor (D7). |
+| `login --file … --passphrase-file … [--replace WORKSPACE]` | Import an age transfer bundle into private workspace access (SSH and WireGuard keys, route). It prompts for the bundle only at a human terminal; `--json` or a non-terminal stderr never prompts and needs `--passphrase-file`. The bundle's Workspace/Workspace ID are the target identity; historical Context annotations are ignored. Login verifies the portable name/ID and node pins using a private staging directory before publishing it as the active credential directory. An existing workspace requires `--replace` with its exact canonical name; same name/different ID and same ID/different name are refused even with `--replace`. Under the store mutation lock, login reloads and replaces all local records for that ID with one verified record while preserving unrelated workspaces and their credentials. Old files are not deleted by canonicalization. Failures leave the store, old credentials and pins untouched. Old bundles without identity remain a bounded alpha access import only on a store with no verified workspace. |
+| `workspace list/show/use/remove` | Saved workspaces, one entry per authoritative workspace ID. `show [NAME_OR_ID]`, `use NAME_OR_ID` and `remove NAME_OR_ID --confirm NAME_OR_ID` use the verified workspace name or generated ID; a private access alias is never a selector. Every node command accepts the root `--workspace NAME`; resolution is the flag, then `EREGION_WORKSPACE`, then the saved current workspace. Same-name/different-ID and same-ID/different-name groups are conflicts; exact IDs can address a name conflict; multiple access records for one ID are ambiguous unless one is current or only one exists. The node client, local identity reads (`secrets export`), DNS addresses, endpoint labels and telemetry credential reads use one resolved access-record snapshot so they cannot disagree. `login` and `server init` reject an explicit global `--workspace`; their creation/assignment inputs are separate. `workspace remove` deletes local access only, never the database identity, applications or server. |
 | `app create/list/status/delete` | Guided or flag-only creation of **production and staging in one submission**: source, Buildpacks settings, processes, plain config, vault secret names and production's optional domain. Both environments and their first revisions commit in the same transaction; both are protected by default, with `--unprotected` as the explicit creation-time opt-out. Supplied `--secret` values and the Git read credential are written before submission into every created environment namespace whose revision names them; a shared recipe therefore writes both production and staging, while an environment-specific name or credential is never copied into another namespace. `--github-auth` is an explicit opt-in alternative to `--git-credential-file`: for a github.com source it reads the local authenticated `gh` token with `gh auth token --hostname github.com` in memory and writes it through the same vault path. Dry runs and idempotent replays never call gh, non-GitHub sources, conflicting credential flags and credential names already used as runtime or webhook secrets are refused before any gh read or vault write, and the token never enters argv, operation input, output or an intermediate file. `create` accepts `platform.app.create` with an `environments` array, the first domain, primary flag and main-node addresses; the first environment's binding commits before its optional first deploy is queued, and the accepted operation exposes that deploy's ID as `first_deploy_operation_id`. A retry with the operator's `--idempotency-key` previews as a replay, writes no vault revision, and returns the original operation including that ID; without the key an existing name is a conflict. Duplicate hostnames across the two environments are refused before or inside the transaction. In a terminal with deploy requested and no `--detach`, `create` follows the create operation and then the first deploy with the deploy viewer and outcome; Ctrl-C detaches with the follow command. `--detach`, JSON and no-TTY return at accepted. List/status read inventory. `status` shows the serving release, processes, persistent protection, per-domain state and recent operations; `delete` always takes `--confirm <app>` and, unless `--dry-run`, a TOTP code typed at a human terminal (D7, D13, D33). The control plane verifies the code and confirmation against locked state in the submission transaction; dry-run preview needs neither and stays available to an agent. |
 | `env create/update/protect/unprotect/promote/list/status/delete` | `create` accepts an environment with its first revision, optional domain binding and its first deploy unless `--no-deploy`; the accepted operation exposes the queued deploy's `first_deploy_operation_id`, and a terminal follows create then the first deploy with the deploy viewer unless `--detach` is given. Protection defaults from the name (production and staging protected, every other name unprotected); `--protected`/`--unprotected` override it at creation. `--from FILE` applies the shared recipe to any name, including a PR name absent from the file. A retry with the operator's `--idempotency-key` replays the accepted operation including that ID without rewriting vault values; `update` merges source, placement, runtime and process changes into a new immutable revision. `--github-auth` replaces the read credential with the local authenticated `gh` token for a github.com source; it is refused for another host, with `--git-credential-file`, with `--from`, and when the selected name is already a runtime or webhook secret. The same role check applies to `--git-credential-file`, before that file is read, and shared revision normalization enforces it for `--from` and every API path using the effective desired revision, including an unchanged source binding and the preserved webhook name. On a dry run or replay it never calls gh. In a terminal with no change flags and no webhook flags, `update` walks the current revision prefilled, shows the diff and confirms; `--auto-deploy[=false]` and `--rotate-webhook-secret` configure push to deploy and show the URL and secret once at a terminal. With flags or JSON/no-TTY it is flag-only. `protect` records durable protected state and is agent-safe; `unprotect` lowers protection and needs a TOTP code at a human terminal, refusing JSON/no-TTY. `promote <app> <source-environment>` is the dedicated D23 path: the target is the app's fixed `production` environment; it resolves and pins the source's current serving image digest, commit and source **inside the submission transaction** as a new production release without a build, then applies production's current revision, config, secret values and release command through the same blue/green path. It refuses a source without a ready serving release, **any** active production deployment (including a different artifact), an artifact already serving production, a different node, a non-production target, cross-app input and a target that fails the explicit-release deployability gate. It never copies domains, config, secrets or the source release command. Dry-run and interactive previews pass the supplied idempotency key, so an accepted same-key submission previews as a replay. List/status include revision, processes, protection and deployability. `status` shows serving release, per-process replicas, domains and recent operations; `delete` takes `--confirm <app>/<env>`; a protected or last environment also needs a TOTP code at a human terminal, while an unprotected non-last environment deletion is available to agents with the exact confirmation alone (D33). |
 | `app create|env create|env update --from FILE`, `app export` | Opt-in definition input turns strict TOML into ordinary desired state; existing flag/guided flows never read a file. The document is a shared recipe plus optional `[environments.production]`, `[environments.staging]` and `[environments.<name>]` overrides; `app create --from` resolves production and staging, while `env create --from --name pr-42` applies the shared recipe without requiring an override entry; the environment name is a command argument, not a document identity. File updates are complete supported state, carry a revision fence, refuse domain drift, require target confirmation when they remove processes/config/secret names/resources, and never deploy. Declared Docker resources are explicitly applied after the environment exists. Export is deterministic, places domains under the selected environment's override, and refuses unrepresentable auto-deploy, webhook and retention state rather than dropping it. |
@@ -221,7 +227,7 @@ bin/eregion help app create --json
 | `metrics show` | Read-only node RPC (`metrics.show`) executed on the node: two bounded reads of the loopback node_exporter with a one-second gap, then one current snapshot. Returns node/exporter identity, fetched and observed timestamps, freshness and explicit issues; CPU utilization is computed from a checked counter delta (nil and an issue after a reset or missing counter), and memory, real filesystems, load and uptime are parsed from the needed metric families. There is no eregion-run telemetry server, Prometheus/Loki deployment, external backend, global PromQL, metric store or history. Plain and JSON are the same snapshot; JSON/no-TTY never prompts. It needs no control database and no credential because the exporter is loopback-only. |
 | `metrics endpoint` | Read-only node RPC (`metrics.endpoint`): the WireGuard-only authenticated endpoint's listen address, `/node` and `/targets.json` URLs, basic-auth username, whether the telemetry Caddyfile is configured, and whether this machine holds a local credential. It never prints a password or hash and is independent of PostgreSQL. |
 | `metrics config` | Generates Prometheus and Grafana Alloy scrape configs that follow the endpoint's HTTP service discovery and use basic auth. Ordinary output (including JSON) always uses a password placeholder. `--format prometheus|alloy|targets --out FILE` writes one new owner-only file with the real credential when one is held locally; the file is never echoed. Targets output carries no secret and is also valid `file_sd`. |
-| `metrics rotate --confirm <node>/metrics` | Generates a 256-bit password, saves it owner-only in the context before the RPC, and sends only its bcrypt hash. Under a node-local telemetry lock the node renders and validates the dedicated WireGuard-only Caddyfile, restarts only `eregion-telemetry.service`, and restores the previous Caddyfile on failure. Public Caddy and its route writer are never touched. A failed RPC restores the previous local credential. There is no generation compare-and-swap, pending file or recovery journal; a lost successful response can leave the local password stale until the next rotation. No password or hash appears in plain/JSON output, logs, events or journals. |
+| `metrics rotate --confirm <node>/metrics` | Generates a 256-bit password, saves it owner-only in the resolved workspace credential directory before the RPC, and sends only its bcrypt hash. Under a node-local telemetry lock the node renders and validates the dedicated WireGuard-only Caddyfile, restarts only `eregion-telemetry.service`, and restores the previous Caddyfile on failure. Public Caddy and its route writer are never touched. A failed RPC restores the previous local credential. There is no generation compare-and-swap, pending file or recovery journal; a lost successful response can leave the local password stale until the next rotation. No password or hash appears in plain/JSON output, logs, events or journals. |
 | `ui` | Full-screen workspace over the same inventory and node-mode action service. Fleet details show one current node_exporter CPU sample plus current memory, filesystem, load and uptime facts through `metrics.show`; no history or request graph is invented. |
 | `operations list/get/follow/cancel` | Over node RPC the SSH-authenticated operator has server authority: an unfiltered list shows every operation on the node newest first (bounded by `--limit`), and snapshot/follow/cancel may open any operation, including CI tokens, the GitHub webhook and other operators' submissions. `--app`/`--environment` select the platform target and include the environment's `build/<id>` operations. State and limit filters apply. The public HTTP API remains strictly actor- and grant-scoped. |
 | `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. The telemetry endpoint is a dedicated Caddy unit, not an eregion node service. |
@@ -403,7 +409,7 @@ disables only a package-started service, leaving no public site. A hostname adds
 the existing public API/ACME site.
 
 `metrics rotate --confirm <node>/metrics` follows vaire's rotate path. It
-generates a 256-bit password, saves it owner-only in the operator context before
+generates a 256-bit password, saves it owner-only in the resolved workspace credential directory before
 the RPC, and sends only the bcrypt hash. Under a node-local telemetry lock the
 node renders the telemetry Caddyfile, validates it with `caddy validate`,
 restarts only `eregion-telemetry.service`, and restores the previous Caddyfile
@@ -575,7 +581,7 @@ node protocol version and database migration version are independent.
 | `025_domain_dns_ownership.sql` | Immutable `eregion_platform_domains.id` (`dom_…`) and the `eregion_platform_domain_dns` ledger. The ledger stores provider, zone, exact ownership marker, generation, desired origins/proxy, state, last operation and cleanup status. It is written atomically with the operation/River job before provider effects and is retained until exact owned provider cleanup is verified; `domain_id` restricts domain deletion while it exists. |
 | `026_deployment_lifecycle_owner.sql` | One durable deployment lifecycle owner per environment. Stores owner operation/deployment/attempt, phase, exclusive route target, frozen restore release/deployment and timestamps. Route writers read this row exclusively. The cutover is fail closed with no legacy backfill: it refuses while a deploy/rollback/restart/promote operation is queued, running or cancelling, or while any deployment row is pending/running. Finish or cancel old work before upgrading; a safe upgrade creates the empty owner table. |
 | `027_provider_credentials.sql` | Installation-wide provider/zone metadata and immutable encrypted credential revisions in the existing vault. Separate from app/environment secret namespaces; uses the existing keyring with provider-bound AAD and revision hashes. Credential activation uses a revision CAS and commits its sanitized audit entry atomically. No token-file import/backfill is performed. |
-| `028_workspace_identity.sql` | Empty singleton installation identity table, generated immutable workspace ID/name and creation time, with update/delete refusal. Migration does not infer or seed identity; setup or explicit `apply --workspace NAME` performs assignment under an advisory transaction lock and insert CAS. |
+| `028_workspace_identity.sql` | Empty singleton installation identity table, generated immutable workspace ID/name and creation time, with update/delete refusal. Migration does not infer or seed identity; setup or explicit `apply --assign-workspace NAME` performs assignment under an advisory transaction lock and insert CAS. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -1116,47 +1122,54 @@ another name conflicts. The table refuses updates/deletes. Names are 1–64
 lowercase alphanumeric/hyphen characters, with alphanumeric ends; IDs are
 generated non-secret identifiers, not authorization capabilities.
 
-Fresh setup accepts `--workspace NAME` or answers-file `workspace`, independently
-of `--node` and `--context-name`. Pending init stores the name before host apply on
-real execution, then the DB-authoritative ID before final handoff. A dry-run
-resume keeps a newly supplied name in memory only. Identical persisted input is
-valid on resume; a conflicting name fails before contact. A pre-alpha.7 pending
-init that already applied its host phase cannot introduce a workspace there:
-finish that flow, then use the ordinary explicit assignment path below.
+Fresh setup accepts `--workspace-name NAME` and answers-file `workspace-name`,
+independently of `--node`. The global `--workspace` selects an existing verified
+workspace only and is rejected by init/login. Pending init stores the requested
+name before host apply on real execution, then the DB-authoritative ID before
+final handoff. A dry-run resume keeps a newly supplied name in memory only.
+Identical persisted input is valid on resume; a conflicting name fails before
+contact. A pre-alpha.7 pending init that already applied its host phase cannot
+introduce a workspace there: finish that flow, then use the ordinary explicit
+assignment path below.
 
-An existing alpha.6 installation initializes through `apply --workspace NAME`
-after upgrading/migrating. `host-workspace-v1`, immediately after the database
-step, assigns the identity and mirrors only `workspace_id`/`workspace_name` into
-`node.json`, preserving node name and unknown keys. That file is not an
-authority or a DB-unavailable fallback. The recorded host intent keeps the
-requested name so future convergence checks the same identity. A conflicting
-request is checked again under the whole-apply lock before state, credentials,
-journals or host effects. Dry run plans but does not assign.
+An existing alpha.6 installation initializes through
+`apply --assign-workspace NAME` after upgrading/migrating. `host-workspace-v1`,
+immediately after the database step, assigns the identity and mirrors only
+`workspace_id`/`workspace_name` into `node.json`, preserving node name and
+unknown keys. That file is not an authority or a DB-unavailable fallback. The
+recorded host intent keeps the requested name so future convergence checks the
+same identity. A conflicting request is checked again under the whole-apply lock
+before state, credentials, journals or host effects. Dry run plans but does not
+assign.
 
 Successful main-node apply reads the authoritative identity for local metadata.
-The refresh targets the context and route captured by the RPC, not whatever
-context another terminal has since selected. Context-store mutation uses a
-shared lock and reload; a replaced route or configured identity conflicts rather
-than being overwritten. A local refresh failure is a warning after successful
-host convergence, not a claim that the host rolled back. Other contexts and the
-latest current selection are preserved.
+The refresh targets the private access record and route captured by the RPC, not
+whatever workspace another terminal has since selected. Workspace-store mutation
+uses a shared lock and reload; a replaced route or configured identity conflicts
+rather than being overwritten. A local refresh failure is a warning after
+successful host convergence, not a claim that the host rolled back. Unrelated
+workspace records and the latest current selection are preserved.
 
-The protected handoff carries `Workspace` and `Workspace ID`; imported context
-metadata carries `workspace:{id,name}` alongside its own route and credentials.
-Login verifies declared workspace and node identity before publishing files,
-retaining exact replacement confirmation and scoped host-key pins. Within one
-local store, the same workspace name with different IDs conflicts; multiple
-context aliases for the same ID are allowed. A configured context's identity
-cannot be replaced by a different/absent one. Legacy bundles remain explicitly
-unconfigured; refresh the human-protected export to transfer portable identity.
+The protected handoff carries `Workspace` and `Workspace ID`; imported private
+access metadata carries `workspace:{id,name}` alongside its route and
+credentials. Login verifies the declared workspace and node identity before
+publishing files, retaining exact replacement confirmation and scoped host-key
+pins. Within one local store, records group by authoritative workspace ID; the
+same name with different IDs and the same ID with different names conflict.
+Multiple access records for one ID are one workspace, resolved by the selected
+record or the sole record and otherwise refused as ambiguous. A verified login
+may replace all records for that ID with one canonical record while preserving
+unrelated workspaces. Legacy bundles remain explicitly unconfigured and are
+confined to the bounded alpha path; refresh the human-protected export to
+transfer portable identity.
 
 `node.info` and server status read PostgreSQL, not the mirror. A failed identity
 read is unknown (`workspace_error`), not unconfigured; trust-sensitive login and
 setup refuse it. The separate version RPC and host-control dispatch remain
-available without a workspace DB read. The TUI labels actual node identity,
-workspace and captured local context separately from the SSH route, and shows
-unknown versus not-configured explicitly. No workspace membership, team ACL,
-multi-node lifecycle or server-sharing feature is introduced.
+available without a workspace DB read. The TUI labels actual node identity and
+workspace separately from the SSH route, and shows unknown versus
+not-configured explicitly. No workspace membership, team ACL, multi-node
+lifecycle or server-sharing feature is introduced.
 
 The old-bundle/unfinished-setup and legacy submission-capability handling is an
 explicitly temporary alpha.7 transition, not a retained compatibility API. The operator's
@@ -1177,17 +1190,16 @@ a missing `tar` (`missing_tool` with the apt command), and existing eregion
 state. A pending init continues its own state; a new init never adopts a host
 that already has eregion state.
 
-Answers have a flag and an `--answers` TOML key: workspace name (required on
-fresh setup), node name, server/local context name, public hostname (used exactly as given, only the
+Answers have a flag and an `--answers` TOML key: workspace name via `--workspace-name` or answers key `workspace-name` (required on
+fresh setup), node name, public hostname (used exactly as given, only the
 trailing dot is trimmed), external DSN file (owner-only; `EREGION_DATABASE_URL`
 is the environment fallback) and admin user. A terminal is asked only for what
 no flag or answer supplied.
 
 ```toml
 host = "root@203.0.113.10"
-workspace = "lab"
+workspace-name = "lab"
 node = "main"
-context = "prod"
 hostname = "app.example.com"
 database_url_file = "/root/eregion-db.url"
 admin_user = "admin"
@@ -1227,9 +1239,9 @@ unauthenticated 200 and warns until rotation configures the telemetry Caddyfile.
 check stores samples. `internal/access` remains the
 hardening/WireGuard/commit-confirm lockdown implementation.
 
-After lockdown the CLI pins the WireGuard host key, saves the token-free context,
+After lockdown the CLI pins the WireGuard host key, saves the token-free workspace access,
 generates the operator-side telemetry credential (or reuses the one already in
-the context), sends only its bcrypt hash to `metrics.rotate`, and calls node RPC
+the workspace credential directory), sends only its bcrypt hash to `metrics.rotate`, and calls node RPC
 `ready`. It then checks the authenticated telemetry endpoint over the tunnel,
 asks the public resolvers once, waits for Caddy's certificate, and runs the
 doctor gate (`host.doctor` with `init: true`). Init mode carries an `AtInit`
@@ -1244,17 +1256,17 @@ generated passphrase and break-glass instructions. A terminal waits for
 `stored`; JSON/no-TTY requires `--secrets-out` before any change and writes the
 whole record to a new 0600 file. No API token is in the handoff.
 
-The unfinished init is saved locally under the context store directory:
+The unfinished init is saved locally under the private workspace store directory:
 `pending/<server>/init.json` (answers, learned facts, completed phases),
 `known_hosts` and the captured `vault-keyring.json`, all 0600. `--resume`
 continues at the first incomplete phase (first contact, operator identity, host
-bootstrap, WireGuard access, context, readiness/certificate checks, doctor gate,
+bootstrap, WireGuard access, workspace, readiness/certificate checks, doctor gate,
 handoff). After a failed doctor gate, resume therefore re-runs only the gate and
 the handoff; once the gate has passed it is not repeated, and the passing report
 (or the `--skip-doctor` marker) is stored in the pending init so the resumed
 result shows the same doctor line without inventing a new count.
 `--discard --confirm <server>` drops the local state and the generated identity
-and warns when the host was already bootstrapped. New init refuses while a context or pending init
+and warns when the host was already bootstrapped. New init refuses while saved workspace access or a pending init
 for the same server exists. `server init --dry-run` still connects, pins the host
 key and uploads a planning bundle; it stops before apply and removes the pending
 state it created. The interactive result card includes the doctor summary line.
@@ -1267,7 +1279,7 @@ proves a TLS connection, not authenticated readiness or an application response.
 ## Host convergence and inspection
 
 `eregion plan`, `apply`, `doctor`, `ssh` and `server status` are node-mode
-commands: the CLI resolves the saved context, opens pinned SSH inside the
+commands: the CLI resolves the saved workspace access, opens pinned SSH inside the
 embedded WireGuard tunnel, and runs `eregion node rpc` on the node. Host RPC
 methods do not open the application service, so plan and doctor still observe a
 node whose database migrations are pending or whose API is down.
@@ -1330,7 +1342,7 @@ above; the file is root-owned `0644` in a root:polkitd `0750` directory so
 through `host-packages-v2`. Both steps are part of fresh init, and a second
 plan is a no-op.
 
-`ssh` uses the context's pinned host key and identity. Without `--command` it
+`ssh` uses the workspace access record's pinned host key and identity. Without `--command` it
 needs a terminal and opens an interactive shell; `--command` runs one remote
 command and exits with its status. The command gets a PTY only when stdin and
 stdout are terminals and output is plain, so `ssh --command … | cat` returns
@@ -1360,9 +1372,9 @@ window.
 | `/usr/local/bin/node_exporter`, `/etc/systemd/system/node-exporter.service` | Pinned exporter and its unit, bound to loopback only; `host-node-exporter-v2` enables the textfile collector at `/var/lib/node_exporter/textfile` and the narrow systemd collector set. No WireGuard or public port is opened for the exporter. |
 | `/etc/eregion-telemetry/targets.json` | Root:caddy `0640` HTTP service-discovery document (no secret). `host-telemetry-v1` writes it; the access setup opens 9101 on `wg0` only. |
 | `/var/lib/node_exporter/`, `/var/lib/node_exporter/textfile/` | Root:root `0755` real directories (no symlinks) read by node_exporter's textfile collector. Apply refuses to follow or mutate a symlink/non-directory; no eregion self-metric is written without a real producer. |
-| OS config dir + `/eregion/contexts.json` | Owner-only context store (SSH/WireGuard route and `auto_upgrade_nodes`); overridden by `EREGION_CONTEXT_FILE`. No API token. |
-| Context store's parent + `/servers/<context>/` | Operator SSH key, WireGuard key and sudo password files. |
-| Context store's parent + `/pending/<server>/` | Unfinished `server init`: answers, phases, pinned host keys and the captured vault keyring (0700 directory, 0600 files). |
+| OS config dir + `/eregion/contexts.json` | Owner-only private workspace store (verified workspace identity plus historical access keys/routes and `auto_upgrade_nodes`); overridden by `EREGION_WORKSPACE_FILE`. No API token. |
+| Private workspace store parent + `/servers/<access>/` | Operator SSH key, WireGuard key and sudo password files for that private access record. |
+| Private workspace store parent + `/pending/<server>/` | Unfinished `server init`: answers, phases, pinned host keys and the captured vault keyring (0700 directory, 0600 files). |
 | `/etc/sudoers.d/eregion-node` | Admin's passwordless `/usr/local/bin/eregion node rpc` rule, validated by `visudo`. |
 
 Node effect identity is `operation:step`, stable across attempts. Execution
@@ -1804,7 +1816,7 @@ Explicit Cloudflare DNS is a separate provider effect under the same domain
 operation. `platform.DomainInput` carries only `dns_mode`, `dns_zone`, explicit
 `dns_origins` and the explicit proxy choice; the credential remains in the
 encrypted provider scope of the PostgreSQL vault. Origins are validated public addresses supplied by the
-operator, never derived from the context's WireGuard management endpoint. Public
+operator, never derived from the workspace access record's WireGuard endpoint. Public
 origin validation rejects private, RFC1918, CGNAT (`100.64/10`), loopback,
 link-local, multicast, unspecified, documentation/benchmarking and other
 non-public ranges for IPv4 and IPv6; IPv6 origins must also be in the global
@@ -1830,8 +1842,8 @@ Use the operator CLI in a human terminal; no server file or environment editing
 is needed:
 
 ```sh
-eregion --context thelab domain cloudflare configure --zone ZONE_ID --zone-name mbvlabs.com
-eregion --context thelab domain cloudflare status --json
+eregion --workspace thelab domain cloudflare configure --zone ZONE_ID --zone-name mbvlabs.com
+eregion --workspace thelab domain cloudflare status --json
 ```
 
 Zone fields also prompt when omitted. The token is accepted only by a no-echo

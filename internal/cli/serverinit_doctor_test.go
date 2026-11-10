@@ -24,7 +24,7 @@ import (
 
 func doctorTestInit(t *testing.T) *serverInit {
 	t.Helper()
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
 	cmd := &cobra.Command{Use: "init"}
 	cmd.SetErr(&strings.Builder{})
 	return &serverInit{
@@ -226,14 +226,14 @@ func (t *initContextTransport) called(method string) bool {
 }
 
 func TestInitReadyAndDoctorUseTheContextBeingInitialized(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
-	t.Setenv("EREGION_CONTEXT", "prod")
-	store, err := host.LoadContextStore("")
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE", "prod")
+	store, err := host.LoadWorkspaceStore("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"staging", "prod"} {
-		if _, err := store.SaveContext(host.Context{Name: name, SSH: &host.ContextSSH{
+		if _, err := store.PublishUnconfiguredAccess(host.WorkspaceAccess{Name: name, SSH: &host.WorkspaceSSH{
 			Address: "10.78.0.1:22", User: "admin", KnownHosts: "/dev/null",
 		}}); err != nil {
 			t.Fatal(err)
@@ -241,8 +241,8 @@ func TestInitReadyAndDoctorUseTheContextBeingInitialized(t *testing.T) {
 	}
 	staging, prod := &initContextTransport{name: "staging"}, &initContextTransport{name: "prod"}
 	a := &app{secrets: &secrets.Registry{}, nodeClients: map[string]*nodeClient{
-		"staging": {remote: staging, operator: "admin", contextName: "staging", stderr: io.Discard},
-		"prod":    {remote: prod, operator: "admin", contextName: "prod", stderr: io.Discard},
+		"staging": {remote: staging, operator: "admin", accessName: "staging", stderr: io.Discard},
+		"prod":    {remote: prod, operator: "admin", accessName: "prod", stderr: io.Discard},
 	}}
 	cmd := &cobra.Command{Use: "init"}
 	cmd.SetErr(&bytes.Buffer{})
@@ -258,7 +258,7 @@ func TestInitReadyAndDoctorUseTheContextBeingInitialized(t *testing.T) {
 	}
 
 	// Resume after the checks: the doctor gate still targets staging even
-	// though EREGION_CONTEXT and the current context name prod.
+	// though EREGION_WORKSPACE and the current context name prod.
 	r.pending.Mark(phaseChecks)
 	summary := &serverInitSummary{}
 	if err := r.runDoctorGate(context.Background(), summary); err != nil {

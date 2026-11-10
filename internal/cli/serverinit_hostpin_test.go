@@ -29,7 +29,7 @@ func testHostKey(t *testing.T) ssh.PublicKey {
 }
 
 func TestInitPinsWireGuardKeyInTheContextKnownHosts(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
 	pending, err := host.PendingKnownHosts("prod")
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestInitPinsWireGuardKeyInTheContextKnownHosts(t *testing.T) {
 
 func TestInitResumeRebuildsScopedKnownHostsFromVerifiedPendingPin(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
-	t.Setenv("EREGION_CONTEXT_FILE", configPath)
+	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	pending, err := host.PendingKnownHosts("prod")
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestInitResumeRebuildsScopedKnownHostsFromVerifiedPendingPin(t *testing.T) 
 
 func TestInitResumeWithoutVerifiedPendingPinFailsClosed(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "eregion", "contexts.json")
-	t.Setenv("EREGION_CONTEXT_FILE", configPath)
+	t.Setenv("EREGION_WORKSPACE_FILE", configPath)
 	// A pin in the old shared location is not a verified first-contact source.
 	wireGuardAddress := net.JoinHostPort(access.NodeAddress, "22")
 	global := filepath.Join(filepath.Dir(configPath), "known_hosts")

@@ -55,7 +55,11 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	metricsCredential, err := loadMetricsCredential(identity.context.Name)
+	credentialDir, err := workspaceCredentialDir(cmd, identity.access)
+	if err != nil {
+		return result{}, err
+	}
+	metricsCredential, err := loadMetricsCredential(credentialDir)
 	if err != nil {
 		return result{}, err
 	}
@@ -65,7 +69,7 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	input := handoffExportInput(identity, exported)
-	record, err := newSecretsHandoff(input.Context, handoffGroups(input))
+	record, err := newSecretsHandoff(input.NodeName, handoffGroups(input))
 	if err != nil {
 		return result{}, err
 	}
@@ -87,7 +91,7 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	data := map[string]any{
-		"node": exported.Node, "hostname": exported.Hostname, "context": input.Context, "exported": true,
+		"node": exported.Node, "hostname": exported.Hostname, "exported": true,
 		"workspace": exported.Workspace,
 	}
 	plain := "Re-exported the server handoff to the terminal"
@@ -121,11 +125,10 @@ func readIdentityFile(path string) (string, error) {
 	return string(raw), nil
 }
 
-// handoffExportIdentity is the selected context's operator identity, read from
-// the local context store. Everything the export record says about the
-// operator comes from here, so it must follow --context / EREGION_CONTEXT.
+// handoffExportIdentity is the selected workspace's operator identity, read
+// from the actual resolved access record directory.
 type handoffExportIdentity struct {
-	context      host.Context
+	access       host.WorkspaceAccess
 	sshKey       string
 	wgKey        transport.WireGuardKey
 	sudoPassword string
@@ -133,14 +136,14 @@ type handoffExportIdentity struct {
 }
 
 func loadHandoffExportIdentity(cmd *cobra.Command) (handoffExportIdentity, error) {
-	current, err := selectedContext(cmd)
+	current, err := selectedWorkspaceAccess(cmd)
 	if err != nil {
 		return handoffExportIdentity{}, err
 	}
 	if current.SSH == nil || current.SSH.WireGuard == nil {
-		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "context "+current.Name+" has no WireGuard operator keys", "This export needs a server-init context with the operator identity.")
+		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "workspace "+current.Name+" has no WireGuard operator keys", "This export needs a server-init workspace with the operator identity.")
 	}
-	dir, err := identityDir(current.Name)
+	dir, err := workspaceCredentialDir(cmd, current)
 	if err != nil {
 		return handoffExportIdentity{}, err
 	}
@@ -156,18 +159,18 @@ func loadHandoffExportIdentity(cmd *cobra.Command) (handoffExportIdentity, error
 	if err != nil {
 		return handoffExportIdentity{}, contract.NewFault(contract.PreconditionFailed, "the operator sudo password is missing", "The context file references credentials that are no longer on this machine; restore them from the stored handoff.")
 	}
-	return handoffExportIdentity{context: current, sshKey: strings.TrimSpace(sshKey), wgKey: wgKey, sudoPassword: strings.TrimSpace(sudoPassword)}, nil
+	return handoffExportIdentity{access: current, sshKey: strings.TrimSpace(sshKey), wgKey: wgKey, sudoPassword: strings.TrimSpace(sudoPassword)}, nil
 }
 
 // handoffExportInput is the record's identity/route half. The exported half
 // (database URL, vault keyring, hostname) comes from the same node the selected
 // context reaches, so a mixed-context record cannot be built here.
 func handoffExportInput(identity handoffExportIdentity, exported rpcHandoffExportResult) handoffRecordInput {
-	current := identity.context
+	current := identity.access
 	publicHost, _, _ := net.SplitHostPort(current.SSH.WireGuard.Endpoint)
 	return handoffRecordInput{
 		NodeName: exported.Node, WorkspaceName: exported.Workspace.Name, WorkspaceID: exported.Workspace.ID,
-		Context: current.Name, Hostname: exported.Hostname,
+		Hostname:      exported.Hostname,
 		PublicAddress: publicHost, Platform: exported.Platform, SSHHostKey: exported.SSHHostKey,
 		WireGuardEndpoint: current.SSH.WireGuard.Endpoint, WireGuardNodeAddress: current.SSH.WireGuard.NodeAddress,
 		WireGuardNodePublicKey: current.SSH.WireGuard.NodePublicKey,

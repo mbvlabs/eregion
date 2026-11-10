@@ -260,7 +260,7 @@ func (f remoteFacts) preflight(allowExisting bool) (host.Platform, error) {
 		return platform, fault
 	}
 	if len(facts.Existing) > 0 && !allowExisting {
-		fault := contract.NewFault(contract.PreconditionFailed, "the server already has eregion state ("+strings.Join(facts.Existing, ", ")+")", "Operate it with an existing context, or rebuild the server before a new server init. An interrupted init for this server resumes with --resume.")
+		fault := contract.NewFault(contract.PreconditionFailed, "the server already has eregion state ("+strings.Join(facts.Existing, ", ")+")", "Operate it with an existing workspace login, or rebuild the server before a new server init. An interrupted init for this server resumes with --resume.")
 		fault.Details = map[string]any{"reason": "existing_state", "paths": facts.Existing}
 		return platform, fault
 	}

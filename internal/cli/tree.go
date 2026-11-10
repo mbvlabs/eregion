@@ -44,7 +44,7 @@ type app struct {
 	result  result
 	started bool
 	secrets *secrets.Registry
-	// nodeClients holds one client per context name for the command's life.
+	// nodeClients holds one client per resolved workspace access for the command's life.
 	nodeClients map[string]*nodeClient
 	// backend overrides the node transport in tests; nil uses the saved context.
 	backend Backend
@@ -82,7 +82,8 @@ func newApp() *app {
 	a.root.PersistentFlags().String("output", "plain", "Output mode: plain or json; commands that follow an operation also accept ndjson")
 	a.root.PersistentFlags().Bool("json", false, "Shorthand for --output json")
 	a.root.PersistentFlags().Bool("auto-upgrade-nodes", false, "Install this CLI's build on a node whose build differs before the command runs")
-	a.root.PersistentFlags().String("context", "", "Context name; overrides EREGION_CONTEXT and the current context")
+	a.root.PersistentFlags().String("workspace", "", "Verified workspace name; overrides EREGION_WORKSPACE and the current workspace")
+	a.root.PersistentFlags().String("workspace-file", "", "Private workspace store (defaults to EREGION_WORKSPACE_FILE or XDG config)")
 	a.root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		var required *pflag.ValueRequiredError
 		if errors.As(err, &required) {
@@ -91,7 +92,7 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.contextSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.workspaceSpecs(), a.logsSpecs(), a.metricsSpecs()} {
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.workspaceCommandSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.uiSpecs(), a.logsSpecs(), a.metricsSpecs()} {
 		for _, s := range specs {
 			a.attach(a.root, s)
 		}
@@ -255,7 +256,7 @@ func (a *app) commands(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 // overview is the no-argument operator map. It is generated from the same
-// catalog as `commands --json`, so it never needs a context, server, or TUI.
+// catalog as `commands --json`, so it never needs a workspace, server, or TUI.
 func (a *app) overview(commands []Command) string {
 	var plain strings.Builder
 	fmt.Fprintf(&plain, "eregion — experimental application platform\nversion: %s\n\n", buildinfo.Current().Version)

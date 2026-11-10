@@ -147,6 +147,10 @@ func contextKnownHostsPath(name string) (string, error) {
 	return filepath.Join(dir, "known_hosts"), nil
 }
 
+func knownHostsPathAt(storePath, name string) string {
+	return filepath.Join(identityDirAt(storePath, name), "known_hosts")
+}
+
 // probeHostKey reads the server's host key without authenticating.
 func probeHostKey(ctx context.Context, address string) (ssh.PublicKey, error) {
 	var key ssh.PublicKey

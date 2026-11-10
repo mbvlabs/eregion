@@ -139,48 +139,48 @@ func TestConfirmationBindingAndExpiry(t *testing.T) {
 	}
 }
 
-func TestContextStore(t *testing.T) {
+func TestWorkspaceStore(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "contexts.json")
-	store, err := LoadContextStore(path)
+	store, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	route := &ContextSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: filepath.Join(root, "known_hosts")}
-	view, err := store.SaveContext(Context{Name: "production", SSH: route, AutoUpgradeNodes: true})
+	route := &WorkspaceSSH{Address: "10.78.0.1:22", User: "admin", KnownHosts: filepath.Join(root, "known_hosts")}
+	view, err := store.PublishWorkspace(testWorkspaceID, "production", WorkspaceAccess{Name: "production", SSH: route, AutoUpgradeNodes: true}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Route == "" || !view.AutoUpgradeNodes || !view.Current {
+	if view.Route == "" || !view.AutoUpgradeNodes || !view.Current || view.ID != testWorkspaceID {
 		t.Fatalf("unexpected view: %+v", view)
 	}
 	info, _ := os.Stat(path)
 	if info.Mode().Perm() != 0o600 {
 		t.Fatal("unsafe store mode")
 	}
-	reloaded, err := LoadContextStore(path)
+	reloaded, err := LoadWorkspaceStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reloaded.Current != "production" {
 		t.Fatal("current not persisted")
 	}
-	if _, err := reloaded.Get("production"); err != nil {
+	if _, ok := reloaded.AccessByName("production"); !ok {
+		t.Fatal("workspace access not persisted")
+	}
+	if views := reloaded.ListWorkspaces(); len(views) != 1 || !views[0].AutoUpgradeNodes || views[0].ID != testWorkspaceID {
+		t.Fatalf("workspace view not persisted: %+v", views)
+	}
+	if _, err := reloaded.UseWorkspace(testWorkspaceID); err != nil {
 		t.Fatal(err)
 	}
-	if !reloaded.List()[0].AutoUpgradeNodes {
-		t.Fatal("auto upgrade flag not persisted")
-	}
-	if _, err := reloaded.Use(""); err != nil {
-		t.Fatal(err)
-	}
-	if ok, err := reloaded.Remove("production"); err != nil || !ok {
-		t.Fatalf("remove: %v %v", ok, err)
+	if _, _, err := reloaded.RemoveWorkspace(testWorkspaceID); err != nil {
+		t.Fatalf("remove: %v", err)
 	}
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadContextStore(path); err == nil {
+	if _, err := LoadWorkspaceStore(path); err == nil {
 		t.Fatal("accepted public credential store")
 	}
 }

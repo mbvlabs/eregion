@@ -41,7 +41,7 @@ func TestApplyProgressGivesEveryPlanStepALine(t *testing.T) {
 }
 
 func TestSavePendingCarriesPinnedHostKey(t *testing.T) {
-	t.Setenv("EREGION_CONTEXT_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
+	t.Setenv("EREGION_WORKSPACE_FILE", filepath.Join(t.TempDir(), "eregion", "contexts.json"))
 	r := &serverInit{
 		answers: serverInitAnswers{
 			Context: "prod", Host: "203.0.113.10", User: "root", Port: "22",

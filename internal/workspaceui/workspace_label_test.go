@@ -5,14 +5,14 @@ import (
 	"testing"
 )
 
-func TestHeaderShowsActualNodeWorkspaceAndContextDistinctly(t *testing.T) {
+func TestHeaderShowsActualNodeAndWorkspace(t *testing.T) {
 	model := New(Options{
 		Host: "admin@10.78.0.1", Node: "main", Workspace: "thelab",
-		WorkspaceKnown: true, WorkspaceConfigured: true, Context: "prod",
+		WorkspaceKnown: true, WorkspaceConfigured: true,
 		Width: 100, Height: 30, NoColor: true,
 	})
 	rendered := model.render()
-	for _, want := range []string{"workspace thelab", "context prod", "node main", "Fleet"} {
+	for _, want := range []string{"workspace thelab", "node main", "Fleet"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("header lacks %q:\n%s", want, rendered)
 		}

@@ -343,11 +343,13 @@ type nodeTransport interface {
 }
 
 type nodeClient struct {
-	remote      nodeTransport
-	route       *host.ContextSSH
-	operator    string
-	contextName string
-	autoUpgrade bool
+	remote        nodeTransport
+	route         *host.WorkspaceSSH
+	operator      string
+	accessName    string
+	workspaceID   string
+	workspaceName string
+	autoUpgrade   bool
 	// dryRun means the invocation previews its work: a version mismatch is
 	// reported, never repaired, because a dry run must not change the node.
 	dryRun bool

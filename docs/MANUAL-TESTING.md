@@ -49,10 +49,11 @@ affect more than the named surfaces. No live target is authorized by this list.
 
 | Changed surface | Required candidate evidence |
 | --- | --- |
-| Cloudflare prompt order | Wrong/missing context/store fails before zone/token input; machine mode still refuses before token entry. Correct context reaches the human flow; do not rotate a credential solely to retest prompt ordering. |
+| Cloudflare prompt order | Wrong/missing workspace/store fails before zone/token input; machine mode still refuses before token entry. Correct workspace reaches the human flow; do not rotate a credential solely to retest prompt ordering. |
 | Explicit gh-assisted webhook automation | JSON/no-TTY enable and rotation require `--github-webhook`; missing gh/auth/permission refuses before secret/vault/desired-state mutation. Dry-run and same-key replay do not rotate or mutate hooks. Real authorized fixture: signed push succeeds, duplicate is suppressed, other branch ignored, old HMAC rejected after rotation. No plaintext in output/argv/events. Partial hook failure reports activation separately and never prints the secret. |
-| Portable workspace identity | New setup distinguishes workspace/node/context. Alpha.6 upgrade requires explicit identity initialization, not inference during reads/migration. Refreshed human export/login across a second machine/store preserves workspace ID and node. Conflicting name/ID import preserves existing credentials/pins; same ID under another local context name remains valid access. |
-| Agent discovery and human presentation | No-argument overview, help, metadata checks and search work offline with no context, including JSON/no-TTY/no-ANSI. Hidden node commands stay hidden. Changed TUI discovery supports keyboard search/help and exact command equivalents without generic unsafe execution. Exercise narrow/wide resize, no-color/plain, detach and terminal restoration. |
+| Portable workspace identity and selection | Workspace is the only named target; node remains distinct. `--workspace` selects verified identity, never a private historical alias; old context commands/flags are absent and obsolete environment settings cannot silently retarget. List/show/use/remove and JSON expose workspaces, not named profiles. Selection and explicit identity initialization (`--assign-workspace`) are distinct. Refreshed export/login across a second machine/store preserves ID and node. Conflicting/ambiguous identities refuse safely; verified replacement preserves unrelated concurrent updates and existing credentials/pins on failure. |
+| Agent discovery and human presentation | No-argument overview, help, metadata checks and search work offline with no saved workspace, including JSON/no-TTY/no-ANSI. Hidden node commands stay hidden. Login, setup and TUI identify the workspace without a duplicate context/profile identity. Changed TUI discovery supports keyboard search/help and exact command equivalents without generic unsafe execution. Exercise narrow/wide resize, no-color/plain, detach and terminal restoration. |
+| HTTPS telemetry integration | Proper HTTPS metrics and discovery URLs on the node hostname are usable by an external collector. Both require authentication; raw exporters remain private. Generated Prometheus/Alloy configuration and discovered targets use reachable URLs. Verify anonymous denial, authenticated metrics/discovery success, correct generated targets and unchanged application routes. A current snapshot or WireGuard-only address does not satisfy this row. Reuse working credentials where possible; no collector/dashboard deployment is implied. |
 | Readiness | Stage/acquisition/query timings and safe pool snapshots distinguish slow acquisition from query work. Deterministic offline cancellation/resource-release regressions pass. Authorized candidate idle/representative-workload observations must establish a cause-specific fix; a shorter handler budget or healthy subsequent probes alone do not resolve LABS-346. |
 | Candidate upgrade | Verify signed artifacts; CLI-only alpha.6 upgrade; mismatch dry-run changes nothing; real node converge reaches expected schema/River; repeat apply is a no-op; doctor has no unexplained failure/warning; existing production/staging retain HTTPS version/environment/secret-match markers. |
 
@@ -73,9 +74,9 @@ acceptance or a readiness fix.
 
 ### Beta.1, RC and final gates
 
-- **Beta.1:** alpha.7 delta acceptance plus authorized real multi-context/server
+- **Beta.1:** alpha.7 delta acceptance plus authorized real multi-workspace/server
   SSH-pin qualification in a single store (shared WireGuard management IP,
-  alternating contexts, wrong-key refusal without damaged contexts). Complete
+  alternating workspaces, wrong-key refusal without damaged saved access). Complete
   Cloudflare provider failure/interruption, multi-binding deletion and actual
   foreign-record **apply** refusal against disposable authorized bindings.
   Preview refusal is not apply refusal. Preserve foreign resources and serving
@@ -653,10 +654,52 @@ owner-only:
   manifest SHA-256
   `a273442688e0152112cc343b823e8ad6ef40dd2425f444d27ff1f62b52eaafa7`.
 
-Full human TUI visual/resize/terminal-restoration acceptance and refreshed
-protected workspace handoff/login remain unqualified. Actual macOS
+**Operator follow-up (2026-11-10).** The operator ran the installed TUI and
+reported a normal detach from Envs, with no operations submitted. The operator
+also completed the authenticator-gated handoff export: the CLI reported writing
+the new handoff file and copying the record to the clipboard. This qualifies
+the protected export flow and clean TUI detach; it does not establish visual
+resize behavior or successful import on another machine. No authentication
+code, passphrase or bundle content is retained in this record, and the agent
+did not open the exported file.
+
+**Second-machine login — pass (operator-reported).** On a separate Linux/amd64
+machine, the operator installed the immutable `edge-b04777ce2218` installer.
+`version` reported the exact commit, edge channel and `dirty=false`. Interactive
+login with the refreshed protected handoff succeeded and selected context
+`thelab`, node `main`, the expected WireGuard SSH route and workspace
+`thelab` / `ws_779004d145462c0fd7f48868`. The transcript confirms portable
+identity and successful login; the agent did not decrypt or retain the pasted
+bundle or its passphrase. The follow-up `doctor` command from that machine
+passed **23 pass / 0 warn / 0 fail / 0 skip**, confirming ordinary operator
+access after import. The operator also identified a public terminology defect:
+workspace selection must use `--workspace`, not `--context`, and the login card
+must not duplicate the installation under a context label. Those presentation
+and command-contract corrections are separate from the successful access check.
+
+Full human TUI visual/resize acceptance remains unqualified. Actual macOS
 installation/upgrade and fresh beta/provider/multi-server gates remain separate.
 No alpha.7 tag, beta promotion or overall acceptance is implied.
+
+### Telemetry verification and external-integration correction (2026-11-10)
+
+A read-only b047 check at approximately 15:49 UTC found the existing exporter
+and authenticated private endpoint configured and healthy. One fresh snapshot
+had no missing values/issues; both services were active with zero restarts.
+Listeners were loopback `127.0.0.1:9100` and WireGuard `10.78.0.1:9101`, with
+no public telemetry listener. Existing doctor evidence included anonymous 401
+denial; authenticated scraping was not re-probed. No configuration, service,
+credential or protected handoff changed. Retained evidence:
+`.local/qualification/telemetry-b047-20261110-154829/`, including the scope
+erratum alongside the unchanged original evidence.
+
+**This does not qualify the operator's external telemetry integration.** The
+operator requires a proper authenticated HTTPS URL as in vaire; the private
+WireGuard URL alone cannot satisfy that requirement. LABS-350 tracks the actual
+endpoint, discovery and collector-configuration correction. Do not call that
+flow complete from the healthy exporter/snapshot check. The future optional
+telemetry-node concept remains in MASTER; no current managed collector or
+dashboard installation is implied.
 
 ### Evidence retention correction (2026-11-10)
 

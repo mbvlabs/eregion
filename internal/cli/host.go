@@ -27,9 +27,9 @@ func (a *app) hostSpecs() []spec {
 	applyMeta := operationMeta("Converge the node to its recorded host intent", "eregion apply --json")
 	applyMeta.Mutating, applyMeta.DryRun = true, true
 	applyMeta.NeedsRestart = "possible"
-	applyMeta.InputFlags = []string{"workspace"}
+	applyMeta.InputFlags = []string{"assign-workspace"}
 	applyMeta.WhenToUse = []string{
-		"Converge the node to its recorded host intent. On an existing alpha.6 installation, pass --workspace NAME once to assign the portable workspace identity explicitly; a dry run previews it without writing.",
+		"Converge the node to its recorded host intent. On an existing alpha.6 installation, pass --assign-workspace NAME once to assign the portable workspace identity explicitly; a dry run previews it without writing. --workspace only selects an existing verified workspace.",
 	}
 	applyMeta.Next = []string{"eregion doctor", "eregion server status"}
 	doctorMeta := operationMeta("Check host drift, security, certificates, disk, versions and services", "eregion doctor --json")
@@ -44,7 +44,7 @@ func (a *app) hostSpecs() []spec {
 		{use: "plan", meta: planMeta, run: a.hostPlan},
 		{use: "apply", meta: applyMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Bool("dry-run", false, "Show the plan without changing the host")
-			cmd.Flags().String("workspace", "", "Assign this portable workspace name once on a legacy installation; immutable after assignment")
+			cmd.Flags().String("assign-workspace", "", "Assign this portable workspace name once on a legacy installation; immutable after assignment")
 		}, run: a.hostApply},
 		{use: "doctor", meta: doctorMeta, run: a.hostDoctor},
 		{use: "ssh [node]", meta: sshMeta, args: cobra.MaximumNArgs(1), flags: func(cmd *cobra.Command) {
@@ -66,13 +66,23 @@ func (a *app) hostPlan(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 func (a *app) hostApply(cmd *cobra.Command, _ []string) (result, error) {
-	client, err := a.nodeClient(cmd)
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	workspaceName := strings.TrimSpace(flagString(cmd, "assign-workspace"))
+	var client *nodeClient
+	var err error
+	if workspaceName != "" {
+		access, _, accessErr := currentInitializationAccess(cmd)
+		if accessErr != nil {
+			return result{}, accessErr
+		}
+		client, err = a.nodeClientForAccess(cmd, access)
+	} else {
+		client, err = a.nodeClient(cmd)
+	}
 	if err != nil {
 		return result{}, err
 	}
-	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	workspaceName, _ := cmd.Flags().GetString("workspace")
-	report, plan, err := client.HostApply(cmd.Context(), dryRun, "", strings.TrimSpace(workspaceName))
+	report, plan, err := client.HostApply(cmd.Context(), dryRun, "", workspaceName)
 	if err != nil {
 		return result{}, err
 	}
@@ -80,20 +90,20 @@ func (a *app) hostApply(cmd *cobra.Command, _ []string) (result, error) {
 		return result{data: plan, plain: planText(plan)}, nil
 	}
 	// The main host converged. Read the authoritative identity once and mirror
-	// it into the selected local context; a local failure is reported as a
+	// it into the selected workspace access; a local failure is reported as a
 	// warning, never as a host apply failure. Non-main roles have no workspace.
 	var identity *controlplane.WorkspaceIdentity
 	if report.Role == host.RoleMain {
 		info, infoErr := client.NodeInfo(cmd.Context())
 		switch {
 		case infoErr != nil:
-			report.Warnings = append(report.Warnings, "the host applied but its workspace identity could not be read for the local context: "+infoErr.Error())
+			report.Warnings = append(report.Warnings, "the host applied but its workspace identity could not be read for the local workspace access: "+infoErr.Error())
 		case info.WorkspaceError != "":
 			report.Warnings = append(report.Warnings, "the host applied but its workspace identity is unknown: "+info.WorkspaceError)
 		default:
 			identity = &info.Workspace
-			if err := recordContextWorkspace(client.contextName, client.route, info.Workspace); err != nil {
-				report.Warnings = append(report.Warnings, "the host applied but the local context workspace metadata could not be saved: "+err.Error())
+			if err := recordWorkspaceIdentity(cmd, client.accessName, client.route, info.Workspace); err != nil {
+				report.Warnings = append(report.Warnings, "the host applied but the local workspace identity could not be saved: "+err.Error())
 			}
 		}
 	}
@@ -105,23 +115,51 @@ type applyResult struct {
 	Workspace *controlplane.WorkspaceIdentity `json:"workspace,omitempty"`
 }
 
-// recordContextWorkspace stores only the verified, configured identity in the
-// exact context whose route the node RPC used. It refuses to overwrite a
-// context replaced by a concurrent login. A context-use change merely selects
-// another context and is preserved.
-func recordContextWorkspace(contextName string, expectedRoute *host.ContextSSH, workspace controlplane.WorkspaceIdentity) error {
+// recordWorkspaceIdentity stores only the verified, configured identity in the
+// exact local access record whose route the node RPC used. It refuses to
+// overwrite an access record replaced by a concurrent login; unrelated
+// workspace records and the current selection are preserved.
+func recordWorkspaceIdentity(cmd *cobra.Command, accessName string, expectedRoute *host.WorkspaceSSH, workspace controlplane.WorkspaceIdentity) error {
 	if !workspace.Configured {
 		return nil
 	}
-	if contextName == "" {
-		return contract.NewFault(contract.Internal, "the node client has no context name", "Retry the command; the workspace metadata was not written.")
+	if accessName == "" {
+		return contract.NewFault(contract.Internal, "the node client has no workspace access record", "Retry the command; the workspace metadata was not written.")
 	}
-	store, err := host.LoadContextStore("")
+	store, err := loadWorkspaceStore(cmd)
 	if err != nil {
 		return err
 	}
-	_, err = store.SetWorkspaceIfRoute(contextName, &host.ContextWorkspace{ID: workspace.ID, Name: workspace.Name}, expectedRoute)
+	_, err = store.SetWorkspaceIdentity(accessName, &host.WorkspaceIdentity{ID: workspace.ID, Name: workspace.Name}, expectedRoute)
 	return err
+}
+
+// sshClientFor resolves the shared workspace snapshot and, when a positional
+// node is supplied, validates it against the selected workspace's actual node.
+// A historical private access alias is never a target.
+func (a *app) sshClientFor(cmd *cobra.Command, args []string) (*nodeClient, error) {
+	access, err := selectedWorkspaceAccess(cmd)
+	if err != nil {
+		return nil, err
+	}
+	client, err := a.nodeClientForAccess(cmd, access)
+	if err != nil {
+		return nil, err
+	}
+	if len(args) == 1 {
+		info, err := client.NodeInfo(cmd.Context())
+		if err != nil {
+			return nil, err
+		}
+		if info.Node != args[0] {
+			fault := contract.NewFault(contract.NotFound,
+				"node "+args[0]+" is not the node of the selected workspace",
+				"Pass the selected workspace's actual node name, or select the intended workspace with --workspace.")
+			fault.Details = map[string]any{"node": args[0], "selected_node": info.Node, "workspace": workspaceDisplayName(access)}
+			return nil, fault
+		}
+	}
+	return client, nil
 }
 
 func (a *app) hostDoctor(cmd *cobra.Command, _ []string) (result, error) {
@@ -253,11 +291,7 @@ func (a *app) ssh(cmd *cobra.Command, args []string) (result, error) {
 			"eregion ssh needs a terminal or --command",
 			"Pass --command to run one command, or use a TTY for a shell.")
 	}
-	name := ""
-	if len(args) == 1 {
-		name = args[0]
-	}
-	client, err := a.nodeClientFor(cmd, name)
+	client, err := a.sshClientFor(cmd, args)
 	if err != nil {
 		return result{}, err
 	}
