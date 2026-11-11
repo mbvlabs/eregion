@@ -1,7 +1,7 @@
 # The workflow file path is part of the pinned cosign certificate identity.
 # Do not rename it: installers and release clients pin
 # publish-stable.yml@refs/tags/v<version>.
-name: Publish stable
+name: Publish release
 
 on:
   push:
@@ -17,6 +17,7 @@ concurrency:
 
 jobs:
   classify:
+    name: Classify release
     runs-on: ubuntu-24.04
     outputs:
       kind: ${{ steps.tag.outputs.kind }}
@@ -37,6 +38,7 @@ jobs:
             exit 1
           fi
   publish:
+    name: Publish stable
     needs: classify
     if: ${{ needs.classify.outputs.kind == 'final' }}
     runs-on: ubuntu-24.04
@@ -142,6 +144,7 @@ jobs:
           cp "${release_root}/${version%%.*}.x/manifest.json.sigstore.json" "${release_root}/manifest.json.sigstore.json"
           scripts/upload-release.sh "${release_root}" stable "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
   publish_prerelease:
+    name: ${{ contains(github.ref_name, '-rc.') && 'Publish RC' || 'Publish prerelease snapshot' }}
     needs: classify
     if: ${{ needs.classify.outputs.kind == 'prerelease' }}
     runs-on: ubuntu-24.04
