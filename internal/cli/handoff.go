@@ -39,6 +39,7 @@ type handoffGroup struct {
 // the operator SSH and WireGuard keys in the local workspace access, so this is the
 // copy that survives losing this machine.
 type secretsHandoff struct {
+	workspace  string
 	node       string
 	groups     []handoffGroup
 	passphrase string
@@ -51,8 +52,8 @@ type secretsHandoff struct {
 // newSecretsHandoff encrypts the record into a transfer bundle with a new
 // passphrase. Nothing is written here; writeRecord is the explicit
 // --secrets-out step.
-func newSecretsHandoff(node string, groups []handoffGroup) (*secretsHandoff, error) {
-	h := &secretsHandoff{node: node, groups: groups}
+func newSecretsHandoff(workspace, node string, groups []handoffGroup) (*secretsHandoff, error) {
+	h := &secretsHandoff{workspace: workspace, node: node, groups: groups}
 	pass, err := bundle.NewPassphrase()
 	if err != nil {
 		return nil, err
@@ -149,7 +150,7 @@ func (h *secretsHandoff) show(w io.Writer) error {
 		}
 		switch choice {
 		case "save":
-			path, err := ui.Input("Save everything to", "A new owner-only Markdown file", "./"+h.node+"-secrets.md")
+			path, err := ui.Input("Save everything to", "A new owner-only Markdown file", "./"+h.workspace+"--"+h.node+"-secrets.md")
 			if err != nil {
 				return err
 			}
@@ -203,7 +204,7 @@ func (r *serverInit) handoff(ctx context.Context, summary *serverInitSummary) er
 	// Register the actual secrets, not public labels: the JSON summary and
 	// ordinary output stay readable while credentials are redacted.
 	r.a.secrets.Add(r.identity.sudoPassword, r.identity.wg.Encode(), r.identity.sshKeyPEM, r.answers.DatabaseURL, r.vaultKeyring)
-	h, err := newSecretsHandoff(r.answers.AccessKey, r.handoffGroups())
+	h, err := newSecretsHandoff(workspace.Name, r.answers.AccessKey, r.handoffGroups())
 	if err != nil {
 		task.end(ui.EndFail, "")
 		return err

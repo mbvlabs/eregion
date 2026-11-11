@@ -69,7 +69,7 @@ func (a *app) secretsExport(cmd *cobra.Command, _ []string) (result, error) {
 		return result{}, err
 	}
 	input := handoffExportInput(identity, exported)
-	record, err := newSecretsHandoff(input.NodeName, handoffGroups(input))
+	record, err := newSecretsHandoff(input.WorkspaceName, input.NodeName, handoffGroups(input))
 	if err != nil {
 		return result{}, err
 	}
