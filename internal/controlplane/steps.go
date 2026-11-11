@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -364,9 +365,14 @@ func (s *Service) appendNodeEvents(ctx context.Context, id contract.OperationID,
 			if event.Kind == "warning" {
 				kind = "warning"
 			}
-			message := s.redact(event.Message)
+			message := s.redaction.RedactPreservingLength(event.Message)
 			if len(message) > 4096 {
-				message = message[:4096]
+				const marker = " [clipped after redaction]"
+				end := 4096 - len(marker)
+				for end > 0 && !utf8.RuneStart(message[end]) {
+					end--
+				}
+				message = message[:end] + marker
 			}
 			if event.Kind == "step" {
 				kind = "step"

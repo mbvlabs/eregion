@@ -22,6 +22,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mbvlabs/eregion/internal/buildpacks"
 	"github.com/mbvlabs/eregion/internal/containerresolver"
@@ -1726,12 +1727,14 @@ func runArgvWithEnvGrace(ctx context.Context, argv []string, env []string, rt en
 	if registry == nil {
 		registry = &secrets.Registry{}
 	}
-	stdout := newLineSink(registry, step, report, "stdout")
-	stderr := newLineSink(registry, step, report, "stderr")
+	capture := &commandCapture{registry: registry, step: step, report: report}
+	stdout := &lineSink{capture: capture, stream: "stdout"}
+	stderr := &lineSink{capture: capture, stream: "stderr"}
 	command.Stdout, command.Stderr = stdout, stderr
 	err := command.Run()
 	stdout.Flush()
 	stderr.Flush()
+	capture.finish()
 	if ctx.Err() != nil {
 		if command.Process != nil {
 			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
@@ -1760,27 +1763,81 @@ func mergeEnv(base, extra []string) []string {
 	return append(out, extra...)
 }
 
-type lineSink struct {
-	mu       sync.Mutex
-	registry *secrets.Registry
-	step     string
-	report   engine.Reporter
-	stream   string
-	buf      bytes.Buffer
-	pending  []byte
-	partial  []byte
-	total    int
-	emitted  int
+const commandLogHalf = 1 << 20
+
+// One lock orders both streams and serializes the reporter for this invocation.
+type commandCapture struct {
+	mu                           sync.Mutex
+	registry                     *secrets.Registry
+	step                         string
+	report                       engine.Reporter
+	prefix                       int
+	tailing                      bool
+	tail                         []string
+	tailBytes                    int
+	omittedRecords, omittedBytes uint64
 }
 
-func newLineSink(registry *secrets.Registry, step string, report engine.Reporter, stream string) *lineSink {
-	return &lineSink{registry: registry, step: step, report: report, stream: stream}
+func (c *commandCapture) record(message string) {
+	if c.report == nil {
+		return
+	}
+	message = c.registry.RedactPreservingLength(message)
+	if !c.tailing && c.prefix+len(message) <= commandLogHalf {
+		c.prefix += len(message)
+		c.report(engine.Event{Kind: "log", Step: c.step, Message: message})
+		return
+	}
+	c.tailing = true
+	c.tail = append(c.tail, message)
+	c.tailBytes += len(message)
+	for c.tailBytes > 2*commandLogHalf-c.prefix {
+		c.evict()
+	}
+}
+
+func (c *commandCapture) evict() {
+	first := c.tail[0]
+	c.tail[0] = ""
+	c.tail = c.tail[1:]
+	c.tailBytes -= len(first)
+	c.omittedRecords++
+	c.omittedBytes += uint64(len(first))
+}
+
+func (c *commandCapture) finish() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.report == nil {
+		return
+	}
+	if c.omittedRecords > 0 {
+		// Reserve enough for the notice even as its counters grow during eviction.
+		for c.tailBytes > 2*commandLogHalf-c.prefix-128 {
+			c.evict()
+		}
+		notice := fmt.Sprintf("command output omitted: %d records, %d rendered bytes", c.omittedRecords, c.omittedBytes)
+		c.report(engine.Event{Kind: "log", Step: c.step, Message: c.registry.RedactPreservingLength(notice)})
+	}
+	for _, message := range c.tail {
+		c.report(engine.Event{Kind: "log", Step: c.step, Message: message})
+	}
+	c.tail = nil
+	c.report = nil
+}
+
+type lineSink struct {
+	capture   *commandCapture
+	stream    string
+	buf       bytes.Buffer
+	pending   []byte
+	discarded uint64
 }
 
 func (s *lineSink) Write(p []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.total += len(p)
+	s.capture.mu.Lock()
+	defer s.capture.mu.Unlock()
+	n := len(p)
 	if s.buf.Len() < 65536 {
 		room := 65536 - s.buf.Len()
 		if len(p) < room {
@@ -1788,43 +1845,71 @@ func (s *lineSink) Write(p []byte) (int, error) {
 		}
 		_, _ = s.buf.Write(p[:room])
 	}
-	s.pending = append(s.pending, p...)
-	for {
-		index := bytes.IndexByte(s.pending, '\n')
+	if s.capture.report == nil {
+		return n, nil
+	}
+	for len(p) > 0 {
+		index := bytes.IndexByte(p, '\n')
+		segment := p
+		if index >= 0 {
+			segment = p[:index]
+		}
+		if s.discarded > 0 || len(s.pending)+len(segment) > 65536 {
+			s.discarded += uint64(len(s.pending)) + uint64(len(segment))
+			s.pending = nil
+		} else {
+			s.pending = append(s.pending, segment...)
+		}
 		if index < 0 {
 			break
 		}
-		line := strings.TrimRight(string(s.pending[:index]), "\r")
-		s.pending = s.pending[index+1:]
-		s.emit(line)
+		if s.discarded > 0 {
+			s.loss()
+		} else {
+			s.emit(strings.TrimRight(string(s.pending), "\r"))
+			s.pending = nil
+		}
+		p = p[index+1:]
 	}
-	return len(p), nil
+	return n, nil
 }
 
 func (s *lineSink) Flush() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.pending) > 0 {
+	s.capture.mu.Lock()
+	defer s.capture.mu.Unlock()
+	if s.discarded > 0 {
+		s.loss()
+	} else if len(s.pending) > 0 {
 		s.emit(string(s.pending))
 		s.pending = nil
 	}
 }
 
 func (s *lineSink) emit(line string) {
-	if s.report == nil || s.emitted >= 100 || strings.TrimSpace(line) == "" {
+	if s.capture.report == nil || strings.TrimSpace(line) == "" {
 		return
 	}
-	message := truncate(output.SafeText(s.registry.Redact(line)), 1024)
-	if message == "" {
-		return
+	message := output.SafeText(s.capture.registry.Redact(line))
+	prefix := s.stream + ": "
+	for len(message) > 0 {
+		end := min(len(message), 4096-len(prefix))
+		for end < len(message) && !utf8.RuneStart(message[end]) {
+			end--
+		}
+		s.capture.record(prefix + message[:end])
+		message = message[end:]
 	}
-	s.emitted++
-	s.report(engine.Event{Kind: "log", Step: s.step, Message: s.stream + ": " + message})
+}
+
+func (s *lineSink) loss() {
+	s.capture.record(fmt.Sprintf("%s: oversized line discarded (%d bytes)", s.stream, s.discarded))
+	s.discarded = 0
+	s.pending = nil
 }
 
 func (s *lineSink) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.capture.mu.Lock()
+	defer s.capture.mu.Unlock()
 	return s.buf.String()
 }
 

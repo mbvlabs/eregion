@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,6 +105,7 @@ func (a *app) buildSpec() spec {
 				args: buildIDArg,
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().Bool("follow", false, "Follow the build operation until it finishes or the viewer is detached")
+					cmd.Flags().String("after", "", "Resume a bounded read after this event cursor (not with --follow or NDJSON)")
 					cmd.Flags().Duration("poll-interval", viewer.DefaultPollInterval, "Follow poll interval")
 				},
 				run: a.buildLogs,
@@ -544,12 +546,29 @@ func deliveryFilters(cmd *cobra.Command, app, environment string) url.Values {
 }
 
 type buildLogsResult struct {
-	Build  platform.BuildRecord `json:"build"`
-	Events []contract.Event     `json:"events"`
-	Cursor uint64               `json:"cursor,string"`
+	Build   platform.BuildRecord `json:"build"`
+	Events  []contract.Event     `json:"events"`
+	Cursor  uint64               `json:"cursor,string"`
+	Partial bool                 `json:"partial"`
 }
 
 func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
+	afterText, _ := cmd.Flags().GetString("after")
+	follow, _ := cmd.Flags().GetBool("follow")
+	var after uint64
+	if cmd.Flags().Changed("after") {
+		if follow || streamsNDJSON(cmd) {
+			return result{}, contract.NewFault(contract.ValidationFailed, "--after cannot be combined with --follow or NDJSON", "Use a bounded read with --after, or follow without it.")
+		}
+		if afterText == "" || strings.Trim(afterText, "0123456789") != "" {
+			return result{}, contract.NewFault(contract.ValidationFailed, "invalid --after cursor", "Use a nonnegative event cursor from a build logs result.")
+		}
+		var parseErr error
+		after, parseErr = strconv.ParseUint(afterText, 10, 63)
+		if parseErr != nil {
+			return result{}, contract.NewFault(contract.ValidationFailed, "invalid --after cursor", "Use a nonnegative event cursor from a build logs result.")
+		}
+	}
 	client, err := a.client(cmd)
 	if err != nil {
 		return result{}, err
@@ -558,15 +577,14 @@ func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	follow, _ := cmd.Flags().GetBool("follow")
 	if follow || streamsNDJSON(cmd) {
 		return a.followBuildLogs(cmd, client, build)
 	}
-	events, cursor, err := fetchOperationEvents(cmd.Context(), client, build.OperationID)
+	events, cursor, partial, err := fetchOperationEvents(cmd.Context(), client, build.OperationID, after)
 	if err != nil {
 		return result{}, err
 	}
-	data := buildLogsResult{Build: build, Events: events, Cursor: cursor}
+	data := buildLogsResult{Build: build, Events: events, Cursor: cursor, Partial: partial}
 	if !plainOutput(cmd) {
 		return result{data: data}, nil
 	}
@@ -584,6 +602,16 @@ func (a *app) buildLogs(cmd *cobra.Command, args []string) (result, error) {
 	}
 	if len(events) == 0 {
 		plain.WriteString("no build log events yet\n")
+	}
+	if partial {
+		command := "eregion"
+		for _, name := range []string{"workspace", "workspace-file"} {
+			if flag := cmd.InheritedFlags().Lookup(name); flag != nil && flag.Changed {
+				command += " --" + name + " '" + strings.ReplaceAll(flag.Value.String(), "'", "'\\''") + "'"
+			}
+		}
+		command += " build logs '" + strings.ReplaceAll(args[0], "'", "'\\''") + "' --after " + strconv.FormatUint(cursor, 10)
+		fmt.Fprintf(&plain, "Partial event read; continue with: %s\n", command)
 	}
 	return result{data: data, plain: plain.String()}, nil
 }
@@ -636,28 +664,39 @@ func (a *app) findBuild(cmd *cobra.Command, client Backend, id platform.BuildID)
 	return platform.BuildRecord{}, contract.NewFault(contract.NotFound, "build not found", "List builds for the environment with eregion build list.")
 }
 
-func fetchOperationEvents(ctx context.Context, client Backend, id contract.OperationID) ([]contract.Event, uint64, error) {
+func fetchOperationEvents(ctx context.Context, client Backend, id contract.OperationID, after uint64) ([]contract.Event, uint64, bool, error) {
 	var events []contract.Event
-	cursor := uint64(0)
+	cursor := after
 	for page := 0; page < 100; page++ {
 		raw, err := client.Events(ctx, contract.Cursor{OperationID: id, After: cursor}, 200)
 		if err != nil {
-			return nil, cursor, err
+			return nil, cursor, false, err
 		}
 		var result operations.EventPage
 		if err := json.Unmarshal(raw, &result); err != nil {
-			return nil, cursor, invalidNodeData("build event page")
+			return nil, cursor, false, invalidNodeData("build event page")
+		}
+		if len(result.Events) > 200 || (len(result.Events) > 0 && result.Cursor.After <= cursor) {
+			return nil, cursor, false, invalidNodeData("build event page")
 		}
 		events = append(events, result.Events...)
 		if result.Cursor.After <= cursor {
-			break
+			return events, cursor, false, nil
 		}
 		cursor = result.Cursor.After
 		if len(result.Events) < 200 {
-			break
+			return events, cursor, false, nil
 		}
 	}
-	return events, cursor, nil
+	raw, err := client.Events(ctx, contract.Cursor{OperationID: id, After: cursor}, 1)
+	if err != nil {
+		return nil, cursor, false, err
+	}
+	var probe operations.EventPage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return nil, cursor, false, invalidNodeData("build event page")
+	}
+	return events, cursor, len(probe.Events) > 0, nil
 }
 
 type deployPlan struct {

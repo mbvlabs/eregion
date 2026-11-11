@@ -88,6 +88,13 @@ eregion operations follow <operation_id> --output ndjson
 eregion operations get <operation_id> --json
 ```
 
+`build logs <build-id> --json` returns at most 20,000 events per read. If
+`partial` is true, resume with `build logs <build-id> --after <cursor>`;
+the cursor is a string. `--after` is for bounded reads, not follow or NDJSON.
+Command output capture itself is bounded and may report omitted records or
+oversized lines, independently of pagination. Buffered tail output is not
+guaranteed to survive a crash or interrupted persistence.
+
 `follow --json` waits for a final snapshot. A failed operation returns a failure
 envelope and nonzero status; inspect its error details and operation state.
 `follow --output ndjson`

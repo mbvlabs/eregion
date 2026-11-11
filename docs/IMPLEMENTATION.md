@@ -270,6 +270,16 @@ bin/eregion help app create --json
 | `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. The telemetry endpoint is a dedicated Caddy unit, not an eregion node service. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
+External command event capture is bounded per invocation: up to 2 MiB of
+redacted, sanitized messages, with a live prefix and newest buffered tail. A
+gap notice counts omitted records and rendered bytes; logical lines over 64 KiB
+are discarded whole with a separate loss notice. Buffered output is not guaranteed
+to survive a crash or cancellation of persistence. This is not unlimited log
+retention. A non-following `build logs` read returns at most 20,000 events;
+`partial` and the string `cursor` identify a continuation with `--after`.
+Pagination is distinct from capture loss. `--after` cannot be combined with
+follow or NDJSON.
+
 All of MASTER section 5's app, environment, deployment and observation surface
 exists. The `platform` command group is deleted: `app`, `env` (including
 `env promote`), `process`, `config`, `domain`, `deploy`, `rollback`, `restart`,

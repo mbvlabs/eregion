@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 const Placeholder = "[REDACTED]"
@@ -40,8 +41,23 @@ func (r *Registry) Add(values ...string) {
 }
 
 func (r *Registry) Redact(text string) string {
+	return r.redact(text, false)
+}
+
+// RedactPreservingLength applies the same registered matches without changing
+// the byte length. Short matches use asterisks; longer ones use the usual
+// placeholder padded with asterisks. This is for already-budgeted event text
+// that must still pass through independent downstream registries.
+func (r *Registry) RedactPreservingLength(text string) string {
+	return r.redact(text, true)
+}
+
+func (r *Registry) redact(text string, preserveLength bool) string {
 	if r == nil {
-		return text
+		if !preserveLength || utf8.ValidString(text) {
+			return text
+		}
+		return validBytes(text)
 	}
 	r.mu.RLock()
 	values := make([]string, 0, len(r.values))
@@ -57,10 +73,41 @@ func (r *Registry) Redact(text string) string {
 	})
 	pairs := make([]string, 0, len(values)*2)
 	for _, value := range values {
-		pairs = append(pairs, value, Placeholder)
+		if preserveLength && len(value) > len(text) {
+			continue
+		}
+		replacement := Placeholder
+		if preserveLength {
+			if len(value) < len(Placeholder) {
+				replacement = strings.Repeat("*", len(value))
+			} else {
+				replacement += strings.Repeat("*", len(value)-len(Placeholder))
+			}
+		}
+		pairs = append(pairs, value, replacement)
 	}
 	// One pass avoids re-redacting the placeholder and prefers longest matches.
-	return strings.NewReplacer(pairs...).Replace(text)
+	result := strings.NewReplacer(pairs...).Replace(text)
+	if preserveLength && !utf8.ValidString(result) {
+		return validBytes(result)
+	}
+	return result
+}
+
+// Replace each invalid byte separately so JSON encoding cannot enlarge it.
+func validBytes(text string) string {
+	var out strings.Builder
+	out.Grow(len(text))
+	for len(text) > 0 {
+		_, size := utf8.DecodeRuneInString(text)
+		if size == 1 && text[0] >= utf8.RuneSelf {
+			out.WriteByte('*')
+		} else {
+			out.WriteString(text[:size])
+		}
+		text = text[size:]
+	}
+	return out.String()
 }
 
 // JSON redacts decoded strings and object keys before re-encoding. UseNumber
