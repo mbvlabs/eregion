@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -51,14 +52,14 @@ func (m Model) render() string {
 	if m.form != nil {
 		return fitLines(m.renderForm(width, height), width, height)
 	}
-	if m.op != nil {
-		return fitLines(m.renderOperation(width, height), width, height)
-	}
 	if m.paletteOpen {
 		return fitLines(m.renderPalette(width, height), width, height)
 	}
 	if m.showHelp {
 		return fitLines(m.renderHelp(width, height), width, height)
+	}
+	if m.op != nil {
+		return fitLines(m.renderOperation(width, height), width, height)
 	}
 	if width < 40 || height < 9 {
 		return fitLines(m.renderCompact(width, height), width, height)
@@ -463,13 +464,18 @@ func (m Model) renderFooter(width int) string {
 		status += m.glyphSeparator() + m.warnStyle().Render(m.clean(m.notice))
 	}
 	hints := "r refresh · / filter · : commands · enter details · ? help · q detach"
+	keys := m.keys
+	if m.tab == Deployments {
+		hints = "r refresh · / filter · : commands · enter history · i details · ? help · q detach"
+		keys.Details = key.NewBinding(key.WithKeys("enter", "i"), key.WithHelp("enter/i", "history/details"))
+	}
 	if width < 72 {
 		hints = "r / : enter ? q"
 	}
 	helpModel := m.help
 	helpModel.SetWidth(max(1, width))
 	if width >= 96 {
-		if rendered := helpModel.View(m.keys); rendered != "" {
+		if rendered := helpModel.View(keys); rendered != "" {
 			hints = rendered
 		}
 	}
@@ -562,6 +568,7 @@ func (m Model) renderHelp(width, height int) string {
 		"",
 		m.boldStyle().Render("Workspaces"),
 		m.dim().Render("1 fleet · 2 apps · 3 envs · 4 releases · 5 deployments · tab cycles"),
+		m.dim().Render("enter opens deployment operation history (other tabs: details) · i or space opens row details"),
 		m.boldStyle().Render("Guided forms"),
 		m.dim().Render("d deploy · o rollback"),
 		m.dim().Render("enter next field · tab next · s submit after preview · e edit preview · esc cancel"),
@@ -751,6 +758,7 @@ func (m Model) formHint(form *formState) string {
 func (m Model) renderOperation(width, height int) string {
 	op := m.op
 	lines := []string{m.boldStyle().Render("OPERATION " + string(op.id))}
+	lines = append(lines, m.dim().Render(truncate("CLI: eregion operations follow "+string(op.id), width)))
 	if op.snapshot.ID != "" {
 		lines = append(lines,
 			m.dim().Render(fmt.Sprintf("kind: %s · target: %s", op.snapshot.Kind, m.clean(op.snapshot.Target))),

@@ -28,7 +28,7 @@ func (a *app) envSpecs() []spec {
 		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
-		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "go-target", "go-version", "go-build-flags", "node-version",
+		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version",
 	}
 	create.Examples = []string{
 		"eregion env create",
@@ -40,13 +40,13 @@ func (a *app) envSpecs() []spec {
 
 	update := operationMeta("Change an environment as a new desired-state revision", "eregion env update api production --git-ref release-2026-10 --json")
 	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued. --github-auth reads the local authenticated gh token for a github.com source as the new read credential; it is opt-in because that token may carry broader scopes. With an authenticated gh, --github-webhook creates or updates the repository webhook for --auto-deploy or --rotate-webhook-secret; manual paste remains the fallback."}
-	update.WhenToUse = append(update.WhenToUse, "Git Buildpacks settings include ordered --buildpack references and optional Go and Node inputs; image sources bypass builds. --build-env '', --go-target '' and --buildpack '' clear their respective lists. --from reads a TOML definition; app export --inspect is not applicable.")
+	update.WhenToUse = append(update.WhenToUse, "Git Buildpacks settings include ordered --buildpack references and optional Go and Node inputs; image sources bypass builds. --build-env '', --target '' and --buildpack '' clear their respective lists. --from reads a TOML definition; app export --inspect is not applicable.")
 	update.Mutating, update.DryRun, update.Prompts = true, true, true
 	update.InputFlags = []string{
 		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name", "github-auth",
 		"image", "builder", "context-path", "build-env", "health-type", "health-path", "health-timeout",
 		"release-command", "process", "from", "github-webhook",
-		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "go-target", "go-version", "go-build-flags", "node-version",
+		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version",
 	}
 	update.Examples = []string{
 		"eregion env update api production",

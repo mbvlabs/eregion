@@ -67,6 +67,7 @@ func StepFamilies() []Family {
 		{Match: resourceStepPattern.MatchString, Build: buildResourceStep},
 		{Match: resourceVolumeRemoveStepPattern.MatchString, Build: buildResourceVolumeRemoveStep},
 		{Match: candidateDiagnosticStepPattern.MatchString, Build: buildCandidateDiagnosticStep},
+		{Match: diagnosticExecutionPattern.MatchString, Build: buildDiagnosticExecutionStep},
 	}
 }
 

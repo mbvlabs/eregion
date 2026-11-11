@@ -32,6 +32,9 @@ type Service struct {
 	transport node.Transport
 	// localNode is the identity of the in-process local transport, if any.
 	localNode string
+	// diagnosticAdmissionNode is the node-mode host identity verified by the
+	// trusted insert-only RPC server against the worker configuration.
+	diagnosticAdmissionNode string
 	// resolver reaches the node a piece of work is placed on: the enrolled
 	// node's own pinned SSH transport, or transport for the node it serves.
 	resolver *NodeResolver
@@ -155,6 +158,11 @@ func (s *Service) Submit(ctx context.Context, sub operations.Submission) (contra
 // never performs first-submission effects and WebhookSecretActivated is false.
 func (s *Service) SubmitWithReceipt(ctx context.Context, sub operations.Submission) (operations.SubmissionResult, error) {
 	var zero operations.SubmissionResult
+	// This operation may only be admitted by the dedicated trusted boundary;
+	// registering its normalizer later must not make generic submit authorize it.
+	if sub.Kind == platform.KindDiagnosticExecution {
+		return zero, contract.NewFault(contract.ValidationFailed, "diagnostic execution is not available through generic submission", "Use the authenticated operator SSH diagnostic execution flow when available.")
+	}
 	if err := sub.Actor.Validate(); err != nil {
 		return zero, err
 	}

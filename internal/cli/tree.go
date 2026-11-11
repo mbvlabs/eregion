@@ -92,7 +92,7 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.workspaceCommandSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.uiSpecs(), a.logsSpecs(), a.metricsSpecs()} {
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.workspaceCommandSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.uiSpecs(), a.logsSpecs(), a.metricsSpecs(), a.diagnoseSpecs()} {
 		for _, s := range specs {
 			a.attach(a.root, s)
 		}

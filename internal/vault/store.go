@@ -185,15 +185,37 @@ func (s *Store) Get(ctx context.Context, namespace Namespace) (Metadata, error) 
 	return metadataQuery(ctx, s.pool, namespace)
 }
 
-// GetTx reads secret-free metadata inside a caller-owned transaction. Secret
-// activation uses this to choose the CAS revision under the same lock order as
-// the subsequent Set.
+// GetTx reads secret-free metadata inside a caller-owned transaction without
+// locking the namespace. Set independently locks and checks its CAS revision.
 func (s *Store) GetTx(ctx context.Context, tx pgx.Tx, namespace Namespace) (Metadata, error) {
 	if tx == nil {
 		return Metadata{}, contract.NewFault(contract.Internal, "secret read has no transaction", "Integrate secret reads through an explicit PostgreSQL transaction.")
 	}
 	if err := namespace.Validate(); err != nil {
 		return Metadata{}, err
+	}
+	return metadataQuery(ctx, tx, namespace)
+}
+
+// GetForUpdateTx locks the namespace row until the caller commits or rolls back,
+// then reads secret-free metadata. It serializes admission decisions with Set
+// and Archive without reading or decrypting secret values.
+func (s *Store) GetForUpdateTx(ctx context.Context, tx pgx.Tx, namespace Namespace) (Metadata, error) {
+	if tx == nil {
+		return Metadata{}, contract.NewFault(contract.Internal, "secret read has no transaction", "Integrate secret reads through an explicit PostgreSQL transaction.")
+	}
+	if err := namespace.Validate(); err != nil {
+		return Metadata{}, err
+	}
+	var name string
+	err := tx.QueryRow(ctx, `SELECT name FROM eregion_secrets
+		WHERE app = $1 AND environment = $2 AND name = $3 FOR UPDATE`,
+		namespace.App, namespace.Environment, namespace.Name).Scan(&name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Metadata{}, notFound(namespace)
+	}
+	if err != nil {
+		return Metadata{}, databaseFault(err)
 	}
 	return metadataQuery(ctx, tx, namespace)
 }

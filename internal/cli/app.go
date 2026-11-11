@@ -26,7 +26,7 @@ func (a *app) appSpecs() []spec {
 		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
-		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "go-target", "go-version", "go-build-flags", "node-version",
+		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version",
 	}
 	create.Examples = []string{
 		"eregion app create",
@@ -45,13 +45,13 @@ func (a *app) appSpecs() []spec {
 	status.Next = []string{"eregion env status <app> <environment> --json"}
 
 	export := operationMeta("Export an environment's TOML definition or inspection snapshot", "eregion app export api production")
-	export.WhenToUse = []string{"Generate a deterministic TOML app definition from the current revision. Normal export refuses unsupported auto-deploy, webhook and retention state. --inspect includes non-secret inventory metadata but produces a non-applicable snapshot; it is not a DNS automation round trip."}
+	export.WhenToUse = []string{"Generate a deterministic TOML app definition from the current revision, including automation and webhook secret names, not values. Normal export refuses unsupported retention state. External webhook and managed DNS provider configuration are not represented. --inspect includes non-secret inventory metadata but produces a non-applicable snapshot; never apply it."}
 	export.InputFlags = []string{"out", "inspect"}
 	export.Examples = []string{
 		"eregion app export api production",
 		"eregion app export api production --out ./eregion.toml --json",
 	}
-	export.Next = []string{"eregion env update <app> <environment> --from ./eregion.toml --dry-run --json"}
+	export.Next = []string{"eregion app export <app> <environment> --help"}
 
 	return []spec{{
 		use:  "app",
@@ -447,7 +447,10 @@ func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
 	if outPath != "" {
 		plain = "Wrote " + outPath + "\n"
 	}
-	return result{data: data, plain: plain}, nil
+	if boolFlag(cmd, "inspect") {
+		return result{data: data, plain: plain, next: []string{"eregion app export " + appName + " " + environment + " --help"}}, nil
+	}
+	return result{data: data, plain: plain, next: []string{"eregion env update " + appName + " " + environment + " --from ./eregion.toml --dry-run --json"}}, nil
 }
 
 func (a *app) appList(cmd *cobra.Command, _ []string) (result, error) {

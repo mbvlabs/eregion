@@ -1110,11 +1110,12 @@ func TestExportRejectsUnrepresentableState(t *testing.T) {
 		mutate func(*platform.EnvironmentRevision)
 		want   string
 	}{
-		"auto-deploy": {func(revision *platform.EnvironmentRevision) { revision.AutoDeploy = true }, "auto_deploy"},
-		"webhook":     {func(revision *platform.EnvironmentRevision) { revision.WebhookSecretName = "HOOK" }, "webhook_secret_name"},
 		"retention": {func(revision *platform.EnvironmentRevision) {
 			revision.Retention = retention.Override{KeepReleases: &keep}
 		}, "retention override"},
+		"release timeout": {func(revision *platform.EnvironmentRevision) {
+			revision.Runtime.ReleaseCommand = &platform.CommandSpec{Argv: []string{"true"}, TimeoutSeconds: 42}
+		}, "release timeout override"},
 		"no source": {func(revision *platform.EnvironmentRevision) { revision.Source = platform.SourceBinding{} }, "no source binding"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1137,5 +1138,101 @@ func TestExportRejectsUnrepresentableState(t *testing.T) {
 		{Domain: "a.example.com", Primary: true}, {Domain: "b.example.com", Primary: true},
 	}, nil); err == nil {
 		t.Fatal("exported multiple primary domains")
+	}
+}
+
+func TestAutomationExportAndUpdate(t *testing.T) {
+	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
+		Source:    platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", Ref: "main", BuildEnv: map[string]string{"BP_X": "x"}},
+		Runtime:   platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
+		Processes: []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+		Config:    map[string]string{"MODE": "production"}, SecretNames: []string{"DATABASE_URL"},
+		AutoDeploy: true, WebhookSecretName: "HOOK",
+	}}
+	current := platform.Environment{App: "api", Name: "production", Node: "main", Revision: revision}
+	doc, err := Export("api", "production", "", revision, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(doc, "auto_deploy = true\nwebhook_secret_name = \"HOOK\"") {
+		t.Fatal(doc)
+	}
+	resolve := func(text string) *Resolved {
+		t.Helper()
+		d, err := Parse([]byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := d.Resolve("production")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	assertPatch := func(text string) platform.EnvironmentUpdateInput {
+		t.Helper()
+		p, _, _, err := resolve(text).UpdatePatch(current, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	p, changed, _, err := resolve(doc).UpdatePatch(current, nil)
+	if err != nil || len(changed) != 0 || p.AutoDeploy != nil || p.WebhookSecretName != nil {
+		t.Fatalf("round trip: %+v %v %v", p, changed, err)
+	}
+	if _, err := resolve(doc).CreateSpec(nil); err == nil {
+		t.Fatal("create accepted enabled automation")
+	}
+	without := strings.Replace(doc, "auto_deploy = true\nwebhook_secret_name = \"HOOK\"\n", "", 1)
+	p = assertPatch(without)
+	if p.AutoDeploy != nil || p.WebhookSecretName != nil {
+		t.Fatalf("omission changed automation: %+v", p)
+	}
+	partial := strings.Replace(doc, "auto_deploy = true\n", "", 1)
+	p = assertPatch(partial)
+	if p.AutoDeploy != nil || p.WebhookSecretName != nil {
+		t.Fatalf("omitted flag changed: %+v", p)
+	}
+	partial = strings.Replace(doc, "webhook_secret_name = \"HOOK\"\n", "", 1)
+	p = assertPatch(partial)
+	if p.AutoDeploy != nil || p.WebhookSecretName != nil {
+		t.Fatalf("omitted name changed: %+v", p)
+	}
+	partial = doc + "\n[environments.production.automation]\nauto_deploy = false\n"
+	p = assertPatch(partial)
+	next := platform.ApplyEnvironmentPatch(revision.RevisionState, p)
+	if next.AutoDeploy || next.WebhookSecretName != "HOOK" {
+		t.Fatalf("partial override did not inherit name: %+v", next)
+	}
+	p = assertPatch(strings.Replace(doc, "auto_deploy = true", "auto_deploy = false", 1))
+	next = platform.ApplyEnvironmentPatch(revision.RevisionState, p)
+	if next.AutoDeploy || next.WebhookSecretName != "HOOK" {
+		t.Fatalf("disable lost name: %+v", next)
+	}
+	p = assertPatch(strings.Replace(doc, "webhook_secret_name = \"HOOK\"", "webhook_secret_name = \"OTHER\"", 1))
+	if p.WebhookSecretName == nil || *p.WebhookSecretName != "OTHER" {
+		t.Fatalf("name change lost: %+v", p)
+	}
+	invalid := strings.Replace(doc, "webhook_secret_name = \"HOOK\"", "webhook_secret_name = \"\"", 1)
+	if _, _, _, err := resolve(invalid).UpdatePatch(current, nil); err == nil {
+		t.Fatal("enabled without secret name accepted")
+	}
+	invalid = strings.Replace(doc, "https://github.com/acme/api", "https://gitlab.com/acme/api", 1)
+	if _, _, _, err := resolve(invalid).UpdatePatch(current, nil); err == nil {
+		t.Fatal("non-GitHub automation accepted")
+	}
+	override := doc + "\n[environments.production.automation]\nauto_deploy = false\nwebhook_secret_name = \"\"\n"
+	p = assertPatch(override)
+	next = platform.ApplyEnvironmentPatch(revision.RevisionState, p)
+	if next.AutoDeploy || next.WebhookSecretName != "" {
+		t.Fatalf("override failed to clear: %+v", next)
+	}
+	snapshot, err := Inspect("api", "production", current, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse([]byte(snapshot)); err == nil {
+		t.Fatal("inspection snapshot was applicable")
 	}
 }

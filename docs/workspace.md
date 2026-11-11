@@ -26,9 +26,12 @@ route. A failed authoritative workspace read is
 shown as unknown, separately from a genuinely unconfigured installation.
 
 Tabs: `1` Fleet, `2` Apps, `3` Envs, `4` Releases, `5` Deployments. Keys:
-arrows/`j/k`, `g/G`, `/` filter, `enter` details, `r` refresh, `:` discovery,
-`?` help, `q`/Ctrl-C detach. The operation view's space key pauses the local
-viewport, not execution.
+arrows/`j/k`, `g/G`, `/` filter, `enter` details (or linked operation history
+on Deployments), `i` or space for row details, `r` refresh, `:` discovery,
+`?` help, `q`/Ctrl-C detach. A deployment without a valid linked operation
+reports history unavailable. The operation viewer replays durable events and
+polls active work; `esc` returns to the selected row without cancelling it.
+The CLI equivalent is `eregion operations follow <operation_id>`.
 
 Existing workspace forms cover deploy and rollback. They preview through the
 node-mode action service and show their exact noninteractive command equivalent.

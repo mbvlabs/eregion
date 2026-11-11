@@ -422,6 +422,7 @@ func decodeDeployments(raw json.RawMessage, clean func(string) string) ([]Item, 
 		search := joinSearch(title, status, operation, string(deployment.ReleaseID), string(deployment.PreviousReleaseID), deployment.Message)
 		items = append(items, Item{
 			Key: clean(string(deployment.ID)), Title: title, Subtitle: operation, Status: status, Details: details, SearchText: search,
+			OperationID: deployment.OperationID,
 			Data: map[string]string{
 				"app": app, "environment": environment, "state": status, "action": action,
 				"release": clean(string(deployment.ReleaseID)), "operation": operation,

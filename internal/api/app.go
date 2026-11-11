@@ -242,6 +242,38 @@ type operationListService interface {
 	ListOperations(context.Context, operations.Authority, operations.ListQuery) (operations.ListPage, error)
 }
 
+type diagnosisService interface {
+	Diagnose(context.Context, operations.Authority, contract.OperationID, uint64, int, string) (platform.Diagnosis, error)
+}
+
+// diagnosticExecutionService is only called by the authenticated node RPC
+// adapter. It is deliberately not registered as a generic HTTP action.
+type diagnosticExecutionService interface {
+	PreviewDiagnosticExecution(context.Context, contract.Actor, string, contract.OperationID, []string, string) (platform.DiagnosticExecutionPreview, error)
+	SubmitDiagnosticExecution(context.Context, contract.Actor, string, contract.OperationID, []string, string) (operations.SubmissionResult, error)
+}
+
+// DiagnosticExecution previews or admits the dedicated SSH-only operation.
+func (s AppService) DiagnosticExecution(ctx context.Context, actor contract.Actor, key string, original contract.OperationID, argv []string, confirmation string, dryRun bool) (any, error) {
+	service, ok := s.Operations.(diagnosticExecutionService)
+	if !ok {
+		return nil, contract.NewFault(contract.Unavailable, "diagnostic execution is not configured", "Use a node with durable diagnostic execution support.")
+	}
+	if dryRun {
+		return service.PreviewDiagnosticExecution(ctx, actor, key, original, argv, confirmation)
+	}
+	return service.SubmitDiagnosticExecution(ctx, actor, key, original, argv, confirmation)
+}
+
+// Diagnose reads the same durable evidence for every presentation.
+func (s AppService) Diagnose(ctx context.Context, authority operations.Authority, id contract.OperationID, after uint64, limit int, localNode string) (platform.Diagnosis, error) {
+	service, ok := s.Operations.(diagnosisService)
+	if !ok {
+		return platform.Diagnosis{}, contract.NewFault(contract.Unavailable, "diagnosis is not configured", "Use a control-plane service with durable platform state.")
+	}
+	return service.Diagnose(ctx, authority, id, after, limit, localNode)
+}
+
 // ListOperations reads operation history under the caller's authority.
 func (s AppService) ListOperations(ctx context.Context, authority operations.Authority, query operations.ListQuery) (operations.ListPage, error) {
 	service, ok := s.Operations.(operationListService)

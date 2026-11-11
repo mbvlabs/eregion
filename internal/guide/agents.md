@@ -88,6 +88,24 @@ eregion operations follow <operation_id> --output ndjson
 eregion operations get <operation_id> --json
 ```
 
+`diagnose <operation-id> --json` reads bounded operation, revision, image and
+candidate evidence without mutating an operation. Resume partial event pages
+with `--after <cursor>`; `--limit` bounds each page. Unavailable entries are
+evidence gaps, not findings. Report retrieval success does not mean the original
+operation succeeded. Image metadata describes declarations, not executable
+availability; child stderr appears only when forwarded to Docker.
+`diagnose` is read-only unless explicitly given `--execute`. For an isolated
+diagnostic, use `eregion diagnose <operation-id> --execute --confirm
+<operation-id> -- /absolute/executable args...` (keep the command on one line).
+Add `--dry-run` to preview without execution and supply a stable
+`--idempotency-key` for retries. Every argument is durable ordinary operation
+input: never include a secret. Exact confirmation is required even on dry runs;
+there is no prompt or `--yes` bypass. Only a recorded local deployment image is
+supported; no image is pulled. The new operation is accepted, not complete:
+follow it for exit, OOM, timeout or unknown status and verified cleanup. All
+command output is withheld because image-baked secrets cannot be redacted
+reliably. Do not treat image metadata as proof that a command was run.
+
 `build logs <build-id> --json` returns at most 20,000 events per read. If
 `partial` is true, resume with `build logs <build-id> --after <cursor>`;
 the cursor is a string. `--after` is for bounded reads, not follow or NDJSON.
@@ -237,13 +255,17 @@ its identity.
 Git sources use Buildpacks; existing image sources bypass builds. Repeat
 `--buildpack` in the desired order, or omit it for builder detection. An empty
 builder uses the build node's platform default; an explicit builder selects an
-image. Configure optional Go targets with `--go-target`, Node inputs with
+image. Configure optional targets with `--target web=./cmd/web`, Node inputs with
 `--frontend-directory` and repeated `--frontend-script`, and advanced inputs
 with `--go-version`, `--go-build-flags` and `--node-version`. Supplied typed
 values override corresponding raw build environment keys; clearing one removes
-the override. `env update --build-env ''`, `--go-target ''`, and
+the override. `env update --build-env ''`, `--target ''`, and
 `--buildpack ''` clear their lists; `--builder ''` resets the builder. TOML
 definitions use `[source.buildpacks] order = [...]` via `--from`.
+In TOML, `[source]` can include `targets = [{ process = "web", target = "./cmd/web" }]`.
+Targets currently require repository-relative Go package paths and map to Paketo
+`BP_GO_TARGETS`; no automatic language target discovery is added. Omit them for
+ordinary non-Go builds; the name does not imply Node or Rails target support.
 Repeated `--keep-file` (TOML `source.buildpacks.keep_files`) passes relative
 globs to `BP_KEEP_FILES`. Select your own runtime files and artifacts; no paths
 are added by default. This preserves matched application paths, not arbitrary
@@ -259,7 +281,16 @@ the list and `--frontend-start-script ''` clears the override; omitted inputs
 remain unchanged.
 Normal `app export` refuses unsupported state; `app export <app> <env> --inspect`
 provides non-secret metadata for inspection only and cannot be applied. It does
-not reconstruct provider ownership or DNS automation.
+not reconstruct provider ownership or DNS automation. A normal export includes
+`[automation]` with the desired auto-deploy flag and webhook secret **name**,
+never its value. Shared and environment-specific automation fields merge
+independently; omission on update preserves the current field. Setting false
+disables auto-deploy without clearing the name; an empty name clears it only
+when disabled. Create an environment before enabling it through `env update
+--auto-deploy`; TOML activation or a name change requires an existing active
+vault secret and never generates or rotates it. TOML does not manage external
+GitHub hook objects, delivery settings or provider credentials. Unchanged domain
+bindings are left alone; a new binding does not reconstruct managed DNS.
 
 Processes are `web` (domains), `worker` (no port), or `service` (private
 port). Web and service processes answer on their process-name DNS alias and

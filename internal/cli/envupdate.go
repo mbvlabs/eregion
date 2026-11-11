@@ -449,7 +449,7 @@ func sourceDiff(old, new platform.SourceBinding) []string {
 		out = append(out, "source.build_env changed")
 	}
 	if !slices.Equal(old.GoTargets, new.GoTargets) {
-		out = append(out, "source.go_targets changed")
+		out = append(out, "source.targets changed")
 	}
 	if !reflect.DeepEqual(old.Buildpacks, new.Buildpacks) {
 		out = append(out, "source.buildpacks changed")

@@ -79,6 +79,11 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 	if !claimed {
 		return w.service.waitForNewerAttempt(ctx, op.ID, attempt)
 	}
+	// Diagnostic execution has its own cleanup-first lifecycle. It must bypass
+	// generic cancellation, settlement and target normalization entirely.
+	if op.Kind == platform.KindDiagnosticExecution {
+		return w.runDiagnosticExecution(ctx, op, raw, attempt)
+	}
 	if op.State == contract.Cancelling {
 		if deploymentLifecycleKind(op.Kind) {
 			release, acquired, lockErr := w.service.tryLockTargets(ctx, []string{op.Target})
@@ -956,6 +961,9 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 // action committed, and otherwise records failure with the serving release that
 // the environment actually had (or a switched release with unknown health).
 func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Operation) error {
+	if op.Kind == platform.KindDiagnosticExecution {
+		return s.requeueDiagnosticCleanup(ctx, op.ID)
+	}
 	if op.Kind == platform.KindDeploy || op.Kind == platform.KindRollback || op.Kind == platform.KindRestart || op.Kind == platform.KindPromote {
 		return s.reconcileDeployment(ctx, op)
 	}

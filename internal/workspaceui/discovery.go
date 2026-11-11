@@ -43,7 +43,7 @@ func CommandActions() []CommandAction {
 			CLI: "eregion operations get <operation_id> --json", CommandPath: "eregion operations get",
 		},
 		{
-			ID: "operations.follow", Name: "Follow an operation", Keys: "f", Form: "",
+			ID: "operations.follow", Name: "Follow an operation", Keys: "enter (deployments), f (result)", Form: "",
 			CLI: "eregion operations follow <operation_id> --interactive", CommandPath: "eregion operations follow",
 		},
 	}

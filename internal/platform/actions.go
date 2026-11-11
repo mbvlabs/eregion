@@ -921,9 +921,6 @@ func normalizeRevisionState(state *RevisionState) error {
 // branch because the webhook deploys the bound branch, not an arbitrary push.
 func ValidatePushToDeploy(state RevisionState) error {
 	if !state.AutoDeploy {
-		if state.WebhookSecretName != "" {
-			return invalid("webhook_secret_name", "A webhook secret name requires push to deploy to be enabled.")
-		}
 		return nil
 	}
 	if state.Source.Kind != "git" {
@@ -1318,11 +1315,6 @@ func ApplyEnvironmentPatch(base RevisionState, patch EnvironmentUpdateInput) Rev
 	}
 	if patch.WebhookSecretName != nil {
 		out.WebhookSecretName = *patch.WebhookSecretName
-	}
-	if !out.AutoDeploy {
-		// Disabling push to deploy clears the recorded name in every caller.
-		// The vault revision is retained.
-		out.WebhookSecretName = ""
 	}
 	if patch.Runtime != nil {
 		runtime := *patch.Runtime

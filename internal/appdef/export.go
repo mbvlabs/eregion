@@ -37,14 +37,11 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 	if revision == nil {
 		return "", errors.New("the environment has no current revision; nothing is exportable")
 	}
-	if inspection == nil && revision.AutoDeploy {
-		return "", errors.New("auto_deploy is enabled and is not representable in this definition version")
-	}
-	if inspection == nil && revision.WebhookSecretName != "" {
-		return "", errors.New("webhook_secret_name is set and is not representable in this definition version")
-	}
 	if inspection == nil && !revision.Retention.IsZero() {
 		return "", errors.New("the environment has a retention override and is not representable in this definition version")
+	}
+	if inspection == nil && hasCustomReleaseTimeout(revision.Runtime) {
+		return "", errors.New("the environment has a release timeout override and is not representable in this definition version")
 	}
 	// Resource declarations are exported from the explicit inventory, never
 	// inferred from a revision name alone. A resource that no longer exists is
@@ -67,6 +64,11 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 	state := platform.CloneRevisionState(revision.RevisionState)
 	if err := platform.NormalizeRevisionState(&state); err != nil {
 		return "", err
+	}
+	if inspection == nil {
+		if err := platform.ValidatePushToDeploy(state); err != nil {
+			return "", err
+		}
 	}
 	if state.Source.Kind == "" {
 		return "", errors.New("the environment has no source binding; add one before exporting")
@@ -118,6 +120,8 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 		out.WriteString("processes = []\n")
 	}
 	out.WriteString("domains = []\n")
+	out.WriteString("\n[automation]\n")
+	fmt.Fprintf(&out, "auto_deploy = %t\nwebhook_secret_name = %s\n", revision.AutoDeploy, quote(revision.WebhookSecretName))
 	if inspection != nil {
 		out.WriteString("\n[inspection]\n")
 		fmt.Fprintf(&out, "auto_deploy = %t\nwebhook_secret_name = %s\nprotected = %t\n", revision.AutoDeploy, quote(revision.WebhookSecretName), inspection.Protected)
@@ -133,7 +137,7 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 			return strconv.Itoa(*v)
 		}
 		fmt.Fprintf(&out, "retention_keep_releases = %s\nretention_keep_newer_than_days = %s\nretention_artifact_grace_days = %s\n", quote(value(revision.Retention.KeepReleases)), quote(value(revision.Retention.KeepNewerThanDays)), quote(value(revision.Retention.ArtifactGraceDays)))
-		out.WriteString("not_represented = [\"auto-deploy and webhook configuration\", \"retention override\", \"environment protection\", \"release timeout\", \"provider ownership and DNS automation\", \"provider live state, credentials, TLS and health observations\"]\n")
+		out.WriteString("not_represented = [\"external webhook configuration\", \"retention override\", \"environment protection\", \"release timeout\", \"provider ownership and DNS automation\", \"provider live state, credentials, TLS and health observations\"]\n")
 		out.WriteString("provider_inventory = \"Only managed DNS metadata present in domain inventory is shown; live provider state and ownership details are unavailable.\"\n")
 		for _, binding := range sortedDomains {
 			if d := binding.ManagedDNS; d != nil {
@@ -152,7 +156,7 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 		fmt.Fprintf(&out, "credential_secret = %s\n", quote(state.Source.CredentialSecretName))
 		fmt.Fprintf(&out, "context_path = %s\n", quote(state.Source.ContextPath))
 		fmt.Fprintf(&out, "builder = %s\n", quote(state.Source.Builder))
-		out.WriteString("go_targets = [")
+		out.WriteString("targets = [")
 		for index, target := range state.Source.GoTargets {
 			if index > 0 {
 				out.WriteString(", ")
@@ -368,11 +372,14 @@ func sortedKeys(values map[string]string) []string {
 // action. A definition is the complete supported desired state: absent
 // collections and maps are empty, so a removed process, config key, secret name
 // or build environment is a detected change rather than silently preserved
-// server state. Server-managed state that this schema does not own (auto-deploy,
-// webhook routing and retention) stays untouched.
+// server state. Omitted automation leaves and server-managed webhook routing
+// and retention stay untouched.
 func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []platform.DomainBinding) (platform.EnvironmentUpdateInput, []string, []string, error) {
 	patch := platform.EnvironmentUpdateInput{App: current.App, Environment: current.Name, ExpectedRevisionID: current.RevisionID}
 	base := currentRevisionState(current)
+	if hasCustomReleaseTimeout(base.Runtime) {
+		return patch, nil, nil, errors.New("the environment has a release timeout override that definitions cannot represent")
+	}
 	if err := platform.NormalizeRevisionState(&base); err != nil {
 		return patch, nil, nil, err
 	}
@@ -400,12 +407,40 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 	if desired.Source.Kind == "" {
 		return patch, nil, nil, errors.New("source.kind is required for an update definition")
 	}
+	if r.Automation != nil {
+		if r.Automation.AutoDeploy != nil {
+			desired.AutoDeploy = *r.Automation.AutoDeploy
+		}
+		if r.Automation.WebhookSecretName != nil {
+			desired.WebhookSecretName = *r.Automation.WebhookSecretName
+		}
+	}
 	if err := platform.NormalizeRevisionState(&desired); err != nil {
+		return patch, nil, nil, err
+	}
+	if err := platform.ValidatePushToDeploy(desired); err != nil {
 		return patch, nil, nil, err
 	}
 
 	changed := make([]string, 0, 8)
 	diff := make([]string, 0, 16)
+	if desired.AutoDeploy != base.AutoDeploy {
+		value := desired.AutoDeploy
+		patch.AutoDeploy = &value
+		changed = append(changed, "automation.auto_deploy")
+		diff = append(diff, fmt.Sprintf("automation.auto_deploy: %t -> %t", base.AutoDeploy, value))
+	}
+	if desired.WebhookSecretName != base.WebhookSecretName {
+		value := desired.WebhookSecretName
+		patch.WebhookSecretName = &value
+		changed = append(changed, "automation.webhook_secret_name")
+		diff = append(diff, "automation.webhook_secret_name: "+display(base.WebhookSecretName)+" -> "+display(value))
+	}
+	// Prevent admission from substituting a default when enabling a retained name.
+	if patch.AutoDeploy != nil && *patch.AutoDeploy && patch.WebhookSecretName == nil {
+		value := desired.WebhookSecretName
+		patch.WebhookSecretName = &value
+	}
 	if desired.Runtime.Node != current.Node {
 		node := r.Node
 		patch.Node = &node
@@ -456,6 +491,10 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 		diff = append(diff, stringSliceDiff("resources", base.Resources, desired.Resources)...)
 	}
 	return patch, changed, diff, nil
+}
+
+func hasCustomReleaseTimeout(runtime platform.RuntimeSpec) bool {
+	return runtime.ReleaseCommand != nil && runtime.ReleaseCommand.TimeoutSeconds != 0 && runtime.ReleaseCommand.TimeoutSeconds != 120
 }
 
 func resourceAttachments(r *Resolved) []string {
@@ -623,7 +662,7 @@ func sourceDiff(old, new platform.SourceBinding) []string {
 		out = append(out, "source.build_env changed")
 	}
 	if !slices.Equal(old.GoTargets, new.GoTargets) {
-		out = append(out, "source.go_targets changed")
+		out = append(out, "source.targets changed")
 	}
 	if !reflect.DeepEqual(old.Buildpacks, new.Buildpacks) {
 		out = append(out, "source.buildpacks changed")

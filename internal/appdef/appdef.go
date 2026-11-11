@@ -30,6 +30,7 @@ type Definition struct {
 	Node         *string                `toml:"node"`
 	BuildNode    *string                `toml:"build_node"`
 	Source       *Source                `toml:"source"`
+	Automation   *Automation            `toml:"automation"`
 	Runtime      *Runtime               `toml:"runtime"`
 	Processes    *[]Process             `toml:"processes"`
 	Config       *map[string]string     `toml:"config"`
@@ -47,12 +48,19 @@ type Environment struct {
 	Node        *string            `toml:"node"`
 	BuildNode   *string            `toml:"build_node"`
 	Source      *Source            `toml:"source"`
+	Automation  *Automation        `toml:"automation"`
 	Runtime     *Runtime           `toml:"runtime"`
 	Processes   *[]Process         `toml:"processes"`
 	Config      *map[string]string `toml:"config"`
 	SecretNames *[]string          `toml:"secret_names"`
 	Domains     *[]Domain          `toml:"domains"`
 	Resources   *[]Resource        `toml:"resources"`
+}
+
+// Automation contains desired state and a vault name, never a secret value.
+type Automation struct {
+	AutoDeploy        *bool   `toml:"auto_deploy"`
+	WebhookSecretName *string `toml:"webhook_secret_name"`
 }
 
 // Source mirrors platform.SourceBinding. CredentialSecret is a vault NAME; a
@@ -65,7 +73,7 @@ type Source struct {
 	ContextPath      *string                `toml:"context_path"`
 	Builder          *string                `toml:"builder"`
 	BuildEnv         *map[string]string     `toml:"build_env"`
-	GoTargets        *[]buildpacks.GoTarget `toml:"go_targets"`
+	GoTargets        *[]buildpacks.GoTarget `toml:"targets"`
 	Buildpacks       *BuildpackSettings     `toml:"buildpacks"`
 	Image            *string                `toml:"image"`
 
@@ -160,7 +168,8 @@ type Resolved struct {
 	BuildNode    string
 	BuildNodeSet bool
 
-	Source *Source
+	Source     *Source
+	Automation *Automation
 
 	Runtime *Runtime
 
@@ -317,7 +326,7 @@ func markSourcePresence(source *Source, present map[string]any) {
 	if hasKey(present, "build_env") && source.BuildEnv == nil {
 		source.BuildEnv = &map[string]string{}
 	}
-	if hasKey(present, "go_targets") && source.GoTargets == nil {
+	if hasKey(present, "targets") && source.GoTargets == nil {
 		source.GoTargets = &[]buildpacks.GoTarget{}
 	}
 	if hasKey(present, "buildpacks") {
@@ -415,14 +424,14 @@ func (d Definition) Resolve(environment string) (*Resolved, error) {
 
 	resolved := &Resolved{App: d.App, Environment: environment}
 	if err := resolved.apply(FileLayer{
-		Node: d.Node, BuildNode: d.BuildNode, Source: d.Source, Runtime: d.Runtime,
+		Node: d.Node, BuildNode: d.BuildNode, Source: d.Source, Automation: d.Automation, Runtime: d.Runtime,
 		Processes: d.Processes, Config: d.Config, SecretNames: d.SecretNames, Domains: d.Domains, Resources: d.Resources,
 	}); err != nil {
 		return nil, err
 	}
 	if override, ok := d.Environments[environment]; ok && environment != "" {
 		if err := resolved.apply(FileLayer{
-			Node: override.Node, BuildNode: override.BuildNode, Source: override.Source, Runtime: override.Runtime,
+			Node: override.Node, BuildNode: override.BuildNode, Source: override.Source, Automation: override.Automation, Runtime: override.Runtime,
 			Processes: override.Processes, Config: override.Config, SecretNames: override.SecretNames, Domains: override.Domains, Resources: override.Resources,
 		}); err != nil {
 			return nil, fmt.Errorf("environments.%s: %w", environment, err)
@@ -446,6 +455,7 @@ type FileLayer struct {
 	Node        *string
 	BuildNode   *string
 	Source      *Source
+	Automation  *Automation
 	Runtime     *Runtime
 	Processes   *[]Process
 	Config      *map[string]string
@@ -455,6 +465,17 @@ type FileLayer struct {
 }
 
 func (r *Resolved) apply(layer FileLayer) error {
+	if layer.Automation != nil {
+		if r.Automation == nil {
+			r.Automation = &Automation{}
+		}
+		if layer.Automation.AutoDeploy != nil {
+			r.Automation.AutoDeploy = layer.Automation.AutoDeploy
+		}
+		if layer.Automation.WebhookSecretName != nil {
+			r.Automation.WebhookSecretName = layer.Automation.WebhookSecretName
+		}
+	}
 	if layer.Node != nil {
 		r.Node, r.NodeSet = *layer.Node, true
 	}
@@ -688,7 +709,7 @@ func validateSourceShape(source *Source) error {
 			return errors.New("source.build_env cannot be set for an image source")
 		}
 		if source.GoTargets != nil || source.Buildpacks != nil || source.buildpacksSpecified {
-			return errors.New("source.go_targets and source.buildpacks cannot be set for an image source")
+			return errors.New("source.targets and source.buildpacks cannot be set for an image source")
 		}
 	default:
 		return errors.New("source.kind: use git or image")
@@ -696,7 +717,7 @@ func validateSourceShape(source *Source) error {
 	if source.Kind == nil || strings.EqualFold(strings.TrimSpace(*source.Kind), "git") {
 		binding := sourceBinding(source)
 		if _, err := buildpacks.NormalizeTargets(binding.GoTargets); err != nil {
-			return fmt.Errorf("source.go_targets: %w", err)
+			return fmt.Errorf("source.targets: %w", err)
 		}
 		if _, err := buildpacks.NormalizeSettings(binding.Buildpacks); err != nil {
 			return fmt.Errorf("source.buildpacks: %w", err)
@@ -911,6 +932,9 @@ func normalizeNames(values []string) ([]string, error) {
 // CreateSpec maps a resolved definition to the existing first-environment
 // action. It rejects states that the first revision cannot represent.
 func (r *Resolved) CreateSpec(domainAddresses []string) (platform.EnvironmentSpec, error) {
+	if r.Automation != nil && ((r.Automation.AutoDeploy != nil && *r.Automation.AutoDeploy) || (r.Automation.WebhookSecretName != nil && *r.Automation.WebhookSecretName != "")) {
+		return platform.EnvironmentSpec{}, errors.New("automation: create the environment first, then enable push to deploy with env update --auto-deploy")
+	}
 	app := r.App
 	if app == "" {
 		return platform.EnvironmentSpec{}, errors.New("app is required")

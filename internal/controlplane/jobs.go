@@ -197,6 +197,23 @@ func (s *Service) recoverOrphanedPlatformJob(ctx context.Context, job orphanedPl
 	// not visible until commit. No new River attempt can claim the operation
 	// between the state change and this event.
 	if exhausted {
+		if op.Kind == platform.KindDiagnosticExecution && !op.State.Terminal() && op.Attempt <= uint32(job.Attempt) {
+			var raw json.RawMessage
+			if err := tx.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {
+				return false, false, unavailable(err)
+			}
+			if err := markDiagnosticCleanupTx(ctx, tx, &op, raw); err != nil {
+				return false, false, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE river_job SET state='scheduled',finalized_at=NULL,
+                max_attempts=GREATEST(max_attempts,attempt+1),scheduled_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, job.ID); err != nil {
+				return false, false, unavailable(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return false, false, unavailable(err)
+			}
+			return true, false, nil
+		}
 		message := fmt.Sprintf("Discarded platform job %d: its final River attempt was left running by an earlier worker process on this host.", job.ID)
 		if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "warning", Stage: "worker", Message: message}); err != nil {
 			return false, false, err
@@ -337,6 +354,9 @@ type WorkerConfig struct {
 	// uses EREGION_NODE_NAME. A worker that serves the local transport needs an
 	// explicit name; there is no fallback identity.
 	LocalNodeName string
+	// DiagnosticAdmissionNode is supplied only by trusted node RPC startup
+	// after comparing the host node identity with the worker's configured name.
+	DiagnosticAdmissionNode string
 	// Resolver is an already-built per-node transport resolver. The process
 	// builds one resolver and shares it with extension dispatch, so there is
 	// exactly one cache and one WireGuard key lock per node. Nil builds the
@@ -358,7 +378,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, vault: config.Vault, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS}
+	service := &Service{pool: pool, secrets: config.SecretResolver, vault: config.Vault, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS, diagnosticAdmissionNode: config.DiagnosticAdmissionNode}
 	service.redaction = config.Redaction
 	if service.redaction == nil {
 		service.redaction = &secrets.Registry{}
@@ -910,15 +930,18 @@ func (s *Service) Reconcile(ctx context.Context) error {
 }
 
 func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationID) error {
-	if s.transport == nil {
-		return contract.NewFault(contract.Unavailable, "node transport is not configured", "Reconciliation requires a worker node transport.")
-	}
 	op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
 	if err != nil {
 		return unavailable()
 	}
 	if op.State.Terminal() {
 		return nil
+	}
+	if op.Kind == platform.KindDiagnosticExecution {
+		return s.requeueDiagnosticCleanup(ctx, id)
+	}
+	if s.transport == nil {
+		return contract.NewFault(contract.Unavailable, "node transport is not configured", "Reconciliation requires a worker node transport.")
 	}
 	if strings.HasPrefix(op.Kind, "platform.") {
 		return s.reconcilePlatformOperation(ctx, op)

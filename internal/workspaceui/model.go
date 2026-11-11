@@ -94,14 +94,15 @@ type Detail struct {
 // Item is one sanitized inventory row. Payload carries the raw server object
 // used to build an action input; it is never rendered directly.
 type Item struct {
-	Key        string
-	Title      string
-	Subtitle   string
-	Status     string
-	Details    []Detail
-	SearchText string
-	Data       map[string]string
-	Payload    json.RawMessage
+	Key         string
+	Title       string
+	Subtitle    string
+	Status      string
+	Details     []Detail
+	SearchText  string
+	Data        map[string]string
+	Payload     json.RawMessage
+	OperationID contract.OperationID
 }
 
 type loadState int
@@ -648,7 +649,27 @@ func (m Model) handleListKey(message tea.KeyPressMsg, pressed string) (tea.Model
 		if len(items) > 0 {
 			m.selected[m.tab] = min(len(items)-1, index+max(1, m.listCapacity()/2))
 		}
-	case "enter", " ":
+	case "enter":
+		if m.tab == Deployments {
+			if item, ok := m.selectedItem(); ok {
+				if item.OperationID.Validate() != nil {
+					m.notice = "Operation history unavailable for this deployment; press i for details."
+					return m, nil
+				}
+				if m.opts.API == nil {
+					m.notice = "This workspace has no API client."
+					return m, nil
+				}
+				m.notice = ""
+				m.detailScroll = 0
+				m.op = &opView{id: item.OperationID, loading: true, at: m.now,
+					reducer: viewer.New(item.OperationID, viewer.Options{Clean: m.clean})}
+				return m, tea.Batch(m.operationCommand(item.OperationID), m.spinCommand())
+			}
+			return m, nil
+		}
+		fallthrough
+	case " ", "i":
 		if item, ok := m.selectedItem(); ok {
 			m.detail = true
 			m.detailScroll = 0

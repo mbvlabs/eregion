@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -743,6 +744,268 @@ func newWebhookIntegrationRuntime(t *testing.T, concurrency int) (*pgxpool.Pool,
 	}
 	t.Cleanup(run.Close)
 	return pool, run, secrets
+}
+
+// These tests use testPool's explicit disposable-DSN gate; no database or
+// container is started by the test suite.
+func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
+	pool, run, secrets := newWebhookIntegrationRuntime(t, 0)
+	s := run.Service
+	ctx := context.Background()
+	platformSubmit(t, s, platform.KindNodeRegister, "platform", "name-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	platformSubmit(t, s, platform.KindAppCreate, "platform", "name-app", map[string]any{
+		"name": "nametest", "environments": []map[string]any{{"name": "production", "node": "local",
+			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"}}},
+	})
+	for _, name := range []string{"ACTIVE", "ARCHIVED"} {
+		ns, err := vault.NewNamespace("nametest", "production", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := secrets.Store().Set(ctx, tx, ns, []byte("test-secret-value"), 0, testActor); err != nil {
+			rollback(tx)
+			t.Fatal(err)
+		}
+		if name == "ARCHIVED" {
+			if _, err := secrets.Store().Archive(ctx, tx, ns, 1, testActor); err != nil {
+				rollback(tx)
+				t.Fatal(err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := func(key, input string) operations.Submission {
+		return operations.Submission{Kind: platform.KindEnvironmentUpdate, Target: "env/nametest/production", Actor: testActor, IdempotencyKey: key, Input: json.RawMessage(input)}
+	}
+	if _, err := s.SubmitWithReceipt(ctx, request("name-enable", `{"auto_deploy":true,"webhook_secret_name":"ACTIVE"}`)); err != nil {
+		t.Fatal(err)
+	}
+	type counts struct {
+		revision                                     string
+		revisions, operations, jobs, secretRevisions int
+	}
+	readCounts := func() counts {
+		t.Helper()
+		var c counts
+		err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
+			(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
+			(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job),
+			(SELECT count(*) FROM eregion_secret_revisions WHERE app='nametest' AND environment='production')
+			FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
+			WHERE a.name='nametest' AND e.name='production'`).Scan(&c.revision, &c.revisions, &c.operations, &c.jobs, &c.secretRevisions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	for _, enabled := range []bool{true, false} {
+		if !enabled {
+			if _, err := s.SubmitWithReceipt(ctx, request("name-disable", `{"auto_deploy":false}`)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, name := range []string{"MISSING", "ARCHIVED"} {
+			before := readCounts()
+			key := fmt.Sprintf("name-reject-%t-%s", enabled, name)
+			_, err := s.SubmitWithReceipt(ctx, request(key, fmt.Sprintf(`{"webhook_secret_name":%q}`, name)))
+			if err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+				t.Fatalf("enabled=%t name=%s error=%v", enabled, name, err)
+			}
+			if after := readCounts(); after != before {
+				t.Fatalf("rejected name changed rows: before=%+v after=%+v", before, after)
+			}
+		}
+	}
+	// Commit a name-only update while disabled, then archive the name. An
+	// idempotent replay must be returned before validating current vault state.
+	ns, _ := vault.NewNamespace("nametest", "production", "ACTIVE")
+	other, _ := vault.NewNamespace("nametest", "production", "OTHER")
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secrets.Store().Set(ctx, tx, other, []byte("other-secret-value"), 0, testActor); err != nil {
+		rollback(tx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replay := request("name-only-replay", `{"webhook_secret_name":"OTHER"}`)
+	first, err := s.SubmitWithReceipt(ctx, replay)
+	if err != nil || first.Replay {
+		t.Fatalf("first name update=%+v err=%v", first, err)
+	}
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secrets.Store().Archive(ctx, tx, other, 1, testActor); err != nil {
+		rollback(tx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := readCounts()
+	again, err := s.SubmitWithReceipt(ctx, replay)
+	if err != nil || !again.Replay || again.Operation.ID != first.Operation.ID || again.WebhookSecretActivated {
+		t.Fatalf("replay=%+v err=%v", again, err)
+	}
+	if after := readCounts(); after != before {
+		t.Fatalf("replay changed rows: before=%+v after=%+v", before, after)
+	}
+	metadata, err := secrets.Store().Get(ctx, other)
+	if err != nil || metadata.State != vault.StateArchived || metadata.LatestRevision != 1 {
+		t.Fatalf("replay changed archived secret: %+v %v", metadata, err)
+	}
+	metadata, err = secrets.Store().Get(ctx, ns)
+	if err != nil || metadata.State != vault.StateActive || metadata.LatestRevision != 1 {
+		t.Fatalf("replay changed prior secret: %+v %v", metadata, err)
+	}
+}
+
+func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
+	pool, run, secrets := newWebhookIntegrationRuntime(t, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	platformSubmit(t, run.Service, platform.KindNodeRegister, "platform", "archive-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	platformSubmit(t, run.Service, platform.KindAppCreate, "platform", "archive-app", map[string]any{
+		"name": "archivetest", "environments": []map[string]any{{"name": "production", "node": "local",
+			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"}}},
+	})
+	ns, err := vault.NewNamespace("archivetest", "production", "HOOK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secrets.Store().Set(ctx, tx, ns, []byte("secret-value"), 0, testActor); err != nil {
+		rollback(tx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	awaitLock := func(fragment string) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var count int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database()
+				AND state='active' AND wait_event_type='Lock' AND query ILIKE '%' || $1 || '%'`, fragment).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count > 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("no lock waiter for %q", fragment)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	// Admission's namespace lock remains held until its caller commits.
+	admission, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollback(admission)
+	name := "HOOK"
+	input := &platform.EnvironmentUpdateInput{App: "archivetest", Environment: "production", WebhookSecretName: &name}
+	state := platform.RevisionState{WebhookSecretName: name}
+	if activated, err := run.Service.activateWebhookSecretTx(ctx, admission, testActor, input, state, nil); err != nil || activated {
+		t.Fatalf("admission validation: activated=%t err=%v", activated, err)
+	}
+	archiveDone := make(chan error, 1)
+	go func() {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			archiveDone <- err
+			return
+		}
+		defer rollback(tx)
+		if _, err = secrets.Store().Archive(ctx, tx, ns, 1, testActor); err == nil {
+			err = tx.Commit(ctx)
+		}
+		archiveDone <- err
+	}()
+	awaitLock("SELECT latest_revision, state")
+	if err := admission.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-archiveDone; err != nil {
+		t.Fatalf("archive after admission commit: %v", err)
+	}
+	// Restore, then archive first inside an uncommitted transaction. The real
+	// submission must wait, observe archived state, and roll back completely.
+	tx, err = pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secrets.Store().Set(ctx, tx, ns, []byte("secret-value-2"), 1, testActor); err != nil {
+		rollback(tx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollback(archive)
+	if _, err := secrets.Store().Archive(ctx, archive, ns, 2, testActor); err != nil {
+		t.Fatal(err)
+	}
+	var beforeRevision string
+	var beforeRevisions, beforeOps, beforeJobs int
+	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
+		(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
+		(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job)
+		FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
+		WHERE a.name='archivetest' AND e.name='production'`).Scan(&beforeRevision, &beforeRevisions, &beforeOps, &beforeJobs); err != nil {
+		t.Fatal(err)
+	}
+	submitted := make(chan error, 1)
+	go func() {
+		_, err := run.Service.SubmitWithReceipt(ctx, operations.Submission{
+			Kind: platform.KindEnvironmentUpdate, Target: "env/archivetest/production", Actor: testActor,
+			IdempotencyKey: "archive-wins", Input: json.RawMessage(`{"auto_deploy":true,"webhook_secret_name":"HOOK"}`),
+		})
+		submitted <- err
+	}()
+	awaitLock("SELECT name FROM eregion_secrets")
+	if err := archive.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-submitted; err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("archived name admission error: %v", err)
+	}
+	var afterRevision string
+	var afterRevisions, afterOps, afterJobs int
+	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
+		(SELECT count(*) FROM eregion_platform_environment_revisions r WHERE r.environment_id=e.id),
+		(SELECT count(*) FROM eregion_operations), (SELECT count(*) FROM river_job)
+		FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
+		WHERE a.name='archivetest' AND e.name='production'`).Scan(&afterRevision, &afterRevisions, &afterOps, &afterJobs); err != nil {
+		t.Fatal(err)
+	}
+	if beforeRevision != afterRevision || beforeRevisions != afterRevisions || beforeOps != afterOps || beforeJobs != afterJobs {
+		t.Fatalf("rejected admission left rows: revision %s->%s revisions %d->%d operations %d->%d jobs %d->%d", beforeRevision, afterRevision, beforeRevisions, afterRevisions, beforeOps, afterOps, beforeJobs, afterJobs)
+	}
 }
 
 func awaitBlockedWebhookInserts(t *testing.T, pool *pgxpool.Pool, want int) {

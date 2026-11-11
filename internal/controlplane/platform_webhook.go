@@ -21,15 +21,9 @@ func (s *Service) activateWebhookSecretTx(ctx context.Context, tx pgx.Tx, actor 
 				"webhook rotation requires a new transient secret",
 				"Rerun through the interactive terminal or --github-webhook path so a new secret can be generated and committed with the operation.")
 		}
-		if input.AutoDeploy != nil && *input.AutoDeploy {
-			// An explicit enable may repeat an already-enabled environment. It
-			// must still name an active sealed secret; otherwise the webhook
-			// would be enabled with no value to verify.
-			if !state.AutoDeploy {
-				return false, contract.NewFault(contract.PreconditionFailed,
-					"push to deploy is not enabled in the effective desired state",
-					"Enable it with --auto-deploy and a GitHub source.")
-			}
+		if (input.AutoDeploy != nil && *input.AutoDeploy) || (input.WebhookSecretName != nil && *input.WebhookSecretName != "") {
+			// Explicit enable or a new name must refer to an active sealed secret.
+			// This also checks names recorded while automation is disabled.
 			if err := platform.ValidatePushToDeploy(state); err != nil {
 				return false, err
 			}
@@ -42,7 +36,9 @@ func (s *Service) activateWebhookSecretTx(ctx context.Context, tx pgx.Tx, actor 
 			if err != nil {
 				return false, err
 			}
-			metadata, err := s.vault.Store().GetTx(ctx, tx, namespace)
+			// Hold the same namespace-row lock used by Archive until the
+			// desired revision and operation commit.
+			metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx, namespace)
 			if err != nil {
 				if contract.Classify(err).Code == contract.NotFound {
 					return false, contract.NewFault(contract.PreconditionFailed,

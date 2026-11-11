@@ -714,6 +714,51 @@ func TestEnvUpdateFromFileRejectsWebhookFlags(t *testing.T) {
 	}
 }
 
+func TestEnvUpdateFromFileDisablesAutomationWithoutWebhookSideEffects(t *testing.T) {
+	installFakeGH(t)
+	generated := countWebhookGenerations(t)
+	current := platform.Environment{App: "api", Name: "production", Node: "main", Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
+		Source:     platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", Ref: "main"},
+		Runtime:    platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
+		Processes:  []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+		AutoDeploy: true, WebhookSecretName: "HOOK",
+	}}}
+	document, err := appdef.Export("api", "production", "", current.Revision, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document = strings.Replace(document, "auto_deploy = true", "auto_deploy = false", 1)
+	path := writeDefinitionFile(t, document)
+	backend := definitionBackendForEnvironment(t, current)
+	cmd := &cobra.Command{Use: "update"}
+	addEnvironmentUpdateFlags(cmd)
+	if err := cmd.ParseFlags([]string{"--from", path}); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{secrets: &secrets.Registry{}, backend: backend}
+	if _, err := a.envUpdate(cmd, []string{"api", "production"}); err != nil {
+		t.Fatal(err)
+	}
+	updates := backend.submissionsOfKind(platform.KindEnvironmentUpdate)
+	if len(updates) != 2 || !updates[0].DryRun || updates[1].DryRun {
+		t.Fatalf("environment updates = %+v", updates)
+	}
+	var patch platform.EnvironmentUpdateInput
+	if err := json.Unmarshal(updates[1].Input, &patch); err != nil {
+		t.Fatal(err)
+	}
+	if patch.AutoDeploy == nil || *patch.AutoDeploy || patch.WebhookSecretName != nil || patch.RotateWebhookSecret {
+		t.Fatalf("unexpected automation patch: %+v", patch)
+	}
+	next := platform.ApplyEnvironmentPatch(current.Revision.RevisionState, patch)
+	if next.AutoDeploy || next.WebhookSecretName != "HOOK" {
+		t.Fatalf("disable lost existing reference: %+v", next)
+	}
+	if *generated != 0 || backend.secretWrite != 0 || backend.secretRead != 0 || len(fakeGHCalls(t)) != 0 {
+		t.Fatalf("unexpected webhook side effect: generated=%d writes=%d reads=%d gh=%v", *generated, backend.secretWrite, backend.secretRead, fakeGHCalls(t))
+	}
+}
+
 func TestEnvUpdateFromFileDryRunBuildsTheSupportedPatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "eregion.toml")
@@ -1342,7 +1387,7 @@ func TestResourceApplyRejectsDuplicateMountDestination(t *testing.T) {
 func TestAppExportProducesARoundTrippableDefinition(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 		Source: platform.SourceBinding{
-			Kind: "image", Image: "ghcr.io/acme/api:1",
+			Kind: "git", URL: "https://github.com/acme/api", Ref: "main", BuildEnv: map[string]string{"BP_TEST": "yes"},
 		},
 		Runtime: platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
 		Processes: []platform.ProcessSpec{
@@ -1351,6 +1396,7 @@ func TestAppExportProducesARoundTrippableDefinition(t *testing.T) {
 		Config:      map[string]string{"APP_ENV": "production"},
 		SecretNames: []string{"DATABASE_URL"},
 		Resources:   []string{"db"},
+		AutoDeploy:  true, WebhookSecretName: "HOOK",
 	}}
 	current := platform.Environment{App: "api", Name: "production", Node: "main", BuildNode: "builder", Revision: revision}
 	rawEnv, _ := json.Marshal(current)
@@ -1402,7 +1448,7 @@ func TestAppExportProducesARoundTrippableDefinition(t *testing.T) {
 	if data.Format != "toml" {
 		t.Fatalf("format = %q", data.Format)
 	}
-	for _, want := range []string{`name = "db"`, `name = "cache"`, `attach = false`, `destination = "/var/lib/postgresql/data"`} {
+	for _, want := range []string{`name = "db"`, `name = "cache"`, `attach = false`, `destination = "/var/lib/postgresql/data"`, `auto_deploy = true`, `webhook_secret_name = "HOOK"`} {
 		if !strings.Contains(data.Document, want) {
 			t.Fatalf("export missing %q:\n%s", want, data.Document)
 		}
@@ -1421,11 +1467,29 @@ func TestAppExportProducesARoundTrippableDefinition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changed) != 0 || patch.Node != nil || patch.Source != nil || patch.Processes != nil {
+	if len(changed) != 0 || patch.Node != nil || patch.Source != nil || patch.Processes != nil || patch.AutoDeploy != nil || patch.WebhookSecretName != nil {
 		t.Fatalf("export did not round-trip: changed=%v patch=%+v", changed, patch)
 	}
 	if patch.Resources != nil {
 		t.Fatalf("export round-trip rewrote resource attachments: %+v", patch.Resources)
+	}
+	cmd.Flags().Bool("inspect", true, "inspect")
+	inspection, err := a.appExport(cmd, []string{"api", "production"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inspection.next) != 1 || strings.Contains(inspection.next[0], "--from") {
+		t.Fatalf("unsafe inspection hint: %v", inspection.next)
+	}
+	inspectionData, _ := json.Marshal(inspection.data)
+	var snapshot struct {
+		Document string `json:"document"`
+	}
+	if err := json.Unmarshal(inspectionData, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := appdef.Parse([]byte(snapshot.Document)); err == nil {
+		t.Fatal("inspection snapshot is applicable")
 	}
 	specs, err := resolved.ResourceApplySpecs()
 	if err != nil {
@@ -1434,7 +1498,12 @@ func TestAppExportProducesARoundTrippableDefinition(t *testing.T) {
 	if len(specs) != 2 {
 		t.Fatalf("round-trip resource specs = %+v", specs)
 	}
-	created, err := resolved.CreateSpec(nil)
+	if _, err := resolved.CreateSpec(nil); err == nil {
+		t.Fatal("create accepted enabled automation")
+	}
+	createResolved := *resolved
+	createResolved.Automation = nil
+	created, err := createResolved.CreateSpec(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

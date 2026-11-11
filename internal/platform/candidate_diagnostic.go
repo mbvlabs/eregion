@@ -47,29 +47,64 @@ type CandidateDiagnosticLine struct {
 }
 
 type CandidateDiagnosticResult struct {
-	Lines       []CandidateDiagnosticLine `json:"lines"`
-	Truncated   bool                      `json:"truncated"`
-	Unavailable bool                      `json:"unavailable"`
+	Lines         []CandidateDiagnosticLine `json:"lines"`
+	Truncated     bool                      `json:"truncated"`
+	Unavailable   bool                      `json:"unavailable"`
+	ImageMismatch bool                      `json:"image_mismatch,omitempty"`
 }
 
-type candidateDiagnosticStep struct{ payload CandidateDiagnosticPayload }
+type candidateDiagnosticStep struct {
+	payload         CandidateDiagnosticPayload
+	runningOnly     bool
+	expectedImageID string
+}
 
 func buildCandidateDiagnosticStep(execution engine.Execution, raw json.RawMessage) (engine.Step, error) {
 	var p CandidateDiagnosticPayload
 	if err := decodePayload(execution, raw, &p); err != nil {
 		return nil, err
 	}
-	if p.Step != execution.Step || p.Step != CandidateDiagnosticStep || ValidateName(p.App) != nil || ValidateName(p.Environment) != nil || p.ReleaseID.Validate() != nil || p.DeploymentID.Validate() != nil || p.Deadline.IsZero() || len(p.Containers) > 64 {
+	if p.Step != execution.Step {
 		return nil, errors.New("invalid candidate diagnostic request")
+	}
+	if err := validateCandidateDiagnostic(p); err != nil {
+		return nil, err
+	}
+	return &candidateDiagnosticStep{payload: p}, nil
+}
+
+func validateCandidateDiagnostic(p CandidateDiagnosticPayload) error {
+	if p.Step != CandidateDiagnosticStep || ValidateName(p.App) != nil || ValidateName(p.Environment) != nil || p.ReleaseID.Validate() != nil || p.DeploymentID.Validate() != nil || p.Deadline.IsZero() || len(p.Containers) > 64 {
+		return errors.New("invalid candidate diagnostic request")
 	}
 	seen := map[string]bool{}
 	for _, c := range p.Containers {
 		if !containerNamePattern.MatchString(c.Name) || !processNamePattern.MatchString(c.Process) || c.Replica == "" || c.Name != WorkloadContainerName(p.App, p.Environment, c.Process, c.Replica, p.DeploymentID) || seen[c.Name] {
-			return nil, errors.New("invalid candidate identity")
+			return errors.New("invalid candidate identity")
 		}
 		seen[c.Name] = true
 	}
-	return &candidateDiagnosticStep{payload: p}, nil
+	return nil
+}
+
+// ObserveRunningCandidateDiagnostics performs the existing bounded, owned-label
+// diagnostic read directly, without a node task or journal write.
+func ObserveRunningCandidateDiagnostics(ctx context.Context, p CandidateDiagnosticPayload, expectedImageID string, rt engine.Runtime) (CandidateDiagnosticResult, error) {
+	if err := validateCandidateDiagnostic(p); err != nil {
+		return CandidateDiagnosticResult{}, err
+	}
+	if !diagnosisImageIDPattern.MatchString(expectedImageID) {
+		return CandidateDiagnosticResult{}, errors.New("invalid candidate image identity")
+	}
+	result, err := (&candidateDiagnosticStep{payload: p, runningOnly: true, expectedImageID: expectedImageID}).Apply(ctx, rt, nil)
+	if err != nil {
+		return CandidateDiagnosticResult{}, err
+	}
+	value, ok := result.Result.(CandidateDiagnosticResult)
+	if !ok {
+		return CandidateDiagnosticResult{}, errors.New("invalid diagnostic result")
+	}
+	return value, nil
 }
 
 func (s *candidateDiagnosticStep) ID() string { return s.payload.Step }
@@ -128,19 +163,36 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 			result.Truncated = true
 			break
 		}
-		inspect := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{json .Id}}\n{{json .Name}}\n{{json .Config.Labels}}", c.Name)
+		format := "{{json .Id}}\n{{json .Name}}\n{{json .Config.Labels}}"
+		if s.runningOnly {
+			format = "{{json .Id}}\n{{json .Name}}\n{{json .State.Running}}\n{{json .Image}}\n{{json .Config.Labels}}"
+		}
+		inspect := exec.CommandContext(ctx, "docker", "inspect", "--format", format, c.Name)
 		metadata := &limitedDiagnosticBuffer{limit: 64 * 1024}
 		inspect.Stdout = metadata
 		if err := inspect.Run(); err != nil || metadata.overflow {
 			result.Unavailable = true
 			continue
 		}
-		parts := strings.SplitN(metadata.String(), "\n", 3)
+		count := 3
+		if s.runningOnly {
+			count = 5
+		}
+		parts := strings.SplitN(metadata.String(), "\n", count)
 		var id, name string
+		running := true
 		var labels map[string]string
-		if len(parts) != 3 || json.Unmarshal([]byte(parts[0]), &id) != nil || json.Unmarshal([]byte(parts[1]), &name) != nil || json.Unmarshal([]byte(parts[2]), &labels) != nil || strings.TrimPrefix(name, "/") != c.Name || id == "" {
+		if len(parts) != count || json.Unmarshal([]byte(parts[0]), &id) != nil || json.Unmarshal([]byte(parts[1]), &name) != nil || (s.runningOnly && json.Unmarshal([]byte(parts[2]), &running) != nil) || json.Unmarshal([]byte(parts[count-1]), &labels) != nil || strings.TrimPrefix(name, "/") != c.Name || id == "" || !running {
 			result.Unavailable = true
 			continue
+		}
+		if s.runningOnly {
+			var imageID string
+			if json.Unmarshal([]byte(parts[3]), &imageID) != nil || imageID != s.expectedImageID {
+				result.Unavailable = true
+				result.ImageMismatch = true
+				continue
+			}
 		}
 		expected := WorkloadLabels(s.payload.App, s.payload.Environment, c.Process, c.Kind, c.Replica, s.payload.ReleaseID, s.payload.DeploymentID)
 		match := true

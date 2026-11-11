@@ -5,6 +5,32 @@ Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 tracks execution. This file says what must work on a real server and what has
 been observed.
 
+## Beta.4 incremental acceptance
+
+These checks describe the candidate changes, not a pass record. Publication is
+authorized separately from live qualification. No live target is authorized by
+this checklist; preserve existing databases, volumes, DNS, credentials and hooks.
+
+| Changed surface | Required candidate evidence |
+| --- | --- |
+| Read-only diagnosis | Inspect an authorized failed and active operation. Verify recorded source/image identities, historical versus current settings, event continuation, and explicit missing evidence. The command must not upgrade a node, pull an image or change deployment state. No raw build environment values or secrets may appear. |
+| Candidate evidence | Observe only the recorded deployment's planned, correctly labelled containers with the exact pinned image. Missing identity or redaction context must withhold logs. Child stderr is observable only when forwarded to container logs. |
+| Isolated diagnostic execution | On a separately authorized disposable fixture, verify exact confirmation, historical image/node pinning, immutable image use without pulling, fixed sandbox limits, and a new operation distinct from the original. Verify cancellation, lost-response recovery and cleanup before terminalization; an ambiguous prior execution must never be rerun automatically. Command output is deliberately withheld. |
+| TUI deployment history | Open active and terminal deployments, read their linked operation history, return to row details, open help/discovery overlays, and detach without cancellation. |
+| TOML automation | Export and reapply an enabled environment without rotating its webhook secret or changing other desired state. Verify omitted fields preserve automation, explicit disable retains the reference, and invalid or archived references refuse without mutation. On an authorized fixture, verify actual master push delivery and PR-branch isolation afterward. |
+| Definition boundaries | Inspection snapshots remain non-applicable with safe guidance. Ordinary domain bindings do not claim to reconstruct managed DNS/provider ownership. Bootstrap secrets and resources through their documented separate steps. |
+| Public build targets | Import/export uses `targets`; CLI uses `--target`. Removed public names are rejected. Optional target mappings retain their documented Go-buildpack semantics; selecting another builder does not imply its runtime qualification. |
+| Secrets handoff filename | At an authorized human handoff, verify the suggested name is `<workspace>--<node>-secrets.md`; explicit paths, owner-only permissions and overwrite refusal remain unchanged. Do not capture the record's contents as evidence. |
+
+The new PostgreSQL automation admission/archival regressions require an explicitly
+authorized disposable database. Compilation without that target is not evidence
+that the database tests passed. Offline build, vet and selected regressions do
+not establish live sandbox or deployment acceptance.
+
+The reported Rails Docker/containerd export failure, worker-lease failures,
+preview/admission discrepancies and stale observations remain separate findings
+until a cause-specific fix is verified; publication alone does not close them.
+
 ## Alpha.1 qualification
 
 The operator explicitly confirmed that all alpha.1 testing is done, including

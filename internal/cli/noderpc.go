@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -96,6 +97,8 @@ const (
 	methodSubmit              = "operations.submit"
 	methodGet                 = "operations.get"
 	methodEvents              = "operations.events"
+	methodDiagnose            = "operations.diagnose"
+	methodDiagnosticExecute   = "operations.diagnostic-execute"
 	methodCancel              = "operations.cancel"
 	methodInventory           = "platform.inventory"
 	methodSecretSet           = "vault.set"
@@ -161,6 +164,36 @@ type rpcEventsParams struct {
 	OperationID string `json:"operation_id"`
 	After       uint64 `json:"after"`
 	Limit       int    `json:"limit"`
+}
+
+type rpcDiagnosticExecutionParams struct {
+	OperationID contract.OperationID `json:"operation_id"`
+	Argv        []string             `json:"argv"`
+}
+
+func validateDiagnosticExecutionRPC(request rpc.Request) (rpcDiagnosticExecutionParams, error) {
+	var params rpcDiagnosticExecutionParams
+	decoder := json.NewDecoder(bytes.NewReader(request.Params))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&params); err != nil || decoder.Decode(new(any)) != io.EOF {
+		return params, contract.NewFault(contract.ValidationFailed, "invalid diagnostic execution parameters", "Provide only operation_id and argv.")
+	}
+	if err := params.OperationID.Validate(); err != nil {
+		return params, err
+	}
+	if err := platform.ValidateDiagnosticExecutionArgv(params.Argv); err != nil {
+		return params, err
+	}
+	if request.Confirm != string(params.OperationID) {
+		return params, contract.NewFault(contract.ConfirmationRequired, "diagnostic execution requires exact operation confirmation", "Pass --confirm with the original operation ID.")
+	}
+	if err := contract.ValidateIdempotencyKey(request.IdempotencyKey); err != nil {
+		return params, err
+	}
+	if len(request.Secrets) != 0 {
+		return params, contract.NewFault(contract.ValidationFailed, "diagnostic execution does not accept secrets", "Command arguments are ordinary durable operation input and must not contain secrets.")
+	}
+	return params, nil
 }
 
 type rpcInventoryParams struct {
@@ -369,6 +402,14 @@ func (n *nodeClient) Get(ctx context.Context, id contract.OperationID) (json.Raw
 
 func (n *nodeClient) Events(ctx context.Context, cursor contract.Cursor, limit int) (json.RawMessage, error) {
 	return n.call(ctx, methodEvents, rpcEventsParams{OperationID: string(cursor.OperationID), After: cursor.After, Limit: limit}, rpcCallOptions{})
+}
+
+func (n *nodeClient) Diagnose(ctx context.Context, id contract.OperationID, after uint64, limit int) (json.RawMessage, error) {
+	return n.call(ctx, methodDiagnose, rpcEventsParams{OperationID: string(id), After: after, Limit: limit}, rpcCallOptions{})
+}
+
+func (n *nodeClient) DiagnosticExecution(ctx context.Context, id contract.OperationID, argv []string, key, confirm string, dryRun bool) (json.RawMessage, error) {
+	return n.call(ctx, methodDiagnosticExecute, rpcDiagnosticExecutionParams{OperationID: id, Argv: argv}, rpcCallOptions{IdempotencyKey: key, Confirm: confirm, DryRun: dryRun})
 }
 
 func (n *nodeClient) Cancel(ctx context.Context, id contract.OperationID) (json.RawMessage, error) {
@@ -1247,6 +1288,11 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	if err := checkNodeClientVersion(request); err != nil {
 		return writeRPCResult(stdout, nil, err)
 	}
+	if request.Method == methodDiagnosticExecute {
+		if _, err := validateDiagnosticExecutionRPC(request); err != nil {
+			return writeRPCResult(stdout, nil, err)
+		}
+	}
 	if isHostMethod(request.Method) {
 		data, err := dispatchHostMethod(ctx, request, stdout, registry)
 		return writeRPCResult(stdout, data, err)
@@ -1282,7 +1328,7 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	app, closeRuntime, err := openNodeApp(ctx, logger, registry)
+	app, closeRuntime, err := openNodeApp(ctx, logger, registry, request.Method == methodDiagnosticExecute)
 	if err != nil {
 		return writeRPCResult(stdout, nil, err)
 	}
@@ -1510,7 +1556,7 @@ func readWorkspaceFromDSN(ctx context.Context, dsn string) (controlplane.Workspa
 	return controlplane.ReadWorkspace(ctx, pool)
 }
 
-func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry) (api.AppService, func(), error) {
+func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry, diagnosticExecution bool) (api.AppService, func(), error) {
 	if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
 		return api.AppService{}, nil, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())
 	}
@@ -1544,9 +1590,16 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		pool.Close()
 		return api.AppService{}, nil, err
 	}
+	diagnosticNode := ""
+	if diagnosticExecution {
+		if nodeConfig, e := host.LoadNodeFile(host.DefaultNodeConfigPath()); e == nil && nodeConfig.Node != "" && nodeConfig.Node == strings.TrimSpace(os.Getenv("EREGION_NODE_NAME")) && platform.ValidateName(nodeConfig.Node) == nil {
+			diagnosticNode = nodeConfig.Node
+		}
+	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
-		Redaction: registry, Vault: parts.Vault,
+		DiagnosticAdmissionNode: diagnosticNode,
+		Redaction:               registry, Vault: parts.Vault,
 		DomainDNS: parts.DomainDNS,
 		HumanFactor: func(code string) error {
 			return protect.NewStore().Verify(code)
@@ -1584,6 +1637,9 @@ func checkNodeClientVersion(request rpc.Request) error {
 
 func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Request) (any, error) {
 	actor, err := nodeOperator(request)
+	if request.Method == methodDiagnosticExecute {
+		actor, err = localRPCOperator()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1592,6 +1648,12 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 	// Submissions keep the operator actor for the audit trail.
 	authority := operations.OperatorAuthority(actor)
 	switch request.Method {
+	case methodDiagnosticExecute:
+		params, err := validateDiagnosticExecutionRPC(request)
+		if err != nil {
+			return nil, err
+		}
+		return app.DiagnosticExecution(ctx, actor, request.IdempotencyKey, params.OperationID, params.Argv, request.Confirm, request.DryRun)
 	case methodTest:
 		var params rpcSubmitParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1642,6 +1704,16 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, err
 		}
 		return app.GetOperation(ctx, authority, id)
+	case methodDiagnose:
+		var params rpcEventsParams
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		localNode := ""
+		if config, e := host.LoadNodeFile(host.DefaultNodeConfigPath()); e == nil {
+			localNode = config.Node
+		}
+		return app.Diagnose(ctx, authority, contract.OperationID(params.OperationID), params.After, params.Limit, localNode)
 	case methodEvents:
 		var params rpcEventsParams
 		if err := decodeRPCParams(request.Params, &params); err != nil {
@@ -1816,6 +1888,22 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 	default:
 		return nil, contract.NewFault(contract.Usage, "unknown node RPC method "+request.Method, "Use a method supported by this node build.")
 	}
+}
+
+// localRPCOperator derives audit attribution from the server process, not the
+// RPC request's caller-controlled operator field. sudo supplies SUDO_USER;
+// direct root execution uses the local OS account.
+func localRPCOperator() (contract.Actor, error) {
+	subject := strings.TrimSpace(os.Getenv("SUDO_USER"))
+	if subject == "" {
+		current, err := user.Current()
+		if err != nil || current.Username == "" {
+			return contract.Actor{}, contract.NewFault(contract.PreconditionFailed, "cannot identify the local SSH operator", "Run node RPC through sudo from the authenticated node account.")
+		}
+		subject = current.Username
+	}
+	actor := contract.Actor{Kind: "operator", Subject: subject}
+	return actor, actor.Validate()
 }
 
 // guardLocalFactor enforces the D7 actions checked without the control
