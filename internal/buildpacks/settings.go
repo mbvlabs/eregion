@@ -6,6 +6,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/google/go-containerregistry/pkg/name"
 )
@@ -17,8 +18,9 @@ type GoTarget struct {
 }
 
 type Frontend struct {
-	Directory string   `json:"directory" toml:"directory"`
-	Scripts   []string `json:"scripts" toml:"scripts"`
+	Directory   string   `json:"directory" toml:"directory"`
+	Scripts     []string `json:"scripts" toml:"scripts"`
+	StartScript string   `json:"start_script,omitempty" toml:"start_script"`
 }
 
 type Advanced struct {
@@ -28,9 +30,10 @@ type Advanced struct {
 }
 
 type Settings struct {
-	Order    []string  `json:"order,omitempty" toml:"order"`
-	Frontend *Frontend `json:"frontend,omitempty" toml:"frontend"`
-	Advanced *Advanced `json:"advanced,omitempty" toml:"advanced"`
+	Order     []string  `json:"order,omitempty" toml:"order"`
+	KeepFiles []string  `json:"keep_files,omitempty" toml:"keep_files"`
+	Frontend  *Frontend `json:"frontend,omitempty" toml:"frontend"`
+	Advanced  *Advanced `json:"advanced,omitempty" toml:"advanced"`
 }
 
 var (
@@ -73,6 +76,18 @@ func NormalizeSettings(input *Settings) (*Settings, error) {
 		return nil, nil
 	}
 	out := *input
+	out.KeepFiles = nil
+	for _, pattern := range input.KeepFiles {
+		if strings.TrimSpace(pattern) == "" || strings.HasPrefix(pattern, "/") || strings.ContainsAny(pattern, ":\\") || len(pattern) > 1024 || strings.IndexFunc(pattern, unicode.IsControl) >= 0 {
+			return nil, fmt.Errorf("keep file pattern %q must be a repository-relative glob without colon or control characters", pattern)
+		}
+		for _, part := range strings.Split(pattern, "/") {
+			if part == ".." {
+				return nil, fmt.Errorf("keep file pattern %q cannot leave the build context", pattern)
+			}
+		}
+		out.KeepFiles = append(out.KeepFiles, pattern)
+	}
 	if len(input.Order) == 0 {
 		out.Order = nil
 	} else {
@@ -92,6 +107,13 @@ func NormalizeSettings(input *Settings) (*Settings, error) {
 	}
 	if input.Frontend != nil {
 		frontend := *input.Frontend
+		frontend.StartScript = strings.TrimSpace(frontend.StartScript)
+		if input.Frontend.StartScript != "" && frontend.StartScript == "" {
+			return nil, fmt.Errorf("frontend start script must be a package script name")
+		}
+		if frontend.StartScript != "" && !scriptPattern.MatchString(frontend.StartScript) {
+			return nil, fmt.Errorf("frontend start script must be a package script name")
+		}
 		frontend.Directory = strings.TrimSpace(frontend.Directory)
 		if strings.HasPrefix(frontend.Directory, "/") || strings.ContainsAny(frontend.Directory, "\x00\r\n") {
 			return nil, fmt.Errorf("frontend directory must be relative")
@@ -152,7 +174,13 @@ func Environment(settings *Settings, targets []GoTarget) map[string]string {
 	if settings == nil {
 		return env
 	}
+	if len(settings.KeepFiles) > 0 {
+		env["BP_KEEP_FILES"] = strings.Join(settings.KeepFiles, ":")
+	}
 	if settings.Frontend != nil {
+		if settings.Frontend.StartScript != "" {
+			env["BP_NPM_START_SCRIPT"] = settings.Frontend.StartScript
+		}
 		if len(settings.Frontend.Scripts) > 0 {
 			env["BP_NODE_RUN_SCRIPTS"] = strings.Join(settings.Frontend.Scripts, ",")
 		}

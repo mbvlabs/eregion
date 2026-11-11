@@ -174,6 +174,22 @@ override does not disable a buildpack feature. Image sources bypass builds.
 The worker passes the selected order to pack without widening builder trust;
 the default builder and matching run image are resolved on the build node.
 
+Repeated `--keep-file` values (TOML `source.buildpacks.keep_files`) map to
+`BP_KEEP_FILES`; they preserve matching paths in the application source, not
+arbitrary buildpack layer dependencies. Choose the runtime files and artifacts
+your application actually needs: no paths are added by default. An exact
+symlink match and a directory's children are different; retaining a directory's
+contents requires a descendant pattern as well, such as `node_modules` and
+`node_modules/**` when appropriate. Patterns are relative to the build context.
+`--frontend-script` selects build-time package scripts, whereas
+`--frontend-start-script` (TOML `source.buildpacks.frontend.start_script`)
+maps to `BP_NPM_START_SCRIPT` and selects an existing package script for launch.
+That script can consume runtime dependencies; it is not a shell command.
+The npm-start buildpack must participate and the script must exist in the
+project. These settings alone do not guarantee a Node runtime. On update,
+`--keep-file ''` clears the list and `--frontend-start-script ''` clears the
+script override; omitted fields are preserved.
+
 `app export --inspect` emits a deterministic non-applicable TOML snapshot with
 non-secret metadata already present in inventory, including unsupported
 auto-deploy, retention, protection, release timeout and managed DNS metadata.

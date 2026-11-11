@@ -75,14 +75,16 @@ type Source struct {
 // The definition uses pointer-valued leaves so an environment override can
 // distinguish an omitted setting from an explicit empty value.
 type BuildpackSettings struct {
-	Order    *[]string          `toml:"order"`
-	Frontend *BuildpackFrontend `toml:"frontend"`
-	Advanced *BuildpackAdvanced `toml:"advanced"`
+	Order     *[]string          `toml:"order"`
+	KeepFiles *[]string          `toml:"keep_files"`
+	Frontend  *BuildpackFrontend `toml:"frontend"`
+	Advanced  *BuildpackAdvanced `toml:"advanced"`
 }
 
 type BuildpackFrontend struct {
-	Directory *string   `toml:"directory"`
-	Scripts   *[]string `toml:"scripts"`
+	Directory   *string   `toml:"directory"`
+	Scripts     *[]string `toml:"scripts"`
+	StartScript *string   `toml:"start_script"`
 }
 
 type BuildpackAdvanced struct {
@@ -327,6 +329,9 @@ func markSourcePresence(source *Source, present map[string]any) {
 		if hasKey(table, "order") && settings.Order == nil {
 			settings.Order = &[]string{}
 		}
+		if hasKey(table, "keep_files") && settings.KeepFiles == nil {
+			settings.KeepFiles = &[]string{}
+		}
 		if hasKey(table, "frontend") {
 			if settings.Frontend == nil {
 				settings.Frontend = &BuildpackFrontend{}
@@ -337,6 +342,9 @@ func markSourcePresence(source *Source, present map[string]any) {
 			}
 			if hasKey(fields, "scripts") && frontend.Scripts == nil {
 				frontend.Scripts = &[]string{}
+			}
+			if hasKey(fields, "start_script") && frontend.StartScript == nil {
+				frontend.StartScript = ptrValue("")
 			}
 		}
 		if hasKey(table, "advanced") {
@@ -568,7 +576,7 @@ func mergeSource(dst, src *Source) {
 
 func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
 	dst.buildpacksSpecified = true
-	if src.Order == nil && src.Frontend == nil && src.Advanced == nil {
+	if src.Order == nil && src.KeepFiles == nil && src.Frontend == nil && src.Advanced == nil {
 		dst.Buildpacks = nil
 		return
 	}
@@ -580,9 +588,13 @@ func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
 		values := append([]string{}, (*src.Order)...)
 		out.Order = &values
 	}
+	if src.KeepFiles != nil {
+		values := append([]string{}, (*src.KeepFiles)...)
+		out.KeepFiles = &values
+	}
 	if src.Frontend != nil {
 		f := src.Frontend
-		if f.Directory == nil && f.Scripts == nil {
+		if f.Directory == nil && f.Scripts == nil && f.StartScript == nil {
 			out.Frontend = nil
 		} else {
 			if out.Frontend == nil {
@@ -594,6 +606,9 @@ func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
 			if f.Scripts != nil {
 				values := append([]string{}, (*f.Scripts)...)
 				out.Frontend.Scripts = &values
+			}
+			if f.StartScript != nil {
+				out.Frontend.StartScript = ptrValue(*f.StartScript)
 			}
 		}
 	}
@@ -1058,12 +1073,18 @@ func sourceBinding(source *Source) platform.SourceBinding {
 	if source.Buildpacks != nil {
 		s := source.Buildpacks
 		settings := &buildpacks.Settings{}
+		if s.KeepFiles != nil {
+			settings.KeepFiles = append([]string{}, (*s.KeepFiles)...)
+		}
 		if s.Order != nil {
 			settings.Order = append([]string{}, (*s.Order)...)
 		}
 		if s.Frontend != nil {
 			f := s.Frontend
 			settings.Frontend = &buildpacks.Frontend{}
+			if f.StartScript != nil {
+				settings.Frontend.StartScript = *f.StartScript
+			}
 			if f.Directory != nil {
 				settings.Frontend.Directory = *f.Directory
 			}

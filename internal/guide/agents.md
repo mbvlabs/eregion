@@ -237,6 +237,19 @@ values override corresponding raw build environment keys; clearing one removes
 the override. `env update --build-env ''`, `--go-target ''`, and
 `--buildpack ''` clear their lists; `--builder ''` resets the builder. TOML
 definitions use `[source.buildpacks] order = [...]` via `--from`.
+Repeated `--keep-file` (TOML `source.buildpacks.keep_files`) passes relative
+globs to `BP_KEEP_FILES`. Select your own runtime files and artifacts; no paths
+are added by default. This preserves matched application paths, not arbitrary
+buildpack layer dependencies. An exact symlink and a directory's children are
+different: preserving children needs a descendant pattern too, for example
+`node_modules` and `node_modules/**` when your application needs them.
+`--frontend-script` selects build-time scripts. `--frontend-start-script`
+(TOML `source.buildpacks.frontend.start_script`) selects an existing package
+script for npm-start at launch, which may consume runtime dependencies. It is
+not a shell command; npm-start must participate and the script must exist. This
+does not by itself guarantee a Node runtime. On update `--keep-file ''` clears
+the list and `--frontend-start-script ''` clears the override; omitted inputs
+remain unchanged.
 Normal `app export` refuses unsupported state; `app export <app> <env> --inspect`
 provides non-secret metadata for inspection only and cannot be applied. It does
 not reconstruct provider ownership or DNS automation.

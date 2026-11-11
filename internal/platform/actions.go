@@ -1261,6 +1261,7 @@ func CloneRevisionState(state RevisionState) RevisionState {
 	}
 	if state.Source.Buildpacks != nil {
 		settings := *state.Source.Buildpacks
+		settings.KeepFiles = append([]string(nil), settings.KeepFiles...)
 		if settings.Order != nil {
 			settings.Order = append([]string{}, settings.Order...)
 		}

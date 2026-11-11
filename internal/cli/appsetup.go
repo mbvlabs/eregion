@@ -217,13 +217,15 @@ func flagChanged(cmd *cobra.Command, name string) bool {
 	return cmd != nil && cmd.Flags().Lookup(name) != nil && cmd.Flags().Changed(name)
 }
 
-var buildpackFlagNames = []string{"buildpack", "frontend-directory", "frontend-script", "go-target", "go-version", "go-build-flags", "node-version"}
+var buildpackFlagNames = []string{"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "go-target", "go-version", "go-build-flags", "node-version"}
 
 func addBuildpackFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
 	f.StringArray("buildpack", nil, "Ordered buildpack OCI reference or builder URN (repeatable; empty clears order)")
+	f.StringArray("keep-file", nil, "Repository-relative keep-file glob (repeatable; empty clears list)")
 	f.String("frontend-directory", "", "Node project directory relative to the build context; empty clears override")
 	f.StringArray("frontend-script", nil, "Node package script in order (repeatable; empty clears override)")
+	f.String("frontend-start-script", "", "Existing npm package script for launch (empty clears override)")
 	f.StringArray("go-target", nil, "Go target PROCESS=./PACKAGE (repeatable; empty clears targets)")
 	f.String("go-version", "", "Go buildpack version")
 	f.String("go-build-flags", "", "Go build flags")
@@ -260,7 +262,7 @@ func parseGoTargets(values []string) ([]buildpacks.GoTarget, error) {
 }
 
 func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) error {
-	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script")
+	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script") || flagChanged(cmd, "frontend-start-script")
 	if flagChanged(cmd, "go-target") {
 		targets, err := parseGoTargets(flagArray(cmd, "go-target"))
 		if err != nil {
@@ -269,7 +271,7 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 		source.GoTargets = targets
 	}
 	advanced := flagChanged(cmd, "go-version") || flagChanged(cmd, "go-build-flags") || flagChanged(cmd, "node-version")
-	if frontend || advanced || flagChanged(cmd, "buildpack") {
+	if frontend || advanced || flagChanged(cmd, "buildpack") || flagChanged(cmd, "keep-file") {
 		if source.Buildpacks == nil {
 			source.Buildpacks = &buildpacks.Settings{}
 		}
@@ -279,6 +281,13 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 				order = []string{}
 			}
 			source.Buildpacks.Order = order
+		}
+		if flagChanged(cmd, "keep-file") {
+			values := flagArray(cmd, "keep-file")
+			if len(values) == 1 && values[0] == "" {
+				values = nil
+			}
+			source.Buildpacks.KeepFiles = values
 		}
 		if frontend {
 			if source.Buildpacks.Frontend == nil {
@@ -290,6 +299,9 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 			}
 			if flagChanged(cmd, "frontend-script") {
 				f.Scripts = flagArray(cmd, "frontend-script")
+			}
+			if flagChanged(cmd, "frontend-start-script") {
+				f.StartScript = flagString(cmd, "frontend-start-script")
 			}
 		}
 		if advanced {
@@ -348,6 +360,23 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 			settings.Order = strings.Split(text, ",")
 		}
 	}
+	var keepFiles []string
+	if settings != nil {
+		keepFiles = settings.KeepFiles
+	}
+	text, err = ui.Input("Keep files", "Comma-separated repository-relative globs; empty clears the list", strings.Join(keepFiles, ","))
+	if err != nil {
+		return err
+	}
+	if settings == nil && text != "" {
+		settings = &buildpacks.Settings{}
+	}
+	if settings != nil {
+		settings.KeepFiles = nil
+		if text != "" {
+			settings.KeepFiles = strings.Split(text, ",")
+		}
+	}
 	enabled := settings != nil && settings.Frontend != nil
 	enabled, err = ui.YesNoDefault("Configure Node build inputs?", "Optional inputs for a selected Node buildpack", enabled)
 	if err != nil {
@@ -370,6 +399,10 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 			return err
 		}
 		f.Scripts = strings.Split(text, ",")
+		f.StartScript, err = ui.Input("Frontend start script", "Existing npm package script for launch; empty uses buildpack default", f.StartScript)
+		if err != nil {
+			return err
+		}
 	} else if settings != nil {
 		settings.Frontend = nil
 	}
@@ -484,7 +517,7 @@ func askIntRange(title, description, def string, min, max int) (int, error) {
 var definitionRevisionFlags = []string{
 	"node", "build-node", "git-url", "git-ref", "git-credential-file",
 	"git-credential-name", "image", "builder", "context-path", "build-env",
-	"buildpack", "frontend-directory", "frontend-script", "go-target", "go-version", "go-build-flags", "node-version",
+	"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "go-target", "go-version", "go-build-flags", "node-version",
 	"container-port", "health-type", "health-path", "health-timeout",
 	"release-command", "process", "config", "secret", "domain", "domain-check-path",
 }

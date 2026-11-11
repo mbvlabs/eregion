@@ -28,7 +28,7 @@ func (a *app) envSpecs() []spec {
 		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
-		"buildpack", "frontend-directory", "frontend-script", "go-target", "go-version", "go-build-flags", "node-version",
+		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "go-target", "go-version", "go-build-flags", "node-version",
 	}
 	create.Examples = []string{
 		"eregion env create",
@@ -46,7 +46,7 @@ func (a *app) envSpecs() []spec {
 		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name", "github-auth",
 		"image", "builder", "context-path", "build-env", "health-type", "health-path", "health-timeout",
 		"release-command", "process", "from", "github-webhook",
-		"buildpack", "frontend-directory", "frontend-script", "go-target", "go-version", "go-build-flags", "node-version",
+		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "go-target", "go-version", "go-build-flags", "node-version",
 	}
 	update.Examples = []string{
 		"eregion env update api production",
