@@ -100,6 +100,43 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx pgx.Tx, id contra
 	if err := ensureNoActiveResourceOperationTx(ctx, tx, id, target); err != nil {
 		return err
 	}
+	if len(input.SecretEnv) > 0 {
+		if s.vault == nil {
+			return contract.NewFault(contract.Unavailable, "secret storage is not configured", "Configure the vault before applying a resource with secret references.")
+		}
+		names := make([]string, 0, len(input.SecretEnv))
+		seen := make(map[string]bool, len(input.SecretEnv))
+		for _, name := range input.SecretEnv {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		var missing []string
+		for _, name := range names {
+			namespace, err := vault.NewNamespace(input.App, input.Environment, name)
+			if err != nil {
+				return err
+			}
+			metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx, namespace)
+			if err != nil {
+				if contract.Classify(err).Code == contract.NotFound {
+					missing = append(missing, name)
+					continue
+				}
+				return err
+			}
+			if metadata.State != vault.StateActive {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			fault := contract.NewFault(contract.PreconditionFailed, "resource requires active secrets: "+strings.Join(missing, ", "), "Set the missing or archived secrets in this environment, then apply the resource again.")
+			fault.Details = map[string]any{"reason": "missing_secret_values", "names": missing}
+			return fault
+		}
+	}
 	existing, found, err := resourceByNameTxOptional(ctx, tx, input.App, input.Environment, input.Name)
 	if err != nil {
 		return err

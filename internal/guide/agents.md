@@ -149,6 +149,13 @@ terminal, some need a human, and a retry may need the same idempotency key.
   (`--dest`), never prints the value, and needs a TOTP code at a human's
   terminal. `secret list` shows metadata only. `secrets export` rebuilds the
   whole server handoff behind the same factor.
+- For a definition with secret-consuming resources, create with `--no-deploy`.
+  Missing or archived resource secrets defer automatic provisioning, with names
+  in `deferred_resources`; the environment's desired attachments remain. Set
+  each secret using `secret set --file /absolute/protected/path`, then reapply
+  the definition with `env update <app> <env> --from <file>`. A dry run checks
+  metadata only. An accepted apply is not proof of resource health, and a
+  secret may still be archived after admission.
 - `app create`, `env create` and `env update` accept explicit `--github-auth`
   for an `https://github.com/...` git source. It reads the operator's
   authenticated `gh auth token` in memory and writes it as the repository read

@@ -14,6 +14,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/vault"
 )
 
 // resourceTestTransport answers the resource node steps without Docker. It
@@ -59,9 +60,17 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 	fake := &resourceTestTransport{}
 	secretResolver := newSnapshotSecretResolver()
 	secretResolver.set("DATABASE_PASSWORD", 1, "hunter2-resource-secret")
+	ring, err := vault.GenerateKeyRing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vaultService, err := vault.NewService(pool, ring)
+	if err != nil {
+		t.Fatal(err)
+	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		SecretResolver: secretResolver,
+		SecretResolver: secretResolver, Vault: vaultService,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -83,6 +92,22 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 			"health": map[string]any{"timeout_seconds": 5},
 		}},
 	}), contract.Succeeded)
+
+	ns, err := vault.NewNamespace("api", "production", "DATABASE_PASSWORD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := vaultService.Store().Set(ctx, tx, ns, []byte("hunter2-resource-secret"), 0, testActor); err != nil {
+		rollback(tx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	apply := platformSubmit(t, s, platform.KindResourceApply, "resource/api/production/db", "resource-apply", map[string]any{
 		"image": "postgres:17",

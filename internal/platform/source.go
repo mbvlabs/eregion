@@ -155,14 +155,11 @@ func ResolveGitRef(ctx context.Context, rawURL, ref string, credential []byte) (
 		return "", contract.NewFault(contract.ValidationFailed, "the git source URL is not allowed", err.Error())
 	}
 	ref = strings.TrimSpace(ref)
+	if err := ValidateGitRef(ref); err != nil {
+		return "", err
+	}
 	if IsGitCommit(ref) {
 		return ref, nil
-	}
-	if abbreviatedGitSHA(ref) {
-		return "", contract.NewFault(contract.ValidationFailed, "the git ref is an abbreviated commit", "Use the full 40-character commit SHA, or a branch or tag name.")
-	}
-	if ref != "" && !validGitRef(ref) {
-		return "", contract.NewFault(contract.ValidationFailed, "invalid git ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen.")
 	}
 
 	resolveCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -223,6 +220,21 @@ func redactGitStderr(stderr string, credential []byte) string {
 
 // IsGitCommit reports a full lowercase git commit SHA (SHA-1 or SHA-256).
 func IsGitCommit(value string) bool { return shaPattern.MatchString(value) }
+
+// ValidateGitRef checks the local shape without resolving a branch or tag.
+func ValidateGitRef(ref string) error {
+	ref = strings.TrimSpace(ref)
+	if IsGitCommit(ref) {
+		return nil
+	}
+	if abbreviatedGitSHA(ref) {
+		return contract.NewFault(contract.ValidationFailed, "the git ref is an abbreviated commit", "Use the full 40-character commit SHA, or a branch or tag name.")
+	}
+	if ref != "" && !validGitRef(ref) {
+		return contract.NewFault(contract.ValidationFailed, "invalid git ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen.")
+	}
+	return nil
+}
 
 // matchGitRef picks the one commit a branch or tag names in git ls-remote
 // output. An annotated tag uses its peeled commit. A name that is both a branch

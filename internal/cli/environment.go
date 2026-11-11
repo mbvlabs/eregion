@@ -307,6 +307,16 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if err != nil {
 		return result{}, err
 	}
+	var deferred []deferredDefinitionResource
+	if dryRun(cmd) && !preview.Replay {
+		_, deferred, err = a.bootstrapDefinitionResources(cmd, ans.ResourceSpecs, true)
+		if err != nil {
+			return result{}, err
+		}
+		for _, item := range deferred {
+			preview.Warnings = append(preview.Warnings, item.warning())
+		}
+	}
 	plan := setupPlan(ans, preview, cmd)
 	if interactive {
 		fmt.Fprintln(os.Stderr, "")
@@ -326,7 +336,7 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		App: ans.App, Environment: ans.Environment, Protected: protectedSpec(spec), Node: ans.Node,
 		Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
 		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, DomainCheckPath: ans.DomainCheckPath, Domains: ans.Domains, Deploy: ans.Deploy,
-		Warnings: preview.Warnings, created: "environment",
+		Warnings: preview.Warnings, DeferredResources: deferred, created: "environment",
 	}
 	if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
 		summary.DNSRecord = &record
@@ -366,11 +376,15 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	summary.OperationID = op.ID
 	summary.FirstDeployOperationID = op.FirstDeployOperationID
 	if len(ans.ResourceSpecs) > 0 {
-		resourceIDs, err := a.provisionDefinitionResources(cmd, ans.ResourceSpecs)
+		resourceIDs, deferred, err := a.bootstrapDefinitionResources(cmd, ans.ResourceSpecs, false)
 		if err != nil {
-			summary.Warnings = append(summary.Warnings, "The environment was created, but resource provisioning was not accepted: "+err.Error()+". Reapply with `eregion resource apply`.")
+			return result{}, resourceAfterAcceptedFault(err, op.ID)
 		}
 		summary.ResolvedResourceIDs = resourceIDs
+		summary.DeferredResources = deferred
+		for _, item := range deferred {
+			summary.Warnings = append(summary.Warnings, item.warning())
+		}
 		if len(resourceIDs) > 0 {
 			summary.Warnings = append(summary.Warnings, "Managed resources were accepted for provisioning; they are not ready until their health checks pass, and the first deploy waits for attached resources.")
 		}
@@ -410,6 +424,9 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 			ui.Dim("the revision is desired state, not a running deployment"),
 			ui.Dim("next:"),
 			"  " + ui.Code("eregion env status "+ans.App+" "+ans.Environment+" --json"),
+		}
+		for _, item := range summary.DeferredResources {
+			footer = append(footer, item.warning())
 		}
 		if summary.FirstDeployOperationID != "" {
 			footer = append(footer, "  "+ui.Code("eregion operations follow "+string(summary.FirstDeployOperationID)))
@@ -975,7 +992,11 @@ func (a *app) envUpdateFromFile(cmd *cobra.Command, appName, environment, path s
 		// provision the container. The applies stay separate accepted actions.
 		operations, err := a.provisionDefinitionResources(cmd, resourceSpecs)
 		if err != nil {
-			data.Warnings = append(data.Warnings, "The revision was accepted, but resource provisioning was not: "+err.Error()+". Use `eregion resource apply` to retry.")
+			fault := contract.Classify(err)
+			if operationID != "" {
+				fault.Message = "Environment update was accepted as " + string(operationID) + ", but resource provisioning failed: " + fault.Message
+			}
+			return result{}, fault
 		}
 		data.ResourceOperations = operations
 	}

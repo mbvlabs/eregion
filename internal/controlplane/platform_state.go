@@ -2386,13 +2386,48 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	switch input := normalized.Input.(type) {
 	case *platform.DeployInput:
 		if input.ReleaseID == "" {
-			env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
+			tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 			if err != nil {
-				return preview, err
+				return preview, unavailable(err)
+			}
+			defer tx.Rollback(ctx)
+			env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE a.name=$1 AND e.name=$2", normalized.Target.App, normalized.Target.Environment))
+			if errors.Is(err, pgx.ErrNoRows) {
+				return preview, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
+			}
+			if err != nil {
+				return preview, unavailable(err)
 			}
 			if env.Revision == nil {
 				return preview, contract.NewFault(contract.PreconditionFailed, "environment has no current revision", "Save an environment revision before deploying.")
 			}
+			if env.Revision.Source.Kind == "git" {
+				if env.BuildNodeName() != env.Node {
+					return preview, contract.NewFault(contract.PreconditionFailed, "build_node is distinct from the application node; moving the built image requires a shared registry", "Use build_node equal to the environment node, or deploy an image release.")
+				}
+				if err := platform.ValidateGitSourceURL(env.Revision.Source.URL); err != nil {
+					return preview, contract.NewFault(contract.PreconditionFailed, "the environment's git source is invalid", err.Error())
+				}
+				ref := input.Ref
+				if ref == "" {
+					ref = env.Revision.Source.Ref
+				}
+				if err := platform.ValidateGitRef(ref); err != nil {
+					return preview, err
+				}
+				if !platform.IsGitCommit(strings.TrimSpace(ref)) {
+					preview.Warnings = append(preview.Warnings, "The Git ref was not resolved in this dry run; submission must verify it against the repository.")
+				}
+			} else if input.Ref != "" {
+				return preview, contract.NewFault(contract.ValidationFailed, "ref is only valid for a git source", "Omit ref when the environment revision binds an image.")
+			}
+			if err := s.checkDeployabilityTx(ctx, tx, env, false); err != nil {
+				return preview, err
+			}
+			if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+				return preview, err
+			}
+			preview.Warnings = append(preview.Warnings, "This read-only preview is advisory; submission rechecks current state.")
 			preview.Steps = deploymentSteps()
 			preview.Summary = fmt.Sprintf("Build %s from %s source, then deploy it to %s/%s with a blue/green switch.", env.App, env.Revision.Source.Kind, env.App, env.Name)
 			if env.ServingRelease != "" {

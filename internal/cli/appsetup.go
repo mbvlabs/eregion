@@ -2137,6 +2137,7 @@ type setupResult struct {
 	DomainCheckPath        string                       `json:"domain_check_path,omitempty"`
 	Domains                []platform.DomainDeclaration `json:"domains,omitempty"`
 	ResolvedResourceIDs    []contract.OperationID       `json:"resource_operations,omitempty"`
+	DeferredResources      []deferredDefinitionResource `json:"deferred_resources,omitempty"`
 	DNSRecord              *hostDNSRecord               `json:"dns_record,omitempty"`
 	Deploy                 bool                         `json:"deploy"`
 	OperationID            contract.OperationID         `json:"operation_id,omitempty"`
@@ -2147,6 +2148,94 @@ type setupResult struct {
 
 	created string
 	plan    string
+}
+
+type deferredDefinitionResource struct {
+	App         string   `json:"app"`
+	Environment string   `json:"environment"`
+	Resource    string   `json:"resource"`
+	SecretNames []string `json:"missing_secret_names"`
+}
+
+func (r deferredDefinitionResource) warning() string {
+	return "Resource " + r.App + "/" + r.Environment + "/" + r.Resource + " requires deferral: missing or archived secrets " + strings.Join(r.SecretNames, ", ") + ". Create with --no-deploy, use `eregion secret set --app " + r.App + " --environment " + r.Environment + " --name <NAME> --file /absolute/protected/path` for each secret (use --expected-revision for archived names), then reapply with `eregion env update " + r.App + " " + r.Environment + " --from <file>`."
+}
+
+func resourceAfterAcceptedFault(err error, operation contract.OperationID) error {
+	fault := contract.Classify(err)
+	fault.Message = "Environment creation was accepted as " + string(operation) + ", but resource provisioning failed: " + fault.Message
+	return fault
+}
+
+// bootstrapDefinitionResources checks only secret metadata; the admission
+// transaction repeats this check under namespace locks before creating work.
+func (a *app) bootstrapDefinitionResources(cmd *cobra.Command, specs []platform.ResourceApplyInput, preview bool) ([]contract.OperationID, []deferredDefinitionResource, error) {
+	var ids []contract.OperationID
+	var deferred []deferredDefinitionResource
+	for _, spec := range specs {
+		names := make([]string, 0, len(spec.SecretEnv))
+		seen := map[string]bool{}
+		for _, name := range spec.SecretEnv {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		missing := []string{}
+		if len(names) > 0 {
+			client, err := a.client(cmd)
+			if err != nil {
+				return ids, deferred, err
+			}
+			for _, name := range names {
+				metadata, err := client.GetSecretMetadata(cmd.Context(), vault.Namespace{App: spec.App, Environment: spec.Environment, Name: name})
+				if err != nil {
+					if contract.Classify(err).Code == contract.NotFound {
+						missing = append(missing, name)
+						continue
+					}
+					return ids, deferred, err
+				}
+				if metadata.State != vault.StateActive {
+					missing = append(missing, name)
+				}
+			}
+		}
+		if len(missing) == 0 && !preview {
+			target, err := platform.NewResourceTarget(spec.App, spec.Environment, spec.Name)
+			if err != nil {
+				return ids, deferred, err
+			}
+			op, err := a.submitAccepted(cmd, platform.KindResourceApply, target.String(), spec, "")
+			if err != nil {
+				fault := contract.Classify(err)
+				if fault.Code != contract.PreconditionFailed || fault.Details["reason"] != "missing_secret_values" {
+					return ids, deferred, err
+				}
+				// RPC decoding may turn a string slice into a generic JSON array.
+				switch values := fault.Details["names"].(type) {
+				case []string:
+					missing = append(missing, values...)
+				case []any:
+					for _, value := range values {
+						if name, ok := value.(string); ok {
+							missing = append(missing, name)
+						}
+					}
+				}
+				if len(missing) == 0 {
+					return ids, deferred, err
+				}
+			} else {
+				ids = append(ids, op.ID)
+			}
+		}
+		if len(missing) > 0 {
+			deferred = append(deferred, deferredDefinitionResource{App: spec.App, Environment: spec.Environment, Resource: spec.Name, SecretNames: missing})
+		}
+	}
+	return ids, deferred, nil
 }
 
 func (r setupResult) plainText() string {
