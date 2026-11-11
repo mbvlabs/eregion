@@ -102,11 +102,11 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 	if !plan.Changed {
 		return result{
 			data:  data,
-			plain: fmt.Sprintf("eregion is already on %s (%s).\nOnly the local CLI is managed here; nodes were not upgraded.\nNodes: %s\n", plan.From.Version, plan.From.Channel, nodesUpgradeCommand),
+			plain: fmt.Sprintf("eregion is already on %s (%s).\nOnly the local CLI is managed here; nodes were not upgraded.\nNodes: %s\n", plan.From.Version, upgradeReleaseLabel(plan.From.Version), nodesUpgradeCommand),
 		}, nil
 	}
 	if dry {
-		plain := fmt.Sprintf("Would upgrade eregion %s → %s (%s)\nat %s\n\n", plan.From.Version, plan.To.Version, plan.To.Channel, target)
+		plain := fmt.Sprintf("Would upgrade eregion %s → %s (%s)\nat %s\n\n", plan.From.Version, plan.To.Version, upgradeReleaseLabel(plan.To.Version), target)
 		for _, warning := range plan.Warnings {
 			plain += "warning: " + warning.Message + "\n"
 		}
@@ -115,7 +115,7 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 	}
 
 	if !yes && upgradeCanPrompt(cmd) {
-		ok, err := upgradePrompt(cmd, fmt.Sprintf("Upgrade eregion %s → %s (%s) at %s?", plan.From.Version, plan.To.Version, plan.To.Channel, target))
+		ok, err := upgradePrompt(cmd, fmt.Sprintf("Upgrade eregion %s → %s (%s) at %s?", plan.From.Version, plan.To.Version, upgradeReleaseLabel(plan.To.Version), target))
 		if err != nil {
 			return result{}, err
 		}
@@ -152,7 +152,7 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 	data.Warnings = append(data.Warnings, warnings...)
 
 	lines := []string{
-		fmt.Sprintf("eregion upgraded %s → %s (%s)", plan.From.Version, plan.To.Version, plan.To.Channel),
+		fmt.Sprintf("eregion upgraded %s → %s (%s)", plan.From.Version, plan.To.Version, upgradeReleaseLabel(plan.To.Version)),
 	}
 	if previous != "" {
 		lines = append(lines, "previous binary kept at "+previous)
@@ -168,6 +168,15 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 		"Nodes: "+nodesUpgradeCommand,
 	)
 	return result{data: data, plain: strings.Join(lines, "\n") + "\n"}, nil
+}
+
+// The manifest channel identifies its signing family, not release stability.
+func upgradeReleaseLabel(version string) string {
+	parsed, ok := release.ParseStable(strings.TrimPrefix(version, "v"))
+	if ok && !parsed.Prerelease() {
+		return "stable"
+	}
+	return "prerelease"
 }
 
 type upgradeManifestResolver interface {

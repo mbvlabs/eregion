@@ -42,6 +42,12 @@ type Step interface {
 	CancelBoundary() Boundary
 }
 
+// ApplyProgress optionally replaces the progress message emitted before Apply.
+// Check details remain available to read-only plans and diagnostics.
+type ApplyProgress interface {
+	ApplyProgressMessage() string
+}
+
 // HostLockIndependent is an opt-in for a step that only signals an in-flight
 // effect through its own private state, without mutating shared host resources.
 // Such a signal must not wait behind the effect it is meant to stop. The engine

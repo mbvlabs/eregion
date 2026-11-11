@@ -102,6 +102,9 @@ func (s *readinessStep) Describe() string {
 	return "Verify the API liveness and public database readiness endpoints"
 }
 func (s *readinessStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
+func (s *readinessStep) ApplyProgressMessage() string {
+	return "Waiting for API readiness…"
+}
 
 func (s *readinessStep) Inputs() ([]byte, error) {
 	return canonicalInput(struct {
@@ -130,7 +133,7 @@ if systemctl is-active --quiet eregion-worker.service; then echo worker:ok; else
 	return complete("API liveness and public /readyz succeeded")
 }
 
-func (s *readinessStep) Apply(ctx context.Context, _ engine.Runtime, _ engine.Reporter) (engine.ApplyResult, error) {
+func (s *readinessStep) Apply(ctx context.Context, _ engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
 	if s.probe == nil {
 		return engine.ApplyResult{}, fmt.Errorf("no readiness probe is configured")
 	}
@@ -141,6 +144,9 @@ func (s *readinessStep) Apply(ctx context.Context, _ engine.Runtime, _ engine.Re
 		last = s.probe.Health(probeCtx, s.cfg)
 		cancel()
 		if last == nil {
+			if report != nil {
+				report(engine.Event{Kind: "log", Step: s.ID(), Message: "Readiness passed: API liveness and /readyz succeeded."})
+			}
 			return engine.ApplyResult{Notes: []string{"API liveness and public /readyz succeeded"}, Result: map[string]any{"ready": true}}, nil
 		}
 		select {

@@ -305,7 +305,13 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	executed := false
 	result := ApplyResult{}
 	if !check.Complete {
-		report.emit(Event{Kind: "log", Step: step.ID(), Message: "applying: " + check.Detail})
+		message := "applying: " + check.Detail
+		if progress, ok := step.(ApplyProgress); ok {
+			if description := progress.ApplyProgressMessage(); description != "" {
+				message = description
+			}
+		}
+		report.emit(Event{Kind: "log", Step: step.ID(), Message: message})
 		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), SecretValues: e.SecretValues, Root: e.StateDir}, report)
 		if err != nil {
 			return e.fail(exec, running, err)
