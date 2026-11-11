@@ -656,7 +656,7 @@ kind = "git"
 url = "https://github.com/acme/api"
 ref = "main"
 credential_secret = "%s"
-builder = "paketobuildpacks/builder-jammy-base"
+builder = ""
 
 [runtime]
 health_path = "/"
