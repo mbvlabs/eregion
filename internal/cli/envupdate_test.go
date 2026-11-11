@@ -13,7 +13,7 @@ func TestBuildGuidedUpdateMapsPrefilledAnswers(t *testing.T) {
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
 				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN", Builder: platform.DefaultBuilder,
+				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			Runtime: platform.RuntimeSpec{
 				Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30,
@@ -29,7 +29,7 @@ func TestBuildGuidedUpdateMapsPrefilledAnswers(t *testing.T) {
 		Node: "main2", BuildNode: "builder",
 		Source: platform.SourceBinding{
 			Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-			CredentialSecretName: "GIT_READ_TOKEN", Builder: platform.DefaultBuilder,
+			CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 		},
 		Runtime: platform.RuntimeSpec{
 			Node: "main2", HealthType: "http", HealthPath: "/readyz", HealthTimeoutSeconds: 30,

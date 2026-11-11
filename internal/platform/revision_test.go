@@ -98,7 +98,7 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 	if len(created.Environments) != 2 || created.Environments[0].Processes[0].ContainerPort != 3000 {
 		t.Fatalf("first environment was not normalized: %+v", created.Environments)
 	}
-	if created.Environments[0].Source.Builder != DefaultBuilder || created.Environments[0].Runtime.HealthTimeoutSeconds != DefaultHealthTimeout {
+	if created.Environments[0].Source.Builder != "" || created.Environments[0].Runtime.HealthTimeoutSeconds != DefaultHealthTimeout {
 		t.Fatalf("revision defaults were not applied: %+v", created.Environments[0])
 	}
 	if created.Environments[0].Protected == nil || !*created.Environments[0].Protected {

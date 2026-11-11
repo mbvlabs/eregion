@@ -18,7 +18,7 @@ import (
 func TestImageMovingStepsHoldTheHostLock(t *testing.T) {
 	rawPack, _ := json.Marshal(PackPayload{
 		Step: "platform-pack-01-v1", Image: "eregion/api-production:abc",
-		Builder: DefaultBuilder, Path: t.TempDir(),
+		Builder: "paketobuildpacks/builder-jammy-base", Path: t.TempDir(),
 	})
 	pack, err := buildPackStep(retentionTestExecution("platform-pack-01-v1"), rawPack)
 	if err != nil {

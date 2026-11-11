@@ -212,10 +212,7 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 			}
 		}
 		builderDefault := base.Builder
-		if builderDefault == "" {
-			builderDefault = platform.DefaultBuilder
-		}
-		builder, err := askValidated("Buildpacks builder", "A pinned builder image on the node; empty uses the platform default", builderDefault, validateOptionalImage)
+		builder, err := askValidated("Buildpacks builder", "Empty uses the build node's platform default", builderDefault, validateOptionalImage)
 		if err != nil {
 			return platform.SourceBinding{}, nil, "", err
 		}

@@ -973,12 +973,12 @@ func TestRetentionGCScriptFailsWhenItsCollectorCannotBeCreated(t *testing.T) {
 
 func TestPackBuildUsesTheExplicitBuildAndLaunchCaches(t *testing.T) {
 	payload := PackPayload{
-		Image: "eregion/api-production:abc", Builder: DefaultBuilder, Path: t.TempDir(),
+		Image: "eregion/api-production:abc", Builder: "paketobuildpacks/builder-jammy-base", Path: t.TempDir(),
 		Env:         map[string]string{"BP_JVM_VERSION": "21"},
 		Cache:       BuildpackCacheVolume("api", "production"),
 		LaunchCache: BuildpackLaunchCacheVolume("api", "production"),
 	}
-	args := packBuildArgs(payload, "/src", "eregion-build-test")
+	args := packBuildArgs(payload, "/src", "eregion-build-test", payload.Builder, "")
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--network eregion-build-test") {
 		t.Fatalf("pack build has no owned build network: %s", joined)
@@ -993,7 +993,7 @@ func TestPackBuildUsesTheExplicitBuildAndLaunchCaches(t *testing.T) {
 		t.Fatalf("pack 0.40 needs one cache type per --cache flag: %s", joined)
 	}
 	payload.Cache, payload.LaunchCache = "", ""
-	if strings.Contains(strings.Join(packBuildArgs(payload, "/src", ""), " "), "--cache") {
+	if strings.Contains(strings.Join(packBuildArgs(payload, "/src", "", payload.Builder, ""), " "), "--cache") {
 		t.Fatal("unset caches must keep the builder's own defaults")
 	}
 

@@ -740,7 +740,7 @@ replicas = 2
 		App: "api", Name: "production", Node: "main", RevisionID: revisionID,
 		Revision: &platform.EnvironmentRevision{ID: revisionID, RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main", Builder: platform.DefaultBuilder,
+				Kind: "git", URL: "https://github.com/acme/api", Ref: "main", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			Runtime:     platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
 			Processes:   []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},

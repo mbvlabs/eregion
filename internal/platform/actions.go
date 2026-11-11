@@ -21,7 +21,6 @@ const (
 	DefaultHealthPath    = "/"
 	DefaultHealthTimeout = 30
 	DefaultBind          = "127.0.0.1"
-	DefaultBuilder       = "paketobuildpacks/builder-jammy-base"
 	// DefaultWebhookSecretName is the stable vault name for an enabled
 	// push-to-deploy webhook when the caller does not name one.
 	DefaultWebhookSecretName = "EREGION_WEBHOOK_SECRET"
@@ -1001,11 +1000,10 @@ func normalizeSourceBinding(source *SourceBinding, enforceGitHosts bool) error {
 		if err := validateContextPath(source.ContextPath); err != nil {
 			return err
 		}
-		if source.Builder == "" {
-			source.Builder = DefaultBuilder
-		}
-		if err := ValidateImage(source.Builder); err != nil {
-			return err
+		if source.Builder != "" {
+			if err := ValidateImage(source.Builder); err != nil {
+				return err
+			}
 		}
 		if err := validateEnv(source.BuildEnv, "build environment"); err != nil {
 			return err
@@ -1263,6 +1261,9 @@ func CloneRevisionState(state RevisionState) RevisionState {
 	}
 	if state.Source.Buildpacks != nil {
 		settings := *state.Source.Buildpacks
+		if settings.Order != nil {
+			settings.Order = append([]string{}, settings.Order...)
+		}
 		if settings.Frontend != nil {
 			frontend := *settings.Frontend
 			if frontend.Scripts != nil {
@@ -1566,11 +1567,10 @@ func normalizeBuild(input *ReleaseCreateInput) error {
 	if input.Build == nil {
 		input.Build = &Build{}
 	}
-	if input.Build.Builder == "" {
-		input.Build.Builder = DefaultBuilder
-	}
-	if err := ValidateImage(input.Build.Builder); err != nil {
-		return err
+	if input.Build.Builder != "" {
+		if err := ValidateImage(input.Build.Builder); err != nil {
+			return err
+		}
 	}
 	if input.Build.Image != "" {
 		if err := ValidateImage(input.Build.Image); err != nil {

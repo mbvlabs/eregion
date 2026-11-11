@@ -164,12 +164,15 @@ does not need to remain online after setup. Local hook administration, the
 stored clone credential and the webhook signing secret remain separate roles;
 rotating one does not automatically rotate the others.
 
-Source builds use the pinned architecture-specific Noble Go profile. An enabled
-Node frontend runs the embedded assets buildpack before Go and requires exactly
-one supported package lockfile. Typed Buildpacks settings override corresponding
-raw build environment keys; frontend controls cannot be enabled through raw
-environment variables. Only the pinned profile builder is verified compatible;
-other custom builders are refused. Image sources bypass this build path.
+Source configuration accepts repeated `--buildpack` references in user-selected
+order, or `[source.buildpacks] order = [...]` in TOML; an empty order means
+builder detection. Empty builder desired state selects the platform default on
+the build node; an explicit builder selects that image. Optional Go targets and
+versions and Node project path and scripts map to standard Paketo `BP_*` inputs;
+supplied typed values take precedence over colliding raw inputs. Clearing an
+override does not disable a buildpack feature. Image sources bypass builds.
+The worker passes the selected order to pack without widening builder trust;
+the default builder and matching run image are resolved on the build node.
 
 `app export --inspect` emits a deterministic non-applicable TOML snapshot with
 non-secret metadata already present in inventory, including unsupported

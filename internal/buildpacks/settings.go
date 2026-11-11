@@ -6,6 +6,8 @@ import (
 	"path"
 	"regexp"
 	"strings"
+
+	"github.com/google/go-containerregistry/pkg/name"
 )
 
 // GoTarget associates a process name with a repository-relative Go package.
@@ -15,10 +17,8 @@ type GoTarget struct {
 }
 
 type Frontend struct {
-	Runtime         string   `json:"runtime" toml:"runtime"`
-	Directory       string   `json:"directory" toml:"directory"`
-	Scripts         []string `json:"scripts" toml:"scripts"`
-	KeepNodeRuntime bool     `json:"keep_node_runtime,omitempty" toml:"keep_node_runtime"`
+	Directory string   `json:"directory" toml:"directory"`
+	Scripts   []string `json:"scripts" toml:"scripts"`
 }
 
 type Advanced struct {
@@ -28,16 +28,17 @@ type Advanced struct {
 }
 
 type Settings struct {
-	Runtime  string    `json:"runtime" toml:"runtime"`
+	Order    []string  `json:"order,omitempty" toml:"order"`
 	Frontend *Frontend `json:"frontend,omitempty" toml:"frontend"`
 	Advanced *Advanced `json:"advanced,omitempty" toml:"advanced"`
 }
 
 var (
-	processPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
-	targetPattern  = regexp.MustCompile(`^[A-Za-z0-9_./*-]+$`)
-	scriptPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$`)
-	versionPattern = regexp.MustCompile(`^[0-9]+(\.[0-9]+){0,2}([-.][0-9A-Za-z]+)?$`)
+	processPattern    = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
+	targetPattern     = regexp.MustCompile(`^[A-Za-z0-9_./*-]+$`)
+	scriptPattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_-]{0,63}$`)
+	versionPattern    = regexp.MustCompile(`^[0-9]+(\.[0-9]+){0,2}([-.][0-9A-Za-z]+)?$`)
+	builderURNPattern = regexp.MustCompile(`^urn:cnb:builder:[a-zA-Z0-9][a-zA-Z0-9._/-]*@[a-zA-Z0-9][a-zA-Z0-9._+-]*$`)
 )
 
 // NormalizeTargets copies, normalizes and validates target entries. Blank
@@ -66,30 +67,38 @@ func NormalizeTargets(targets []GoTarget) ([]GoTarget, error) {
 	return out, nil
 }
 
-// NormalizeSettings returns an independent canonical copy of the Go recipe.
+// NormalizeSettings returns an independent canonical copy of the recipe.
 func NormalizeSettings(input *Settings) (*Settings, error) {
 	if input == nil {
 		return nil, nil
 	}
 	out := *input
-	out.Runtime = strings.ToLower(strings.TrimSpace(out.Runtime))
-	if out.Runtime != "go" {
-		return nil, fmt.Errorf("Buildpacks runtime must be go")
+	if len(input.Order) == 0 {
+		out.Order = nil
+	} else {
+		out.Order = append([]string{}, input.Order...)
+		for _, ref := range out.Order {
+			if builderURNPattern.MatchString(ref) {
+				continue
+			}
+			parts := strings.SplitN(ref, "/", 2)
+			if strings.HasPrefix(ref, ".") || len(parts) != 2 || !(strings.ContainsAny(parts[0], ".:") || parts[0] == "localhost") || (!strings.Contains(parts[1], ":") && !strings.Contains(parts[1], "@")) {
+				return nil, fmt.Errorf("buildpack %q must be a fully qualified OCI reference with tag or digest, or a builder URN", ref)
+			}
+			if _, err := name.ParseReference(ref, name.StrictValidation); err != nil {
+				return nil, fmt.Errorf("invalid buildpack reference %q: %w", ref, err)
+			}
+		}
 	}
 	if input.Frontend != nil {
 		frontend := *input.Frontend
-		frontend.Runtime = strings.TrimSpace(frontend.Runtime)
-		if frontend.Runtime != "node" {
-			return nil, fmt.Errorf("frontend runtime must be node")
-		}
 		frontend.Directory = strings.TrimSpace(frontend.Directory)
-		if frontend.Directory == "" {
-			frontend.Directory = "."
-		}
 		if strings.HasPrefix(frontend.Directory, "/") || strings.ContainsAny(frontend.Directory, "\x00\r\n") {
 			return nil, fmt.Errorf("frontend directory must be relative")
 		}
-		frontend.Directory = path.Clean(frontend.Directory)
+		if frontend.Directory != "" {
+			frontend.Directory = path.Clean(frontend.Directory)
+		}
 		if frontend.Directory == ".." || strings.HasPrefix(frontend.Directory, "../") {
 			return nil, fmt.Errorf("frontend directory cannot leave the build context")
 		}
@@ -103,9 +112,6 @@ func NormalizeSettings(input *Settings) (*Settings, error) {
 				return nil, fmt.Errorf("frontend build script must be a package script name")
 			}
 			frontend.Scripts = append(frontend.Scripts, script)
-		}
-		if len(frontend.Scripts) == 0 {
-			frontend.Scripts = []string{"build"}
 		}
 		out.Frontend = &frontend
 	}
@@ -147,10 +153,11 @@ func Environment(settings *Settings, targets []GoTarget) map[string]string {
 		return env
 	}
 	if settings.Frontend != nil {
-		env["BP_DEPLOYCRATE_FRONTEND_SCRIPTS"] = strings.Join(settings.Frontend.Scripts, ",")
-		env["BP_DEPLOYCRATE_FRONTEND_DIRECTORY"] = settings.Frontend.Directory
-		if settings.Frontend.KeepNodeRuntime {
-			env["BP_DEPLOYCRATE_KEEP_NODE_RUNTIME"] = "true"
+		if len(settings.Frontend.Scripts) > 0 {
+			env["BP_NODE_RUN_SCRIPTS"] = strings.Join(settings.Frontend.Scripts, ",")
+		}
+		if settings.Frontend.Directory != "" {
+			env["BP_NODE_PROJECT_PATH"] = settings.Frontend.Directory
 		}
 	}
 	if settings.Advanced != nil {

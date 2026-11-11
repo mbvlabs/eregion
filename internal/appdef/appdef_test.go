@@ -453,7 +453,7 @@ B = "3"
 		Revision: &platform.EnvironmentRevision{ID: revisionID, RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
 				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN", Builder: platform.DefaultBuilder,
+				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			AutoDeploy:        true,
 			WebhookSecretName: "DEPLOY_HOOK",
@@ -517,7 +517,7 @@ func TestUpdatePatchRejectsSourceCredentialRoleAliasing(t *testing.T) {
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
 				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN", Builder: platform.DefaultBuilder,
+				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			AutoDeploy:        true,
 			WebhookSecretName: "EREGION_WEBHOOK_SECRET",
@@ -609,7 +609,7 @@ release_command = []
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
 				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				Builder: platform.DefaultBuilder, BuildEnv: map[string]string{"BP": "x"},
+				Builder: "paketobuildpacks/builder-jammy-base", BuildEnv: map[string]string{"BP": "x"},
 			},
 			Runtime: platform.RuntimeSpec{
 				Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30,
@@ -758,7 +758,7 @@ func TestExportIsDeterministicAndRoundTrips(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 		Source: platform.SourceBinding{
 			Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-			CredentialSecretName: "GIT_READ_TOKEN", Builder: platform.DefaultBuilder,
+			CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			BuildEnv: map[string]string{"BP_Z": "z", "BP_A": "a"},
 		},
 		Runtime: platform.RuntimeSpec{

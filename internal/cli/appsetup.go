@@ -133,7 +133,7 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	f.String("git-credential-name", "", "Vault secret name for the read token (default GIT_READ_TOKEN)")
 	f.Bool("github-auth", false, "Use the local authenticated gh token as the github.com read credential (opt-in; broader scopes may apply)")
 	f.String("image", "", "Existing OCI image reference; alternative to --git-url")
-	f.String("builder", platform.DefaultBuilder, "Buildpacks builder image for a git source")
+	f.String("builder", "", "Buildpacks builder image; empty uses the build node's platform default")
 	f.String("context-path", "", "Build context path inside the repository")
 	f.StringArray("build-env", nil, "Buildpacks environment KEY=VALUE (repeatable; update with '' clears all)")
 	addBuildpackFlags(cmd)
@@ -217,18 +217,17 @@ func flagChanged(cmd *cobra.Command, name string) bool {
 	return cmd != nil && cmd.Flags().Lookup(name) != nil && cmd.Flags().Changed(name)
 }
 
-var buildpackFlagNames = []string{"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend"}
+var buildpackFlagNames = []string{"buildpack", "frontend-directory", "frontend-script", "go-target", "go-version", "go-build-flags", "node-version"}
 
 func addBuildpackFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
-	f.String("frontend-directory", "", "Node frontend directory relative to the build context (default .)")
-	f.StringArray("frontend-script", nil, "Node package script to run in order (repeatable; default build)")
-	f.Bool("keep-node-runtime", false, "Keep Node in the runtime image; use =false to disable")
+	f.StringArray("buildpack", nil, "Ordered buildpack OCI reference or builder URN (repeatable; empty clears order)")
+	f.String("frontend-directory", "", "Node project directory relative to the build context; empty clears override")
+	f.StringArray("frontend-script", nil, "Node package script in order (repeatable; empty clears override)")
 	f.StringArray("go-target", nil, "Go target PROCESS=./PACKAGE (repeatable; empty clears targets)")
 	f.String("go-version", "", "Go buildpack version")
 	f.String("go-build-flags", "", "Go build flags")
 	f.String("node-version", "", "Node buildpack version")
-	f.Bool("no-frontend", false, "Remove the Node frontend settings")
 }
 
 func buildpackFlagsChanged(cmd *cobra.Command) bool {
@@ -261,10 +260,7 @@ func parseGoTargets(values []string) ([]buildpacks.GoTarget, error) {
 }
 
 func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) error {
-	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script") || flagChanged(cmd, "keep-node-runtime")
-	if boolFlag(cmd, "no-frontend") && frontend {
-		return contract.NewFault(contract.ValidationFailed, "frontend flags conflict", "Use --no-frontend without frontend configuration flags.")
-	}
+	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script")
 	if flagChanged(cmd, "go-target") {
 		targets, err := parseGoTargets(flagArray(cmd, "go-target"))
 		if err != nil {
@@ -273,16 +269,20 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 		source.GoTargets = targets
 	}
 	advanced := flagChanged(cmd, "go-version") || flagChanged(cmd, "go-build-flags") || flagChanged(cmd, "node-version")
-	if frontend || advanced || boolFlag(cmd, "no-frontend") {
+	if frontend || advanced || flagChanged(cmd, "buildpack") {
 		if source.Buildpacks == nil {
-			source.Buildpacks = &buildpacks.Settings{Runtime: "go"}
+			source.Buildpacks = &buildpacks.Settings{}
 		}
-		if boolFlag(cmd, "no-frontend") {
-			source.Buildpacks.Frontend = nil
+		if flagChanged(cmd, "buildpack") {
+			order := flagArray(cmd, "buildpack")
+			if len(order) == 1 && order[0] == "" {
+				order = []string{}
+			}
+			source.Buildpacks.Order = order
 		}
 		if frontend {
 			if source.Buildpacks.Frontend == nil {
-				source.Buildpacks.Frontend = &buildpacks.Frontend{Runtime: "node"}
+				source.Buildpacks.Frontend = &buildpacks.Frontend{}
 			}
 			f := source.Buildpacks.Frontend
 			if flagChanged(cmd, "frontend-directory") {
@@ -290,9 +290,6 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 			}
 			if flagChanged(cmd, "frontend-script") {
 				f.Scripts = flagArray(cmd, "frontend-script")
-			}
-			if flagChanged(cmd, "keep-node-runtime") {
-				f.KeepNodeRuntime = boolFlag(cmd, "keep-node-runtime")
 			}
 		}
 		if advanced {
@@ -334,32 +331,45 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 		return err
 	}
 	settings := source.Buildpacks
+	var order []string
+	if settings != nil {
+		order = settings.Order
+	}
+	text, err = ui.Input("Buildpack order", "Comma-separated fully qualified references; empty uses builder detection", strings.Join(order, ","))
+	if err != nil {
+		return err
+	}
+	if settings == nil && text != "" {
+		settings = &buildpacks.Settings{}
+	}
+	if settings != nil {
+		settings.Order = nil
+		if text != "" {
+			settings.Order = strings.Split(text, ",")
+		}
+	}
 	enabled := settings != nil && settings.Frontend != nil
-	enabled, err = ui.YesNoDefault("Build a Node frontend?", "Runs package scripts before building Go", enabled)
+	enabled, err = ui.YesNoDefault("Configure Node build inputs?", "Optional inputs for a selected Node buildpack", enabled)
 	if err != nil {
 		return err
 	}
 	if settings == nil && enabled {
-		settings = &buildpacks.Settings{Runtime: "go"}
+		settings = &buildpacks.Settings{}
 	}
 	if enabled {
 		if settings.Frontend == nil {
-			settings.Frontend = &buildpacks.Frontend{Runtime: "node", Directory: ".", Scripts: []string{"build"}}
+			settings.Frontend = &buildpacks.Frontend{}
 		}
 		f := settings.Frontend
-		f.Directory, err = ui.Input("Frontend directory", "Relative to the build context; empty uses .", f.Directory)
+		f.Directory, err = ui.Input("Frontend directory", "Relative to the build context; empty uses buildpack default", f.Directory)
 		if err != nil {
 			return err
 		}
-		text, err = ui.Input("Frontend scripts", "Comma-separated package script names; empty uses build", strings.Join(f.Scripts, ","))
+		text, err = ui.Input("Frontend scripts", "Comma-separated package script names; empty uses buildpack default", strings.Join(f.Scripts, ","))
 		if err != nil {
 			return err
 		}
 		f.Scripts = strings.Split(text, ",")
-		f.KeepNodeRuntime, err = ui.YesNoDefault("Keep Node runtime?", "Keep Node available in the application image", f.KeepNodeRuntime)
-		if err != nil {
-			return err
-		}
 	} else if settings != nil {
 		settings.Frontend = nil
 	}
@@ -381,7 +391,7 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 	}
 	if advanced != (buildpacks.Advanced{}) {
 		if settings == nil {
-			settings = &buildpacks.Settings{Runtime: "go"}
+			settings = &buildpacks.Settings{}
 		}
 		settings.Advanced = &advanced
 	} else if settings != nil {
@@ -474,7 +484,7 @@ func askIntRange(title, description, def string, min, max int) (int, error) {
 var definitionRevisionFlags = []string{
 	"node", "build-node", "git-url", "git-ref", "git-credential-file",
 	"git-credential-name", "image", "builder", "context-path", "build-env",
-	"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend",
+	"buildpack", "frontend-directory", "frontend-script", "go-target", "go-version", "go-build-flags", "node-version",
 	"container-port", "health-type", "health-path", "health-timeout",
 	"release-command", "process", "config", "secret", "domain", "domain-check-path",
 }
@@ -841,7 +851,7 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			return nil, err
 		}
 		if interactive && !flagChanged(cmd, "builder") {
-			value, err := askValidated("Buildpacks builder", "A pinned builder image on the node; empty uses the platform default", ans.Builder, func(value string) error {
+			value, err := askValidated("Buildpacks builder", "Empty uses the build node's platform default", ans.Builder, func(value string) error {
 				if value == "" {
 					return nil
 				}

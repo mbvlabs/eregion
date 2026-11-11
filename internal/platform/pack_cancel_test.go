@@ -126,7 +126,7 @@ func waitForFileContains(t *testing.T, path, want string) {
 func packStepForTest(t *testing.T, operationID contract.OperationID, stepID, source string) engine.Step {
 	t.Helper()
 	payload := PackPayload{
-		Step: stepID, Image: "eregion/api-production:abc", Builder: DefaultBuilder,
+		Step: stepID, Image: "eregion/api-production:abc", Builder: "paketobuildpacks/builder-jammy-base",
 		Path:        source,
 		Cache:       BuildpackCacheVolume("api", "production"),
 		LaunchCache: BuildpackLaunchCacheVolume("api", "production"),

@@ -212,12 +212,9 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
 		return release, errPlatformCancelled
 	}
-	buildInfo := platform.Build{Builder: platform.DefaultBuilder}
+	buildInfo := platform.Build{}
 	if release.Build != nil {
 		buildInfo = *release.Build
-	}
-	if buildInfo.Builder == "" {
-		buildInfo.Builder = platform.DefaultBuilder
 	}
 	gitRef := build.CommitSHA
 	if gitRef == "" {

@@ -418,7 +418,7 @@ func TestEnvUpdateFlagsMergeOverTheCurrentRevision(t *testing.T) {
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
 				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN", Builder: platform.DefaultBuilder,
+				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			Runtime: platform.RuntimeSpec{
 				Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30,
@@ -441,7 +441,7 @@ func TestEnvUpdateFlagsMergeOverTheCurrentRevision(t *testing.T) {
 	}
 	if patch.Source == nil || patch.Source.URL != "https://github.com/acme/api" ||
 		patch.Source.Ref != "release-2026-10" || patch.Source.CredentialSecretName != "GIT_READ_TOKEN" ||
-		patch.Source.Builder != platform.DefaultBuilder {
+		patch.Source.Builder != "paketobuildpacks/builder-jammy-base" {
 		t.Fatalf("source patch = %+v", patch.Source)
 	}
 	if patch.Runtime == nil || patch.Runtime.Node != "main2" || patch.Runtime.HealthPath != "/readyz" ||

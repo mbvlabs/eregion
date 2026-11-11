@@ -75,16 +75,14 @@ type Source struct {
 // The definition uses pointer-valued leaves so an environment override can
 // distinguish an omitted setting from an explicit empty value.
 type BuildpackSettings struct {
-	Runtime  *string            `toml:"runtime"`
+	Order    *[]string          `toml:"order"`
 	Frontend *BuildpackFrontend `toml:"frontend"`
 	Advanced *BuildpackAdvanced `toml:"advanced"`
 }
 
 type BuildpackFrontend struct {
-	Runtime         *string   `toml:"runtime"`
-	Directory       *string   `toml:"directory"`
-	Scripts         *[]string `toml:"scripts"`
-	KeepNodeRuntime *bool     `toml:"keep_node_runtime"`
+	Directory *string   `toml:"directory"`
+	Scripts   *[]string `toml:"scripts"`
 }
 
 type BuildpackAdvanced struct {
@@ -326,25 +324,19 @@ func markSourcePresence(source *Source, present map[string]any) {
 		}
 		table := tableValue(present, "buildpacks")
 		settings := source.Buildpacks
-		if hasKey(table, "runtime") && settings.Runtime == nil {
-			settings.Runtime = ptrValue("")
+		if hasKey(table, "order") && settings.Order == nil {
+			settings.Order = &[]string{}
 		}
 		if hasKey(table, "frontend") {
 			if settings.Frontend == nil {
 				settings.Frontend = &BuildpackFrontend{}
 			}
 			frontend, fields := settings.Frontend, tableValue(table, "frontend")
-			if hasKey(fields, "runtime") && frontend.Runtime == nil {
-				frontend.Runtime = ptrValue("")
-			}
 			if hasKey(fields, "directory") && frontend.Directory == nil {
 				frontend.Directory = ptrValue("")
 			}
 			if hasKey(fields, "scripts") && frontend.Scripts == nil {
 				frontend.Scripts = &[]string{}
-			}
-			if hasKey(fields, "keep_node_runtime") && frontend.KeepNodeRuntime == nil {
-				frontend.KeepNodeRuntime = ptrValue(false)
 			}
 		}
 		if hasKey(table, "advanced") {
@@ -576,7 +568,7 @@ func mergeSource(dst, src *Source) {
 
 func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
 	dst.buildpacksSpecified = true
-	if src.Runtime == nil && src.Frontend == nil && src.Advanced == nil {
+	if src.Order == nil && src.Frontend == nil && src.Advanced == nil {
 		dst.Buildpacks = nil
 		return
 	}
@@ -584,19 +576,17 @@ func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
 		dst.Buildpacks = &BuildpackSettings{}
 	}
 	out := dst.Buildpacks
-	if src.Runtime != nil {
-		out.Runtime = ptrValue(*src.Runtime)
+	if src.Order != nil {
+		values := append([]string{}, (*src.Order)...)
+		out.Order = &values
 	}
 	if src.Frontend != nil {
 		f := src.Frontend
-		if f.Runtime == nil && f.Directory == nil && f.Scripts == nil && f.KeepNodeRuntime == nil {
+		if f.Directory == nil && f.Scripts == nil {
 			out.Frontend = nil
 		} else {
 			if out.Frontend == nil {
 				out.Frontend = &BuildpackFrontend{}
-			}
-			if f.Runtime != nil {
-				out.Frontend.Runtime = ptrValue(*f.Runtime)
 			}
 			if f.Directory != nil {
 				out.Frontend.Directory = ptrValue(*f.Directory)
@@ -604,9 +594,6 @@ func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
 			if f.Scripts != nil {
 				values := append([]string{}, (*f.Scripts)...)
 				out.Frontend.Scripts = &values
-			}
-			if f.KeepNodeRuntime != nil {
-				out.Frontend.KeepNodeRuntime = ptrValue(*f.KeepNodeRuntime)
 			}
 		}
 	}
@@ -1071,23 +1058,17 @@ func sourceBinding(source *Source) platform.SourceBinding {
 	if source.Buildpacks != nil {
 		s := source.Buildpacks
 		settings := &buildpacks.Settings{}
-		if s.Runtime != nil {
-			settings.Runtime = *s.Runtime
+		if s.Order != nil {
+			settings.Order = append([]string{}, (*s.Order)...)
 		}
 		if s.Frontend != nil {
 			f := s.Frontend
 			settings.Frontend = &buildpacks.Frontend{}
-			if f.Runtime != nil {
-				settings.Frontend.Runtime = *f.Runtime
-			}
 			if f.Directory != nil {
 				settings.Frontend.Directory = *f.Directory
 			}
 			if f.Scripts != nil {
 				settings.Frontend.Scripts = append([]string{}, (*f.Scripts)...)
-			}
-			if f.KeepNodeRuntime != nil {
-				settings.Frontend.KeepNodeRuntime = *f.KeepNodeRuntime
 			}
 		}
 		if s.Advanced != nil {

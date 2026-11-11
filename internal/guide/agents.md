@@ -227,13 +227,16 @@ its identity.
 
 ### Deploy, rollback and promotion
 
-Git sources use Buildpacks; existing image sources bypass builds. Configure Go
-targets with `--go-target` and the optional Node frontend with
-`--frontend-directory`, `--frontend-script` and `--keep-node-runtime`;
-`--go-version`, `--go-build-flags` and `--node-version` set advanced values.
-Typed settings take precedence over corresponding raw build environment keys.
-`env update --build-env ''` clears that map; `--go-target ''` clears targets,
-and `--no-frontend` removes the frontend. Definitions use TOML via `--from`.
+Git sources use Buildpacks; existing image sources bypass builds. Repeat
+`--buildpack` in the desired order, or omit it for builder detection. An empty
+builder uses the build node's platform default; an explicit builder selects an
+image. Configure optional Go targets with `--go-target`, Node inputs with
+`--frontend-directory` and repeated `--frontend-script`, and advanced inputs
+with `--go-version`, `--go-build-flags` and `--node-version`. Supplied typed
+values override corresponding raw build environment keys; clearing one removes
+the override. `env update --build-env ''`, `--go-target ''`, and
+`--buildpack ''` clear their lists; `--builder ''` resets the builder. TOML
+definitions use `[source.buildpacks] order = [...]` via `--from`.
 Normal `app export` refuses unsupported state; `app export <app> <env> --inspect`
 provides non-secret metadata for inspection only and cannot be applied. It does
 not reconstruct provider ownership or DNS automation.

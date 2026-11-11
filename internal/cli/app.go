@@ -26,7 +26,7 @@ func (a *app) appSpecs() []spec {
 		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
-		"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend",
+		"buildpack", "frontend-directory", "frontend-script", "go-target", "go-version", "go-build-flags", "node-version",
 	}
 	create.Examples = []string{
 		"eregion app create",

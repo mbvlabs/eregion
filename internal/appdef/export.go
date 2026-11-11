@@ -165,13 +165,11 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 	}
 	if settings := state.Source.Buildpacks; settings != nil {
 		out.WriteString("\n[source.buildpacks]\n")
-		fmt.Fprintf(&out, "runtime = %s\n", quote(settings.Runtime))
+		fmt.Fprintf(&out, "order = %s\n", stringArray(settings.Order))
 		if frontend := settings.Frontend; frontend != nil {
 			out.WriteString("\n[source.buildpacks.frontend]\n")
-			fmt.Fprintf(&out, "runtime = %s\n", quote(frontend.Runtime))
 			fmt.Fprintf(&out, "directory = %s\n", quote(frontend.Directory))
 			fmt.Fprintf(&out, "scripts = %s\n", stringArray(frontend.Scripts))
-			fmt.Fprintf(&out, "keep_node_runtime = %t\n", frontend.KeepNodeRuntime)
 		}
 		if advanced := settings.Advanced; advanced != nil {
 			out.WriteString("\n[source.buildpacks.advanced]\n")

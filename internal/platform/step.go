@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/buildpacks"
-	"github.com/mbvlabs/eregion/internal/buildpacks/nodeassets"
 	"github.com/mbvlabs/eregion/internal/containerresolver"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -895,8 +894,10 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if err := ValidateImage(payload.Image); err != nil {
 		return nil, err
 	}
-	if err := ValidateImage(payload.Builder); err != nil {
-		return nil, err
+	if payload.Builder != "" {
+		if err := ValidateImage(payload.Builder); err != nil {
+			return nil, err
+		}
 	}
 	if (payload.Path == "") == (payload.GitURL == "") {
 		return nil, errors.New("pack source must have exactly one of path or git_url")
@@ -1097,26 +1098,15 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 			applyErr = fmt.Errorf("%w; cleaning the build network failed: %v", applyErr, cleanupErr)
 		}
 	}()
-	profile, err := buildpacks.ProfileForArchitecture(runtime.GOARCH)
-	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
-	}
-	if s.payload.Builder != "" && s.payload.Builder != DefaultBuilder && s.payload.Builder != profile.Builder {
-		return engine.ApplyResult{}, fmt.Errorf("%w: custom builder is not verified compatible with the pinned Go buildpack and run image", engine.ErrPermanent)
-	}
-	assets := ""
-	if s.payload.Buildpacks != nil && s.payload.Buildpacks.Frontend != nil {
-		assets, err = nodeassets.Materialize(filepath.Join(work, "buildpacks"))
+	builder, runImage := s.payload.Builder, ""
+	if builder == "" {
+		profile, err := buildpacks.ProfileForArchitecture(runtime.GOARCH)
 		if err != nil {
-			return engine.ApplyResult{}, err
+			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
 		}
+		builder, runImage = profile.Builder, profile.RunImage
 	}
-	args := packBuildArgs(s.payload, source, network)
-	args[6] = profile.Builder
-	if assets != "" {
-		args = append(args, "--buildpack", buildpacks.NodeEngineBuildpack, "--buildpack", assets)
-	}
-	args = append(args, "--buildpack", profile.Buildpack, "--trust-extra-buildpacks", "--run-image", profile.RunImage)
+	args := packBuildArgs(s.payload, source, network, builder, runImage)
 	buildRunCtx, cancel := context.WithTimeout(buildCtx, time.Duration(s.payload.TimeoutSeconds)*time.Second)
 	defer cancel()
 	_, stderr, err := runArgvCleanPack(buildRunCtx, args, isolation, rt, s.ID(), report)
@@ -1141,8 +1131,16 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 // creates a randomly keyed launch volume on every build. The dedicated network
 // makes every lifecycle container this build creates identifiable after a
 // cancellation.
-func packBuildArgs(payload PackPayload, source, network string) []string {
-	args := []string{"pack", "build", payload.Image, "--path", source, "--builder", payload.Builder}
+func packBuildArgs(payload PackPayload, source, network, builder, runImage string) []string {
+	args := []string{"pack", "build", payload.Image, "--path", source, "--builder", builder}
+	if runImage != "" {
+		args = append(args, "--run-image", runImage)
+	}
+	if payload.Buildpacks != nil {
+		for _, ref := range payload.Buildpacks.Order {
+			args = append(args, "--buildpack", ref)
+		}
+	}
 	if network != "" {
 		args = append(args, "--network", network)
 	}
@@ -1157,18 +1155,6 @@ func packBuildArgs(payload PackPayload, source, network string) []string {
 	env := make(map[string]string, len(payload.Env))
 	for key, value := range payload.Env {
 		env[key] = value
-	}
-	// Typed recipes own these controls, including their disabled states.
-	for _, key := range []string{"BP_DEPLOYCRATE_FRONTEND_SCRIPTS", "BP_DEPLOYCRATE_FRONTEND_DIRECTORY", "BP_DEPLOYCRATE_KEEP_NODE_RUNTIME"} {
-		delete(env, key)
-	}
-	if payload.Buildpacks != nil {
-		for _, key := range []string{"BP_GO_VERSION", "BP_GO_BUILD_FLAGS", "BP_NODE_VERSION"} {
-			delete(env, key)
-		}
-	}
-	if payload.GoTargets != nil {
-		delete(env, "BP_GO_TARGETS")
 	}
 	for key, value := range buildpacks.Environment(payload.Buildpacks, payload.GoTargets) {
 		env[key] = value

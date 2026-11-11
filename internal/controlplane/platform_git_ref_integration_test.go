@@ -28,7 +28,7 @@ func gitDeployFixture(t *testing.T) (*Service, *pgxpool.Pool) {
 		"name": "production", "node": "local",
 		"source": map[string]any{
 			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "main",
-			"builder": platform.DefaultBuilder,
+			"builder": "paketobuildpacks/builder-jammy-base",
 		},
 		"domain": "shop.example.com", "domain_addresses": []string{"203.0.113.10"},
 	})
@@ -79,7 +79,7 @@ func TestIntegrationDeployRefusesARevisionThatChangedAfterResolution(t *testing.
 		// Publish a new revision after the source was read for resolution but
 		// before the submission transaction reads it again.
 		moveEnvironmentSource(t, s, "move-ref", map[string]any{
-			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": platform.DefaultBuilder,
+			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
 		})
 		return submittedGitCommit, nil
 	}
@@ -125,7 +125,7 @@ func TestIntegrationDeployRefChangeWithOverrideDoesNotConflict(t *testing.T) {
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
 		resolvedRef = ref
 		moveEnvironmentSource(t, s, "move-ref", map[string]any{
-			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": platform.DefaultBuilder,
+			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
 		})
 		return submittedGitCommit, nil
 	}
