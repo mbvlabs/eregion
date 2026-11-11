@@ -12,6 +12,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/mbvlabs/eregion/internal/buildpacks"
 	"github.com/mbvlabs/eregion/internal/retention"
 )
 
@@ -963,7 +964,7 @@ func normalizeSourceBinding(source *SourceBinding, enforceGitHosts bool) error {
 	switch source.Kind {
 	case "":
 		if source.URL != "" || source.Ref != "" || source.CredentialSecretName != "" ||
-			source.ContextPath != "" || source.Builder != "" || source.Image != "" || len(source.BuildEnv) > 0 {
+			source.ContextPath != "" || source.Builder != "" || source.Image != "" || len(source.BuildEnv) > 0 || source.GoTargets != nil || source.Buildpacks != nil {
 			return invalid("source kind", "Use git or image, or omit the source to leave a deployability gap.")
 		}
 		return nil
@@ -972,7 +973,7 @@ func normalizeSourceBinding(source *SourceBinding, enforceGitHosts bool) error {
 			return err
 		}
 		if source.URL != "" || source.Ref != "" || source.CredentialSecretName != "" ||
-			source.ContextPath != "" || source.Builder != "" || len(source.BuildEnv) > 0 {
+			source.ContextPath != "" || source.Builder != "" || len(source.BuildEnv) > 0 || source.GoTargets != nil || source.Buildpacks != nil {
 			return invalid("source", "An image source uses only source.image.")
 		}
 		return nil
@@ -1009,6 +1010,15 @@ func normalizeSourceBinding(source *SourceBinding, enforceGitHosts bool) error {
 		if err := validateEnv(source.BuildEnv, "build environment"); err != nil {
 			return err
 		}
+		targets, err := buildpacks.NormalizeTargets(source.GoTargets)
+		if err != nil {
+			return invalid("source go targets", err.Error())
+		}
+		settings, err := buildpacks.NormalizeSettings(source.Buildpacks)
+		if err != nil {
+			return invalid("source buildpacks", err.Error())
+		}
+		source.GoTargets, source.Buildpacks = targets, settings
 		return nil
 	default:
 		return invalid("source kind", "Use git or image.")
@@ -1248,6 +1258,24 @@ func containsString(values []string, want string) bool {
 func CloneRevisionState(state RevisionState) RevisionState {
 	out := state
 	out.Source.BuildEnv = cloneStringMap(state.Source.BuildEnv)
+	if state.Source.GoTargets != nil {
+		out.Source.GoTargets = append([]buildpacks.GoTarget{}, state.Source.GoTargets...)
+	}
+	if state.Source.Buildpacks != nil {
+		settings := *state.Source.Buildpacks
+		if settings.Frontend != nil {
+			frontend := *settings.Frontend
+			if frontend.Scripts != nil {
+				frontend.Scripts = append([]string{}, frontend.Scripts...)
+			}
+			settings.Frontend = &frontend
+		}
+		if settings.Advanced != nil {
+			advanced := *settings.Advanced
+			settings.Advanced = &advanced
+		}
+		out.Source.Buildpacks = &settings
+	}
 	out.Config = cloneStringMap(state.Config)
 	out.SecretNames = append([]string(nil), state.SecretNames...)
 	out.Resources = append([]string(nil), state.Resources...)
@@ -1551,6 +1579,15 @@ func normalizeBuild(input *ReleaseCreateInput) error {
 	}
 	if input.Build.Env == nil {
 		input.Build.Env = map[string]string{}
+	}
+	var err error
+	input.Build.GoTargets, err = buildpacks.NormalizeTargets(input.Build.GoTargets)
+	if err != nil {
+		return invalid("Go targets", err.Error())
+	}
+	input.Build.Buildpacks, err = buildpacks.NormalizeSettings(input.Build.Buildpacks)
+	if err != nil {
+		return invalid("Buildpacks settings", err.Error())
 	}
 	return validateEnv(input.Build.Env, "build environment")
 }

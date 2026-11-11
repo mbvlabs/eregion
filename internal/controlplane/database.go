@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
@@ -112,6 +114,9 @@ var migration027 string
 //go:embed migrations/028_workspace_identity.sql
 var migration028 string
 
+//go:embed migrations/029_webhook_environment_identity.sql
+var migration029 string
+
 type migration struct {
 	version int
 	name    string
@@ -150,6 +155,7 @@ var migrations = []migration{
 	{version: 26, name: "026_deployment_lifecycle_owner.sql", sql: migration026},
 	{version: 27, name: "027_provider_credentials.sql", sql: migration027},
 	{version: 28, name: "028_workspace_identity.sql", sql: migration028},
+	{version: 29, name: "029_webhook_environment_identity.sql", sql: migration029},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.
@@ -371,6 +377,10 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
 		}
 		if _, err := tx.Exec(ctx, m.sql); err != nil {
 			rollback(tx)
+			var pgErr *pgconn.PgError
+			if m.version == 29 && errors.As(err, &pgErr) && pgErr.Code == "ER029" {
+				return plan, contract.NewFault(contract.PreconditionFailed, pgErr.Message, "Pause webhook admission and drain or resolve the affected work on an explicitly authorized target, then retry migration.")
+			}
 			return plan, unavailable(err)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO eregion_schema_migrations(version,checksum) VALUES ($1,$2)`, m.version, migrationHash(m)); err != nil {

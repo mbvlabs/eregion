@@ -494,8 +494,8 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		}
 		return inserted.Job.ID, nil
 	}
-	service.enqueueWebhook = func(ctx context.Context, tx pgx.Tx, deliveryIDHash string) (int64, error) {
-		inserted, err := client.InsertTx(ctx, tx, webhookArgs{DeliveryIDHash: deliveryIDHash}, &river.InsertOpts{Queue: webhookQueue, MaxAttempts: platformMaxAttempts})
+	service.enqueueWebhook = func(ctx context.Context, tx pgx.Tx, environmentID, deliveryIDHash string) (int64, error) {
+		inserted, err := client.InsertTx(ctx, tx, webhookArgs{EnvironmentID: environmentID, DeliveryIDHash: deliveryIDHash}, &river.InsertOpts{Queue: webhookQueue, MaxAttempts: platformMaxAttempts})
 		if err != nil {
 			return 0, err
 		}

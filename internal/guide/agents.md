@@ -227,6 +227,33 @@ its identity.
 
 ### Deploy, rollback and promotion
 
+Git sources use Buildpacks; existing image sources bypass builds. Configure Go
+targets with `--go-target` and the optional Node frontend with
+`--frontend-directory`, `--frontend-script` and `--keep-node-runtime`;
+`--go-version`, `--go-build-flags` and `--node-version` set advanced values.
+Typed settings take precedence over corresponding raw build environment keys.
+`env update --build-env ''` clears that map; `--go-target ''` clears targets,
+and `--no-frontend` removes the frontend. Definitions use TOML via `--from`.
+Normal `app export` refuses unsupported state; `app export <app> <env> --inspect`
+provides non-secret metadata for inspection only and cannot be applied. It does
+not reconstruct provider ownership or DNS automation.
+
+Processes are `web` (domains), `worker` (no port), or `service` (private
+port). Web and service processes answer on their process-name DNS alias and
+declared container port on the environment network. Current deployment health
+gates probe web replicas only and require a healthy web upstream; service and
+worker health is not independently gated. The release command is separate and
+runs once per release, not once per deployment or as a fourth process kind.
+Use bare executable names such as `ssr`, `migrate` and `queue` when installed
+on the effective launch-time PATH; explicit paths are used as given. A
+commandless plain or CNB image uses its native default. Process and release
+command text accepts quoted argv and backslash escapes, not expansion, globs,
+substitution or implicit shell operators; `/bin/sh -c` is explicit if needed.
+
+For supported submitting commands, terminal plain output follows by default;
+JSON and piped plain output return acceptance only. Explicit NDJSON follows
+unless detached. In every mode acceptance is not completion.
+
 `eregion deploy <app> <env>` builds the current source or deploys an existing
 release from the same environment; `rollback` restores an earlier release with
 its recorded revision and secret snapshot. Both are durable operations: follow

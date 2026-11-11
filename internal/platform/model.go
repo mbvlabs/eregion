@@ -3,6 +3,7 @@ package platform
 import (
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/buildpacks"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/retention"
 )
@@ -80,14 +81,16 @@ type HealthConfig struct {
 // A git binding is an HTTPS repository with an optional read-credential secret
 // NAME; the value lives in the vault and is never part of the revision.
 type SourceBinding struct {
-	Kind                 string            `json:"kind"`
-	URL                  string            `json:"url,omitempty"`
-	Ref                  string            `json:"ref,omitempty"`
-	CredentialSecretName string            `json:"credential_secret_name,omitempty"`
-	ContextPath          string            `json:"context_path,omitempty"`
-	Builder              string            `json:"builder,omitempty"`
-	BuildEnv             map[string]string `json:"build_env,omitempty"`
-	Image                string            `json:"image,omitempty"`
+	Kind                 string                `json:"kind"`
+	URL                  string                `json:"url,omitempty"`
+	Ref                  string                `json:"ref,omitempty"`
+	CredentialSecretName string                `json:"credential_secret_name,omitempty"`
+	ContextPath          string                `json:"context_path,omitempty"`
+	Builder              string                `json:"builder,omitempty"`
+	BuildEnv             map[string]string     `json:"build_env,omitempty"`
+	GoTargets            []buildpacks.GoTarget `json:"go_targets,omitempty"`
+	Buildpacks           *buildpacks.Settings  `json:"buildpacks,omitempty"`
+	Image                string                `json:"image,omitempty"`
 }
 
 // RuntimeSpec is the environment runtime declaration. Node is mirrored on the
@@ -317,9 +320,11 @@ type Source struct {
 type Build struct {
 	// Image is the optional output image reference. When empty the control
 	// plane derives one from the app, environment, and operation.
-	Image   string            `json:"image,omitempty"`
-	Builder string            `json:"builder,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
+	Image      string                `json:"image,omitempty"`
+	Builder    string                `json:"builder,omitempty"`
+	Env        map[string]string     `json:"env,omitempty"`
+	GoTargets  []buildpacks.GoTarget `json:"go_targets,omitempty"`
+	Buildpacks *buildpacks.Settings  `json:"buildpacks,omitempty"`
 }
 
 // CommandSpec is an optional one-off release command run in the release image
@@ -463,6 +468,7 @@ type InventoryQuery struct {
 	Node        string
 	State       string
 	Build       string
+	Deployment  string
 	Limit       int
 }
 

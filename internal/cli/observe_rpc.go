@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
@@ -32,13 +33,14 @@ type rpcWorkloadParams struct {
 }
 
 type rpcLogParams struct {
-	App          string `json:"app"`
-	Environment  string `json:"environment"`
-	DeploymentID string `json:"deployment_id,omitempty"`
-	Process      string `json:"process,omitempty"`
-	Follow       bool   `json:"follow,omitempty"`
-	Since        string `json:"since,omitempty"`
-	Tail         int    `json:"tail,omitempty"`
+	App                string   `json:"app"`
+	Environment        string   `json:"environment"`
+	DeploymentID       string   `json:"deployment_id,omitempty"`
+	Process            string   `json:"process,omitempty"`
+	Follow             bool     `json:"follow,omitempty"`
+	Since              string   `json:"since,omitempty"`
+	Tail               int      `json:"tail,omitempty"`
+	ExpectedContainers []string `json:"expected_containers,omitempty"`
 }
 
 type rpcOperationsListParams struct {
@@ -67,6 +69,7 @@ func (n *nodeClient) Logs(ctx context.Context, query platform.LogQuery, onLine f
 	params := rpcLogParams{
 		App: query.App, Environment: query.Environment, DeploymentID: string(query.DeploymentID),
 		Process: query.Process, Follow: query.Follow, Since: query.Since.String(), Tail: query.Tail,
+		ExpectedContainers: query.ExpectedContainers,
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -199,6 +202,21 @@ func streamNodeLogs(ctx context.Context, params rpcLogParams, out io.Writer, reg
 		containers = append(containers, container)
 	}
 	result := platform.LogResult{Follow: params.Follow}
+	if params.DeploymentID != "" && len(containers) == 0 {
+		result.Unavailable = true
+	}
+	if len(params.ExpectedContainers) > 0 {
+		found := make(map[string]bool, len(containers))
+		for _, container := range containers {
+			found[container.Name] = true
+		}
+		for _, name := range params.ExpectedContainers {
+			if !found[name] {
+				result.Unavailable = true
+				break
+			}
+		}
+	}
 	if len(containers) > 64 {
 		containers = containers[:64]
 		result.Truncated = true
@@ -209,7 +227,7 @@ func streamNodeLogs(ctx context.Context, params rpcLogParams, out io.Writer, reg
 			if err != nil {
 				return result, err
 			}
-			for _, message := range splitLogLines(raw) {
+			for _, message := range splitLogLines([]byte(registry.Redact(string(raw)))) {
 				if len(result.Lines) >= 10000 {
 					result.Truncated = true
 					break
@@ -246,13 +264,18 @@ func splitLogLines(raw []byte) []string {
 }
 
 func containerLogLine(container platform.ContainerObservation, registry *secrets.Registry, message string) platform.LogLine {
+	message = registry.Redact(message)
 	if len(message) > 32*1024 {
-		message = message[:32*1024] + "…"
+		end := 32*1024 - len("…")
+		for end > 0 && !utf8.RuneStart(message[end]) {
+			end--
+		}
+		message = message[:end] + "…"
 	}
 	return platform.LogLine{
 		App: container.App, Environment: container.Environment,
 		Process: container.Process, Replica: container.Replica,
-		Container: container.Name, Stream: "combined", Message: registry.Redact(message),
+		Container: container.Name, Stream: "combined", Message: message,
 	}
 }
 

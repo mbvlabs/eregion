@@ -164,6 +164,21 @@ does not need to remain online after setup. Local hook administration, the
 stored clone credential and the webhook signing secret remain separate roles;
 rotating one does not automatically rotate the others.
 
+Source builds use the pinned architecture-specific Noble Go profile. An enabled
+Node frontend runs the embedded assets buildpack before Go and requires exactly
+one supported package lockfile. Typed Buildpacks settings override corresponding
+raw build environment keys; frontend controls cannot be enabled through raw
+environment variables. Only the pinned profile builder is verified compatible;
+other custom builders are refused. Image sources bypass this build path.
+
+`app export --inspect` emits a deterministic non-applicable TOML snapshot with
+non-secret metadata already present in inventory, including unsupported
+auto-deploy, retention, protection, release timeout and managed DNS metadata.
+Strict definition parsing refuses the inspection marker before any node call.
+It does not query providers or claim DNS automation can round-trip; normal export
+retains its existing refusals. Process and release command input parses quoted
+argv without shell expansion; guided editing preserves argument boundaries.
+
 Cloudflare setup needs the **zone ID**, not the account ID: select the DNS zone
 in Cloudflare and use its zone identity with the matching zone name. A rejected
 read validation activates no credential and is not repaired by repeated apply.
@@ -226,7 +241,7 @@ bin/eregion help app create --json
 | `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secret export` carries the code in the same node request that returns the value (`vault.export`); there is no separate pre-check request to skip. `secrets export` rebuilds the server-init handoff (including the vault keyring and the local telemetry credential when present) and honours `--secrets-out`; a missing telemetry credential is reported as a warning, never invented. |
 | `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
-| `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. No telemetry service is needed. Ctrl-C detaches. `--json` without `--follow` returns one envelope; NDJSON requires `--output ndjson`, and `--json --follow` is a usage error that names that fix. |
+| `logs <app> <environment> [--process NAME] [--follow] [--since] [--tail]` | Reads the serving deployment's Docker containers through node RPC; lines are prefixed with process/replica. `--deployment ID` selects that environment's available live containers and reports missing ones. `--operation ID` reads only retained candidate diagnostics from that environment's deployment operation, including after cleanup; it cannot follow, but `operations follow ID --output ndjson` follows operation events. Before terminal cleanup, a best-effort capture verifies candidate labels and planned names and uses the pinned secret revisions for redaction. History records unavailable or truncated capture explicitly; it is bounded and is not a retained log service. No telemetry service is needed. Ctrl-C detaches. `--json` without `--follow` returns one envelope; NDJSON requires `--output ndjson`, and `--json --follow` is a usage error that names that fix. |
 | `metrics show` | Read-only node RPC (`metrics.show`) executed on the node: two bounded reads of the loopback node_exporter with a one-second gap, then one current snapshot. Returns node/exporter identity, fetched and observed timestamps, freshness and explicit issues; CPU utilization is computed from a checked counter delta (nil and an issue after a reset or missing counter), and memory, real filesystems, load and uptime are parsed from the needed metric families. There is no eregion-run telemetry server, Prometheus/Loki deployment, external backend, global PromQL, metric store or history. Plain and JSON are the same snapshot; JSON/no-TTY never prompts. It needs no control database and no credential because the exporter is loopback-only. |
 | `metrics endpoint` | Read-only node RPC (`metrics.endpoint`): configuration state, public hostname, desired `https://<hostname>/metrics/node` and `/metrics/targets.json` URLs, the loopback gateway address, basic-auth username, whether the gateway Caddyfile is configured, and whether this machine holds a local credential. A missing hostname is explicitly unconfigured with no listener or WireGuard fallback. It never prints a password or hash and is independent of PostgreSQL. |
 | `metrics config` | Generates Prometheus and Grafana Alloy scrape configs that follow the endpoint's HTTP service discovery and use basic auth. Ordinary output (including JSON) always uses a password placeholder. `--format prometheus|alloy|targets --out FILE` writes one new owner-only file with the real credential when one is held locally; the file is never echoed. Targets output carries no secret and is also valid `file_sd`. |
@@ -591,7 +606,7 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 028
+## Database: embedded schema 029
 
 Authority: `internal/controlplane/database.go` and
 `internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
@@ -627,6 +642,7 @@ node protocol version and database migration version are independent.
 | `026_deployment_lifecycle_owner.sql` | One durable deployment lifecycle owner per environment. Stores owner operation/deployment/attempt, phase, exclusive route target, frozen restore release/deployment and timestamps. Route writers read this row exclusively. The cutover is fail closed with no legacy backfill: it refuses while a deploy/rollback/restart/promote operation is queued, running or cancelling, or while any deployment row is pending/running. Finish or cancel old work before upgrading; a safe upgrade creates the empty owner table. |
 | `027_provider_credentials.sql` | Installation-wide provider/zone metadata and immutable encrypted credential revisions in the existing vault. Separate from app/environment secret namespaces; uses the existing keyring with provider-bound AAD and revision hashes. Credential activation uses a revision CAS and commits its sanitized audit entry atomically. No token-file import/backfill is performed. |
 | `028_workspace_identity.sql` | Empty singleton installation identity table, generated immutable workspace ID/name and creation time, with update/delete refusal. Migration does not infer or seed identity; setup or explicit `apply --assign-workspace NAME` performs assignment under an advisory transaction lock and insert CAS. |
+| `029_webhook_environment_identity.sql` | Scopes webhook receipt uniqueness to immutable environment ID plus delivery hash and backfills the recorded River jobs with that environment ID. Refuses running webhook jobs, unresolved receipts without an environment ID, or queued jobs without a matching scoped receipt. Pause admission and drain or resolve affected work on a separately authorized target before retrying a refused cutover. Submitted receipt and operation links remain intact. |
 
 Tables below have the literal `eregion_` prefix:
 
@@ -654,9 +670,15 @@ Tables below have the literal `eregion_` prefix:
 | `retention_runs` | `rtr_…` ID, optional owning operation, pending/running/succeeded/failed/cancelled status, planned/removed item arrays, planned/reclaimed bytes, per-item errors JSON, start/finish timestamps, the latest Buildpacks cache measurement (`cache_bytes` NULL means unknown, measured-at, error), and the per-run registry GC generation. |
 | `secrets`, `secret_revisions` | Namespace `(app, environment, name)` and revision; state/CAS, key ID, ciphertext and hashes. Not FKs to platform app/env rows. |
 | `access_grants`, `integration_audit` | Grant JSON and durable authorization/provider audit JSON. |
-| `webhook_deliveries` | Hashed delivery ID and exact-body hash, actor/kind/target, sanitized repository/branch/commit, non-secret environment/revision/secret-revision identities, admitted/submitted/failed state, River job ID, operation ID and terminal sanitized error code. Legacy pending/submitted rows remain valid; pending legacy rows are reconciled only on authenticated redelivery. |
+| `webhook_deliveries` | Composite identity `(environment_id, delivery_id_hash)`, exact-body hash, actor/kind/target, sanitized repository/branch/commit, non-secret revision/secret-revision identities, admitted/submitted/failed state, River job ID, operation ID and terminal sanitized error code. Jobs, receipt lookups and downstream deploy idempotency use the same scoped identity. Historical submitted links remain; unresolved unscoped receipts block migration rather than being guessed or globally replayed. |
 
 Application-model execution boundaries (MASTER sections 4 and 6):
+
+- Revision mutations lock the narrow environment row first, then load the current
+  environment and exact referenced immutable revision in a fresh SQL statement.
+  Missing or mismatched revision identity fails closed; it cannot publish default
+  desired state from an inconsistent locking join. This repairs the read mechanism
+  without establishing the cause of the historical PR state loss.
 
 - The environment revision and the deployment's recorded process instances are
   the deploy worker's source of truth. The legacy stable/candidate columns are

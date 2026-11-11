@@ -516,6 +516,9 @@ func (s *Service) cleanupInstancesForDeployment(ctx context.Context, env platfor
 }
 
 func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env platform.Environment, dep platform.Deployment, instances []platform.DeploymentInstance, reason string) error {
+	if reason == "candidate" {
+		s.captureCandidateDiagnostics(ctx, env, dep)
+	}
 	if len(instances) == 0 {
 		var err error
 		instances, err = s.cleanupInstancesForDeployment(ctx, env, dep)

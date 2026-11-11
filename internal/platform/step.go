@@ -16,12 +16,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/buildpacks"
+	"github.com/mbvlabs/eregion/internal/buildpacks/nodeassets"
 	"github.com/mbvlabs/eregion/internal/containerresolver"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -63,6 +66,7 @@ func StepFamilies() []Family {
 		{Match: retentionGCStepPattern.MatchString, Build: buildRetentionGCStep},
 		{Match: resourceStepPattern.MatchString, Build: buildResourceStep},
 		{Match: resourceVolumeRemoveStepPattern.MatchString, Build: buildResourceVolumeRemoveStep},
+		{Match: candidateDiagnosticStepPattern.MatchString, Build: buildCandidateDiagnosticStep},
 	}
 }
 
@@ -859,8 +863,10 @@ type PackPayload struct {
 	Builder string `json:"builder"`
 	// GitContextPath is the Buildpacks context inside the git checkout. It is
 	// meaningless for a directory source and therefore valid only with GitURL.
-	GitContextPath string            `json:"git_context_path,omitempty"`
-	Env            map[string]string `json:"env,omitempty"`
+	GitContextPath string                `json:"git_context_path,omitempty"`
+	Env            map[string]string     `json:"env,omitempty"`
+	GoTargets      []buildpacks.GoTarget `json:"go_targets,omitempty"`
+	Buildpacks     *buildpacks.Settings  `json:"buildpacks,omitempty"`
 	// GitCredentialSecretKey names the transient secret value used by the
 	// embedded askpass helper. The value never enters the payload.
 	GitCredentialSecretKey string `json:"git_credential_secret_key,omitempty"`
@@ -921,6 +927,15 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if err := validateEnv(payload.Env, "build environment"); err != nil {
 		return nil, err
 	}
+	var err error
+	payload.GoTargets, err = buildpacks.NormalizeTargets(payload.GoTargets)
+	if err != nil {
+		return nil, err
+	}
+	payload.Buildpacks, err = buildpacks.NormalizeSettings(payload.Buildpacks)
+	if err != nil {
+		return nil, err
+	}
 	if payload.GitCredentialSecretKey != "" {
 		if payload.GitURL == "" {
 			return nil, errors.New("a git credential requires a git source")
@@ -972,6 +987,7 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	if err := os.MkdirAll(work, 0o700); err != nil {
 		return engine.ApplyResult{}, err
 	}
+	defer os.RemoveAll(work)
 	isolation, err := buildIsolation(work)
 	if err != nil {
 		return engine.ApplyResult{}, err
@@ -1081,7 +1097,26 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 			applyErr = fmt.Errorf("%w; cleaning the build network failed: %v", applyErr, cleanupErr)
 		}
 	}()
+	profile, err := buildpacks.ProfileForArchitecture(runtime.GOARCH)
+	if err != nil {
+		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	}
+	if s.payload.Builder != "" && s.payload.Builder != DefaultBuilder && s.payload.Builder != profile.Builder {
+		return engine.ApplyResult{}, fmt.Errorf("%w: custom builder is not verified compatible with the pinned Go buildpack and run image", engine.ErrPermanent)
+	}
+	assets := ""
+	if s.payload.Buildpacks != nil && s.payload.Buildpacks.Frontend != nil {
+		assets, err = nodeassets.Materialize(filepath.Join(work, "buildpacks"))
+		if err != nil {
+			return engine.ApplyResult{}, err
+		}
+	}
 	args := packBuildArgs(s.payload, source, network)
+	args[6] = profile.Builder
+	if assets != "" {
+		args = append(args, "--buildpack", buildpacks.NodeEngineBuildpack, "--buildpack", assets)
+	}
+	args = append(args, "--buildpack", profile.Buildpack, "--trust-extra-buildpacks", "--run-image", profile.RunImage)
 	buildRunCtx, cancel := context.WithTimeout(buildCtx, time.Duration(s.payload.TimeoutSeconds)*time.Second)
 	defer cancel()
 	_, stderr, err := runArgvCleanPack(buildRunCtx, args, isolation, rt, s.ID(), report)
@@ -1119,8 +1154,27 @@ func packBuildArgs(payload PackPayload, source, network string) []string {
 		// both the build and launch caches reliably.
 		args = append(args, "--cache", "type=launch;format=volume;name="+payload.LaunchCache)
 	}
-	for _, key := range sortedEnvKeys(payload.Env) {
-		args = append(args, "--env", key+"="+payload.Env[key])
+	env := make(map[string]string, len(payload.Env))
+	for key, value := range payload.Env {
+		env[key] = value
+	}
+	// Typed recipes own these controls, including their disabled states.
+	for _, key := range []string{"BP_DEPLOYCRATE_FRONTEND_SCRIPTS", "BP_DEPLOYCRATE_FRONTEND_DIRECTORY", "BP_DEPLOYCRATE_KEEP_NODE_RUNTIME"} {
+		delete(env, key)
+	}
+	if payload.Buildpacks != nil {
+		for _, key := range []string{"BP_GO_VERSION", "BP_GO_BUILD_FLAGS", "BP_NODE_VERSION"} {
+			delete(env, key)
+		}
+	}
+	if payload.GoTargets != nil {
+		delete(env, "BP_GO_TARGETS")
+	}
+	for key, value := range buildpacks.Environment(payload.Buildpacks, payload.GoTargets) {
+		env[key] = value
+	}
+	for _, key := range sortedEnvKeys(env) {
+		args = append(args, "--env", key+"="+env[key])
 	}
 	return args
 }

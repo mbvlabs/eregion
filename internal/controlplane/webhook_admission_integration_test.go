@@ -198,18 +198,18 @@ func TestIntegrationWebhookAdmissionQueuesAtomically(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT job_id FROM eregion_webhook_deliveries WHERE delivery_id_hash=$1`, record.DeliveryIDHash).Scan(&storedJobID); err != nil || storedJobID != admitted.JobID {
 		t.Fatalf("receipt job_id=%d admitted=%d err=%v", storedJobID, admitted.JobID, err)
 	}
-	var queue, state, argHash string
+	var queue, state, argHash, argEnvironmentID string
 	var argKeys int64
-	if err := pool.QueryRow(ctx, `SELECT queue,state,args->>'delivery_id_hash',
+	if err := pool.QueryRow(ctx, `SELECT queue,state,args->>'delivery_id_hash',args->>'environment_id',
         (SELECT count(*) FROM jsonb_object_keys(args)) FROM river_job WHERE id=$1`, admitted.JobID).
-		Scan(&queue, &state, &argHash, &argKeys); err != nil {
+		Scan(&queue, &state, &argHash, &argEnvironmentID, &argKeys); err != nil {
 		t.Fatal(err)
 	}
 	if queue != webhookQueue || state != "available" {
 		t.Fatalf("job queue=%q state=%q", queue, state)
 	}
-	if argHash != record.DeliveryIDHash || argKeys != 1 {
-		t.Fatalf("job args hash=%q keys=%d", argHash, argKeys)
+	if argHash != record.DeliveryIDHash || argEnvironmentID != record.EnvironmentID || argKeys != 2 {
+		t.Fatalf("job args environment=%q hash=%q keys=%d", argEnvironmentID, argHash, argKeys)
 	}
 	var operations int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations`).Scan(&operations); err != nil || operations != 0 {
@@ -263,7 +263,7 @@ func TestIntegrationWebhookAdmissionRollsBackWhenQueueFails(t *testing.T) {
 	record, _ := webhookIntegrationFixture(t, pool, run)
 	record.DeliveryIDHash = api.WebhookDeliveryHash("rollback-" + record.EnvironmentID)
 	store := NewWebhookDeliveryStore(pool)
-	store.enqueue = func(context.Context, pgx.Tx, string) (int64, error) {
+	store.enqueue = func(context.Context, pgx.Tx, string, string) (int64, error) {
 		return 0, errors.New("injected queue failure")
 	}
 	if _, _, err := store.Admit(ctx, record); err == nil {
@@ -407,10 +407,10 @@ func TestIntegrationWebhookWorkerSubmitsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := run.Service.submitWebhookAdmission(ctx, admitted.DeliveryIDHash); err != nil {
+	if err := run.Service.submitWebhookAdmission(ctx, admitted.EnvironmentID, admitted.DeliveryIDHash); err != nil {
 		t.Fatalf("first submit: %v", err)
 	}
-	if err := run.Service.submitWebhookAdmission(ctx, admitted.DeliveryIDHash); err != nil {
+	if err := run.Service.submitWebhookAdmission(ctx, admitted.EnvironmentID, admitted.DeliveryIDHash); err != nil {
 		t.Fatalf("second submit: %v", err)
 	}
 	var state, operationID string
@@ -424,7 +424,7 @@ func TestIntegrationWebhookWorkerSubmitsOnce(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT kind,target,idempotency_key FROM eregion_operations WHERE id=$1`, operationID).Scan(&kind, &target, &key); err != nil {
 		t.Fatal(err)
 	}
-	if kind != platform.KindDeploy || target != record.Target || key != "ghdelivery-"+record.DeliveryIDHash {
+	if kind != platform.KindDeploy || target != record.Target || key != "ghdelivery-"+record.EnvironmentID+"-"+record.DeliveryIDHash {
 		t.Fatalf("operation kind=%q target=%q key=%q", kind, target, key)
 	}
 	var operations, platformJobs int
@@ -445,9 +445,9 @@ func TestIntegrationWebhookLegacyReconcileNeverResubmits(t *testing.T) {
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash([]byte("legacy body"))
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state)
-        VALUES($1,$2,$3,$4,$5,$6,'pending')`,
-		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target); err != nil {
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
 	appName, envName := webhookRecordApp(t, record)
@@ -482,9 +482,9 @@ func TestIntegrationWebhookLegacyMissingOperationIsAmbiguous(t *testing.T) {
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash([]byte("legacy missing body"))
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state)
-        VALUES($1,$2,$3,$4,$5,$6,'pending')`,
-		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target); err != nil {
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
 	appName, envName := webhookRecordApp(t, record)
@@ -510,9 +510,9 @@ func TestIntegrationWebhookHTTPLegacyPendingRetainsOperation(t *testing.T) {
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash(body)
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state)
-        VALUES($1,$2,$3,$4,$5,$6,'pending')`,
-		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target); err != nil {
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
 	canonical, _ := json.Marshal(platform.DeployInput{App: appName, Environment: envName, Ref: record.Commit})
@@ -561,9 +561,9 @@ func TestIntegrationWebhookHTTPLegacyPendingMissingReportsAmbiguous(t *testing.T
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash(body)
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state)
-        VALUES($1,$2,$3,$4,$5,$6,'pending')`,
-		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target); err != nil {
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
 	handler := newWebhookIntegrationHandler(t, pool, run, secrets)
@@ -683,7 +683,7 @@ func TestIntegrationWebhookMaintenanceRechecksCurrentJobUnderLock(t *testing.T) 
 	failures := make(chan error, 2)
 	for range 2 {
 		wait.Go(func() {
-			failures <- run.Service.reconcileWebhookAdmission(ctx, admitted.DeliveryIDHash)
+			failures <- run.Service.reconcileWebhookAdmission(ctx, admitted.EnvironmentID, admitted.DeliveryIDHash)
 		})
 	}
 	wait.Wait()
@@ -705,7 +705,7 @@ func TestIntegrationWebhookMaintenanceRechecksCurrentJobUnderLock(t *testing.T) 
 	if jobs != 2 || attempts != 2 {
 		t.Fatalf("concurrent reconciliation jobs=%d attempts=%d, want 2/2", jobs, attempts)
 	}
-	if err := run.Service.reconcileWebhookAdmission(ctx, admitted.DeliveryIDHash); err != nil {
+	if err := run.Service.reconcileWebhookAdmission(ctx, admitted.EnvironmentID, admitted.DeliveryIDHash); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE args->>'delivery_id_hash'=$1`, admitted.DeliveryIDHash).Scan(&jobs); err != nil {
@@ -740,7 +740,7 @@ func TestIntegrationWebhookWorkerRejectsRebindAndDeletedEnvironment(t *testing.T
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2 WHERE id=$1`, record.EnvironmentID, newRevisionID); err != nil {
 		t.Fatal(err)
 	}
-	if err := run.Service.submitWebhookAdmission(ctx, admitted.DeliveryIDHash); err != nil {
+	if err := run.Service.submitWebhookAdmission(ctx, admitted.EnvironmentID, admitted.DeliveryIDHash); err != nil {
 		t.Fatal(err)
 	}
 	var state, code string
@@ -760,7 +760,7 @@ func TestIntegrationWebhookWorkerRejectsRebindAndDeletedEnvironment(t *testing.T
 	if _, err := pool.Exec(ctx, `DELETE FROM eregion_platform_environments WHERE id=$1`, second.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
-	if err := run.Service.submitWebhookAdmission(ctx, secondAdmitted.DeliveryIDHash); err != nil {
+	if err := run.Service.submitWebhookAdmission(ctx, secondAdmitted.EnvironmentID, secondAdmitted.DeliveryIDHash); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT state,error_code FROM eregion_webhook_deliveries WHERE delivery_id_hash=$1`, secondAdmitted.DeliveryIDHash).Scan(&state, &code); err != nil {

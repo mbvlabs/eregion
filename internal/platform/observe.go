@@ -214,13 +214,14 @@ func EnvironmentDomains(env Environment, domains []DomainBinding) []DomainObserv
 // LogQuery is one bounded container-log read. DeploymentID selects the serving
 // formation's containers; Process optionally narrows it further.
 type LogQuery struct {
-	App          string
-	Environment  string
-	DeploymentID DeploymentID
-	Process      string
-	Follow       bool
-	Since        time.Duration
-	Tail         int
+	App                string
+	Environment        string
+	DeploymentID       DeploymentID
+	Process            string
+	Follow             bool
+	Since              time.Duration
+	Tail               int
+	ExpectedContainers []string
 }
 
 // Validate checks the shape of a log query. The node repeats the checks before
@@ -251,21 +252,24 @@ func (q LogQuery) Validate() error {
 
 // LogLine is one line of container output attributed to a process replica.
 type LogLine struct {
-	App         string `json:"app,omitempty"`
-	Environment string `json:"environment,omitempty"`
-	Process     string `json:"process,omitempty"`
-	Replica     string `json:"replica,omitempty"`
-	Container   string `json:"container,omitempty"`
-	Stream      string `json:"stream,omitempty"`
-	Message     string `json:"message"`
+	App         string     `json:"app,omitempty"`
+	Environment string     `json:"environment,omitempty"`
+	Process     string     `json:"process,omitempty"`
+	Replica     string     `json:"replica,omitempty"`
+	Container   string     `json:"container,omitempty"`
+	Stream      string     `json:"stream,omitempty"`
+	Message     string     `json:"message"`
+	Timestamp   *time.Time `json:"timestamp,omitempty"`
 }
 
 // LogResult is one bounded read (or the summary of a followed read).
 type LogResult struct {
-	Lines     []LogLine `json:"lines,omitempty"`
-	Count     int       `json:"count"`
-	Follow    bool      `json:"follow,omitempty"`
-	Truncated bool      `json:"truncated,omitempty"`
+	Lines            []LogLine `json:"lines,omitempty"`
+	Count            int       `json:"count"`
+	Follow           bool      `json:"follow,omitempty"`
+	Truncated        bool      `json:"truncated,omitempty"`
+	Unavailable      bool      `json:"unavailable,omitempty"`
+	DiagnosticStatus string    `json:"diagnostic_status,omitempty"`
 }
 
 // FormatLogLine prefixes a line with process/replica so output from several

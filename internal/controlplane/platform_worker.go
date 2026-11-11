@@ -1311,6 +1311,12 @@ func (s *Service) recoverOwnedDeployment(ctx context.Context, op contract.Operat
 		if err != nil {
 			return false, err
 		}
+		if err := s.checkCancelled(ctx, op.ID); err != nil {
+			if errors.Is(err, errPlatformCancelled) {
+				return s.restoreAndCancelOwnedDeployment(ctx, op, dep, env, owner)
+			}
+			return false, err
+		}
 		if err := s.syncRoutes(ctx); err != nil {
 			return s.handlePostSwitchRouteFailure(ctx, op, dep, env, owner, err)
 		}
@@ -1346,6 +1352,12 @@ func (s *Service) recoverOwnedDeployment(ctx context.Context, op contract.Operat
 		// election based on creation time.
 		owner, err = s.setDeploymentOwnerRoute(ctx, owner, dep.ID, deploymentOwnerServing, op.Attempt)
 		if err != nil {
+			return false, err
+		}
+		if err := s.checkCancelled(ctx, op.ID); err != nil {
+			if errors.Is(err, errPlatformCancelled) {
+				return s.restoreAndCancelOwnedDeployment(ctx, op, dep, env, owner)
+			}
 			return false, err
 		}
 		if err := s.syncRoutes(ctx); err != nil {

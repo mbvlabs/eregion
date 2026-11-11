@@ -13,7 +13,8 @@ import (
 )
 
 func (a *app) processSpecs() []spec {
-	parent := operationMeta("Inspect and scale environment processes", "eregion process list api production --json")
+	parent := operationMeta("Inspect and scale web, worker and private service processes", "eregion process list api production --json")
+	parent.WhenToUse = []string{"Web receives domains; worker has no port; private service listens on its declared container port under its process-name DNS alias on the environment network. Only web replicas receive deployment health probes; a healthy web upstream is required. Release is a separate once-per-release command, not a process kind.", "Bare executables such as ssr and queue resolve on effective launch PATH; explicit paths are used as given. Commandless images use native plain or CNB defaults. Quoted argv is supported without implicit shell expansion."}
 
 	list := operationMeta("List the environment's desired processes and replicas", "eregion process list api production --json")
 	list.Examples = []string{"eregion process list api production --json"}

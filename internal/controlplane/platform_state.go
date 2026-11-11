@@ -1274,7 +1274,7 @@ func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, op
 			CredentialSecretName: source.CredentialSecretName,
 		}
 		sourceJSON, _ = json.Marshal(buildSource)
-		build := platform.Build{Builder: source.Builder, Env: source.BuildEnv}
+		build := platform.Build{Builder: source.Builder, Env: source.BuildEnv, GoTargets: source.GoTargets, Buildpacks: source.Buildpacks}
 		buildJSON, _ = json.Marshal(build)
 	default:
 		return "", contract.NewFault(contract.PreconditionFailed, "environment source is not deployable", "Bind an image or HTTPS git source in the environment revision.")
@@ -1405,7 +1405,7 @@ func rollbackSnapshotTx(ctx context.Context, tx pgx.Tx, env platform.Environment
 }
 
 func (s *Service) queueFirstDeployTx(ctx context.Context, tx pgx.Tx, envID platform.EnvironmentID, actor contract.Actor, resolved *resolvedGitRef) error {
-	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE e.id=$1 FOR UPDATE OF e", envID))
+	env, err := environmentByIDTx(ctx, tx, envID)
 	if err != nil {
 		return unavailable()
 	}
@@ -1731,7 +1731,7 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,e.protected,coa
     coalesce((SELECT array_agg(c.container_name ORDER BY c.container_name)
               FROM eregion_platform_container_cleanup c WHERE c.environment_id=e.id),'{}'),
     EXISTS(SELECT 1 FROM eregion_platform_releases rr WHERE rr.environment_id=e.id AND rr.status='ready'),
-    coalesce(e.current_revision_id,''),coalesce(r.number,0),coalesce(r.operation_id,''),
+    coalesce(e.current_revision_id,''),coalesce(r.id,''),coalesce(r.number,0),coalesce(r.operation_id,''),
     coalesce(r.actor_kind,'system'),coalesce(r.actor_subject,''),coalesce(r.operation,''),coalesce(r.summary,''),
     coalesce(r.source,'{}'::jsonb),coalesce(r.auto_deploy,false),coalesce(r.webhook_secret_name,''),
     coalesce(r.runtime,'{}'::jsonb),coalesce(r.processes,'[]'::jsonb),coalesce(r.config,'{}'::jsonb),
@@ -1739,12 +1739,12 @@ const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,e.protected,coa
     e.created_at,e.updated_at
     FROM eregion_platform_environments e
     JOIN eregion_platform_apps a ON a.id=e.app_id
-    LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id`
+    LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id AND r.environment_id=e.id`
 
 func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var env platform.Environment
 	var rawEnv, rawRefs, rawSource, rawRuntime, rawProcesses, rawConfig, rawRetention []byte
-	var desired, applied, serving, servingDeployment, revisionID string
+	var desired, applied, serving, servingDeployment, revisionID, loadedRevisionID string
 	var revisionNumber int
 	var operationID, actorKind, actorSubject, operation, summary, webhookSecretName, primaryDNS string
 	var autoDeploy, deployIntent bool
@@ -1753,12 +1753,15 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.Protected, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
 		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
-		&env.PrimaryDomain, &primaryDNS, &env.PendingCleanup, &env.ArtifactReady, &revisionID, &revisionNumber, &operationID,
+		&env.PrimaryDomain, &primaryDNS, &env.PendingCleanup, &env.ArtifactReady, &revisionID, &loadedRevisionID, &revisionNumber, &operationID,
 		&actorKind, &actorSubject, &operation, &summary, &rawSource, &autoDeploy, &webhookSecretName,
 		&rawRuntime, &rawProcesses, &rawConfig, &secretNames, &resourceNames, &rawRetention, &deployIntent, &revisionCreated,
 		&env.CreatedAt, &env.UpdatedAt)
 	if err != nil {
 		return env, err
+	}
+	if revisionID != loadedRevisionID {
+		return env, contract.NewFault(contract.PreconditionFailed, "environment current revision is missing or inconsistent", "Inspect the environment revision before retrying.")
 	}
 	env.ServingDeploymentID = platform.DeploymentID(servingDeployment)
 	env.Env = map[string]string{}
@@ -2137,6 +2140,13 @@ func (s *Service) inventoryDeployments(ctx context.Context, query platform.Inven
 	items := []platform.Deployment{}
 	statement := deploymentSelect + " WHERE 1=1"
 	args := []any{}
+	if query.Deployment != "" {
+		if err := platform.DeploymentID(query.Deployment).Validate(); err != nil {
+			return nil, err
+		}
+		args = append(args, query.Deployment)
+		statement += fmt.Sprintf(" AND d.id=$%d", len(args))
+	}
 	if query.App != "" {
 		args = append(args, query.App)
 		statement += fmt.Sprintf(" AND a.name=$%d", len(args))
@@ -2301,26 +2311,40 @@ func nodeByNameTx(ctx context.Context, tx pgx.Tx, name string) (platform.Node, e
 }
 
 func environmentByNameTx(ctx context.Context, tx pgx.Tx, app, name string) (platform.Environment, error) {
-	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE a.name=$1 AND e.name=$2 FOR UPDATE OF e", app, name))
+	var id platform.EnvironmentID
+	err := tx.QueryRow(ctx, `SELECT e.id FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND e.name=$2 FOR UPDATE OF e`, app, name).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return env, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
+		return platform.Environment{}, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
 	}
 	if err != nil {
-		return env, unavailable()
+		return platform.Environment{}, unavailable(err)
 	}
-	return env, nil
+	return loadLockedEnvironmentTx(ctx, tx, id)
 }
 
 // environmentByIDTx locks and reads the exact environment row an admission
 // observed. The opaque ID, not the app/name pair, proves the environment was not
 // deleted and recreated while the push waited in the queue.
 func environmentByIDTx(ctx context.Context, tx pgx.Tx, id platform.EnvironmentID) (platform.Environment, error) {
-	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE e.id=$1 FOR UPDATE OF e", id))
+	var lockedID platform.EnvironmentID
+	err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_environments WHERE id=$1 FOR UPDATE`, id).Scan(&lockedID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return env, contract.NewFault(contract.NotFound, "environment not found", "The environment was deleted after the push was admitted.")
+		return platform.Environment{}, contract.NewFault(contract.NotFound, "environment not found", "The environment was deleted after the push was admitted.")
 	}
 	if err != nil {
-		return env, unavailable()
+		return platform.Environment{}, unavailable(err)
+	}
+	return loadLockedEnvironmentTx(ctx, tx, lockedID)
+}
+
+// A separate statement gets a fresh READ COMMITTED snapshot after the row lock.
+func loadLockedEnvironmentTx(ctx context.Context, tx pgx.Tx, id platform.EnvironmentID) (platform.Environment, error) {
+	env, err := scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+" WHERE e.id=$1", id))
+	if err != nil {
+		return env, err
+	}
+	if env.Revision == nil || env.RevisionID == "" || env.Revision.ID != env.RevisionID {
+		return env, contract.NewFault(contract.PreconditionFailed, "environment current revision is missing or inconsistent", "Inspect the environment revision before retrying.")
 	}
 	return env, nil
 }

@@ -44,7 +44,7 @@ func (a *app) resourceSpecs() []spec {
 	attach.WhenToUse = []string{
 		"Record the resource as a dependency of the environment's next desired-state revision. Nothing is provisioned and deployment stays blocked until the resource reports ready.",
 	}
-	attach.Next = []string{"eregion resource status api production db --json", "eregion deploy api production --json"}
+	attach.Next = []string{"eregion resource status <app> <environment> <name> --json", "eregion deploy <app> <environment> --json"}
 	detach := followingMeta(platformMutationMeta(
 		"Detach a managed resource from the environment's desired revision",
 		"eregion resource detach api production db --json"))
@@ -55,7 +55,7 @@ func (a *app) resourceSpecs() []spec {
 	changeFlags := func(cmd *cobra.Command) {
 		cmd.Flags().Bool("dry-run", false, "Validate and return a plan without accepting an operation")
 		cmd.Flags().String("idempotency-key", "", "Stable submission key; generated when omitted")
-		cmd.Flags().Bool("detach", false, "Return after acceptance instead of following the operation")
+		cmd.Flags().Bool("detach", false, "Return after acceptance; terminal plain follows by default, JSON and pipes do not, NDJSON follows unless detached")
 		cmd.Flags().Duration("poll-interval", viewer.DefaultPollInterval, "Follow poll interval")
 	}
 	applyFlags := func(cmd *cobra.Command) {

@@ -28,6 +28,7 @@ func (a *app) envSpecs() []spec {
 		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
+		"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend",
 	}
 	create.Examples = []string{
 		"eregion env create",
@@ -39,11 +40,13 @@ func (a *app) envSpecs() []spec {
 
 	update := operationMeta("Change an environment as a new desired-state revision", "eregion env update api production --git-ref release-2026-10 --json")
 	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued. --github-auth reads the local authenticated gh token for a github.com source as the new read credential; it is opt-in because that token may carry broader scopes. With an authenticated gh, --github-webhook creates or updates the repository webhook for --auto-deploy or --rotate-webhook-secret; manual paste remains the fallback."}
+	update.WhenToUse = append(update.WhenToUse, "Git Buildpacks settings include Go targets and an optional Node frontend; image sources bypass builds. --build-env '' clears the build environment, --go-target '' clears targets, and --no-frontend removes frontend settings. --from reads a TOML definition; app export --inspect is not applicable.")
 	update.Mutating, update.DryRun, update.Prompts = true, true, true
 	update.InputFlags = []string{
 		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name", "github-auth",
-		"image", "builder", "context-path", "health-type", "health-path", "health-timeout",
+		"image", "builder", "context-path", "build-env", "health-type", "health-path", "health-timeout",
 		"release-command", "process", "from", "github-webhook",
+		"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend",
 	}
 	update.Examples = []string{
 		"eregion env update api production",
@@ -231,10 +234,11 @@ func addEnvironmentUpdateFlags(cmd *cobra.Command) {
 	f.String("builder", "", "Buildpacks builder image for a git source")
 	f.String("context-path", "", "Build context path inside the repository")
 	f.StringArray("build-env", nil, "Buildpacks environment KEY=VALUE (repeatable; replaces the map)")
+	addBuildpackFlags(cmd)
 	f.String("health-type", "", "Health check type: http or tcp")
 	f.String("health-path", "", "Loopback health path")
 	f.Int("health-timeout", 0, "Health timeout in seconds (1–300)")
-	f.String("release-command", "", "One-off release command line; empty clears it")
+	f.String("release-command", "", "Release command run once per release (quoted argv, no shell); empty clears it")
 	f.StringArray("process", nil, "Complete process formation entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces all processes)")
 	f.String("from", "", "Read an eregion.toml definition as the complete supported desired state; config is plain, secrets are names only; revision and webhook flags cannot be combined")
 	f.Bool("auto-deploy", false, "Enable push to deploy for a GitHub source; --auto-deploy=false disables it")
@@ -1151,7 +1155,10 @@ func (a *app) buildEnvironmentUpdate(cmd *cobra.Command, current platform.Enviro
 			runtime.HealthTimeoutSeconds = flagInt(cmd, "health-timeout")
 		}
 		if flagChanged(cmd, "release-command") {
-			command := commandSpecFromLine(flagString(cmd, "release-command"))
+			command, err := commandSpecFromLine(flagString(cmd, "release-command"))
+			if err != nil {
+				return patch, nil, "", nil, err
+			}
 			if command != nil && base.Runtime.ReleaseCommand != nil {
 				command.TimeoutSeconds = base.Runtime.ReleaseCommand.TimeoutSeconds
 			}
@@ -1183,7 +1190,7 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding, 
 	}
 	gitChanged := githubAuth || flagChanged(cmd, "git-url") || flagChanged(cmd, "git-ref") ||
 		flagChanged(cmd, "git-credential-file") || flagChanged(cmd, "git-credential-name") ||
-		flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env")
+		flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env") || buildpackFlagsChanged(cmd)
 	if !imageChanged && !gitChanged {
 		return platform.SourceBinding{}, false, nil, "", nil
 	}
@@ -1201,7 +1208,7 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding, 
 
 	source := platform.SourceBinding{}
 	if base.Kind == "git" {
-		source = base
+		source = platform.CloneRevisionState(platform.RevisionState{Source: base}).Source
 	}
 	source.Kind = "git"
 	if flagChanged(cmd, "git-url") {
@@ -1235,6 +1242,9 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding, 
 			return platform.SourceBinding{}, false, nil, "", err
 		}
 		source.BuildEnv = values
+	}
+	if err := applyBuildpackFlags(cmd, &source); err != nil {
+		return platform.SourceBinding{}, false, nil, "", err
 	}
 	if githubAuth {
 		name := source.CredentialSecretName

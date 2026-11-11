@@ -19,12 +19,14 @@ func (a *app) appSpecs() []spec {
 
 	create := followingMeta(operationMeta("Create an application with production and staging", "eregion app create --name api --node main --git-url https://github.com/acme/api --json"))
 	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup: app, shared source, processes, config, secrets and production's domain. The same recipe creates production and staging atomically. Agents pass every flag; JSON and no-TTY never prompt. Both start protected; creation never asks for a TOTP code."}
+	create.WhenToUse = append(create.WhenToUse, "Use a git source with Buildpacks or an existing image; --from loads a TOML definition. Configure Go targets and optional Node frontend with the typed source flags.")
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
 		"name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
 		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
+		"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend",
 	}
 	create.Examples = []string{
 		"eregion app create",
@@ -42,14 +44,14 @@ func (a *app) appSpecs() []spec {
 	status.Examples = []string{"eregion app status api --json"}
 	status.Next = []string{"eregion env status <app> <environment> --json"}
 
-	export := operationMeta("Export one environment's desired state as an eregion.toml", "eregion app export api production")
-	export.WhenToUse = []string{"Generate a deterministic app definition from the current revision, process formation, plain config, secret names, domain bindings and managed resource declarations. Secret values, releases, health and TLS observations are never exported."}
-	export.InputFlags = []string{"out"}
+	export := operationMeta("Export an environment's TOML definition or inspection snapshot", "eregion app export api production")
+	export.WhenToUse = []string{"Generate a deterministic TOML app definition from the current revision. Normal export refuses unsupported auto-deploy, webhook and retention state. --inspect includes non-secret inventory metadata but produces a non-applicable snapshot; it is not a DNS automation round trip."}
+	export.InputFlags = []string{"out", "inspect"}
 	export.Examples = []string{
 		"eregion app export api production",
 		"eregion app export api production --out ./eregion.toml --json",
 	}
-	export.Next = []string{"eregion env update api production --from ./eregion.toml --dry-run --json"}
+	export.Next = []string{"eregion env update <app> <environment> --from ./eregion.toml --dry-run --json"}
 
 	return []spec{{
 		use:  "app",
@@ -92,6 +94,7 @@ func (a *app) appSpecs() []spec {
 				args: platformTwoNames("app", "environment"),
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().String("out", "", "Write the definition to this new file instead of stdout")
+					cmd.Flags().Bool("inspect", false, "Export a non-applicable inspection snapshot with unsupported metadata")
 				},
 				run: a.appExport,
 			},
@@ -117,7 +120,7 @@ func cloneEnvironmentSpec(spec platform.EnvironmentSpec) platform.EnvironmentSpe
 		process.Args = append([]string(nil), process.Args...)
 		out.Processes[i] = process
 	}
-	out.Source.BuildEnv = cloneStringMap(spec.Source.BuildEnv)
+	out.Source = platform.CloneRevisionState(platform.RevisionState{Source: spec.Source}).Source
 	if spec.Runtime.ReleaseCommand != nil {
 		command := *spec.Runtime.ReleaseCommand
 		command.Argv = append([]string(nil), command.Argv...)
@@ -408,7 +411,12 @@ func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	document, err := appdef.Export(appName, environment, current.BuildNode, current.Revision, domains, resources)
+	var document string
+	if boolFlag(cmd, "inspect") {
+		document, err = appdef.Inspect(appName, environment, current, domains, resources)
+	} else {
+		document, err = appdef.Export(appName, environment, current.BuildNode, current.Revision, domains, resources)
+	}
 	if err != nil {
 		return result{}, contract.NewFault(contract.PreconditionFailed, "cannot export this environment faithfully", err.Error())
 	}

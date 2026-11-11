@@ -5,6 +5,7 @@ import (
 	"github.com/spf13/cobra"
 	"maps"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -222,11 +223,17 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 		if err != nil {
 			return platform.SourceBinding{}, nil, "", err
 		}
+		source := platform.CloneRevisionState(platform.RevisionState{Source: base}).Source
+		if base.Kind != "git" {
+			source = platform.SourceBinding{}
+		}
+		source.Kind, source.URL, source.Ref, source.CredentialSecretName = "git", url, ref, name
+		source.ContextPath, source.Builder = contextPath, builder
+		if err := guidedBuildpacks(&source); err != nil {
+			return platform.SourceBinding{}, nil, "", err
+		}
 		keep = true
-		return platform.SourceBinding{
-			Kind: "git", URL: url, Ref: ref, CredentialSecretName: name,
-			ContextPath: contextPath, Builder: builder, BuildEnv: base.BuildEnv,
-		}, credential, name, nil
+		return source, credential, name, nil
 	default:
 		return platform.SourceBinding{}, nil, "", contract.NewFault(contract.Internal, "unsupported guided source kind", "Report the command and binary version.")
 	}
@@ -262,9 +269,9 @@ func guidedRuntime(base platform.RuntimeSpec, node string) (platform.RuntimeSpec
 	}
 	releaseLine := ""
 	if base.ReleaseCommand != nil {
-		releaseLine = strings.Join(base.ReleaseCommand.Argv, " ")
+		releaseLine = formatCommandArgv(base.ReleaseCommand.Argv)
 	}
-	releaseLine, err = ui.Input("Release command", "Executable and arguments, split on spaces; empty for none", releaseLine)
+	releaseLine, err = ui.Input("Release command", "Executable and quoted arguments; empty for none; no shell", releaseLine)
 	if err != nil {
 		return platform.RuntimeSpec{}, err
 	}
@@ -273,7 +280,10 @@ func guidedRuntime(base platform.RuntimeSpec, node string) (platform.RuntimeSpec
 	runtime.HealthType = healthType
 	runtime.HealthPath = healthPath
 	runtime.HealthTimeoutSeconds = timeout
-	runtime.ReleaseCommand = commandSpecFromLine(releaseLine)
+	runtime.ReleaseCommand, err = commandSpecFromLine(releaseLine)
+	if err != nil {
+		return platform.RuntimeSpec{}, err
+	}
 	if runtime.ReleaseCommand != nil && base.ReleaseCommand != nil {
 		runtime.ReleaseCommand.TimeoutSeconds = base.ReleaseCommand.TimeoutSeconds
 	}
@@ -299,17 +309,21 @@ func guidedProcesses(base []platform.ProcessSpec) ([]platform.ProcessSpec, error
 			}
 			process.ContainerPort = port
 		}
-		line := process.Command
-		if len(process.Args) > 0 {
-			line += " " + strings.Join(process.Args, " ")
+		line := ""
+		if process.Command != "" {
+			line = formatCommandArgv(append([]string{process.Command}, process.Args...))
 		}
 		for {
-			input, inputErr := ui.Input("Command for "+process.Name, "Executable and arguments, split on spaces; empty for a web process", line)
+			input, inputErr := ui.Input("Command for "+process.Name, "Executable and quoted arguments; empty for a web process", line)
 			if inputErr != nil {
 				return nil, inputErr
 			}
 			line = input
-			command, args := splitCommandLine(line)
+			command, args, err := splitCommandLine(line)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, ui.Warn(err.Error()))
+				continue
+			}
 			if process.Kind != "web" && command == "" {
 				fmt.Fprintln(os.Stderr, ui.Warn("A worker or service process needs a command."))
 				continue
@@ -387,7 +401,8 @@ func validateOptionalSecretName(value string) error {
 func sourceEqual(a, b platform.SourceBinding) bool {
 	return a.Kind == b.Kind && a.URL == b.URL && a.Ref == b.Ref &&
 		a.CredentialSecretName == b.CredentialSecretName && a.ContextPath == b.ContextPath &&
-		a.Builder == b.Builder && a.Image == b.Image && maps.Equal(a.BuildEnv, b.BuildEnv)
+		a.Builder == b.Builder && a.Image == b.Image && maps.Equal(a.BuildEnv, b.BuildEnv) &&
+		slices.Equal(a.GoTargets, b.GoTargets) && reflect.DeepEqual(a.Buildpacks, b.Buildpacks)
 }
 
 func runtimeEqual(a, b platform.RuntimeSpec) bool {
@@ -436,6 +451,12 @@ func sourceDiff(old, new platform.SourceBinding) []string {
 	if !maps.Equal(old.BuildEnv, new.BuildEnv) {
 		out = append(out, "source.build_env changed")
 	}
+	if !slices.Equal(old.GoTargets, new.GoTargets) {
+		out = append(out, "source.go_targets changed")
+	}
+	if !reflect.DeepEqual(old.Buildpacks, new.Buildpacks) {
+		out = append(out, "source.buildpacks changed")
+	}
 	return out
 }
 
@@ -451,10 +472,10 @@ func runtimeDiff(old, new platform.RuntimeSpec) []string {
 	field("health_timeout_seconds", strconv.Itoa(old.HealthTimeoutSeconds), strconv.Itoa(new.HealthTimeoutSeconds))
 	oldRelease, newRelease := "", ""
 	if old.ReleaseCommand != nil {
-		oldRelease = strings.Join(old.ReleaseCommand.Argv, " ")
+		oldRelease = formatCommandArgv(old.ReleaseCommand.Argv)
 	}
 	if new.ReleaseCommand != nil {
-		newRelease = strings.Join(new.ReleaseCommand.Argv, " ")
+		newRelease = formatCommandArgv(new.ReleaseCommand.Argv)
 	}
 	field("release_command", oldRelease, newRelease)
 	return out

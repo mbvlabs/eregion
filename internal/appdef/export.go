@@ -3,6 +3,8 @@ package appdef
 import (
 	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +19,15 @@ import (
 // are never exported. A resource that the revision depends on must still have
 // an inventory definition; it is refused rather than silently dropped.
 func Export(app, environment, buildNode string, revision *platform.EnvironmentRevision, domains []platform.DomainBinding, resources []platform.Resource) (string, error) {
+	return export(app, environment, buildNode, revision, domains, resources, nil)
+}
+
+// Inspect exports a non-applicable snapshot using only the supplied inventory.
+func Inspect(app, environment string, current platform.Environment, domains []platform.DomainBinding, resources []platform.Resource) (string, error) {
+	return export(app, environment, current.BuildNode, current.Revision, domains, resources, &current)
+}
+
+func export(app, environment, buildNode string, revision *platform.EnvironmentRevision, domains []platform.DomainBinding, resources []platform.Resource, inspection *platform.Environment) (string, error) {
 	if err := platform.ValidateName(app); err != nil {
 		return "", fmt.Errorf("app: %w", err)
 	}
@@ -26,13 +37,13 @@ func Export(app, environment, buildNode string, revision *platform.EnvironmentRe
 	if revision == nil {
 		return "", errors.New("the environment has no current revision; nothing is exportable")
 	}
-	if revision.AutoDeploy {
+	if inspection == nil && revision.AutoDeploy {
 		return "", errors.New("auto_deploy is enabled and is not representable in this definition version")
 	}
-	if revision.WebhookSecretName != "" {
+	if inspection == nil && revision.WebhookSecretName != "" {
 		return "", errors.New("webhook_secret_name is set and is not representable in this definition version")
 	}
-	if !revision.Retention.IsZero() {
+	if inspection == nil && !revision.Retention.IsZero() {
 		return "", errors.New("the environment has a retention override and is not representable in this definition version")
 	}
 	// Resource declarations are exported from the explicit inventory, never
@@ -96,6 +107,9 @@ func Export(app, environment, buildNode string, revision *platform.EnvironmentRe
 
 	var out strings.Builder
 	fmt.Fprintf(&out, "version = %d\n", Version)
+	if inspection != nil {
+		out.WriteString("inspection_only = true\n")
+	}
 	fmt.Fprintf(&out, "app = %s\n", quote(app))
 	fmt.Fprintf(&out, "node = %s\n", quote(state.Runtime.Node))
 	fmt.Fprintf(&out, "build_node = %s\n", quote(buildNode))
@@ -104,6 +118,30 @@ func Export(app, environment, buildNode string, revision *platform.EnvironmentRe
 		out.WriteString("processes = []\n")
 	}
 	out.WriteString("domains = []\n")
+	if inspection != nil {
+		out.WriteString("\n[inspection]\n")
+		fmt.Fprintf(&out, "auto_deploy = %t\nwebhook_secret_name = %s\nprotected = %t\n", revision.AutoDeploy, quote(revision.WebhookSecretName), inspection.Protected)
+		timeout := "not configured"
+		if revision.Runtime.ReleaseCommand != nil {
+			timeout = strconv.Itoa(revision.Runtime.ReleaseCommand.TimeoutSeconds) + " seconds (0 means default)"
+		}
+		fmt.Fprintf(&out, "release_timeout = %s\n", quote(timeout))
+		value := func(v *int) string {
+			if v == nil {
+				return "inherited (server value unavailable)"
+			}
+			return strconv.Itoa(*v)
+		}
+		fmt.Fprintf(&out, "retention_keep_releases = %s\nretention_keep_newer_than_days = %s\nretention_artifact_grace_days = %s\n", quote(value(revision.Retention.KeepReleases)), quote(value(revision.Retention.KeepNewerThanDays)), quote(value(revision.Retention.ArtifactGraceDays)))
+		out.WriteString("not_represented = [\"auto-deploy and webhook configuration\", \"retention override\", \"environment protection\", \"release timeout\", \"provider ownership and DNS automation\", \"provider live state, credentials, TLS and health observations\"]\n")
+		out.WriteString("provider_inventory = \"Only managed DNS metadata present in domain inventory is shown; live provider state and ownership details are unavailable.\"\n")
+		for _, binding := range sortedDomains {
+			if d := binding.ManagedDNS; d != nil {
+				out.WriteString("\n[[inspection.managed_dns]]\n")
+				fmt.Fprintf(&out, "domain = %s\nprovider = %s\nzone_id = %s\nzone_name = %s\norigins = %s\nproxied = %t\nstate = %s\ngeneration = %d\napplied_generation = %d\n", quote(binding.Domain), quote(d.Provider), quote(d.ZoneID), quote(d.ZoneName), stringArray(d.Origins), d.Proxied, quote(d.State), d.Generation, d.AppliedGeneration)
+			}
+		}
+	}
 
 	out.WriteString("\n[source]\n")
 	out.WriteString("kind = " + quote(state.Source.Kind) + "\n")
@@ -114,8 +152,33 @@ func Export(app, environment, buildNode string, revision *platform.EnvironmentRe
 		fmt.Fprintf(&out, "credential_secret = %s\n", quote(state.Source.CredentialSecretName))
 		fmt.Fprintf(&out, "context_path = %s\n", quote(state.Source.ContextPath))
 		fmt.Fprintf(&out, "builder = %s\n", quote(state.Source.Builder))
+		out.WriteString("go_targets = [")
+		for index, target := range state.Source.GoTargets {
+			if index > 0 {
+				out.WriteString(", ")
+			}
+			fmt.Fprintf(&out, "{ process = %s, target = %s }", quote(target.Process), quote(target.Target))
+		}
+		out.WriteString("]\n")
 	case "image":
 		fmt.Fprintf(&out, "image = %s\n", quote(state.Source.Image))
+	}
+	if settings := state.Source.Buildpacks; settings != nil {
+		out.WriteString("\n[source.buildpacks]\n")
+		fmt.Fprintf(&out, "runtime = %s\n", quote(settings.Runtime))
+		if frontend := settings.Frontend; frontend != nil {
+			out.WriteString("\n[source.buildpacks.frontend]\n")
+			fmt.Fprintf(&out, "runtime = %s\n", quote(frontend.Runtime))
+			fmt.Fprintf(&out, "directory = %s\n", quote(frontend.Directory))
+			fmt.Fprintf(&out, "scripts = %s\n", stringArray(frontend.Scripts))
+			fmt.Fprintf(&out, "keep_node_runtime = %t\n", frontend.KeepNodeRuntime)
+		}
+		if advanced := settings.Advanced; advanced != nil {
+			out.WriteString("\n[source.buildpacks.advanced]\n")
+			fmt.Fprintf(&out, "go_version = %s\n", quote(advanced.GoVersion))
+			fmt.Fprintf(&out, "go_build_flags = %s\n", quote(advanced.GoBuildFlags))
+			fmt.Fprintf(&out, "node_version = %s\n", quote(advanced.NodeVersion))
+		}
 	}
 	if state.Source.Kind == "git" && len(state.Source.BuildEnv) == 0 {
 		out.WriteString("\n[source.build_env]\n")
@@ -480,7 +543,8 @@ func currentDomainsMatch(current platform.Environment, bindings []platform.Domai
 func sourceEqual(a, b platform.SourceBinding) bool {
 	if a.Kind != b.Kind || a.URL != b.URL || a.Ref != b.Ref ||
 		a.CredentialSecretName != b.CredentialSecretName || a.ContextPath != b.ContextPath ||
-		a.Builder != b.Builder || a.Image != b.Image || len(a.BuildEnv) != len(b.BuildEnv) {
+		a.Builder != b.Builder || a.Image != b.Image || len(a.BuildEnv) != len(b.BuildEnv) ||
+		!slices.Equal(a.GoTargets, b.GoTargets) || !reflect.DeepEqual(a.Buildpacks, b.Buildpacks) {
 		return false
 	}
 	for key, value := range a.BuildEnv {
@@ -557,6 +621,12 @@ func sourceDiff(old, new platform.SourceBinding) []string {
 	add("image", old.Image, new.Image)
 	if !stringMapEqual(old.BuildEnv, new.BuildEnv) {
 		out = append(out, "source.build_env changed")
+	}
+	if !slices.Equal(old.GoTargets, new.GoTargets) {
+		out = append(out, "source.go_targets changed")
+	}
+	if !reflect.DeepEqual(old.Buildpacks, new.Buildpacks) {
+		out = append(out, "source.buildpacks changed")
 	}
 	return out
 }

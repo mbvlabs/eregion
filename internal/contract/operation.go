@@ -167,6 +167,17 @@ type HealthObservation struct {
 	Detail         string `json:"detail,omitempty"`
 }
 
+// CandidateDiagnostic identifies retained output from a failed candidate only.
+type CandidateDiagnostic struct {
+	DeploymentID string    `json:"deployment_id"`
+	Process      string    `json:"process,omitempty"`
+	Replica      string    `json:"replica,omitempty"`
+	Container    string    `json:"container,omitempty"`
+	ContainerID  string    `json:"container_id,omitempty"`
+	Timestamp    time.Time `json:"timestamp,omitempty"`
+	Status       string    `json:"status,omitempty"`
+}
+
 type Event struct {
 	OperationID OperationID `json:"operation_id"`
 	Sequence    uint64      `json:"sequence,string"`
@@ -190,7 +201,8 @@ type Event struct {
 	// DurationMS is the measured duration of one completed step.
 	DurationMS *int64 `json:"duration_ms,omitempty"`
 	// Health is a structured probe observation.
-	Health *HealthObservation `json:"health,omitempty"`
+	Health              *HealthObservation   `json:"health,omitempty"`
+	CandidateDiagnostic *CandidateDiagnostic `json:"candidate_diagnostic,omitempty"`
 	// ErrorCode classifies a failed terminal state. It is only valid on a
 	// state event that reports the failed state.
 	ErrorCode Code      `json:"error_code,omitempty"`

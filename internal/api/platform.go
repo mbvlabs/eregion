@@ -134,6 +134,11 @@ func parseInventoryQuery(raw string) (platform.InventoryQuery, error) {
 				return query, contract.NewFault(contract.ValidationFailed, "invalid build filter", "Use a build ID from build list or a deploy operation.")
 			}
 			query.Build = value
+		case "deployment":
+			if err := platform.DeploymentID(value).Validate(); err != nil {
+				return query, contract.NewFault(contract.ValidationFailed, "invalid deployment filter", "Use a deployment ID from inventory.")
+			}
+			query.Deployment = value
 		case "limit":
 			limit, err := strconv.Atoi(value)
 			if err != nil || limit < 1 || limit > 200 {
@@ -146,6 +151,9 @@ func parseInventoryQuery(raw string) (platform.InventoryQuery, error) {
 	}
 	if query.Collection == "" {
 		return query, contract.NewFault(contract.InputRequired, "inventory collection is required", "Use collection=summary, nodes, apps, environments, releases, deployments, changes, or resources.")
+	}
+	if query.Deployment != "" && query.Collection != "deployments" {
+		return query, contract.NewFault(contract.ValidationFailed, "deployment filter requires deployments collection", "Select deployments when filtering by deployment ID.")
 	}
 	return query, nil
 }

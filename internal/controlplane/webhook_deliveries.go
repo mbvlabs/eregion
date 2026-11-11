@@ -18,7 +18,7 @@ import (
 // non-secret identity and the accepted operation/job IDs.
 type PostgresWebhookDeliveries struct {
 	pool    *pgxpool.Pool
-	enqueue func(context.Context, pgx.Tx, string) (int64, error)
+	enqueue func(context.Context, pgx.Tx, string, string) (int64, error)
 }
 
 var _ api.WebhookAdmissionStore = (*PostgresWebhookDeliveries)(nil)
@@ -56,7 +56,7 @@ func (s *PostgresWebhookDeliveries) Admit(ctx context.Context, incoming api.Webh
 	if err != nil {
 		return api.WebhookAdmission{}, false, unavailable(err)
 	}
-	jobID, err := s.enqueue(ctx, insertTx, incoming.DeliveryIDHash)
+	jobID, err := s.enqueue(ctx, insertTx, incoming.EnvironmentID, incoming.DeliveryIDHash)
 	if err != nil {
 		return api.WebhookAdmission{}, false, unavailable(err)
 	}
@@ -66,7 +66,7 @@ func (s *PostgresWebhookDeliveries) Admit(ctx context.Context, incoming api.Webh
          environment_id, revision_id, secret_revision, secret_revision_hash,
          repository, branch, commit_sha, job_id, admitted_at, admission_attempts)
         VALUES ($1,$2,$3,$4,$5,$6,'admitted',$7,$8,$9,$10,$11,$12,$13,$14,clock_timestamp(),1)
-        ON CONFLICT (delivery_id_hash) DO NOTHING
+        ON CONFLICT (environment_id, delivery_id_hash) DO NOTHING
         RETURNING first_seen_at`,
 		incoming.DeliveryIDHash, incoming.BodySHA256, incoming.Actor.Kind, incoming.Actor.Subject,
 		incoming.Kind, incoming.Target, incoming.EnvironmentID, incoming.RevisionID,
@@ -76,7 +76,7 @@ func (s *PostgresWebhookDeliveries) Admit(ctx context.Context, incoming api.Webh
 		if err := insertTx.Rollback(ctx); err != nil {
 			return api.WebhookAdmission{}, false, unavailable(err)
 		}
-		existing, err := loadWebhookAdmissionTx(ctx, tx, incoming.DeliveryIDHash, false)
+		existing, err := loadWebhookAdmissionTx(ctx, tx, incoming.EnvironmentID, incoming.DeliveryIDHash, false)
 		if err != nil {
 			return api.WebhookAdmission{}, false, unavailable(err)
 		}
@@ -129,7 +129,7 @@ func (s *PostgresWebhookDeliveries) ReconcileLegacy(ctx context.Context, incomin
 		return api.WebhookAdmission{}, false, unavailable(err)
 	}
 	defer rollback(tx)
-	existing, err := loadWebhookAdmissionTx(ctx, tx, incoming.DeliveryIDHash, true)
+	existing, err := loadWebhookAdmissionTx(ctx, tx, incoming.EnvironmentID, incoming.DeliveryIDHash, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return api.WebhookAdmission{}, false, contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation disappeared", "Do not resubmit; the delivery record is no longer available.")
 	}
@@ -173,8 +173,8 @@ func (s *PostgresWebhookDeliveries) ReconcileLegacy(ctx context.Context, incomin
 		return api.WebhookAdmission{}, false, idempotencyInputConflict()
 	}
 	tag, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
-        SET state='submitted', operation_id=$2, submitted_at=clock_timestamp()
-        WHERE delivery_id_hash=$1 AND state='pending'`, incoming.DeliveryIDHash, operationID)
+        SET state='submitted', operation_id=$3, submitted_at=clock_timestamp()
+        WHERE environment_id=$1 AND delivery_id_hash=$2 AND state='pending'`, incoming.EnvironmentID, incoming.DeliveryIDHash, operationID)
 	if err != nil {
 		return api.WebhookAdmission{}, false, unavailable(err)
 	}
@@ -190,8 +190,8 @@ func (s *PostgresWebhookDeliveries) ReconcileLegacy(ctx context.Context, incomin
 }
 
 // Lookup reads one record. It is exposed for tests and status reporting.
-func (s *PostgresWebhookDeliveries) Lookup(ctx context.Context, deliveryIDHash string) (api.WebhookAdmission, bool, error) {
-	record, err := loadWebhookAdmissionTx(ctx, s.pool, deliveryIDHash, false)
+func (s *PostgresWebhookDeliveries) Lookup(ctx context.Context, environmentID, deliveryIDHash string) (api.WebhookAdmission, bool, error) {
+	record, err := loadWebhookAdmissionTx(ctx, s.pool, environmentID, deliveryIDHash, false)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return api.WebhookAdmission{}, false, nil
 	}
@@ -278,12 +278,12 @@ func (s *PostgresWebhookDeliveries) bindingCurrentTx(ctx context.Context, tx pgx
 		revisionHash == record.SecretRevisionHash, nil
 }
 
-func loadWebhookAdmissionTx(ctx context.Context, q rowQueryer, deliveryIDHash string, forUpdate bool) (api.WebhookAdmission, error) {
+func loadWebhookAdmissionTx(ctx context.Context, q rowQueryer, environmentID, deliveryIDHash string, forUpdate bool) (api.WebhookAdmission, error) {
 	statement := `SELECT delivery_id_hash, body_sha256, actor_kind, actor_subject, kind, target, state,
         coalesce(operation_id,''), coalesce(job_id,0), admission_attempts, error_code, first_seen_at,
         environment_id, revision_id, secret_revision, secret_revision_hash,
         repository, branch, commit_sha
-        FROM eregion_webhook_deliveries WHERE delivery_id_hash=$1`
+        FROM eregion_webhook_deliveries WHERE environment_id=$1 AND delivery_id_hash=$2`
 	if forUpdate {
 		statement += " FOR UPDATE"
 	}
@@ -291,7 +291,7 @@ func loadWebhookAdmissionTx(ctx context.Context, q rowQueryer, deliveryIDHash st
 	var state string
 	var operationID string
 	var secretRevision int64
-	err := q.QueryRow(ctx, statement, deliveryIDHash).Scan(
+	err := q.QueryRow(ctx, statement, environmentID, deliveryIDHash).Scan(
 		&record.DeliveryIDHash, &record.BodySHA256, &record.Actor.Kind, &record.Actor.Subject,
 		&record.Kind, &record.Target, &state, &operationID, &record.JobID, &record.AdmissionAttempts, &record.ErrorCode,
 		&record.FirstSeenAt, &record.EnvironmentID, &record.RevisionID, &secretRevision,
@@ -313,7 +313,7 @@ func loadWebhookAdmissionTx(ctx context.Context, q rowQueryer, deliveryIDHash st
 // operation identity. Comparing the body hash alone would let the same signed
 // delivery ID be rebound to a different actor or target after a path change.
 func compareWebhookAdmission(existing, incoming api.WebhookAdmission) error {
-	if existing.BodySHA256 != incoming.BodySHA256 ||
+	if existing.EnvironmentID != incoming.EnvironmentID || existing.BodySHA256 != incoming.BodySHA256 ||
 		existing.Actor.Kind != incoming.Actor.Kind ||
 		existing.Actor.Subject != incoming.Actor.Subject ||
 		existing.Kind != incoming.Kind ||

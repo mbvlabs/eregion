@@ -125,13 +125,14 @@ func TestWebhookAdmissionDispositionFor(t *testing.T) {
 	}
 }
 
-func TestWebhookArgsCarryOnlyTheDeliveryHash(t *testing.T) {
+func TestWebhookArgsCarryOnlyScopedDeliveryIdentity(t *testing.T) {
 	hash := strings.Repeat("f", 64)
-	raw, err := json.Marshal(webhookArgs{DeliveryIDHash: hash})
+	environmentID := "env_" + strings.Repeat("1", 32)
+	raw, err := json.Marshal(webhookArgs{EnvironmentID: environmentID, DeliveryIDHash: hash})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != `{"delivery_id_hash":"`+hash+`"}` {
+	if string(raw) != `{"environment_id":"`+environmentID+`","delivery_id_hash":"`+hash+`"}` {
 		t.Fatalf("args = %s", raw)
 	}
 }

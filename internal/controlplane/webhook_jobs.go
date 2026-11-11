@@ -16,9 +16,10 @@ import (
 
 const webhookQueue = "webhook"
 
-// webhookArgs deliberately carries only the delivery hash. The body, signature,
+// webhookArgs carries the environment identity and delivery hash. The body, signature,
 // secret, sender and raw delivery ID never enter River arguments or logs.
 type webhookArgs struct {
+	EnvironmentID  string `json:"environment_id"`
 	DeliveryIDHash string `json:"delivery_id_hash"`
 }
 
@@ -38,7 +39,7 @@ func (*webhookWorker) NextRetry(job *river.Job[webhookArgs]) time.Time {
 }
 
 func (w *webhookWorker) Work(ctx context.Context, job *river.Job[webhookArgs]) error {
-	return w.service.submitWebhookAdmission(ctx, job.Args.DeliveryIDHash)
+	return w.service.submitWebhookAdmission(ctx, job.Args.EnvironmentID, job.Args.DeliveryIDHash)
 }
 
 // submitWebhookAdmission submits the ordinary platform.deploy operation for one
@@ -47,8 +48,8 @@ func (w *webhookWorker) Work(ctx context.Context, job *river.Job[webhookArgs]) e
 // submission, and the delivery link is committed with them. A crash before
 // commit rolls everything back; a retry after commit sees the submitted link
 // and does nothing.
-func (s *Service) submitWebhookAdmission(ctx context.Context, deliveryIDHash string) error {
-	if !validHash(deliveryIDHash) {
+func (s *Service) submitWebhookAdmission(ctx context.Context, environmentID, deliveryIDHash string) error {
+	if environmentID == "" || !validHash(deliveryIDHash) {
 		return contract.NewFault(contract.ValidationFailed, "webhook admission job has a malformed delivery hash", "Inspect the River job; do not retry it with a different identity.")
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -56,7 +57,7 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, deliveryIDHash str
 		return unavailable(err)
 	}
 	defer rollback(tx)
-	record, err := loadWebhookAdmissionTx(ctx, tx, deliveryIDHash, true)
+	record, err := loadWebhookAdmissionTx(ctx, tx, environmentID, deliveryIDHash, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -113,7 +114,7 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, deliveryIDHash str
 	if err != nil {
 		return err
 	}
-	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.DeliveryIDHash, resolved, "", nil)
+	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.EnvironmentID+"-"+record.DeliveryIDHash, resolved, "", nil)
 	if err != nil {
 		code, detail, retry := webhookAdmissionFailure(err)
 		if retry {
@@ -124,12 +125,12 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, deliveryIDHash str
 		// receipt, so a failed admission can never leave a partial operation
 		// or platform job behind.
 		rollback(tx)
-		return s.markWebhookAdmissionFailed(ctx, record.DeliveryIDHash, code, detail)
+		return s.markWebhookAdmissionFailed(ctx, record.EnvironmentID, record.DeliveryIDHash, code, detail)
 	}
 	op := result.Operation
 	tag, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
-        SET state='submitted', operation_id=$2, submitted_at=clock_timestamp()
-        WHERE delivery_id_hash=$1 AND state='admitted'`, record.DeliveryIDHash, op.ID)
+        SET state='submitted', operation_id=$3, submitted_at=clock_timestamp()
+        WHERE environment_id=$1 AND delivery_id_hash=$2 AND state='admitted'`, record.EnvironmentID, record.DeliveryIDHash, op.ID)
 	if err != nil {
 		return unavailable(err)
 	}
@@ -164,13 +165,13 @@ func webhookSourceBindingCurrent(env platform.Environment, record api.WebhookAdm
 // markWebhookAdmissionFailed records a terminal failure in its own transaction.
 // The worker uses it after rolling back a failed submission attempt so no
 // partial operation can commit with the receipt.
-func (s *Service) markWebhookAdmissionFailed(ctx context.Context, deliveryIDHash string, code contract.Code, detail string) error {
+func (s *Service) markWebhookAdmissionFailed(ctx context.Context, environmentID, deliveryIDHash string, code contract.Code, detail string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return unavailable(err)
 	}
 	defer rollback(tx)
-	record, err := loadWebhookAdmissionTx(ctx, tx, deliveryIDHash, true)
+	record, err := loadWebhookAdmissionTx(ctx, tx, environmentID, deliveryIDHash, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -188,9 +189,9 @@ func (s *Service) markWebhookAdmissionFailed(ctx context.Context, deliveryIDHash
 // terminal instead of staying pending forever.
 func (s *Service) failWebhookAdmission(ctx context.Context, tx pgx.Tx, record api.WebhookAdmission, code contract.Code, detail string) error {
 	if _, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
-        SET state='failed', failed_at=clock_timestamp(), error_code=$2, error_detail=$3
-        WHERE delivery_id_hash=$1 AND state='admitted'`,
-		record.DeliveryIDHash, string(code), sanitizeWebhookFailure(detail)); err != nil {
+        SET state='failed', failed_at=clock_timestamp(), error_code=$3, error_detail=$4
+        WHERE environment_id=$1 AND delivery_id_hash=$2 AND state='admitted'`,
+		record.EnvironmentID, record.DeliveryIDHash, string(code), sanitizeWebhookFailure(detail)); err != nil {
 		return unavailable(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -266,7 +267,7 @@ func webhookAdmissionDispositionFor(jobState string) webhookAdmissionDisposition
 // its receipt row lock; a concurrent maintenance pass may already have replaced
 // the job, so the current job identity and state decide the action.
 func (s *Service) reconcileWebhookAdmissions(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT d.delivery_id_hash
+	rows, err := s.pool.Query(ctx, `SELECT d.environment_id, d.delivery_id_hash
         FROM eregion_webhook_deliveries d
         LEFT JOIN river_job j ON j.id=d.job_id
         WHERE d.state='admitted'
@@ -276,14 +277,14 @@ func (s *Service) reconcileWebhookAdmissions(ctx context.Context) error {
 	if err != nil {
 		return unavailable(err)
 	}
-	var hashes []string
+	var identities []webhookArgs
 	for rows.Next() {
-		var hash string
-		if err := rows.Scan(&hash); err != nil {
+		var identity webhookArgs
+		if err := rows.Scan(&identity.EnvironmentID, &identity.DeliveryIDHash); err != nil {
 			rows.Close()
 			return err
 		}
-		hashes = append(hashes, hash)
+		identities = append(identities, identity)
 	}
 	err = rows.Err()
 	rows.Close()
@@ -291,8 +292,8 @@ func (s *Service) reconcileWebhookAdmissions(ctx context.Context) error {
 		return err
 	}
 	var failures []error
-	for _, hash := range hashes {
-		if err := s.reconcileWebhookAdmission(ctx, hash); err != nil {
+	for _, identity := range identities {
+		if err := s.reconcileWebhookAdmission(ctx, identity.EnvironmentID, identity.DeliveryIDHash); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -303,13 +304,13 @@ func (s *Service) reconcileWebhookAdmissions(ctx context.Context) error {
 // current job_id and River state are read inside that lock, so a concurrent
 // maintenance requeue cannot make this pass fail a valid replacement job or
 // enqueue the same receipt twice.
-func (s *Service) reconcileWebhookAdmission(ctx context.Context, deliveryIDHash string) error {
+func (s *Service) reconcileWebhookAdmission(ctx context.Context, environmentID, deliveryIDHash string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return unavailable(err)
 	}
 	defer rollback(tx)
-	record, err := loadWebhookAdmissionTx(ctx, tx, deliveryIDHash, true)
+	record, err := loadWebhookAdmissionTx(ctx, tx, environmentID, deliveryIDHash, true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -333,13 +334,13 @@ func (s *Service) reconcileWebhookAdmission(ctx context.Context, deliveryIDHash 
 		if s.enqueueWebhook == nil {
 			return unavailable()
 		}
-		jobID, err := s.enqueueWebhook(ctx, tx, deliveryIDHash)
+		jobID, err := s.enqueueWebhook(ctx, tx, environmentID, deliveryIDHash)
 		if err != nil {
 			return unavailable(err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
-            SET job_id=$2, admission_attempts=admission_attempts+1
-            WHERE delivery_id_hash=$1 AND state='admitted'`, deliveryIDHash, jobID); err != nil {
+            SET job_id=$3, admission_attempts=admission_attempts+1
+            WHERE environment_id=$1 AND delivery_id_hash=$2 AND state='admitted'`, environmentID, deliveryIDHash, jobID); err != nil {
 			return unavailable(err)
 		}
 		if err := tx.Commit(ctx); err != nil {

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mbvlabs/eregion/internal/buildpacks"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -57,14 +58,39 @@ type Environment struct {
 // Source mirrors platform.SourceBinding. CredentialSecret is a vault NAME; a
 // value is never part of the file.
 type Source struct {
-	Kind             *string            `toml:"kind"`
-	URL              *string            `toml:"url"`
-	Ref              *string            `toml:"ref"`
-	CredentialSecret *string            `toml:"credential_secret"`
-	ContextPath      *string            `toml:"context_path"`
-	Builder          *string            `toml:"builder"`
-	BuildEnv         *map[string]string `toml:"build_env"`
-	Image            *string            `toml:"image"`
+	Kind             *string                `toml:"kind"`
+	URL              *string                `toml:"url"`
+	Ref              *string                `toml:"ref"`
+	CredentialSecret *string                `toml:"credential_secret"`
+	ContextPath      *string                `toml:"context_path"`
+	Builder          *string                `toml:"builder"`
+	BuildEnv         *map[string]string     `toml:"build_env"`
+	GoTargets        *[]buildpacks.GoTarget `toml:"go_targets"`
+	Buildpacks       *BuildpackSettings     `toml:"buildpacks"`
+	Image            *string                `toml:"image"`
+
+	buildpacksSpecified bool
+}
+
+// The definition uses pointer-valued leaves so an environment override can
+// distinguish an omitted setting from an explicit empty value.
+type BuildpackSettings struct {
+	Runtime  *string            `toml:"runtime"`
+	Frontend *BuildpackFrontend `toml:"frontend"`
+	Advanced *BuildpackAdvanced `toml:"advanced"`
+}
+
+type BuildpackFrontend struct {
+	Runtime         *string   `toml:"runtime"`
+	Directory       *string   `toml:"directory"`
+	Scripts         *[]string `toml:"scripts"`
+	KeepNodeRuntime *bool     `toml:"keep_node_runtime"`
+}
+
+type BuildpackAdvanced struct {
+	GoVersion    *string `toml:"go_version"`
+	GoBuildFlags *string `toml:"go_build_flags"`
+	NodeVersion  *string `toml:"node_version"`
 }
 
 // Runtime mirrors platform.RuntimeSpec. ReleaseCommand is the direct argv of
@@ -156,14 +182,17 @@ type Resolved struct {
 
 // Parse decodes a strict definition and validates its schema version.
 func Parse(raw []byte) (Definition, error) {
+	var present map[string]any
+	if err := toml.Unmarshal(raw, &present); err != nil {
+		return Definition{}, decodeError(err)
+	}
+	if _, ok := present["inspection_only"]; ok {
+		return Definition{}, errors.New("inspection-only snapshot is not an applicable definition; create or export an applicable definition and configure unsupported settings separately")
+	}
 	var definition Definition
 	decoder := toml.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&definition); err != nil {
-		return Definition{}, decodeError(err)
-	}
-	var present map[string]any
-	if err := toml.Unmarshal(raw, &present); err != nil {
 		return Definition{}, decodeError(err)
 	}
 	markPresence(&definition, present)
@@ -287,6 +316,52 @@ func markSourcePresence(source *Source, present map[string]any) {
 	}
 	if hasKey(present, "build_env") && source.BuildEnv == nil {
 		source.BuildEnv = &map[string]string{}
+	}
+	if hasKey(present, "go_targets") && source.GoTargets == nil {
+		source.GoTargets = &[]buildpacks.GoTarget{}
+	}
+	if hasKey(present, "buildpacks") {
+		if source.Buildpacks == nil {
+			source.Buildpacks = &BuildpackSettings{}
+		}
+		table := tableValue(present, "buildpacks")
+		settings := source.Buildpacks
+		if hasKey(table, "runtime") && settings.Runtime == nil {
+			settings.Runtime = ptrValue("")
+		}
+		if hasKey(table, "frontend") {
+			if settings.Frontend == nil {
+				settings.Frontend = &BuildpackFrontend{}
+			}
+			frontend, fields := settings.Frontend, tableValue(table, "frontend")
+			if hasKey(fields, "runtime") && frontend.Runtime == nil {
+				frontend.Runtime = ptrValue("")
+			}
+			if hasKey(fields, "directory") && frontend.Directory == nil {
+				frontend.Directory = ptrValue("")
+			}
+			if hasKey(fields, "scripts") && frontend.Scripts == nil {
+				frontend.Scripts = &[]string{}
+			}
+			if hasKey(fields, "keep_node_runtime") && frontend.KeepNodeRuntime == nil {
+				frontend.KeepNodeRuntime = ptrValue(false)
+			}
+		}
+		if hasKey(table, "advanced") {
+			if settings.Advanced == nil {
+				settings.Advanced = &BuildpackAdvanced{}
+			}
+			advanced, fields := settings.Advanced, tableValue(table, "advanced")
+			if hasKey(fields, "go_version") && advanced.GoVersion == nil {
+				advanced.GoVersion = ptrValue("")
+			}
+			if hasKey(fields, "go_build_flags") && advanced.GoBuildFlags == nil {
+				advanced.GoBuildFlags = ptrValue("")
+			}
+			if hasKey(fields, "node_version") && advanced.NodeVersion == nil {
+				advanced.NodeVersion = ptrValue("")
+			}
+		}
 	}
 }
 
@@ -490,6 +565,70 @@ func mergeSource(dst, src *Source) {
 			}
 		}
 	}
+	if src.GoTargets != nil {
+		targets := append([]buildpacks.GoTarget{}, (*src.GoTargets)...)
+		dst.GoTargets = &targets
+	}
+	if src.Buildpacks != nil {
+		mergeBuildpacks(dst, src.Buildpacks)
+	}
+}
+
+func mergeBuildpacks(dst *Source, src *BuildpackSettings) {
+	dst.buildpacksSpecified = true
+	if src.Runtime == nil && src.Frontend == nil && src.Advanced == nil {
+		dst.Buildpacks = nil
+		return
+	}
+	if dst.Buildpacks == nil {
+		dst.Buildpacks = &BuildpackSettings{}
+	}
+	out := dst.Buildpacks
+	if src.Runtime != nil {
+		out.Runtime = ptrValue(*src.Runtime)
+	}
+	if src.Frontend != nil {
+		f := src.Frontend
+		if f.Runtime == nil && f.Directory == nil && f.Scripts == nil && f.KeepNodeRuntime == nil {
+			out.Frontend = nil
+		} else {
+			if out.Frontend == nil {
+				out.Frontend = &BuildpackFrontend{}
+			}
+			if f.Runtime != nil {
+				out.Frontend.Runtime = ptrValue(*f.Runtime)
+			}
+			if f.Directory != nil {
+				out.Frontend.Directory = ptrValue(*f.Directory)
+			}
+			if f.Scripts != nil {
+				values := append([]string{}, (*f.Scripts)...)
+				out.Frontend.Scripts = &values
+			}
+			if f.KeepNodeRuntime != nil {
+				out.Frontend.KeepNodeRuntime = ptrValue(*f.KeepNodeRuntime)
+			}
+		}
+	}
+	if src.Advanced != nil {
+		a := src.Advanced
+		if a.GoVersion == nil && a.GoBuildFlags == nil && a.NodeVersion == nil {
+			out.Advanced = nil
+		} else {
+			if out.Advanced == nil {
+				out.Advanced = &BuildpackAdvanced{}
+			}
+			if a.GoVersion != nil {
+				out.Advanced.GoVersion = ptrValue(*a.GoVersion)
+			}
+			if a.GoBuildFlags != nil {
+				out.Advanced.GoBuildFlags = ptrValue(*a.GoBuildFlags)
+			}
+			if a.NodeVersion != nil {
+				out.Advanced.NodeVersion = ptrValue(*a.NodeVersion)
+			}
+		}
+	}
 }
 
 func mergeRuntime(dst, src *Runtime) {
@@ -546,8 +685,20 @@ func validateSourceShape(source *Source) error {
 		if source.BuildEnv != nil && len(*source.BuildEnv) > 0 {
 			return errors.New("source.build_env cannot be set for an image source")
 		}
+		if source.GoTargets != nil || source.Buildpacks != nil || source.buildpacksSpecified {
+			return errors.New("source.go_targets and source.buildpacks cannot be set for an image source")
+		}
 	default:
 		return errors.New("source.kind: use git or image")
+	}
+	if source.Kind == nil || strings.EqualFold(strings.TrimSpace(*source.Kind), "git") {
+		binding := sourceBinding(source)
+		if _, err := buildpacks.NormalizeTargets(binding.GoTargets); err != nil {
+			return fmt.Errorf("source.go_targets: %w", err)
+		}
+		if _, err := buildpacks.NormalizeSettings(binding.Buildpacks); err != nil {
+			return fmt.Errorf("source.buildpacks: %w", err)
+		}
 	}
 	return nil
 }
@@ -913,6 +1064,46 @@ func sourceBinding(source *Source) platform.SourceBinding {
 		for key, value := range *source.BuildEnv {
 			binding.BuildEnv[key] = value
 		}
+	}
+	if source.GoTargets != nil {
+		binding.GoTargets = append([]buildpacks.GoTarget{}, (*source.GoTargets)...)
+	}
+	if source.Buildpacks != nil {
+		s := source.Buildpacks
+		settings := &buildpacks.Settings{}
+		if s.Runtime != nil {
+			settings.Runtime = *s.Runtime
+		}
+		if s.Frontend != nil {
+			f := s.Frontend
+			settings.Frontend = &buildpacks.Frontend{}
+			if f.Runtime != nil {
+				settings.Frontend.Runtime = *f.Runtime
+			}
+			if f.Directory != nil {
+				settings.Frontend.Directory = *f.Directory
+			}
+			if f.Scripts != nil {
+				settings.Frontend.Scripts = append([]string{}, (*f.Scripts)...)
+			}
+			if f.KeepNodeRuntime != nil {
+				settings.Frontend.KeepNodeRuntime = *f.KeepNodeRuntime
+			}
+		}
+		if s.Advanced != nil {
+			a := s.Advanced
+			settings.Advanced = &buildpacks.Advanced{}
+			if a.GoVersion != nil {
+				settings.Advanced.GoVersion = *a.GoVersion
+			}
+			if a.GoBuildFlags != nil {
+				settings.Advanced.GoBuildFlags = *a.GoBuildFlags
+			}
+			if a.NodeVersion != nil {
+				settings.Advanced.NodeVersion = *a.NodeVersion
+			}
+		}
+		binding.Buildpacks = settings
 	}
 	return binding
 }

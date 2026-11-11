@@ -309,7 +309,7 @@ func ensureNoActiveParentDeleteTx(ctx context.Context, tx pgx.Tx, id contract.Op
 	var active int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_operations
         WHERE id<>$1 AND state IN ('queued','running','cancelling')
-          AND (target=$2 OR target=$3)`, id, "app/"+app, "env/"+app+"/"+environment).Scan(&active); err != nil {
+          AND ((kind=$4 AND target=$2) OR (kind=$5 AND target=$3))`, id, "app/"+app, "env/"+app+"/"+environment, platform.KindAppDelete, platform.KindEnvironmentDelete).Scan(&active); err != nil {
 		return unavailable()
 	}
 	if active > 0 {

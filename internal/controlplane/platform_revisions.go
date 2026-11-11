@@ -219,20 +219,10 @@ func nullableString(value string) any {
 }
 
 func currentRevisionStateTx(ctx context.Context, tx pgx.Tx, env platform.Environment) (platform.RevisionState, error) {
-	if env.Revision != nil {
+	if env.Revision != nil && env.RevisionID != "" && env.Revision.ID == env.RevisionID {
 		return platform.CloneRevisionState(env.Revision.RevisionState), nil
 	}
-	// The migration backfills every pre-existing environment, so this is only a
-	// defensive fallback for a row created by an older binary mid-upgrade.
-	state := platform.RevisionState{
-		Runtime: platform.RuntimeSpec{
-			Node: env.Node, HealthType: env.Health.Type, HealthPath: env.Health.Path,
-			HealthTimeoutSeconds: env.Health.TimeoutSeconds,
-		},
-		Processes: []platform.ProcessSpec{{Name: "web", Kind: "web", Args: []string{}, Replicas: 1, ContainerPort: env.ContainerPort}},
-		Config:    env.Env,
-	}
-	return state, nil
+	return platform.RevisionState{}, contract.NewFault(contract.PreconditionFailed, "environment current revision is missing or inconsistent", "Inspect the environment revision before retrying.")
 }
 
 // ---------------------------------------------------------------- inventory

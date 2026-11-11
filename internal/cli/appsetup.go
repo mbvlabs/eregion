@@ -12,8 +12,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/mbvlabs/eregion/internal/appdef"
+	"github.com/mbvlabs/eregion/internal/buildpacks"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/output"
@@ -60,6 +62,8 @@ type setupAnswers struct {
 	Builder         string
 	ContextPath     string
 	BuildEnv        map[string]string
+	GoTargets       []buildpacks.GoTarget
+	Buildpacks      *buildpacks.Settings
 
 	ContainerPort int
 	HealthType    string
@@ -131,13 +135,14 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	f.String("image", "", "Existing OCI image reference; alternative to --git-url")
 	f.String("builder", platform.DefaultBuilder, "Buildpacks builder image for a git source")
 	f.String("context-path", "", "Build context path inside the repository")
-	f.StringArray("build-env", nil, "Buildpacks environment KEY=VALUE (repeatable)")
+	f.StringArray("build-env", nil, "Buildpacks environment KEY=VALUE (repeatable; update with '' clears all)")
+	addBuildpackFlags(cmd)
 	f.Int("container-port", platform.DefaultContainerPort, "Web process container port")
 	f.String("health-type", "http", "Health check type: http or tcp")
 	f.String("health-path", platform.DefaultHealthPath, "Loopback health path")
 	f.Int("health-timeout", platform.DefaultHealthTimeout, "Health timeout in seconds (1–300)")
-	f.String("release-command", "", "Command line each deploy runs once before the switch, such as a migration")
-	f.StringArray("process", nil, "Complete process entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces the default web process). A worker has no port: queue=worker::1:/app/bin/queue")
+	f.String("release-command", "", "Release-scoped command run once per release before deployment, e.g. migrate")
+	f.StringArray("process", nil, "Complete process entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces default web). A worker has no port: queue=worker::1:queue; quotes preserve argv, no shell")
 	f.StringArray("config", nil, "Plain configuration KEY=VALUE (repeatable)")
 	f.StringArray("secret", nil, "Vault secret NAME=PATH with a protected 0600 value file (repeatable)")
 	f.String("from", "", "Read an eregion.toml app definition; config is plain, secrets are names only; revision flags cannot be combined")
@@ -210,6 +215,184 @@ func flagArray(cmd *cobra.Command, name string) []string {
 
 func flagChanged(cmd *cobra.Command, name string) bool {
 	return cmd != nil && cmd.Flags().Lookup(name) != nil && cmd.Flags().Changed(name)
+}
+
+var buildpackFlagNames = []string{"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend"}
+
+func addBuildpackFlags(cmd *cobra.Command) {
+	f := cmd.Flags()
+	f.String("frontend-directory", "", "Node frontend directory relative to the build context (default .)")
+	f.StringArray("frontend-script", nil, "Node package script to run in order (repeatable; default build)")
+	f.Bool("keep-node-runtime", false, "Keep Node in the runtime image; use =false to disable")
+	f.StringArray("go-target", nil, "Go target PROCESS=./PACKAGE (repeatable; empty clears targets)")
+	f.String("go-version", "", "Go buildpack version")
+	f.String("go-build-flags", "", "Go build flags")
+	f.String("node-version", "", "Node buildpack version")
+	f.Bool("no-frontend", false, "Remove the Node frontend settings")
+}
+
+func buildpackFlagsChanged(cmd *cobra.Command) bool {
+	for _, name := range buildpackFlagNames {
+		if flagChanged(cmd, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseGoTargets(values []string) ([]buildpacks.GoTarget, error) {
+	targets := make([]buildpacks.GoTarget, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		process, target, ok := strings.Cut(value, "=")
+		if !ok {
+			return nil, contract.NewFault(contract.ValidationFailed, "invalid --go-target", "Use PROCESS=./PACKAGE; an empty value clears targets.")
+		}
+		targets = append(targets, buildpacks.GoTarget{Process: process, Target: target})
+	}
+	result, err := buildpacks.NormalizeTargets(targets)
+	if err != nil {
+		return nil, contract.NewFault(contract.ValidationFailed, "invalid --go-target", err.Error())
+	}
+	return result, nil
+}
+
+func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) error {
+	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script") || flagChanged(cmd, "keep-node-runtime")
+	if boolFlag(cmd, "no-frontend") && frontend {
+		return contract.NewFault(contract.ValidationFailed, "frontend flags conflict", "Use --no-frontend without frontend configuration flags.")
+	}
+	if flagChanged(cmd, "go-target") {
+		targets, err := parseGoTargets(flagArray(cmd, "go-target"))
+		if err != nil {
+			return err
+		}
+		source.GoTargets = targets
+	}
+	advanced := flagChanged(cmd, "go-version") || flagChanged(cmd, "go-build-flags") || flagChanged(cmd, "node-version")
+	if frontend || advanced || boolFlag(cmd, "no-frontend") {
+		if source.Buildpacks == nil {
+			source.Buildpacks = &buildpacks.Settings{Runtime: "go"}
+		}
+		if boolFlag(cmd, "no-frontend") {
+			source.Buildpacks.Frontend = nil
+		}
+		if frontend {
+			if source.Buildpacks.Frontend == nil {
+				source.Buildpacks.Frontend = &buildpacks.Frontend{Runtime: "node"}
+			}
+			f := source.Buildpacks.Frontend
+			if flagChanged(cmd, "frontend-directory") {
+				f.Directory = flagString(cmd, "frontend-directory")
+			}
+			if flagChanged(cmd, "frontend-script") {
+				f.Scripts = flagArray(cmd, "frontend-script")
+			}
+			if flagChanged(cmd, "keep-node-runtime") {
+				f.KeepNodeRuntime = boolFlag(cmd, "keep-node-runtime")
+			}
+		}
+		if advanced {
+			if source.Buildpacks.Advanced == nil {
+				source.Buildpacks.Advanced = &buildpacks.Advanced{}
+			}
+			a := source.Buildpacks.Advanced
+			if flagChanged(cmd, "go-version") {
+				a.GoVersion = flagString(cmd, "go-version")
+			}
+			if flagChanged(cmd, "go-build-flags") {
+				a.GoBuildFlags = flagString(cmd, "go-build-flags")
+			}
+			if flagChanged(cmd, "node-version") {
+				a.NodeVersion = flagString(cmd, "node-version")
+			}
+		}
+		settings, err := buildpacks.NormalizeSettings(source.Buildpacks)
+		if err != nil {
+			return contract.NewFault(contract.ValidationFailed, "invalid Buildpacks settings", err.Error())
+		}
+		source.Buildpacks = settings
+	}
+	return nil
+}
+
+// guidedBuildpacks edits an independent source copy using the same canonical validation as flags.
+func guidedBuildpacks(source *platform.SourceBinding) error {
+	var values []string
+	for _, target := range source.GoTargets {
+		values = append(values, target.Process+"="+target.Target)
+	}
+	text, err := ui.Input("Go targets", "Comma-separated PROCESS=./PACKAGE entries; empty for defaults", strings.Join(values, ","))
+	if err != nil {
+		return err
+	}
+	source.GoTargets, err = parseGoTargets(strings.Split(text, ","))
+	if err != nil {
+		return err
+	}
+	settings := source.Buildpacks
+	enabled := settings != nil && settings.Frontend != nil
+	enabled, err = ui.YesNoDefault("Build a Node frontend?", "Runs package scripts before building Go", enabled)
+	if err != nil {
+		return err
+	}
+	if settings == nil && enabled {
+		settings = &buildpacks.Settings{Runtime: "go"}
+	}
+	if enabled {
+		if settings.Frontend == nil {
+			settings.Frontend = &buildpacks.Frontend{Runtime: "node", Directory: ".", Scripts: []string{"build"}}
+		}
+		f := settings.Frontend
+		f.Directory, err = ui.Input("Frontend directory", "Relative to the build context; empty uses .", f.Directory)
+		if err != nil {
+			return err
+		}
+		text, err = ui.Input("Frontend scripts", "Comma-separated package script names; empty uses build", strings.Join(f.Scripts, ","))
+		if err != nil {
+			return err
+		}
+		f.Scripts = strings.Split(text, ",")
+		f.KeepNodeRuntime, err = ui.YesNoDefault("Keep Node runtime?", "Keep Node available in the application image", f.KeepNodeRuntime)
+		if err != nil {
+			return err
+		}
+	} else if settings != nil {
+		settings.Frontend = nil
+	}
+	advanced := buildpacks.Advanced{}
+	if settings != nil && settings.Advanced != nil {
+		advanced = *settings.Advanced
+	}
+	advanced.GoVersion, err = ui.Input("Go version", "Empty uses the buildpack default", advanced.GoVersion)
+	if err != nil {
+		return err
+	}
+	advanced.GoBuildFlags, err = ui.Input("Go build flags", "Empty uses the buildpack default", advanced.GoBuildFlags)
+	if err != nil {
+		return err
+	}
+	advanced.NodeVersion, err = ui.Input("Node version", "Empty uses the buildpack default", advanced.NodeVersion)
+	if err != nil {
+		return err
+	}
+	if advanced != (buildpacks.Advanced{}) {
+		if settings == nil {
+			settings = &buildpacks.Settings{Runtime: "go"}
+		}
+		settings.Advanced = &advanced
+	} else if settings != nil {
+		settings.Advanced = nil
+	}
+	settings, err = buildpacks.NormalizeSettings(settings)
+	if err != nil {
+		return contract.NewFault(contract.ValidationFailed, "invalid Buildpacks settings", err.Error())
+	}
+	source.Buildpacks = settings
+	return nil
 }
 
 // validateIdempotencyFlag rejects a malformed key before any vault write, so a
@@ -291,6 +474,7 @@ func askIntRange(title, description, def string, min, max int) (int, error) {
 var definitionRevisionFlags = []string{
 	"node", "build-node", "git-url", "git-ref", "git-credential-file",
 	"git-credential-name", "image", "builder", "context-path", "build-env",
+	"frontend-directory", "frontend-script", "keep-node-runtime", "go-target", "go-version", "go-build-flags", "node-version", "no-frontend",
 	"container-port", "health-type", "health-path", "health-timeout",
 	"release-command", "process", "config", "secret", "domain", "domain-check-path",
 }
@@ -397,6 +581,7 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 		SourceKind: primary.Source.Kind, GitURL: primary.Source.URL, GitRef: primary.Source.Ref,
 		CredentialName: primary.Source.CredentialSecretName, Image: primary.Source.Image,
 		Builder: primary.Source.Builder, ContextPath: primary.Source.ContextPath,
+		GoTargets: primary.Source.GoTargets, Buildpacks: primary.Source.Buildpacks,
 		ContainerPort: primary.ContainerPort, HealthType: primary.Runtime.HealthType,
 		HealthPath: primary.Runtime.HealthPath, HealthTimeout: primary.Runtime.HealthTimeoutSeconds,
 		Processes: primary.Processes, Config: cloneStringMap(primary.Config),
@@ -679,6 +864,16 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			return nil, err
 		}
 		ans.BuildEnv = values
+		source := platform.SourceBinding{}
+		if err := applyBuildpackFlags(cmd, &source); err != nil {
+			return nil, err
+		}
+		if interactive && !buildpackFlagsChanged(cmd) {
+			if err := guidedBuildpacks(&source); err != nil {
+				return nil, err
+			}
+		}
+		ans.GoTargets, ans.Buildpacks = source.GoTargets, source.Buildpacks
 	} else {
 		if ans.Image == "" {
 			value, err := askValidated("Container image", "registry/repository:tag or digest", "", platform.ValidateImage)
@@ -687,7 +882,7 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			}
 			ans.Image = value
 		}
-		if flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || len(flagArray(cmd, "build-env")) > 0 {
+		if flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env") || buildpackFlagsChanged(cmd) {
 			return nil, contract.NewFault(contract.ValidationFailed, "build settings need a git source", "An image source does not run Buildpacks; omit --builder, --context-path and --build-env.")
 		}
 	}
@@ -881,7 +1076,7 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 		if err != nil {
 			return nil, err
 		}
-		line, err := ui.Input("Command", "Executable and arguments, split on spaces; no shell", "")
+		line, err := ui.Input("Command", "Executable and quoted arguments; no shell", "")
 		if err != nil {
 			return nil, err
 		}
@@ -900,7 +1095,11 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 		if err != nil {
 			return nil, err
 		}
-		command, args := splitCommandLine(line)
+		command, args, err := splitCommandLine(line)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, ui.Warn(err.Error()))
+			continue
+		}
 		extras = append(extras, platform.ProcessSpec{
 			Name: name, Kind: kind, Command: command, Args: args, Replicas: replicas, ContainerPort: port,
 		})
@@ -1033,6 +1232,7 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 			Kind: "git", URL: ans.GitURL, Ref: ans.GitRef,
 			CredentialSecretName: ans.CredentialName, ContextPath: ans.ContextPath,
 			Builder: ans.Builder, BuildEnv: ans.BuildEnv,
+			GoTargets: ans.GoTargets, Buildpacks: ans.Buildpacks,
 		}
 	case "image":
 		if err := platform.ValidateImage(ans.Image); err != nil {
@@ -1103,7 +1303,10 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 	if len(domains) > 0 {
 		domainAddresses = mainNodeAddresses(cmd)
 	}
-	releaseCommand := commandSpecFromLine(ans.ReleaseCommand)
+	releaseCommand, err := commandSpecFromLine(ans.ReleaseCommand)
+	if err != nil {
+		return platform.EnvironmentSpec{}, err
+	}
 	if ans.ReleaseArgv != nil {
 		releaseCommand = nil
 		if len(ans.ReleaseArgv) > 0 {
@@ -1192,8 +1395,7 @@ func parseSecretFlags(values []string) (map[string]string, error) {
 }
 
 // parseProcessSpecs parses NAME=KIND:PORT:REPLICAS:COMMAND ARGS. Port,
-// replicas and command are optional; the command line is split on spaces and
-// never runs through a shell.
+// replicas and command are optional; the command line never runs through a shell.
 func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 	if len(values) > 32 {
 		return nil, contract.NewFault(contract.ValidationFailed, "too many processes", "Use at most 32 processes.")
@@ -1239,29 +1441,104 @@ func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 		}
 		command, args := "", []string{}
 		if len(parts) > 3 {
-			command, args = splitCommandLine(parts[3])
+			var err error
+			command, args, err = splitCommandLine(parts[3])
+			if err != nil {
+				return nil, err
+			}
 		}
 		out = append(out, platform.ProcessSpec{Name: name, Kind: kind, Command: command, Args: args, Replicas: replicas, ContainerPort: port})
 	}
 	return out, nil
 }
 
-// splitCommandLine splits an executable and its arguments on spaces. It is not
-// a shell: quoting, expansion and operators have no meaning.
-func splitCommandLine(line string) (string, []string) {
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return "", []string{}
+// splitCommandLine parses quoting only, without shell expansion or execution.
+func splitCommandLine(line string) (string, []string, error) {
+	fields, err := parseCommandArgv(line)
+	if err != nil {
+		return "", nil, err
 	}
-	return fields[0], fields[1:]
+	if len(fields) == 0 {
+		return "", []string{}, nil
+	}
+	return fields[0], fields[1:], nil
 }
 
-func commandSpecFromLine(line string) *platform.CommandSpec {
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return nil
+func commandSpecFromLine(line string) (*platform.CommandSpec, error) {
+	fields, err := parseCommandArgv(line)
+	if err != nil {
+		return nil, err
 	}
-	return &platform.CommandSpec{Argv: fields}
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	return &platform.CommandSpec{Argv: fields}, nil
+}
+
+func parseCommandArgv(line string) ([]string, error) {
+	var fields []string
+	var word strings.Builder
+	var quote rune
+	started, escaped := false, false
+	for _, r := range line {
+		if quote == '\'' {
+			if r == quote {
+				quote = 0
+			} else {
+				word.WriteRune(r)
+			}
+			continue
+		}
+		if escaped {
+			word.WriteRune(r)
+			escaped = false
+			started = true
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			started = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			} else {
+				word.WriteRune(r)
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			started = true
+			continue
+		}
+		if unicode.IsSpace(r) {
+			if started {
+				fields = append(fields, word.String())
+				word.Reset()
+				started = false
+			}
+			continue
+		}
+		word.WriteRune(r)
+		started = true
+	}
+	if escaped || quote != 0 {
+		return nil, contract.NewFault(contract.ValidationFailed, "invalid command quoting", "Close all quotes and escape sequences; commands are argv, not shell expressions.")
+	}
+	if started {
+		fields = append(fields, word.String())
+	}
+	return fields, nil
+}
+
+func formatCommandArgv(argv []string) string {
+	parts := make([]string, len(argv))
+	for i, arg := range argv {
+		parts[i] = "\"" + strings.NewReplacer("\\", "\\\\", "\"", "\\\"").Replace(arg) + "\""
+	}
+	return strings.Join(parts, " ")
 }
 
 // validateGitURLShape checks the parts every node can agree on without reading

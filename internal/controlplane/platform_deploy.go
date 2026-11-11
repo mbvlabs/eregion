@@ -225,7 +225,7 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	}
 	payload := platform.PackPayload{
 		Step: deploymentPackStep, Image: release.Image,
-		Builder: buildInfo.Builder, Env: buildInfo.Env, TimeoutSeconds: 900,
+		Builder: buildInfo.Builder, Env: buildInfo.Env, GoTargets: buildInfo.GoTargets, Buildpacks: buildInfo.Buildpacks, TimeoutSeconds: 900,
 		Cache:       platform.BuildpackCacheVolume(release.App, release.Environment),
 		LaunchCache: platform.BuildpackLaunchCacheVolume(release.App, release.Environment),
 	}
@@ -256,6 +256,9 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
 		return release, errPlatformCancelled
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return release, err
+	}
 	w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
 		fmt.Sprintf("build_running on node %s; %d of %d build slot(s) in use; %s", buildNode.Name, 1, limit, build.Source.Type))
 	buildSecrets := map[string]string{}
@@ -282,6 +285,9 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	}
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
 		return release, errPlatformCancelled
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return release, err
 	}
 	commit := stepResultString(result, "commit")
 	if build.Source.Type == "git" && commit == "" {
@@ -327,6 +333,9 @@ func (w *platformWorker) verifyReleaseImage(ctx context.Context, id contract.Ope
 		}, nil); err != nil {
 			return release, err
 		}
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return release, err
 	}
 	result, err := w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
 		Step:           deploymentImageStep,
@@ -529,6 +538,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
 			contract.NewFault(contract.PreconditionFailed, "deployment has no environment revision", "Deploy with an environment that has a current revision."))
 	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+	}
 
 	// Preflight verifies the immutable image is present on the application node.
 	if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentPreflightStep, platform.ArgvPayload{
@@ -539,6 +551,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
 	}
 
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+	}
 	network := platform.EnvironmentNetwork(env.ID)
 	if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentNetworkStep, platform.ArgvPayload{
 		Step: deploymentNetworkStep,
@@ -578,6 +593,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
 				contract.NewFault(contract.PreconditionFailed, "release command has not succeeded for this release", "Deploy the release first; restart, scale and rollback never run the release command."))
 		default:
+			if err := w.service.checkCancelled(ctx, id); err != nil {
+				return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+			}
 			if err := w.service.startReleaseCommandRun(ctx, release.ID, digest, id); err != nil {
 				return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
 			}
@@ -621,6 +639,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, allCandidates, cause)
 	}
 	for _, planned := range plan {
+		if err := w.service.checkCancelled(ctx, id); err != nil {
+			return failWithCandidates(err)
+		}
 		processEnv := cloneMap(containerEnv)
 		if planned.Publish {
 			processEnv["PORT"] = fmt.Sprint(planned.ContainerPort)
@@ -652,6 +673,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		instance.HostPort = stepResultInt(result, "host_port")
 		instance.ContainerID = stepResultString(result, "container_id")
 		if planned.Publish && instance.HostPort == 0 {
+			if err := w.service.checkCancelled(ctx, id); err != nil {
+				return failWithCandidates(err)
+			}
 			portStep := portStepID(planned.Name)
 			portResult, portErr := w.runStepOn(ctx, tr, id, attempt, portStep, platform.ArgvPayload{
 				Step: portStep, Argv: []string{"docker", "port", planned.Name, fmt.Sprintf("%d/tcp", planned.ContainerPort)},
@@ -674,6 +698,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	for _, instance := range instances {
 		if instance.Kind != "web" {
 			continue
+		}
+		if err := w.service.checkCancelled(ctx, id); err != nil {
+			return failWithCandidates(err)
 		}
 		target := deploymentHealthTarget(env, instance.HostPort)
 		healthResult, healthErr := w.runStepOn(ctx, tr, id, attempt, healthStepID(instance.Process, instance.Replica), platform.HealthPayload{
@@ -701,6 +728,12 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	// that the apply happened; route writers read this owner field only.
 	owner, err = w.service.setDeploymentOwnerRoute(ctx, owner, dep.ID, deploymentOwnerSwitching, attempt)
 	if err != nil {
+		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, allCandidates, err)
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			return w.cancelOwnedDeployment(ctx, id, attempt)
+		}
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, allCandidates, err)
 	}
 	switched, err := w.service.runControlStep(ctx, id, attempt, deploymentRouteStep, map[string]any{
@@ -750,12 +783,12 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 			ReleaseID: string(release.ID), ServingReleaseID: string(release.ID),
 			Message: "Caddy now load balances release " + string(release.ID) + " across " + fmt.Sprint(len(candidateUpstreams)) + " web replica(s).",
 		})
-		if err := w.service.checkCancelled(ctx, id); err != nil {
-			if errors.Is(err, errPlatformCancelled) {
-				return w.cancelOwnedDeployment(ctx, id, attempt)
-			}
-			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, allCandidates, err)
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			return w.cancelOwnedDeployment(ctx, id, attempt)
 		}
+		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, allCandidates, err)
 	}
 	publicPath := w.service.primaryCheckPath(ctx, env)
 	if _, err := w.service.runControlStep(ctx, id, attempt, deploymentPublicStep, map[string]any{
@@ -800,6 +833,12 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	// periodic route maintenance can no longer point Caddy back at containers
 	// this deploy is about to remove.
 	if err := w.service.recordServing(ctx, env, release, dep, instances); err != nil {
+		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, allCandidates, err)
+	}
+	if err := w.service.checkCancelled(ctx, id); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			return w.cancelOwnedDeployment(ctx, id, attempt)
+		}
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, allCandidates, err)
 	}
 	resync := w.service.syncRoutes
