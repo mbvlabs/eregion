@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -23,6 +24,24 @@ func TestMigration005MatchesVaultSchema(t *testing.T) {
 	}
 	if requiredVersion() != len(migrations) {
 		t.Fatalf("required schema version = %d, want %d", requiredVersion(), len(migrations))
+	}
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
+			files = append(files, entry.Name())
+		}
+	}
+	if len(files) != len(migrations) {
+		t.Fatalf("migration files = %d, registered migrations = %d; register every SQL migration", len(files), len(migrations))
+	}
+	for index, name := range files {
+		if migrations[index].name != name || strings.TrimSpace(migrations[index].sql) == "" {
+			t.Fatalf("migration %s is missing or empty in the registry", name)
+		}
 	}
 }
 

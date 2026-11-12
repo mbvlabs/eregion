@@ -184,7 +184,7 @@ func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIden
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Current != 27 || plan.Required != 29 {
+	if plan.Current != 27 || plan.Required != 31 {
 		t.Fatalf("pre-028 plan = %+v", plan)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
@@ -222,7 +222,7 @@ func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIden
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Current != 29 || plan.Required != 29 {
+	if plan.Current != 31 || plan.Required != 31 {
 		t.Fatalf("post-migration plan = %+v", plan)
 	}
 	var rows int
