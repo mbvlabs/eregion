@@ -20,6 +20,7 @@ type domainDNSLedgerFixture struct {
 	records                 map[string]integrations.DNSRecord
 	reappearDelete          bool
 	failReadAfterDelete     bool
+	failReadHost            string
 	failDeleteHost          string
 	failReadAfterDeleteHost string
 	afterDelete             func()
@@ -40,6 +41,10 @@ func (f *domainDNSLedgerFixture) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	switch r.Method {
 	case http.MethodGet:
+		if f.failReadHost != "" && r.URL.Query().Get("name") == f.failReadHost {
+			http.Error(w, "injected hostname read failure", http.StatusInternalServerError)
+			return
+		}
 		values := make([]integrations.DNSRecord, 0, len(f.records))
 		for _, record := range f.records {
 			values = append(values, record)

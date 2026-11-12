@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -239,17 +240,27 @@ func TestIntegrationMultiBindingDNSCleanupPreflightsAll(t *testing.T) {
 	s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-preflight")
 	fixture.mu.Lock()
 	fixture.records["foreign-b"] = integrations.DNSRecord{ID: "foreign-b", Name: "b.example.com", Type: "CNAME", Content: "other.example.net", TTL: 1, Comment: "manual"}
+	// External records are preserved, not a cleanup refusal. A failed read of
+	// the later binding must still stop cleanup before any owned record changes.
+	fixture.failReadHost = "b.example.com"
+	before := maps.Clone(fixture.records)
 	fixture.mu.Unlock()
 	w := &platformWorker{service: s}
 	_ = w.deleteEnvironment(ctx, deleteOp.ID, deleteOp.Attempt, "multi-preflight", "test")
 	if transport.runCount("platform-delete-01-v1") != 0 {
-		t.Fatal("workload was removed after preflight conflict")
+		t.Fatal("workload was removed after preflight read failure")
 	}
 	if !providerRecordPresent(fixture, "a.example.com") || !providerRecordPresent(fixture, "b.example.com") {
-		t.Fatal("preflight conflict mutated provider records")
+		t.Fatal("preflight read failure mutated provider records")
+	}
+	fixture.mu.Lock()
+	unchanged := maps.Equal(before, fixture.records)
+	fixture.mu.Unlock()
+	if !unchanged {
+		t.Fatal("preflight read failure changed owned or external provider records")
 	}
 	if _, err := s.environment(ctx, "multi-preflight", "test"); err != nil {
-		t.Fatalf("environment was removed after preflight conflict: %v", err)
+		t.Fatalf("environment was removed after preflight read failure: %v", err)
 	}
 	text := operationEventText(t, s, deleteOp.ID)
 	if !strings.Contains(text, "preflight refused") || !strings.Contains(text, "no workload was removed") {
