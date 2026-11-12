@@ -3,6 +3,8 @@ package node
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -92,6 +94,112 @@ func TestConcurrentRunsApplyOnce(t *testing.T) {
 	}
 	if got := countEffects(t, local.dispatcher.engine.StateDir, exec); got != 1 {
 		t.Fatalf("duplicate effect: %d", got)
+	}
+}
+
+func TestRunReportsObservedOwnerNotRequestAttempt(t *testing.T) {
+	local, err := NewLocal(t.TempDir(), "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := execution(t, DiagnosticStepID(1), 1)
+	local.dispatcher.engine.LockTimeout = 30 * time.Millisecond
+	done := make(chan Response, 1)
+	go func() {
+		response, callErr := local.Call(context.Background(), runRequest(t, first, 1000), nil)
+		if callErr != nil {
+			t.Error(callErr)
+		}
+		done <- response
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status, statusErr := local.Call(context.Background(), Request{Method: MethodStatus, RequestID: "status", Execution: first}, nil)
+		if statusErr != nil {
+			t.Fatal(statusErr)
+		}
+		if status.Status == engine.StatusRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("never observed a running owner: %+v", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A second attempt asks to attach. The response must name the live owner,
+	// never the attempt that only made the request.
+	second := first
+	second.Attempt = 2
+	response, err := local.Call(context.Background(), runRequest(t, second, 1000), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusRunning {
+		t.Fatalf("attach response = %+v, want running", response)
+	}
+	if response.ExecutionID != first.ExecutionID() {
+		t.Fatalf("attach execution id = %q, want observed %q", response.ExecutionID, first.ExecutionID())
+	}
+	if response.Attempt != first.Attempt {
+		t.Fatalf("attach attempt = %d, want observed %d", response.Attempt, first.Attempt)
+	}
+	if response.Phase == "" {
+		t.Fatalf("attach response did not carry a phase: %+v", response)
+	}
+	if completed := <-done; completed.Status != engine.StatusCompleted {
+		t.Fatalf("owner did not complete: %+v", completed)
+	}
+}
+
+func TestRunReportsDeferredHostLockWait(t *testing.T) {
+	local, err := NewLocal(t.TempDir(), "local", &secrets.Registry{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	release, err := engine.Acquire(ctx, filepath.Join(local.dispatcher.engine.StateDir, "host.lock"), engine.LockExclusive, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local.dispatcher.engine.LockTimeout = 30 * time.Millisecond
+	exec := execution(t, DiagnosticStepID(1), 1)
+	response, err := local.Call(ctx, runRequest(t, exec, 0), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusDeferred {
+		t.Fatalf("host-lock timeout = %+v, want deferred", response)
+	}
+	if response.ExecutionID != exec.ExecutionID() {
+		t.Fatalf("deferred execution id = %q, want %q", response.ExecutionID, exec.ExecutionID())
+	}
+	if response.Phase != engine.PhaseWaitingHostLock {
+		t.Fatalf("deferred phase = %q, want %q", response.Phase, engine.PhaseWaitingHostLock)
+	}
+	if response.WaitMS < 0 {
+		t.Fatalf("deferred wait is negative: %d", response.WaitMS)
+	}
+	if response.Status == engine.StatusRunning {
+		t.Fatal("an exited waiter was reported as a live running task")
+	}
+	status, err := local.Call(ctx, Request{Method: MethodStatus, RequestID: "status", Execution: exec}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != engine.StatusDeferred {
+		t.Fatalf("deferred status = %+v, want deferred", status)
+	}
+	if got := countEffects(t, local.dispatcher.engine.StateDir, exec); got != 0 {
+		t.Fatalf("an exited pre-Check/Apply waiter applied %d effects", got)
+	}
+	release()
+	// The same attempt resumes after the host lock is free and applies once.
+	response, err = local.Call(ctx, runRequest(t, exec, 0), nil)
+	if err != nil || response.Status != engine.StatusCompleted || !response.Executed {
+		t.Fatalf("resume after the host lock was released: %+v %v", response, err)
+	}
+	if got := countEffects(t, local.dispatcher.engine.StateDir, exec); got != 1 {
+		t.Fatalf("resume applied %d effects", got)
 	}
 }
 
@@ -282,6 +390,90 @@ func TestRecoveredEffectRecordsTheApplyingAttempt(t *testing.T) {
 	}
 	if response.AppliedAttempt != 1 {
 		t.Fatalf("applied attempt %d, want the attempt that applied the effect (1)", response.AppliedAttempt)
+	}
+}
+
+// failingStep is a real dispatcher step whose Apply classification survives the
+// journal handoff.
+type failingStep struct {
+	exec  engine.Execution
+	cause error
+}
+
+func (s *failingStep) ID() string       { return s.exec.Step }
+func (s *failingStep) Describe() string { return "failing step" }
+func (s *failingStep) Inputs() ([]byte, error) {
+	return json.Marshal(map[string]string{"step": s.exec.Step})
+}
+func (*failingStep) Check(context.Context, engine.Runtime) (engine.CheckResult, error) {
+	return engine.CheckResult{Detail: "always applies"}, nil
+}
+func (s *failingStep) Apply(context.Context, engine.Runtime, engine.Reporter) (engine.ApplyResult, error) {
+	return engine.ApplyResult{}, s.cause
+}
+func (*failingStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
+
+func TestFailedStatusRetainsRetryabilityAcrossAttempts(t *testing.T) {
+	registry := NewStepRegistryWithHost(HostSettings{})
+	registry.Register(
+		func(id string) bool { return id == "retryable-step-v1" || id == "permanent-step-v1" },
+		func(exec engine.Execution, _ json.RawMessage) (engine.Step, error) {
+			cause := errors.New("transient node failure")
+			if exec.Step == "permanent-step-v1" {
+				cause = fmt.Errorf("%w: permanent node failure", engine.ErrPermanent)
+			}
+			return &failingStep{exec: exec, cause: cause}, nil
+		},
+	)
+	dispatcher, err := NewDispatcherWithSteps(t.TempDir(), "local", &secrets.Registry{}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := &Local{dispatcher: dispatcher, name: "local"}
+	request := func(exec engine.Execution) Request {
+		return Request{Method: MethodRun, RequestID: "request", Execution: exec}
+	}
+
+	retryable := execution(t, "retryable-step-v1", 1)
+	first, err := local.Call(context.Background(), request(retryable), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != engine.StatusFailed || !first.Retryable || first.ErrorCode != "internal_error" {
+		t.Fatalf("retryable failure = %+v", first)
+	}
+	if first.Attempt != 1 || first.ExecutionID != retryable.ExecutionID() {
+		t.Fatalf("retryable failure identity = %q/%d, want %q/1", first.ExecutionID, first.Attempt, retryable.ExecutionID())
+	}
+	// The next River attempt asks status first. The journal must still carry
+	// the transient classification, not turn it into a permanent failure.
+	nextAttempt := retryable
+	nextAttempt.Attempt = 2
+	status, err := local.Call(context.Background(), Request{Method: MethodStatus, RequestID: "status", Execution: nextAttempt}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != engine.StatusFailed || !status.Retryable || status.ErrorCode != "internal_error" {
+		t.Fatalf("retryable status after handoff = %+v", status)
+	}
+	if status.ExecutionID != retryable.ExecutionID() || status.Attempt != 1 {
+		t.Fatalf("status observed identity = %q/%d, want the failed owner %q/1", status.ExecutionID, status.Attempt, retryable.ExecutionID())
+	}
+
+	permanent := execution(t, "permanent-step-v1", 1)
+	first, err = local.Call(context.Background(), request(permanent), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != engine.StatusFailed || first.Retryable || first.ErrorCode != "precondition_failed" {
+		t.Fatalf("permanent failure = %+v", first)
+	}
+	status, err = local.Call(context.Background(), Request{Method: MethodStatus, RequestID: "status", Execution: permanent}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != engine.StatusFailed || status.Retryable || status.ErrorCode != "precondition_failed" {
+		t.Fatalf("permanent status after handoff = %+v", status)
 	}
 }
 

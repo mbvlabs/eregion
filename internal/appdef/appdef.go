@@ -20,24 +20,25 @@ import (
 )
 
 // Version is the only accepted file schema version.
-const Version = 1
+const Version = 2
 
 // Definition is one strict eregion.toml document. Pointer fields distinguish an
 // absent value (inherit/default) from an explicitly empty value (clear).
 type Definition struct {
-	Version      *int                   `toml:"version"`
-	App          string                 `toml:"app"`
-	Node         *string                `toml:"node"`
-	BuildNode    *string                `toml:"build_node"`
-	Source       *Source                `toml:"source"`
-	Automation   *Automation            `toml:"automation"`
-	Runtime      *Runtime               `toml:"runtime"`
-	Processes    *[]Process             `toml:"processes"`
-	Config       *map[string]string     `toml:"config"`
-	SecretNames  *[]string              `toml:"secret_names"`
-	Domains      *[]Domain              `toml:"domains"`
-	Resources    *[]Resource            `toml:"resources"`
-	Environments map[string]Environment `toml:"environments"`
+	Version         *int                   `toml:"version"`
+	App             string                 `toml:"app"`
+	ImageRepository *string                `toml:"image_repository"`
+	Node            *string                `toml:"node"`
+	BuildNode       *string                `toml:"build_node"`
+	Source          *Source                `toml:"source"`
+	Automation      *Automation            `toml:"automation"`
+	Runtime         *Runtime               `toml:"runtime"`
+	Processes       *[]Process             `toml:"processes"`
+	Config          *map[string]string     `toml:"config"`
+	SecretNames     *[]string              `toml:"secret_names"`
+	Domains         *[]Domain              `toml:"domains"`
+	Resources       *[]Resource            `toml:"resources"`
+	Environments    map[string]Environment `toml:"environments"`
 
 	invalidResources error
 }
@@ -63,10 +64,9 @@ type Automation struct {
 	WebhookSecretName *string `toml:"webhook_secret_name"`
 }
 
-// Source mirrors platform.SourceBinding. CredentialSecret is a vault NAME; a
-// value is never part of the file.
+// Source is the optional Git build recipe. Absent or empty means the
+// environment has no Git source and deploys explicit artifacts.
 type Source struct {
-	Kind             *string                `toml:"kind"`
 	URL              *string                `toml:"url"`
 	Ref              *string                `toml:"ref"`
 	CredentialSecret *string                `toml:"credential_secret"`
@@ -75,7 +75,6 @@ type Source struct {
 	BuildEnv         *map[string]string     `toml:"build_env"`
 	GoTargets        *[]buildpacks.GoTarget `toml:"targets"`
 	Buildpacks       *BuildpackSettings     `toml:"buildpacks"`
-	Image            *string                `toml:"image"`
 
 	buildpacksSpecified bool
 }
@@ -161,12 +160,13 @@ type ResourceHealth struct {
 // the corresponding server state alone; an explicit empty collection is set
 // and clears it.
 type Resolved struct {
-	App          string
-	Environment  string
-	Node         string
-	NodeSet      bool
-	BuildNode    string
-	BuildNodeSet bool
+	App             string
+	ImageRepository string
+	Environment     string
+	Node            string
+	NodeSet         bool
+	BuildNode       string
+	BuildNodeSet    bool
 
 	Source     *Source
 	Automation *Automation
@@ -315,9 +315,9 @@ func markPresence(definition *Definition, present map[string]any) {
 
 func markSourcePresence(source *Source, present map[string]any) {
 	for key, target := range map[string]**string{
-		"kind": &source.Kind, "url": &source.URL, "ref": &source.Ref,
+		"url": &source.URL, "ref": &source.Ref,
 		"credential_secret": &source.CredentialSecret, "context_path": &source.ContextPath,
-		"builder": &source.Builder, "image": &source.Image,
+		"builder": &source.Builder,
 	} {
 		if hasKey(present, key) && *target == nil {
 			*target = ptrValue("")
@@ -423,6 +423,13 @@ func (d Definition) Resolve(environment string) (*Resolved, error) {
 	}
 
 	resolved := &Resolved{App: d.App, Environment: environment}
+	if d.ImageRepository != nil {
+		repository, err := platform.NormalizeImageRepository(*d.ImageRepository)
+		if err != nil {
+			return nil, fmt.Errorf("image_repository: %w", err)
+		}
+		resolved.ImageRepository = repository
+	}
 	if err := resolved.apply(FileLayer{
 		Node: d.Node, BuildNode: d.BuildNode, Source: d.Source, Automation: d.Automation, Runtime: d.Runtime,
 		Processes: d.Processes, Config: d.Config, SecretNames: d.SecretNames, Domains: d.Domains, Resources: d.Resources,
@@ -483,14 +490,16 @@ func (r *Resolved) apply(layer FileLayer) error {
 		r.BuildNode, r.BuildNodeSet = *layer.BuildNode, true
 	}
 	if layer.Source != nil {
-		if r.Source == nil {
+		if sourceLayerIsEmpty(layer.Source) {
+			// An explicitly empty [source] table clears the Git build recipe
+			// instead of inheriting every shared field.
 			r.Source = &Source{}
-		} else if layer.Source.Kind != nil && r.Source.Kind != nil && *layer.Source.Kind != *r.Source.Kind {
-			// A kind change starts a fresh source so stale git/image fields
-			// cannot leak into the new declaration.
-			r.Source = &Source{}
+		} else {
+			if r.Source == nil {
+				r.Source = &Source{}
+			}
+			mergeSource(r.Source, layer.Source)
 		}
-		mergeSource(r.Source, layer.Source)
 	}
 	if layer.Runtime != nil {
 		if r.Runtime == nil {
@@ -552,10 +561,13 @@ func (r *Resolved) apply(layer FileLayer) error {
 	return nil
 }
 
+func sourceLayerIsEmpty(source *Source) bool {
+	return source.URL == nil && source.Ref == nil && source.CredentialSecret == nil &&
+		source.ContextPath == nil && source.Builder == nil && source.BuildEnv == nil &&
+		source.GoTargets == nil && source.Buildpacks == nil && !source.buildpacksSpecified
+}
+
 func mergeSource(dst, src *Source) {
-	if src.Kind != nil {
-		dst.Kind = src.Kind
-	}
 	if src.URL != nil {
 		dst.URL = src.URL
 	}
@@ -570,9 +582,6 @@ func mergeSource(dst, src *Source) {
 	}
 	if src.Builder != nil {
 		dst.Builder = src.Builder
-	}
-	if src.Image != nil {
-		dst.Image = src.Image
 	}
 	if src.BuildEnv != nil {
 		if dst.BuildEnv == nil {
@@ -671,57 +680,20 @@ func mergeRuntime(dst, src *Runtime) {
 }
 
 func validateSourceShape(source *Source) error {
-	if source.Kind == nil {
-		if source.URL != nil && strings.TrimSpace(*source.URL) != "" &&
-			source.Image != nil && strings.TrimSpace(*source.Image) != "" {
-			return errors.New("source: set only url or image, with a matching kind")
+	if source.URL == nil || strings.TrimSpace(*source.URL) == "" {
+		if source.Ref != nil || source.CredentialSecret != nil || source.ContextPath != nil ||
+			source.Builder != nil || source.BuildEnv != nil || source.GoTargets != nil ||
+			source.Buildpacks != nil || source.buildpacksSpecified {
+			return errors.New("source.url is required for a Git build recipe")
 		}
 		return nil
 	}
-	switch strings.ToLower(strings.TrimSpace(*source.Kind)) {
-	case "git":
-		if source.URL == nil || strings.TrimSpace(*source.URL) == "" {
-			return errors.New("source.url is required for a git source")
-		}
-		if source.Image != nil && strings.TrimSpace(*source.Image) != "" {
-			return errors.New("source.image cannot be set for a git source")
-		}
-	case "image":
-		if source.Image == nil || strings.TrimSpace(*source.Image) == "" {
-			return errors.New("source.image is required for an image source")
-		}
-		if source.URL != nil && strings.TrimSpace(*source.URL) != "" {
-			return errors.New("source.url cannot be set for an image source")
-		}
-		if source.Ref != nil && strings.TrimSpace(*source.Ref) != "" {
-			return errors.New("source.ref cannot be set for an image source")
-		}
-		if source.CredentialSecret != nil && strings.TrimSpace(*source.CredentialSecret) != "" {
-			return errors.New("source.credential_secret cannot be set for an image source")
-		}
-		if source.ContextPath != nil && strings.TrimSpace(*source.ContextPath) != "" {
-			return errors.New("source.context_path cannot be set for an image source")
-		}
-		if source.Builder != nil && strings.TrimSpace(*source.Builder) != "" {
-			return errors.New("source.builder cannot be set for an image source")
-		}
-		if source.BuildEnv != nil && len(*source.BuildEnv) > 0 {
-			return errors.New("source.build_env cannot be set for an image source")
-		}
-		if source.GoTargets != nil || source.Buildpacks != nil || source.buildpacksSpecified {
-			return errors.New("source.targets and source.buildpacks cannot be set for an image source")
-		}
-	default:
-		return errors.New("source.kind: use git or image")
+	binding := sourceBinding(source)
+	if _, err := buildpacks.NormalizeTargets(binding.GoTargets); err != nil {
+		return fmt.Errorf("source.targets: %w", err)
 	}
-	if source.Kind == nil || strings.EqualFold(strings.TrimSpace(*source.Kind), "git") {
-		binding := sourceBinding(source)
-		if _, err := buildpacks.NormalizeTargets(binding.GoTargets); err != nil {
-			return fmt.Errorf("source.targets: %w", err)
-		}
-		if _, err := buildpacks.NormalizeSettings(binding.Buildpacks); err != nil {
-			return fmt.Errorf("source.buildpacks: %w", err)
-		}
+	if _, err := buildpacks.NormalizeSettings(binding.Buildpacks); err != nil {
+		return fmt.Errorf("source.buildpacks: %w", err)
 	}
 	return nil
 }
@@ -952,10 +924,10 @@ func (r *Resolved) CreateSpec(domainAddresses []string) (platform.EnvironmentSpe
 	if node == "" {
 		node = "main"
 	}
-	if r.Source == nil {
-		return platform.EnvironmentSpec{}, errors.New("source is required; add [source] with kind = \"git\" or kind = \"image\"")
+	source := platform.SourceBinding{}
+	if r.Source != nil {
+		source = sourceBinding(r.Source)
 	}
-	source := sourceBinding(r.Source)
 	runtime := platform.RuntimeSpec{
 		Node: node, HealthType: "http", HealthPath: platform.DefaultHealthPath,
 		HealthTimeoutSeconds: platform.DefaultHealthTimeout,
@@ -1007,7 +979,7 @@ func (r *Resolved) CreateSpec(domainAddresses []string) (platform.EnvironmentSpe
 		}
 	}
 	secretNames := append([]string(nil), r.SecretNames...)
-	if r.Source.CredentialSecret != nil && *r.Source.CredentialSecret != "" {
+	if r.Source != nil && r.Source.CredentialSecret != nil && *r.Source.CredentialSecret != "" {
 		for _, name := range secretNames {
 			if name == *r.Source.CredentialSecret {
 				return platform.EnvironmentSpec{}, errors.New("secret_names: the git read credential is not injected into the application")
@@ -1064,9 +1036,6 @@ func validateDomainBinding(name string, addresses []string) error {
 
 func sourceBinding(source *Source) platform.SourceBinding {
 	binding := platform.SourceBinding{}
-	if source.Kind != nil {
-		binding.Kind = strings.ToLower(strings.TrimSpace(*source.Kind))
-	}
 	if source.URL != nil {
 		binding.URL = *source.URL
 	}
@@ -1081,9 +1050,6 @@ func sourceBinding(source *Source) platform.SourceBinding {
 	}
 	if source.Builder != nil {
 		binding.Builder = *source.Builder
-	}
-	if source.Image != nil {
-		binding.Image = *source.Image
 	}
 	if source.BuildEnv != nil {
 		binding.BuildEnv = make(map[string]string, len(*source.BuildEnv))

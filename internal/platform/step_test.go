@@ -59,10 +59,11 @@ func TestProcessCommandArgsUseTheLauncherOnlyForBuildpacksImages(t *testing.T) {
 }
 
 func TestPackPayloadAcceptsGitContextPathOnlyWithAGitSource(t *testing.T) {
-	exec := engine.Execution{OperationID: contract.OperationID("op_" + strings.Repeat("a", 32)), Attempt: 1, Step: "platform-pack-01-v1"}
+	exec := engine.Execution{OperationID: contract.OperationID("op_" + strings.Repeat("a", 32)), Attempt: 1, Step: "platform-pack-02-v1"}
 	payload := PackPayload{
-		Step: "platform-pack-01-v1", Image: "eregion/app-production:abc", Builder: "paketobuildpacks/builder-jammy-base",
-		GitURL: "https://github.com/acme/app.git", GitRef: "main", GitContextPath: "apps/web",
+		Step: "platform-pack-02-v1", Image: "eregion/app-production:abc", Builder: "paketobuildpacks/builder-jammy-base",
+		Registry: "127.0.0.1:5000",
+		GitURL:   "https://github.com/acme/app.git", GitRef: "main", GitContextPath: "apps/web",
 	}
 	raw, _ := json.Marshal(payload)
 	if _, err := buildPackStep(exec, raw); err != nil {

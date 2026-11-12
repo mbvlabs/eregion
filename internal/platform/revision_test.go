@@ -43,7 +43,7 @@ func TestEnvironmentUpdateWebhookIntentIsCanonicalAndNonsecret(t *testing.T) {
 
 func TestValidatePushToDeployRequiresGitHubBranchAndSecretName(t *testing.T) {
 	valid := RevisionState{
-		Source:            SourceBinding{Kind: "git", URL: "https://github.com/acme/api", Ref: "main"},
+		Source:            SourceBinding{URL: "https://github.com/acme/api", Ref: "main"},
 		AutoDeploy:        true,
 		WebhookSecretName: DefaultWebhookSecretName,
 	}
@@ -51,7 +51,7 @@ func TestValidatePushToDeployRequiresGitHubBranchAndSecretName(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, mutate := range map[string]func(*RevisionState){
-		"non-git source": func(state *RevisionState) { state.Source = SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"} },
+		"non-git source": func(state *RevisionState) { state.Source = SourceBinding{} },
 		"non-github source": func(state *RevisionState) {
 			state.Source.URL = "https://gitlab.com/acme/api"
 		},
@@ -79,7 +79,7 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 		"name": "api", "deploy": true,
 		"environments": []map[string]any{{
 			"name": "production", "node": "app-1",
-			"source":  map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source":  map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 			"runtime": map[string]any{"health_path": "/healthz"},
 			"processes": []map[string]any{{
 				"name": "web", "kind": "web", "replicas": 2, "container_port": 3000,
@@ -88,7 +88,7 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 			"secret_names": []string{"DATABASE_URL"},
 		}, {
 			"name": "staging", "node": "app-1",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
 	if err != nil {
@@ -123,7 +123,7 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 
 	if _, err := normalize(KindEnvironmentUpdate, "env/api/production", map[string]any{
 		"node":   "app-2",
-		"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"},
+		"source": map[string]any{"url": "https://github.com/acme/api"},
 		"processes": []map[string]any{{
 			"name": "web", "kind": "web", "container_port": 8080, "replicas": 1,
 		}},
@@ -134,7 +134,7 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 	}
 	for name, input := range map[string]map[string]any{
 		"unknown field":               {"health": map[string]any{"path": "/"}},
-		"bad source":                  {"source": map[string]any{"kind": "git", "url": "http://github.com/acme/api"}},
+		"bad source":                  {"source": map[string]any{"url": "http://github.com/acme/api"}},
 		"bad process":                 {"processes": []map[string]any{{"name": "web", "kind": "web"}}},
 		"bad secret name":             {"secret_names": []string{"database_url"}},
 		"bad retention":               {"retention": map[string]any{"keep_releases": 0}},
@@ -176,7 +176,7 @@ func TestEnvironmentRevisionNormalizers(t *testing.T) {
 func TestNormalizeRevisionStateRejectsSourceCredentialAliasing(t *testing.T) {
 	base := RevisionState{
 		Source: SourceBinding{
-			Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
+			URL: "https://github.com/acme/api", Ref: "main",
 			CredentialSecretName: "GIT_READ_TOKEN",
 		},
 		Runtime: RuntimeSpec{Node: "app-1", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
@@ -217,7 +217,7 @@ func TestNormalizeRevisionStateRejectsSourceCredentialAliasing(t *testing.T) {
 
 func TestEnvironmentRevisionPatchMerge(t *testing.T) {
 	base := RevisionState{
-		Source:      SourceBinding{Kind: "git", URL: "https://github.com/acme/api", Ref: "main"},
+		Source:      SourceBinding{URL: "https://github.com/acme/api", Ref: "main"},
 		Runtime:     RuntimeSpec{Node: "app-1", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
 		Processes:   []ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}, {Name: "worker", Kind: "worker", Command: "bin/worker", Replicas: 1}},
 		Config:      map[string]string{"APP_ENV": "production"},
@@ -258,7 +258,7 @@ func TestEnvironmentRevisionPatchMerge(t *testing.T) {
 
 func TestEnvironmentUpdateExplicitEmptyCollectionsApply(t *testing.T) {
 	base := RevisionState{
-		Source:      SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+		Source:      SourceBinding{},
 		Runtime:     RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
 		Processes:   []ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}, {Name: "worker", Kind: "worker", Command: "bin/worker", Replicas: 1}},
 		Config:      map[string]string{"APP_ENV": "production"},
@@ -355,7 +355,7 @@ func TestRetentionOverrideIsCarriedByOtherRevisionChanges(t *testing.T) {
 
 func TestEvaluateDeployability(t *testing.T) {
 	revision := &EnvironmentRevision{RevisionState: RevisionState{
-		Source:    SourceBinding{Kind: "git", URL: "https://github.com/acme/api"},
+		Source:    SourceBinding{URL: "https://github.com/acme/api"},
 		Runtime:   RuntimeSpec{Node: "app-1", HealthPath: "/"},
 		Processes: []ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
 	}}
@@ -365,7 +365,7 @@ func TestEvaluateDeployability(t *testing.T) {
 	}
 	empty := &EnvironmentRevision{}
 	blocked := EvaluateDeployability(empty, DeployabilityState{DNS: string(DNSWrong)})
-	want := []string{"source", "artifact", "runtime", "web_process", "domain", "dns"}
+	want := []string{"artifact", "runtime", "web_process", "domain", "dns"}
 	if !reflect.DeepEqual(blocked.Missing, want) || blocked.Deployable {
 		t.Fatalf("blocked report=%+v", blocked)
 	}
@@ -389,8 +389,8 @@ func TestEvaluateDeployability(t *testing.T) {
 	if wrong.Deployable || len(wrong.Missing) != 1 || wrong.Missing[0] != "dns" {
 		t.Fatalf("wrong DNS report=%+v", wrong)
 	}
-	if EvaluateDeployability(nil, DeployabilityState{ArtifactReady: true, PrimaryDomain: "api.example.com"}).Missing[0] != "source" {
-		t.Fatal("a nil revision must report a missing source")
+	if EvaluateDeployability(nil, DeployabilityState{ArtifactReady: true, PrimaryDomain: "api.example.com"}).Missing[0] != "runtime" {
+		t.Fatal("a nil revision must report missing runtime state")
 	}
 	// An explicit release supplies its artifact, so it deploys without the
 	// revision's source binding.
@@ -406,7 +406,7 @@ func TestEvaluateDeployability(t *testing.T) {
 	}
 	if fromSource := EvaluateDeployability(noSource, DeployabilityState{
 		ArtifactReady: true, PrimaryDomain: "api.example.com",
-	}); len(fromSource.Missing) != 1 || fromSource.Missing[0] != "source" {
-		t.Fatalf("a source deploy without a binding=%+v", fromSource)
+	}); !fromSource.Deployable {
+		t.Fatalf("a Git-less revision with a ready artifact was not deployable: %+v", fromSource)
 	}
 }

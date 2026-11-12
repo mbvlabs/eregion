@@ -91,18 +91,42 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 		status, err := requestEngine.Run(ctx, step, request.Execution, report)
 		if err != nil {
 			if errors.Is(err, engine.ErrLockHeld) {
+				// The observed task identity is the journal's owner, never the
+				// request attempt that merely asked to join it. A deferral is a
+				// separate nonterminal observation from a live running task.
+				statusName := status.Status
+				if statusName == "" {
+					statusName = engine.StatusRunning
+				}
 				return Response{
-					Status:      engine.StatusRunning,
-					ExecutionID: request.Execution.ExecutionID(),
-					InputsHash:  status.InputsHash,
-					Retryable:   true,
-					Detail:      registry.Redact(status.Detail),
+					Status:         statusName,
+					ExecutionID:    status.ExecutionID,
+					Attempt:        status.Attempt,
+					AppliedAttempt: status.AppliedAttempt,
+					InputsHash:     status.InputsHash,
+					Phase:          status.Phase,
+					PhaseStartedAt: status.PhaseStartedAt,
+					WaitMS:         maxWaitMS(status.WaitMS),
+					Retryable:      true,
+					Detail:         registry.Redact(status.Detail),
 				}, nil
+			}
+			executionID, attempt := status.ExecutionID, status.Attempt
+			if executionID == "" {
+				executionID = request.Execution.ExecutionID()
+			}
+			if attempt == 0 {
+				attempt = request.Execution.Attempt
 			}
 			return Response{
 				Status:         engine.StatusFailed,
-				ExecutionID:    request.Execution.ExecutionID(),
+				ExecutionID:    executionID,
+				Attempt:        attempt,
+				AppliedAttempt: status.AppliedAttempt,
 				InputsHash:     status.InputsHash,
+				Phase:          status.Phase,
+				PhaseStartedAt: status.PhaseStartedAt,
+				WaitMS:         maxWaitMS(status.WaitMS),
 				Retryable:      !permanent(err),
 				InputsMismatch: errors.Is(err, engine.ErrInputsMismatch),
 				ErrorCode:      string(errorCode(err)),
@@ -174,8 +198,20 @@ func ResponseFromStatus(status engine.TaskStatus) Response {
 		Attempt:        status.Attempt,
 		AppliedAttempt: status.AppliedAttempt,
 		InputsHash:     status.InputsHash,
+		Phase:          status.Phase,
+		PhaseStartedAt: status.PhaseStartedAt,
+		WaitMS:         maxWaitMS(status.WaitMS),
 		Executed:       status.Executed,
+		Retryable:      status.Retryable,
+		ErrorCode:      status.ErrorCode,
 		Result:         status.Result,
 		Detail:         status.Detail,
 	}
+}
+
+func maxWaitMS(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }

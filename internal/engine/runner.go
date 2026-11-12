@@ -23,27 +23,53 @@ type Status string
 const (
 	StatusAbsent    Status = "absent"
 	StatusRunning   Status = "running"
+	StatusDeferred  Status = "deferred"
 	StatusStale     Status = "stale"
 	StatusCompleted Status = "completed"
 	StatusFailed    Status = "failed"
 )
 
+// TaskPhase is the typed execution phase persisted with a running task. It
+// makes a benign wait for the node host lock visible without pretending that
+// Check or Apply already started.
+type TaskPhase string
+
+const (
+	// PhaseWaitingHostLock means the task is waiting for the exclusive host
+	// lock before Check/Apply.
+	PhaseWaitingHostLock TaskPhase = "waiting_host_lock"
+	// PhaseChecking means the task holds the host lock and is running Check.
+	PhaseChecking TaskPhase = "checking"
+	// PhaseApplying means Check was incomplete and Apply is in progress.
+	PhaseApplying TaskPhase = "applying"
+)
+
 // TaskStatus is what status/run returns for one effect identity.
 type TaskStatus struct {
-	Status         Status          `json:"status"`
-	ExecutionID    string          `json:"execution_id,omitempty"`
-	Attempt        uint32          `json:"attempt,omitempty"`
-	AppliedAttempt uint32          `json:"applied_attempt,omitempty"`
-	InputsHash     string          `json:"inputs_hash,omitempty"`
-	Executed       bool            `json:"executed"`
-	Result         json.RawMessage `json:"result,omitempty"`
-	Detail         string          `json:"detail,omitempty"`
+	Status         Status    `json:"status"`
+	ExecutionID    string    `json:"execution_id,omitempty"`
+	Attempt        uint32    `json:"attempt,omitempty"`
+	AppliedAttempt uint32    `json:"applied_attempt,omitempty"`
+	InputsHash     string    `json:"inputs_hash,omitempty"`
+	Phase          TaskPhase `json:"phase,omitempty"`
+	PhaseStartedAt string    `json:"phase_started_at,omitempty"`
+	// WaitMS is the accumulated, non-negative host-lock wait observed for this
+	// execution. A live wait grows with the phase start; a deferred exit keeps
+	// the bounded value it persisted.
+	WaitMS    int64           `json:"wait_ms"`
+	ErrorCode string          `json:"error_code,omitempty"`
+	Retryable bool            `json:"retryable,omitempty"`
+	Executed  bool            `json:"executed"`
+	Result    json.RawMessage `json:"result,omitempty"`
+	Detail    string          `json:"detail,omitempty"`
 }
 
 func TaskStatusName(state string) Status {
 	switch state {
 	case TaskRunning:
 		return StatusRunning
+	case TaskDeferred:
+		return StatusDeferred
 	case TaskCompleted:
 		return StatusCompleted
 	case TaskFailed:
@@ -169,16 +195,18 @@ func (e *Engine) Status(ctx context.Context, exec Execution) (TaskStatus, error)
 	if !ok {
 		return TaskStatus{Status: StatusAbsent, ExecutionID: exec.ExecutionID()}, nil
 	}
-	status := TaskStatus{
-		Status:         TaskStatusName(task.Status),
-		ExecutionID:    task.ExecutionID,
-		Attempt:        task.Attempt,
-		AppliedAttempt: task.AppliedAttempt,
-		InputsHash:     task.InputsHash,
-		Result:         task.Result,
-	}
+	status := taskStatusObservation(task)
 	switch task.Status {
 	case TaskCompleted, TaskFailed:
+		return status, nil
+	case TaskDeferred:
+		// The previous attempt exited before Check/Apply. This is a
+		// nonterminal observation, not a live task: the effect lock is free
+		// and no later side effect can appear from that process.
+		status.Status = StatusDeferred
+		if status.Detail == "" {
+			status.Detail = "the previous attempt exited while waiting for the host lock before Check/Apply"
+		}
 		return status, nil
 	case TaskRunning:
 		release, lockErr := Acquire(ctx, e.effectLockPath(exec), LockExclusive, 0)
@@ -199,9 +227,79 @@ func (e *Engine) Status(ctx context.Context, exec Execution) (TaskStatus, error)
 	}
 }
 
+// taskStatusObservation projects the durable task fields into an honest
+// observation. A live host-lock wait grows from its phase start; every other
+// phase keeps the backlog the task recorded when it left the wait.
+func taskStatusObservation(task Task) TaskStatus {
+	status := TaskStatus{
+		Status:         TaskStatusName(task.Status),
+		ExecutionID:    task.ExecutionID,
+		Attempt:        task.Attempt,
+		AppliedAttempt: task.AppliedAttempt,
+		InputsHash:     task.InputsHash,
+		Phase:          task.Phase,
+		PhaseStartedAt: task.PhaseStartedAt,
+		WaitMS:         nonNegativeMillis(task.WaitMS),
+		ErrorCode:      task.ErrorCode,
+		Retryable:      task.Retryable,
+		Detail:         task.Detail,
+		Result:         task.Result,
+	}
+	if status.Detail == "" && task.Error != "" {
+		status.Detail = task.Error
+	}
+	if task.Status == TaskRunning && task.Phase == PhaseWaitingHostLock {
+		if waitingFor, ok := parseTaskTime(task.PhaseStartedAt); ok {
+			status.WaitMS = nonNegativeMillis(status.WaitMS) + elapsedMillis(waitingFor)
+		}
+	}
+	return status
+}
+
+func parseTaskTime(value string) (time.Time, bool) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
+}
+
+// elapsedMillis returns a non-negative duration in milliseconds. A clock that
+// moved backwards reports zero rather than a fabricated negative wait.
+func elapsedMillis(start time.Time) int64 {
+	elapsed := time.Since(start).Milliseconds()
+	if elapsed < 0 {
+		return 0
+	}
+	return elapsed
+}
+
+func nonNegativeMillis(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+// observedTaskStatus returns the journaled task observation for exec without
+// inventing an execution identity. A missing task yields an empty observation.
+func (e *Engine) observedTaskStatus(exec Execution) TaskStatus {
+	journal, err := LoadJournal(e.JournalPath())
+	if err != nil {
+		return TaskStatus{}
+	}
+	task, ok := journal.Tasks[exec.EffectKey()]
+	if !ok {
+		return TaskStatus{}
+	}
+	return taskStatusObservation(task)
+}
+
 // Run acquires the effect lock, reconciles an existing effect, and otherwise
 // runs Check then Apply once. It returns StatusRunning with ErrLockHeld when a
-// live local owner holds the effect longer than the lock timeout.
+// live local owner holds the effect longer than the lock timeout, and
+// StatusDeferred with ErrLockHeld when it exits before Check/Apply while the
+// node host lock is busy.
 func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Reporter) (TaskStatus, error) {
 	if err := exec.Validate(); err != nil {
 		return TaskStatus{}, err
@@ -217,7 +315,26 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	effectLock, err := Acquire(ctx, e.effectLockPath(exec), LockExclusive, e.lockTimeout())
 	if err != nil {
 		if errors.Is(err, ErrLockHeld) {
-			return TaskStatus{Status: StatusRunning, ExecutionID: exec.ExecutionID(), InputsHash: inputsHash, Detail: "another local execution holds the effect lock"}, ErrLockHeld
+			// Never present the request attempt as the observed owner. A live
+			// owner journals its own attempt identity before taking the effect.
+			status := e.observedTaskStatus(exec)
+			if status.InputsHash != "" && status.InputsHash != inputsHash {
+				return status, fmt.Errorf("%w: effect %s has different inputs", ErrInputsMismatch, exec.EffectKey())
+			}
+			if status.Status == StatusCompleted || status.Status == StatusFailed {
+				// The owner finished after this attempt's bounded wait. Report
+				// its terminal observation rather than a stale running claim.
+				if status.InputsHash == "" {
+					status.InputsHash = inputsHash
+				}
+				return status, nil
+			}
+			status.Status = StatusRunning
+			status.InputsHash = inputsHash
+			if status.Detail == "" {
+				status.Detail = "another local execution holds the effect lock"
+			}
+			return status, ErrLockHeld
 		}
 		return TaskStatus{}, err
 	}
@@ -277,24 +394,76 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		ExecutionID: exec.ExecutionID(),
 		RequestID:   exec.RequestID,
 		InputsHash:  inputsHash,
-		Status:      string(StatusRunning),
+		Status:      string(TaskRunning),
 		Owner:       owner,
 		StartedAt:   now(),
 	}
-	if err := e.saveTask(exec, running); err != nil {
-		return TaskStatus{}, err
+	if existing, ok := journal.Tasks[exec.EffectKey()]; ok && existing.Attempt == exec.Attempt {
+		// Resuming the same River attempt keeps its original start time and
+		// accumulated lock wait. A benign waiter that exited must not rewrite
+		// the attempt's history when it is retried.
+		running = existing
+		running.Status = string(TaskRunning)
+		running.Owner = owner
+		running.RequestID = exec.RequestID
+		running.InputsHash = inputsHash
+		running.Detail = ""
+		running.Error = ""
+		running.ErrorCode = ""
+		running.Retryable = false
+		if running.ExecutionID == "" {
+			running.ExecutionID = exec.ExecutionID()
+		}
+		if running.StartedAt == "" {
+			running.StartedAt = now()
+		}
+	} else {
+		running.WaitMS = 0
 	}
 
 	independent, ok := step.(HostLockIndependent)
-	if !ok || !independent.IndependentOfHostLock() {
+	needsHostLock := !ok || !independent.IndependentOfHostLock()
+	if needsHostLock {
+		waitStarted := time.Now()
+		running.Phase = PhaseWaitingHostLock
+		running.PhaseStartedAt = waitStarted.UTC().Format(time.RFC3339Nano)
+		running.WaitMS = nonNegativeMillis(running.WaitMS)
+		if err := e.saveTask(exec, running); err != nil {
+			return TaskStatus{}, err
+		}
 		hostLock, err := Acquire(ctx, e.hostLockPath(), LockExclusive, e.lockTimeout())
 		if err != nil {
 			if errors.Is(err, ErrLockHeld) {
-				return TaskStatus{Status: StatusRunning, ExecutionID: exec.ExecutionID(), InputsHash: inputsHash, Detail: "another local host mutation holds the host lock"}, ErrLockHeld
+				// The process exits before Check or Apply. Persist that explicit
+				// nonterminal state before returning so status does not report a
+				// live owner or a stale interrupted effect.
+				running.Status = string(TaskDeferred)
+				running.WaitMS = nonNegativeMillis(running.WaitMS) + elapsedMillis(waitStarted)
+				running.Detail = "exited while waiting for the host lock before Check/Apply; no effect was attempted"
+				if saveErr := e.saveTask(exec, running); saveErr != nil {
+					return TaskStatus{}, saveErr
+				}
+				return TaskStatus{
+					Status:         StatusDeferred,
+					ExecutionID:    running.ExecutionID,
+					Attempt:        running.Attempt,
+					AppliedAttempt: running.AppliedAttempt,
+					InputsHash:     running.InputsHash,
+					Phase:          PhaseWaitingHostLock,
+					PhaseStartedAt: running.PhaseStartedAt,
+					WaitMS:         running.WaitMS,
+					Detail:         running.Detail,
+				}, ErrLockHeld
 			}
 			return TaskStatus{}, err
 		}
 		defer hostLock()
+		running.WaitMS = nonNegativeMillis(running.WaitMS) + elapsedMillis(waitStarted)
+	}
+	running.Phase = PhaseChecking
+	running.PhaseStartedAt = now()
+	if err := e.saveTask(exec, running); err != nil {
+		return TaskStatus{}, err
 	}
 
 	// Check again after locking: another effect may have changed state.
@@ -304,12 +473,23 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	}
 	executed := false
 	result := ApplyResult{}
+	if check.Complete && check.Result != nil {
+		// A recovered Check result is the only durable evidence available after
+		// a crash between the effect and the engine's record. Apply did not run
+		// in this attempt, so it must not replace it.
+		result.Result = check.Result
+	}
 	if !check.Complete {
 		message := "applying: " + check.Detail
 		if progress, ok := step.(ApplyProgress); ok {
 			if description := progress.ApplyProgressMessage(); description != "" {
 				message = description
 			}
+		}
+		running.Phase = PhaseApplying
+		running.PhaseStartedAt = now()
+		if err := e.saveTask(exec, running); err != nil {
+			return TaskStatus{}, err
 		}
 		report.emit(Event{Kind: "log", Step: step.ID(), Message: message})
 		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), SecretValues: e.SecretValues, Root: e.StateDir}, report)
@@ -427,8 +607,11 @@ func (e *Engine) completeFromRecord(exec Execution, record EffectRecord) error {
 
 func (e *Engine) fail(exec Execution, task Task, cause error) (TaskStatus, error) {
 	message := e.registry().Redact(cause.Error())
+	errorCode, retryable := failureClassification(cause)
 	task.Status = TaskFailed
 	task.Error = message
+	task.ErrorCode = errorCode
+	task.Retryable = retryable
 	task.CompletedAt = now()
 	if err := updateJournal(e.JournalPath(), e.registry(), func(journal *Journal) {
 		journal.Node = e.Node
@@ -439,12 +622,28 @@ func (e *Engine) fail(exec Execution, task Task, cause error) (TaskStatus, error
 		}
 		current.Status = TaskFailed
 		current.Error = message
+		current.ErrorCode = errorCode
+		current.Retryable = retryable
 		current.CompletedAt = task.CompletedAt
 		journal.Tasks[exec.EffectKey()] = current
 	}); err != nil {
 		return TaskStatus{}, errors.Join(cause, err)
 	}
-	return TaskStatus{Status: StatusFailed, ExecutionID: exec.ExecutionID(), Attempt: exec.Attempt, InputsHash: task.InputsHash, Detail: message}, cause
+	return TaskStatus{
+		Status: StatusFailed, ExecutionID: exec.ExecutionID(), Attempt: exec.Attempt,
+		InputsHash: task.InputsHash, ErrorCode: errorCode, Retryable: retryable, Detail: message,
+	}, cause
+}
+
+// failureClassification mirrors the node dispatcher's classification without
+// importing it (the node package imports the engine). It keeps retryability
+// durable in the journal so a later status observation does not turn a
+// transient failure into a permanent one.
+func failureClassification(cause error) (string, bool) {
+	if errors.Is(cause, ErrPermanent) || errors.Is(cause, ErrInputsMismatch) || errors.Is(cause, ErrJournalCorrupt) {
+		return "precondition_failed", false
+	}
+	return "internal_error", true
 }
 
 func claimToken() (string, error) {

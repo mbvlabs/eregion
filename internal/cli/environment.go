@@ -16,14 +16,14 @@ import (
 
 func (a *app) envSpecs() []spec {
 	parent := operationMeta("Create and inspect application environments", "eregion env list --app api --json")
-	parent.WhenToUse = []string{"Manage the unit of deployment: its source binding, runtime, processes and domains."}
+	parent.WhenToUse = []string{"Manage the unit of deployment: its optional Git build recipe, runtime, processes and domains."}
 
 	create := followingMeta(operationMeta("Create an environment with its first desired-state revision", "eregion env create --app api --name production --node main --git-url https://github.com/acme/api --json"))
 	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup. The first deploy is queued from the new revision unless --no-deploy. JSON and no-TTY take every value from flags and never prompt."}
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
 		"app", "name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
-		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
+		"git-credential-name", "github-auth", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
 		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version",
@@ -38,11 +38,11 @@ func (a *app) envSpecs() []spec {
 
 	update := followingMeta(operationMeta("Change an environment as a new desired-state revision", "eregion env update api production --git-ref release-2026-10 --json"))
 	update.WhenToUse = []string{"Change source, placement, runtime or the process formation as a new immutable revision. In a terminal with no change flags it walks the current revision prefilled, shows the diff and confirms; with flags or JSON/no TTY it is flag-only. Plain config uses config set; secret names use secret set. No deploy is queued. --github-auth reads the local authenticated gh token for a github.com source as the new read credential; it is opt-in because that token may carry broader scopes. With an authenticated gh, --github-webhook creates or updates the repository webhook for --auto-deploy or --rotate-webhook-secret; manual paste remains the fallback."}
-	update.WhenToUse = append(update.WhenToUse, "Git Buildpacks settings include ordered --buildpack references and optional Go and Node inputs; image sources bypass builds. --build-env '', --target '' and --buildpack '' clear their respective lists. App export --inspect is not applicable.", "With --from, use --dry-run to plan, then submit the exact plan nonce and digest with a stable idempotency key. Removal requires --confirm app/environment. No deploy is queued; --confirm-domain is not supported.")
+	update.WhenToUse = append(update.WhenToUse, "Git Buildpacks settings include ordered --buildpack references and optional Go and Node inputs; image artifacts are selected at deploy time, not stored in the revision. --build-env '', --target '' and --buildpack '' clear their respective lists. App export --inspect is not applicable.", "With --from, use --dry-run to plan, then submit the exact plan nonce and digest with a stable idempotency key. Removal requires --confirm app/environment. No deploy is queued; --confirm-domain is not supported.")
 	update.Mutating, update.DryRun, update.Prompts = true, true, true
 	update.InputFlags = []string{
 		"node", "build-node", "git-url", "git-ref", "git-credential-file", "git-credential-name", "github-auth",
-		"image", "builder", "context-path", "build-env", "health-type", "health-path", "health-timeout",
+		"builder", "context-path", "build-env", "health-type", "health-path", "health-timeout",
 		"release-command", "process", "from", "github-webhook", "plan-nonce", "confirm-plan", "idempotency-key", "confirm", "detach",
 		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version",
 	}
@@ -229,7 +229,6 @@ func addEnvironmentUpdateFlags(cmd *cobra.Command) {
 	f.String("git-credential-file", "", "Protected 0600 file containing a new repository read token")
 	f.String("git-credential-name", "", "Vault secret name for the read token; empty clears the name")
 	f.Bool("github-auth", false, "Use the local authenticated gh token as the github.com read credential (opt-in; broader scopes may apply)")
-	f.String("image", "", "Existing OCI image reference; replaces a git source")
 	f.String("builder", "", "Buildpacks builder image; empty resets to the build node's platform default")
 	f.String("context-path", "", "Build context path inside the repository")
 	f.StringArray("build-env", nil, "Buildpacks environment KEY=VALUE (repeatable; replaces the map)")
@@ -264,6 +263,17 @@ func (a *app) envCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		return result{}, setupPromptError("env create", err)
 	}
 	defer ans.clearSecrets()
+	if ans.ImageRepository != "" {
+		appRecord, err := a.findApp(cmd, ans.App)
+		if err != nil {
+			return result{}, err
+		}
+		if appRecord.ImageRepository != ans.ImageRepository {
+			return result{}, contract.NewFault(contract.ValidationFailed,
+				"environment definition cannot change the app image repository",
+				"The image repository is app-level immutable metadata; remove image_repository from the environment's definition.")
+		}
+	}
 	spec, err := ans.environmentSpec(cmd)
 	if err != nil {
 		return result{}, err
@@ -866,7 +876,6 @@ func (a *app) buildEnvironmentUpdate(cmd *cobra.Command, current platform.Enviro
 }
 
 func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding, current platform.Environment) (platform.SourceBinding, bool, []byte, string, error) {
-	imageChanged := flagChanged(cmd, "image")
 	githubAuth := githubAuthRequested(cmd)
 	runtimeSecrets, webhookSecret := revisionCredentialRoles(current)
 	if githubAuth && flagChanged(cmd, "git-credential-file") {
@@ -877,31 +886,24 @@ func (a *app) readUpdateSource(cmd *cobra.Command, base platform.SourceBinding, 
 	gitChanged := githubAuth || flagChanged(cmd, "git-url") || flagChanged(cmd, "git-ref") ||
 		flagChanged(cmd, "git-credential-file") || flagChanged(cmd, "git-credential-name") ||
 		flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env") || buildpackFlagsChanged(cmd)
-	if !imageChanged && !gitChanged {
+	if !gitChanged {
 		return platform.SourceBinding{}, false, nil, "", nil
-	}
-	if imageChanged && gitChanged {
-		return platform.SourceBinding{}, false, nil, "", contract.NewFault(contract.ValidationFailed, "choose one source", "Use --image or a git flag, not both.")
-	}
-	if imageChanged {
-		image := flagString(cmd, "image")
-		if image == "" {
-			return platform.SourceBinding{}, false, nil, "", contract.NewFault(contract.ValidationFailed, "an image source is empty", "Pass a registry/repository:tag or digest reference.")
-		}
-		source := platform.SourceBinding{Kind: "image", Image: image}
-		return source, true, nil, "", nil
 	}
 
 	source := platform.SourceBinding{}
-	if base.Kind == "git" {
+	if base.URL != "" {
 		source = platform.CloneRevisionState(platform.RevisionState{Source: base}).Source
 	}
-	source.Kind = "git"
 	if flagChanged(cmd, "git-url") {
 		source.URL = flagString(cmd, "git-url")
 	}
 	if source.URL == "" {
-		return platform.SourceBinding{}, false, nil, "", contract.NewFault(contract.ValidationFailed, "a git source needs a repository URL", "Pass --git-url with the HTTPS repository URL.")
+		if flagChanged(cmd, "git-url") && !flagChanged(cmd, "git-ref") && !flagChanged(cmd, "builder") &&
+			!flagChanged(cmd, "context-path") && !flagChanged(cmd, "build-env") && !buildpackFlagsChanged(cmd) &&
+			!flagChanged(cmd, "git-credential-name") && !flagChanged(cmd, "git-credential-file") && !githubAuth {
+			return platform.SourceBinding{}, true, nil, "", nil
+		}
+		return platform.SourceBinding{}, false, nil, "", contract.NewFault(contract.ValidationFailed, "a Git build recipe needs a repository URL", "Pass --git-url with the HTTPS repository URL, or clear it with --git-url '' to remove the Git source.")
 	}
 	if err := validateGitURLShape(source.URL); err != nil {
 		return platform.SourceBinding{}, false, nil, "", err

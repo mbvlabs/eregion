@@ -166,6 +166,20 @@ func ValidateImage(image string) error {
 	return nil
 }
 
+// IsImageDigestReference reports whether image names an immutable manifest
+// digest. A repository:tag alone is mutable and is never accepted as a
+// retained registry artifact identity.
+func IsImageDigestReference(image string) bool {
+	if ValidateImage(image) != nil {
+		return false
+	}
+	index := strings.LastIndexByte(image, '@')
+	if index <= 0 || index == len(image)-1 {
+		return false
+	}
+	return registryDigestPattern.MatchString(image[index+1:])
+}
+
 type TargetKind string
 
 const (

@@ -316,7 +316,7 @@ func (w *platformWorker) createDefinitionChild(ctx context.Context, parent contr
 	if _, err := tx.Exec(ctx, `UPDATE eregion_definition_steps SET child_operation_id=$3 WHERE parent_operation_id=$1 AND ordinal=$2`, op.ID, ordinal, id); err != nil {
 		return err
 	}
-	result, err := w.service.recordPlatformSubmissionTx(ctx, tx, id, n, op.Actor, fmt.Sprintf("definition:%s:%d", op.ID, ordinal), nil, "", nil)
+	result, err := w.service.recordPlatformSubmissionTx(ctx, tx, id, n, op.Actor, fmt.Sprintf("definition:%s:%d", op.ID, ordinal), nil, nil, "", nil)
 	if err != nil {
 		return err
 	}

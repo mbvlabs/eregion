@@ -52,7 +52,7 @@ func TestAppCreateFlagsBuildTheFirstRevision(t *testing.T) {
 	if ans.App != "api" || ans.Environment != "production" || ans.Node != "main" || ans.Deploy {
 		t.Fatalf("identity/deploy mismatch: %+v", ans)
 	}
-	if ans.SourceKind != "git" || ans.GitURL != "https://github.com/acme/api" || ans.GitRef != "main" {
+	if ans.GitURL == "" || ans.GitURL != "https://github.com/acme/api" || ans.GitRef != "main" {
 		t.Fatalf("source mismatch: %+v", ans)
 	}
 	if ans.CredentialName != "GIT_READ_TOKEN" || string(ans.CredentialValue) != "read-token" {
@@ -94,6 +94,85 @@ func TestAppCreateFlagsBuildTheFirstRevision(t *testing.T) {
 	}
 }
 
+func TestAppCreateGitLessDefaultsToNoFirstDeploy(t *testing.T) {
+	cmd := &cobra.Command{Use: "create"}
+	cmd.Flags().String("name", "", "app")
+	cmd.Flags().String("image-repository", "", "repository")
+	cmd.Flags().Bool("no-deploy", false, "no deploy")
+	addSetupFlags(cmd, true)
+	if err := cmd.ParseFlags([]string{"--name", "api", "--node", "main", "--image-repository", "mbvlabs/api"}); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{secrets: &secrets.Registry{}}
+	ans, err := a.readSetup(cmd, setupApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ans.clearSecrets()
+	if ans.Deploy {
+		t.Fatal("a Git-less app create requested a first deploy without an explicit selector")
+	}
+	spec, err := ans.environmentSpec(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.Source.URL != "" {
+		t.Fatalf("Git-less app create carried a source: %+v", spec.Source)
+	}
+}
+
+func TestAppCreateGitLessFromFileDefaultsToNoFirstDeploy(t *testing.T) {
+	definition := writeDefinitionFile(t, "version = 2\napp = \"api\"\nnode = \"main\"\nimage_repository = \"mbvlabs/api\"\n")
+	cmd := &cobra.Command{Use: "create"}
+	cmd.Flags().String("name", "", "app")
+	cmd.Flags().String("image-repository", "", "repository")
+	cmd.Flags().Bool("no-deploy", false, "no deploy")
+	addSetupFlags(cmd, true)
+	if err := cmd.ParseFlags([]string{"--from", definition}); err != nil {
+		t.Fatal(err)
+	}
+	a := &app{secrets: &secrets.Registry{}}
+	ans, err := a.readSetup(cmd, setupApp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ans.clearSecrets()
+	if ans.Deploy {
+		t.Fatal("a Git-less file app create requested a first deploy without an explicit selector")
+	}
+}
+
+func TestAppCreateImageOnlyWithoutNoDeploySubmitsNoDeploy(t *testing.T) {
+	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{}}
+	a := newApp()
+	a.backend = backend
+	var stdout, stderr bytes.Buffer
+	exit := runApp(context.Background(), []string{
+		"app", "create", "--name", "api", "--node", "main",
+		"--image-repository", "mbvlabs/api", "--detach", "--json",
+	}, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
+	if exit != 0 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
+	}
+	submissions := backend.submissionsOfKind(platform.KindAppCreate)
+	var actual *definitionSubmission
+	for index := range submissions {
+		if !submissions[index].DryRun {
+			actual = &submissions[index]
+		}
+	}
+	if actual == nil {
+		t.Fatalf("no accepted app create submission: %+v", submissions)
+	}
+	var input platform.AppCreateInput
+	if err := json.Unmarshal(actual.Input, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.Deploy {
+		t.Fatal("image-only app create implicitly requested a first deploy")
+	}
+}
+
 func TestAppCreateBuildsProtectedProductionAndStagingAtomically(t *testing.T) {
 	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{}}
 	a := newApp()
@@ -101,7 +180,7 @@ func TestAppCreateBuildsProtectedProductionAndStagingAtomically(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	exit := runApp(context.Background(), []string{
 		"app", "create", "--name", "api", "--node", "main",
-		"--image", "ghcr.io/acme/api:1", "--domain", "api.example.com", "--detach", "--json",
+		"--image-repository", "mbvlabs/api", "--domain", "api.example.com", "--no-deploy", "--detach", "--json",
 	}, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
 	if exit != 0 {
 		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout.String(), stderr.String())
@@ -180,11 +259,11 @@ func TestSetupSecretWritesRespectEnvironmentSpecificNames(t *testing.T) {
 	}
 	prod := platform.EnvironmentSpec{
 		Name: "production", SecretNames: []string{"PROD_ONLY"},
-		Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", CredentialSecretName: "PROD_GIT"},
+		Source: platform.SourceBinding{URL: "https://github.com/acme/api", CredentialSecretName: "PROD_GIT"},
 	}
 	stage := platform.EnvironmentSpec{
 		Name: "staging", SecretNames: []string{"STAGE_ONLY"},
-		Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", CredentialSecretName: "STAGE_GIT"},
+		Source: platform.SourceBinding{URL: "https://github.com/acme/api", CredentialSecretName: "STAGE_GIT"},
 	}
 	if _, err := a.writeSetupSecretsForEnvironments(&cobra.Command{}, ans, []platform.EnvironmentSpec{prod, stage}); err != nil {
 		t.Fatal(err)
@@ -266,11 +345,11 @@ func TestCreateRejectsConflictingProtectionFlags(t *testing.T) {
 		args []string
 	}{
 		{name: "app create", args: []string{
-			"app", "create", "--name", "api", "--image", "ghcr.io/acme/api:1",
+			"app", "create", "--name", "api",
 			"--protected", "--unprotected", "--json",
 		}},
 		{name: "env create", args: []string{
-			"env", "create", "--app", "api", "--name", "production", "--image", "ghcr.io/acme/api:1",
+			"env", "create", "--app", "api", "--name", "production",
 			"--unprotected", "--protected", "--json",
 		}},
 		{name: "app create from file", args: []string{
@@ -338,16 +417,18 @@ func TestEnvProtectionRequiresFactorOnlyToLowerProtection(t *testing.T) {
 	}
 }
 
-func TestAppCreateImageSourceUsesTheDefaultWebProcess(t *testing.T) {
+func TestAppCreateImageRepositoryUsesTheDefaultWebProcess(t *testing.T) {
 	cmd := &cobra.Command{Use: "create"}
 	cmd.Flags().String("name", "", "app")
 	cmd.Flags().String("environment", "production", "environment")
+	cmd.Flags().String("image-repository", "", "repository")
 	cmd.Flags().Bool("no-deploy", false, "no deploy")
 	addSetupFlags(cmd, true)
 	if err := cmd.ParseFlags([]string{
 		"--name", "api",
 		"--node", "main",
-		"--image", "ghcr.io/acme/api:2026-10-20",
+		"--image-repository", "mbvlabs/api",
+		"--no-deploy",
 		"--health-path", "/healthz",
 	}); err != nil {
 		t.Fatal(err)
@@ -362,15 +443,14 @@ func TestAppCreateImageSourceUsesTheDefaultWebProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Source.Kind != "image" || spec.Source.Image != "ghcr.io/acme/api:2026-10-20" ||
-		spec.Source.Builder != "" || spec.Source.CredentialSecretName != "" {
-		t.Fatalf("image source = %+v", spec.Source)
+	if spec.Source.URL != "" || spec.Source.Builder != "" || spec.Source.CredentialSecretName != "" {
+		t.Fatalf("image-only app carried a source: %+v", spec.Source)
 	}
 	if len(spec.Processes) != 1 || spec.Processes[0].Name != "web" ||
 		spec.Processes[0].ContainerPort != platform.DefaultContainerPort || spec.ContainerPort != platform.DefaultContainerPort {
 		t.Fatalf("default web process = %+v port=%d", spec.Processes, spec.ContainerPort)
 	}
-	if spec.Health.Path != "/healthz" || !ans.Deploy {
+	if spec.Health.Path != "/healthz" || ans.Deploy {
 		t.Fatalf("runtime/deploy = %+v deploy=%t", spec.Health, ans.Deploy)
 	}
 }
@@ -393,7 +473,7 @@ func TestEnvCreateDeployFlagMapping(t *testing.T) {
 		}
 		return ans
 	}
-	base := []string{"--app", "api", "--name", "staging", "--node", "main", "--image", "ghcr.io/acme/api:1"}
+	base := []string{"--app", "api", "--name", "staging", "--node", "main", "--git-url", "https://github.com/acme/api"}
 	if ans := build(base...); !ans.Deploy {
 		t.Fatal("env create did not request the first deploy by default")
 	}
@@ -417,8 +497,7 @@ func TestEnvUpdateFlagsMergeOverTheCurrentRevision(t *testing.T) {
 		Health: platform.HealthConfig{Type: "http", Path: "/", TimeoutSeconds: 30},
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
+				URL: "https://github.com/acme/api", CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			Runtime: platform.RuntimeSpec{
 				Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30,

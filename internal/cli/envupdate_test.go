@@ -12,8 +12,7 @@ func TestBuildGuidedUpdateMapsPrefilledAnswers(t *testing.T) {
 		App: "api", Name: "production", Node: "main",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
+				URL: "https://github.com/acme/api", CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			Runtime: platform.RuntimeSpec{
 				Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30,
@@ -28,8 +27,7 @@ func TestBuildGuidedUpdateMapsPrefilledAnswers(t *testing.T) {
 	answers := guidedUpdateAnswers{
 		Node: "main2", BuildNode: "builder",
 		Source: platform.SourceBinding{
-			Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-			CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
+			URL: "https://github.com/acme/api", CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 		},
 		Runtime: platform.RuntimeSpec{
 			Node: "main2", HealthType: "http", HealthPath: "/readyz", HealthTimeoutSeconds: 30,
@@ -82,7 +80,7 @@ func TestBuildGuidedUpdateKeepsUnchangedRevision(t *testing.T) {
 	current := platform.Environment{
 		App: "api", Name: "production", Node: "main",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-			Source:    platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+			Source:    platform.SourceBinding{URL: "https://github.com/acme/api"},
 			Runtime:   platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
 			Processes: []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
 		}},

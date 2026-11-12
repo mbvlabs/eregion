@@ -62,7 +62,7 @@ func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool, run *Runtime) (
         VALUES($1,$2,'production','local',$3,$4,3000)`, envID, appID, hostPort, hostPort+1); err != nil {
 		t.Fatal(err)
 	}
-	source, _ := json.Marshal(platform.SourceBinding{Kind: "git", URL: "https://github.com/mbvlabs/hello.git", Ref: "main"})
+	source, _ := json.Marshal(platform.SourceBinding{URL: "https://github.com/mbvlabs/hello.git", Ref: "main"})
 	runtime, _ := json.Marshal(platform.RuntimeSpec{Node: "local", HealthType: "http", HealthPath: "/health", HealthTimeoutSeconds: 30})
 	processes, _ := json.Marshal([]platform.ProcessSpec{{Name: "web", Kind: "web", Command: "./app", Replicas: 1, ContainerPort: 3000}})
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
@@ -726,7 +726,7 @@ func TestIntegrationWebhookWorkerRejectsRebindAndDeletedEnvironment(t *testing.T
 		t.Fatal(err)
 	}
 	newRevisionID, _ := platform.NewEnvironmentRevisionID()
-	otherSource, _ := json.Marshal(platform.SourceBinding{Kind: "git", URL: "https://github.com/mbvlabs/other.git", Ref: "main"})
+	otherSource, _ := json.Marshal(platform.SourceBinding{URL: "https://github.com/mbvlabs/other.git", Ref: "main"})
 	runtime, _ := json.Marshal(platform.RuntimeSpec{Node: "local", HealthType: "http", HealthPath: "/health", HealthTimeoutSeconds: 30})
 	processes, _ := json.Marshal([]platform.ProcessSpec{{Name: "web", Kind: "web", Command: "./app", Replicas: 1, ContainerPort: 3000}})
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions

@@ -17,10 +17,11 @@ import (
 // step family must not opt out of that lock.
 func TestImageMovingStepsHoldTheHostLock(t *testing.T) {
 	rawPack, _ := json.Marshal(PackPayload{
-		Step: "platform-pack-01-v1", Image: "eregion/api-production:abc",
-		Builder: "paketobuildpacks/builder-jammy-base", Path: t.TempDir(),
+		Step: "platform-pack-02-v1", Image: "eregion/api-production:abc",
+		Registry: "127.0.0.1:5000",
+		Builder:  "paketobuildpacks/builder-jammy-base", Path: t.TempDir(),
 	})
-	pack, err := buildPackStep(retentionTestExecution("platform-pack-01-v1"), rawPack)
+	pack, err := buildPackStep(retentionTestExecution("platform-pack-02-v1"), rawPack)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,6 +17,19 @@ import (
 
 const testWorkspaceID = "ws_0123456789abcdef01234567"
 
+func testWorkspaceRegistryHost() controlplane.RegistryHostIdentity {
+	return controlplane.RegistryHostIdentity{
+		NodeName: "main", HostKeyType: "ssh-ed25519",
+		HostKeyFingerprint: "SHA256:" + strings.Repeat("A", 43),
+		StateDir:           "/var/lib/eregion/node",
+	}
+}
+
+func testWorkspaceRegistryHostPtr() *controlplane.RegistryHostIdentity {
+	identity := testWorkspaceRegistryHost()
+	return &identity
+}
+
 type fakeWorkspaceDatabase struct {
 	identity controlplane.WorkspaceIdentity
 	readErr  error
@@ -34,15 +47,21 @@ func (f *fakeWorkspaceDatabase) ReadWorkspace(context.Context, string) (controlp
 	f.reads++
 	return f.identity, f.readErr
 }
-func (f *fakeWorkspaceDatabase) AssignWorkspace(_ context.Context, _, name string) (controlplane.WorkspaceIdentity, error) {
+func (f *fakeWorkspaceDatabase) AssignWorkspace(_ context.Context, _, name string, registryHost controlplane.RegistryHostIdentity) (controlplane.WorkspaceIdentity, error) {
 	f.assigns++
 	if f.identity.Configured {
 		if f.identity.Name != name {
 			return controlplane.WorkspaceIdentity{}, contract.NewFault(contract.Conflict, "already configured", "Use the existing name.")
 		}
+		if f.identity.RegistryHost == nil {
+			return controlplane.WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed, "unverified binding", "Use a fresh installation.")
+		}
+		if !f.identity.RegistryHost.Equal(registryHost) {
+			return controlplane.WorkspaceIdentity{}, contract.NewFault(contract.Conflict, "different physical host", "Use the original host.")
+		}
 		return f.identity, nil
 	}
-	f.identity = controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: name}
+	f.identity = controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: name, RegistryHost: &registryHost}
 	return f.identity, nil
 }
 
@@ -50,11 +69,11 @@ func TestFreshWorkspacePreflightPlanAndRuntime(t *testing.T) {
 	cfg := fixture(t, RoleMain)
 	cfg.Workspace = "thelab"
 	db := &fakeWorkspaceDatabase{readErr: controlplane.ErrWorkspaceSchemaMissing}
-	runner := &Runner{Config: cfg, Database: db}
+	runner := &Runner{Config: cfg, Database: db, RegistryHostIdentity: testWorkspaceRegistryHostPtr()}
 	if err := runner.preflightWorkspace(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	step := &workspaceStep{cfg: cfg, database: db}
+	step := &workspaceStep{cfg: cfg, database: db, hostIdentity: testWorkspaceRegistryHostPtr()}
 	plan, err := step.Plan(context.Background(), engine.Runtime{})
 	if err != nil || plan.Complete || plan.Error != "" || !strings.Contains(plan.Detail, "follows migration") {
 		t.Fatalf("fresh plan = %+v, %v", plan, err)
@@ -161,7 +180,7 @@ func TestWorkspaceStepAssignsOnceMirrorsAndPreservesNode(t *testing.T) {
 	put(t, configPath, `{"node":"custom-node","state_dir":"/var/lib/custom","privileged_helper":{"keep":true}}`, 0o600)
 
 	database := &fakeWorkspaceDatabase{}
-	step := &workspaceStep{cfg: cfg, database: database}
+	step := &workspaceStep{cfg: cfg, database: database, hostIdentity: testWorkspaceRegistryHostPtr()}
 
 	before, err := os.ReadFile(configPath)
 	if err != nil {
@@ -234,8 +253,8 @@ func TestWorkspaceStepRefusesAConflictingName(t *testing.T) {
 	cfg := fixture(t, RoleMain)
 	cfg.Workspace = "requested"
 	step := &workspaceStep{cfg: cfg, database: &fakeWorkspaceDatabase{
-		identity: controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: "existing"},
-	}}
+		identity: controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: "existing", RegistryHost: testWorkspaceRegistryHostPtr()},
+	}, hostIdentity: testWorkspaceRegistryHostPtr()}
 	check, err := step.Check(context.Background(), engine.Runtime{})
 	if contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("check conflict = %v (result %+v), want conflict", err, check)
@@ -245,13 +264,40 @@ func TestWorkspaceStepRefusesAConflictingName(t *testing.T) {
 	}
 }
 
+func TestWorkspaceStepRefusesUnverifiedOrDifferentHostBinding(t *testing.T) {
+	cfg := fixture(t, RoleMain)
+	cfg.Workspace = "thelab"
+	unverified := &fakeWorkspaceDatabase{
+		identity: controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: "thelab"},
+	}
+	step := &workspaceStep{cfg: cfg, database: unverified, hostIdentity: testWorkspaceRegistryHostPtr()}
+	if _, err := step.Check(context.Background(), engine.Runtime{}); err == nil {
+		t.Fatal("an unverified workspace binding passed Check")
+	}
+	if _, err := step.Apply(context.Background(), engine.Runtime{}, nil); err == nil {
+		t.Fatal("an unverified workspace binding was mutated")
+	}
+	otherHost := testWorkspaceRegistryHost()
+	otherHost.HostKeyFingerprint = "SHA256:" + strings.Repeat("B", 43)
+	conflicting := &fakeWorkspaceDatabase{
+		identity: controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: "thelab", RegistryHost: &otherHost},
+	}
+	step = &workspaceStep{cfg: cfg, database: conflicting, hostIdentity: testWorkspaceRegistryHostPtr()}
+	if _, err := step.Check(context.Background(), engine.Runtime{}); err == nil {
+		t.Fatal("a different physical host passed Check")
+	}
+	if _, err := step.Apply(context.Background(), engine.Runtime{}, nil); err == nil {
+		t.Fatal("a different physical host was assigned")
+	}
+}
+
 func TestWorkspaceStepReportsAMissingOrStaleMirror(t *testing.T) {
 	cfg := fixture(t, RoleMain)
 	cfg.Workspace = "thelab"
 	database := &fakeWorkspaceDatabase{
-		identity: controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: "thelab"},
+		identity: controlplane.WorkspaceIdentity{Configured: true, ID: testWorkspaceID, Name: "thelab", RegistryHost: testWorkspaceRegistryHostPtr()},
 	}
-	step := &workspaceStep{cfg: cfg, database: database}
+	step := &workspaceStep{cfg: cfg, database: database, hostIdentity: testWorkspaceRegistryHostPtr()}
 	check, err := step.Check(context.Background(), engine.Runtime{})
 	if err != nil || check.Complete {
 		t.Fatalf("missing mirror = %+v, %v; want incomplete", check, err)
@@ -275,7 +321,7 @@ func TestWorkspaceStepRunsAfterMigrationsAndBeforeVaultAndServices(t *testing.T)
 		positions[step.ID()] = index
 	}
 	database, hasDatabase := positions["host-database-v1"]
-	workspace, hasWorkspace := positions["host-workspace-v1"]
+	workspace, hasWorkspace := positions["host-workspace-v2"]
 	vault, hasVault := positions["host-vault-keyring-v1"]
 	if !hasDatabase || !hasWorkspace || !hasVault {
 		t.Fatalf("missing steps: %v", positions)

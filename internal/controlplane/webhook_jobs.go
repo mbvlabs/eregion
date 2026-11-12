@@ -115,14 +115,14 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, environmentID, del
 	// transaction helper still checks this URL and ref against the revision it
 	// reads, exactly as an ordinary deploy does.
 	resolved := &resolvedGitRef{
-		Kind: "git", URL: env.Revision.Source.URL,
+		URL: env.Revision.Source.URL,
 		Ref: record.Commit, SHA: record.Commit,
 	}
 	id, err := contract.NewOperationID()
 	if err != nil {
 		return err
 	}
-	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.EnvironmentID+"-"+record.DeliveryIDHash, resolved, "", nil)
+	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.EnvironmentID+"-"+record.DeliveryIDHash, resolved, nil, "", nil)
 	if err != nil {
 		code, detail, retry := webhookAdmissionFailure(err)
 		if retry {
@@ -156,7 +156,7 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, environmentID, del
 // advanced to a newer runtime, process or config state; only deletion or a
 // repository/branch rebind makes the accepted intent terminal.
 func webhookSourceBindingCurrent(env platform.Environment, record api.WebhookAdmission) error {
-	if env.Revision == nil || env.Revision.Source.Kind != "git" {
+	if env.Revision == nil || env.Revision.Source.URL == "" {
 		return contract.NewFault(contract.PreconditionFailed, "the environment source is no longer a git repository", "The push was accepted against a git source; create a new push after changing the source.")
 	}
 	repository, ok := platform.GitHubRepository(env.Revision.Source.URL)

@@ -93,7 +93,7 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D8 | Hosts and platforms | Servers: Debian 13 and Ubuntu 26.04, amd64 and arm64. Operator CLI: Linux and macOS; no Windows builds. Operator mode pushes the matching verified Linux binary to the node. |
 | D9 | Control database | External PostgreSQL 17+ with `sslmode=verify-full`, never installed on the app server. Its DSN is a server secret and goes in the handoff. |
 | D10 | Workloads | deploycrate's: directly managed Docker containers identified by ownership labels, images by immutable digest, restart `unless-stopped`, ports published only on dynamic loopback ports (or the node's WireGuard address). Docker Compose and per-environment systemd units are never state stores. |
-| D11 | Builds | Cloud Native Buildpacks with a pinned `pack` and architecture-pinned default Paketo builder, Go apps first. The CLI/TOML user owns explicit buildpack order; Eregion does not inject a Go/Node sequence or custom assets buildpack. With no explicit order, Pack uses its normal source-descriptor/builder detection. Empty builder configuration selects the default on the build node; explicit builders are honored unchanged. Optional typed build inputs map to standard buildpack settings, not runtime selection or a guarantee that frontend scripts run. Builds run on the main node for v1. |
+| D11 | Builds | Cloud Native Buildpacks with a pinned `pack` and architecture-pinned default Paketo builder, Go apps first. The CLI/TOML user owns explicit buildpack order; Eregion does not inject a Go/Node sequence or custom assets buildpack. With no explicit order, Pack uses its normal source-descriptor/builder detection. Empty builder configuration selects the default on the build node; explicit builders are honored unchanged. Optional typed build inputs map to standard buildpack settings, not runtime selection or a guarantee that frontend scripts run. Builds run on the main node for v1. Finished Buildpacks application images belong in the existing private node registry, with immutable artifact identity; Docker-local copies are runtime materialization, not the only retained artifact. Reuse D30 retention to protect serving and rollback artifacts and clean only eligible owned data. Temporary build cleanup must not remove retained artifacts, broaden registry exposure or switch builds to host networking. This does not add off-server backup or mirroring of arbitrary external image sources. |
 | D12 | Confirmation | Destructive commands take a token that names the target (`--confirm <app>`, `--confirm <app>/<env>`, `--confirm <server>`); `--yes` alone never suffices. The control plane validates the token against current state. `app delete` always needs the D7 factor; `env delete` needs it for a protected or last environment and otherwise needs only the exact target token (D33). Their dry run needs neither. |
 | D13 | Deletion | deploycrate's policy: deleting an app removes every environment, source, domain, secret, release, deployment and route it owns after workload cleanup succeeds; deleting the last environment deletes the app and therefore needs the app-deletion human factor even when that environment is unprotected (D33). Durable operation history is kept. |
 | D14 | Release model | `master` is the combined development and edge stream and publishes on every push; `1.x` is the whole v1 line. Keep release history linear: squash feature PRs into `master`, then fast-forward `1.x` to the exact reviewed `master` commit for a release. Do not squash a second release PR or merge the release line back into `master`; those duplicate changes and create a merge ladder. A non-fast-forward release promotion stops for explicit resolution, never an automatic force push or cherry-pick. Alpha and beta tags publish exact immutable snapshots without a moving channel; RC tags advance an opt-in `rc` channel; stable channels advance only on final tags. Manifest `channel` is the signing family, not a promotion channel: every tagged artifact, including alpha/beta/RC, says `stable` and is signed by `publish-stable.yml@refs/tags/v<version>`; edge says `edge`. Stable and major-line pointers accept only final versions and the rc pointer accepts only rc versions; the build, upload and promotion paths enforce this independently. An RC client also checks its stable major line for a newer final, without automatically moving the RC pointer. Existing release tags and signed snapshots remain immutable. |
@@ -111,7 +111,7 @@ A live retry before any route intent may resume and rebind to the frozen
 predecessor; reconciliation without a worker lease fails it. |
 | D18 | Secret resolution | deploycrate's: the environment revision names its secrets; each deploy resolves their current values and records the exact secret revisions on the deployment, so a rollback reproduces them. No hand-pinned `vault:…@N` refs. |
 | D19 | Application resources | Alpha.2 adds optional, generic Docker resources owned by an environment; an application may instead use external dependencies through secrets. This supersedes the earlier exclusion of managed application databases: a PostgreSQL container is an app resource, never the external control-plane database. Resources use private networking and optional persistent volumes, secret names rather than values in definitions, and retain data when detached; deleting data requires a separate `resource destroy --delete-data` naming the exact resource, which removes only that resource's owned volumes. No backup product is implied, and the external control-plane PostgreSQL is not a backup of these volumes. |
-| D20 | Sources | HTTPS git (public, or private with a per-environment read credential) and existing images. No GitHub App integration is planned (decided 2026-11-04): a per-environment read credential plus the D28 webhook covers private repositories and push to deploy with far less setup. |
+| D20 | Sources | An environment has an **optional** HTTPS Git build recipe (public, or private with an environment read credential): URL, ref, Buildpacks context/builder/settings and push-to-deploy (D28). Git absence is explicit: there is no persistent image source, kind discriminator or image mode in a revision. An app owns one immutable private-workspace image repository (`image_repository`, defaulting to the app slug), which builds and uploads use and environments cannot change. A deploy selects its artifact explicitly with `--image-tag`, `--image-digest`, `--image` (fully qualified public reference) or an existing `--release`; with no selector it builds the configured Git ref. Artifacts are pinned to an immutable manifest and expected config digest at admission. No GitHub App integration is planned (decided 2026-11-04): a per-environment read credential plus the D28 webhook covers private repositories and push to deploy with less setup. |
 | D21 | Processes | deploycrate's: an environment declares processes of kind `web` (receives the domains through Caddy), `worker` (no port), `service` (port reachable privately, no domain) and a `release` command, each with a command, arguments and replicas. Caddy balances a `web` process across its replicas. The release command (typically migrations) is **release-scoped**, as in deploycrate: it runs once per release and command, before the release fans out to its deployments (and, after v1, to several nodes); a successful run is recorded, and `restart`, `process scale` and `rollback` to that release never run it again. A failed run blocks that release until a new `deploy`. A forced re-run is a possible later override, not alpha scope. A bare process command runs through the same static Linux `eregion` binary bind-mounted read-only at a fixed container path and execs after searching the effective launch-time PATH (including relative/empty entries, then cwd) with the target container's cwd, filesystem and permissions; the Buildpacks launcher completes its environment first, a plain image uses the resolver directly, and no shell or PATH rewrite is used. Explicit paths keep exact argv (plain image directly, Buildpacks through its launcher); commandless containers keep the native entrypoint. None receives the resolver mount. A configured or secret-valued PATH is applied only through the transient Docker client environment, never argv. |
 | D22 | Access modes | Public only in the alpha; basic auth and private-network access after v1. |
 | D23 | Promotion | A dedicated node-mode **`env promote <app> <source-environment>`** moves the source environment's current serving release into the application's `production` environment. Production is the only target; there is no general cross-environment deploy. The command pins the source release's exact image digest, commit and source as a new `ready` production release **without rebuilding** and without copying source plain config, secret names/values, domains or release command. The source serving release is resolved and pinned inside the **submission transaction, not at worker execution**, so a later staging deploy cannot change the artifact. The ordinary deploy path then applies production's current revision, config, secrets, domain and release command through the same release-command and blue/green health/Caddy/public-verification/cleanup semantics. The source must have a ready, unpruned serving release; source and production must be environments of the same app on the same node (cross-node artifact transfer is not implemented); production must pass the explicit-release deployability gate, including a primary domain. Promotion admission refuses **any** active production deployment, including a different artifact, under the production row lock; this keeps previous-release cleanup and rollback history unambiguous. Ordinary deploys queued after a promotion rebind their previous release/deployment at execution under the target lock, so whichever deployment runs next chains to the actual serving predecessor. Preview is read-only and honors the supplied idempotency key with the same normalized-input hash fence as submit: identical input replays, changed input conflicts. JSON/no-TTY never prompts. The same idempotency key replays the accepted operation without re-resolving the source; a new key is new work. An artifact already serving in production is refused rather than promoted twice. `deploy --release` continues to accept only a release from the same app and environment; it is not a cross-environment workaround. Durable production release/change history and operation events distinguish promotion from a rebuild deploy. |
@@ -123,8 +123,9 @@ predecessor; reconciliation without a worker lease fails it. |
 | D29 | Domain check path | Each domain binding has an optional check path (`domain add … --check-path PATH`), defaulting to the `web` process health path. The domain observer and the D17 public verification request each host at its own path, so an alias that serves no health route can still be ready. deploycrate has one path per web process; this is an eregion extension found in a real deployment. |
 | D30 | Disk retention | Required for alpha.1 (R9). A retention policy (server default, per-environment override) and one planner used by a periodic River job and by `eregion prune [--dry-run]`. Defaults: keep the newest 10 releases per environment plus any newer than 14 days, always the serving release and its rollback target; registry artifacts no release references after 14 days; Buildpacks caches above 10 GiB or 80% disk; ownerless labeled containers and dangling images always. Release rows are never deleted; a pruned release records `pruned_at` and a rollback to it refuses clearly. Registry deletion needs a new registry host-step version with deletes enabled plus garbage collection. A real `eregion prune` requires `--confirm <server>` and a dry run needs no confirmation. `doctor` reports the last run and warns when the Buildpacks cache exceeds the policy's absolute cap; it reads the run's durable cache measurement, and an absent or stale measurement is unknown rather than a zero-byte healthy cache. |
 | D31 | Workload repair | As deploycrate's `workload_reconciliation`: on worker start the control plane compares each serving deployment's recorded containers with Docker and queues one restart of the serving release for an environment whose serving containers are missing. A restart never re-runs the release command (D21). |
-| D32 | App definition file (planned for alpha.2) | Adopt a Fly-style `eregion.toml` **as input only**, never as a store: `app create --from FILE`, `env create|update --from FILE` and `app export <app> <env>` turn it into ordinary desired state. Existing guided and flag-only workflows remain usable without a file; PostgreSQL stays authoritative. The file is a **shared recipe plus optional overrides**, not an exhaustive environment inventory: `[environments.staging]`, `[environments.production]` and `[environments.<name>]` override the shared fields when present, and `env create --from FILE --name pr-42` applies the shared recipe without adding `pr-42` to the file. The selected name is a command argument, not a document identity. The file names processes, health, source and build settings, non-secret config, secret **names** (never values), domains and optional generic Docker resources (D19). Domains are environment-specific; export places them under the selected environment's override so a shared recipe cannot make production and staging claim the same hostname. Explicit apply previews and provisions declared resources; an ordinary deploy or push never reads the file. `--dry-run` shows changes, removals require target confirmation, and resource data is retained unless separately destroyed. |
-| D33 | Environment protection (alpha.2 redesign) | Every environment has persistent `protected` state. `app create` creates **production and staging atomically from one recipe**; both are protected by default, and creation itself never asks for a TOTP code. Other environment names are unprotected by default; `--protected` / `--unprotected` make one creation-time choice explicit. `app delete` always requires the D7 TOTP factor. `env delete` requires it when the environment is protected or when it is the app's **last** environment (that deletion removes the app); an unprotected non-last environment deletion needs only exact `--confirm <app>/<env>` and works with agents, `--json` and no-TTY. `env protect` is agent-safe; `env unprotect` requires the factor. The decision and TOTP verification run in the control-plane submission transaction against locked environment/application rows, so node RPC, HTTP and direct service callers cannot bypass it; HTTP refuses actions whose current state needs the factor because it cannot carry a code. Migration 024 backfills every pre-existing environment as protected (fail closed); an operator may lower it with the factor. |
+| D32 | App definition file (planned for alpha.2) | Adopt a Fly-style `eregion.toml` **as input only**, never as a store: `app create --from FILE`, `env create|update --from FILE` and `app export <app> <env>` turn it into ordinary desired state. Existing guided and flag-only workflows remain usable without a file; PostgreSQL stays authoritative. The file is a **shared recipe plus optional overrides**, not an exhaustive environment inventory: `[environments.staging]`, `[environments.production]` and `[environments.<name>]` override the shared fields when present, and `env create --from FILE --name pr-42` applies the shared recipe without adding `pr-42` to the file. The selected name is a command argument, not a document identity. The file names processes, health, an optional Git `[source]` recipe, non-secret config, secret **names** (never values), domains and optional generic Docker resources (D19). Schema version 2 removes `source.kind` and `source.image`; an absent or empty `[source]` means no Git build. Root `image_repository` is app metadata, is consumed once by `app create` and exported with the actual durable value; it is not an environment recipe or override. Domains are environment-specific; export places them under the selected environment's override so a shared recipe cannot make production and staging claim the same hostname. Explicit apply previews and provisions declared resources; an ordinary deploy or push never reads the file. `--dry-run` shows changes, removals require target confirmation, and resource data is retained unless separately destroyed. |
+| D33 | Environment protection (alpha.2 redesign) | Every environment has persistent `protected` state. `app create` creates **production and staging atomically from one recipe**, and records the app's immutable image repository in the same transaction; both environments are protected by default, and creation itself never asks for a TOTP code. Other environment names are unprotected by default; `--protected` / `--unprotected` make one creation-time choice explicit. `app delete` always requires the D7 TOTP factor. `env delete` requires it when the environment is protected or when it is the app's **last** environment (that deletion removes the app); an unprotected non-last environment deletion needs only exact `--confirm <app>/<env>` and works with agents, `--json` and no-TTY. `env protect` is agent-safe; `env unprotect` requires the factor. The decision and TOTP verification run in the control-plane submission transaction against locked environment/application rows, so node RPC, HTTP and direct service callers cannot bypass it; HTTP refuses actions whose current state needs the factor because it cannot carry a code. Migration 024 backfills every pre-existing environment as protected (fail closed); an operator may lower it with the factor. |
+| D35 | App image repository and artifact admission (beta.5) | Each app owns one exact private-workspace image repository path such as `mbvlabs/andurel`, unique in the control database and immutable for beta.5. It never includes a registry host, port, tag, digest, URL or credentials; omission at app create defaults to the app slug. App create may therefore make an image-only app with no Git recipe and no first deploy; an explicit create-and-deploy without Git fails before any transaction commits. Environments retain an optional Git Buildpacks recipe only; `SourceBinding.Image`, `Kind`, TOML `source.image`/`source.kind`, `--image` on app/env create and env update, and the guided Git-versus-image choice are removed without compatibility aliases. Artifact selection is a deploy input: `--image-tag` and `--image-digest` address the app repository, `--image` is a fully qualified public/private reference, and these are distinct from `--ref` and `--release`, mutually exclusive, with no implicit latest. A fully qualified reference to this private registry must name exactly the app repository. Public external references are resolved anonymously with bounded read-only metadata and pulled by canonical digest; no Docker credentials, private external credential feature or automatic mirroring is added. Admission replays the idempotency hash before registry I/O, resolves the tag/index outside any SQL transaction, rechecks app/repository/environment placement facts under the admission lock, and records a pending release pinned to the canonical immutable manifest and expected config digest plus the requested selector as provenance only. A worker never re-resolves a tag; it pulls the pinned artifact, verifies the config digest, then marks the release ready. A missing artifact after admission fails and leaves the previous release serving with no tag fallback, rebuild or mirror. Multi-architecture input selects the target node architecture's immutable child manifest. Preview remains read-only with no registry I/O, shows the app repository/selector and known config blockers, and labels availability unverified. Existing retention/GC policy is unchanged; exact repository parsing protects every environment sharing an app repository, all accepted pending/serving/rollback digests and moved tags, with no heuristic leading-component strip and no external registry delete. Image upload resolves the durable app repository from the app record and verifies the immutable workspace registry-host binding (public SSH host key and canonical state directory) before reading the payload; it holds the app session advisory lock plus the shared node host lock through identity recheck, payload read and every upload helper. Final app/last-environment deletion verifies the same binding before provider/host cleanup and again before the short metadata transaction, takes the same host lock after effects and deletes by durable app ID, so no delete/recreate or second host can retarget an upload. External registry metadata is public-HTTPS-only on every redirect, connection and token realm with no proxy or ambient credentials, redirects are refused, and requested manifest digests are authenticated against raw bytes at top level and selected index child. Artifact pulls use an explicit isolated environment with a private empty Docker config. The canonical artifact reference is bounded against the actual registry endpoint before app creation. `platform.release.create` and its arbitrary destination/pull toggle are removed; internal release constructors and build retry remain. |
 
 ### D5 clarification — vaire telemetry model
 
@@ -175,6 +176,16 @@ are access data for that workspace's single node, not another identity. Setup
 asks for workspace name separately from node name. Same workspace/name
 initialization reuses its ID; a conflicting name is refused. Reads and migration
 do not guess or assign it.
+
+The same singleton also carries an immutable, all-or-none **registry-host
+binding** established atomically on first workspace assignment: main node name,
+public SSH host-key type/SHA256 fingerprint and canonical node state directory.
+This is installation metadata for the physical host that owns the private
+registry, not a fleet, node-role or remote-locking feature. Identical
+initialization replay is allowed; a different name, host key or state directory
+is refused. A workspace row created before the binding remains explicitly
+unverified: uploads and deletion finalization refuse it and it is never
+backfilled or inferred. No private key is stored or compared.
 
 `--workspace NAME` selects the verified workspace name, never a historical
 local alias. Selection precedence is the explicit flag, `EREGION_WORKSPACE`, then
@@ -255,13 +266,14 @@ D19's default retention or authorize deletion.
   scope, not a tenancy or team boundary.
 - **Server / node.** A VPS. The first one `server init` sets up is the **main
   node**. The selected workspace identifies which installation to operate.
-- **App.** A named group of environments. Owns nothing at runtime by itself.
+- **App.** A named group of environments. It owns one immutable private-workspace image repository used by builds and uploads; environments cannot override it.
 - **Environment.** The unit of deployment (`staging`, `production`, …). It also
   carries persistent deletion **protection** (D33), separate from its desired
   revisions. Its **desired state** is one complete revision containing:
-  - **source binding**: an HTTPS git repository, ref and optional read
-    credential, or an image reference; Buildpacks context path, builder and
-    buildpack settings; auto-deploy on push (D28);
+  - **optional Git build recipe**: an HTTPS git repository, ref, read
+    credential, Buildpacks context path/builder/settings and auto-deploy on
+    push (D28); absent means no Git source and an explicit artifact selector at
+    deploy time;
   - **runtime**: node, health path and timeouts, release command;
   - **processes** (D21): name, kind, command, arguments, replicas, container
     port for `web` and `service`;
@@ -271,12 +283,14 @@ D19's default retention or authorize deletion.
     process.
 
   Every change commits a new immutable revision and a change record. A
-  **deployability** report lists what is missing before a deploy can run
-  (source, artifact, runtime, domain, DNS), as deploycrate's does.
-- **Build.** One attempt to turn a source revision (exact commit) into an image,
-  with its own logs and lifecycle; it can be stopped and retried.
-- **Release.** An immutable deployable artifact (image digest) for one
-  environment, from a build or an existing image.
+  **deployability** report lists what is missing before an explicit deploy can
+  run (artifact, runtime, domain, DNS), as deploycrate's does.
+- **Build.** One attempt to turn a source revision (exact commit) into an image
+  in the app image repository, with its own logs and lifecycle; it can be
+  stopped and retried.
+- **Release.** An immutable deployable artifact (manifest digest plus expected
+  image config digest, with requested-selector provenance) for one environment,
+  from a build or an explicit artifact selector.
 - **Deployment.** Applying a release plus the environment's revision to its
   runtime. Success means every process runs that release and the public check
   passed, not that a job returned. Rollback is a deployment of an earlier
@@ -297,12 +311,12 @@ eregion plan | apply [--auto-upgrade-nodes] [--assign-workspace NAME] | doctor  
 eregion login [--replace WORKSPACE] | workspace list|show|use|remove
                                                        # every node command: --workspace NAME / EREGION_WORKSPACE
 eregion secrets export                                 # server handoff, human factor
-eregion app create|list|status|delete             # create: production + staging atomically
+eregion app create|list|status|delete [--image-repository PATH] # create: app repo + production + staging atomically
 eregion env create|update|protect|unprotect|list|status|delete
 eregion env promote <app> <source-environment>         # exact serving release -> production
 eregion process list|scale                             # per environment
-eregion deploy <app> <env> [--ref REF | --release ID] | rollback <app> <env> [--to ID]
-eregion image push <local-image> --app <app> [--tag <tag>]   # local image into the node registry
+eregion deploy <app> <env> [--ref REF | --release ID | --image-tag TAG | --image-digest SHA256 | --image REF] | rollback <app> <env> [--to ID]
+eregion image push <local-image> --app <app> [--tag <tag>]   # local image into the app's private repository
 eregion build list|logs|stop|retry  ·  release list
 eregion domain add|list|remove [--primary] [--check-path PATH]
                                                          # optional explicit --dns cloudflare --dns-zone ZONE --dns-origin ADDRESS --dns-proxy dns-only|proxied
@@ -369,28 +383,38 @@ retention and versions. `eregion ssh` opens a shell over WireGuard.
 
 ### 6.3 App setup (deploycrate)
 
-`eregion app create` asks for the app name, one shared source/runtime/process
-recipe and production's domain, shows the plan and DNS record, then commits the
-app, **production and staging** and each first revision in one transaction.
-Both are protected by default; creation never asks for a TOTP code. The shared
-recipe defaults to production and staging names, and `--unprotected` is the
-explicit creation-time opt-out. Unless `--no-deploy`, the first environment's
-ref is resolved and its first build and deployment are queued in the same
-transaction; staging starts without a domain unless a definition override
-supplies a distinct one. The flag-only form expresses exactly the same intent.
-`env create` adds any environment the same way, defaulting to unprotected
-unless the name is `production` or `staging` or `--protected` is passed; from
-`--from FILE`, an arbitrary name such as `pr-42` uses the shared recipe without
-being listed in the file. `env update` changes any part of desired state as a
-new revision; `process scale` changes replicas; `env protect`/`env unprotect`
-change durable deletion protection (D33).
+`eregion app create` asks for the app name, an optional shared Git/runtime/process
+recipe, an optional private image repository and production's domain, shows the
+plan and DNS record, then commits the app (including its image repository),
+**production and staging** and each first revision in one transaction. Both are
+protected by default; creation never asks for a TOTP code. The shared recipe
+defaults to production and staging names, and `--unprotected` is the explicit
+creation-time opt-out. Unless `--no-deploy`, the first environment's Git ref is
+resolved and its first build and deployment are queued in the same transaction;
+a Git-less image-only create has no implicit first deploy, and an explicit
+create-and-deploy without Git is refused before commit. Staging starts without a
+domain unless a definition override supplies a distinct one. The flag-only form
+expresses exactly the same intent. `env create` adds any environment the same
+way, defaulting to unprotected unless the name is `production` or `staging` or
+`--protected` is passed; its Git recipe is optional and it cannot change the app
+image repository. From `--from FILE`, an arbitrary name such as `pr-42` uses the
+shared recipe without being listed in the file. `env update` changes any part of
+desired state as a new revision; `process scale` changes replicas; `env
+protect`/`env unprotect` change durable deletion protection (D33).
 
 ### 6.4 Deploy
 
-`eregion deploy <app> <env>` builds the environment's source at its ref (or
-`--ref`), records the release by digest and deploys it. `--release` redeploys an
-existing release with the current revision; that release must belong to the same
-app and environment. The pipeline, per D17: preflight →
+`eregion deploy <app> <env>` builds the environment's Git source at its ref (or
+`--ref`), records the release by canonical manifest digest and deploys it.
+Without a selector, a Git-less environment is refused with explicit artifact
+guidance rather than guessing latest, newest or the serving image. `--image-tag`
+and `--image-digest` select an artifact from the app's private repository;
+`--image` takes a fully qualified registry reference (a reference to this
+private registry must name exactly the app repository). These selectors are
+mutually exclusive with each other, `--ref` and `--release`, and there is no
+implicit latest. `--release` redeploys an existing release with the current
+revision; that release must belong to the same app and environment. `restart`
+reapplies the serving artifact. The pipeline, per D17: preflight →
 release command → candidate containers for every process on dynamic loopback
 ports → candidate health → Caddy backend switch for `web` → public verification
 → stop the previous containers. A failed candidate leaves the old release
@@ -1570,7 +1594,7 @@ MANUAL-TESTING for the evidence.
 | `server init` | vaire flow: preflight, `--answers`, `--password-stdin`, plan with `--confirm <server>`, binary installed once, vault keyring, loopback node_exporter and WireGuard-only authenticated telemetry endpoint, guarded handoff with `--secrets-out`, `--resume`/`--discard`, `context remove`. SSH on port 22 only. | Closed by operator confirmation for alpha.1; alpha.5 telemetry extension is host-qualified. |
 | Operator channel | `eregion node rpc` over SSH in WireGuard; token-free contexts and handoff; version lockstep and `--auto-upgrade-nodes`. | Closed by operator confirmation. |
 | Host convergence | `plan`, `apply`, `doctor`, `server status`, `ssh`, `node unlock-ssh`. | Closed by operator confirmation. |
-| Apps and environments | Revisions with source binding, processes, config and secret names; guided and flag-only `app create`, `env create|update`; `process`, `config`; deployability gate. | Closed by operator confirmation. |
+| Apps and environments | App image repository plus revisions with optional Git recipe, processes, config and secret names; guided and flag-only `app create`, `env create|update`; `process`, `config`; deployability gate. | Closed by operator confirmation. |
 | Build, release, deploy | Deploy from the bound source (public or private git) or a release; build lifecycle; per-process containers with replicas; blue/green switch with public verification; rollback with pinned secret revisions; restart. | Closed by operator confirmation. |
 | Domains | Primary and aliases; DNS, route, certificate and public state; serialized atomic Caddy writes; reconciliation and observation. | Closed by operator confirmation. |
 | Observe and remove | `app/env status`, `logs`, `operations list`, `app/env delete` per D13. Over node RPC the operator reads, follows and cancels any operation; the public HTTP path stays actor- and grant-scoped. | Closed by operator confirmation. |
@@ -1615,7 +1639,7 @@ subsequently implemented and qualified in alpha.5/alpha.6.
 | 1 | **Node-mode dispatch.** `eregion node <cmd> --json` over SSH/WireGuard calls the application services; contexts and handoff carry no API token; version lockstep and `--auto-upgrade-nodes`; binary installed once. | Separate-install login works; mismatched version refuses before mutation; no token in context or handoff. |
 | 2 | **`server init` to vaire's shape.** Preflight, `--answers`, `--password-stdin`, `--confirm <server>`, `--resume`/`--discard`, handoff with stored gate and `--secrets-out`, vault keyring, loopback node_exporter with an authenticated WireGuard-only telemetry endpoint, `context remove`, `secrets export` behind the human factor. | Interrupted-init and lockdown-revert checks pass; JSON/no-TTY never prompts. |
 | 3 | **Host convergence.** `plan`, `apply`, `doctor`, `status`, `ssh`, `node unlock-ssh`. | A second `apply` is a no-op; an upgraded node re-runs only changed steps. |
-| 4 | **App and environment model.** Migration for source binding, revisions, processes and deployability; `app create`, `env create|update|protect|unprotect|list|status`, `process list|scale`, `config`, secrets per D18. | Guided and flag-only paths save the same revision; a new environment can deploy without raw JSON. |
+| 4 | **App and environment model.** Migration for the app image repository, optional Git recipe, revisions, processes and deployability; `app create`, `env create|update|protect|unprotect|list|status`, `process list|scale`, `config`, secrets per D18. | Guided and flag-only paths save the same revision; image-only and Git deployments both work without raw JSON. |
 | 5 | **Deploy.** `deploy` from source (public or private git) or release, build lifecycle commands, release command, per-process containers with replicas, blue/green per D17, public verification, rollback, restart. | Two deploys and a rollback verified at the public HTTPS URL with no failed requests during the switch; a failed candidate leaves the old release serving; a worker process runs alongside web. |
 | 6 | **Domains.** Primary/aliases, DNS check, desired/applied/observed route state, serialized atomic Caddy writes, reconciliation on start and retry. | Failed reload and interrupted change recover; removing one domain leaves others intact. |
 | 7 | **Observe and remove.** `app/env status`, `logs`, `operations list`, `app delete`, `env delete` per D13. | Status shows serving release, processes and per-domain state; deletion cleans containers, routes and secrets and keeps history. |

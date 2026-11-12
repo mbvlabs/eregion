@@ -9,13 +9,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/node"
@@ -44,19 +44,19 @@ type rpcImagePushResult struct {
 }
 
 func (a *app) imageSpecs() []spec {
-	parent := operationMeta("Move a locally built Docker image into the node's local registry", "eregion image push andurel-site:local --app andurel --json")
-	parent.WhenToUse = []string{"Push an image that exists only on the operator's machine into the main node's loopback registry, so an environment can deploy it by immutable digest."}
+	parent := operationMeta("Move a locally built Docker image into the app's private registry repository", "eregion image push andurel-site:local --app andurel --json")
+	parent.WhenToUse = []string{"Push an image that exists only on the operator's machine into the private app repository, so an environment can deploy it by tag or immutable digest."}
 	parent.Examples = []string{"eregion image push andurel-site:local --app andurel --json"}
 
-	push := operationMeta("Stream a local Docker image through node RPC into the node's local registry", "eregion image push andurel-site:local --app andurel --tag local-2026-10-27 --json")
-	push.WhenToUse = []string{"Push a locally built image without an external registry. The image streams over SSH inside WireGuard; there is no registry port forwarding or temporary file. The default tag is the local image's short ID."}
+	push := operationMeta("Stream a local Docker image through node RPC into the app's private repository", "eregion image push andurel-site:local --app andurel --tag local-2026-10-27 --json")
+	push.WhenToUse = []string{"Push a locally built image into the app's immutable private registry repository. The node resolves the repository from the durable app record; the caller supplies only the app name and tag."}
 	push.Mutating = true
 	push.DryRunReason = "The image is streamed to the node and loaded into its registry; there is no safe local preview of the transfer."
 	push.Examples = []string{
 		"eregion image push andurel-site:local --app andurel",
 		"eregion image push andurel-site:local --app andurel --tag release-42 --json",
 	}
-	push.Next = []string{"eregion env update <app> <environment> --image <reference>"}
+	push.Next = []string{"eregion deploy <app> <environment> --image-tag <tag>"}
 
 	return []spec{{
 		use:  "image",
@@ -151,9 +151,9 @@ func (a *app) imagePush(cmd *cobra.Command, args []string) (result, error) {
 	}
 
 	node := imagePushTarget(client)
-	plain := fmt.Sprintf("Pushed %s to %s\nreference: %s\ntag: %s\nsize: %s\nnext: eregion env update %s <environment> --image %s",
-		localImage, node, pushed.Reference, pushed.TagReference, imageSize(pushed.SizeBytes), appName, pushed.Reference)
-	next := []string{fmt.Sprintf("eregion env update %s <environment> --image %s", appName, pushed.Reference)}
+	plain := fmt.Sprintf("Pushed %s to %s\nreference: %s\ntag: %s\nsize: %s\nnext: eregion deploy %s <environment> --image-tag %s",
+		localImage, node, pushed.Reference, pushed.TagReference, imageSize(pushed.SizeBytes), appName, tag)
+	next := []string{fmt.Sprintf("eregion deploy %s <environment> --image-tag %s", appName, tag)}
 	return result{data: pushed, plain: plain, next: next}, nil
 }
 
@@ -223,7 +223,7 @@ func (n *nodeClient) PushImage(ctx context.Context, repository, tag string, payl
 
 func validateImagePushParams(params rpcImagePushParams) error {
 	if err := platform.ValidateName(params.Repository); err != nil {
-		return contract.NewFault(contract.ValidationFailed, "invalid image repository", "Use the app name: 1–40 lowercase letters, digits, and inner hyphens; start with a letter and end with a letter or digit.")
+		return contract.NewFault(contract.ValidationFailed, "invalid application name", "Use the app name: 1–40 lowercase letters, digits, and inner hyphens; start with a letter and end with a letter or digit.")
 	}
 	if !imageTagPattern.MatchString(params.Tag) {
 		return contract.NewFault(contract.ValidationFailed, "invalid image tag", "Use 1–128 letters, digits, dots, underscores, or hyphens.")
@@ -233,24 +233,12 @@ func validateImagePushParams(params rpcImagePushParams) error {
 
 // nodeRegistryAddress follows the recorded host intent so a non-default
 // loopback registry address is used for tagging and the digest lookup.
-func nodeRegistryAddress() string {
-	if intent, err := host.LoadIntent(host.DefaultLayout()); err == nil && strings.TrimSpace(intent.RegistryListen) != "" {
-		return strings.TrimSpace(intent.RegistryListen)
-	}
-	return host.DefaultConfig(host.RoleMain, "").RegistryListen
-}
-
-// nodeHostLockPath is the lock every node host mutation takes: builds, host
-// apply, retention removal and garbage collection. The image push takes it too,
-// so a GC or registry restart cannot interrupt a push half-way.
+// nodeHostLockPath is the actual lock every node host mutation takes: builds,
+// host apply, retention removal, garbage collection, image upload and final app
+// metadata deletion. It comes from the shared managed node state directory,
+// never a separate worker-local path.
 func nodeHostLockPath() string {
-	if value := strings.TrimSpace(os.Getenv("EREGION_NODE_STATE_DIR")); value != "" {
-		return filepath.Join(value, "host.lock")
-	}
-	if config, err := host.LoadNodeFile(host.DefaultNodeConfigPath()); err == nil && strings.TrimSpace(config.StateDir) != "" {
-		return filepath.Join(strings.TrimSpace(config.StateDir), "host.lock")
-	}
-	return filepath.Join(node.DefaultStateDir(), "host.lock")
+	return node.HostLockPath("")
 }
 
 // acquireNodeHostLock takes the node's host lock without waiting: a running
@@ -272,30 +260,38 @@ func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Re
 	if err := validateImagePushParams(params); err != nil {
 		return rpcImagePushResult{}, err
 	}
-	release, err := acquireNodeHostLock(ctx)
+	lease, err := acquireNodeImageUploadLease(ctx, params.Repository)
 	if err != nil {
 		return rpcImagePushResult{}, err
 	}
-	defer release()
+	defer lease.Release()
+	registry, err := host.ManagedRegistryEndpoint(os.Getenv)
+	if err != nil {
+		return rpcImagePushResult{}, err
+	}
 	if payload == nil {
 		payload = strings.NewReader("")
 	}
+	dockerEnv, dockerCleanup, err := platform.IsolatedDockerEnvironment()
+	if err != nil {
+		return rpcImagePushResult{}, contract.NewFault(contract.PreconditionFailed, "isolated Docker configuration is unavailable", err.Error())
+	}
+	defer dockerCleanup()
 	progress := &imagePushProgress{out: out}
-	size, loaded, err := loadDockerImage(ctx, payload, progress)
+	size, loaded, err := loadDockerImage(ctx, payload, progress, dockerEnv)
 	if err != nil {
 		return rpcImagePushResult{}, err
 	}
-	registry := nodeRegistryAddress()
-	repository := registry + "/" + params.Repository
+	repository := registry + "/" + lease.ImageRepository
 	tagReference := repository + ":" + params.Tag
-	if _, err := runDockerImageCommand(ctx, []string{"docker", "tag", loaded, tagReference}, progress, false); err != nil {
+	if _, err := runDockerImageCommand(ctx, []string{"docker", "tag", loaded, tagReference}, progress, false, dockerEnv); err != nil {
 		return rpcImagePushResult{}, err
 	}
 	progress.emit("pushing " + tagReference)
-	if _, err := runDockerImageCommand(ctx, []string{"docker", "push", tagReference}, progress, true); err != nil {
+	if _, err := runDockerImageCommand(ctx, []string{"docker", "push", tagReference}, progress, true, dockerEnv); err != nil {
 		return rpcImagePushResult{}, err
 	}
-	raw, err := runDockerImageCommand(ctx, []string{"docker", "inspect", "--format", "{{json .RepoDigests}}", tagReference}, nil, false)
+	raw, err := runDockerImageCommand(ctx, []string{"docker", "inspect", "--format", "{{json .RepoDigests}}", tagReference}, nil, false, dockerEnv)
 	if err != nil {
 		return rpcImagePushResult{}, err
 	}
@@ -307,9 +303,33 @@ func pushNodeImage(ctx context.Context, params rpcImagePushParams, payload io.Re
 	return rpcImagePushResult{Reference: reference, TagReference: tagReference, Digest: digest, SizeBytes: size}, nil
 }
 
-func loadDockerImage(ctx context.Context, payload io.Reader, progress *imagePushProgress) (int64, string, error) {
+// acquireNodeImageUploadLease resolves the durable app identity and holds the
+// shared app advisory lock plus the actual node host lock through the complete
+// upload. The connection is dedicated to the session lock, not a pooled
+// connection that could outlive the stream.
+func acquireNodeImageUploadLease(ctx context.Context, appName string) (*controlplane.ImageUploadLease, error) {
+	if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
+		return nil, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())
+	}
+	dsn := strings.TrimSpace(os.Getenv("EREGION_DATABASE_URL"))
+	if dsn == "" {
+		return nil, contract.NewFault(contract.InputRequired, "the node has no control database URL", "Check "+host.ServiceEnvPath+" on the node.")
+	}
+	config, err := controlplane.ParseDatabaseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	identity, err := host.LocalRegistryIdentity()
+	if err != nil {
+		return nil, err
+	}
+	return controlplane.AcquireImageUploadLease(ctx, config.ConnConfig, identity, appName)
+}
+
+func loadDockerImage(ctx context.Context, payload io.Reader, progress *imagePushProgress, dockerEnv []string) (int64, string, error) {
 	reader := &boundedImagePayload{reader: payload, max: maxImagePushBytes, progress: progress}
 	command := exec.CommandContext(ctx, "docker", "load")
+	command.Env = dockerEnv
 	command.Stdin = reader
 	output := &lockedBuffer{}
 	command.Stdout, command.Stderr = output, output
@@ -380,8 +400,9 @@ func selectRepoDigest(raw []byte, repository string) (string, string, error) {
 	return "", "", contract.NewFault(contract.PreconditionFailed, "the pushed image has no registry digest", "Check that the node's local registry is running, then push the image again.")
 }
 
-func runDockerImageCommand(ctx context.Context, argv []string, progress *imagePushProgress, stream bool) ([]byte, error) {
+func runDockerImageCommand(ctx context.Context, argv []string, progress *imagePushProgress, stream bool, dockerEnv []string) ([]byte, error) {
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // G204: fixed argv built from validated values.
+	command.Env = dockerEnv
 	var output []byte
 	var err error
 	if stream && progress != nil {

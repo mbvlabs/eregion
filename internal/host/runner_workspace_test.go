@@ -42,14 +42,14 @@ func (d *interleavingWorkspaceDatabase) Inspect(context.Context, string) (Databa
 func (d *interleavingWorkspaceDatabase) Migrate(context.Context, string) (DatabaseState, error) {
 	return DatabaseState{}, nil
 }
-func (d *interleavingWorkspaceDatabase) AssignWorkspace(context.Context, string, string) (controlplane.WorkspaceIdentity, error) {
+func (d *interleavingWorkspaceDatabase) AssignWorkspace(context.Context, string, string, controlplane.RegistryHostIdentity) (controlplane.WorkspaceIdentity, error) {
 	return controlplane.WorkspaceIdentity{}, errors.New("unexpected assignment")
 }
 func (d *interleavingWorkspaceDatabase) ReadWorkspace(context.Context, string) (controlplane.WorkspaceIdentity, error) {
-	identity := controlplane.WorkspaceIdentity{Configured: true, ID: "ws_0123456789abcdef01234567", Name: "thelab"}
+	identity := controlplane.WorkspaceIdentity{Configured: true, ID: "ws_0123456789abcdef01234567", Name: "thelab", RegistryHost: testWorkspaceRegistryHostPtr()}
 	select {
 	case <-d.conflict:
-		identity = controlplane.WorkspaceIdentity{Configured: true, ID: "ws_aaaaaaaaaaaaaaaaaaaaaaaa", Name: "otherlab"}
+		identity = controlplane.WorkspaceIdentity{Configured: true, ID: "ws_aaaaaaaaaaaaaaaaaaaaaaaa", Name: "otherlab", RegistryHost: testWorkspaceRegistryHostPtr()}
 	default:
 	}
 	// Capture the first result before allowing the test to change authority.
@@ -70,6 +70,7 @@ func TestApplyRechecksWorkspaceAuthorityUnderTheApplyLock(t *testing.T) {
 	runner.Now = func() time.Time { return now }
 	database := &interleavingWorkspaceDatabase{early: make(chan struct{}), conflict: make(chan struct{})}
 	runner.Database = database
+	runner.RegistryHostIdentity = testWorkspaceRegistryHostPtr()
 	if err := ensureState(cfg); err != nil {
 		t.Fatal(err)
 	}

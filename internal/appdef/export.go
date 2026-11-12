@@ -18,16 +18,16 @@ import (
 // resource declarations. Observed health, releases, credentials and TLS state
 // are never exported. A resource that the revision depends on must still have
 // an inventory definition; it is refused rather than silently dropped.
-func Export(app, environment, buildNode string, revision *platform.EnvironmentRevision, domains []platform.DomainBinding, resources []platform.Resource) (string, error) {
-	return export(app, environment, buildNode, revision, domains, resources, nil)
+func Export(app, environment, imageRepository, buildNode string, revision *platform.EnvironmentRevision, domains []platform.DomainBinding, resources []platform.Resource) (string, error) {
+	return export(app, environment, imageRepository, buildNode, revision, domains, resources, nil)
 }
 
 // Inspect exports a non-applicable snapshot using only the supplied inventory.
-func Inspect(app, environment string, current platform.Environment, domains []platform.DomainBinding, resources []platform.Resource) (string, error) {
-	return export(app, environment, current.BuildNode, current.Revision, domains, resources, &current)
+func Inspect(app, environment, imageRepository string, current platform.Environment, domains []platform.DomainBinding, resources []platform.Resource) (string, error) {
+	return export(app, environment, imageRepository, current.BuildNode, current.Revision, domains, resources, &current)
 }
 
-func export(app, environment, buildNode string, revision *platform.EnvironmentRevision, domains []platform.DomainBinding, resources []platform.Resource, inspection *platform.Environment) (string, error) {
+func export(app, environment, imageRepository, buildNode string, revision *platform.EnvironmentRevision, domains []platform.DomainBinding, resources []platform.Resource, inspection *platform.Environment) (string, error) {
 	if err := platform.ValidateName(app); err != nil {
 		return "", fmt.Errorf("app: %w", err)
 	}
@@ -70,8 +70,8 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 			return "", err
 		}
 	}
-	if state.Source.Kind == "" {
-		return "", errors.New("the environment has no source binding; add one before exporting")
+	if state.Source.URL == "" && (len(state.Source.BuildEnv) > 0 || state.Source.Builder != "" || state.Source.Ref != "" || state.Source.ContextPath != "" || state.Source.CredentialSecretName != "" || state.Source.GoTargets != nil || state.Source.Buildpacks != nil) {
+		return "", errors.New("the environment has Git build settings without a source URL")
 	}
 
 	sortedDomains := append([]platform.DomainBinding(nil), domains...)
@@ -113,6 +113,13 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 		out.WriteString("inspection_only = true\n")
 	}
 	fmt.Fprintf(&out, "app = %s\n", quote(app))
+	if imageRepository != "" {
+		normalized, err := platform.NormalizeImageRepository(imageRepository)
+		if err != nil {
+			return "", fmt.Errorf("image_repository: %w", err)
+		}
+		fmt.Fprintf(&out, "image_repository = %s\n", quote(normalized))
+	}
 	fmt.Fprintf(&out, "node = %s\n", quote(state.Runtime.Node))
 	fmt.Fprintf(&out, "build_node = %s\n", quote(buildNode))
 	fmt.Fprintf(&out, "secret_names = %s\n", stringArray(state.SecretNames))
@@ -147,10 +154,8 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 		}
 	}
 
-	out.WriteString("\n[source]\n")
-	out.WriteString("kind = " + quote(state.Source.Kind) + "\n")
-	switch state.Source.Kind {
-	case "git":
+	if state.Source.URL != "" {
+		out.WriteString("\n[source]\n")
 		fmt.Fprintf(&out, "url = %s\n", quote(state.Source.URL))
 		fmt.Fprintf(&out, "ref = %s\n", quote(state.Source.Ref))
 		fmt.Fprintf(&out, "credential_secret = %s\n", quote(state.Source.CredentialSecretName))
@@ -164,8 +169,6 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 			fmt.Fprintf(&out, "{ process = %s, target = %s }", quote(target.Process), quote(target.Target))
 		}
 		out.WriteString("]\n")
-	case "image":
-		fmt.Fprintf(&out, "image = %s\n", quote(state.Source.Image))
 	}
 	if settings := state.Source.Buildpacks; settings != nil {
 		out.WriteString("\n[source.buildpacks]\n")
@@ -184,7 +187,7 @@ func export(app, environment, buildNode string, revision *platform.EnvironmentRe
 			fmt.Fprintf(&out, "node_version = %s\n", quote(advanced.NodeVersion))
 		}
 	}
-	if state.Source.Kind == "git" && len(state.Source.BuildEnv) == 0 {
+	if state.Source.URL != "" && len(state.Source.BuildEnv) == 0 {
 		out.WriteString("\n[source.build_env]\n")
 	} else if len(state.Source.BuildEnv) > 0 {
 		out.WriteString("\n[source.build_env]\n")
@@ -383,18 +386,18 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 	if err := platform.NormalizeRevisionState(&base); err != nil {
 		return patch, nil, nil, err
 	}
+	if r.ImageRepository != "" && r.ImageRepository != current.ImageRepository {
+		return patch, nil, nil, fmt.Errorf("image_repository: definition value %q does not match the app's repository %q", r.ImageRepository, current.ImageRepository)
+	}
 	if !r.NodeSet {
 		return patch, nil, nil, errors.New("node is required for an update definition; export an existing environment to get a complete file")
-	}
-	if r.Source == nil {
-		return patch, nil, nil, errors.New("source is required for an update definition; export an existing environment to get a complete file")
 	}
 	if err := currentDomainsMatch(current, currentDomains); err != nil {
 		return patch, nil, nil, err
 	}
 
 	desired := platform.RevisionState{
-		Source:            sourceBinding(r.Source),
+		Source:            platform.SourceBinding{},
 		Runtime:           runtimeFromDefinition(r.Runtime, r.Node),
 		Processes:         append([]platform.ProcessSpec(nil), r.Processes...),
 		Config:            cloneStringMap(r.Config),
@@ -404,8 +407,8 @@ func (r *Resolved) UpdatePatch(current platform.Environment, currentDomains []pl
 		WebhookSecretName: base.WebhookSecretName,
 		Retention:         base.Retention.Clone(),
 	}
-	if desired.Source.Kind == "" {
-		return patch, nil, nil, errors.New("source.kind is required for an update definition")
+	if r.Source != nil {
+		desired.Source = sourceBinding(r.Source)
 	}
 	if r.Automation != nil {
 		if r.Automation.AutoDeploy != nil {
@@ -580,9 +583,9 @@ func currentDomainsMatch(current platform.Environment, bindings []platform.Domai
 }
 
 func sourceEqual(a, b platform.SourceBinding) bool {
-	if a.Kind != b.Kind || a.URL != b.URL || a.Ref != b.Ref ||
+	if a.URL != b.URL || a.Ref != b.Ref ||
 		a.CredentialSecretName != b.CredentialSecretName || a.ContextPath != b.ContextPath ||
-		a.Builder != b.Builder || a.Image != b.Image || len(a.BuildEnv) != len(b.BuildEnv) ||
+		a.Builder != b.Builder || len(a.BuildEnv) != len(b.BuildEnv) ||
 		!slices.Equal(a.GoTargets, b.GoTargets) || !reflect.DeepEqual(a.Buildpacks, b.Buildpacks) {
 		return false
 	}
@@ -651,13 +654,11 @@ func sourceDiff(old, new platform.SourceBinding) []string {
 			out = append(out, "source."+name+": "+display(before)+" -> "+display(after))
 		}
 	}
-	add("kind", old.Kind, new.Kind)
 	add("url", old.URL, new.URL)
 	add("ref", old.Ref, new.Ref)
 	add("credential_secret", old.CredentialSecretName, new.CredentialSecretName)
 	add("context_path", old.ContextPath, new.ContextPath)
 	add("builder", old.Builder, new.Builder)
-	add("image", old.Image, new.Image)
 	if !stringMapEqual(old.BuildEnv, new.BuildEnv) {
 		out = append(out, "source.build_env changed")
 	}

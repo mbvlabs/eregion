@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,13 +41,14 @@ type Family struct {
 }
 
 var (
-	argvStepPattern      = regexp.MustCompile(`^platform-(argv|node|pull|image|cleanup|preflight|port|network)-[0-9a-z]+(-[0-9a-z]+)*-v1$`)
-	containerStepPattern = regexp.MustCompile(`^platform-container-[0-9a-z]+(-[0-9a-z]+)*-v1$`)
-	healthStepPattern    = regexp.MustCompile(`^platform-health-[0-9a-z]+(-[0-9a-z]+)*-v1$`)
-	packStepPattern      = regexp.MustCompile(`^platform-pack-[0-9]{2}-v1$`)
-	buildStopStepPattern = regexp.MustCompile(`^platform-build-stop-[0-9]{2}-v1$`)
-	containerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
-	labelKeyPattern      = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$`)
+	argvStepPattern       = regexp.MustCompile(`^platform-(argv|node|pull|image|cleanup|preflight|port|network)-[0-9a-z]+(-[0-9a-z]+)*-v1$`)
+	containerStepPattern  = regexp.MustCompile(`^platform-container-[0-9a-z]+(-[0-9a-z]+)*-v1$`)
+	healthStepPattern     = regexp.MustCompile(`^platform-health-[0-9a-z]+(-[0-9a-z]+)*-v1$`)
+	packStepPattern       = regexp.MustCompile(`^platform-pack-[0-9]{2}-v1$`)
+	readyImageStepPattern = regexp.MustCompile(`^platform-ready-image-[0-9]{2}-v1$`)
+	buildStopStepPattern  = regexp.MustCompile(`^platform-build-stop-[0-9]{2}-v1$`)
+	containerNamePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
+	labelKeyPattern       = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]{0,61}[a-z0-9])?$`)
 )
 
 //go:embed scripts/git-askpass.sh
@@ -60,6 +62,7 @@ func StepFamilies() []Family {
 		{Match: releaseCommandStepPattern.MatchString, Build: buildReleaseCommandStep},
 		{Match: healthStepPattern.MatchString, Build: buildHealthStep},
 		{Match: packStepPattern.MatchString, Build: buildPackStep},
+		{Match: readyImageStepPattern.MatchString, Build: buildReadyImageStep},
 		{Match: buildStopStepPattern.MatchString, Build: buildBuildStopStep},
 		{Match: deleteStepPattern.MatchString, Build: buildDeleteStep},
 		{Match: retentionRemoveStepPattern.MatchString, Build: buildRetentionRemoveStep},
@@ -113,7 +116,10 @@ type ArgvPayload struct {
 	AllowFailure  bool              `json:"allow_failure,omitempty"`
 	// MissingOK makes a "No such container" removal result a success. It is
 	// only for idempotent cleanup, never for a step that creates state.
-	MissingOK      bool `json:"missing_ok,omitempty"`
+	MissingOK bool `json:"missing_ok,omitempty"`
+	// IsolatedDocker runs the command with an explicit private empty Docker
+	// config, never the node user's HOME/DOCKER_CONFIG or credential helpers.
+	IsolatedDocker bool `json:"isolated_docker,omitempty"`
 	TimeoutSeconds int  `json:"timeout_seconds,omitempty"`
 }
 
@@ -171,22 +177,56 @@ func (s *ArgvStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckRe
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	_, _, err := runArgv(probeCtx, s.payload.CheckArgv, nil, rt, s.ID(), nil)
+	var env []string
+	cleanup := func() {}
+	if s.payload.IsolatedDocker {
+		var envErr error
+		env, cleanup, envErr = s.commandEnv(rt)
+		if envErr != nil {
+			return engine.CheckResult{Complete: false, Detail: "isolated Docker configuration is unavailable"}, nil
+		}
+	}
+	defer cleanup()
+	_, _, err := s.run(probeCtx, s.payload.CheckArgv, env, rt, nil)
 	if err != nil {
 		return engine.CheckResult{Complete: false, Detail: "node command check did not succeed"}, nil
 	}
 	return engine.CheckResult{Complete: true, Detail: "node command check already succeeded"}, nil
 }
 
+func (s *ArgvStep) commandEnv(rt engine.Runtime) ([]string, func(), error) {
+	env, err := stepEnv(s.payload.Env, s.payload.SecretEnvKeys, rt)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	}
+	if s.payload.IsolatedDocker {
+		isolated, cleanup, isoErr := IsolatedDockerEnvironment()
+		if isoErr != nil {
+			return nil, func() {}, fmt.Errorf("%w: %s", engine.ErrPermanent, isoErr)
+		}
+		env = append(env, isolated...)
+		return env, cleanup, nil
+	}
+	return env, func() {}, nil
+}
+
+func (s *ArgvStep) run(ctx context.Context, argv, env []string, rt engine.Runtime, report engine.Reporter) (string, string, error) {
+	if s.payload.IsolatedDocker {
+		return runArgvClean(ctx, argv, env, rt, s.ID(), report)
+	}
+	return runArgv(ctx, argv, env, rt, s.ID(), report)
+}
+
 func (s *ArgvStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
 	timeout := time.Duration(s.payload.TimeoutSeconds) * time.Second
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	extraEnv, err := stepEnv(s.payload.Env, s.payload.SecretEnvKeys, rt)
+	extraEnv, cleanup, err := s.commandEnv(rt)
 	if err != nil {
-		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		return engine.ApplyResult{}, err
 	}
-	stdout, stderr, err := runArgv(runCtx, s.payload.Argv, extraEnv, rt, s.ID(), report)
+	defer cleanup()
+	stdout, stderr, err := s.run(runCtx, s.payload.Argv, extraEnv, rt, report)
 	if err != nil && s.payload.MissingOK && containerAlreadyGone(stderr) {
 		return engine.ApplyResult{Result: map[string]any{
 			"stdout": truncate(stdout, 8192), "missing": true,
@@ -838,9 +878,9 @@ func (s *HealthStep) Apply(ctx context.Context, rt engine.Runtime, report engine
 
 const (
 	// A pack build gets a dedicated Docker network so every lifecycle phase
-	// container is attributable to this operation, step and attempt. Cancelling
-	// the build can then remove exactly those containers without touching
-	// serving, concurrent or unrelated containers.
+	// container is attributable to this operation, step and attempt. The
+	// private registry container is temporarily attached to it so a remote
+	// publish never needs host networking.
 	buildNetworkOwner          = "pack"
 	buildNetworkOwnerLabel     = "io.eregion.build.owner"
 	buildNetworkOperationLabel = "io.eregion.build.operation"
@@ -848,11 +888,21 @@ const (
 	buildNetworkAttemptLabel   = "io.eregion.build.attempt"
 	buildNetworkCreateTimeout  = 30 * time.Second
 	buildNetworkCleanupTimeout = 30 * time.Second
-	buildNetworkLabelsFormat   = "{{json .Labels}}"
+	buildNetworkDetailFormat   = "{{json .}}"
 	// packBuildKillGrace lets pack remove its own lifecycle containers and
 	// volumes after cancellation before it is killed. The owned-network
 	// cleanup remains the backstop when pack cannot clean up in time.
 	packBuildKillGrace = 5 * time.Second
+	// packPublishPlatformAPIMinor is the first Platform API that makes pack's
+	// --insecure-registry reach the lifecycle. Pack silently omits the flag
+	// below it, so a successful build would otherwise fail to reach our
+	// loopback HTTP registry.
+	packPublishPlatformAPIMinor = 13
+	// packSupportedPlatformAPIMinor is the latest Platform API pack 0.40.9
+	// offers; the builder must advertise one of 0.13–0.15 for a supported
+	// insecure publish.
+	packSupportedPlatformAPIMinor = 15
+	packCompletionSchema          = 1
 )
 
 type PackPayload struct {
@@ -862,6 +912,10 @@ type PackPayload struct {
 	GitURL  string `json:"git_url,omitempty"`
 	GitRef  string `json:"git_ref,omitempty"`
 	Builder string `json:"builder"`
+	// Registry is the node's actual configured loopback registry endpoint. It
+	// is never defaulted in the read path: a missing or unreadable node
+	// configuration fails the build instead of publishing somewhere else.
+	Registry string `json:"registry"`
 	// GitContextPath is the Buildpacks context inside the git checkout. It is
 	// meaningless for a directory source and therefore valid only with GitURL.
 	GitContextPath string                `json:"git_context_path,omitempty"`
@@ -880,6 +934,38 @@ type PackPayload struct {
 	LaunchCache string `json:"launch_cache,omitempty"`
 }
 
+// packCompletion is the durable evidence written after a published build has
+// been pulled and verified but before the local completion tag exists. Check
+// can therefore recover the exact commit and canonical registry reference
+// after a crash without trusting a pre-existing local tag.
+type packCompletion struct {
+	Schema      int    `json:"schema"`
+	OperationID string `json:"operation_id"`
+	Step        string `json:"step"`
+	Attempt     uint32 `json:"attempt"`
+	InputsHash  string `json:"inputs_hash"`
+	Image       string `json:"image"`
+	Registry    string `json:"registry"`
+	Platform    string `json:"platform"`
+	Reference   string `json:"reference"`
+	Digest      string `json:"digest"`
+	ImageID     string `json:"image_id"`
+	Commit      string `json:"commit,omitempty"`
+}
+
+func (c packCompletion) result() map[string]any {
+	fields := map[string]any{
+		"image":     c.Image,
+		"image_id":  c.ImageID,
+		"reference": c.Reference,
+		"digest":    c.Digest,
+	}
+	if c.Commit != "" {
+		fields["commit"] = c.Commit
+	}
+	return fields
+}
+
 type PackStep struct {
 	exec    engine.Execution
 	payload PackPayload
@@ -896,6 +982,14 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if err := ValidateImage(payload.Image); err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(payload.Registry) == "" {
+		return nil, errors.New("pack payload requires the node's configured loopback registry endpoint")
+	}
+	registry, err := normalizeRegistryAddress(payload.Registry)
+	if err != nil {
+		return nil, fmt.Errorf("pack payload registry: %w", err)
+	}
+	payload.Registry = registry
 	if payload.Builder != "" {
 		if err := ValidateImage(payload.Builder); err != nil {
 			return nil, err
@@ -930,7 +1024,6 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if err := validateEnv(payload.Env, "build environment"); err != nil {
 		return nil, err
 	}
-	var err error
 	payload.GoTargets, err = buildpacks.NormalizeTargets(payload.GoTargets)
 	if err != nil {
 		return nil, err
@@ -970,16 +1063,53 @@ func (s *PackStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfte
 func (s *PackStep) Inputs() ([]byte, error)         { return json.Marshal(s.payload) }
 
 func (s *PackStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckResult, error) {
+	completion, exists, err := loadPackCompletion(rt.Root, s.exec.OperationID, s.payload.Step)
+	if err != nil {
+		return engine.CheckResult{}, err
+	}
+	if !exists {
+		return engine.CheckResult{Detail: "no durable registry-backed build completion exists"}, nil
+	}
+	if !IsImageDigestReference(completion.Reference) || !registryDigestPattern.MatchString(completion.Digest) || !imageIDPattern.MatchString(completion.ImageID) || !strings.HasSuffix(completion.Reference, "@"+completion.Digest) {
+		return engine.CheckResult{Detail: "the durable build completion has no valid immutable registry identity"}, nil
+	}
+	inputs, err := s.Inputs()
+	if err != nil {
+		return engine.CheckResult{}, err
+	}
+	expectedHash := engine.InputsHash(s.ID(), inputs)
+	expectedPlatform, platformErr := buildpacks.TargetPlatform(runtime.GOARCH)
+	if platformErr != nil {
+		return engine.CheckResult{}, platformErr
+	}
+	if completion.InputsHash != expectedHash || completion.Image != s.payload.Image || completion.Registry != s.payload.Registry || completion.OperationID != string(s.exec.OperationID) || completion.Step != s.payload.Step || completion.Platform != expectedPlatform {
+		return engine.CheckResult{Detail: "the durable build completion belongs to other inputs or another operation"}, nil
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	stdout, stderr, err := runArgv(probeCtx, []string{"docker", "image", "inspect", "--format", "{{.Id}}", s.payload.Image}, nil, rt, s.ID(), nil)
+	stdout, stderr, err := runArgvClean(probeCtx, []string{"docker", "image", "inspect", "--format", "{{.Id}}|{{json .RepoDigests}}", s.payload.Image}, nil, rt, s.ID(), nil)
 	if err != nil {
-		if strings.Contains(strings.ToLower(stderr), "no such") || strings.Contains(strings.ToLower(stderr), "not found") {
-			return engine.CheckResult{Complete: false, Detail: "built image is absent"}, nil
+		if imageMissingError(stderr) {
+			return engine.CheckResult{Detail: "the local completion tag is absent"}, nil
 		}
 		return engine.CheckResult{}, permanentCommandError(err)
 	}
-	return engine.CheckResult{Complete: true, Detail: "built image already exists (" + truncate(strings.TrimSpace(stdout), 80) + ")"}, nil
+	imageID, repoDigests, err := parsePackImageInspection(stdout)
+	if err != nil {
+		return engine.CheckResult{}, err
+	}
+	if imageID != completion.ImageID {
+		return engine.CheckResult{Detail: "the local completion tag does not match the durable image config digest"}, nil
+	}
+	if !containsString(repoDigests, completion.Reference) {
+		return engine.CheckResult{Detail: "the local completion tag does not carry the canonical registry digest"}, nil
+	}
+	return engine.CheckResult{
+		Complete:       true,
+		AppliedAttempt: completion.Attempt,
+		Result:         completion.result(),
+		Detail:         "recovered a verified registry-backed build completion (" + completion.Digest + ")",
+	}, nil
 }
 
 func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (result engine.ApplyResult, applyErr error) {
@@ -1070,11 +1200,42 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	if err != nil || !info.IsDir() {
 		return engine.ApplyResult{}, fmt.Errorf("%w: build source %s is not a readable directory on the node", engine.ErrPermanent, source)
 	}
+	builder, runImage := s.payload.Builder, ""
+	if builder == "" {
+		profile, err := buildpacks.ProfileForArchitecture(runtime.GOARCH)
+		if err != nil {
+			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+		}
+		builder, runImage = profile.Builder, profile.RunImage
+	}
+	platform, err := buildpacks.TargetPlatform(runtime.GOARCH)
+	if err != nil {
+		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	}
+	if err := verifyBuilderPlatformAPI(buildCtx, rt, isolation, builder, platform, s.ID(), report); err != nil {
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
+		}
+		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	}
+	registry, err := inspectRegistryContainer(buildCtx, rt, isolation, s.payload.Registry, s.ID(), report)
+	if err != nil {
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
+		}
+		return engine.ApplyResult{}, err
+	}
+	if err := removeStaleBuildNetworks(buildCtx, rt, isolation, registry.ID, s.ID(), report); err != nil {
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
+		}
+		return engine.ApplyResult{}, err
+	}
 	networkCtx, cancelNetwork := context.WithTimeout(buildCtx, buildNetworkCreateTimeout)
 	network, err := createBuildNetwork(networkCtx, rt, isolation, s.exec.OperationID, s.payload.Step, s.exec.Attempt)
 	cancelNetwork()
 	if err != nil {
-		cleanupErr := cleanupAmbiguousBuildNetwork(ctx, rt, isolation, network, s.exec.OperationID, s.payload.Step, s.exec.Attempt)
+		cleanupErr := cleanupAmbiguousBuildNetwork(ctx, rt, isolation, network, s.exec.OperationID, s.payload.Step, s.exec.Attempt, registry.ID)
 		if cleanupErr != nil && report != nil {
 			report(engine.Event{Kind: "warning", Step: s.ID(), Message: cleanupErr.Error()})
 		}
@@ -1089,7 +1250,7 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildNetworkCleanupTimeout)
 		defer cancel()
-		cleanupErr := removeBuildNetwork(cleanupCtx, rt, isolation, network, s.exec.OperationID, s.payload.Step, s.exec.Attempt)
+		cleanupErr := removeBuildNetwork(cleanupCtx, rt, isolation, network, s.exec.OperationID, s.payload.Step, s.exec.Attempt, registry.ID)
 		if cleanupErr == nil {
 			return
 		}
@@ -1100,15 +1261,18 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 			applyErr = fmt.Errorf("%w; cleaning the build network failed: %v", applyErr, cleanupErr)
 		}
 	}()
-	builder, runImage := s.payload.Builder, ""
-	if builder == "" {
-		profile, err := buildpacks.ProfileForArchitecture(runtime.GOARCH)
-		if err != nil {
-			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	transientEndpoint, err := attachRegistryToBuildNetwork(buildCtx, rt, isolation, network, registry, s.ID(), report)
+	if err != nil {
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
 		}
-		builder, runImage = profile.Builder, profile.RunImage
+		return engine.ApplyResult{}, err
 	}
-	args := packBuildArgs(s.payload, source, network, builder, runImage)
+	publishReference, repository, tag, err := packPublishReference(s.payload.Image, transientEndpoint)
+	if err != nil {
+		return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+	}
+	args := packBuildArgs(s.payload, source, network, builder, runImage, publishReference, platform, transientEndpoint)
 	buildRunCtx, cancel := context.WithTimeout(buildCtx, time.Duration(s.payload.TimeoutSeconds)*time.Second)
 	defer cancel()
 	_, stderr, err := runArgvCleanPack(buildRunCtx, args, isolation, rt, s.ID(), report)
@@ -1121,22 +1285,76 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 		}
 		return engine.ApplyResult{}, fmt.Errorf("%w: pack build failed: %s", engine.ErrPermanent, commandDetail(err, stderr))
 	}
-	fields := map[string]any{"image": s.payload.Image}
-	if commit != "" {
-		fields["commit"] = commit
+	digest, err := resolvePublishedManifestDigest(buildCtx, s.payload.Registry, repository, tag)
+	if err != nil {
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
+		}
+		return engine.ApplyResult{}, err
 	}
-	return engine.ApplyResult{Result: fields}, nil
+	canonical := s.payload.Registry + "/" + repository + "@" + digest
+	imageID, err := pullAndVerifyPublishedImage(buildCtx, rt, isolation, canonical, runtime.GOARCH, s.ID(), report)
+	if err != nil {
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
+		}
+		return engine.ApplyResult{}, err
+	}
+	// The registry attachment and every lifecycle container belong to the
+	// transient build. Clean them before the local completion tag so a failure
+	// here cannot leave a tag that looks like a finished artifact.
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), buildNetworkCleanupTimeout)
+	cleanupErr := removeBuildNetwork(cleanupCtx, rt, isolation, network, s.exec.OperationID, s.payload.Step, s.exec.Attempt, registry.ID)
+	cancelCleanup()
+	if cleanupErr != nil {
+		return engine.ApplyResult{}, fmt.Errorf("cleaning the build network before completion failed: %w", cleanupErr)
+	}
+	if buildCtx.Err() != nil {
+		return engine.ApplyResult{}, engine.ErrInterrupted
+	}
+	inputs, err := s.Inputs()
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
+	completion := packCompletion{
+		Schema: packCompletionSchema, OperationID: string(s.exec.OperationID), Step: s.payload.Step,
+		Attempt: s.exec.Attempt, InputsHash: engine.InputsHash(s.ID(), inputs),
+		Image: s.payload.Image, Registry: s.payload.Registry, Platform: platform,
+		Reference: canonical, Digest: digest, ImageID: imageID, Commit: commit,
+	}
+	if err := writePackCompletion(rt.Root, completion); err != nil {
+		return engine.ApplyResult{}, err
+	}
+	taggedID, err := tagVerifiedPublishedImage(buildCtx, rt, isolation, s.payload.Image, canonical, s.ID(), report)
+	if err != nil {
+		if buildCtx.Err() != nil {
+			return engine.ApplyResult{}, engine.ErrInterrupted
+		}
+		return engine.ApplyResult{}, err
+	}
+	if taggedID != imageID {
+		return engine.ApplyResult{}, fmt.Errorf("%w: the local completion tag resolved to %s, not the verified registry image %s", engine.ErrPermanent, taggedID, imageID)
+	}
+	return engine.ApplyResult{Result: completion.result()}, nil
 }
 
 // packBuildArgs renders one Buildpacks build. Explicit volume caches keep the
 // build and launch caches attributable to one environment; pack otherwise
 // creates a randomly keyed launch volume on every build. The dedicated network
 // makes every lifecycle container this build creates identifiable after a
-// cancellation.
-func packBuildArgs(payload PackPayload, source, network, builder, runImage string) []string {
-	args := []string{"pack", "build", payload.Image, "--path", source, "--builder", builder}
+// cancellation. Publish sends the finished app image to the private registry
+// and selects the build node's exact target platform for both the pinned
+// default builder and an explicit builder.
+func packBuildArgs(payload PackPayload, source, network, builder, runImage, publishReference, platform, insecureRegistry string) []string {
+	args := []string{"pack", "build", publishReference, "--publish", "--path", source, "--builder", builder}
 	if runImage != "" {
 		args = append(args, "--run-image", runImage)
+	}
+	if platform != "" {
+		args = append(args, "--platform", platform)
+	}
+	if insecureRegistry != "" {
+		args = append(args, "--insecure-registry", insecureRegistry)
 	}
 	if payload.Buildpacks != nil {
 		for _, ref := range payload.Buildpacks.Order {
@@ -1207,31 +1425,64 @@ func createBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []stri
 // fresh bounded context. The deterministic network is removed only after
 // removeBuildNetwork verifies every ownership label; a foreign or pre-existing
 // network is refused and left untouched.
-func cleanupAmbiguousBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, network string, operationID contract.OperationID, step string, attempt uint32) error {
+func cleanupAmbiguousBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, network string, operationID contract.OperationID, step string, attempt uint32, registryID string) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildNetworkCleanupTimeout)
 	defer cancel()
-	return removeBuildNetwork(cleanupCtx, rt, isolation, network, operationID, step, attempt)
+	return removeBuildNetwork(cleanupCtx, rt, isolation, network, operationID, step, attempt, registryID)
+}
+
+type buildNetworkContainer struct {
+	Name        string `json:"Name"`
+	IPv4Address string `json:"IPv4Address"`
+}
+
+type buildNetworkInspection struct {
+	Name       string                           `json:"Name"`
+	Labels     map[string]string                `json:"Labels"`
+	Containers map[string]buildNetworkContainer `json:"Containers"`
+}
+
+// inspectBuildNetwork reads the exact name, ownership labels and attached
+// containers in one bounded Docker call. A missing network is reported as
+// clean rather than as an error.
+func inspectBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, name, step string) (buildNetworkInspection, bool, error) {
+	stdout, stderr, err := runArgvClean(ctx, []string{"docker", "network", "inspect", "--format", buildNetworkDetailFormat, name}, isolation, rt, step, nil)
+	if err != nil {
+		if buildNetworkGone(stderr) {
+			return buildNetworkInspection{}, false, nil
+		}
+		return buildNetworkInspection{}, false, fmt.Errorf("inspecting build network %s failed: %s", name, commandDetail(err, stderr))
+	}
+	var inspection buildNetworkInspection
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &inspection); err != nil {
+		return buildNetworkInspection{}, false, fmt.Errorf("build network %s did not report its details: %v", name, err)
+	}
+	if inspection.Labels == nil {
+		inspection.Labels = map[string]string{}
+	}
+	if inspection.Containers == nil {
+		inspection.Containers = map[string]buildNetworkContainer{}
+	}
+	return inspection, true, nil
 }
 
 // removeBuildNetwork removes only containers attached to the network created
-// for this exact build attempt, then removes the network itself. It verifies
-// the ownership labels first so a name collision or a foreign network is never
-// cleaned. A missing network is already clean.
-func removeBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, name string, operationID contract.OperationID, step string, attempt uint32) error {
+// for this exact build attempt, detaches the validated private registry, then
+// removes the network itself. It verifies the ownership labels first so a name
+// collision or a foreign network is never cleaned. The shared registry
+// container is never stopped, removed or restarted here. A missing network is
+// already clean.
+func removeBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, name string, operationID contract.OperationID, step string, attempt uint32, registryID string) error {
 	expected := buildNetworkLabels(operationID, step, attempt)
-	stdout, stderr, err := runArgvClean(ctx, []string{"docker", "network", "inspect", "--format", buildNetworkLabelsFormat, name}, isolation, rt, step, nil)
+	inspection, exists, err := inspectBuildNetwork(ctx, rt, isolation, name, step)
 	if err != nil {
-		if buildNetworkGone(stderr) {
-			return nil
-		}
-		return fmt.Errorf("inspecting build network %s failed: %s", name, commandDetail(err, stderr))
+		return err
 	}
-	var labels map[string]string
-	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &labels); err != nil {
-		return fmt.Errorf("build network %s did not report its labels: %v", name, err)
+	if !exists {
+		return nil
 	}
 	for key, want := range expected {
-		if labels[key] != want {
+		if inspection.Labels[key] != want {
 			return fmt.Errorf("refusing to clean build network %s: label %s does not have the expected ownership value", name, key)
 		}
 	}
@@ -1251,16 +1502,79 @@ func removeBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []stri
 		}
 		return nil
 	}
+	detachRegistry := func() error {
+		if registryID == "" {
+			return nil
+		}
+		if _, attached := inspection.Containers[registryID]; !attached {
+			return nil
+		}
+		_, disconnectStderr, disconnectErr := runArgvClean(ctx, []string{"docker", "network", "disconnect", name, registryID}, isolation, rt, step, nil)
+		if disconnectErr != nil && !buildNetworkNotConnected(disconnectStderr) && !buildNetworkGone(disconnectStderr) {
+			return fmt.Errorf("detaching the registry container from build network %s failed: %s", name, commandDetail(disconnectErr, disconnectStderr))
+		}
+		return nil
+	}
 	for pass := 0; pass < 2; pass++ {
 		if err := removeContainers(); err != nil {
 			return err
 		}
-		_, stderr, err = runArgvClean(ctx, []string{"docker", "network", "rm", name}, isolation, rt, step, nil)
+		if err := detachRegistry(); err != nil {
+			return err
+		}
+		_, stderr, err := runArgvClean(ctx, []string{"docker", "network", "rm", name}, isolation, rt, step, nil)
 		if err == nil || buildNetworkGone(stderr) {
 			return nil
 		}
 		if pass == 1 || !buildNetworkInUse(stderr) {
 			return fmt.Errorf("removing build network %s failed: %s", name, commandDetail(err, stderr))
+		}
+	}
+	return nil
+}
+
+// removeStaleBuildNetworks cleanly removes owned build networks left by an
+// interrupted or crashed attempt. The host lock serializes Pack steps, so any
+// other network carrying the exact pack ownership label is stale. Each network
+// is validated against its own labels before anything is removed; an
+// unreadable or inconsistent owned network fails closed.
+func removeStaleBuildNetworks(ctx context.Context, rt engine.Runtime, isolation []string, registryID, step string, report engine.Reporter) error {
+	listed, stderr, err := runArgvClean(ctx, []string{"docker", "network", "ls", "-q", "--filter", "label=" + buildNetworkOwnerLabel + "=" + buildNetworkOwner}, isolation, rt, step, nil)
+	if err != nil {
+		return fmt.Errorf("listing stale build networks failed: %s", commandDetail(err, stderr))
+	}
+	for _, id := range strings.Fields(listed) {
+		inspection, exists, err := inspectBuildNetwork(ctx, rt, isolation, id, step)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		if inspection.Labels[buildNetworkOwnerLabel] != buildNetworkOwner {
+			return fmt.Errorf("refusing to clean build network %s: it does not carry the pack ownership label", id)
+		}
+		operationID := contract.OperationID(inspection.Labels[buildNetworkOperationLabel])
+		if err := operationID.Validate(); err != nil {
+			return fmt.Errorf("refusing to clean build network %s: its operation label is invalid", id)
+		}
+		networkStep := inspection.Labels[buildNetworkStepLabel]
+		if !packStepPattern.MatchString(networkStep) {
+			return fmt.Errorf("refusing to clean build network %s: its step label is invalid", id)
+		}
+		attemptValue := inspection.Labels[buildNetworkAttemptLabel]
+		attempt, parseErr := strconv.ParseUint(attemptValue, 10, 32)
+		if parseErr != nil || attempt == 0 {
+			return fmt.Errorf("refusing to clean build network %s: its attempt label is invalid", id)
+		}
+		if expectedName := buildNetworkName(operationID, networkStep, uint32(attempt)); inspection.Name != expectedName {
+			return fmt.Errorf("refusing to clean build network %s: it is not the deterministic network %s", inspection.Name, expectedName)
+		}
+		if err := removeBuildNetwork(ctx, rt, isolation, inspection.Name, operationID, networkStep, uint32(attempt), registryID); err != nil {
+			return err
+		}
+		if report != nil {
+			report(engine.Event{Kind: "log", Step: step, Message: "removed a stale build network left by an interrupted attempt"})
 		}
 	}
 	return nil
@@ -1275,6 +1589,425 @@ func buildNetworkGone(stderr string) bool {
 func buildNetworkInUse(stderr string) bool {
 	lowered := strings.ToLower(stderr)
 	return strings.Contains(lowered, "active endpoint") || strings.Contains(lowered, "connected to network")
+}
+
+func buildNetworkNotConnected(stderr string) bool {
+	lowered := strings.ToLower(stderr)
+	return strings.Contains(lowered, "not connected") || strings.Contains(lowered, "is not connected to network")
+}
+
+type registryContainer struct {
+	ID    string
+	Image string
+}
+
+type registryPortBinding struct {
+	HostIP   string `json:"HostIp"`
+	HostPort string `json:"HostPort"`
+}
+
+// inspectRegistryContainer validates the shared private registry by exact
+// container ID, pinned image reference, running state and the actual loopback
+// publication. A missing or foreign container is never adopted for a build.
+func inspectRegistryContainer(ctx context.Context, rt engine.Runtime, isolation []string, endpoint, step string, report engine.Reporter) (registryContainer, error) {
+	host, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return registryContainer{}, fmt.Errorf("%w: configured registry endpoint %q is invalid: %v", engine.ErrPermanent, endpoint, err)
+	}
+	stdout, stderr, err := runArgvClean(ctx, []string{
+		"docker", "inspect", "--type=container", "--format",
+		"{{.Id}}|{{.Name}}|{{.Config.Image}}|{{.State.Running}}|{{json .HostConfig.PortBindings}}",
+		RegistryContainer,
+	}, isolation, rt, step, nil)
+	if err != nil {
+		if imageMissingError(stderr) || strings.Contains(strings.ToLower(stderr), "no such container") {
+			return registryContainer{}, fmt.Errorf("%w: the private registry container %s is not available; apply the registry host step before building", engine.ErrPermanent, RegistryContainer)
+		}
+		return registryContainer{}, fmt.Errorf("inspecting the private registry container failed: %s", commandDetail(err, stderr))
+	}
+	parts := strings.SplitN(strings.TrimSpace(stdout), "|", 5)
+	if len(parts) != 5 {
+		return registryContainer{}, fmt.Errorf("%w: the private registry container returned an unreadable inspection", engine.ErrPermanent)
+	}
+	id, name, image, running := parts[0], strings.TrimPrefix(parts[1], "/"), parts[2], parts[3]
+	if !shaPattern.MatchString(id) || len(id) != 64 {
+		return registryContainer{}, fmt.Errorf("%w: the private registry container ID is not a full immutable ID", engine.ErrPermanent)
+	}
+	if name != RegistryContainer {
+		return registryContainer{}, fmt.Errorf("%w: refusing the registry container named %q", engine.ErrPermanent, name)
+	}
+	if image != RegistryImage {
+		return registryContainer{}, fmt.Errorf("%w: the private registry container does not run the pinned image %s", engine.ErrPermanent, RegistryImage)
+	}
+	if strings.ToLower(strings.TrimSpace(running)) != "true" {
+		return registryContainer{}, fmt.Errorf("%w: the private registry container is not running", engine.ErrPermanent)
+	}
+	var bindings map[string][]registryPortBinding
+	if err := json.Unmarshal([]byte(parts[4]), &bindings); err != nil {
+		return registryContainer{}, fmt.Errorf("%w: the private registry container did not report readable port bindings", engine.ErrPermanent)
+	}
+	published := false
+	for _, binding := range bindings["5000/tcp"] {
+		if binding.HostIP == host && binding.HostPort == port {
+			published = true
+			break
+		}
+	}
+	if !published {
+		return registryContainer{}, fmt.Errorf("%w: the private registry container is not published on the configured loopback endpoint %s", engine.ErrPermanent, endpoint)
+	}
+	if report != nil {
+		report(engine.Event{Kind: "log", Step: step, Message: "validated private registry container " + id + " on " + endpoint})
+	}
+	return registryContainer{ID: id, Image: image}, nil
+}
+
+// attachRegistryToBuildNetwork attaches the already-validated registry
+// container to the owned build network and returns its assigned bridge
+// endpoint. The container always listens on RegistryContainerPort; the
+// configured loopback endpoint's host port is only the host publication and
+// must not leak into the bridge address. An ambiguous connect error is
+// resolved by reading the network endpoint rather than assuming success or
+// failure.
+func attachRegistryToBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, network string, registry registryContainer, step string, report engine.Reporter) (string, error) {
+	_, stderr, err := runArgvClean(ctx, []string{"docker", "network", "connect", network, registry.ID}, isolation, rt, step, nil)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		inspectCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), buildNetworkCreateTimeout)
+		inspection, exists, inspectErr := inspectBuildNetwork(inspectCtx, rt, isolation, network, step)
+		cancel()
+		if inspectErr != nil || !exists {
+			return "", fmt.Errorf("attaching the private registry to build network %s failed: %s", network, commandDetail(err, stderr))
+		}
+		if _, attached := inspection.Containers[registry.ID]; !attached {
+			return "", fmt.Errorf("attaching the private registry to build network %s failed: %s", network, commandDetail(err, stderr))
+		}
+	}
+	inspection, exists, err := inspectBuildNetwork(ctx, rt, isolation, network, step)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("build network %s disappeared before the registry address was read", network)
+	}
+	container, attached := inspection.Containers[registry.ID]
+	if !attached {
+		return "", fmt.Errorf("the validated registry container is not attached to build network %s", network)
+	}
+	address := strings.TrimSpace(container.IPv4Address)
+	if slash := strings.IndexByte(address, '/'); slash >= 0 {
+		address = address[:slash]
+	}
+	ip := net.ParseIP(address)
+	if ip == nil || ip.To4() == nil {
+		return "", fmt.Errorf("build network %s did not assign the registry container an IPv4 address", network)
+	}
+	endpoint := net.JoinHostPort(ip.String(), strconv.Itoa(RegistryContainerPort))
+	if report != nil {
+		report(engine.Event{Kind: "log", Step: step, Message: "private registry is reachable for this build at " + endpoint})
+	}
+	return endpoint, nil
+}
+
+func imageMissingError(stderr string) bool {
+	lowered := strings.ToLower(stderr)
+	return strings.Contains(lowered, "no such image") || strings.Contains(lowered, "no such object") ||
+		strings.Contains(lowered, "no such container") || strings.Contains(lowered, "not found")
+}
+
+func parsePackImageInspection(stdout string) (string, []string, error) {
+	parts := strings.SplitN(strings.TrimSpace(stdout), "|", 2)
+	if len(parts) != 2 || !imageIDPattern.MatchString(parts[0]) {
+		return "", nil, fmt.Errorf("%w: Docker returned an unreadable image identity", engine.ErrPermanent)
+	}
+	var digests []string
+	if err := json.Unmarshal([]byte(parts[1]), &digests); err != nil {
+		return "", nil, fmt.Errorf("%w: Docker returned an unreadable repository digest list", engine.ErrPermanent)
+	}
+	return parts[0], digests, nil
+}
+
+// packPublishReference places the same repository path under the registry's
+// transient bridge address. Only the transport endpoint changes.
+func packPublishReference(localImage, transientEndpoint string) (reference, repository, tag string, err error) {
+	slash := strings.LastIndexByte(localImage, '/')
+	colon := strings.LastIndexByte(localImage, ':')
+	if colon <= slash || colon == len(localImage)-1 {
+		return "", "", "", fmt.Errorf("pack image %q must include a tag when publishing", localImage)
+	}
+	if strings.Contains(localImage, "@") {
+		return "", "", "", fmt.Errorf("pack image %q must be a local tag, not a digest", localImage)
+	}
+	repository, tag = localImage[:colon], localImage[colon+1:]
+	if repository == "" {
+		return "", "", "", fmt.Errorf("pack image %q has no repository path", localImage)
+	}
+	if _, _, splitErr := net.SplitHostPort(transientEndpoint); splitErr != nil {
+		return "", "", "", fmt.Errorf("transient registry endpoint %q is invalid: %w", transientEndpoint, splitErr)
+	}
+	reference = transientEndpoint + "/" + repository + ":" + tag
+	if err := ValidateImage(reference); err != nil {
+		return "", "", "", err
+	}
+	return reference, repository, tag, nil
+}
+
+// resolvePublishedManifestDigest reads the immutable manifest digest through
+// the node's canonical loopback endpoint, never through the transient bridge
+// address. The registry's Docker-Content-Digest is authoritative; a missing
+// header falls back to the exact manifest bytes.
+func resolvePublishedManifestDigest(ctx context.Context, endpoint, repository, tag string) (string, error) {
+	address, err := normalizeRegistryAddress(endpoint)
+	if err != nil {
+		return "", err
+	}
+	manifestURL := (&url.URL{
+		Scheme: "http",
+		Host:   address,
+		Path:   "/v2/" + repository + "/manifests/" + tag,
+	}).String()
+	request, err := http.NewRequestWithContext(ctx, http.MethodHead, manifestURL, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Accept", registryManifestAccept)
+	response, err := retentionRegistryHTTPClient.Do(request)
+	if err != nil {
+		return "", contract.NewFault(contract.Unavailable, "the private registry is not reachable through its loopback endpoint", err.Error())
+	}
+	closeRegistryResponse(response)
+	digest := strings.TrimSpace(response.Header.Get("Docker-Content-Digest"))
+	switch response.StatusCode {
+	case http.StatusOK:
+		if isIndexMediaType(response.Header.Get("Content-Type")) {
+			return "", fmt.Errorf("%w: the published tag is an image index; the bounded single-platform publish contract refuses it", engine.ErrPermanent)
+		}
+		if registryDigestPattern.MatchString(digest) {
+			return digest, nil
+		}
+		if digest != "" {
+			return "", fmt.Errorf("%w: the private registry returned an invalid manifest digest %q", engine.ErrPermanent, digest)
+		}
+		return digestPublishedManifest(ctx, manifestURL)
+	case http.StatusNotFound:
+		return "", fmt.Errorf("%w: the private registry has no manifest for %s:%s after the publish", engine.ErrPermanent, repository, tag)
+	default:
+		return "", contract.NewFault(contract.Unavailable, "the private registry answered the manifest lookup with "+response.Status, "Retry the build after the registry is reachable.")
+	}
+}
+
+func isIndexMediaType(contentType string) bool {
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	return strings.HasPrefix(contentType, "application/vnd.oci.image.index.v1+json") ||
+		strings.HasPrefix(contentType, "application/vnd.docker.distribution.manifest.list.v2+json")
+}
+
+func digestPublishedManifest(ctx context.Context, manifestURL string) (string, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Accept", registryManifestAccept)
+	response, err := retentionRegistryHTTPClient.Do(request)
+	if err != nil {
+		return "", contract.NewFault(contract.Unavailable, "the private registry is not reachable through its loopback endpoint", err.Error())
+	}
+	defer closeRegistryResponse(response)
+	if response.StatusCode != http.StatusOK {
+		return "", contract.NewFault(contract.Unavailable, "the private registry answered the manifest read with "+response.Status, "Retry the build after the registry is reachable.")
+	}
+	if isIndexMediaType(response.Header.Get("Content-Type")) {
+		return "", fmt.Errorf("%w: the published tag is an image index; the bounded single-platform publish contract refuses it", engine.ErrPermanent)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20+1))
+	if err != nil {
+		return "", err
+	}
+	if len(body) > 4<<20 {
+		return "", fmt.Errorf("%w: the published manifest is larger than the bounded read", engine.ErrPermanent)
+	}
+	sum := sha256.Sum256(body)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+func closeRegistryResponse(response *http.Response) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	_ = response.Body.Close()
+}
+
+// pullAndVerifyPublishedImage materializes the application image through the
+// canonical loopback reference. Docker never pulls the transient bridge
+// address, so the daemon needs no insecure-registry configuration.
+func pullAndVerifyPublishedImage(ctx context.Context, rt engine.Runtime, isolation []string, canonical, expectedArchitecture, step string, report engine.Reporter) (string, error) {
+	if !IsImageDigestReference(canonical) {
+		return "", fmt.Errorf("%w: published image reference %q is not immutable", engine.ErrPermanent, canonical)
+	}
+	platform := "linux/" + expectedArchitecture
+	pullCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	_, stderr, err := runArgvClean(pullCtx, []string{"docker", "pull", "--platform", platform, canonical}, isolation, rt, step, report)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("pulling the published image %s failed: %s", canonical, commandDetail(err, stderr))
+	}
+	stdout, inspectStderr, err := runArgvClean(pullCtx, []string{"docker", "image", "inspect", "--format", "{{.Id}}|{{.Os}}|{{.Architecture}}|{{json .RepoDigests}}", canonical}, isolation, rt, step, nil)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("inspecting the published image %s failed: %s", canonical, commandDetail(err, inspectStderr))
+	}
+	parts := strings.SplitN(strings.TrimSpace(stdout), "|", 4)
+	if len(parts) != 4 || !imageIDPattern.MatchString(parts[0]) {
+		return "", fmt.Errorf("%w: the published image did not report an immutable config digest", engine.ErrPermanent)
+	}
+	if parts[1] != "linux" || parts[2] != expectedArchitecture {
+		return "", fmt.Errorf("%w: the published image platform is %s/%s, not linux/%s", engine.ErrPermanent, parts[1], parts[2], expectedArchitecture)
+	}
+	var digests []string
+	if err := json.Unmarshal([]byte(parts[3]), &digests); err != nil || !containsString(digests, canonical) {
+		return "", fmt.Errorf("%w: the published image does not carry its canonical repository digest %s", engine.ErrPermanent, canonical)
+	}
+	if report != nil {
+		report(engine.Event{Kind: "log", Step: step, Message: "materialized canonical image " + canonical + " as " + parts[0]})
+	}
+	return parts[0], nil
+}
+
+func tagVerifiedPublishedImage(ctx context.Context, rt engine.Runtime, isolation []string, localImage, canonical, step string, report engine.Reporter) (string, error) {
+	if _, stderr, err := runArgvClean(ctx, []string{"docker", "tag", canonical, localImage}, isolation, rt, step, report); err != nil {
+		return "", fmt.Errorf("tagging the verified registry image as %s failed: %s", localImage, commandDetail(err, stderr))
+	}
+	stdout, stderr, err := runArgvClean(ctx, []string{"docker", "image", "inspect", "--format", "{{.Id}}|{{json .RepoDigests}}", localImage}, isolation, rt, step, nil)
+	if err != nil {
+		return "", fmt.Errorf("inspecting the local completion tag %s failed: %s", localImage, commandDetail(err, stderr))
+	}
+	imageID, digests, err := parsePackImageInspection(stdout)
+	if err != nil {
+		return "", err
+	}
+	if !containsString(digests, canonical) {
+		return "", fmt.Errorf("%w: the local completion tag does not carry the canonical registry digest", engine.ErrPermanent)
+	}
+	return imageID, nil
+}
+
+type builderMetadata struct {
+	Lifecycle struct {
+		APIs struct {
+			Platform struct {
+				Deprecated []string `json:"deprecated"`
+				Supported  []string `json:"supported"`
+			} `json:"platform"`
+		} `json:"apis"`
+	} `json:"lifecycle"`
+}
+
+func platformAPIMinor(version string) (int, bool) {
+	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(version), "v"), ".")
+	if len(parts) < 2 {
+		return 0, false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	if majorErr != nil || minorErr != nil || major != 0 {
+		return 0, false
+	}
+	return minor, true
+}
+
+// verifyBuilderPlatformAPI refuses a builder whose negotiated Platform API
+// cannot carry --insecure-registry into the lifecycle. Pack silently omits the
+// flag below 0.13, and a successful-looking build would then fail to reach the
+// loopback HTTP registry.
+func verifyBuilderPlatformAPI(ctx context.Context, rt engine.Runtime, isolation []string, builder, platform, step string, report engine.Reporter) error {
+	format := `{{index .Config.Labels "io.buildpacks.builder.metadata"}}`
+	inspectBuilder := func() (string, string, error) {
+		return runArgvClean(ctx, []string{"docker", "image", "inspect", "--format", format, builder}, isolation, rt, step, nil)
+	}
+	stdout, stderr, err := inspectBuilder()
+	if err != nil {
+		if !imageMissingError(stderr) {
+			return fmt.Errorf("inspecting builder %s failed: %s", builder, commandDetail(err, stderr))
+		}
+		pullCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		_, pullStderr, pullErr := runArgvClean(pullCtx, []string{"docker", "pull", "--platform", platform, builder}, isolation, rt, step, report)
+		cancel()
+		if pullErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("pulling builder %s failed: %s", builder, commandDetail(pullErr, pullStderr))
+		}
+		stdout, stderr, err = inspectBuilder()
+		if err != nil {
+			return fmt.Errorf("inspecting builder %s after pull failed: %s", builder, commandDetail(err, stderr))
+		}
+	}
+	raw := strings.TrimSpace(stdout)
+	if raw == "" || raw == "<no value>" || raw == "null" {
+		return fmt.Errorf("builder %s does not report io.buildpacks.builder.metadata; its Platform API cannot be verified for insecure registry publishing", builder)
+	}
+	var metadata builderMetadata
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return fmt.Errorf("builder %s has unreadable Buildpacks metadata: %v", builder, err)
+	}
+	versions := append(append([]string{}, metadata.Lifecycle.APIs.Platform.Deprecated...), metadata.Lifecycle.APIs.Platform.Supported...)
+	selected := 0
+	for _, version := range versions {
+		minor, ok := platformAPIMinor(version)
+		if !ok || minor < packPublishPlatformAPIMinor || minor > packSupportedPlatformAPIMinor {
+			continue
+		}
+		if minor > selected {
+			selected = minor
+		}
+	}
+	if selected == 0 {
+		return fmt.Errorf("builder %s does not advertise a Platform API from 0.%d to 0.%d; --insecure-registry would be ignored (supported: %s)",
+			builder, packPublishPlatformAPIMinor, packSupportedPlatformAPIMinor, strings.Join(versions, ", "))
+	}
+	if report != nil {
+		report(engine.Event{Kind: "log", Step: step, Message: fmt.Sprintf("builder %s supports Platform API 0.%d for the published build", builder, selected)})
+	}
+	return nil
+}
+
+func packCompletionPath(root string, operationID contract.OperationID, step string) string {
+	return filepath.Join(root, "builds", "completions", string(operationID)+"-"+step+".json")
+}
+
+func loadPackCompletion(root string, operationID contract.OperationID, step string) (packCompletion, bool, error) {
+	raw, err := os.ReadFile(packCompletionPath(root, operationID, step)) //nolint:gosec // G304: fixed path beneath the node state directory.
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return packCompletion{}, false, nil
+		}
+		return packCompletion{}, false, err
+	}
+	var completion packCompletion
+	if err := json.Unmarshal(raw, &completion); err != nil || completion.Schema != packCompletionSchema {
+		// A corrupt marker is not durable evidence. Refuse to trust a
+		// pre-existing local tag and let a new build replace the marker.
+		return packCompletion{}, false, nil
+	}
+	return completion, true, nil
+}
+
+func writePackCompletion(root string, completion packCompletion) error {
+	dir := filepath.Dir(packCompletionPath(root, contract.OperationID(completion.OperationID), completion.Step))
+	if err := engine.EnsureDir(dir); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(completion)
+	if err != nil {
+		return err
+	}
+	return engine.WriteFileAtomic(packCompletionPath(root, contract.OperationID(completion.OperationID), completion.Step), append(raw, '\n'), 0o600)
 }
 
 // resolveGitContextPath resolves the revision's Buildpacks context inside the
@@ -1365,7 +2098,99 @@ func buildCancelPath(root, operationID, step string) string {
 	return filepath.Join(root, "builds", operationID+"-"+step+".cancel")
 }
 
-// ------------------------------------------------------------ build stop step
+// ------------------------------------------------------- ready image step
+
+// ReadyImagePayload re-materializes one ready registry-backed release on its
+// application node. The recorded image is an immutable manifest reference and
+// ImageID is the exact config digest the release already recorded; a pull that
+// resolves to any other config digest is refused rather than accepted.
+type ReadyImagePayload struct {
+	Step    string `json:"step"`
+	Image   string `json:"image"`
+	ImageID string `json:"image_id"`
+}
+
+type ReadyImageStep struct {
+	exec    engine.Execution
+	payload ReadyImagePayload
+}
+
+func buildReadyImageStep(exec engine.Execution, raw json.RawMessage) (engine.Step, error) {
+	var payload ReadyImagePayload
+	if err := decodePayload(exec, raw, &payload); err != nil {
+		return nil, err
+	}
+	if payload.Step != exec.Step {
+		return nil, fmt.Errorf("step ID %q does not match the payload step %q", exec.Step, payload.Step)
+	}
+	if !IsImageDigestReference(payload.Image) {
+		return nil, errors.New("a ready release image must be an immutable registry digest reference")
+	}
+	if !imageIDPattern.MatchString(payload.ImageID) {
+		return nil, errors.New("a ready release needs its recorded immutable image config digest")
+	}
+	return &ReadyImageStep{exec: exec, payload: payload}, nil
+}
+
+func (s *ReadyImageStep) ID() string { return s.payload.Step }
+func (s *ReadyImageStep) Describe() string {
+	return "Materialize ready release image " + s.payload.Image
+}
+func (s *ReadyImageStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
+func (s *ReadyImageStep) Inputs() ([]byte, error)         { return json.Marshal(s.payload) }
+
+func (s *ReadyImageStep) Check(ctx context.Context, rt engine.Runtime) (engine.CheckResult, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	env, cleanup, envErr := IsolatedDockerEnvironment()
+	if envErr != nil {
+		return engine.CheckResult{}, permanentCommandError(envErr)
+	}
+	defer cleanup()
+	stdout, stderr, err := runArgvClean(probeCtx, []string{"docker", "image", "inspect", "--format", "{{.Id}}", s.payload.ImageID}, env, rt, s.ID(), nil)
+	if err != nil {
+		if imageMissingError(stderr) {
+			return engine.CheckResult{Detail: "the recorded release image is absent on this node"}, nil
+		}
+		return engine.CheckResult{}, permanentCommandError(err)
+	}
+	if id := strings.TrimSpace(stdout); id != s.payload.ImageID {
+		return engine.CheckResult{}, fmt.Errorf("%w: the recorded release image resolved to %s, not %s", engine.ErrPermanent, id, s.payload.ImageID)
+	}
+	return engine.CheckResult{Complete: true, Detail: "the recorded release image is already present"}, nil
+}
+
+func (s *ReadyImageStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
+	pullCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	env, cleanup, envErr := IsolatedDockerEnvironment()
+	if envErr != nil {
+		return engine.ApplyResult{}, permanentCommandError(envErr)
+	}
+	defer cleanup()
+	_, stderr, err := runArgvClean(pullCtx, []string{"docker", "pull", "--platform", "linux/" + runtime.GOARCH, s.payload.Image}, env, rt, s.ID(), report)
+	if err != nil {
+		if ctx.Err() != nil {
+			return engine.ApplyResult{}, ctx.Err()
+		}
+		return engine.ApplyResult{}, fmt.Errorf("pulling the recorded release image %s failed: %s", s.payload.Image, commandDetail(err, stderr))
+	}
+	stdout, inspectStderr, err := runArgvClean(pullCtx, []string{"docker", "image", "inspect", "--format", "{{.Id}}|{{json .RepoDigests}}", s.payload.Image}, env, rt, s.ID(), nil)
+	if err != nil {
+		return engine.ApplyResult{}, fmt.Errorf("inspecting the pulled release image %s failed: %s", s.payload.Image, commandDetail(err, inspectStderr))
+	}
+	imageID, digests, err := parsePackImageInspection(stdout)
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
+	if imageID != s.payload.ImageID {
+		return engine.ApplyResult{}, fmt.Errorf("%w: pulled image config digest %s does not match the recorded release image_id %s", engine.ErrPermanent, imageID, s.payload.ImageID)
+	}
+	if !containsString(digests, s.payload.Image) {
+		return engine.ApplyResult{}, fmt.Errorf("%w: the pulled image does not carry its canonical repository digest", engine.ErrPermanent)
+	}
+	return engine.ApplyResult{Result: map[string]any{"image": s.payload.Image, "image_id": imageID}}, nil
+}
 
 type BuildStopPayload struct {
 	Step        string `json:"step"`
@@ -1511,7 +2336,7 @@ func validateArgv(argv []string) error {
 			return errors.New("docker command is missing a subcommand")
 		}
 		switch argv[1] {
-		case "version", "pull", "run", "stop", "rm", "inspect", "port", "ps", "network", "restart", "exec":
+		case "version", "pull", "run", "stop", "rm", "inspect", "port", "ps", "network", "restart", "exec", "tag":
 		case "image":
 			if len(argv) < 3 || (argv[2] != "inspect" && argv[2] != "ls" && argv[2] != "rm") {
 				return errors.New("unsupported docker image command")

@@ -356,6 +356,9 @@ func decodeReleases(raw json.RawMessage, clean func(string) string) ([]Item, err
 		if release.Source.Ref != "" {
 			details = append(details, Detail{Label: "source ref", Value: clean(release.Source.Ref)})
 		}
+		if release.Source.Selector != "" {
+			details = append(details, Detail{Label: "requested selector", Value: clean(release.Source.SelectorKind + " " + release.Source.Selector)})
+		}
 		if release.Build != nil {
 			details = append(details, Detail{Label: "builder", Value: clean(release.Build.Builder)})
 		}

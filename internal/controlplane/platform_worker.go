@@ -32,8 +32,9 @@ const platformStepTotal = 32
 const (
 	deploymentPreflightStep    = "platform-preflight-01-v1"
 	deploymentCommandStep      = "platform-command-01-v1"
-	deploymentPackStep         = "platform-pack-01-v1"
+	deploymentPackStep         = "platform-pack-02-v1"
 	deploymentImageStep        = "platform-image-01-v1"
+	deploymentReadyImageStep   = "platform-ready-image-01-v1"
 	deploymentPullStep         = "platform-pull-01-v1"
 	deploymentNetworkStep      = "platform-network-01-v1"
 	deploymentRouteStep        = "platform-routes-01-v1"
@@ -152,7 +153,7 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 	case platform.KindNodeReconcile:
 		return w.runNodeReconcile(ctx, op.ID, attempt, normalized)
 	case platform.KindReleaseCreate:
-		return w.runRelease(ctx, op.ID, attempt, normalized)
+		return contract.NewFault(contract.ValidationFailed, "the platform.release.create action is removed", "Use an explicit deploy selector (--image-tag, --image-digest, or --image) or a Git deploy; there is no arbitrary release destination or pull toggle.")
 	case platform.KindBuildStop:
 		return w.runBuildStop(ctx, op.ID, attempt, normalized)
 	case platform.KindBuildRetry:
@@ -825,6 +826,366 @@ func (stream *nodeEventStream) close() error {
 	return stream.err
 }
 
+// Node effect scheduling. A node step may be waiting for the node host lock
+// behind a long build. The wait is benign: the task has not run Check or Apply
+// and its execution attempt is still live. The worker observes that wait in
+// place instead of unwinding the deployment pipeline and consuming a River
+// retry.
+const (
+	defaultNodeEffectStatusPoll       = time.Second
+	defaultNodeEffectRetryBackoff     = time.Second
+	defaultNodeEffectDeferredBackoff  = 2 * time.Second
+	defaultNodeEffectObservationEvery = 15 * time.Second
+)
+
+type nodeEffectPolicy struct {
+	StatusPoll       time.Duration
+	RetryBackoff     time.Duration
+	DeferredBackoff  time.Duration
+	ObservationEvery time.Duration
+}
+
+func (p nodeEffectPolicy) withDefaults() nodeEffectPolicy {
+	if p.StatusPoll <= 0 {
+		p.StatusPoll = defaultNodeEffectStatusPoll
+	}
+	if p.RetryBackoff <= 0 {
+		p.RetryBackoff = defaultNodeEffectRetryBackoff
+	}
+	if p.DeferredBackoff <= 0 {
+		p.DeferredBackoff = defaultNodeEffectDeferredBackoff
+	}
+	if p.ObservationEvery <= 0 {
+		p.ObservationEvery = defaultNodeEffectObservationEvery
+	}
+	return p
+}
+
+// observedFailureAttempt validates the observed failed execution identity. A
+// retryable failure may only be redispatched when it belongs to a strictly
+// older attempt. A current-attempt failure returns to River; a missing,
+// mismatched, or future identity fails closed without another dispatch.
+func (l nodeEffectLoop) observedFailureAttempt(response node.Response) (uint32, error) {
+	if response.Attempt == 0 {
+		return 0, nodeEffectIdentityFault("the failed node task has no attempt")
+	}
+	if response.ExecutionID == "" {
+		return 0, nodeEffectIdentityFault("the failed node task has no execution identity")
+	}
+	if l.Current.Step == "" {
+		return 0, nodeEffectIdentityFault("the current node effect has no step identity")
+	}
+	expected := engine.Execution{
+		OperationID: l.Current.OperationID,
+		Attempt:     response.Attempt,
+		Step:        l.Current.Step,
+	}.ExecutionID()
+	if response.ExecutionID != expected {
+		return 0, nodeEffectIdentityFault("the failed node task identity does not match its operation, attempt and step")
+	}
+	return response.Attempt, nil
+}
+
+func nodeEffectIdentityFault(message string) error {
+	return contract.NewFault(contract.Unavailable,
+		"node failure identity is missing or ambiguous: "+message,
+		"Inspect the node journal; do not dispatch another effect under an ambiguous execution identity.")
+}
+
+// currentAttemptFailure records a retryable failure owned by this attempt and
+// returns it to River. It never redispatches: the next River attempt owns the
+// retry budget.
+func (l nodeEffectLoop) currentAttemptFailure(ctx context.Context, response node.Response) error {
+	if err := l.Failed(ctx, response); err != nil {
+		return err
+	}
+	return contract.NewFault(contract.Unavailable,
+		"the current node attempt failed",
+		"Retry the operation; this attempt's retry budget is consumed before another dispatch.")
+}
+
+// nodeEffectWaitInterrupted reports a worker deadline or shutdown that ended
+// the wait before a safe boundary. It deliberately does not unwrap the context
+// error: a shutdown is retryable and must not be mistaken for a durable
+// cancellation that authorizes cleanup while a detached task may be live.
+func nodeEffectWaitInterrupted() error {
+	return contract.NewFault(contract.Unavailable,
+		"the node effect wait ended before a safe boundary",
+		"Retry the operation; a detached node task may still be running and status will reconcile it before dispatch.")
+}
+
+// errNodeEffectOutcomeUnknown means the transport did not establish whether a
+// node effect ran. Callers must not record the build or step as failed and must
+// not terminalize cancellation while such an effect may still be live.
+var errNodeEffectOutcomeUnknown = errors.New("node effect outcome is unknown")
+
+// errNodeEffectAlreadyCompleted means another worker acknowledged the step row
+// between this worker's status/record read and its beginStep. The durable
+// result wins; the loop never dispatches after it.
+var errNodeEffectAlreadyCompleted = errors.New("node effect was acknowledged by another writer")
+
+// nodeEffectLoop drives one node effect without starting a second Run while an
+// earlier task may still be live. Status is always observed before Run. A live
+// running task is polled, a pre-Check/Apply deferral is backed off, and a
+// durable cancellation stops new dispatch. The caller owns the database step
+// row, so beginStep happens once outside this loop.
+type nodeEffectLoop struct {
+	Status    func(context.Context) (node.Response, error)
+	Dispatch  func(context.Context) (node.Response, error)
+	Begin     func(context.Context) error
+	Completed func(context.Context, node.Response, bool) error
+	Failed    func(context.Context, node.Response) error
+	Cancelled func(context.Context) error
+	Observe   func(node.Response)
+	Wait      func(context.Context, time.Duration) error
+	Policy    nodeEffectPolicy
+	Current   engine.Execution
+}
+
+func (l nodeEffectLoop) run(ctx context.Context) (node.Response, error) {
+	policy := l.Policy.withDefaults()
+	retriedPriorFailure := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return node.Response{}, nodeEffectWaitInterrupted()
+		}
+		cancelErr, err := l.cancellation(ctx)
+		if err != nil {
+			return node.Response{}, err
+		}
+		response, err := l.Status(ctx)
+		if err != nil {
+			// An unknown outcome is never reinterpreted as cancellation.
+			return node.Response{}, err
+		}
+		switch response.Status {
+		case engine.StatusCompleted:
+			l.observe(response)
+			if err := l.Completed(ctx, response, true); err != nil {
+				return response, err
+			}
+			if err := l.postCompletionCancellation(ctx); err != nil {
+				return response, err
+			}
+			return response, nil
+		case engine.StatusFailed:
+			l.observe(response)
+			if response.Retryable {
+				// A retryable failure may only be redispatched when it belongs
+				// to an older execution attempt. A failure from the current
+				// River attempt returns to River; the next attempt owns the
+				// retry budget. Missing or mismatched identities fail closed.
+				if cancelErr != nil {
+					return response, cancelErr
+				}
+				observedAttempt, identityErr := l.observedFailureAttempt(response)
+				if identityErr != nil {
+					return response, identityErr
+				}
+				switch {
+				case observedAttempt == l.Current.Attempt:
+					return response, l.currentAttemptFailure(ctx, response)
+				case observedAttempt > l.Current.Attempt:
+					return response, nodeEffectIdentityFault("the failed node task belongs to a future attempt")
+				case retriedPriorFailure:
+					return response, contract.NewFault(contract.Unavailable,
+						"a prior node attempt's retryable failure was already retried in this attempt",
+						"Return the current attempt to River instead of dispatching another effect.")
+				default:
+					retriedPriorFailure = true
+					if err := l.wait(ctx, policy.RetryBackoff); err != nil {
+						return response, nodeEffectWaitInterrupted()
+					}
+					done, out, err := l.dispatch(ctx)
+					if done {
+						return out, err
+					}
+					continue
+				}
+			}
+			failErr := l.Failed(ctx, response)
+			if failErr != nil {
+				return response, failErr
+			}
+			if err := l.postCompletionCancellation(ctx); err != nil {
+				return response, err
+			}
+			return response, nil
+		case engine.StatusRunning:
+			l.observe(response)
+			if err := l.wait(ctx, policy.StatusPoll); err != nil {
+				return response, nodeEffectWaitInterrupted()
+			}
+		case engine.StatusDeferred:
+			l.observe(response)
+			if cancelErr != nil {
+				// No task holds the effect lock and no Check/Apply ran.
+				return response, cancelErr
+			}
+			if err := l.wait(ctx, policy.DeferredBackoff); err != nil {
+				return response, nodeEffectWaitInterrupted()
+			}
+			done, out, err := l.dispatch(ctx)
+			if done {
+				return out, err
+			}
+		case engine.StatusAbsent, engine.StatusStale:
+			l.observe(response)
+			if cancelErr != nil {
+				return response, cancelErr
+			}
+			if err := l.wait(ctx, policy.RetryBackoff); err != nil {
+				return response, nodeEffectWaitInterrupted()
+			}
+			done, out, err := l.dispatch(ctx)
+			if done {
+				return out, err
+			}
+		default:
+			return response, fmt.Errorf("node returned unexpected status %q", response.Status)
+		}
+	}
+}
+
+// dispatch runs one effect after the caller observed a non-live status. It
+// rechecks durable cancellation after the backoff and after the dispatch
+// returns, so a cancellation accepted while a task is starting is not mistaken
+// for a safe boundary.
+func (l nodeEffectLoop) dispatch(ctx context.Context) (bool, node.Response, error) {
+	cancelErr, err := l.cancellation(ctx)
+	if err != nil {
+		return true, node.Response{}, err
+	}
+	if cancelErr != nil {
+		return true, node.Response{}, cancelErr
+	}
+	if l.Begin != nil {
+		if err := l.Begin(ctx); err != nil {
+			return true, node.Response{}, err
+		}
+	}
+	response, err := l.Dispatch(ctx)
+	if err != nil {
+		return true, node.Response{}, err
+	}
+	l.observe(response)
+	cancelErr, err = l.cancellation(ctx)
+	if err != nil {
+		return true, response, err
+	}
+	switch response.Status {
+	case engine.StatusCompleted:
+		if err := l.Completed(ctx, response, false); err != nil {
+			return true, response, err
+		}
+		if cancelErr != nil {
+			return true, response, cancelErr
+		}
+		return true, response, nil
+	case engine.StatusFailed:
+		if response.Retryable {
+			observedAttempt, identityErr := l.observedFailureAttempt(response)
+			if identityErr != nil {
+				return true, response, identityErr
+			}
+			if observedAttempt != l.Current.Attempt {
+				return true, response, nodeEffectIdentityFault("the dispatched failure does not belong to the current attempt")
+			}
+		}
+		failErr := l.Failed(ctx, response)
+		if failErr != nil {
+			return true, response, failErr
+		}
+		if cancelErr != nil {
+			return true, response, cancelErr
+		}
+		return true, response, nil
+	case engine.StatusRunning:
+		if err := l.wait(ctx, l.Policy.withDefaults().StatusPoll); err != nil {
+			return true, response, nodeEffectWaitInterrupted()
+		}
+		return false, response, nil
+	case engine.StatusDeferred:
+		if cancelErr != nil {
+			return true, response, cancelErr
+		}
+		return false, response, nil
+	case engine.StatusAbsent, engine.StatusStale:
+		if cancelErr != nil {
+			return true, response, cancelErr
+		}
+		if err := l.wait(ctx, l.Policy.withDefaults().RetryBackoff); err != nil {
+			return true, response, nodeEffectWaitInterrupted()
+		}
+		return false, response, nil
+	default:
+		return true, response, fmt.Errorf("node returned unexpected status %q", response.Status)
+	}
+}
+
+// cancellation returns errPlatformCancelled when cancellation was durably
+// accepted. A different error stops the loop; a live or unknown task must
+// retain nonterminal ownership instead of entering cleanup.
+func (l nodeEffectLoop) cancellation(ctx context.Context) (error, error) {
+	if l.Cancelled == nil {
+		return nil, nil
+	}
+	err := l.Cancelled(ctx)
+	if err == nil {
+		return nil, nil
+	}
+	if errors.Is(err, errPlatformCancelled) {
+		return err, nil
+	}
+	return nil, err
+}
+
+func (l nodeEffectLoop) postCompletionCancellation(ctx context.Context) error {
+	cancelErr, err := l.cancellation(ctx)
+	if err != nil {
+		return err
+	}
+	if cancelErr != nil {
+		return cancelErr
+	}
+	return nil
+}
+
+func (l nodeEffectLoop) observe(response node.Response) {
+	if l.Observe == nil {
+		return
+	}
+	if response.Status != engine.StatusRunning && response.Status != engine.StatusDeferred {
+		return
+	}
+	l.Observe(response)
+}
+
+func (l nodeEffectLoop) wait(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	if l.Wait != nil {
+		return l.Wait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// nodeEffectCancellationExempt reports post-cancellation cleanup effects that
+// must still reach the node. Cancellation stops forward work, never the
+// removal step that makes a failed or cancelled deployment safe.
+func nodeEffectCancellationExempt(stepID string) bool {
+	return stepID == platform.DiagnosticCleanupStep ||
+		strings.HasPrefix(stepID, deploymentCleanupStepPrefix)
+}
+
 // runStep mirrors the diagnostic worker's durable effect protocol for a generic
 // platform payload. Database acknowledgement is attempt-fenced; node status is
 // always consulted before a retry dispatches another effect.
@@ -859,79 +1220,110 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 			return record.Result, nil
 		}
 	}
-	status, err := tr.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
-	if err != nil {
-		if errors.Is(err, engine.ErrJournalCorrupt) {
-			return nil, contract.NewFault(contract.PreconditionFailed, "node journal is corrupt", "Inspect the node journal before retrying.")
+	rowExists := hasRecord
+	begunThisAttempt := hasRecord && record.Attempt == attempt && record.ExecutionID == exec.ExecutionID()
+	ensureRow := func(ctx context.Context, executionID string) error {
+		if rowExists {
+			return nil
 		}
-		if node.IsPermanentTransport(err) {
-			return nil, contract.NewFault(contract.PreconditionFailed, "the node transport refused the request", "Check the pinned node identity and host configuration.")
+		already, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, executionID)
+		if err != nil {
+			return err
 		}
-		return nil, fmt.Errorf("node status %s: %w", stepID, err)
+		rowExists = true
+		if already {
+			return errNodeEffectAlreadyCompleted
+		}
+		return nil
 	}
-	if status.InputsHash != "" && status.InputsHash != inputsHash {
-		return nil, contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
+	ensureDispatchBegun := func(ctx context.Context) error {
+		if begunThisAttempt {
+			return nil
+		}
+		already, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, exec.ExecutionID())
+		if err != nil {
+			return err
+		}
+		rowExists = true
+		begunThisAttempt = true
+		if already {
+			return errNodeEffectAlreadyCompleted
+		}
+		return nil
 	}
-	if stepID == deploymentCommandStep && status.InputsHash == "" && (status.Status == engine.StatusCompleted || status.Status == engine.StatusFailed) {
-		return nil, contract.NewFault(contract.Unavailable, "release command status has no effect evidence", "Recover the original node effect before rerunning the release command.")
+
+	status := func(ctx context.Context) (node.Response, error) {
+		response, err := tr.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
+		if err != nil {
+			if node.IsCallCancelled(err) {
+				return node.Response{}, nodeEffectWaitInterrupted()
+			}
+			if errors.Is(err, engine.ErrJournalCorrupt) {
+				return node.Response{}, contract.NewFault(contract.PreconditionFailed, "node journal is corrupt", "Inspect the node journal before retrying.")
+			}
+			if node.IsPermanentTransport(err) {
+				return node.Response{}, contract.NewFault(contract.PreconditionFailed, "the node transport refused the request", "Check the pinned node identity and host configuration.")
+			}
+			return node.Response{}, fmt.Errorf("%w: node status %s: %w", errNodeEffectOutcomeUnknown, stepID, err)
+		}
+		if response.InputsHash != "" && response.InputsHash != inputsHash {
+			return node.Response{}, contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
+		}
+		if stepID == deploymentCommandStep && response.InputsHash == "" && (response.Status == engine.StatusCompleted || response.Status == engine.StatusFailed) {
+			return node.Response{}, contract.NewFault(contract.Unavailable, "release command status has no effect evidence", "Recover the original node effect before rerunning the release command.")
+		}
+		return response, nil
 	}
-	if status.Status == engine.StatusCompleted {
-		if !hasRecord {
-			if _, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, status.ExecutionID); err != nil {
-				return nil, err
+	dispatch := func(ctx context.Context) (node.Response, error) {
+		w.service.registerSecretValues(secrets)
+		events := w.service.newNodeEventStream(ctx, id, attempt)
+		response, err := tr.Call(ctx, node.Request{
+			Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec, Payload: raw, Secrets: secrets,
+		}, events.add)
+		if appendErr := events.close(); appendErr != nil && err == nil {
+			err = appendErr
+		}
+		if err != nil {
+			if node.IsCallCancelled(err) {
+				return node.Response{}, nodeEffectWaitInterrupted()
+			}
+			if node.IsPermanentTransport(err) {
+				return node.Response{}, contract.NewFault(contract.PreconditionFailed, "the node transport refused the request", "Check the pinned node identity and host configuration.")
+			}
+			// Unknown outcome: the next observation asks status first and
+			// never starts a second effect under the same key.
+			return node.Response{}, fmt.Errorf("%w: node run %s: %w", errNodeEffectOutcomeUnknown, stepID, err)
+		}
+		if response.InputsHash != "" && response.InputsHash != inputsHash {
+			return node.Response{}, contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
+		}
+		if stepID == deploymentCommandStep && response.InputsHash == "" {
+			return node.Response{}, contract.NewFault(contract.Unavailable, "release command response has no effect evidence", "Recover the original node effect before rerunning the release command.")
+		}
+		return response, nil
+	}
+	completed := func(ctx context.Context, response node.Response, recovered bool) error {
+		if err := ensureRow(ctx, response.ExecutionID); err != nil {
+			return err
+		}
+		if recovered {
+			if err := w.service.recordRecoveredStep(ctx, id, attempt, stepID, inputsHash, response); err != nil {
+				return err
 			}
 		}
-		if err := w.service.recordRecoveredStep(ctx, id, attempt, stepID, inputsHash, status); err != nil {
-			return nil, err
-		}
-		if _, err := w.service.ackStep(ctx, id, attempt, stepID, inputsHash, status.ExecutionID, status.Result, platformStepTotal); err != nil {
-			return nil, err
-		}
-		return status.Result, nil
-	}
-	already, err := w.service.beginStep(ctx, id, attempt, stepID, inputsHash, exec.ExecutionID())
-	if err != nil {
-		return nil, err
-	}
-	if already {
-		return record.Result, nil
-	}
-	w.service.registerSecretValues(secrets)
-	events := w.service.newNodeEventStream(ctx, id, attempt)
-	response, err := tr.Call(ctx, node.Request{
-		Method: node.MethodRun, RequestID: exec.RequestID, Execution: exec, Payload: raw, Secrets: secrets,
-	}, events.add)
-	if appendErr := events.close(); appendErr != nil && err == nil {
-		err = appendErr
-	}
-	if err != nil {
-		if node.IsPermanentTransport(err) {
-			return nil, contract.NewFault(contract.PreconditionFailed, "the node transport refused the request", "Check the pinned node identity and host configuration.")
-		}
-		// Unknown outcome: the next attempt asks status first and never starts a
-		// second effect under the same key.
-		return nil, fmt.Errorf("node run %s: %w", stepID, err)
-	}
-	if response.InputsHash != "" && response.InputsHash != inputsHash {
-		return nil, contract.NewFault(contract.PreconditionFailed, "node effect has different inputs", "Do not acknowledge an effect recorded under other inputs.")
-	}
-	if stepID == deploymentCommandStep && response.InputsHash == "" {
-		return nil, contract.NewFault(contract.Unavailable, "release command response has no effect evidence", "Recover the original node effect before rerunning the release command.")
-	}
-	switch response.Status {
-	case engine.StatusCompleted:
 		if _, err := w.service.ackStep(ctx, id, attempt, stepID, inputsHash, response.ExecutionID, response.Result, platformStepTotal); err != nil {
-			return nil, err
+			return err
 		}
-		duration := time.Since(started).Milliseconds()
-		w.service.appendWorkerEventWith(ctx, id, attempt, contract.Event{
-			Kind: "log", Stage: stepID, Step: stepID, DurationMS: &duration,
-			Message: fmt.Sprintf("Node step %s completed in %dms.", stepID, duration),
-		})
-		return response.Result, nil
-	case engine.StatusRunning:
-		return nil, contract.NewFault(contract.Unavailable, "node task is still running", "The operation remains running; retrying will attach to the existing effect, not start another.")
-	case engine.StatusFailed:
+		if !recovered {
+			duration := time.Since(started).Milliseconds()
+			w.service.appendWorkerEventWith(ctx, id, attempt, contract.Event{
+				Kind: "log", Stage: stepID, Step: stepID, DurationMS: &duration,
+				Message: fmt.Sprintf("Node step %s completed in %dms.", stepID, duration),
+			})
+		}
+		return nil
+	}
+	failed := func(ctx context.Context, response node.Response) error {
 		code := contract.Code(response.ErrorCode)
 		if code == "" {
 			code = contract.Internal
@@ -941,22 +1333,70 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 			detail = "node step failed"
 		}
 		if failErr := w.service.failStep(ctx, id, attempt, stepID, code, detail); failErr != nil {
-			return nil, failErr
+			return failErr
 		}
 		if code == contract.Conflict {
 			// Preserve the machine-readable refusal so a caller that can
 			// classify it (retention) records a per-item skip instead of a
 			// generic permanent failure.
-			return nil, contract.NewFault(contract.Conflict, "node step "+stepID+" conflicted: "+detail, "Inspect the node state; a deterministic conflict is not fixed by retrying.")
+			return contract.NewFault(contract.Conflict, "node step "+stepID+" conflicted: "+detail, "Inspect the node state; a deterministic conflict is not fixed by retrying.")
 		}
 		if response.Retryable {
-			return nil, fmt.Errorf("node step %s failed: %s", stepID, detail)
+			return fmt.Errorf("node step %s failed: %s", stepID, detail)
 		}
-		return nil, errors.Join(errNodeStepPermanentFailure,
+		return errors.Join(errNodeStepPermanentFailure,
 			contract.NewFault(contract.PreconditionFailed, "node step failed: "+detail, "Inspect operation events and node state before resubmitting."))
-	default:
-		return nil, fmt.Errorf("node returned unexpected status %q for %s", response.Status, stepID)
 	}
+
+	policy := nodeEffectPolicy{}.withDefaults()
+	lastObservation := time.Time{}
+	lastObservationKey := ""
+	observe := func(response node.Response) {
+		key := string(response.Status) + "/" + response.ExecutionID + "/" + string(response.Phase)
+		observedAt := time.Now()
+		if key == lastObservationKey && observedAt.Sub(lastObservation) < policy.ObservationEvery {
+			return
+		}
+		lastObservation, lastObservationKey = observedAt, key
+		message := fmt.Sprintf("Node step %s is %s", stepID, response.Status)
+		if response.Phase != "" {
+			message += " (phase=" + string(response.Phase)
+			if response.WaitMS > 0 {
+				message += fmt.Sprintf(", waited=%dms", response.WaitMS)
+			}
+			message += ")"
+		} else if response.WaitMS > 0 {
+			message += fmt.Sprintf(" (waited=%dms)", response.WaitMS)
+		}
+		w.service.appendWorkerEvent(ctx, id, attempt, stepID, message+".")
+	}
+
+	loop := nodeEffectLoop{
+		Status:    status,
+		Dispatch:  dispatch,
+		Begin:     ensureDispatchBegun,
+		Completed: completed,
+		Failed:    failed,
+		Observe:   observe,
+		Policy:    policy,
+		Current:   exec,
+	}
+	if !nodeEffectCancellationExempt(stepID) {
+		loop.Cancelled = func(ctx context.Context) error { return w.service.checkCancelled(ctx, id) }
+	}
+	response, err := loop.run(ctx)
+	if err != nil {
+		if errors.Is(err, errNodeEffectAlreadyCompleted) {
+			if refreshed, found, recordErr := w.service.stepRecord(ctx, id, stepID); recordErr != nil {
+				return nil, recordErr
+			} else if found {
+				return refreshed.Result, nil
+			}
+			return nil, nil
+		}
+		return nil, err
+	}
+	return response.Result, nil
 }
 
 // reconcilePlatformOperation closes an operation whose River job disappeared.
@@ -977,7 +1417,7 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 		return s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation reconciled after the River job ended.")
 	}
 	switch op.Kind {
-	case platform.KindReleaseCreate, platform.KindBuildRetry:
+	case platform.KindBuildRetry:
 		release, err := s.releaseForOperation(ctx, op.ID)
 		if err != nil {
 			if fault := contract.Classify(err); fault.Code == contract.NotFound {
@@ -1229,6 +1669,125 @@ func (s *Service) failReconciledPlatform(ctx context.Context, op contract.Operat
 	return nil
 }
 
+// deploymentNodeEffectStep reports whether a deployment step is executed by
+// the application node. Route, public, and restore steps are control-plane
+// effects and must never be mistaken for an outstanding node task.
+func deploymentNodeEffectStep(step string) bool {
+	switch step {
+	case deploymentPreflightStep, deploymentCommandStep, deploymentPackStep,
+		deploymentImageStep, deploymentReadyImageStep, deploymentPullStep,
+		deploymentNetworkStep, deploymentBuildStopStep:
+		return true
+	}
+	return strings.HasPrefix(step, deploymentContainerStepPrefix) ||
+		strings.HasPrefix(step, deploymentHealthStepPrefix) ||
+		strings.HasPrefix(step, "platform-port-") ||
+		strings.HasPrefix(step, deploymentCleanupStepPrefix)
+}
+
+// deploymentNodeEffectOutstanding reports whether a deployment step may still
+// be live on the deployment's pinned node, or whether its outcome cannot be
+// observed. It asks the placement-correct node transport and never starts a
+// step. A completed effect is acknowledged so cancellation cleanup cannot
+// discard it.
+func (s *Service) deploymentNodeEffectOutstanding(ctx context.Context, dep platform.Deployment, env platform.Environment, id contract.OperationID, attempt uint32) (bool, error) {
+	records, err := s.stepRecords(ctx, id)
+	if err != nil {
+		return true, err
+	}
+	var outstanding []StepRecord
+	for _, record := range records {
+		if record.State == "completed" || !deploymentNodeEffectStep(record.Step) {
+			continue
+		}
+		outstanding = append(outstanding, record)
+	}
+	if len(outstanding) == 0 {
+		return false, nil
+	}
+	// Resolve the deployment's pinned revision node, not the environment's
+	// current node. The environment may have moved A -> B after this
+	// deployment was pinned to A; observing B would miss a live A effect.
+	nodeName, err := deploymentCleanupNode(ctx, s, dep, env.Node)
+	if err != nil {
+		return true, err
+	}
+	if nodeName == "" {
+		return false, nil
+	}
+	if s.resolver == nil {
+		// An incomplete node step exists and no transport can observe it. Its
+		// outcome is unknown; retain ownership instead of terminalizing.
+		return true, nil
+	}
+	tr, err := s.resolver.TransportFor(ctx, nodeName)
+	if err != nil {
+		return true, err
+	}
+	for _, record := range outstanding {
+		recordAttempt := record.Attempt
+		if recordAttempt == 0 {
+			recordAttempt = attempt
+		}
+		exec := engine.Execution{OperationID: id, Attempt: recordAttempt, Step: record.Step, RequestID: newRequestID()}
+		response, err := tr.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
+		if err != nil {
+			return true, fmt.Errorf("observe node step %s before cancellation cleanup: %w", record.Step, err)
+		}
+		if response.InputsHash != "" && response.InputsHash != record.InputsHash {
+			return true, contract.NewFault(contract.PreconditionFailed,
+				"node effect has different inputs during cancellation recovery",
+				"Do not discard an effect recorded under other inputs; inspect the node journal.")
+		}
+		switch response.Status {
+		case engine.StatusCompleted:
+			if _, err := s.ackStep(ctx, id, attempt, record.Step, record.InputsHash, response.ExecutionID, response.Result, platformStepTotal); err != nil {
+				return true, err
+			}
+		case engine.StatusRunning:
+			// A live effect is not a cleanup boundary. A pre-Check/Apply
+			// deferral is different: that process exited and no side effect was
+			// attempted, so cancellation may proceed from that safe boundary.
+			return true, nil
+		case engine.StatusDeferred:
+			// Exited before Check/Apply. Safe to cancel and clean up.
+		case engine.StatusAbsent, engine.StatusStale, engine.StatusFailed:
+			// The task is gone. Restore/cleanup recovery remains authoritative
+			// for what it may have changed.
+		default:
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ensureNoOutstandingDeploymentEffect blocks cancellation, cleanup and
+// terminalization while a detached effect for the deployment may still be live.
+// It uses the deployment's pinned placement, so an environment moved to another
+// node cannot hide an effect on the old node.
+func (w *platformWorker) ensureNoOutstandingDeploymentEffect(ctx context.Context, id contract.OperationID, attempt uint32, dep platform.Deployment, env platform.Environment, stage string) error {
+	outstanding, err := w.service.deploymentNodeEffectOutstanding(ctx, dep, env, id, attempt)
+	if err != nil {
+		w.service.appendWorkerEventWith(ctx, id, attempt, contract.Event{
+			Kind: "warning", Stage: stage,
+			Message: "Deployment effects cannot be observed on the pinned node yet: " + contract.Classify(err).Message,
+		})
+		return contract.NewFault(contract.Unavailable,
+			"deployment node effects cannot yet be proven safe",
+			"Keep the deployment owner and retry after the pinned node transport is available.")
+	}
+	if outstanding {
+		w.service.appendWorkerEventWith(ctx, id, attempt, contract.Event{
+			Kind: "warning", Stage: stage,
+			Message: "A detached node effect is still live or its outcome is unknown; route restoration and candidate cleanup were not started.",
+		})
+		return contract.NewFault(contract.Unavailable,
+			"a detached node effect is still live or its outcome is unknown",
+			"Keep the deployment owner and retry after the effect completes or exits before Check/Apply.")
+	}
+	return nil
+}
+
 // cancelOwnedDeployment acknowledges cancellation only through the durable
 // owner. The caller holds the environment lock. A cancelled operation that never
 // owned the route can end immediately; an owner must restore its exact target
@@ -1247,6 +1806,9 @@ func (w *platformWorker) cancelOwnedDeployment(ctx context.Context, id contract.
 			return w.service.cancelPlatform(ctx, id, attempt, "Cancellation acknowledged; the environment no longer exists.")
 		}
 		return w.settle(ctx, id, attempt, err)
+	}
+	if err := w.ensureNoOutstandingDeploymentEffect(ctx, id, attempt, dep, env, "cancellation"); err != nil {
+		return err
 	}
 	owner, acquired, err := w.service.acquireDeploymentOwner(ctx, dep, env, attempt)
 	if err != nil {
@@ -1302,6 +1864,15 @@ func (w *platformWorker) cancelOwnedDeployment(ctx context.Context, id contract.
 func (s *Service) recoverOwnedDeployment(ctx context.Context, op contract.Operation, dep platform.Deployment, env platform.Environment, owner deploymentOwner, allowResume bool) (bool, error) {
 	if op.State.Terminal() {
 		return true, nil
+	}
+	if op.State == contract.Cancelling || !allowResume {
+		stage := "recovery"
+		if op.State == contract.Cancelling {
+			stage = "cancellation"
+		}
+		if err := (&platformWorker{service: s}).ensureNoOutstandingDeploymentEffect(ctx, op.ID, op.Attempt, dep, env, stage); err != nil {
+			return false, err
+		}
 	}
 	routeRecord, routeHas, err := s.stepRecord(ctx, op.ID, deploymentRouteStep)
 	if err != nil {

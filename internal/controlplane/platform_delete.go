@@ -288,6 +288,9 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
+	if _, err := w.service.verifyLocalRegistryHost(ctx); err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
 	// Provider cleanup must succeed before any serving workload is removed. A
 	// failed Cloudflare read/delete then leaves the retained app alive and
 	// retryable instead of taking it offline while its route remains.
@@ -329,6 +332,11 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 	if err := w.service.syncRoutes(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
+	hostRelease, err := w.service.acquireRegistryHostLock(ctx)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	defer hostRelease()
 	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		if err := deleteEnvironmentRowsTx(ctx, tx, env); err != nil {
 			return err
@@ -349,6 +357,9 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 func (w *platformWorker) deleteApplication(ctx context.Context, id contract.OperationID, attempt uint32, appName string) error {
 	app, environments, err := w.service.applicationEnvironments(ctx, appName)
 	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	if _, err := w.service.verifyLocalRegistryHost(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
 	environmentIDs := make([]platform.EnvironmentID, 0, len(environments))
@@ -406,6 +417,11 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 	if err := w.service.syncRoutes(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
+	hostRelease, err := w.service.acquireRegistryHostLock(ctx)
+	if err != nil {
+		return w.settle(ctx, id, attempt, err)
+	}
+	defer hostRelease()
 	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		for _, env := range environments {
 			if err := deleteEnvironmentRowsTx(ctx, tx, env); err != nil {
@@ -462,14 +478,31 @@ func deleteEmptyApplicationTx(ctx context.Context, tx pgx.Tx, app string) error 
 	if remaining != 0 {
 		return nil
 	}
-	return deleteApplicationRowsTx(ctx, tx, platform.App{Name: app})
+	var appID platform.AppID
+	err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&appID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return unavailable()
+	}
+	return deleteApplicationRowsTx(ctx, tx, platform.App{ID: appID, Name: app})
 }
 
 func deleteApplicationRowsTx(ctx context.Context, tx pgx.Tx, app platform.App) error {
+	if app.ID == "" {
+		return contract.NewFault(contract.Internal, "application identity is missing for deletion", "Reload the application and retry; deletion is bound to the durable app ID, not its name alone.")
+	}
 	// Changes and any remaining environments cascade with the app row. Secret
 	// namespaces are not foreign keys to platform apps and are removed here.
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_apps WHERE name=$1`, app.Name); err != nil {
+	tag, err := tx.Exec(ctx, `DELETE FROM eregion_platform_apps WHERE id=$1`, app.ID)
+	if err != nil {
 		return unavailable()
+	}
+	if tag.RowsAffected() == 0 {
+		// The identity-bound row is already gone; never erase another app's
+		// same-named secret namespace.
+		return nil
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM eregion_secrets WHERE app=$1`, app.Name); err != nil {
 		return unavailable()
@@ -653,8 +686,8 @@ func (s *Service) ensureApplication(ctx context.Context, app string) error {
 
 func (s *Service) applicationEnvironments(ctx context.Context, app string) (platform.App, []platform.Environment, error) {
 	var record platform.App
-	if err := s.pool.QueryRow(ctx, `SELECT id,name,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`, app).
-		Scan(&record.ID, &record.Name, &record.CreatedAt, &record.UpdatedAt); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT id,name,image_repository,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`, app).
+		Scan(&record.ID, &record.Name, &record.ImageRepository, &record.CreatedAt, &record.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return record, nil, contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
 		}

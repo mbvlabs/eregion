@@ -81,7 +81,7 @@ func (a *app) readWebhookUpdate(cmd *cobra.Command, appName, environment string,
 		return update, contract.NewFault(contract.PreconditionFailed, "push to deploy is not enabled, so there is no secret to rotate", "Enable it with eregion env update "+appName+" "+environment+" --auto-deploy.")
 	}
 	needsSecret := rotate || (autoSet && enabled && (!currentEnabled || currentName == ""))
-	if source.Kind != "git" {
+	if source.URL == "" {
 		return update, contract.NewFault(contract.PreconditionFailed, "push to deploy needs a git source", "Set a git source with --git-url and a branch ref first.")
 	}
 	repository, ok := platform.GitHubRepository(source.URL)

@@ -88,7 +88,7 @@ func (r *PushWebhookResolver) ResolvePushWebhook(ctx context.Context, app, envir
 		return api.PushWebhookTarget{}, false, contract.NewFault(contract.PreconditionFailed, "the environment source does not parse", "Re-save the environment source.")
 	}
 	repository, ok := platform.GitHubRepository(source.URL)
-	if !ok || source.Kind != "git" {
+	if !ok || source.URL == "" {
 		return api.PushWebhookTarget{}, false, nil
 	}
 	if r.secrets == nil || r.secrets.Store() == nil || r.secrets.Store().Ring() == nil {

@@ -18,7 +18,7 @@ type credentialsStep struct {
 	credentials Credentials
 }
 
-func (s *credentialsStep) ID() string { return "host-credentials-v1" }
+func (s *credentialsStep) ID() string { return "host-credentials-v2" }
 func (s *credentialsStep) Describe() string {
 	return "Write owner-only API credentials and the control-plane environment"
 }
@@ -40,7 +40,8 @@ func (s *credentialsStep) Inputs() ([]byte, error) {
 		EnvPath         string            `json:"env_path"`
 		Node            string            `json:"node"`
 		NodeStateDir    string            `json:"node_state_dir"`
-	}{hashes, engine.HashSecret(s.cfg.DatabaseURL), s.authPath(), s.envPath(), s.cfg.Node, s.cfg.Layout.NodeStateDir})
+		RegistryListen  string            `json:"registry_listen"`
+	}{hashes, engine.HashSecret(s.cfg.DatabaseURL), s.authPath(), s.envPath(), s.cfg.Node, s.cfg.Layout.NodeStateDir, s.cfg.RegistryListen})
 }
 
 func (s *credentialsStep) managedEnv() []string {
@@ -48,6 +49,7 @@ func (s *credentialsStep) managedEnv() []string {
 		envLine("EREGION_DATABASE_URL", s.cfg.DatabaseURL),
 		envLine("EREGION_AUTH_FILE", s.authPath()),
 		envLine("EREGION_NODE_STATE_DIR", s.cfg.Layout.NodeStateDir),
+		envLine("EREGION_REGISTRY_LISTEN", s.cfg.RegistryListen),
 		envLine("EREGION_NODE_TRANSPORT", "local"),
 		envLine("EREGION_NODE_NAME", s.cfg.Node),
 		// The operator installs this identity and pins node host keys here.

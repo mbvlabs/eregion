@@ -35,6 +35,9 @@ type Runner struct {
 
 	// SkipRootCheck exists only for unit tests. Real apply is root-only.
 	SkipRootCheck bool
+	// RegistryHostIdentity exists for unit tests; production derives the public
+	// binding from the bootstrap config and installed host key.
+	RegistryHostIdentity *controlplane.RegistryHostIdentity
 }
 
 // Plan is a read-only preview. It is also the source of the confirmation
@@ -226,7 +229,7 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		// identity; status remains explicitly unconfigured until an explicit
 		// assignment.
 		if r.Config.Workspace != "" {
-			steps = append(steps, &workspaceStep{cfg: r.Config, database: r.Database})
+			steps = append(steps, &workspaceStep{cfg: r.Config, database: r.Database, hostIdentity: r.RegistryHostIdentity})
 		}
 		// Before the credentials file that names EREGION_VAULT_KEY_FILE and
 		// before the services that load it.
@@ -242,6 +245,12 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		steps = append(steps, &ingressStep{cfg: r.Config, exec: r.Exec})
 	}
 	steps = append(steps, &binaryStep{cfg: r.Config, role: role})
+	// node.json must exist before the API and worker services start: their
+	// managed runtime reads the public node name, state directory and host key
+	// before the first request or River attempt. Keep the late duplicate out.
+	if role.ControlPlane || role.NodeAgent {
+		steps = append(steps, &nodeConfigStep{cfg: r.Config})
+	}
 	if role.ControlPlane {
 		steps = append(steps, newAPIService(r.Config, r.Exec), newWorkerService(r.Config, r.Exec))
 		steps = append(steps, &readinessStep{cfg: r.Config, exec: r.Exec, probe: r.Probe})
@@ -250,13 +259,6 @@ func (r *Runner) steps(credentials Credentials) ([]Step, error) {
 		// 127.0.0.1:9101, reached through two exact public ingress paths and
 		// enabled by credential rotation. It is independent of WireGuard.
 		steps = append(steps, &nodeExporterStep{cfg: r.Config, exec: r.Exec, database: r.Database}, &telemetryStep{cfg: r.Config, exec: r.Exec})
-	}
-	// The main node also needs /etc/eregion/node.json: node RPC, the CI URLs,
-	// push-to-deploy and secrets export all read the node identity and main
-	// hostname from it. Only a role with a node execution account installs
-	// forced-command operator keys.
-	if role.ControlPlane || role.NodeAgent {
-		steps = append(steps, &nodeConfigStep{cfg: r.Config})
 	}
 	return steps, nil
 }
@@ -361,6 +363,26 @@ func (r *Runner) preflightWorkspace(ctx context.Context) error {
 	}
 	if identity.Configured && identity.Name != r.Config.Workspace {
 		return workspaceNameConflict(identity.Name, r.Config.Workspace)
+	}
+	if identity.Configured {
+		observed := r.RegistryHostIdentity
+		if observed == nil {
+			derived, err := BootstrapRegistryIdentity(r.Config)
+			if err != nil {
+				return err
+			}
+			observed = &derived
+		}
+		if identity.RegistryHost == nil {
+			return contract.NewFault(contract.PreconditionFailed,
+				"the workspace has no verified registry host binding",
+				"This workspace remains unverified and is never backfilled. Use a fresh installation.")
+		}
+		if !identity.RegistryHost.Equal(*observed) {
+			return contract.NewFault(contract.Conflict,
+				"this physical host is not the workspace's bound registry host",
+				"Use the original bootstrap host; node names alone are not sufficient.")
+		}
 	}
 	return nil
 }

@@ -355,6 +355,15 @@ type WorkerConfig struct {
 	// NodeStateDir is the local dispatcher's shared state directory. Tests inject
 	// a temporary directory; services use EREGION_NODE_STATE_DIR or the default.
 	NodeStateDir string
+	// RegistryEndpoint is the build node's actual configured loopback registry
+	// endpoint, supplied by node composition. It is never defaulted here: a
+	// build or private artifact selection without it fails rather than
+	// publishing or reading somewhere unconfigured.
+	RegistryEndpoint string
+	// RegistryHostIdentity is the observed public identity of the physical main
+	// host. New verifies it against the immutable workspace binding; a nil value
+	// leaves direct registry mutation guards closed.
+	RegistryHostIdentity *RegistryHostIdentity
 	// SecretResolver resolves environment secret references at deployment time.
 	// Nil means referenced secrets fail honestly instead of being injected.
 	SecretResolver SecretResolver
@@ -395,7 +404,14 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, vault: config.Vault, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS, diagnosticAdmissionNode: config.DiagnosticAdmissionNode}
+	service := &Service{pool: pool, secrets: config.SecretResolver, vault: config.Vault, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS, diagnosticAdmissionNode: config.DiagnosticAdmissionNode, registryEndpoint: strings.TrimSpace(config.RegistryEndpoint)}
+	if config.RegistryHostIdentity != nil {
+		identity := *config.RegistryHostIdentity
+		if _, err := VerifyWorkspaceRegistryHost(context.Background(), pool, identity); err != nil {
+			return nil, err
+		}
+		service.registryHostIdentity = &identity
+	}
 	service.redaction = config.Redaction
 	if service.redaction == nil {
 		service.redaction = &secrets.Registry{}

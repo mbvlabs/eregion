@@ -249,6 +249,24 @@ func scriptedResult(request node.Request) json.RawMessage {
 	if strings.HasPrefix(request.Execution.Step, "platform-port-") {
 		return json.RawMessage(`{"stdout":"127.0.0.1:18080"}`)
 	}
+	if request.Execution.Step == deploymentPackStep {
+		var payload platform.PackPayload
+		_ = json.Unmarshal(request.Payload, &payload)
+		local := payload.Image
+		if colon := strings.LastIndexByte(local, ':'); colon > strings.LastIndexByte(local, '/') {
+			local = local[:colon]
+		}
+		sum := sha256.Sum256([]byte(payload.Image))
+		imageID := "sha256:" + hex.EncodeToString(sum[:])
+		manifest := sha256.Sum256([]byte("manifest:" + payload.Image))
+		reference := payload.Registry + "/" + local + "@sha256:" + hex.EncodeToString(manifest[:])
+		result := map[string]string{"image_id": imageID, "reference": reference, "digest": "sha256:" + hex.EncodeToString(manifest[:])}
+		if payload.GitRef != "" {
+			result["commit"] = payload.GitRef
+		}
+		raw, _ := json.Marshal(result)
+		return raw
+	}
 	if request.Execution.Step != "platform-image-01-v1" {
 		return json.RawMessage(`{}`)
 	}

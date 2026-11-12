@@ -6,7 +6,7 @@ import (
 )
 
 func TestResolveSelectionAutomationAndTarget(t *testing.T) {
-	raw := []byte(`version = 1
+	raw := []byte(`version = 2
 app = "api"
 [automation]
 auto_deploy = true
@@ -39,7 +39,7 @@ auto_deploy = false
 			}
 		})
 	}
-	selected, err := ResolveSelection([]byte("version = 1\n"), "api", "production")
+	selected, err := ResolveSelection([]byte("version = 2\n"), "api", "production")
 	if err != nil || selected.App != "api" || selected.Automation != nil {
 		t.Fatalf("explicit target: resolved=%+v err=%v", selected, err)
 	}
@@ -49,7 +49,7 @@ auto_deploy = false
 }
 
 func TestResolveSelectionDefinitionSizeBoundary(t *testing.T) {
-	const prefix = "version = 1\n#"
+	const prefix = "version = 2\n#"
 	raw := prefix + strings.Repeat("x", MaxDefinitionBytes-len(prefix))
 	if _, err := ResolveSelection([]byte(raw), "api", "production"); err != nil {
 		t.Fatalf("definition at limit: %v", err)

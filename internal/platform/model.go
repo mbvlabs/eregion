@@ -65,10 +65,15 @@ type Node struct {
 }
 
 type App struct {
-	ID        AppID     `json:"id"`
-	Name      string    `json:"name"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID   AppID  `json:"id"`
+	Name string `json:"name"`
+	// ImageRepository is the app's immutable private-workspace registry path,
+	// for example mbvlabs/andurel. It never contains a registry host, tag,
+	// digest, URL or credentials. Every build and upload for the app publishes
+	// into this exact repository; environments cannot override it.
+	ImageRepository string    `json:"image_repository"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 type HealthConfig struct {
@@ -77,11 +82,13 @@ type HealthConfig struct {
 	TimeoutSeconds int    `json:"timeout_seconds"`
 }
 
-// SourceBinding is the durable source declaration in an environment revision.
-// A git binding is an HTTPS repository with an optional read-credential secret
-// NAME; the value lives in the vault and is never part of the revision.
+// SourceBinding is the optional Git build recipe in an environment revision.
+// Its zero value means the environment has no Git source; an artifact is then
+// selected explicitly at deploy time. There is no persistent image source and
+// no kind discriminator: a non-empty URL is the Git binding. CredentialSecretName
+// is a vault secret NAME; the value lives in the vault and is never part of the
+// revision.
 type SourceBinding struct {
-	Kind                 string                `json:"kind"`
 	URL                  string                `json:"url,omitempty"`
 	Ref                  string                `json:"ref,omitempty"`
 	CredentialSecretName string                `json:"credential_secret_name,omitempty"`
@@ -90,7 +97,6 @@ type SourceBinding struct {
 	BuildEnv             map[string]string     `json:"build_env,omitempty"`
 	GoTargets            []buildpacks.GoTarget `json:"go_targets,omitempty"`
 	Buildpacks           *buildpacks.Settings  `json:"buildpacks,omitempty"`
-	Image                string                `json:"image,omitempty"`
 }
 
 // RuntimeSpec is the environment runtime declaration. Node is mirrored on the
@@ -161,6 +167,10 @@ type Deployability struct {
 // DeployabilityState supplies the non-revision observations.
 type DeployabilityState struct {
 	ArtifactReady bool
+	// ArtifactPlanned is true when the submission itself supplies an immutable
+	// artifact (an explicit deploy selector), so no previously ready release is
+	// required for admission.
+	ArtifactPlanned bool
 	// ExplicitRelease is true when the deploy names an existing release. That
 	// release supplies the artifact, so the revision's source binding is not
 	// required.
@@ -183,10 +193,10 @@ func EvaluateDeployability(revision *EnvironmentRevision, state DeployabilitySta
 		dns = "unknown"
 	}
 	missing := make([]string, 0, 6)
-	if !state.ExplicitRelease && (revision == nil || !sourceReady(revision.Source)) {
-		missing = append(missing, "source")
-	}
-	if !state.ArtifactReady {
+	// A Git-less revision is not a deployability blocker: an explicit artifact
+	// selector supplies the image. A no-selector submission is refused with
+	// artifact-selection guidance instead of inventing a source or latest tag.
+	if !state.ArtifactReady && !state.ArtifactPlanned {
 		missing = append(missing, "artifact")
 	}
 	if revision == nil || !runtimeReady(revision.Runtime) {
@@ -207,17 +217,6 @@ func EvaluateDeployability(revision *EnvironmentRevision, state DeployabilitySta
 		missing = append(missing, "dns")
 	}
 	return Deployability{Deployable: len(missing) == 0, Missing: missing, DNS: dns}
-}
-
-func sourceReady(source SourceBinding) bool {
-	switch source.Kind {
-	case "git":
-		return source.URL != ""
-	case "image":
-		return source.Image != ""
-	default:
-		return false
-	}
 }
 
 func runtimeReady(runtime RuntimeSpec) bool {
@@ -245,7 +244,11 @@ type Environment struct {
 	ID   EnvironmentID `json:"id"`
 	App  string        `json:"app"`
 	Name string        `json:"name"`
-	Node string        `json:"node"`
+	// ImageRepository mirrors the owning app's immutable private repository so
+	// definition updates can assert the explicit file value without a second
+	// read. It is not environment desired state and cannot be changed here.
+	ImageRepository string `json:"image_repository,omitempty"`
+	Node            string `json:"node"`
 	// Protected gates a real environment deletion behind the human factor.
 	// production and staging are created protected by default; other names are
 	// unprotected by default. An application deletion always needs the factor.
@@ -315,6 +318,12 @@ type Source struct {
 	// CredentialSecretName is the vault NAME used by a private HTTPS clone. The
 	// value is resolved at execution and never stored here.
 	CredentialSecretName string `json:"credential_secret_name,omitempty"`
+	// Selector records the operator's requested artifact selector for an image
+	// release (image-tag, image-digest, or image). It is provenance only: the
+	// worker never re-resolves it.
+	Selector string `json:"selector,omitempty"`
+	// SelectorKind is image-tag, image-digest, or image for an image release.
+	SelectorKind string `json:"selector_kind,omitempty"`
 }
 
 type Build struct {

@@ -22,6 +22,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
+	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -97,10 +98,12 @@ func (a *app) nodeServiceSpecs() []spec {
 	migrateMeta.DryRun = true
 	serveMeta := serverMeta("Run the authenticated control-plane API", "eregion node serve --listen 127.0.0.1:8080", "A running API/worker service has no static mutation preview; use node migrate --dry-run to inspect schema changes.")
 	serveMeta.Environment = append(serveMeta.Environment, "EREGION_AUTH_FILE")
+	serveMeta.Environment = append(serveMeta.Environment, "EREGION_REGISTRY_LISTEN")
 	serveMeta.Environment = append(serveMeta.Environment, nodeTransportEnvironment...)
 	serveMeta.Environment = append(serveMeta.Environment, extensionEnvironment...)
 	serveMeta.Environment = append(serveMeta.Environment, serveExtensionEnvironment...)
 	workerMeta := serverMeta("Run River workers without an API listener", "eregion node worker --concurrency 2", "Background execution cannot be previewed; this command starts workers for accepted operations.")
+	workerMeta.Environment = append(workerMeta.Environment, "EREGION_REGISTRY_LISTEN")
 	workerMeta.Environment = append(workerMeta.Environment, nodeTransportEnvironment...)
 	workerMeta.Environment = append(workerMeta.Environment, extensionEnvironment...)
 	return []spec{
@@ -249,6 +252,15 @@ func (a *app) logger(cmd *cobra.Command) *slog.Logger {
 // startRuntime opens the database and builds the runtime. The returned
 // closer releases the node transport (a WireGuard tunnel and its key lock);
 // call it after the workers stopped.
+func managedRegistryEndpointForAdmission() (string, error) {
+	if strings.TrimSpace(os.Getenv(host.RegistryListenEnv)) == "" {
+		// Truly offline discovery may not have registry configuration. Any
+		// admission that needs the endpoint fails closed in the service.
+		return "", nil
+	}
+	return host.ManagedRegistryEndpoint(os.Getenv)
+}
+
 func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime controlplane.ReadinessRuntime) (*pgxpool.Pool, *controlplane.Runtime, extensionRuntime, func(), error) {
 	ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
 	defer cancel()
@@ -302,11 +314,34 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime
 		pool.Close()
 		return nil, nil, extensionRuntime{}, nil, err
 	}
+	// A build worker publishes into the node's actual private registry. The
+	// managed host configuration must provide the endpoint when one is
+	// configured; a missing setting is allowed for offline discovery, but any
+	// admission that needs it fails closed. A malformed configured endpoint is
+	// always a startup error.
+	registryEndpoint, endpointErr := managedRegistryEndpointForAdmission()
+	if endpointErr != nil {
+		closeTransport()
+		pool.Close()
+		return nil, nil, extensionRuntime{}, nil, endpointErr
+	}
+	var registryHostIdentity *controlplane.RegistryHostIdentity
+	if concurrency > 0 {
+		identity, identityErr := host.LocalRegistryIdentity()
+		if identityErr != nil {
+			closeTransport()
+			pool.Close()
+			return nil, nil, extensionRuntime{}, nil, identityErr
+		}
+		registryHostIdentity = &identity
+	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
-		Vault:         parts.Vault,
-		LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
-		Nodes:         a.fleetResolverConfig(logger), Resolver: nodes, Redaction: a.secrets,
+		Vault:                parts.Vault,
+		RegistryEndpoint:     registryEndpoint,
+		RegistryHostIdentity: registryHostIdentity,
+		LocalNodeName:        os.Getenv("EREGION_NODE_NAME"),
+		Nodes:                a.fleetResolverConfig(logger), Resolver: nodes, Redaction: a.secrets,
 		DomainDNS: parts.DomainDNS,
 	})
 	if err != nil {

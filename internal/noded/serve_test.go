@@ -216,7 +216,7 @@ func TestServeDoesNotCompactTheJournal(t *testing.T) {
 	stateDir := filepath.Join(directory, "state")
 	config := Config{Node: "test-node", StateDir: stateDir, Path: filepath.Join(directory, "node.json")}
 	old := journalWithOldTask(t, stateDir)
-	stdin := strings.NewReader(`{"type":"hello","version":1}` + "\n")
+	stdin := strings.NewReader(fmt.Sprintf(`{"type":"hello","version":%d}`+"\n", node.ProtocolVersion))
 	var stdout bytes.Buffer
 	if err := Serve(config, stdin, &stdout); err != nil {
 		t.Fatal(err)

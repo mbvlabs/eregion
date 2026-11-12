@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -21,69 +22,6 @@ import (
 )
 
 // ----------------------------------------------------------------- builds
-
-func (w *platformWorker) runRelease(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
-	input := normalized.Input.(*platform.ReleaseCreateInput)
-	env, err := w.service.environment(ctx, input.App, input.Environment)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := crossNodeBuildUnsupported(env, input.Source.Type); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	nodeName := env.Node
-	role, capability := platform.RoleApplication, platform.CapabilityDocker
-	if input.Source.Type != "image" {
-		nodeName = env.BuildNodeName()
-		role, capability = platform.RoleBuilder, platform.CapabilityBuildpacks
-	}
-	n, err := w.service.node(ctx, nodeName)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.checkPlacement(n, role, capability); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	tr, err := w.service.resolver.TransportFor(ctx, n.Name)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	release, err := w.service.releaseForOperation(ctx, id)
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	buildSecrets := map[string]string{}
-	if input.Source.Type == "git" && input.Source.CredentialSecretName != "" {
-		value, _, resolveErr := w.service.resolveCredentialSecret(ctx, env, input.Source.CredentialSecretName)
-		if resolveErr != nil {
-			return w.settle(ctx, id, attempt, resolveErr)
-		}
-		buildSecrets[input.Source.CredentialSecretName] = value
-	}
-	if input.Source.Type == "image" {
-		release, err = w.verifyReleaseImage(ctx, id, attempt, release, tr, input.Pull)
-	} else {
-		release, err = w.buildRelease(ctx, id, attempt, env, release, tr, buildSecrets)
-	}
-	if err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		if err := appendEvent(ctx, tx, op, contract.Event{
-			Kind: "log", Stage: "release", ReleaseID: string(release.ID),
-			Message: "Release " + string(release.ID) + " is ready with image " + release.ImageID + ".",
-		}); err != nil {
-			return err
-		}
-		return insertPlatformChange(ctx, tx, op, "release.ready", release.App, release.Environment,
-			"Release "+string(release.ID)+" is ready from "+release.Source.Type+" source.",
-			map[string]any{"release_id": release.ID, "image": release.Image},
-			map[string]any{"release_id": release.ID, "image": release.Image, "image_id": release.ImageID, "commit": release.CommitSHA})
-	}); err != nil {
-		return w.settle(ctx, id, attempt, err)
-	}
-	return nil
-}
 
 func (w *platformWorker) runBuildRetry(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
 	input := normalized.Input.(*platform.BuildRetryInput)
@@ -136,7 +74,7 @@ func (w *platformWorker) runBuildRetry(ctx context.Context, id contract.Operatio
 		return insertPlatformChange(ctx, tx, op, "build.succeeded", env.App, env.Name,
 			"Retried build "+string(old.ID)+" at commit "+release.CommitSHA+".",
 			map[string]any{"build_id": old.ID, "commit": old.CommitSHA},
-			map[string]any{"release_id": release.ID, "image_id": release.ImageID})
+			map[string]any{"release_id": release.ID, "image": release.Image, "image_id": release.ImageID})
 	}); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
@@ -220,8 +158,14 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	if gitRef == "" {
 		gitRef = build.Source.Ref
 	}
+	registryEndpoint := strings.TrimSpace(w.service.registryEndpoint)
+	if registryEndpoint == "" {
+		fault := contract.NewFault(contract.PreconditionFailed, "the build node has no configured registry endpoint", "Apply the node's recorded host intent and start the worker with its configured loopback registry endpoint before building.")
+		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
+		return release, fault
+	}
 	payload := platform.PackPayload{
-		Step: deploymentPackStep, Image: release.Image,
+		Step: deploymentPackStep, Image: release.Image, Registry: registryEndpoint,
 		Builder: buildInfo.Builder, Env: buildInfo.Env, GoTargets: buildInfo.GoTargets, Buildpacks: buildInfo.Buildpacks, TimeoutSeconds: 900,
 		Cache:       platform.BuildpackCacheVolume(release.App, release.Environment),
 		LaunchCache: platform.BuildpackLaunchCacheVolume(release.App, release.Environment),
@@ -270,11 +214,22 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	}
 	result, buildErr := w.runStepOn(ctx, tr, id, attempt, deploymentPackStep, payload, buildSecrets)
 	if buildErr != nil {
+		if errors.Is(buildErr, errNodeEffectOutcomeUnknown) {
+			// The node may still be building. Do not turn a lost SSH response
+			// into cancellation or a failed build; retain unknown ownership and
+			// let the next attempt reconcile status before any new dispatch.
+			return release, buildErr
+		}
 		if state, _, stateErr := w.service.operationState(ctx, id); stateErr == nil && state == contract.Cancelling {
 			_ = w.service.markBuildCancelled(ctx, build.ID)
 			return release, errPlatformCancelled
 		}
+		if errors.Is(buildErr, errPlatformCancelled) {
+			_ = w.service.markBuildCancelled(ctx, build.ID)
+			return release, errPlatformCancelled
+		}
 		if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
+			_ = w.service.markBuildCancelled(ctx, build.ID)
 			return release, errPlatformCancelled
 		}
 		_ = w.service.markBuildFailed(ctx, build.ID, buildErr, release.ID)
@@ -292,9 +247,15 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
 		return release, fault
 	}
+	canonicalImage, builtImageID, identityErr := builtReleaseIdentity(result)
+	if identityErr != nil {
+		_ = w.service.markBuildFailed(ctx, build.ID, identityErr, release.ID)
+		return release, identityErr
+	}
 	imageResult, err := w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
 		Step:           deploymentImageStep,
 		Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.Image},
+		IsolatedDocker: true,
 		TimeoutSeconds: 30,
 	}, nil)
 	if err != nil {
@@ -307,10 +268,15 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
 		return release, fault
 	}
+	if imageID != builtImageID {
+		fault := contract.NewFault(contract.PreconditionFailed, "the local completion tag does not match the built registry image", "Do not accept a mismatched image; retry the build and inspect the registry publication.")
+		_ = w.service.markBuildFailed(ctx, build.ID, fault, release.ID)
+		return release, fault
+	}
 	if cancelled, _ := w.service.buildCancelled(ctx, build.ID); cancelled {
 		return release, errPlatformCancelled
 	}
-	if err := w.service.markBuildSucceeded(ctx, build.ID, release.ID, commit, imageID); err != nil {
+	if err := w.service.markBuildSucceeded(ctx, build.ID, release.ID, canonicalImage, commit, imageID); err != nil {
 		return release, err
 	}
 	updated, err := w.service.releaseByID(ctx, release.ID)
@@ -323,10 +289,55 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	return updated, nil
 }
 
+// readyReleaseImagePayload is the bounded ready-release materialization
+// contract for every immutable release, Git-built or artifact-admitted. A ready
+// release must already name its canonical registry manifest digest and recorded
+// config digest, with no fallback to a historical local tag.
+func readyReleaseImagePayload(release platform.Release) (platform.ReadyImagePayload, error) {
+	if release.Source.Type == "" && release.Image == "" {
+		return platform.ReadyImagePayload{}, nil
+	}
+	if !platform.IsImageDigestReference(release.Image) {
+		return platform.ReadyImagePayload{}, contract.NewFault(contract.PreconditionFailed,
+			"ready release has no canonical registry digest reference",
+			"This historical local-only release cannot be materialized safely; deploy it again with an explicit artifact or a Git build.")
+	}
+	if release.ImageID == "" {
+		return platform.ReadyImagePayload{}, contract.NewFault(contract.PreconditionFailed,
+			"ready release has no recorded image config digest",
+			"Do not accept image presence alone; inspect or redeploy the release.")
+	}
+	return platform.ReadyImagePayload{
+		Step: deploymentReadyImageStep, Image: release.Image, ImageID: release.ImageID,
+	}, nil
+}
+
+// materializeReadyReleaseImage ensures a ready Git-built release exists on the
+// application node. Present images stay untouched. A missing image is pulled by
+// the recorded canonical digest, and the resulting config ID must equal the
+// recorded image_id; the database is never rewritten to accept a mismatch.
+func (w *platformWorker) materializeReadyReleaseImage(ctx context.Context, id contract.OperationID, attempt uint32, release platform.Release, tr node.Transport) error {
+	payload, err := readyReleaseImagePayload(release)
+	if err != nil {
+		return err
+	}
+	if payload.Image == "" {
+		return nil
+	}
+	_, err = w.runStepOn(ctx, tr, id, attempt, deploymentReadyImageStep, payload, nil)
+	return err
+}
+
 func (w *platformWorker) verifyReleaseImage(ctx context.Context, id contract.OperationID, attempt uint32, release platform.Release, tr node.Transport, pull bool) (platform.Release, error) {
+	expectedConfig := release.ImageID
+	if expectedConfig == "" || !strings.HasPrefix(expectedConfig, "sha256:") || len(expectedConfig) != 71 {
+		return release, contract.NewFault(contract.PreconditionFailed,
+			"release has no expected image config digest",
+			"Artifact admission must record the immutable config identity before deploying.")
+	}
 	if pull {
 		if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentPullStep, platform.ArgvPayload{
-			Step: deploymentPullStep, Argv: []string{"docker", "pull", release.Image}, TimeoutSeconds: 600,
+			Step: deploymentPullStep, Argv: []string{"docker", "pull", "--platform", "linux/" + runtime.GOARCH, release.Image}, IsolatedDocker: true, TimeoutSeconds: 600,
 		}, nil); err != nil {
 			return release, err
 		}
@@ -337,6 +348,7 @@ func (w *platformWorker) verifyReleaseImage(ctx context.Context, id contract.Ope
 	result, err := w.runStepOn(ctx, tr, id, attempt, deploymentImageStep, platform.ArgvPayload{
 		Step:           deploymentImageStep,
 		Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.Image},
+		IsolatedDocker: true,
 		TimeoutSeconds: 30,
 	}, nil)
 	if err != nil {
@@ -345,6 +357,11 @@ func (w *platformWorker) verifyReleaseImage(ctx context.Context, id contract.Ope
 	imageID := stepStdout(result)
 	if !strings.HasPrefix(imageID, "sha256:") || len(imageID) != 71 {
 		return release, contract.NewFault(contract.PreconditionFailed, "image inspection did not return an immutable image ID", "Inspect the node image and release operation before retrying.")
+	}
+	if imageID != expectedConfig {
+		return release, contract.NewFault(contract.PreconditionFailed,
+			"the pulled artifact config digest does not match the admitted image",
+			"The registry artifact changed or the pull resolved another image; do not deploy it. Inspect the pinned manifest and retry only after the registry is correct.")
 	}
 	if _, err := w.service.pool.Exec(ctx, `UPDATE eregion_platform_releases
         SET status='ready',image_id=$2,completed_at=clock_timestamp(),error='',error_code=''
@@ -464,13 +481,16 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
 	}
 	needsBuild := release.Status != platform.ReleaseReady || release.ImageID == ""
+	gitBuild := requiresGitBuild(release)
 	// The git read credential is not an application secret, but it is part of
 	// the same snapshot: the first attempt pins its revision and every later
 	// attempt reuses that pinned revision. A retry whose snapshot already exists
 	// therefore reads the credential from resolveDeploymentSecrets, not only
-	// from the first-attempt branch below.
+	// from the first-attempt branch below. An explicit image artifact never
+	// resolves or pins a Git credential merely because the revision has a Git
+	// recipe.
 	credentialValue := ""
-	if needsBuild && credentialKey != "" {
+	if gitBuild && credentialKey != "" {
 		credentialValue = pinnedCredential
 		if credentialValue == "" {
 			// No snapshot pinned this credential (first attempt, or a snapshot
@@ -502,7 +522,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	}
 
 	// A deploy from the current revision records a pending release and build.
-	if needsBuild && release.Source.Type != "image" {
+	if gitBuild {
 		builder, err := w.service.node(ctx, env.BuildNodeName())
 		if err != nil {
 			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
@@ -516,7 +536,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		if credentialValue != "" {
 			buildSecrets[credentialKey] = credentialValue
 		}
-		if release.BuildID != "" || (release.Source.Type != "image" && release.Source.Type != "") {
+		if gitBuild {
 			release, err = w.buildRelease(ctx, id, attempt, env, release, tr, buildSecrets)
 		} else {
 			// An image source may live only in the node's loopback registry.
@@ -531,6 +551,11 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
 			contract.NewFault(contract.PreconditionFailed, "release has no immutable image", "Build or inspect the release before deploying."))
 	}
+	if !needsBuild {
+		if err := w.materializeReadyReleaseImage(ctx, id, attempt, release, tr); err != nil {
+			return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
+		}
+	}
 	if env.Revision == nil {
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil,
 			contract.NewFault(contract.PreconditionFailed, "deployment has no environment revision", "Deploy with an environment that has a current revision."))
@@ -543,6 +568,7 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 	if _, err := w.runStepOn(ctx, tr, id, attempt, deploymentPreflightStep, platform.ArgvPayload{
 		Step:           deploymentPreflightStep,
 		Argv:           []string{"docker", "image", "inspect", "--format", "{{.Id}}", release.ImageID},
+		IsolatedDocker: true,
 		TimeoutSeconds: 30,
 	}, nil); err != nil {
 		return w.finishDeploymentFailure(ctx, tr, id, attempt, env, dep, nil, err)
@@ -1004,6 +1030,12 @@ func (w *platformWorker) finishDeploymentFailure(ctx context.Context, tr node.Tr
 		return cause
 	}
 	if deploymentFailureNeedsCleanup(cause) {
+		// A terminal or cancellation settlement is not safe while a detached
+		// node effect may still be live. This includes a lost SSH response
+		// during a build whose operation received cancellation meanwhile.
+		if err := w.ensureNoOutstandingDeploymentEffect(ctx, id, attempt, dep, env, "deployment-failure"); err != nil {
+			return err
+		}
 		cleanupCtx := context.WithoutCancel(ctx)
 		if err := w.service.persistDeploymentCleanupInstances(cleanupCtx, env, dep, candidates, "candidate"); err != nil {
 			return deploymentCleanupIntentFault(err)
@@ -1080,6 +1112,10 @@ func (s *Service) deploymentPlan(ctx context.Context, operationID contract.Opera
 		}
 	}
 	return dep, env, release, previous, nil
+}
+
+func requiresGitBuild(release platform.Release) bool {
+	return (release.Status != platform.ReleaseReady || release.ImageID == "") && release.Source.Type == "git"
 }
 
 // ----------------------------------------------------------- secret snapshot
@@ -1215,15 +1251,31 @@ func (s *Service) markBuildRunning(ctx context.Context, id platform.BuildID) err
 	return nil
 }
 
-func (s *Service) markBuildSucceeded(ctx context.Context, id platform.BuildID, releaseID platform.ReleaseID, commit, imageID string) error {
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_builds
-        SET state='succeeded',commit_sha=$2,completed_at=clock_timestamp(),error='',error_code=''
-        WHERE id=$1 AND state<>'cancelled'`, id, commit); err != nil {
+func (s *Service) markBuildSucceeded(ctx context.Context, id platform.BuildID, releaseID platform.ReleaseID, image, commit, imageID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
 		return unavailable()
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_releases
-        SET status='ready',image_id=$2,commit_sha=$3,completed_at=clock_timestamp(),error='',error_code=''
-        WHERE id=$1 AND status='pending'`, releaseID, imageID, commit); err != nil {
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	buildTag, err := tx.Exec(ctx, `UPDATE eregion_platform_builds
+        SET state='succeeded',commit_sha=$2,completed_at=clock_timestamp(),error='',error_code=''
+        WHERE id=$1 AND state IN ('pending','running')`, id, commit)
+	if err != nil {
+		return unavailable()
+	}
+	releaseTag, err := tx.Exec(ctx, `UPDATE eregion_platform_releases
+        SET status='ready',image=$2,image_id=$3,commit_sha=$4,completed_at=clock_timestamp(),error='',error_code=''
+        WHERE id=$1 AND status='pending'`, releaseID, image, imageID, commit)
+	if err != nil {
+		return unavailable()
+	}
+	if buildTag.RowsAffected() == 0 || releaseTag.RowsAffected() == 0 {
+		// A cancellation or another terminal writer won the fence. Rolling
+		// back keeps the build and release rows consistent instead of
+		// publishing a ready release after a stop was accepted.
+		return errPlatformCancelled
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return unavailable()
 	}
 	return nil
@@ -1591,6 +1643,20 @@ func deploymentHealthTarget(env platform.Environment, port int) string {
 		path = env.Revision.Runtime.HealthPath
 	}
 	return fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
+}
+
+// builtReleaseIdentity reads the complete identity a published build must
+// return. A missing or mutable reference is a failed build, never a reason to
+// fall back to a local tag.
+func builtReleaseIdentity(raw json.RawMessage) (string, string, error) {
+	image := stepResultString(raw, "reference")
+	imageID := stepResultString(raw, "image_id")
+	if !platform.IsImageDigestReference(image) || !strings.HasPrefix(imageID, "sha256:") || len(imageID) != 71 {
+		return "", "", contract.NewFault(contract.PreconditionFailed,
+			"build did not record a canonical registry digest and image identity",
+			"A Git build must publish to the node registry and return repo@sha256:<digest> plus its config digest before the release can be ready.")
+	}
+	return image, imageID, nil
 }
 
 func stepResultString(raw json.RawMessage, key string) string {

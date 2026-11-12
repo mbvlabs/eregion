@@ -3,6 +3,7 @@ package node
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -56,5 +57,18 @@ func TestStreamLostIsExplicit(t *testing.T) {
 	}
 	if IsStreamLost(errors.New("other")) {
 		t.Fatal("an unrelated error was reported as a stream loss")
+	}
+}
+
+func TestCallCancelledIsDistinctFromStreamLost(t *testing.T) {
+	err := errors.Join(context.Canceled, ErrCallCancelled)
+	if !IsCallCancelled(err) {
+		t.Fatal("a wrapped caller cancellation is not detected")
+	}
+	if IsStreamLost(err) {
+		t.Fatal("caller cancellation was reported as a stream loss")
+	}
+	if IsCallCancelled(ErrStreamLost) {
+		t.Fatal("a stream loss was reported as caller cancellation")
 	}
 }

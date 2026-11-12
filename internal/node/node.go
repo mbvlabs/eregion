@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -54,14 +55,17 @@ type Event struct {
 // Response is the final node result. A transport error is separate: a domain
 // failure returns a Response with Status failed.
 type Response struct {
-	Status         engine.Status `json:"status"`
-	ExecutionID    string        `json:"execution_id,omitempty"`
-	Attempt        uint32        `json:"attempt,omitempty"`
-	AppliedAttempt uint32        `json:"applied_attempt,omitempty"`
-	InputsHash     string        `json:"inputs_hash,omitempty"`
-	Executed       bool          `json:"executed"`
-	Retryable      bool          `json:"retryable"`
-	InputsMismatch bool          `json:"inputs_mismatch,omitempty"`
+	Status         engine.Status    `json:"status"`
+	ExecutionID    string           `json:"execution_id,omitempty"`
+	Attempt        uint32           `json:"attempt,omitempty"`
+	AppliedAttempt uint32           `json:"applied_attempt,omitempty"`
+	InputsHash     string           `json:"inputs_hash,omitempty"`
+	Phase          engine.TaskPhase `json:"phase,omitempty"`
+	PhaseStartedAt string           `json:"phase_started_at,omitempty"`
+	WaitMS         int64            `json:"wait_ms"`
+	Executed       bool             `json:"executed"`
+	Retryable      bool             `json:"retryable"`
+	InputsMismatch bool             `json:"inputs_mismatch,omitempty"`
 	// ErrorCode classifies a failed step in a machine-readable way, so a caller
 	// never has to parse the message text to tell a precondition failure from
 	// an unexpected one.
@@ -106,6 +110,19 @@ func DefaultStateDir() string {
 		return filepath.Join(os.TempDir(), "eregion-node")
 	}
 	return filepath.Join(home, ".local", "state", "eregion", "node")
+}
+
+// HostLockPath returns the one node host-mutation lock shared by host apply,
+// builds, image upload, retention removal, registry GC and final app metadata
+// deletion. Callers must pass the actual node state directory; an empty value
+// uses the managed node state directory. The lock is never inferred from a
+// different worker-local directory.
+func HostLockPath(stateDir string) string {
+	stateDir = strings.TrimSpace(stateDir)
+	if stateDir == "" {
+		stateDir = DefaultStateDir()
+	}
+	return filepath.Join(stateDir, "host.lock")
 }
 
 func (*Local) Name() string { return "local" }

@@ -58,7 +58,7 @@ func TestEnvironmentCreateDeployNeedsASource(t *testing.T) {
 	}
 	good, err := normalize(map[string]any{
 		"name": "production", "node": "app-1", "deploy": true,
-		"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"},
+		"source": map[string]any{"url": "https://github.com/acme/api"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -219,7 +219,7 @@ func TestContextPathInputGateRejectsPathsOutsideTheRepository(t *testing.T) {
 		raw, _ := json.Marshal(map[string]any{
 			"name": "production", "node": "app-1",
 			"source": map[string]any{
-				"kind": "git", "url": "https://github.com/acme/app.git", "context_path": contextPath,
+				"url": "https://github.com/acme/app.git", "context_path": contextPath,
 			},
 		})
 		_, err := registry.Normalize(KindEnvironmentCreate, "app/api", raw)

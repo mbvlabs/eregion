@@ -37,7 +37,7 @@ func definitionIntegrationFixture(t *testing.T) (*pgxpool.Pool, *Service, api.Ap
 	t.Helper()
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
-	if _, err := AssignWorkspace(ctx, pool, "main"); err != nil {
+	if _, err := AssignWorkspace(ctx, pool, "main", testRegistryHostIdentity()); err != nil {
 		t.Fatal(err)
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{

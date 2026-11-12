@@ -33,9 +33,11 @@ const RegistryImage = "registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5
 // The registry's host paths. Host convergence may use another layout; the
 // retention effects target these defaults unless the payload names them.
 const (
-	RegistryUnit        = "eregion-registry.service"
-	RegistryConfigPath  = "/etc/eregion/registry/config.yml"
-	DefaultRegistryAddr = "127.0.0.1:5000"
+	RegistryUnit          = "eregion-registry.service"
+	RegistryContainer     = "eregion-registry"
+	RegistryContainerPort = 5000
+	RegistryConfigPath    = "/etc/eregion/registry/config.yml"
+	DefaultRegistryAddr   = "127.0.0.1:5000"
 )
 
 var (

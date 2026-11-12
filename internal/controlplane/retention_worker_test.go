@@ -60,11 +60,13 @@ func (f *retentionFakeTransport) Call(_ context.Context, request node.Request, _
 			return node.Response{
 				Status: engine.StatusFailed, ErrorCode: string(contract.Conflict),
 				Retryable: false, Detail: "image is referenced in multiple repositories",
+				Attempt: request.Execution.Attempt, ExecutionID: request.Execution.ExecutionID(),
 			}, nil
 		}
 		if f.failSteps[step] > 0 {
 			f.failSteps[step]--
-			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Unavailable), Retryable: true, Detail: "transient node failure"}, nil
+			return node.Response{Status: engine.StatusFailed, ErrorCode: string(contract.Unavailable), Retryable: true, Detail: "transient node failure",
+				Attempt: request.Execution.Attempt, ExecutionID: request.Execution.ExecutionID()}, nil
 		}
 		return node.Response{Status: engine.StatusCompleted, Result: json.RawMessage(`{"removed":true}`)}, nil
 	default:

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -19,11 +20,11 @@ func (a *app) appSpecs() []spec {
 
 	create := followingMeta(operationMeta("Create an application with production and staging", "eregion app create --name api --node main --git-url https://github.com/acme/api --json"))
 	create.WhenToUse = []string{"Run it bare in a terminal for the guided setup: app, shared source, processes, config, secrets and production's domain. The same recipe creates production and staging atomically. Agents pass every flag; JSON and no-TTY never prompt. Both start protected; creation never asks for a TOTP code."}
-	create.WhenToUse = append(create.WhenToUse, "Use a git source with Buildpacks or an existing image; --from loads a TOML definition. Configure Go targets and optional Node frontend with the typed source flags.")
+	create.WhenToUse = append(create.WhenToUse, "Use an optional Git Buildpacks recipe; omit it for image-only app creation and select the artifact explicitly at deploy time. --from loads a TOML definition. Configure Go targets and optional Node frontend with the typed source flags.")
 	create.Mutating, create.DryRun, create.Prompts = true, true, true
 	create.InputFlags = []string{
 		"name", "node", "build-node", "git-url", "git-ref", "git-credential-file",
-		"git-credential-name", "github-auth", "image", "builder", "context-path", "build-env", "container-port",
+		"git-credential-name", "github-auth", "image-repository", "builder", "context-path", "build-env", "container-port",
 		"health-path", "process", "config", "secret", "domain", "domain-check-path", "from", "no-deploy", "detach",
 		"protected", "unprotected",
 		"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version",
@@ -32,7 +33,7 @@ func (a *app) appSpecs() []spec {
 		"eregion app create",
 		"eregion app create --name api --node main --git-url https://github.com/acme/api --git-ref main --container-port 8080 --health-path /healthz --domain api.example.com --json",
 		"eregion app create --name api --node main --git-url https://github.com/acme/api --github-auth --no-deploy --json",
-		"eregion app create --name api --node main --image ghcr.io/acme/api:2026-10-20 --no-deploy --json",
+		"eregion app create --name api --node main --image-repository mbvlabs/api --no-deploy --json",
 		"eregion app create --from ./eregion.toml --no-deploy --json",
 	}
 	create.Next = []string{"eregion env status <app> <environment> --json", "eregion app status <app> --json"}
@@ -63,6 +64,7 @@ func (a *app) appSpecs() []spec {
 				meta: create,
 				flags: func(cmd *cobra.Command) {
 					cmd.Flags().String("name", "", "Application name")
+					cmd.Flags().String("image-repository", "", "Immutable private image repository path; defaults to the app name")
 					cmd.Flags().Bool("no-deploy", false, "Do not request the first deploy")
 					cmd.Flags().Bool("detach", false, "Submit and return without following the create and first deploy")
 					addProtectionFlags(cmd)
@@ -224,7 +226,7 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 	if err := validateFollowRequest(cmd, follow); err != nil {
 		return result{}, err
 	}
-	input := platform.AppCreateInput{Name: ans.App, Environments: specs, Deploy: ans.Deploy}
+	input := platform.AppCreateInput{Name: ans.App, ImageRepository: ans.ImageRepository, Environments: specs, Deploy: ans.Deploy}
 
 	if err := validateIdempotencyFlag(cmd); err != nil {
 		return result{}, err
@@ -271,7 +273,7 @@ func (a *app) appCreate(cmd *cobra.Command, _ []string) (res result, err error) 
 		}
 	}
 	summary := setupResult{
-		App: ans.App, Environment: ans.Environment, Protected: protectedSpec(spec), Environments: summarizeEnvironmentSpecs(specs),
+		App: ans.App, ImageRepository: defaultRepositoryLabel(ans), Environment: ans.Environment, Protected: protectedSpec(spec), Environments: summarizeEnvironmentSpecs(specs),
 		Node: spec.Node, Source: spec.Source, Processes: spec.Processes, ConfigKeys: sortedKeys(spec.Config),
 		CredentialSecretName: ans.CredentialName, Domain: ans.Domain, DomainCheckPath: ans.DomainCheckPath, Domains: ans.Domains, Deploy: ans.Deploy,
 		Warnings: preview.Warnings, DeferredResources: deferred, created: "app",
@@ -421,6 +423,10 @@ func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
+	appRecord, err := a.findApp(cmd, appName)
+	if err != nil {
+		return result{}, err
+	}
 	if err := definitionDomainState(current, domains); err != nil {
 		return result{}, err
 	}
@@ -430,9 +436,9 @@ func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
 	}
 	var document string
 	if boolFlag(cmd, "inspect") {
-		document, err = appdef.Inspect(appName, environment, current, domains, resources)
+		document, err = appdef.Inspect(appName, environment, appRecord.ImageRepository, current, domains, resources)
 	} else {
-		document, err = appdef.Export(appName, environment, current.BuildNode, current.Revision, domains, resources)
+		document, err = appdef.Export(appName, environment, appRecord.ImageRepository, current.BuildNode, current.Revision, domains, resources)
 	}
 	if err != nil {
 		return result{}, contract.NewFault(contract.PreconditionFailed, "cannot export this environment faithfully", err.Error())
@@ -470,6 +476,23 @@ func (a *app) appExport(cmd *cobra.Command, args []string) (result, error) {
 	return result{data: data, plain: plain, next: []string{"eregion env update " + appName + " " + environment + " --from ./eregion.toml --dry-run --json"}}, nil
 }
 
+func (a *app) findApp(cmd *cobra.Command, name string) (platform.App, error) {
+	raw, err := a.platformReadInventoryWith(cmd, "apps", url.Values{"app": {name}, "limit": {"200"}})
+	if err != nil {
+		return platform.App{}, err
+	}
+	items, err := decodeInventoryItems[platform.App](raw)
+	if err != nil {
+		return platform.App{}, err
+	}
+	for _, item := range items {
+		if item.Name == name {
+			return item, nil
+		}
+	}
+	return platform.App{}, contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
+}
+
 func (a *app) appList(cmd *cobra.Command, _ []string) (result, error) {
 	raw, err := a.platformReadInventory(cmd, "apps")
 	if err != nil {
@@ -481,11 +504,11 @@ func (a *app) appList(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	rows := make([][]string, 0, len(items))
 	for _, item := range items {
-		rows = append(rows, []string{item.Name, string(item.ID), item.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")})
+		rows = append(rows, []string{item.Name, item.ImageRepository, string(item.ID), item.UpdatedAt.Format("2006-01-02 15:04:05Z07:00")})
 	}
 	plain := ui.Header("Applications", 72) + "\nNo applications. Create one with eregion app create.\n"
 	if len(rows) > 0 {
-		plain = ui.Header("Applications", 72) + "\n" + writeTable([]string{"NAME", "ID", "UPDATED"}, rows)
+		plain = ui.Header("Applications", 72) + "\n" + writeTable([]string{"NAME", "IMAGE REPOSITORY", "ID", "UPDATED"}, rows)
 	}
 	return result{data: raw, plain: plain}, nil
 }

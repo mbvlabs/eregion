@@ -1648,11 +1648,17 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 			diagnosticNode = nodeConfig.Node
 		}
 	}
+	registryEndpoint, endpointErr := managedRegistryEndpointForAdmission()
+	if endpointErr != nil {
+		pool.Close()
+		return api.AppService{}, nil, endpointErr
+	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		DiagnosticAdmissionNode: diagnosticNode,
 		Redaction:               registry, Vault: parts.Vault,
-		DomainDNS: parts.DomainDNS,
+		RegistryEndpoint: registryEndpoint,
+		DomainDNS:        parts.DomainDNS,
 		HumanFactor: func(code string) error {
 			return protect.NewStore().Verify(code)
 		},

@@ -67,7 +67,7 @@ func applyGitHubAuthToSpecs(cmd *cobra.Command, ans *setupAnswers, specs []platf
 	names := map[string]bool{}
 	gitSpecs := 0
 	for _, spec := range specs {
-		if spec.Source.Kind != "git" {
+		if spec.Source.URL == "" {
 			continue
 		}
 		gitSpecs++
@@ -110,7 +110,7 @@ func applyGitHubAuthToSpecs(cmd *cobra.Command, ans *setupAnswers, specs []platf
 		}
 	}
 	for _, spec := range specs {
-		if spec.Source.Kind != "git" {
+		if spec.Source.URL == "" {
 			continue
 		}
 		for _, secretName := range spec.SecretNames {
@@ -124,7 +124,7 @@ func applyGitHubAuthToSpecs(cmd *cobra.Command, ans *setupAnswers, specs []platf
 
 	out := append([]platform.EnvironmentSpec(nil), specs...)
 	for index := range out {
-		if out[index].Source.Kind == "git" {
+		if out[index].Source.URL != "" {
 			out[index].Source.CredentialSecretName = requestedName
 		}
 	}

@@ -26,6 +26,7 @@ import (
 type definitionSnapshot struct {
 	Workspace        WorkspaceIdentity
 	AppID            platform.AppID
+	ImageRepository  string
 	EnvironmentID    platform.EnvironmentID
 	RevisionID       platform.RevisionID
 	Protected        bool
@@ -112,7 +113,7 @@ func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, app, environment s
 	if !snap.Workspace.Configured {
 		return snap, env, contract.NewFault(contract.PreconditionFailed, "workspace is not configured", "Initialize the workspace before planning a definition.")
 	}
-	err = tx.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&snap.AppID)
+	err = tx.QueryRow(ctx, `SELECT id,image_repository FROM eregion_platform_apps WHERE name=$1`, app).Scan(&snap.AppID, &snap.ImageRepository)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return snap, env, unavailable()
 	}
@@ -287,6 +288,9 @@ func (s *Service) planDefinition(ctx context.Context, actor contract.Actor, inpu
 		return p, err
 	}
 	p = api.DefinitionPlan{PlanNonce: input.PlanNonce, WorkspaceID: snap.Workspace.ID, App: r.App, Environment: r.Environment, AppExists: snap.AppID != "", EnvironmentExists: snap.EnvironmentID != "", CurrentRevision: snap.RevisionID, Changes: []string{}, Diff: []string{}, Domains: []api.DefinitionDomainChange{}, DNS: []integrations.DefinitionDNSPlan{}, DNSCleanup: []integrations.DomainDNSPlan{}, Blockers: []string{}, Warnings: []string{}}
+	if snap.AppID != "" && r.ImageRepository != "" && r.ImageRepository != snap.ImageRepository {
+		p.Blockers = append(p.Blockers, fmt.Sprintf("image_repository: definition value %q does not match the app's repository %q", r.ImageRepository, snap.ImageRepository))
+	}
 	current := make([]platform.DomainBinding, 0, len(snap.Bindings))
 	byName := map[string]definitionBinding{}
 	for _, b := range snap.Bindings {

@@ -139,17 +139,24 @@ func TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState(t *tes
 	promotion := platformSubmit(t, s, platform.KindPromote, "env/live/production", "promote-1", input)
 	runOperation(promotion)
 
-	var targetReleaseID, targetImage, targetCommand, targetBuild string
-	if err := pool.QueryRow(ctx, `SELECT id,image_id,coalesce(command::text,''),coalesce(build_id,'')
+	var targetReleaseID, targetImage, targetImageRef, targetCommand, targetBuild string
+	if err := pool.QueryRow(ctx, `SELECT id,image_id,image,coalesce(command::text,''),coalesce(build_id,'')
         FROM eregion_platform_releases WHERE operation_id=$1`, promotion.ID).
-		Scan(&targetReleaseID, &targetImage, &targetCommand, &targetBuild); err != nil {
+		Scan(&targetReleaseID, &targetImage, &targetImageRef, &targetCommand, &targetBuild); err != nil {
 		t.Fatal(err)
 	}
 	if targetReleaseID == "" || targetReleaseID == string(productionRelease) || targetReleaseID == string(stagingRelease) {
 		t.Fatalf("promotion release ID = %q", targetReleaseID)
 	}
+	var stagingImageRef string
+	if err := pool.QueryRow(ctx, `SELECT image FROM eregion_platform_releases WHERE id=$1`, stagingRelease).Scan(&stagingImageRef); err != nil {
+		t.Fatal(err)
+	}
 	if targetImage != stagingImageID {
 		t.Fatalf("promotion image ID = %q, want staging image %q", targetImage, stagingImageID)
+	}
+	if targetImageRef != stagingImageRef {
+		t.Fatalf("promotion image reference = %q, want staging reference %q", targetImageRef, stagingImageRef)
 	}
 	if targetCommand != "" || targetBuild != "" {
 		t.Fatalf("promotion copied source command/build: command=%q build=%q", targetCommand, targetBuild)

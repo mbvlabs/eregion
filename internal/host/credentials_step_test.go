@@ -25,6 +25,13 @@ func TestCredentialsStepPreservesMintedAndRevokedTokens(t *testing.T) {
 	if _, err := step.Apply(context.Background(), engine.Runtime{}, nil); err != nil {
 		t.Fatal(err)
 	}
+	controlPlaneEnv, err := os.ReadFile(step.envPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(controlPlaneEnv), `EREGION_REGISTRY_LISTEN="`+cfg.RegistryListen+`"`) {
+		t.Fatalf("the control-plane environment does not carry the configured registry endpoint:\n%s", controlPlaneEnv)
+	}
 	if check, err := step.Check(context.Background(), engine.Runtime{}); err != nil || !check.Complete {
 		t.Fatalf("the initialized store was not complete: %+v %v", check, err)
 	}

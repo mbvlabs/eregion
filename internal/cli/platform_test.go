@@ -45,19 +45,19 @@ func TestRollbackRequiresExactTargetConfirmation(t *testing.T) {
 }
 
 func TestDeliveryInputMapping(t *testing.T) {
-	deploy, err := deployInput("api", "production", " main ", "")
+	deploy, err := deployInput("api", "production", " main ", "", "", "", "")
 	if err != nil || deploy.App != "api" || deploy.Environment != "production" || deploy.Ref != "main" || deploy.ReleaseID != "" {
 		t.Fatalf("source deploy input: %+v %v", deploy, err)
 	}
 	release := "rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	deploy, err = deployInput("api", "production", "", release)
+	deploy, err = deployInput("api", "production", "", release, "", "", "")
 	if err != nil || deploy.ReleaseID != "rel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || deploy.Ref != "" {
 		t.Fatalf("release deploy input: %+v %v", deploy, err)
 	}
-	if _, err := deployInput("api", "production", "main", release); err == nil {
+	if _, err := deployInput("api", "production", "main", release, "", "", ""); err == nil {
 		t.Fatal("deploy accepted --ref with --release")
 	}
-	if _, err := deployInput("api", "production", "", "not-a-release"); err == nil {
+	if _, err := deployInput("api", "production", "", "not-a-release", "", "", ""); err == nil {
 		t.Fatal("deploy accepted an invalid release ID")
 	}
 	rollback, err := rollbackInput("api", "production", release)

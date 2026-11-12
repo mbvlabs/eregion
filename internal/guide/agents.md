@@ -270,7 +270,13 @@ its identity.
 
 ### Deploy, rollback and promotion
 
-Git sources use Buildpacks; existing image sources bypass builds. Repeat
+An environment has an optional Git Buildpacks recipe; there is no persistent
+image source or `source.kind` mode. Omit `[source]`/`--git-url` for an
+image-only app, then select its artifact explicitly at deploy time. Each app has
+one immutable private image repository (for example `mbvlabs/andurel`), set at
+`app create` with `--image-repository` and defaulting to the app slug. Builds
+and `eregion image push --app <app>` publish into that exact repository;
+environment create/update cannot change it. Repeat
 `--buildpack` in the desired order, or omit it for builder detection. An empty
 builder uses the build node's platform default; an explicit builder selects an
 image. Configure optional targets with `--target web=./cmd/web`, Node inputs with
@@ -326,10 +332,21 @@ For supported submitting commands, terminal plain output follows by default;
 JSON and piped plain output return acceptance only. Explicit NDJSON follows
 unless detached. In every mode acceptance is not completion.
 
-`eregion deploy <app> <env>` builds the current source or deploys an existing
-release from the same environment; `rollback` restores an earlier release with
-its recorded revision and secret snapshot. Both are durable operations: follow
-the operation and read the serving state before claiming success.
+`eregion deploy <app> <env>` builds the current Git ref or deploys an explicitly
+selected artifact from the same app/environment. Use exactly one of `--ref`,
+`--release`, `--image-tag`, `--image-digest`, or `--image`; there is no
+implicit latest. `--image-tag` and `--image-digest` address the app repository;
+`--image` is a fully qualified `registry/repository:tag` or
+`registry/repository@sha256:…` reference, and a reference to this private
+registry must name exactly the app repository. With no selector a Git-less
+environment is refused with artifact guidance rather than guessing latest,
+newest or the serving image; use `restart` to reapply the serving artifact. The
+selected artifact is resolved to an immutable manifest and expected config
+digest at acceptance and the worker never follows a moved tag; a missing
+artifact keeps the previous release serving. `rollback` restores an earlier
+release with its recorded revision and secret snapshot. Both are durable
+operations: follow the operation and read the serving state before claiming
+success.
 
 `eregion env promote <app> <source-environment>` moves the source's current
 serving release to the same app's fixed `production` environment without

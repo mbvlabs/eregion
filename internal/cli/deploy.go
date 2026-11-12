@@ -40,6 +40,9 @@ func (a *app) deliverySpecs() []spec {
 				addDeliveryFlags(cmd)
 				cmd.Flags().String("ref", "", "Git branch, tag, or commit to build; defaults to the current revision's ref")
 				cmd.Flags().String("release", "", "Redeploy an existing release ID instead of building from source")
+				cmd.Flags().String("image-tag", "", "Tag in the app's private image repository to resolve and deploy")
+				cmd.Flags().String("image-digest", "", "sha256 manifest digest in the app's private image repository to deploy")
+				cmd.Flags().String("image", "", "Fully qualified registry/repository:tag or registry/repository@sha256:… to deploy")
 			},
 			run: a.deployCommand,
 		},
@@ -161,13 +164,22 @@ func buildIDArg(_ *cobra.Command, args []string) error {
 
 // deployInput maps the command's flags to the shared action input and rejects
 // ambiguous combinations before any node call.
-func deployInput(app, environment, ref, release string) (platform.DeployInput, error) {
+func deployInput(app, environment, ref, release, imageTag, imageDigest, image string) (platform.DeployInput, error) {
 	ref = strings.TrimSpace(ref)
 	release = strings.TrimSpace(release)
-	if ref != "" && release != "" {
-		return platform.DeployInput{}, contract.NewFault(contract.ValidationFailed, "--ref and --release cannot be combined", "Deploy source at a ref, or redeploy an existing release.")
+	imageTag = strings.TrimSpace(imageTag)
+	imageDigest = strings.TrimSpace(imageDigest)
+	image = strings.TrimSpace(image)
+	selectors := 0
+	for _, value := range []string{ref, release, imageTag, imageDigest, image} {
+		if value != "" {
+			selectors++
+		}
 	}
-	input := platform.DeployInput{App: app, Environment: environment, Ref: ref}
+	if selectors > 1 {
+		return platform.DeployInput{}, contract.NewFault(contract.ValidationFailed, "artifact selectors cannot be combined", "Use exactly one of --ref, --release, --image-tag, --image-digest, or --image.")
+	}
+	input := platform.DeployInput{App: app, Environment: environment, Ref: ref, ImageTag: imageTag, ImageDigest: imageDigest, Image: image}
 	if release != "" {
 		input.ReleaseID = platform.ReleaseID(release)
 		if err := input.ReleaseID.Validate(); err != nil {
@@ -399,7 +411,8 @@ func withFirstDeployResume(err error, id contract.OperationID) error {
 }
 
 func (a *app) deployCommand(cmd *cobra.Command, args []string) (result, error) {
-	input, err := deployInput(args[0], args[1], stringFlag(cmd, "ref"), stringFlag(cmd, "release"))
+	input, err := deployInput(args[0], args[1], stringFlag(cmd, "ref"), stringFlag(cmd, "release"),
+		stringFlag(cmd, "image-tag"), stringFlag(cmd, "image-digest"), stringFlag(cmd, "image"))
 	if err != nil {
 		return result{}, err
 	}
@@ -705,6 +718,9 @@ type deployPlan struct {
 	Raw         json.RawMessage
 	Ref         string
 	Release     *platform.Release
+	ImageTag    string
+	ImageDigest string
+	Image       string
 }
 
 func (a *app) loadDeployPlan(cmd *cobra.Command, client Backend, app, environment string, input platform.DeployInput) (deployPlan, error) {
@@ -716,7 +732,7 @@ func (a *app) loadDeployPlan(cmd *cobra.Command, client Backend, app, environmen
 	if err != nil {
 		return deployPlan{}, err
 	}
-	plan := deployPlan{Environment: env, Preview: preview, Raw: raw, Ref: input.Ref}
+	plan := deployPlan{Environment: env, Preview: preview, Raw: raw, Ref: input.Ref, ImageTag: input.ImageTag, ImageDigest: input.ImageDigest, Image: input.Image}
 	if input.ReleaseID != "" {
 		if release, ok := a.findRelease(cmd, client, app, environment, input.ReleaseID); ok {
 			plan.Release = &release
@@ -768,14 +784,23 @@ func (a *app) renderDeployPlan(plan deployPlan) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "Deploy %s/%s\n", env.App, env.Name)
 	if plan.Release != nil {
-		fmt.Fprintf(&out, "release: %s %s\n", plan.Release.ID, plan.Release.Image)
+		fmt.Fprintf(&out, "artifact: %s %s (release)\n", plan.Release.ID, plan.Release.Image)
 		if plan.Release.CommitSHA != "" {
 			fmt.Fprintf(&out, "commit: %s\n", shortCommit(plan.Release.CommitSHA))
 		}
+	} else if plan.ImageTag != "" || plan.ImageDigest != "" || plan.Image != "" {
+		switch {
+		case plan.ImageTag != "":
+			fmt.Fprintf(&out, "artifact selector: image-tag %s\n", plan.ImageTag)
+		case plan.ImageDigest != "":
+			fmt.Fprintf(&out, "artifact selector: image-digest %s\n", plan.ImageDigest)
+		default:
+			fmt.Fprintf(&out, "artifact selector: image %s\n", plan.Image)
+		}
+		fmt.Fprintln(&out, "artifact availability: unverified by this preview")
 	} else if env.Revision != nil {
 		source := env.Revision.Source
-		switch source.Kind {
-		case "git":
+		if source.URL != "" {
 			fmt.Fprintf(&out, "source: git %s\n", source.URL)
 			ref := plan.Ref
 			if ref == "" {
@@ -784,10 +809,8 @@ func (a *app) renderDeployPlan(plan deployPlan) string {
 			if ref != "" {
 				fmt.Fprintf(&out, "ref: %s\n", ref)
 			}
-		case "image":
-			fmt.Fprintf(&out, "source: image %s\n", source.Image)
-		default:
-			fmt.Fprintln(&out, "source: (not bound)")
+		} else {
+			fmt.Fprintln(&out, "source: none (select an explicit artifact)")
 		}
 	} else {
 		fmt.Fprintln(&out, "source: (no current revision)")
@@ -948,7 +971,11 @@ func releaseTable(releases []platform.Release) string {
 			commit = commit[:12]
 		}
 		created := release.CreatedAt.UTC().Format(time.RFC3339)
-		rows = append(rows, []string{string(release.ID), string(release.Status), commit, release.Image, created})
+		source := release.Source.Type
+		if release.Source.SelectorKind != "" {
+			source += ":" + release.Source.Selector
+		}
+		rows = append(rows, []string{string(release.ID), string(release.Status), commit, release.Image, source, created})
 	}
-	return writeTable([]string{"ID", "STATUS", "COMMIT", "IMAGE", "CREATED"}, rows)
+	return writeTable([]string{"ID", "STATUS", "COMMIT", "IMAGE", "SOURCE", "CREATED"}, rows)
 }

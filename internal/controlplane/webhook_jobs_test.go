@@ -141,7 +141,7 @@ func TestWebhookSourceBindingCurrent(t *testing.T) {
 	record := validWebhookAdmission()
 	env := platform.Environment{
 		Revision: &platform.EnvironmentRevision{
-			Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/mbvlabs/hello.git", Ref: "refs/heads/main"},
+			Source: platform.SourceBinding{URL: "https://github.com/mbvlabs/hello.git", Ref: "refs/heads/main"},
 		},
 	}
 	if err := webhookSourceBindingCurrent(env, record); err != nil {
@@ -162,7 +162,7 @@ func TestWebhookSourceBindingCurrent(t *testing.T) {
 	}
 	image := env
 	imageRevision := *env.Revision
-	imageRevision.Source = platform.SourceBinding{Kind: "image", Image: "example/app:1"}
+	imageRevision.Source = platform.SourceBinding{}
 	image.Revision = &imageRevision
 	if err := webhookSourceBindingCurrent(image, record); err == nil {
 		t.Fatal("image source was accepted")

@@ -236,10 +236,11 @@ func (i registryInventoryIndex) hasRepository(repository string) bool {
 }
 
 // repositoryMatches compares a release repository with an inventory
-// repository. Registry catalogs often omit a registry host, and the first path
-// component of a reference can be a host in one spelling and a namespace in
-// another; ignoring one leading component on either side keeps those spellings
-// matched without collapsing unrelated namespaces.
+// repository. Registry catalogs may omit the registry host, while a canonical
+// release reference includes it. Only a component that is unambiguously a
+// registry host (localhost, a DNS name, or a host:port) may be ignored; an
+// ordinary namespace component is never stripped, so two apps with the same
+// final component do not share protection accidentally.
 func repositoryMatches(left, right string) bool {
 	if left == right {
 		return true
@@ -247,14 +248,19 @@ func repositoryMatches(left, right string) bool {
 	if left == "" || right == "" {
 		return false
 	}
-	return stripRepositoryComponent(left) == right || stripRepositoryComponent(right) == left
+	return stripRegistryHost(left) == right || stripRegistryHost(right) == left
 }
 
-func stripRepositoryComponent(repository string) string {
-	if index := strings.Index(repository, "/"); index >= 0 {
-		return repository[index+1:]
+func stripRegistryHost(repository string) string {
+	index := strings.Index(repository, "/")
+	if index < 0 {
+		return ""
 	}
-	return ""
+	first := repository[:index]
+	if !looksLikeRegistryHost(first) {
+		return ""
+	}
+	return repository[index+1:]
 }
 
 // registryProtection is the set of references a retained release still needs.

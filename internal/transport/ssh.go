@@ -77,7 +77,8 @@ type SSHConfig struct {
 	// PollInterval is how often a detached task is asked for its status.
 	PollInterval time.Duration
 	// MaxWait bounds how long one call waits for a detached node task. The
-	// node task keeps running when the wait ends; the outcome is unknown.
+	// node task keeps running when the wait ends; the call returns its last
+	// observed running or deferred response, never a fabricated lost stream.
 	// A shorter caller deadline wins: a worker waits at most until its job
 	// deadline.
 	MaxWait time.Duration
@@ -285,10 +286,11 @@ func (t *SSHTransport) exchange(ctx context.Context, client *ssh.Client, request
 		return result.response, result.err
 	case <-ctx.Done():
 		// Closing the connection aborts the read. It never signals the remote
-		// task: a node task is detached and keeps running.
+		// task: a node task is detached and keeps running. The caller ended
+		// the wait, which is distinct from a lost stream.
 		_ = client.Close()
 		<-done
-		return node.Response{}, fmt.Errorf("%w: the request ended before the node reported an outcome: %w", node.ErrStreamLost, ctx.Err())
+		return node.Response{}, fmt.Errorf("%w: the request ended before the node reported an outcome: %w", node.ErrCallCancelled, ctx.Err())
 	}
 }
 
@@ -388,7 +390,10 @@ func (t *SSHTransport) runSession(client *ssh.Client, request node.Request, onEv
 }
 
 // awaitTerminal asks for the status of a detached node task until it is
-// terminal. A lost stream stays an explicit unknown outcome.
+// terminal, deferred at a safe pre-Apply boundary, or this transport's own
+// poll window ends. A poll-window boundary returns the last observed running or
+// deferred response; it is not a fabricated lost stream. A cancelled caller,
+// a failed exchange, a stale task and a task that never started stay distinct.
 //
 // A task that died (a stale status) and a task that never started (an absent
 // status past the grace window) are reported as retryable failures instead of
@@ -402,9 +407,23 @@ func (t *SSHTransport) awaitTerminal(ctx context.Context, client *ssh.Client, re
 	}
 	// The grace window starts when the node reported that it started the task.
 	started := time.Now()
+	var last node.Response
 	for {
 		if !time.Now().Before(deadline) {
-			return node.Response{}, fmt.Errorf("%w: the node task is still running after %s; the node may still finish it", node.ErrStreamLost, t.config.MaxWait)
+			if last.Status == engine.StatusDeferred {
+				last.Retryable = true
+				return last, nil
+			}
+			if last.Status == engine.StatusRunning {
+				last.Retryable = true
+				if last.Detail == "" {
+					last.Detail = "the node task is still running at the transport poll window; the node may still finish it"
+				} else {
+					last.Detail += "\nthe node task is still running at the transport poll window; the node may still finish it"
+				}
+				return last, nil
+			}
+			return node.Response{}, fmt.Errorf("%w: the node did not report a status before the transport poll window ended", node.ErrStreamLost)
 		}
 		waitFor := interval
 		if remaining := time.Until(deadline); remaining < waitFor {
@@ -412,8 +431,11 @@ func (t *SSHTransport) awaitTerminal(ctx context.Context, client *ssh.Client, re
 		}
 		select {
 		case <-ctx.Done():
-			return node.Response{}, fmt.Errorf("%w: the node task is still running and the request ended: %w", node.ErrStreamLost, ctx.Err())
+			return node.Response{}, fmt.Errorf("%w: the node task wait ended before the node reported an outcome: %w", node.ErrCallCancelled, ctx.Err())
 		case <-time.After(waitFor):
+		}
+		if err := ctx.Err(); err != nil {
+			return node.Response{}, fmt.Errorf("%w: the node task wait ended before the node reported an outcome: %w", node.ErrCallCancelled, err)
 		}
 		status := node.Request{Method: node.MethodStatus, RequestID: request.RequestID, Execution: request.Execution}
 		response, err := t.exchange(ctx, client, status, nil, registry)
@@ -423,6 +445,13 @@ func (t *SSHTransport) awaitTerminal(ctx context.Context, client *ssh.Client, re
 		switch response.Status {
 		case engine.StatusCompleted, engine.StatusFailed:
 			return response, nil
+		case engine.StatusDeferred:
+			// The pre-Check/Apply waiter exited. This is a safe, observed
+			// boundary: stop the wait instead of polling until the deadline.
+			response.Retryable = true
+			return response, nil
+		case engine.StatusRunning:
+			last = response
 		case engine.StatusStale:
 			// The node task died: it released its effect lock. The effect may
 			// or may not have been applied, so the outcome stays unknown and
@@ -450,11 +479,17 @@ func retryableFailure(response node.Response, reason string) node.Response {
 		detail += ": " + response.Detail
 	}
 	return node.Response{
-		Status:      engine.StatusFailed,
-		ExecutionID: response.ExecutionID,
-		Retryable:   true,
-		ErrorCode:   string(contract.Unavailable),
-		Detail:      detail,
+		Status:         engine.StatusFailed,
+		ExecutionID:    response.ExecutionID,
+		Attempt:        response.Attempt,
+		AppliedAttempt: response.AppliedAttempt,
+		InputsHash:     response.InputsHash,
+		Phase:          response.Phase,
+		PhaseStartedAt: response.PhaseStartedAt,
+		WaitMS:         response.WaitMS,
+		Retryable:      true,
+		ErrorCode:      string(contract.Unavailable),
+		Detail:         detail,
 	}
 }
 

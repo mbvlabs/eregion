@@ -3,6 +3,8 @@ package controlplane
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
@@ -22,7 +24,7 @@ func TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable(t *test
 		t.Fatalf("a migrated installation started configured: %+v", unconfigured)
 	}
 
-	assigned, err := AssignWorkspace(ctx, pool, "thelab")
+	assigned, err := AssignWorkspace(ctx, pool, "thelab", testRegistryHostIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,21 +34,21 @@ func TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable(t *test
 	if err := ValidateWorkspaceID(assigned.ID); err != nil {
 		t.Fatal(err)
 	}
-	replayed, err := AssignWorkspace(ctx, pool, "thelab")
+	replayed, err := AssignWorkspace(ctx, pool, "thelab", testRegistryHostIdentity())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if replayed.ID != assigned.ID || replayed.Name != assigned.Name {
 		t.Fatalf("same-name replay changed the identity: %+v -> %+v", assigned, replayed)
 	}
-	if _, err := AssignWorkspace(ctx, pool, "otherlab"); contract.Classify(err).Code != contract.Conflict {
+	if _, err := AssignWorkspace(ctx, pool, "otherlab", testRegistryHostIdentity()); contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("conflicting assignment = %v, want conflict", err)
 	}
 	read, err := ReadWorkspace(ctx, pool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if read != assigned {
+	if !reflect.DeepEqual(read, assigned) {
 		t.Fatalf("read identity = %+v, want %+v", read, assigned)
 	}
 
@@ -56,6 +58,38 @@ func TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable(t *test
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM eregion_workspace`); err == nil {
 		t.Fatal("a DELETE of the immutable workspace identity succeeded")
+	}
+}
+
+func TestIntegrationWorkspaceRegistryHostBindingIsExactAndNeverBackfilled(t *testing.T) {
+	pool, _ := testPool(t, true)
+	ctx := context.Background()
+	identity := testRegistryHostIdentity()
+	if _, err := AssignWorkspace(ctx, pool, "thelab", identity); err != nil {
+		t.Fatal(err)
+	}
+	other := identity
+	other.HostKeyFingerprint = "SHA256:" + strings.Repeat("B", 43)
+	if _, err := AssignWorkspace(ctx, pool, "thelab", other); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("different fingerprint replay = %v, want conflict", err)
+	}
+	if _, err := VerifyWorkspaceRegistryHost(ctx, pool, other); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("different local identity = %v, want conflict", err)
+	}
+	if _, err := VerifyWorkspaceRegistryHost(ctx, pool, identity); err != nil {
+		t.Fatalf("exact local identity was refused: %v", err)
+	}
+
+	unboundPool, _ := testPool(t, true)
+	if _, err := unboundPool.Exec(ctx, `INSERT INTO eregion_workspace (singleton, workspace_id, name)
+        VALUES (true,'ws_0123456789abcdef01234567','thelab')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := AssignWorkspace(ctx, unboundPool, "thelab", identity); contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("unverified workspace assignment = %v, want precondition_failed", err)
+	}
+	if _, err := VerifyWorkspaceRegistryHost(ctx, unboundPool, identity); contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("unverified workspace verification = %v, want precondition_failed", err)
 	}
 }
 
@@ -70,7 +104,7 @@ func TestIntegrationConcurrentWorkspaceAssignmentAgrees(t *testing.T) {
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
-			results[index], errs[index] = AssignWorkspace(ctx, pool, "thelab")
+			results[index], errs[index] = AssignWorkspace(ctx, pool, "thelab", testRegistryHostIdentity())
 		}(i)
 	}
 	wait.Wait()
@@ -95,7 +129,7 @@ func TestIntegrationConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner(
 		wait.Add(1)
 		go func(index int) {
 			defer wait.Done()
-			results[index], errs[index] = AssignWorkspace(ctx, pool, names[index])
+			results[index], errs[index] = AssignWorkspace(ctx, pool, names[index], testRegistryHostIdentity())
 		}(i)
 	}
 	wait.Wait()
@@ -139,7 +173,7 @@ func TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize(t *testing.T) 
 	if table != nil {
 		t.Fatalf("a read created the workspace table: %v", *table)
 	}
-	if _, err := AssignWorkspace(context.Background(), pool, "thelab"); err == nil {
+	if _, err := AssignWorkspace(context.Background(), pool, "thelab", testRegistryHostIdentity()); err == nil {
 		t.Fatal("assignment succeeded without migration 028")
 	}
 }
@@ -184,7 +218,7 @@ func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIden
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Current != 27 || plan.Required != 31 {
+	if plan.Current != 27 || plan.Required != 33 {
 		t.Fatalf("pre-028 plan = %+v", plan)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
@@ -222,7 +256,7 @@ func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIden
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Current != 31 || plan.Required != 31 {
+	if plan.Current != 33 || plan.Required != 33 {
 		t.Fatalf("post-migration plan = %+v", plan)
 	}
 	var rows int
@@ -264,7 +298,7 @@ func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIden
 
 func TestIntegrationAssignWorkspaceRejectsAnInvalidNameBeforeDatabaseAccess(t *testing.T) {
 	pool, _ := testPool(t, false)
-	_, err := AssignWorkspace(context.Background(), pool, "The Lab")
+	_, err := AssignWorkspace(context.Background(), pool, "The Lab", testRegistryHostIdentity())
 	if contract.Classify(err).Code != contract.ValidationFailed {
 		t.Fatalf("invalid name = %v, want validation_failed", err)
 	}

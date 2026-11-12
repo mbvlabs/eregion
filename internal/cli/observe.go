@@ -55,6 +55,9 @@ func (a *app) appStatusView(cmd *cobra.Command, app string) (result, error) {
 	}
 	var plain strings.Builder
 	plain.WriteString(ui.Header(fmt.Sprintf("App %s (%s)", record.Name, record.ID), 72) + "\n")
+	if record.ImageRepository != "" {
+		fmt.Fprintf(&plain, "Image repository: %s\n", record.ImageRepository)
+	}
 	if len(observation.Environments) == 0 {
 		plain.WriteString("No environments. Add one with eregion env create.\n")
 		return result{data: observation, plain: plain.String()}, nil

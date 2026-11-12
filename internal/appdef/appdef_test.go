@@ -14,7 +14,7 @@ import (
 func ptr[T any](value T) *T { return &value }
 
 func TestParseIsStrictAndVersioned(t *testing.T) {
-	valid := []byte("version = 1\napp = \"api\"\n")
+	valid := []byte("version = 2\napp = \"api\"\n")
 	definition, err := Parse(valid)
 	if err != nil {
 		t.Fatal(err)
@@ -24,10 +24,10 @@ func TestParseIsStrictAndVersioned(t *testing.T) {
 	}
 	for name, raw := range map[string]string{
 		"missing version": "app = \"api\"\n",
-		"wrong version":   "version = 2\napp = \"api\"\n",
-		"unknown key":     "version = 1\nunknown = \"x\"\n",
-		"secret values":   "version = 1\n[secrets]\nDATABASE_URL = \"postgres://user:pass@example/db\"\n",
-		"duplicate key":   "version = 1\napp = \"one\"\napp = \"two\"\n",
+		"wrong version":   "version = 23\napp = \"api\"\n",
+		"unknown key":     "version = 2\nunknown = \"x\"\n",
+		"secret values":   "version = 2\n[secrets]\nDATABASE_URL = \"postgres://user:pass@example/db\"\n",
+		"duplicate key":   "version = 2\napp = \"one\"\napp = \"two\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Parse([]byte(raw))
@@ -42,11 +42,11 @@ func TestParseIsStrictAndVersioned(t *testing.T) {
 }
 
 func TestResourceDeclarationValidation(t *testing.T) {
-	if _, err := Parse([]byte("version = 1\napp = \"api\"\n[[resources]]\nname = \"db\"\n")); err == nil {
+	if _, err := Parse([]byte("version = 2\napp = \"api\"\n[[resources]]\nname = \"db\"\n")); err == nil {
 		t.Fatal("accepted a resource without an image or health command")
 	}
 	definition, err := Parse([]byte(`
-version = 1
+version = 2
 app = "api"
 
 [[resources]]
@@ -86,13 +86,12 @@ destination = "/var/lib/postgresql/data"
 
 func TestResolveMergesSharedFieldsAndSelectedOverride(t *testing.T) {
 	definition, err := Parse([]byte(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 secret_names = ["DATABASE_URL", "API_KEY"]
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = "main"
 builder = "paketobuildpacks/builder-jammy-base"
@@ -173,10 +172,10 @@ C = "4"
 	if _, err := definition.Resolve("pr-42"); err != nil {
 		t.Fatalf("shared recipe was not reusable for an arbitrary environment: %v", err)
 	}
-	if _, err := Parse([]byte("version = 1\n")); err != nil {
+	if _, err := Parse([]byte("version = 2\n")); err != nil {
 		t.Fatal(err)
 	}
-	disagree, err := Parse([]byte("version = 1\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"))
+	disagree, err := Parse([]byte("version = 2\n[source]\nurl = \"https://github.com/acme/api\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +186,7 @@ C = "4"
 
 func TestDefinitionCollectionLimits(t *testing.T) {
 	processes := strings.Builder{}
-	processes.WriteString("version = 1\napp = \"api\"\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n")
+	processes.WriteString("version = 2\napp = \"api\"\n[source]\nurl = \"https://github.com/acme/api\"\n")
 	for index := 0; index < 33; index++ {
 		fmt.Fprintf(&processes, "\n[[processes]]\nname = \"p%d\"\nkind = \"worker\"\ncommand = \"./worker\"\n", index)
 	}
@@ -206,7 +205,7 @@ func TestDefinitionCollectionLimits(t *testing.T) {
 	for index := 0; index < 129; index++ {
 		names = append(names, fmt.Sprintf("SECRET_%d", index))
 	}
-	raw := "version = 1\napp = \"api\"\nsecret_names = [\"" + strings.Join(names, `", "`) + "\"]\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"
+	raw := "version = 2\napp = \"api\"\nsecret_names = [\"" + strings.Join(names, `", "`) + "\"]\n[source]\nurl = \"https://github.com/acme/api\"\n"
 	definition, err = Parse([]byte(raw))
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +216,7 @@ func TestDefinitionCollectionLimits(t *testing.T) {
 }
 
 func TestResolveDistinguishesAbsentFromEmpty(t *testing.T) {
-	absent, err := Parse([]byte("version = 1\napp = \"api\"\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n"))
+	absent, err := Parse([]byte("version = 2\napp = \"api\"\n[source]\nurl = \"https://github.com/acme/api\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,14 +227,12 @@ func TestResolveDistinguishesAbsentFromEmpty(t *testing.T) {
 	if resolved.ProcessesSet || resolved.ConfigSet || resolved.SecretNamesSet || resolved.DomainsSet {
 		t.Fatalf("absent collections were reported as set: %+v", resolved)
 	}
-	empty, err := Parse([]byte(`version = 1
+	empty, err := Parse([]byte(`version = 2
 app = "api"
 secret_names = []
 processes = []
 domains = []
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 [config]
 `))
 	if err != nil {
@@ -255,14 +252,13 @@ image = "ghcr.io/acme/api:1"
 
 func TestCreateSpecMapsTheSupportedDefinition(t *testing.T) {
 	raw := []byte(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 build_node = "builder"
 secret_names = ["DATABASE_URL"]
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = "main"
 credential_secret = "GIT_READ_TOKEN"
@@ -309,7 +305,7 @@ check_path = "/custom"
 	if spec.Name != "production" || spec.Node != "main" || spec.BuildNode != "builder" {
 		t.Fatalf("identity = %+v", spec)
 	}
-	if spec.Source.Kind != "git" || spec.Source.URL != "https://github.com/acme/api" ||
+	if spec.Source.URL == "" || spec.Source.URL != "https://github.com/acme/api" ||
 		spec.Source.Ref != "main" || spec.Source.CredentialSecretName != "GIT_READ_TOKEN" ||
 		spec.Source.ContextPath != "apps/api" || spec.Source.BuildEnv["BP_X"] != "y" {
 		t.Fatalf("source = %+v", spec.Source)
@@ -335,11 +331,9 @@ check_path = "/custom"
 }
 
 func TestCreateSpecRefusesUnrepresentableCollections(t *testing.T) {
-	base := `version = 1
+	base := `version = 2
 app = "api"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 `
 	for name, extra := range map[string]string{
 		"empty processes":    "",
@@ -350,13 +344,12 @@ image = "ghcr.io/acme/api:1"
 			raw := base + extra
 			switch name {
 			case "empty processes":
-				raw = "version = 1\napp = \"api\"\nprocesses = []\n" + base[len("version = 1\napp = \"api\"\n"):]
+				raw = "version = 2\napp = \"api\"\nprocesses = []\n" + base[len("version = 2\napp = \"api\"\n"):]
 			case "credential in app":
-				raw = `version = 1
+				raw = `version = 2
 app = "api"
 secret_names = ["GIT_READ_TOKEN"]
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 credential_secret = "GIT_READ_TOKEN"
 `
@@ -378,11 +371,9 @@ credential_secret = "GIT_READ_TOKEN"
 
 func TestCreateSpecCarriesMultipleDomains(t *testing.T) {
 	raw := []byte(`
-version = 1
+version = 2
 app = "api"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 [[domains]]
 name = "api.example.com"
 primary = true
@@ -418,7 +409,7 @@ check_path = "/readyz"
 
 func TestUpdatePatchChangesOnlySupportedFields(t *testing.T) {
 	raw := []byte(`
-version = 1
+version = 2
 app = "api"
 node = "main2"
 secret_names = []
@@ -426,7 +417,6 @@ processes = []
 domains = []
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = "next"
 credential_secret = "GIT_READ_TOKEN"
@@ -452,7 +442,7 @@ B = "3"
 		App: "api", Name: "production", Node: "main", BuildNode: "builder", RevisionID: revisionID,
 		Revision: &platform.EnvironmentRevision{ID: revisionID, RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
+				URL: "https://github.com/acme/api", Ref: "main",
 				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			AutoDeploy:        true,
@@ -516,7 +506,7 @@ func TestUpdatePatchRejectsSourceCredentialRoleAliasing(t *testing.T) {
 		App: "api", Name: "production", Node: "main",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
+				URL: "https://github.com/acme/api", Ref: "main",
 				CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			},
 			AutoDeploy:        true,
@@ -540,13 +530,12 @@ func TestUpdatePatchRejectsSourceCredentialRoleAliasing(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			raw := fmt.Sprintf(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 secret_names = %s
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = "main"
 credential_secret = "%s"
@@ -581,14 +570,13 @@ replicas = 1
 
 func TestUpdatePatchClearsExplicitEmptyCollections(t *testing.T) {
 	raw := []byte(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 secret_names = []
 resources = []
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = ""
 builder = "paketobuildpacks/builder-jammy-base"
@@ -608,7 +596,7 @@ release_command = []
 		App: "api", Name: "production", Node: "main", BuildNode: "builder",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
+				URL: "https://github.com/acme/api", Ref: "main",
 				Builder: "paketobuildpacks/builder-jammy-base", BuildEnv: map[string]string{"BP": "x"},
 			},
 			Runtime: platform.RuntimeSpec{
@@ -669,37 +657,39 @@ release_command = []
 	}
 }
 
-func TestUpdatePatchRequiresNodeAndSource(t *testing.T) {
-	base := "version = 1\napp = \"api\"\n"
-	for name, raw := range map[string]string{
-		"missing node":   base + "[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n",
-		"missing source": base + "node = \"main\"\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			definition, err := Parse([]byte(raw))
-			if err != nil {
-				t.Fatal(err)
-			}
-			resolved, err := definition.Resolve("production")
-			if err != nil {
-				t.Fatal(err)
-			}
-			current := platform.Environment{App: "api", Name: "production", Node: "main"}
-			if _, _, _, err := resolved.UpdatePatch(current, nil); err == nil {
-				t.Fatal("accepted an incomplete update definition")
-			}
-		})
+func TestUpdatePatchRequiresNodeAndAllowsNoSource(t *testing.T) {
+	base := "version = 2\napp = \"api\"\n"
+	definition, err := Parse([]byte(base + "[source]\nurl = \"https://github.com/acme/api\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := definition.Resolve("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := platform.Environment{App: "api", Name: "production", Node: "main"}
+	if _, _, _, err := resolved.UpdatePatch(current, nil); err == nil {
+		t.Fatal("accepted an update definition without node")
+	}
+	definition, err = Parse([]byte(base + "node = \"main\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err = definition.Resolve("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := resolved.UpdatePatch(current, nil); err != nil {
+		t.Fatalf("a Git-less update definition was refused: %v", err)
 	}
 }
 
 func TestUpdatePatchDetectsAnOmittedDomainRemoval(t *testing.T) {
 	raw := []byte(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 `)
 	definition, err := Parse(raw)
 	if err != nil {
@@ -711,7 +701,7 @@ image = "ghcr.io/acme/api:1"
 	}
 	current := platform.Environment{App: "api", Name: "production", Node: "main",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-			Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+			Source: platform.SourceBinding{URL: "https://github.com/acme/api"},
 		}},
 	}
 	if _, _, _, err := resolved.UpdatePatch(current, []platform.DomainBinding{
@@ -726,12 +716,10 @@ image = "ghcr.io/acme/api:1"
 
 func TestUpdatePatchLeavesDomainChangesToTheDomainPlan(t *testing.T) {
 	raw := []byte(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 [[domains]]
 name = "api.example.com"
 primary = true
@@ -746,7 +734,7 @@ primary = true
 	}
 	current := platform.Environment{App: "api", Name: "production",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-			Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+			Source: platform.SourceBinding{URL: "https://github.com/acme/api"},
 		}},
 	}
 	if _, _, _, err := resolved.UpdatePatch(current, []platform.DomainBinding{{Domain: "other.example.com", Primary: true}}); err != nil {
@@ -757,7 +745,7 @@ primary = true
 func TestExportIsDeterministicAndRoundTrips(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 		Source: platform.SourceBinding{
-			Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
+			URL: "https://github.com/acme/api", Ref: "main",
 			CredentialSecretName: "GIT_READ_TOKEN", Builder: "paketobuildpacks/builder-jammy-base",
 			BuildEnv: map[string]string{"BP_Z": "z", "BP_A": "a"},
 		},
@@ -776,11 +764,11 @@ func TestExportIsDeterministicAndRoundTrips(t *testing.T) {
 		{Domain: "api.example.com", App: "api", Environment: "production", Primary: true, CheckPath: "/readyz"},
 		{Domain: "www.example.com", App: "api", Environment: "production", CheckPath: "/alias"},
 	}
-	first, err := Export("api", "production", "", revision, domains, nil)
+	first, err := Export("api", "production", "", "", revision, domains, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Export("api", "production", "", revision, domains, nil)
+	second, err := Export("api", "production", "", "", revision, domains, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -828,7 +816,7 @@ func TestExportIsDeterministicAndRoundTrips(t *testing.T) {
 
 func TestExportResourcesRoundTrip(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-		Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+		Source: platform.SourceBinding{URL: "https://github.com/acme/api"},
 		Runtime: platform.RuntimeSpec{
 			Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30,
 		},
@@ -846,7 +834,7 @@ func TestExportResourcesRoundTrip(t *testing.T) {
 			Health:    platform.ResourceHealthSpec{Type: "exec", Command: []string{"pg_isready"}},
 		},
 	}}
-	document, err := Export("api", "production", "", revision, nil, resources)
+	document, err := Export("api", "production", "", "", revision, nil, resources)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -870,18 +858,16 @@ func TestExportResourcesRoundTrip(t *testing.T) {
 	if len(specs) != 1 || specs[0].Name != "db" || specs[0].Image != "postgres:17" || specs[0].Port != 5432 {
 		t.Fatalf("round-trip specs = %+v", specs)
 	}
-	if _, err := Export("api", "production", "", revision, nil, nil); err == nil {
+	if _, err := Export("api", "production", "", "", revision, nil, nil); err == nil {
 		t.Fatal("exported a revision whose resource definition was unavailable")
 	}
 }
 
 func TestResourceAttachmentsHonorAttachFalse(t *testing.T) {
 	definition, err := Parse([]byte(`
-version = 1
+version = 2
 app = "api"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 
 [[resources]]
 name = "db"
@@ -931,11 +917,9 @@ command = ["redis-cli", "ping"]
 
 func TestResourceDeclarationRejectsDuplicateMountDestination(t *testing.T) {
 	_, err := Parse([]byte(`
-version = 1
+version = 2
 app = "api"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 
 [[resources]]
 name = "db"
@@ -962,7 +946,7 @@ destination = "/var/lib/postgresql/data/."
 
 func TestExportIncludesResourcesAndRoundTrips(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-		Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+		Source: platform.SourceBinding{URL: "https://github.com/acme/api"},
 		Runtime: platform.RuntimeSpec{
 			Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30,
 		},
@@ -982,7 +966,7 @@ func TestExportIncludesResourcesAndRoundTrips(t *testing.T) {
 		Image:  "redis:7",
 		Health: platform.ResourceHealthSpec{Type: "exec", Command: []string{"redis-cli", "ping"}, TimeoutSeconds: 30, IntervalMS: 500},
 	}}
-	document, err := Export("api", "production", "", revision, nil, []platform.Resource{db, cache})
+	document, err := Export("api", "production", "", "", revision, nil, []platform.Resource{db, cache})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1046,10 +1030,10 @@ func TestExportIncludesResourcesAndRoundTrips(t *testing.T) {
 
 func TestExportRejectsAttachedResourceWithoutDefinition(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-		Source:    platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+		Source:    platform.SourceBinding{URL: "https://github.com/acme/api"},
 		Resources: []string{"db"},
 	}}
-	_, err := Export("api", "production", "", revision, nil, nil)
+	_, err := Export("api", "production", "", "", revision, nil, nil)
 	if err == nil {
 		t.Fatal("exported a revision that depends on a missing resource definition")
 	}
@@ -1060,12 +1044,10 @@ func TestExportRejectsAttachedResourceWithoutDefinition(t *testing.T) {
 
 func TestUpdatePatchRefusesWhenCurrentBindingsAreMissing(t *testing.T) {
 	raw := []byte(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 `)
 	definition, err := Parse(raw)
 	if err != nil {
@@ -1080,7 +1062,7 @@ image = "ghcr.io/acme/api:1"
 		Domains:       []string{"api.example.com"},
 		PrimaryDomain: "api.example.com",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-			Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+			Source: platform.SourceBinding{URL: "https://github.com/acme/api"},
 		}},
 	}
 	if _, _, _, err := resolved.UpdatePatch(current, nil); err == nil {
@@ -1101,9 +1083,68 @@ image = "ghcr.io/acme/api:1"
 	}
 }
 
+func TestUpdatePatchOmittedSourceClearsGitAndEnforcesAutomationInvariant(t *testing.T) {
+	current := platform.Environment{
+		App: "api", Name: "production", Node: "main",
+		ImageRepository: "mbvlabs/api",
+		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
+			Source:            platform.SourceBinding{URL: "https://github.com/acme/api", Ref: "main"},
+			AutoDeploy:        true,
+			WebhookSecretName: "HOOK",
+			Runtime:           platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
+			Processes:         []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+		}},
+	}
+	definition, err := Parse([]byte("version = 2\napp = \"api\"\nnode = \"main\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := definition.Resolve("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := resolved.UpdatePatch(current, nil); err == nil {
+		t.Fatal("clearing Git with enabled automation was accepted")
+	} else if fault := contract.Classify(err); fault.Code != contract.ValidationFailed || !strings.Contains(fault.Hint, "Automatic deployment requires") {
+		t.Fatalf("clearing Git with enabled automation = %+v", fault)
+	}
+	disabled, err := Parse([]byte("version = 2\napp = \"api\"\nnode = \"main\"\n[automation]\nauto_deploy = false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err = disabled.Resolve("production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, _, _, err := resolved.UpdatePatch(current, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if patch.Source == nil || patch.Source.URL != "" {
+		t.Fatalf("omitted source did not clear Git: %+v", patch.Source)
+	}
+	if patch.AutoDeploy == nil || *patch.AutoDeploy {
+		t.Fatalf("automation was not disabled explicitly: %+v", patch.AutoDeploy)
+	}
+}
+
+func TestExportOmitsSourceForAGitLessRevision(t *testing.T) {
+	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
+		Runtime:   platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
+		Processes: []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+	}}
+	document, err := Export("api", "production", "mbvlabs/api", "", revision, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(document, "[source]") {
+		t.Fatalf("a Git-less export emitted a source recipe:\n%s", document)
+	}
+}
+
 func TestExportRejectsUnrepresentableState(t *testing.T) {
 	base := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-		Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+		Source: platform.SourceBinding{URL: "https://github.com/acme/api"},
 	}}
 	keep := 3
 	for name, test := range map[string]struct {
@@ -1116,13 +1157,12 @@ func TestExportRejectsUnrepresentableState(t *testing.T) {
 		"release timeout": {func(revision *platform.EnvironmentRevision) {
 			revision.Runtime.ReleaseCommand = &platform.CommandSpec{Argv: []string{"true"}, TimeoutSeconds: 42}
 		}, "release timeout override"},
-		"no source": {func(revision *platform.EnvironmentRevision) { revision.Source = platform.SourceBinding{} }, "no source binding"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			revision := *base
 			revision.RevisionState = platform.CloneRevisionState(base.RevisionState)
 			test.mutate(&revision)
-			_, err := Export("api", "production", "", &revision, nil, nil)
+			_, err := Export("api", "production", "", "", &revision, nil, nil)
 			if err == nil {
 				t.Fatal("exported unrepresentable state")
 			}
@@ -1131,10 +1171,10 @@ func TestExportRejectsUnrepresentableState(t *testing.T) {
 			}
 		})
 	}
-	if _, err := Export("api", "production", "", nil, nil, nil); err == nil {
+	if _, err := Export("api", "production", "", "", nil, nil, nil); err == nil {
 		t.Fatal("exported an environment with no revision")
 	}
-	if _, err := Export("api", "production", "", base, []platform.DomainBinding{
+	if _, err := Export("api", "production", "", "", base, []platform.DomainBinding{
 		{Domain: "a.example.com", Primary: true}, {Domain: "b.example.com", Primary: true},
 	}, nil); err == nil {
 		t.Fatal("exported multiple primary domains")
@@ -1143,14 +1183,14 @@ func TestExportRejectsUnrepresentableState(t *testing.T) {
 
 func TestAutomationExportAndUpdate(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-		Source:    platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", Ref: "main", BuildEnv: map[string]string{"BP_X": "x"}},
+		Source:    platform.SourceBinding{URL: "https://github.com/acme/api", Ref: "main", BuildEnv: map[string]string{"BP_X": "x"}},
 		Runtime:   platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
 		Processes: []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
 		Config:    map[string]string{"MODE": "production"}, SecretNames: []string{"DATABASE_URL"},
 		AutoDeploy: true, WebhookSecretName: "HOOK",
 	}}
 	current := platform.Environment{App: "api", Name: "production", Node: "main", Revision: revision}
-	doc, err := Export("api", "production", "", revision, nil, nil)
+	doc, err := Export("api", "production", "", "", revision, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1228,7 +1268,7 @@ func TestAutomationExportAndUpdate(t *testing.T) {
 	if next.AutoDeploy || next.WebhookSecretName != "" {
 		t.Fatalf("override failed to clear: %+v", next)
 	}
-	snapshot, err := Inspect("api", "production", current, nil, nil)
+	snapshot, err := Inspect("api", "production", "", current, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -35,13 +35,18 @@ var (
 
 type AppCreateInput struct {
 	Name string `json:"name"`
+	// ImageRepository is the app's immutable private-workspace registry path.
+	// Omitted uses the app slug. It is app metadata, never an environment
+	// source or override.
+	ImageRepository string `json:"image_repository,omitempty"`
 	// Environments optionally creates environments and their first
 	// desired-state revisions in the same submission transaction. The CLI
 	// creates production and staging here; direct API callers may create an
 	// application with no environment.
 	Environments []EnvironmentSpec `json:"environments,omitempty"`
 	// Deploy queues the first environment's first build-and-deploy in the same
-	// submission transaction.
+	// submission transaction. It needs the first environment's Git source;
+	// artifact selection is an explicit deploy, never an app-create side effect.
 	Deploy bool `json:"deploy,omitempty"`
 }
 
@@ -263,8 +268,16 @@ type DeployInput struct {
 	Environment string    `json:"environment,omitempty"`
 	ReleaseID   ReleaseID `json:"release_id,omitempty"`
 	// Ref optionally overrides the current revision's git ref for a source
-	// deploy. It is ignored when ReleaseID is set.
+	// deploy. It is mutually exclusive with every artifact selector below.
 	Ref string `json:"ref,omitempty"`
+	// ImageTag selects a tag in the app's immutable private registry repository.
+	ImageTag string `json:"image_tag,omitempty"`
+	// ImageDigest selects a manifest digest (sha256:…) in the app's repository.
+	ImageDigest string `json:"image_digest,omitempty"`
+	// Image is a fully qualified registry/repository:tag or
+	// registry/repository@sha256:… reference. A reference to this node's
+	// private registry must name exactly the app's repository.
+	Image string `json:"image,omitempty"`
 }
 
 func (in *DeployInput) Target() Target {
@@ -372,7 +385,6 @@ func registerBuiltins(r *Registry) {
 	r.registerBuiltin(Definition{Kind: KindEnvironmentSecretAttach, Summary: "Attach a vault secret name to the environment's next revision", Normalize: normalizeEnvironmentSecretAttach})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentResourceAttach, Summary: "Attach a managed resource name to the environment's next revision", Normalize: normalizeEnvironmentResource})
 	r.registerBuiltin(Definition{Kind: KindEnvironmentResourceDetach, Summary: "Detach a managed resource name from the environment's next revision", Normalize: normalizeEnvironmentResource})
-	r.registerBuiltin(Definition{Kind: KindReleaseCreate, Summary: "Record or build a release", Normalize: normalizeReleaseCreate})
 	r.registerBuiltin(Definition{Kind: KindBuildStop, Summary: "Stop a running build", Normalize: normalizeBuildStop})
 	r.registerBuiltin(Definition{Kind: KindBuildRetry, Summary: "Retry a build of the same commit", Normalize: normalizeBuildRetry})
 	r.registerBuiltin(Definition{Kind: KindDeploy, Summary: "Build from the revision or deploy a release with blue/green switching", Normalize: normalizeDeploy})
@@ -399,6 +411,15 @@ func normalizeAppCreate(target Target, raw json.RawMessage) (ActionInput, error)
 	if err := ValidateName(input.Name); err != nil {
 		return nil, err
 	}
+	repository := strings.TrimSpace(input.ImageRepository)
+	if repository == "" {
+		repository = DefaultImageRepository(input.Name)
+	}
+	normalizedRepository, err := NormalizeImageRepository(repository)
+	if err != nil {
+		return nil, err
+	}
+	input.ImageRepository = normalizedRepository
 	seen := map[string]bool{}
 	for index := range input.Environments {
 		spec := &input.Environments[index]
@@ -414,8 +435,8 @@ func normalizeAppCreate(target Target, raw json.RawMessage) (ActionInput, error)
 		if len(input.Environments) == 0 {
 			return nil, invalid("deploy", "A first deploy needs an environment specification.")
 		}
-		if input.Environments[0].Source.Kind == "" {
-			return nil, invalid("deploy", "A first deploy needs a source binding.")
+		if input.Environments[0].Source.URL == "" {
+			return nil, invalid("deploy", "A first deploy needs a Git source binding. Create the app without --deploy, then run `eregion deploy <app> <environment> --image-tag TAG` or another explicit artifact selector.")
 		}
 	}
 	return &input, nil
@@ -628,8 +649,8 @@ func normalizeEnvironmentCreate(target Target, raw json.RawMessage) (ActionInput
 	if err := normalizeEnvironmentSpec(&input.EnvironmentSpec); err != nil {
 		return nil, err
 	}
-	if input.Deploy && input.Source.Kind == "" {
-		return nil, invalid("deploy", "A first deploy needs a source binding.")
+	if input.Deploy && input.Source.URL == "" {
+		return nil, invalid("deploy", "A first deploy needs a Git source binding. Create the environment without --deploy, then run `eregion deploy <app> <environment> --image-tag TAG` or another explicit artifact selector.")
 	}
 	return &input, nil
 }
@@ -883,8 +904,8 @@ func normalizeRevisionStateWithHosts(state *RevisionState, enforceGitHosts bool)
 		return err
 	}
 	state.WebhookSecretName = name
-	if state.AutoDeploy && state.Source.Kind != "git" {
-		return invalid("auto_deploy", "Automatic deployment requires a git source binding.")
+	if state.AutoDeploy && state.Source.URL == "" {
+		return invalid("auto_deploy", "Automatic deployment requires a Git source binding.")
 	}
 	if err := validateSourceCredentialRole(state.Source, state.SecretNames, state.WebhookSecretName); err != nil {
 		return err
@@ -923,8 +944,8 @@ func ValidatePushToDeploy(state RevisionState) error {
 	if !state.AutoDeploy {
 		return nil
 	}
-	if state.Source.Kind != "git" {
-		return invalid("auto_deploy", "Automatic deployment requires a git source binding.")
+	if state.Source.URL == "" {
+		return invalid("auto_deploy", "Automatic deployment requires a Git source binding.")
 	}
 	if _, ok := GitHubRepository(state.Source.URL); !ok {
 		return invalid("auto_deploy", "Automatic deployment requires an https://github.com/owner/repository source.")
@@ -947,77 +968,59 @@ func ResolveWebhookSecretName(state *RevisionState) {
 }
 
 func normalizeSourceBinding(source *SourceBinding, enforceGitHosts bool) error {
-	source.Kind = strings.ToLower(strings.TrimSpace(source.Kind))
 	source.URL = strings.TrimSpace(source.URL)
 	source.Ref = strings.TrimSpace(source.Ref)
 	source.CredentialSecretName = strings.TrimSpace(source.CredentialSecretName)
 	source.ContextPath = strings.TrimSpace(source.ContextPath)
 	source.Builder = strings.TrimSpace(source.Builder)
-	source.Image = strings.TrimSpace(source.Image)
 	if source.BuildEnv == nil {
 		source.BuildEnv = map[string]string{}
 	}
-	switch source.Kind {
-	case "":
-		if source.URL != "" || source.Ref != "" || source.CredentialSecretName != "" ||
-			source.ContextPath != "" || source.Builder != "" || source.Image != "" || len(source.BuildEnv) > 0 || source.GoTargets != nil || source.Buildpacks != nil {
-			return invalid("source kind", "Use git or image, or omit the source to leave a deployability gap.")
-		}
-		return nil
-	case "image":
-		if err := ValidateImage(source.Image); err != nil {
-			return err
-		}
-		if source.URL != "" || source.Ref != "" || source.CredentialSecretName != "" ||
+	if source.URL == "" {
+		if source.Ref != "" || source.CredentialSecretName != "" ||
 			source.ContextPath != "" || source.Builder != "" || len(source.BuildEnv) > 0 || source.GoTargets != nil || source.Buildpacks != nil {
-			return invalid("source", "An image source uses only source.image.")
+			return invalid("source", "A Git build recipe starts with source.url; an omitted source has no Git build.")
 		}
 		return nil
-	case "git":
-		var err error
-		if enforceGitHosts {
-			err = ValidateGitSourceURL(source.URL)
-		} else {
-			err = ValidateGitSourceURLShape(source.URL)
-		}
-		if err != nil {
-			return invalid("source URL", err.Error())
-		}
-		if source.Ref != "" && !validGitRef(source.Ref) {
-			return invalid("source ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
-		}
-		if source.Image != "" {
-			return invalid("source", "A git source uses source.url and optional source.ref.")
-		}
-		if source.CredentialSecretName != "" {
-			if !secretNamePattern.MatchString(source.CredentialSecretName) {
-				return invalid("credential secret name", "Use a vault secret NAME such as GIT_READ_TOKEN; the value is never part of the revision.")
-			}
-		}
-		if err := validateContextPath(source.ContextPath); err != nil {
-			return err
-		}
-		if source.Builder != "" {
-			if err := ValidateImage(source.Builder); err != nil {
-				return err
-			}
-		}
-		if err := validateEnv(source.BuildEnv, "build environment"); err != nil {
-			return err
-		}
-		targets, err := buildpacks.NormalizeTargets(source.GoTargets)
-		if err != nil {
-			return invalid("source go targets", err.Error())
-		}
-		settings, err := buildpacks.NormalizeSettings(source.Buildpacks)
-		if err != nil {
-			return invalid("source buildpacks", err.Error())
-		}
-		source.GoTargets, source.Buildpacks = targets, settings
-		return nil
-	default:
-		return invalid("source kind", "Use git or image.")
 	}
+	var err error
+	if enforceGitHosts {
+		err = ValidateGitSourceURL(source.URL)
+	} else {
+		err = ValidateGitSourceURLShape(source.URL)
+	}
+	if err != nil {
+		return invalid("source URL", err.Error())
+	}
+	if source.Ref != "" && !validGitRef(source.Ref) {
+		return invalid("source ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
+	}
+	if source.CredentialSecretName != "" {
+		if !secretNamePattern.MatchString(source.CredentialSecretName) {
+			return invalid("credential secret name", "Use a vault secret NAME such as GIT_READ_TOKEN; the value is never part of the revision.")
+		}
+	}
+	if err := validateContextPath(source.ContextPath); err != nil {
+		return err
+	}
+	if source.Builder != "" {
+		if err := ValidateImage(source.Builder); err != nil {
+			return err
+		}
+	}
+	if err := validateEnv(source.BuildEnv, "build environment"); err != nil {
+		return err
+	}
+	targets, err := buildpacks.NormalizeTargets(source.GoTargets)
+	if err != nil {
+		return invalid("source go targets", err.Error())
+	}
+	settings, err := buildpacks.NormalizeSettings(source.Buildpacks)
+	if err != nil {
+		return invalid("source buildpacks", err.Error())
+	}
+	source.GoTargets, source.Buildpacks = targets, settings
+	return nil
 }
 
 func validateContextPath(path string) error {
@@ -1605,14 +1608,42 @@ func normalizeDeploy(target Target, raw json.RawMessage) (ActionInput, error) {
 			return nil, err
 		}
 	}
-	if input.Ref != "" {
-		input.Ref = strings.TrimSpace(input.Ref)
-		if !validGitRef(input.Ref) {
-			return nil, invalid("ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
+	input.Ref = strings.TrimSpace(input.Ref)
+	input.ImageTag = strings.TrimSpace(input.ImageTag)
+	input.ImageDigest = strings.TrimSpace(input.ImageDigest)
+	input.Image = strings.TrimSpace(input.Image)
+	selectors := 0
+	for _, value := range []string{input.Ref, string(input.ReleaseID), input.ImageTag, input.ImageDigest, input.Image} {
+		if value != "" {
+			selectors++
 		}
 	}
-	if input.ReleaseID != "" && input.Ref != "" {
-		return nil, invalid("ref", "Omit ref when redeploying an existing release.")
+	if selectors > 1 {
+		return nil, invalid("artifact selector", "Use exactly one of --ref, --release, --image-tag, --image-digest, or --image.")
+	}
+	if input.Ref != "" && !validGitRef(input.Ref) {
+		return nil, invalid("ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
+	}
+	if input.ImageTag != "" {
+		tag, err := NormalizeImageTag(input.ImageTag)
+		if err != nil {
+			return nil, err
+		}
+		input.ImageTag = tag
+	}
+	if input.ImageDigest != "" {
+		digest, err := NormalizeImageDigest(input.ImageDigest)
+		if err != nil {
+			return nil, err
+		}
+		input.ImageDigest = digest
+	}
+	if input.Image != "" {
+		reference, err := ParseFullyQualifiedImage(input.Image)
+		if err != nil {
+			return nil, err
+		}
+		input.Image = reference.Original
 	}
 	return &input, nil
 }

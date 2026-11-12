@@ -12,7 +12,7 @@ import (
 // the node binary exchange it in the handshake before any request is accepted.
 // A change to the request, event, or response shape is a new version; both
 // sides must be upgraded together. There is no negotiation and no downgrade.
-const ProtocolVersion = 1
+const ProtocolVersion = 2
 
 // Frame types exchanged over the node protocol.
 const (
@@ -58,11 +58,20 @@ var ErrProtocol = errors.New("invalid node protocol")
 // forever.
 var ErrPermanentTransport = errors.New("permanent node transport failure")
 
+// ErrCallCancelled means the caller's context ended while the transport was
+// still waiting. It is distinct from a lost stream (the request outcome is
+// unknown because the wait ended, not because the node disappeared) and from a
+// stale or absent node task.
+var ErrCallCancelled = errors.New("node call cancelled")
+
 // IsPermanentTransport reports whether a transport error is permanent.
 func IsPermanentTransport(err error) bool { return errors.Is(err, ErrPermanentTransport) }
 
 // IsStreamLost reports whether err is an explicit lost-stream outcome.
 func IsStreamLost(err error) bool { return errors.Is(err, ErrStreamLost) }
+
+// IsCallCancelled reports whether the caller ended the transport wait.
+func IsCallCancelled(err error) bool { return errors.Is(err, ErrCallCancelled) }
 
 // WriteFrame writes one protocol frame as a single line.
 func WriteFrame(w io.Writer, frame Frame) error {

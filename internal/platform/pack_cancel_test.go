@@ -4,8 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +20,16 @@ import (
 )
 
 func packCancelTestIDs() (contract.OperationID, string) {
-	return contract.OperationID("op_" + strings.Repeat("a", 32)), "platform-pack-01-v1"
+	return contract.OperationID("op_" + strings.Repeat("a", 32)), "platform-pack-02-v1"
 }
+
+const (
+	packTestRegistryEndpoint = "127.0.0.1:5000"
+	packTestRegistryID       = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	packTestImageID          = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	packTestManifestDigest   = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	packTestCanonical        = packTestRegistryEndpoint + "/eregion/api-production@" + packTestManifestDigest
+)
 
 func writePackTestExecutable(t *testing.T, dir, name, script string) {
 	t.Helper()
@@ -25,13 +38,25 @@ func writePackTestExecutable(t *testing.T, dir, name, script string) {
 	}
 }
 
-// writeBuildDockerFixture writes the label and container response files used by
-// the fake Docker script and returns their paths.
+// writeBuildDockerFixture writes the response files used by the fake Docker
+// script. The network detail always carries the validated registry container
+// and one pack lifecycle container so cleanup has concrete resources.
 func writeBuildDockerFixture(t *testing.T, dir string, labels map[string]string, containers string) (string, string) {
 	t.Helper()
 	labelsPath := filepath.Join(dir, "network-labels.json")
 	if labels != nil {
-		encoded, err := json.Marshal(labels)
+		detail := struct {
+			Name       string            `json:"Name"`
+			Labels     map[string]string `json:"Labels"`
+			Containers map[string]any    `json:"Containers"`
+		}{
+			Name:   "eregion-build-test",
+			Labels: labels,
+			Containers: map[string]any{
+				packTestRegistryID: map[string]string{"Name": "eregion-registry", "IPv4Address": "172.18.0.2/16"},
+			},
+		}
+		encoded, err := json.Marshal(detail)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -43,24 +68,68 @@ func writeBuildDockerFixture(t *testing.T, dir string, labels map[string]string,
 	if err := os.WriteFile(containersPath, []byte(containers), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	registryPath := filepath.Join(dir, "registry-inspect")
+	registry := packTestRegistryID + "|/eregion-registry|" + RegistryImage + "|true|{\"5000/tcp\":[{\"HostIp\":\"127.0.0.1\",\"HostPort\":\"5000\"}]}"
+	if err := os.WriteFile(registryPath, []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	builderPath := filepath.Join(dir, "builder-metadata.json")
+	builder := `{"lifecycle":{"apis":{"platform":{"deprecated":["0.12"],"supported":["0.13","0.14","0.15"]}}}}`
+	if err := os.WriteFile(builderPath, []byte(builder), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	imagesPath := filepath.Join(dir, "image-inspect")
+	images := packTestImageID + `|["` + packTestCanonical + `"]`
+	if err := os.WriteFile(imagesPath, []byte(images), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pulledPath := filepath.Join(dir, "pulled-image-inspect")
+	pulled := packTestImageID + `|linux|` + runtime.GOARCH + `|["` + packTestCanonical + `"]`
+	if err := os.WriteFile(pulledPath, []byte(pulled), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stalePath := filepath.Join(dir, "stale-networks")
+	if err := os.WriteFile(stalePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return labelsPath, containersPath
 }
 
 // writeFakeBuildDocker writes a docker script that logs calls and answers the
-// build network lifecycle. createCase is the shell fragment after
-// `"network create")` and must include its own exit.
+// build, registry and completion lifecycle. createCase is the shell fragment
+// after `"network create")` and must include its own exit.
 func writeFakeBuildDocker(t *testing.T, dir, log, labelsPath, containersPath, createCase string) {
 	t.Helper()
+	registryPath := filepath.Join(dir, "registry-inspect")
+	builderPath := filepath.Join(dir, "builder-metadata.json")
+	imagesPath := filepath.Join(dir, "image-inspect")
+	pulledPath := filepath.Join(dir, "pulled-image-inspect")
+	stalePath := filepath.Join(dir, "stale-networks")
+	staleIDPath := filepath.Join(dir, "stale-network-id")
+	staleDetailPath := filepath.Join(dir, "stale-network-detail")
+	connectFailsPath := filepath.Join(dir, "connect-fails")
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "` + log + `"
 case "$1 $2" in
   "network create") ` + createCase + `
   "network inspect")
+    if [ -f "` + staleIDPath + `" ] && [ -f "` + staleDetailPath + `" ] && { [ "$5" = "$(cat "` + staleIDPath + `")" ] || [ "$5" = "$(cat "` + filepath.Join(dir, "stale-network-name") + `")" ]; }; then cat "` + staleDetailPath + `"; exit 0; fi
     if [ -f "` + labelsPath + `" ]; then cat "` + labelsPath + `"; exit 0; fi
     echo "Error response from daemon: network not found" >&2; exit 1;;
+  "network ls") cat "` + stalePath + `"; exit 0;;
+  "network connect")
+    if [ -f "` + connectFailsPath + `" ]; then echo "endpoint already exists" >&2; exit 1; fi
+    exit 0;;
+  "network disconnect"|"network rm") exit 0;;
   "ps -aq") cat "` + containersPath + `"; exit 0;;
-  "network rm") exit 0;;
-  "rm -f") exit 0;;
+  "rm -f"|"tag"|"pull") exit 0;;
+  "image inspect")
+    case "$*" in
+      *io.buildpacks.builder.metadata*) cat "` + builderPath + `"; exit 0;;
+      *@sha256:*) cat "` + pulledPath + `"; exit 0;;
+    esac
+    cat "` + imagesPath + `"; exit 0;;
+  inspect*) cat "` + registryPath + `"; exit 0;;
 esac
 exit 0
 `
@@ -125,8 +194,14 @@ func waitForFileContains(t *testing.T, path, want string) {
 
 func packStepForTest(t *testing.T, operationID contract.OperationID, stepID, source string) engine.Step {
 	t.Helper()
+	return packStepWithRegistry(t, operationID, stepID, source, packTestRegistryEndpoint)
+}
+
+func packStepWithRegistry(t *testing.T, operationID contract.OperationID, stepID, source, registry string) engine.Step {
+	t.Helper()
 	payload := PackPayload{
 		Step: stepID, Image: "eregion/api-production:abc", Builder: "paketobuildpacks/builder-jammy-base",
+		Registry:    registry,
 		Path:        source,
 		Cache:       BuildpackCacheVolume("api", "production"),
 		LaunchCache: BuildpackLaunchCacheVolume("api", "production"),
@@ -140,6 +215,28 @@ func packStepForTest(t *testing.T, operationID contract.OperationID, stepID, sou
 		t.Fatal(err)
 	}
 	return step
+}
+
+// writePackRegistryFixture rewrites the fake registry and image responses for
+// one test's actual loopback server port and canonical digest.
+func writePackRegistryFixture(t *testing.T, dir, endpoint, canonical string) {
+	t.Helper()
+	_, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := packTestRegistryID + "|/eregion-registry|" + RegistryImage + `|true|{"5000/tcp":[{"HostIp":"127.0.0.1","HostPort":"` + port + `"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "registry-inspect"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	images := packTestImageID + `|["` + canonical + `"]`
+	if err := os.WriteFile(filepath.Join(dir, "image-inspect"), []byte(images), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pulled := packTestImageID + `|linux|` + runtime.GOARCH + `|["` + canonical + `"]`
+	if err := os.WriteFile(filepath.Join(dir, "pulled-image-inspect"), []byte(pulled), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestBuildNetworkNameIsScopedToTheAttempt(t *testing.T) {
@@ -156,7 +253,7 @@ func TestBuildNetworkNameIsScopedToTheAttempt(t *testing.T) {
 	}
 }
 
-func TestPackBuildUsesAnOwnedNetworkAndRemovesItAfterSuccess(t *testing.T) {
+func TestPackBuildPublishesThroughTheOwnedBridgeAndTagsLocally(t *testing.T) {
 	operationID, stepID := packCancelTestIDs()
 	network := buildNetworkName(operationID, stepID, 1)
 	dir := t.TempDir()
@@ -167,23 +264,40 @@ printf '%s\n' "$*" >> "`+packLog+`"
 exit 0
 `)
 	fakeBuildDocker(t, dir, dockerLog, buildNetworkLabels(operationID, stepID, 1), "")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Docker-Content-Digest", packTestManifestDigest)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+	}))
+	defer server.Close()
+	endpoint := server.Listener.Addr().String()
+	transient := net.JoinHostPort("172.18.0.2", strconv.Itoa(RegistryContainerPort))
+	canonical := endpoint + "/eregion/api-production@" + packTestManifestDigest
+	writePackRegistryFixture(t, dir, endpoint, canonical)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	step := packStepForTest(t, operationID, stepID, t.TempDir())
-	result, err := step.Apply(context.Background(), engine.Runtime{Root: t.TempDir()}, nil)
+	step := packStepWithRegistry(t, operationID, stepID, t.TempDir(), endpoint)
+	root := t.TempDir()
+	result, err := step.Apply(context.Background(), engine.Runtime{Root: root}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fields, ok := result.Result.(map[string]any)
-	if !ok || fields["image"] != "eregion/api-production:abc" {
+	if !ok || fields["image"] != "eregion/api-production:abc" || fields["image_id"] != packTestImageID ||
+		fields["reference"] != canonical || fields["digest"] != packTestManifestDigest {
 		t.Fatalf("build result = %#v", result.Result)
 	}
-
 	packCalls, err := os.ReadFile(packLog)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
+		"build " + transient + "/eregion/api-production:abc --publish",
+		"--platform linux/" + runtime.GOARCH,
+		"--insecure-registry " + transient,
 		"--network " + network,
 		"--cache type=build;format=volume;name=" + BuildpackCacheVolume("api", "production"),
 		"--cache type=launch;format=volume;name=" + BuildpackLaunchCacheVolume("api", "production"),
@@ -192,27 +306,28 @@ exit 0
 			t.Fatalf("pack invocation lacks %q: %s", want, packCalls)
 		}
 	}
-
 	calls := dockerCallLog(t, dockerLog)
-	if len(calls) != 4 {
-		t.Fatalf("docker calls = %q, want create, inspect, list and remove", calls)
-	}
-	if !strings.HasPrefix(calls[0], "network create ") || !strings.HasSuffix(calls[0], " "+network) {
-		t.Fatalf("network create call = %q", calls[0])
-	}
-	for key, value := range buildNetworkLabels(operationID, stepID, 1) {
-		if !strings.Contains(calls[0], "--label "+key+"="+value) {
-			t.Fatalf("network create call %q lacks ownership label %s=%s", calls[0], key, value)
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"network create ",
+		"network connect " + network + " " + packTestRegistryID,
+		"network disconnect " + network + " " + packTestRegistryID,
+		"network rm " + network,
+		"pull --platform linux/" + runtime.GOARCH + " " + canonical,
+		"tag " + canonical + " eregion/api-production:abc",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("docker calls lack %q:\n%s", want, joined)
 		}
 	}
-	if calls[1] != "network inspect --format {{json .Labels}} "+network {
-		t.Fatalf("network inspect call = %q", calls[1])
+	if !strings.Contains(joined, "network inspect --format {{json .}} "+network) {
+		t.Fatalf("docker calls did not inspect the owned network detail:\n%s", joined)
 	}
-	if calls[2] != "ps -aq --filter network="+network+" --filter label=author=pack" {
-		t.Fatalf("container list call = %q", calls[2])
+	if strings.Contains(joined, "stop eregion-registry") || strings.Contains(joined, "rm -f "+packTestRegistryID) {
+		t.Fatalf("network cleanup touched the shared registry container:\n%s", joined)
 	}
-	if calls[3] != "network rm "+network {
-		t.Fatalf("network remove call = %q", calls[3])
+	if _, err := os.Stat(packCompletionPath(root, operationID, stepID)); err != nil {
+		t.Fatalf("durable build completion was not written: %v", err)
 	}
 }
 
@@ -248,28 +363,26 @@ exec sleep 10
 	}
 
 	calls := dockerCallLog(t, dockerLog)
-	if len(calls) != 5 {
-		t.Fatalf("docker calls = %q, want create and four cleanup calls", calls)
-	}
-	if !strings.HasPrefix(calls[0], "network create ") || !strings.HasSuffix(calls[0], " "+network) {
-		t.Fatalf("network create call = %q", calls[0])
-	}
-	for key, value := range buildNetworkLabels(operationID, stepID, 1) {
-		if !strings.Contains(calls[0], "--label "+key+"="+value) {
-			t.Fatalf("network create call %q lacks ownership label %s=%s", calls[0], key, value)
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"network create ",
+		"network connect " + network + " " + packTestRegistryID,
+		"ps -aq --filter network=" + network + " --filter label=author=pack",
+		"rm -f pack-build-container",
+		"network disconnect " + network + " " + packTestRegistryID,
+		"network rm " + network,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("cancelled build docker calls lack %q:\n%s", want, joined)
 		}
 	}
-	if calls[1] != "network inspect --format {{json .Labels}} "+network {
-		t.Fatalf("network inspect call = %q", calls[1])
+	for key, value := range buildNetworkLabels(operationID, stepID, 1) {
+		if !strings.Contains(joined, "--label "+key+"="+value) {
+			t.Fatalf("network create lacks ownership label %s=%s:\n%s", key, value, joined)
+		}
 	}
-	if calls[2] != "ps -aq --filter network="+network+" --filter label=author=pack" {
-		t.Fatalf("container list call = %q", calls[2])
-	}
-	if calls[3] != "rm -f pack-build-container" {
-		t.Fatalf("container remove call = %q", calls[3])
-	}
-	if calls[4] != "network rm "+network {
-		t.Fatalf("network remove call = %q", calls[4])
+	if strings.Contains(joined, "stop eregion-registry") || strings.Contains(joined, "rm -f "+packTestRegistryID) {
+		t.Fatalf("cancelled build cleanup touched the shared registry:\n%s", joined)
 	}
 }
 
@@ -283,11 +396,29 @@ func TestPackBuildCancellationKeepsErrInterruptedWhenCleanupFails(t *testing.T) 
 printf '%s\n' "$*" >> "`+packLog+`"
 exec sleep 10
 `)
+	labelsPath, containersPath := writeBuildDockerFixture(t, dir, buildNetworkLabels(operationID, stepID, 1), "pack-build-container\n")
+	builderPath := filepath.Join(dir, "builder-metadata.json")
+	registryPath := filepath.Join(dir, "registry-inspect")
+	imagesPath := filepath.Join(dir, "image-inspect")
+	stalePath := filepath.Join(dir, "stale-networks")
+	inspectCount := filepath.Join(dir, "inspect-count")
 	writePackTestExecutable(t, dir, "docker", `#!/bin/sh
 printf '%s\n' "$*" >> "`+dockerLog+`"
 case "$1 $2" in
   "network create") exit 0;;
-  "network inspect") echo "permission denied" >&2; exit 1;;
+  "network ls") cat "`+stalePath+`"; exit 0;;
+  "network connect") exit 0;;
+  "network inspect")
+    count=0
+    if [ -f "`+inspectCount+`" ]; then count=$(cat "`+inspectCount+`"); fi
+    count=$((count+1)); printf '%s' "$count" > "`+inspectCount+`"
+    if [ "$count" -ge 2 ]; then echo "permission denied" >&2; exit 1; fi
+    cat "`+labelsPath+`"; exit 0;;
+  "ps -aq") cat "`+containersPath+`"; exit 0;;
+  "image inspect")
+    case "$*" in *io.buildpacks.builder.metadata*) cat "`+builderPath+`"; exit 0;; esac
+    cat "`+imagesPath+`"; exit 0;;
+  inspect*) cat "`+registryPath+`"; exit 0;;
 esac
 exit 0
 `)
@@ -346,20 +477,17 @@ exit 0
 		t.Fatalf("pack ran after a failed network create: %v", statErr)
 	}
 	calls := dockerCallLog(t, dockerLog)
-	if len(calls) != 4 {
-		t.Fatalf("docker calls = %q, want create, inspect, list and remove", calls)
-	}
-	if !strings.HasPrefix(calls[0], "network create ") {
-		t.Fatalf("network create call = %q", calls[0])
-	}
-	if calls[1] != "network inspect --format {{json .Labels}} "+network {
-		t.Fatalf("network inspect call = %q", calls[1])
-	}
-	if calls[2] != "ps -aq --filter network="+network+" --filter label=author=pack" {
-		t.Fatalf("container list call = %q", calls[2])
-	}
-	if calls[3] != "network rm "+network {
-		t.Fatalf("network remove call = %q", calls[3])
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"network create ",
+		"network inspect --format {{json .}} " + network,
+		"ps -aq --filter network=" + network + " --filter label=author=pack",
+		"network disconnect " + network + " " + packTestRegistryID,
+		"network rm " + network,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("ambiguous create docker calls lack %q:\n%s", want, joined)
+		}
 	}
 }
 
@@ -397,26 +525,22 @@ exit 0
 		t.Fatalf("pack ran after a cancelled network create: %v", statErr)
 	}
 	calls := dockerCallLog(t, dockerLog)
-	if len(calls) != 4 {
-		t.Fatalf("docker calls = %q, want create, inspect, list and remove after cancellation", calls)
-	}
-	if !strings.HasPrefix(calls[0], "network create ") {
-		t.Fatalf("network create call = %q", calls[0])
-	}
-	if calls[1] != "network inspect --format {{json .Labels}} "+network {
-		t.Fatalf("network inspect call = %q", calls[1])
-	}
-	if calls[2] != "ps -aq --filter network="+network+" --filter label=author=pack" {
-		t.Fatalf("container list call = %q", calls[2])
-	}
-	if calls[3] != "network rm "+network {
-		t.Fatalf("network remove call = %q", calls[3])
+	joined := strings.Join(calls, "\n")
+	for _, want := range []string{
+		"network create ",
+		"network inspect --format {{json .}} " + network,
+		"ps -aq --filter network=" + network + " --filter label=author=pack",
+		"network disconnect " + network + " " + packTestRegistryID,
+		"network rm " + network,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("cancelled create docker calls lack %q:\n%s", want, joined)
+		}
 	}
 }
 
 func TestPackBuildAmbiguousNetworkCreateDoesNotCleanForeignNetwork(t *testing.T) {
 	operationID, stepID := packCancelTestIDs()
-	network := buildNetworkName(operationID, stepID, 1)
 	dir := t.TempDir()
 	dockerLog := filepath.Join(dir, "docker-calls")
 	foreign := buildNetworkLabels(operationID, stepID, 1)
@@ -442,14 +566,12 @@ func TestPackBuildAmbiguousNetworkCreateDoesNotCleanForeignNetwork(t *testing.T)
 		t.Fatalf("warning events = %q, want the foreign network refusal", warnings)
 	}
 	calls := dockerCallLog(t, dockerLog)
-	if len(calls) != 2 {
-		t.Fatalf("docker calls = %q, want only create and ownership inspection", calls)
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "network create ") || !strings.Contains(joined, "network inspect --format {{json .}} ") {
+		t.Fatalf("docker calls = %q, want create and ownership inspection", calls)
 	}
-	if !strings.HasPrefix(calls[0], "network create ") {
-		t.Fatalf("network create call = %q", calls[0])
-	}
-	if calls[1] != "network inspect --format {{json .Labels}} "+network {
-		t.Fatalf("network inspect call = %q", calls[1])
+	if strings.Contains(joined, "ps -aq") || strings.Contains(joined, "network rm ") || strings.Contains(joined, "network disconnect ") {
+		t.Fatalf("a foreign network was partly cleaned: %q", calls)
 	}
 }
 
@@ -462,7 +584,7 @@ func TestPackBuildNetworkCleanupRefusesAForeignNetwork(t *testing.T) {
 	fakeBuildDocker(t, dir, dockerLog, labels, "serving-container\n")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	err := removeBuildNetwork(context.Background(), engine.Runtime{}, nil, buildNetworkName(operationID, stepID, 1), operationID, stepID, 1)
+	err := removeBuildNetwork(context.Background(), engine.Runtime{}, nil, buildNetworkName(operationID, stepID, 1), operationID, stepID, 1, "")
 	if err == nil || !strings.Contains(err.Error(), "refusing to clean") {
 		t.Fatalf("foreign network cleanup error = %v, want a refusal", err)
 	}
@@ -479,7 +601,7 @@ func TestPackBuildNetworkCleanupTreatsAMissingNetworkAsDone(t *testing.T) {
 	fakeBuildDocker(t, dir, dockerLog, nil, "")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	if err := removeBuildNetwork(context.Background(), engine.Runtime{}, nil, buildNetworkName(operationID, stepID, 1), operationID, stepID, 1); err != nil {
+	if err := removeBuildNetwork(context.Background(), engine.Runtime{}, nil, buildNetworkName(operationID, stepID, 1), operationID, stepID, 1, ""); err != nil {
 		t.Fatalf("missing network cleanup failed: %v", err)
 	}
 	calls := dockerCallLog(t, dockerLog)

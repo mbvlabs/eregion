@@ -12,7 +12,7 @@ import (
 )
 
 func TestDefinitionPlanDigestBindsAutomationAndProviderSnapshot(t *testing.T) {
-	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: "version = 1\n[automation]\nauto_deploy = false\n"}
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: "version = 2\n[automation]\nauto_deploy = false\n"}
 	snapshot := definitionSnapshot{Workspace: WorkspaceIdentity{Configured: true, ID: "ws_123456789012345678901234", Name: "main"}, ProviderRevision: 1}
 	plan := api.DefinitionPlan{DNS: []integrations.DefinitionDNSPlan{{Host: "api.example.com"}}}
 	want, err := definitionPlanDigest(input, snapshot, plan)
@@ -23,12 +23,12 @@ func TestDefinitionPlanDigestBindsAutomationAndProviderSnapshot(t *testing.T) {
 	if err != nil || again != want {
 		t.Fatalf("unstable digest: %s %s %v", want, again, err)
 	}
-	input.Definition = "version = 1\n[automation]\n"
+	input.Definition = "version = 2\n[automation]\n"
 	changed, _ := definitionPlanDigest(input, snapshot, plan)
 	if changed == want {
 		t.Fatal("omitted automation field did not change digest")
 	}
-	input.Definition = "version = 1\n[automation]\nauto_deploy = false\n"
+	input.Definition = "version = 2\n[automation]\nauto_deploy = false\n"
 	snapshot.ProviderRevision++
 	changed, _ = definitionPlanDigest(input, snapshot, plan)
 	if changed == want {
@@ -49,12 +49,10 @@ func TestDefinitionPlanDigestBindsAutomationAndProviderSnapshot(t *testing.T) {
 }
 
 func TestDefinitionFrozenRemovalConfirmation(t *testing.T) {
-	const definition = `version = 1
+	const definition = `version = 2
 app = "api"
 node = "main"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 [automation]
 auto_deploy = false
 `
@@ -76,7 +74,7 @@ auto_deploy = false
 		{"resource", func(s *platform.RevisionState) { s.Resources = []string{"cache"} }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			base := platform.RevisionState{Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"}}
+			base := platform.RevisionState{Source: platform.SourceBinding{}}
 			tc.mutate(&base)
 			env := platform.Environment{App: "api", Name: "production", Node: "main", Revision: &platform.EnvironmentRevision{RevisionState: base}}
 			plan := api.DefinitionPlan{App: "api", Environment: "production"}
@@ -119,7 +117,7 @@ auto_deploy = false
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := platform.Environment{App: "api", Name: "production", Node: "main", Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"}}}}
+	env := platform.Environment{App: "api", Name: "production", Node: "main", Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{Source: platform.SourceBinding{}}}}
 	plan := api.DefinitionPlan{App: "api", Environment: "production"}
 	steps, err := compileDefinitionWork(addition, r, snap, env, &plan)
 	if err != nil {
@@ -146,12 +144,10 @@ auto_deploy = false
 }
 
 func TestCompileDefinitionWorkOrderingAndIdentity(t *testing.T) {
-	input := api.DefinitionPlanInput{App: "api", Environment: "production", PlanNonce: "nonce", Definition: `version = 1
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", PlanNonce: "nonce", Definition: `version = 2
 app = "api"
 node = "main"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:2"
 [[resources]]
 name = "cache"
 image = "redis:7"
@@ -169,7 +165,7 @@ name = "keep.example.com"
 	}
 	id := definitionPlannedDomainID("ws", "api", "production", input.PlanNonce, "new.example.com")
 	snap := definitionSnapshot{Workspace: WorkspaceIdentity{ID: "ws"}, AppID: "app", EnvironmentID: "env", Policy: api.DefinitionDNSPolicy{Enabled: true, ZoneID: "0123456789abcdef0123456789abcdef", Origins: []string{"1.1.1.1"}, ProxyMode: "dns-only"}, Bindings: []definitionBinding{{ID: "old", Name: "old.example.com", Primary: true, ZoneID: "0123456789abcdef0123456789abcdef"}, {ID: "keep", Name: "keep.example.com"}}}
-	env := platform.Environment{App: "api", Name: "production", Node: "main", Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"}}}}
+	env := platform.Environment{App: "api", Name: "production", Node: "main", Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{Source: platform.SourceBinding{}}}}
 	plan := api.DefinitionPlan{Domains: []api.DefinitionDomainChange{{Action: "remove", Name: "old.example.com", ID: "old"}, {Action: "unchanged", Name: "keep.example.com", ID: "keep"}, {Action: "add", Name: "new.example.com", ID: id, Primary: true}}, DNS: []integrations.DefinitionDNSPlan{{Host: "new.example.com", DomainID: string(id)}, {Host: "keep.example.com", DomainID: "keep"}}, DNSCleanup: []integrations.DomainDNSPlan{{Host: "old.example.com", DomainID: "old"}}}
 	steps, err := compileDefinitionWork(input, r, snap, env, &plan)
 	if err != nil {

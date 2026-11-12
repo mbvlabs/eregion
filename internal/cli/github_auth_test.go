@@ -90,7 +90,7 @@ func TestApplyGitHubAuthRejectsNonGitHubSource(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, err := applyGitHubAuthToSpecs(cmd, &setupAnswers{}, []platform.EnvironmentSpec{{
-				Name: "production", Source: platform.SourceBinding{Kind: "git", URL: rawURL},
+				Name: "production", Source: platform.SourceBinding{URL: rawURL},
 			}})
 			if contract.Classify(err).Code != contract.ValidationFailed {
 				t.Fatalf("error = %v", err)
@@ -110,9 +110,9 @@ func TestApplyGitHubAuthNamesTheCredential(t *testing.T) {
 	}
 	ans := &setupAnswers{SecretValues: map[string][]byte{}}
 	specs, err := applyGitHubAuthToSpecs(cmd, ans, []platform.EnvironmentSpec{
-		{Name: "production", Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api"}},
-		{Name: "staging", Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api"}},
-		{Name: "images", Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"}},
+		{Name: "production", Source: platform.SourceBinding{URL: "https://github.com/acme/api"}},
+		{Name: "staging", Source: platform.SourceBinding{URL: "https://github.com/acme/api"}},
+		{Name: "images", Source: platform.SourceBinding{URL: "https://github.com/acme/api"}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -122,7 +122,7 @@ func TestApplyGitHubAuthNamesTheCredential(t *testing.T) {
 	}
 	for index, spec := range specs {
 		want := ""
-		if spec.Source.Kind == "git" {
+		if spec.Source.URL != "" {
 			want = defaultGitReadCredentialName
 		}
 		if spec.Source.CredentialSecretName != want {
@@ -151,7 +151,7 @@ func TestApplyGitHubAuthRejectsConflictingCredentialInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := applyGitHubAuthToSpecs(cmd, &setupAnswers{}, []platform.EnvironmentSpec{{
-		Name: "production", Source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api"},
+		Name: "production", Source: platform.SourceBinding{URL: "https://github.com/acme/api"},
 	}})
 	if contract.Classify(err).Code != contract.Usage {
 		t.Fatalf("error = %v", err)
@@ -160,8 +160,7 @@ func TestApplyGitHubAuthRejectsConflictingCredentialInputs(t *testing.T) {
 
 func TestReadUpdateSourceGitHubAuthUsesGitHubSource(t *testing.T) {
 	base := platform.SourceBinding{
-		Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-		CredentialSecretName: "GIT_READ_TOKEN",
+		URL: "https://github.com/acme/api", CredentialSecretName: "GIT_READ_TOKEN",
 	}
 	cmd := &cobra.Command{Use: "update"}
 	addEnvironmentUpdateFlags(cmd)
@@ -197,8 +196,7 @@ func TestEnvUpdateGitHubAuthWritesCredential(t *testing.T) {
 		ID: "env_1", App: "api", Name: "production", Node: "main",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN",
+				URL: "https://github.com/acme/api", CredentialSecretName: "GIT_READ_TOKEN",
 			},
 			SecretNames: []string{"DATABASE_URL"},
 			Runtime:     platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
@@ -259,8 +257,7 @@ func TestEnvUpdateGitHubAuthReplayDoesNotReadGH(t *testing.T) {
 		ID: "env_1", App: "api", Name: "production", Node: "main",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: "GIT_READ_TOKEN",
+				URL: "https://github.com/acme/api", CredentialSecretName: "GIT_READ_TOKEN",
 			},
 			Runtime: platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
 			Processes: []platform.ProcessSpec{
@@ -636,13 +633,12 @@ func writeUpdateDefinition(t *testing.T, credential, secretNames string) string 
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "eregion.toml")
 	raw := fmt.Sprintf(`
-version = 1
+version = 2
 app = "api"
 node = "main"
 secret_names = %s
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = "main"
 credential_secret = "%s"
@@ -691,7 +687,7 @@ func TestValidateEnvironmentGitCredentialRolesRejectsWebhookAlias(t *testing.T) 
 	err := validateEnvironmentGitCredentialRoles([]platform.EnvironmentSpec{{
 		Name: "production",
 		Source: platform.SourceBinding{
-			Kind: "git", URL: "https://github.com/acme/api", CredentialSecretName: "DEPLOY_HOOK",
+			URL: "https://github.com/acme/api", CredentialSecretName: "DEPLOY_HOOK",
 		},
 		WebhookSecretName: "DEPLOY_HOOK",
 	}})
@@ -709,8 +705,6 @@ func TestAppCreateFromFileGitHubAuthWritesOnlyGitNamespace(t *testing.T) {
 	t.Setenv("GH_FAKE_TOKEN", token)
 	definition := testDefinition + `
 [environments.staging.source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 `
 	path := filepath.Join(t.TempDir(), "eregion.toml")
 	if err := os.WriteFile(path, []byte(definition), 0o600); err != nil {
@@ -831,7 +825,6 @@ func TestReadUpdateSourceGitHubAuthRejectsMaliciousURL(t *testing.T) {
 				t.Fatal(err)
 			}
 			base := platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
 				CredentialSecretName: "GIT_READ_TOKEN",
 			}
 			if _, _, _, _, err := (&app{}).readUpdateSource(cmd, base, platform.Environment{}); contract.Classify(err).Code != contract.ValidationFailed {
@@ -846,8 +839,7 @@ func githubAuthEnvUpdateEnvironment(sourceCredential string, secretNames []strin
 		ID: "env_1", App: "api", Name: "production", Node: "main",
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main",
-				CredentialSecretName: sourceCredential,
+				URL: "https://github.com/acme/api", Ref: "main", CredentialSecretName: sourceCredential,
 			},
 			WebhookSecretName: webhookSecret,
 			SecretNames:       append([]string(nil), secretNames...),

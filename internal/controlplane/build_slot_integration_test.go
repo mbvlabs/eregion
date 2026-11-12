@@ -117,9 +117,10 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	}
 	t.Setenv("EREGION_BUILD_SOURCE_ROOTS", sourceRoot)
 	transport := &scriptedPlatformTransport{results: map[string]json.RawMessage{
+		deploymentPackStep:  json.RawMessage(`{"reference":"127.0.0.1:5000/eregion/live-production:build@sha256:` + strings.Repeat("b", 64) + `","image_id":"sha256:` + strings.Repeat("a", 64) + `"}`),
 		deploymentImageStep: json.RawMessage(`{"stdout":"sha256:` + strings.Repeat("a", 64) + `"}`),
 	}}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: 2, TestOnly: true, Transport: transport})
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: 2, TestOnly: true, Transport: transport, RegistryEndpoint: "127.0.0.1:5000"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,6 +176,9 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	release, err := s.releaseForOperation(ctx, ready.ID)
 	if err != nil || release.Status != platform.ReleaseReady || !strings.HasPrefix(release.ImageID, "sha256:") {
 		t.Fatalf("release=%+v err=%v", release, err)
+	}
+	if !platform.IsImageDigestReference(release.Image) || !strings.HasPrefix(release.Image, "127.0.0.1:5000/eregion/live-production@sha256:") {
+		t.Fatalf("release image = %q, want the canonical registry digest reference", release.Image)
 	}
 	if got := transport.runCount(deploymentPackStep); got != 1 {
 		t.Fatalf("pack ran %d times", got)

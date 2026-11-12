@@ -17,6 +17,7 @@ const JournalSchema = 1
 // Task states recorded in the journal.
 const (
 	TaskRunning   = "running"
+	TaskDeferred  = "deferred"
 	TaskCompleted = "completed"
 	TaskFailed    = "failed"
 )
@@ -38,6 +39,12 @@ type Task struct {
 	RequestID      string          `json:"request_id,omitempty"`
 	InputsHash     string          `json:"inputs_hash"`
 	Status         string          `json:"status"`
+	Phase          TaskPhase       `json:"phase,omitempty"`
+	PhaseStartedAt string          `json:"phase_started_at,omitempty"`
+	WaitMS         int64           `json:"wait_ms,omitempty"`
+	Detail         string          `json:"detail,omitempty"`
+	ErrorCode      string          `json:"error_code,omitempty"`
+	Retryable      bool            `json:"retryable,omitempty"`
 	Owner          Owner           `json:"owner"`
 	StartedAt      string          `json:"started_at,omitempty"`
 	CompletedAt    string          `json:"completed_at,omitempty"`

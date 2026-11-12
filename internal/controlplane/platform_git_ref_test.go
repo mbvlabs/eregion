@@ -15,10 +15,10 @@ func TestCheckResolvedGitSourceRefusesARevisionChange(t *testing.T) {
 		imageRef = "example/app:1"
 		conflict = "environment source changed during submission"
 	)
-	gitSource := platform.SourceBinding{Kind: "git", URL: gitURL, Ref: "main"}
-	imageSource := platform.SourceBinding{Kind: "image", Image: imageRef}
-	resolvedGit := &resolvedGitRef{Kind: "git", URL: gitURL, Ref: "main", SHA: sha}
-	resolvedImage := &resolvedGitRef{Kind: "image"}
+	gitSource := platform.SourceBinding{URL: gitURL, Ref: "main"}
+	imageSource := platform.SourceBinding{}
+	resolvedGit := &resolvedGitRef{URL: gitURL, Ref: "main", SHA: sha}
+	resolvedImage := &resolvedGitRef{}
 
 	for _, tc := range []struct {
 		name      string
@@ -28,9 +28,9 @@ func TestCheckResolvedGitSourceRefusesARevisionChange(t *testing.T) {
 		wantError bool
 	}{
 		{name: "unchanged git source", resolved: resolvedGit, source: gitSource},
-		{name: "ref changed without override", resolved: resolvedGit, source: platform.SourceBinding{Kind: "git", URL: gitURL, Ref: "other"}, wantError: true},
-		{name: "ref changed with override", resolved: resolvedGit, source: platform.SourceBinding{Kind: "git", URL: gitURL, Ref: "other"}, override: "main"},
-		{name: "url changed", resolved: resolvedGit, source: platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/other.git", Ref: "main"}, wantError: true},
+		{name: "ref changed without override", resolved: resolvedGit, source: platform.SourceBinding{URL: gitURL, Ref: "other"}, wantError: true},
+		{name: "ref changed with override", resolved: resolvedGit, source: platform.SourceBinding{URL: gitURL, Ref: "other"}, override: "main"},
+		{name: "url changed", resolved: resolvedGit, source: platform.SourceBinding{URL: "https://github.com/acme/other.git", Ref: "main"}, wantError: true},
 		{name: "git became image", resolved: resolvedGit, source: imageSource, wantError: true},
 		{name: "image became git", resolved: resolvedImage, source: gitSource, wantError: true},
 		{name: "override differs from the resolution", resolved: resolvedGit, source: gitSource, override: "other", wantError: true},

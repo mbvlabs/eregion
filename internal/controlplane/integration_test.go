@@ -87,7 +87,7 @@ func testRuntime(t *testing.T, pool *pgxpool.Pool, workers int, stateDirs ...str
 	if stateDir == "" {
 		stateDir = t.TempDir()
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: workers, TestOnly: true, NodeStateDir: stateDir, LocalNodeName: "local"})
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: workers, TestOnly: true, NodeStateDir: stateDir, LocalNodeName: "local", RegistryEndpoint: "127.0.0.1:5000"})
 	if err != nil {
 		t.Fatal(err)
 	}

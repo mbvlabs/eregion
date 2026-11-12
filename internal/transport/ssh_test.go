@@ -14,6 +14,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
+	"github.com/mbvlabs/eregion/internal/secrets"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -201,8 +202,11 @@ func TestSSHTransportCancellationDoesNotKillTheNodeTask(t *testing.T) {
 	if err == nil {
 		t.Fatal("a cancelled call reported success")
 	}
-	if !node.IsStreamLost(err) {
-		t.Fatalf("a cancelled call is not an explicit unknown outcome: %v", err)
+	if !node.IsCallCancelled(err) {
+		t.Fatalf("a cancelled call is not a distinct cancellation: %v", err)
+	}
+	if node.IsStreamLost(err) {
+		t.Fatalf("a cancelled call was mislabeled as a lost stream: %v", err)
 	}
 	// The detached node task is not signalled: the effect is still applied.
 	deadline := time.Now().Add(10 * time.Second)
@@ -275,11 +279,50 @@ func TestSSHTransportWaitFollowsTheContextDeadline(t *testing.T) {
 	if err == nil {
 		t.Fatal("a wait that ended with the deadline reported success")
 	}
-	if !node.IsStreamLost(err) {
-		t.Fatalf("the wait that ended with the deadline is not explicit: %v", err)
+	if !node.IsCallCancelled(err) {
+		t.Fatalf("the wait that ended with the deadline is not a distinct cancellation: %v", err)
+	}
+	if node.IsStreamLost(err) {
+		t.Fatalf("the wait that ended with the deadline was mislabeled as a lost stream: %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 30*time.Second {
 		t.Fatalf("the wait did not follow the deadline: %s", elapsed)
+	}
+	server.waitTaskExit(t, exec)
+}
+
+// TestSSHTransportReturnsTheObservedRunningTaskAtThePollWindow proves that the
+// transport's own poll window is not reported as a fabricated lost stream. The
+// node task is detached and keeps running; the last observed running response
+// carries the node's execution identity, phase, and wait.
+func TestSSHTransportReturnsTheObservedRunningTaskAtThePollWindow(t *testing.T) {
+	server := newTestServer(t)
+	server.transportConfig = func(config *SSHConfig) {
+		config.MaxWait = 300 * time.Millisecond
+		config.PollInterval = 50 * time.Millisecond
+	}
+	client := server.transport(t, nil)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	response, err := client.Call(context.Background(), runRequest(t, exec, 900), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusRunning {
+		t.Fatalf("poll window response = %+v, want running", response)
+	}
+	if response.ExecutionID != exec.ExecutionID() {
+		t.Fatalf("poll window execution id = %q, want %q", response.ExecutionID, exec.ExecutionID())
+	}
+	if !response.Retryable {
+		t.Fatalf("poll window response is not retryable: %+v", response)
+	}
+	// The wait ended, not the task: a later status observes the live task.
+	status, err := client.Call(context.Background(), statusRequest(exec), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != engine.StatusRunning && status.Status != engine.StatusCompleted {
+		t.Fatalf("status after the poll window = %+v", status)
 	}
 	server.waitTaskExit(t, exec)
 }
@@ -369,6 +412,39 @@ func TestSSHTransportBoundsTheStderrTail(t *testing.T) {
 		t.Fatalf("the stderr tail is not bounded: %d bytes", len(err.Error()))
 	}
 	server.waitTaskExit(t, exec)
+}
+
+// TestSSHTransportCarriesDeferredPhaseAndWait proves that a status observation
+// keeps the executed task's identity, typed phase, and non-negative wait rather
+// than reporting the request attempt as a live owner.
+func TestSSHTransportCarriesDeferredPhaseAndWait(t *testing.T) {
+	server := newTestServer(t)
+	client := server.transport(t, nil)
+	exec := testExecution(t, node.DiagnosticStepID(1))
+	journal := engine.NewJournal(server.config.Node)
+	observedID := exec.ExecutionID()
+	journal.Tasks[exec.EffectKey()] = engine.Task{
+		OperationID: string(exec.OperationID), Step: exec.Step, Attempt: exec.Attempt,
+		ExecutionID: observedID, Status: engine.TaskDeferred,
+		Phase: engine.PhaseWaitingHostLock, PhaseStartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		WaitMS: 20000, Detail: "exited while waiting for the host lock",
+	}
+	if err := journal.Save(engine.JournalPath(server.config.StateDir), &secrets.Registry{}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Call(context.Background(), statusRequest(exec), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusDeferred {
+		t.Fatalf("deferred status = %+v", response)
+	}
+	if response.ExecutionID != observedID || response.Attempt != exec.Attempt {
+		t.Fatalf("observed identity = %q/%d, want %q/%d", response.ExecutionID, response.Attempt, observedID, exec.Attempt)
+	}
+	if response.Phase != engine.PhaseWaitingHostLock || response.WaitMS < 0 {
+		t.Fatalf("phase/wait = %q/%d", response.Phase, response.WaitMS)
+	}
 }
 
 // TestSSHTransportReportsADeadNodeTaskPromptly proves that a node task that

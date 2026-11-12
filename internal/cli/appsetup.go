@@ -50,15 +50,16 @@ var setupProcessNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
 type setupAnswers struct {
 	App         string
 	Environment string
-	Node        string
-	BuildNode   string
+	// ImageRepository is app creation metadata only. Environment creation
+	// matches the existing app and cannot change it.
+	ImageRepository string
+	Node            string
+	BuildNode       string
 
-	SourceKind      string
 	GitURL          string
 	GitRef          string
 	CredentialName  string
 	CredentialValue []byte
-	Image           string
 	Builder         string
 	ContextPath     string
 	BuildEnv        map[string]string
@@ -132,7 +133,6 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	f.String("git-credential-file", "", "Protected 0600 file containing the repository read token")
 	f.String("git-credential-name", "", "Vault secret name for the read token (default GIT_READ_TOKEN)")
 	f.Bool("github-auth", false, "Use the local authenticated gh token as the github.com read credential (opt-in; broader scopes may apply)")
-	f.String("image", "", "Existing OCI image reference; alternative to --git-url")
 	f.String("builder", "", "Buildpacks builder image; empty uses the build node's platform default")
 	f.String("context-path", "", "Build context path inside the repository")
 	f.StringArray("build-env", nil, "Buildpacks environment KEY=VALUE (repeatable; update with '' clears all)")
@@ -559,6 +559,24 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 	if err := platform.ValidateName(appName); err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "definition app is missing or invalid", "Set app in the definition or pass the command's app flag.")
 	}
+	resolvedImageRepository := ""
+	if definition.ImageRepository != nil {
+		normalized, err := platform.NormalizeImageRepository(*definition.ImageRepository)
+		if err != nil {
+			return nil, definitionFault(fmt.Errorf("image_repository: %w", err))
+		}
+		resolvedImageRepository = normalized
+	}
+	if flagChanged(cmd, "image-repository") {
+		flagRepository, err := platform.NormalizeImageRepository(flagString(cmd, "image-repository"))
+		if err != nil {
+			return nil, err
+		}
+		if resolvedImageRepository != "" && resolvedImageRepository != flagRepository {
+			return nil, contract.NewFault(contract.ValidationFailed, "definition image_repository disagrees with --image-repository", "Use the file's repository, or edit the definition.")
+		}
+		resolvedImageRepository = flagRepository
+	}
 	addresses := mainNodeAddresses(cmd)
 	resolve := func(name string) (*appdef.Resolved, platform.EnvironmentSpec, []platform.ResourceApplyInput, error) {
 		resolved, err := definition.Resolve(name)
@@ -620,10 +638,10 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 
 	primary := specs[0]
 	ans := &setupAnswers{
-		App: appName, Environment: primary.Name, Node: primary.Node, BuildNode: primary.BuildNode,
-		SourceKind: primary.Source.Kind, GitURL: primary.Source.URL, GitRef: primary.Source.Ref,
-		CredentialName: primary.Source.CredentialSecretName, Image: primary.Source.Image,
-		Builder: primary.Source.Builder, ContextPath: primary.Source.ContextPath,
+		App: appName, Environment: primary.Name, ImageRepository: resolvedImageRepository, Node: primary.Node, BuildNode: primary.BuildNode,
+		GitURL: primary.Source.URL, GitRef: primary.Source.Ref,
+		CredentialName: primary.Source.CredentialSecretName,
+		Builder:        primary.Source.Builder, ContextPath: primary.Source.ContextPath,
 		GoTargets: primary.Source.GoTargets, Buildpacks: primary.Source.Buildpacks,
 		ContainerPort: primary.ContainerPort, HealthType: primary.Runtime.HealthType,
 		HealthPath: primary.Runtime.HealthPath, HealthTimeout: primary.Runtime.HealthTimeoutSeconds,
@@ -653,13 +671,17 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 	case boolFlag(cmd, "no-deploy"):
 		ans.Deploy = false
 	case interactive && !flagChanged(cmd, "no-deploy"):
+		if primary.Source.URL == "" {
+			ans.Deploy = false
+			break
+		}
 		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from production's new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
 		if err != nil {
 			return nil, err
 		}
 		ans.Deploy = deploy
 	default:
-		ans.Deploy = true
+		ans.Deploy = primary.Source.URL != ""
 	}
 	if len(ans.ResourceSpecs) > 0 || len(ans.AdditionalResourceSpecs["staging"]) > 0 {
 		// Resources are provisioned only after the environment exists. Queuing
@@ -747,10 +769,10 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 	interactive := humanInteractive(cmd)
 	ans := &setupAnswers{
 		Node:            flagString(cmd, "node"),
+		ImageRepository: flagString(cmd, "image-repository"),
 		BuildNode:       flagString(cmd, "build-node"),
 		GitURL:          flagString(cmd, "git-url"),
 		GitRef:          flagString(cmd, "git-ref"),
-		Image:           flagString(cmd, "image"),
 		Builder:         flagString(cmd, "builder"),
 		ContextPath:     flagString(cmd, "context-path"),
 		ContainerPort:   flagInt(cmd, "container-port"),
@@ -843,33 +865,18 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 	}
 
 	switch {
-	case ans.GitURL != "" && ans.Image != "":
-		return nil, contract.NewFault(contract.ValidationFailed, "choose one source", "Use --git-url or --image, not both.")
 	case ans.GitURL != "":
-		ans.SourceKind = "git"
-	case ans.Image != "":
-		ans.SourceKind = "image"
+		// A Git URL is the only source recipe. Absent means image-only app
+		// creation; the artifact is selected explicitly at deploy time.
 	case interactive:
-		kind, err := ui.Choose("Source", "How this environment gets its application image", [][2]string{
-			{"HTTPS git repository", "git"},
-			{"Existing image", "image"},
-		})
+		value, err := ui.Input("HTTPS git repository (optional)", "Leave empty to deploy explicit artifacts later; no source is required", "")
 		if err != nil {
 			return nil, err
 		}
-		ans.SourceKind = kind
-	default:
-		return nil, contract.NewFault(contract.InputRequired, "a source is required without a terminal", "Pass --git-url or --image.")
+		ans.GitURL = strings.TrimSpace(value)
 	}
 
-	if ans.SourceKind == "git" {
-		if ans.GitURL == "" {
-			value, err := askValidated("HTTPS git repository", "No credentials in the URL; the node checks its allowed hosts", "", validateGitURLShape)
-			if err != nil {
-				return nil, err
-			}
-			ans.GitURL = value
-		}
+	if ans.GitURL != "" {
 		if err := validateGitURLShape(ans.GitURL); err != nil {
 			return nil, err
 		}
@@ -918,15 +925,8 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 		ans.GoTargets, ans.Buildpacks = source.GoTargets, source.Buildpacks
 	} else {
-		if ans.Image == "" {
-			value, err := askValidated("Container image", "registry/repository:tag or digest", "", platform.ValidateImage)
-			if err != nil {
-				return nil, err
-			}
-			ans.Image = value
-		}
 		if flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env") || buildpackFlagsChanged(cmd) {
-			return nil, contract.NewFault(contract.ValidationFailed, "build settings need a git source", "An image source does not run Buildpacks; omit --builder, --context-path and --build-env.")
+			return nil, contract.NewFault(contract.ValidationFailed, "build settings need a Git source", "Pass --git-url, or omit --builder, --context-path and --build-env for an image-only app.")
 		}
 	}
 
@@ -1010,13 +1010,17 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 	case boolFlag(cmd, "no-deploy"):
 		ans.Deploy = false
 	case interactive && !flagChanged(cmd, "no-deploy"):
+		if ans.GitURL == "" {
+			ans.Deploy = false
+			break
+		}
 		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from the new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
 		if err != nil {
 			return nil, err
 		}
 		ans.Deploy = deploy
 	default:
-		ans.Deploy = true
+		ans.Deploy = ans.GitURL != ""
 	}
 
 	if _, err := ans.environmentSpec(cmd); err != nil {
@@ -1256,8 +1260,7 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 		}
 	}
 	source := platform.SourceBinding{}
-	switch ans.SourceKind {
-	case "git":
+	if ans.GitURL != "" {
 		if err := validateGitURLShape(ans.GitURL); err != nil {
 			return platform.EnvironmentSpec{}, err
 		}
@@ -1272,18 +1275,11 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 			}
 		}
 		source = platform.SourceBinding{
-			Kind: "git", URL: ans.GitURL, Ref: ans.GitRef,
+			URL: ans.GitURL, Ref: ans.GitRef,
 			CredentialSecretName: ans.CredentialName, ContextPath: ans.ContextPath,
 			Builder: ans.Builder, BuildEnv: ans.BuildEnv,
 			GoTargets: ans.GoTargets, Buildpacks: ans.Buildpacks,
 		}
-	case "image":
-		if err := platform.ValidateImage(ans.Image); err != nil {
-			return platform.EnvironmentSpec{}, err
-		}
-		source = platform.SourceBinding{Kind: "image", Image: ans.Image}
-	default:
-		return platform.EnvironmentSpec{}, contract.NewFault(contract.ValidationFailed, "a source is required", "Use a git source or an image.")
 	}
 
 	if ans.HealthType != "http" && ans.HealthType != "tcp" {
@@ -1645,7 +1641,7 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 	if ans.BuildNode != "" {
 		fmt.Fprintf(&out, "builder node: %s\n", ans.BuildNode)
 	}
-	if ans.SourceKind == "git" {
+	if ans.GitURL != "" {
 		ref := ans.GitRef
 		if ref == "" {
 			ref = "repository default"
@@ -1664,7 +1660,7 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 			fmt.Fprintf(&out, "build environment: %s\n", strings.Join(sortedKeys(ans.BuildEnv), ", "))
 		}
 	} else {
-		fmt.Fprintf(&out, "source: image %s\n", ans.Image)
+		fmt.Fprintln(&out, "source: none (deploy explicit artifacts)")
 	}
 	for _, process := range planProcesses(ans) {
 		fmt.Fprintf(&out, "process: %s\n", process)
@@ -2124,6 +2120,7 @@ type setupEnvironmentResult struct {
 // setupResult is the secret-free result of app create or env create.
 type setupResult struct {
 	App                    string                       `json:"app"`
+	ImageRepository        string                       `json:"image_repository,omitempty"`
 	Environment            string                       `json:"environment"`
 	Protected              bool                         `json:"protected"`
 	Environments           []setupEnvironmentResult     `json:"environments,omitempty"`
@@ -2263,6 +2260,9 @@ func (r setupResult) plainText() string {
 	}
 	var out strings.Builder
 	if r.created == "app" {
+		if r.ImageRepository != "" {
+			fmt.Fprintf(&out, "Image repository: %s\n", r.ImageRepository)
+		}
 		if len(r.Environments) > 0 {
 			labels := make([]string, 0, len(r.Environments))
 			for _, environment := range r.Environments {
@@ -2337,21 +2337,24 @@ func (a *app) provisionDefinitionResources(cmd *cobra.Command, specs []platform.
 	return ids, nil
 }
 
-func describeSource(source platform.SourceBinding) string {
-	switch source.Kind {
-	case "git":
-		ref := source.Ref
-		if ref == "" {
-			ref = "default branch"
-		}
-		line := "git " + source.URL + " @ " + ref
-		if source.CredentialSecretName != "" {
-			line += " (credential " + source.CredentialSecretName + ")"
-		}
-		return line
-	case "image":
-		return "image " + source.Image
-	default:
-		return "none"
+func defaultRepositoryLabel(ans *setupAnswers) string {
+	if ans.ImageRepository != "" {
+		return ans.ImageRepository
 	}
+	return platform.DefaultImageRepository(ans.App)
+}
+
+func describeSource(source platform.SourceBinding) string {
+	if source.URL == "" {
+		return "none (deploy an explicit artifact)"
+	}
+	ref := source.Ref
+	if ref == "" {
+		ref = "default branch"
+	}
+	line := "git " + source.URL + " @ " + ref
+	if source.CredentialSecretName != "" {
+		line += " (credential " + source.CredentialSecretName + ")"
+	}
+	return line
 }

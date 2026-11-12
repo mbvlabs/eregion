@@ -60,8 +60,8 @@ Type=simple
 Restart=on-failure
 RestartSec=5s
 ExecStartPre=/usr/bin/docker pull %s
-ExecStart=/usr/bin/docker run --rm --name eregion-registry --env REGISTRY_STORAGE_DELETE_ENABLED=true --publish %s:5000 --volume %s:/var/lib/registry --volume %s:/etc/docker/registry/config.yml:ro %s
-ExecStop=/usr/bin/docker stop eregion-registry
+ExecStart=/usr/bin/docker run --rm --name `+platform.RegistryContainer+` --env REGISTRY_STORAGE_DELETE_ENABLED=true --publish %s:5000 --volume %s:/var/lib/registry --volume %s:/etc/docker/registry/config.yml:ro %s
+ExecStop=/usr/bin/docker stop `+platform.RegistryContainer+`
 TimeoutStopSec=30s
 
 [Install]

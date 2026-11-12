@@ -15,9 +15,9 @@ func TestValidateImagePushParams(t *testing.T) {
 	}{
 		{name: "empty repository", params: rpcImagePushParams{Tag: "v1"}},
 		{name: "uppercase repository", params: rpcImagePushParams{Repository: "Andurel", Tag: "v1"}},
-		{name: "underscore repository", params: rpcImagePushParams{Repository: "andurel_site", Tag: "v1"}},
-		{name: "leading digit repository", params: rpcImagePushParams{Repository: "1andurel", Tag: "v1"}},
-		{name: "too long repository", params: rpcImagePushParams{Repository: strings.Repeat("a", 41), Tag: "v1"}},
+		{name: "host in repository", params: rpcImagePushParams{Repository: "ghcr.io/andurel", Tag: "v1"}},
+		{name: "tag in repository", params: rpcImagePushParams{Repository: "andurel:v1", Tag: "v1"}},
+		{name: "too long repository", params: rpcImagePushParams{Repository: strings.Repeat("a", 201), Tag: "v1"}},
 		{name: "empty tag", params: rpcImagePushParams{Repository: "andurel"}},
 		{name: "slash in tag", params: rpcImagePushParams{Repository: "andurel", Tag: "bad/tag"}},
 		{name: "space in tag", params: rpcImagePushParams{Repository: "andurel", Tag: "bad tag"}},

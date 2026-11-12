@@ -123,6 +123,12 @@ var migration030 string
 //go:embed migrations/031_definition_runs.sql
 var migration031 string
 
+//go:embed migrations/032_app_image_repository.sql
+var migration032 string
+
+//go:embed migrations/033_workspace_registry_host.sql
+var migration033 string
+
 type migration struct {
 	version int
 	name    string
@@ -164,6 +170,8 @@ var migrations = []migration{
 	{version: 29, name: "029_webhook_environment_identity.sql", sql: migration029},
 	{version: 30, name: "030_definition_dns_policy.sql", sql: migration030},
 	{version: 31, name: "031_definition_runs.sql", sql: migration031},
+	{version: 32, name: "032_app_image_repository.sql", sql: migration032},
+	{version: 33, name: "033_workspace_registry_host.sql", sql: migration033},
 }
 
 const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.

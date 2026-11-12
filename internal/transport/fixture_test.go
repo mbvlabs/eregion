@@ -186,8 +186,8 @@ func TestSSHFixtureCancellationDoesNotKillTheNodeTask(t *testing.T) {
 	if got.err == nil {
 		t.Fatal("a cancelled call reported success")
 	}
-	if !node.IsStreamLost(got.err) {
-		t.Fatalf("a cancelled call is not an explicit unknown outcome: %v", got.err)
+	if !node.IsCallCancelled(got.err) {
+		t.Fatalf("a cancelled call is not an explicit caller-cancel outcome: %v", got.err)
 	}
 	effectDeadline := time.Now().Add(20 * time.Second)
 	for {

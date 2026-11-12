@@ -278,13 +278,24 @@ func runResponse(config Config, steps *node.StepRegistry, request node.Request) 
 		// The effect is already durable. Report it; never apply it twice.
 		return node.ResponseFromStatus(status)
 	case engine.StatusRunning:
+		// A live owner keeps its own attempt identity. Never replace it with
+		// the attempt that merely asked to attach.
 		return node.Response{
-			Status:      engine.StatusRunning,
-			ExecutionID: request.Execution.ExecutionID(),
-			InputsHash:  inputsHash,
-			Retryable:   true,
-			Detail:      "another node task owns this effect",
+			Status:         engine.StatusRunning,
+			ExecutionID:    status.ExecutionID,
+			Attempt:        status.Attempt,
+			AppliedAttempt: status.AppliedAttempt,
+			InputsHash:     status.InputsHash,
+			Phase:          status.Phase,
+			PhaseStartedAt: status.PhaseStartedAt,
+			WaitMS:         maxWaitMS(status.WaitMS),
+			Retryable:      true,
+			Detail:         "another node task owns this effect",
 		}
+	case engine.StatusDeferred:
+		// A deferral is an exited pre-Check/Apply waiter. It is safe to resume
+		// under a new task; the control plane decides when to stop backing off.
+		// The new task, not the deferred observation, owns the next execution.
 	}
 	if err := SpawnTask(config, request); err != nil {
 		return node.Response{Status: engine.StatusFailed, ExecutionID: request.Execution.ExecutionID(), ErrorCode: string(contract.Internal), Detail: err.Error()}
@@ -292,10 +303,18 @@ func runResponse(config Config, steps *node.StepRegistry, request node.Request) 
 	return node.Response{
 		Status:      engine.StatusRunning,
 		ExecutionID: request.Execution.ExecutionID(),
+		Attempt:     request.Execution.Attempt,
 		InputsHash:  inputsHash,
 		Retryable:   true,
 		Detail:      "node task started",
 	}
+}
+
+func maxWaitMS(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }
 
 // SpawnTask starts the step in a detached child process. The child runs in

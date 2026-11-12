@@ -93,6 +93,43 @@ func newTestEngine(t *testing.T) *Engine {
 	return eng
 }
 
+func TestRunRecoversADurableCheckResult(t *testing.T) {
+	eng := newTestEngine(t)
+	exec := testExecution(t, "test-recover-step-v1", 1)
+	step := &recoverCheckStep{exec: exec}
+	status, err := eng.Run(context.Background(), step, exec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Status != StatusCompleted || status.Executed || status.AppliedAttempt != 9 {
+		t.Fatalf("recovered status = %+v", status)
+	}
+	var result map[string]string
+	if err := json.Unmarshal(status.Result, &result); err != nil ||
+		result["commit"] != strings.Repeat("a", 40) || result["reference"] != "127.0.0.1:5000/app@sha256:"+strings.Repeat("b", 64) {
+		t.Fatalf("recovered result = %s (%v)", status.Result, err)
+	}
+}
+
+type recoverCheckStep struct{ exec Execution }
+
+func (s *recoverCheckStep) ID() string              { return s.exec.Step }
+func (s *recoverCheckStep) Describe() string        { return "recoverable test step" }
+func (s *recoverCheckStep) Inputs() ([]byte, error) { return json.Marshal(s.exec.Step) }
+func (*recoverCheckStep) CancelBoundary() Boundary  { return BoundaryAfterApply }
+func (s *recoverCheckStep) Check(context.Context, Runtime) (CheckResult, error) {
+	return CheckResult{
+		Complete: true, AppliedAttempt: 9, Detail: "durable evidence",
+		Result: map[string]string{
+			"commit":    strings.Repeat("a", 40),
+			"reference": "127.0.0.1:5000/app@sha256:" + strings.Repeat("b", 64),
+		},
+	}, nil
+}
+func (*recoverCheckStep) Apply(context.Context, Runtime, Reporter) (ApplyResult, error) {
+	return ApplyResult{}, errors.New("Apply must not run when Check has durable evidence")
+}
+
 func TestRunIsIdempotentAndJournaled(t *testing.T) {
 	eng := newTestEngine(t)
 	exec := testExecution(t, "test-step-v1", 1)

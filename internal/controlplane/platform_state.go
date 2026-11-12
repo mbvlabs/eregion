@@ -49,7 +49,16 @@ func (s *Service) submitPlatformWithReceipt(ctx context.Context, sub operations.
 		}
 		return operations.SubmissionResult{Operation: existing, Replay: true}, nil
 	}
+	if input, ok := normalized.Input.(*platform.AppCreateInput); ok {
+		if err := platform.ValidateAppImageRepositoryForRegistry(input.ImageRepository, s.registryEndpoint); err != nil {
+			return zero, err
+		}
+	}
 	resolved, err := s.resolveSubmissionGitRef(ctx, normalized)
+	if err != nil {
+		return zero, err
+	}
+	artifact, err := s.resolveSubmissionArtifact(ctx, normalized)
 	if err != nil {
 		return zero, err
 	}
@@ -65,7 +74,7 @@ func (s *Service) submitPlatformWithReceipt(ctx context.Context, sub operations.
 		return zero, unavailable()
 	}
 	defer rollback(tx)
-	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, sub.Actor, sub.IdempotencyKey, resolved, sub.HumanFactor, sub.WebhookSecret)
+	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, sub.Actor, sub.IdempotencyKey, resolved, artifact, sub.HumanFactor, sub.WebhookSecret)
 	if err != nil {
 		return zero, err
 	}
@@ -81,7 +90,7 @@ func (s *Service) submitPlatformWithReceipt(ctx context.Context, sub operations.
 // and by the webhook worker, so a webhook can commit its operation and its
 // delivery link atomically without calling Service.Submit (which opens a
 // transaction) or nesting one.
-func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, key string, resolved *resolvedGitRef, humanFactor string, webhookSecret []byte) (operations.SubmissionResult, error) {
+func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, key string, resolved *resolvedGitRef, artifact *resolvedArtifact, humanFactor string, webhookSecret []byte) (operations.SubmissionResult, error) {
 	var zero operations.SubmissionResult
 	inputHash := hashInput(normalized.Canonical)
 	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
@@ -112,7 +121,7 @@ func (s *Service) recordPlatformSubmissionTx(ctx context.Context, tx pgx.Tx, id 
 		return operations.SubmissionResult{Operation: existing, Replay: true}, nil
 	}
 	var activated bool
-	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved, humanFactor, webhookSecret, &activated); err != nil {
+	if err := s.preparePlatform(ctx, tx, id, normalized, actor, resolved, artifact, humanFactor, webhookSecret, &activated); err != nil {
 		return zero, err
 	}
 	if s.enqueuePlatform == nil {
@@ -219,8 +228,6 @@ func platformAcceptedMessage(kind string) string {
 		return "Environment desired state accepted durably as a new revision; no deploy was queued."
 	case platform.KindEnvironmentProtect:
 		return "Environment protection change accepted durably."
-	case platform.KindReleaseCreate:
-		return "Release accepted durably; the image is verified or built before it becomes ready."
 	case platform.KindBuildStop:
 		return "Build stop accepted durably; the running pack process will be cancelled."
 	case platform.KindBuildRetry:
@@ -334,7 +341,7 @@ func fenceDefinitionAdmissionTx(ctx context.Context, tx pgx.Tx, id contract.Oper
 	return nil
 }
 
-func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef, humanFactor string, webhookSecret []byte, webhookActivated *bool) error {
+func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef, artifact *resolvedArtifact, humanFactor string, webhookSecret []byte, webhookActivated *bool) error {
 	if err := fenceDefinitionAdmissionTx(ctx, tx, id, normalized, actor); err != nil {
 		return err
 	}
@@ -344,10 +351,10 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return unavailable()
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name) VALUES($1,$2)`, appID, input.Name); err != nil {
-			return platformWriteError(err, "application name already exists")
+		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name,image_repository) VALUES($1,$2,$3)`, appID, input.Name, input.ImageRepository); err != nil {
+			return platformWriteError(err, "application name or image repository already exists")
 		}
-		app := platform.App{ID: appID, Name: input.Name}
+		app := platform.App{ID: appID, Name: input.Name, ImageRepository: input.ImageRepository}
 		for index := range input.Environments {
 			spec := &input.Environments[index]
 			deployIntent := input.Deploy && index == 0
@@ -728,65 +735,6 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			}
 		}
 		return fenceDomainDNSOperationTx(ctx, tx, domainID, id)
-	case *platform.ReleaseCreateInput:
-		env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
-		if err != nil {
-			return err
-		}
-		if input.Source.Type != "image" {
-			if err := crossNodeBuildUnsupported(env, input.Source.Type); err != nil {
-				return err
-			}
-			node, err := nodeByNameTx(ctx, tx, env.BuildNodeName())
-			if err != nil {
-				return err
-			}
-			if err := s.checkPlacement(node, platform.RoleBuilder, platform.CapabilityBuildpacks); err != nil {
-				return err
-			}
-		}
-		if input.Source.Type == "directory" {
-			if _, err := platform.ResolveBuildSource(input.Source.Path, s.buildSourceRoots()); err != nil {
-				return err
-			}
-		}
-		image := input.Source.Image
-		if image == "" {
-			if input.Build == nil || input.Build.Image == "" {
-				image = "eregion/" + input.App + "-" + input.Environment + ":" + strings.TrimPrefix(string(id), "op_")[:12]
-			} else {
-				image = input.Build.Image
-			}
-		}
-		if err := platform.ValidateImage(image); err != nil {
-			return err
-		}
-		releaseID, err := platform.NewReleaseID()
-		if err != nil {
-			return unavailable()
-		}
-		source, _ := json.Marshal(input.Source)
-		var build, command []byte
-		if input.Build != nil {
-			build, _ = json.Marshal(input.Build)
-		}
-		if input.Command != nil {
-			command, _ = json.Marshal(input.Command)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_releases
-            (id,operation_id,app_id,environment_id,image,source,build,command,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'pending')`,
-			releaseID, id, envAppID(ctx, tx, env.App), env.ID, image, source, nullableJSON(build), nullableJSON(command)); err != nil {
-			return platformWriteError(err, "release could not be recorded")
-		}
-		if input.Source.Type != "image" {
-			buildID, err := insertBuildTx(ctx, tx, id, env, releaseID, env.RevisionID, input.Source, "")
-			if err != nil {
-				return err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET build_id=$2 WHERE id=$1`, releaseID, buildID); err != nil {
-				return unavailable()
-			}
-		}
 	case *platform.BuildStopInput:
 		build, err := s.buildByID(ctx, input.BuildID)
 		if err != nil {
@@ -816,11 +764,20 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return err
 		}
-		if err := s.checkDeployabilityTx(ctx, tx, env, input.ReleaseID != ""); err != nil {
+		explicitArtifact := input.ImageTag != "" || input.ImageDigest != "" || input.Image != ""
+		if explicitArtifact && artifact == nil {
+			return contract.NewFault(contract.Internal, "artifact selector was not resolved before admission", "Retry the deploy; no operation was recorded.")
+		}
+		if err := s.checkDeployabilityTx(ctx, tx, env, input.ReleaseID != "" || explicitArtifact); err != nil {
 			return err
 		}
 		releaseID := input.ReleaseID
-		if releaseID == "" {
+		if explicitArtifact {
+			releaseID, err = s.createArtifactReleaseTx(ctx, tx, id, env, artifact)
+			if err != nil {
+				return err
+			}
+		} else if releaseID == "" {
 			releaseID, err = s.createReleaseFromRevisionTx(ctx, tx, id, env, input.Ref, resolved)
 			if err != nil {
 				return err
@@ -1150,14 +1107,15 @@ func envAppID(ctx context.Context, tx pgx.Tx, app string) string {
 }
 
 // checkDeployabilityTx refuses a deployment before any build or container work
-// when the pure deployability report lists blockers. Deploycrate's gate blocks
-// on source, registry/artifact, runtime, a web process, a primary domain and a
-// managed DNS binding that is not applied. A merely unobserved record does not
-// block the first deploy, nor does a Cloudflare-proxied one; a wrong answer does. A source
-// deploy creates its artifact, and an explicit release is checked separately,
-// so artifact readiness is not a blocker here. An explicit release also carries
-// its own artifact, so it does not need the revision's source binding.
-func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platform.Environment, explicitRelease bool) error {
+// when the pure deployability report lists blockers. The gate blocks on
+// artifact identity, runtime, a web process, a primary domain and a managed DNS
+// binding that is not applied. A merely unobserved record does not block the
+// first deploy, nor does a Cloudflare-proxied one; a wrong answer does. A Git
+// deploy creates its artifact and an explicit artifact/release supplies one, so
+// artifact readiness is not a blocker here. A Git-less revision is valid when an
+// explicit artifact selector is present; a no-selector submission is refused
+// with artifact guidance when the release is created.
+func (s *Service) checkDeployabilityTx(ctx context.Context, tx pgx.Tx, env platform.Environment, explicitRelease bool, artifactPlanned ...bool) error {
 	dns := ""
 	if env.PrimaryDomain != "" {
 		var state string
@@ -1224,22 +1182,24 @@ func nullableDeploymentID(id platform.DeploymentID) any {
 // resolvedGitRef is the exact commit a submission resolved before its
 // transaction opened. The transaction checks the URL and ref against the
 // revision it reads, so a concurrent revision change cannot record a commit
-// that belongs to another source.
+// that belongs to another source. An empty SHA with a non-empty URL means the
+// revision has a Git recipe but the caller did not request a build (for
+// example an explicit artifact selector).
 type resolvedGitRef struct {
-	Kind string
-	URL  string
-	Ref  string
-	SHA  string
+	URL string
+	Ref string
+	SHA string
 }
 
 // resolveSubmissionGitRef resolves a git ref before the submission transaction
 // opens for every path that creates a release from an environment revision:
 // deploy, CI and the webhook (which already sends a commit), and the first
 // deploy requested by app or env create. A failure here creates no operation.
+// Explicit artifact selectors and existing releases do not read Git.
 func (s *Service) resolveSubmissionGitRef(ctx context.Context, normalized platform.Normalized) (*resolvedGitRef, error) {
 	switch input := normalized.Input.(type) {
 	case *platform.DeployInput:
-		if input.ReleaseID != "" {
+		if input.ReleaseID != "" || input.ImageTag != "" || input.ImageDigest != "" || input.Image != "" {
 			return nil, nil
 		}
 		env, err := s.environment(ctx, input.App, input.Environment)
@@ -1249,11 +1209,11 @@ func (s *Service) resolveSubmissionGitRef(ctx context.Context, normalized platfo
 		if env.Revision == nil {
 			return nil, nil
 		}
-		if env.Revision.Source.Kind != "git" {
-			// Record the kind so a revision that becomes git before the
-			// transaction opens conflicts instead of taking the git branch
-			// without an exact commit.
-			return &resolvedGitRef{Kind: env.Revision.Source.Kind, URL: env.Revision.Source.URL}, nil
+		if env.Revision.Source.URL == "" {
+			if input.Ref != "" {
+				return nil, contract.NewFault(contract.ValidationFailed, "--ref requires a Git build recipe", "Bind a Git source with env update --git-url, or deploy an explicit artifact with --image-tag, --image-digest, or --image.")
+			}
+			return &resolvedGitRef{}, nil
 		}
 		ref := input.Ref
 		if ref == "" {
@@ -1265,16 +1225,16 @@ func (s *Service) resolveSubmissionGitRef(ctx context.Context, normalized platfo
 			return nil, nil
 		}
 		first := &input.Environments[0]
-		if first.Source.Kind != "git" {
-			return &resolvedGitRef{Kind: first.Source.Kind, URL: first.Source.URL}, nil
+		if first.Source.URL == "" {
+			return &resolvedGitRef{}, nil
 		}
 		return s.resolveGitSourceRef(ctx, input.Name, first.Name, first.Source, first.Source.Ref)
 	case *platform.EnvironmentCreateInput:
 		if !input.Deploy {
 			return nil, nil
 		}
-		if input.Source.Kind != "git" {
-			return &resolvedGitRef{Kind: input.Source.Kind, URL: input.Source.URL}, nil
+		if input.Source.URL == "" {
+			return &resolvedGitRef{}, nil
 		}
 		return s.resolveGitSourceRef(ctx, input.App, input.Name, input.Source, input.Source.Ref)
 	}
@@ -1285,7 +1245,7 @@ func (s *Service) resolveGitSourceRef(ctx context.Context, app, environment stri
 	// A submission that already carries a commit (the CI and webhook paths) needs
 	// no repository read and no credential. It is already exact.
 	if platform.IsGitCommit(ref) {
-		return &resolvedGitRef{Kind: "git", URL: source.URL, Ref: ref, SHA: ref}, nil
+		return &resolvedGitRef{URL: source.URL, Ref: ref, SHA: ref}, nil
 	}
 	var credential []byte
 	if source.CredentialSecretName != "" {
@@ -1303,7 +1263,7 @@ func (s *Service) resolveGitSourceRef(ctx context.Context, app, environment stri
 	if err != nil {
 		return nil, err
 	}
-	return &resolvedGitRef{Kind: "git", URL: source.URL, Ref: ref, SHA: sha}, nil
+	return &resolvedGitRef{URL: source.URL, Ref: ref, SHA: sha}, nil
 }
 
 // sourceChangedDuringSubmission is the single conflict used when the revision
@@ -1317,10 +1277,13 @@ func sourceChangedDuringSubmission() error {
 // to another branch: a git source that became an image has no commit to record.
 // An explicit --ref owns the effective ref, so only a URL change conflicts then.
 func checkResolvedGitSource(resolved *resolvedGitRef, source platform.SourceBinding, refOverride string) error {
-	if resolved == nil || resolved.Kind != source.Kind {
+	if resolved == nil {
 		return sourceChangedDuringSubmission()
 	}
-	if source.Kind != "git" {
+	if source.URL == "" {
+		if resolved.URL != "" || resolved.Ref != "" || resolved.SHA != "" {
+			return sourceChangedDuringSubmission()
+		}
 		return nil
 	}
 	if resolved.URL != source.URL {
@@ -1336,62 +1299,61 @@ func checkResolvedGitSource(resolved *resolvedGitRef, source platform.SourceBind
 }
 
 // createReleaseFromRevisionTx records the pending release and build for a
-// deploy from the environment's current revision. The ref was resolved to an
-// exact commit before the transaction; the commit is recorded on both rows
-// before any build starts, and the worker only builds that commit.
+// deploy from the environment's current Git revision. The ref was resolved to
+// an exact commit before the transaction; the commit is recorded on both rows
+// before any build starts, and the worker only builds that commit. The build
+// publishes into the app's immutable private repository; an environment with no
+// Git recipe must select an explicit artifact instead.
 func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, refOverride string, resolved *resolvedGitRef) (platform.ReleaseID, error) {
 	if env.Revision == nil {
 		return "", contract.NewFault(contract.PreconditionFailed, "environment has no current revision", "Save an environment revision before deploying.")
 	}
 	state := env.Revision.RevisionState
 	source := state.Source
+	if source.URL == "" {
+		return "", contract.NewFault(contract.PreconditionFailed,
+			"environment has no Git build source and no artifact was selected",
+			"Deploy an explicit artifact with `eregion deploy "+env.App+" "+env.Name+" --image-tag TAG`, --image-digest, or --image. Use `eregion restart "+env.App+" "+env.Name+"` to reapply the serving artifact.")
+	}
 	if err := checkResolvedGitSource(resolved, source, refOverride); err != nil {
 		return "", err
 	}
-	if refOverride != "" && source.Kind != "git" {
-		return "", contract.NewFault(contract.ValidationFailed, "ref is only valid for a git source", "Omit ref when the environment revision binds an image.")
+	if refOverride != "" && source.URL == "" {
+		return "", contract.NewFault(contract.ValidationFailed, "ref is only valid for a Git build recipe", "Bind a Git source with env update --git-url, or deploy an explicit artifact.")
+	}
+	app, err := appByNameTx(ctx, tx, env.App)
+	if err != nil {
+		return "", err
+	}
+	if app.ImageRepository == "" {
+		return "", contract.NewFault(contract.PreconditionFailed, "application has no image repository", "This app predates app-level image repositories; recreate it before building an artifact.")
 	}
 	releaseID, err := platform.NewReleaseID()
 	if err != nil {
 		return "", unavailable()
 	}
-	var sourceJSON []byte
-	var buildJSON []byte
-	var buildSource platform.Source
-	commit := ""
-	switch source.Kind {
-	case "image":
-		buildSource = platform.Source{Type: "image", Image: source.Image}
-		sourceJSON, _ = json.Marshal(buildSource)
-	case "git":
-		if env.BuildNodeName() != env.Node {
-			return "", contract.NewFault(contract.PreconditionFailed, "build_node is distinct from the application node; moving the built image requires a shared registry", "Use build_node equal to the environment node, or deploy an image release.")
-		}
-		ref := refOverride
-		if ref == "" {
-			ref = source.Ref
-		}
-		if err := platform.ValidateGitSourceURL(source.URL); err != nil {
-			return "", contract.NewFault(contract.PreconditionFailed, "the environment's git source is invalid", err.Error())
-		}
-		if !platform.IsGitCommit(resolved.SHA) {
-			return "", contract.NewFault(contract.PreconditionFailed, "the git ref did not resolve to an exact commit", "Retry the deploy so the ref resolves to a full commit SHA.")
-		}
-		commit = resolved.SHA
-		buildSource = platform.Source{
-			Type: "git", URL: source.URL, Ref: ref, Path: source.ContextPath,
-			CredentialSecretName: source.CredentialSecretName,
-		}
-		sourceJSON, _ = json.Marshal(buildSource)
-		build := platform.Build{Builder: source.Builder, Env: source.BuildEnv, GoTargets: source.GoTargets, Buildpacks: source.Buildpacks}
-		buildJSON, _ = json.Marshal(build)
-	default:
-		return "", contract.NewFault(contract.PreconditionFailed, "environment source is not deployable", "Bind an image or HTTPS git source in the environment revision.")
+	if env.BuildNodeName() != env.Node {
+		return "", contract.NewFault(contract.PreconditionFailed, "build_node is distinct from the application node; moving the built image requires a shared registry", "Use build_node equal to the environment node.")
 	}
-	image := "eregion/" + env.App + "-" + env.Name + ":" + strings.TrimPrefix(string(opID), "op_")[:12]
-	if source.Kind == "image" {
-		image = source.Image
+	ref := refOverride
+	if ref == "" {
+		ref = source.Ref
 	}
+	if err := platform.ValidateGitSourceURL(source.URL); err != nil {
+		return "", contract.NewFault(contract.PreconditionFailed, "the environment's git source is invalid", err.Error())
+	}
+	if resolved == nil || !platform.IsGitCommit(resolved.SHA) {
+		return "", contract.NewFault(contract.PreconditionFailed, "the git ref did not resolve to an exact commit", "Retry the deploy so the ref resolves to a full commit SHA.")
+	}
+	commit := resolved.SHA
+	buildSource := platform.Source{
+		Type: "git", URL: source.URL, Ref: ref, Path: source.ContextPath,
+		CredentialSecretName: source.CredentialSecretName,
+	}
+	sourceJSON, _ := json.Marshal(buildSource)
+	build := platform.Build{Builder: source.Builder, Env: source.BuildEnv, GoTargets: source.GoTargets, Buildpacks: source.Buildpacks}
+	buildJSON, _ := json.Marshal(build)
+	image := app.ImageRepository + ":" + strings.TrimPrefix(string(opID), "op_")[:12]
 	if err := platform.ValidateImage(image); err != nil {
 		return "", err
 	}
@@ -1401,14 +1363,12 @@ func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, op
 		releaseID, opID, envAppID(ctx, tx, env.App), env.ID, image, sourceJSON, nullableJSON(buildJSON), commit); err != nil {
 		return "", platformWriteError(err, "release could not be recorded")
 	}
-	if source.Kind == "git" {
-		buildID, err := insertBuildTx(ctx, tx, opID, env, releaseID, env.RevisionID, buildSource, commit)
-		if err != nil {
-			return "", err
-		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET build_id=$2 WHERE id=$1`, releaseID, buildID); err != nil {
-			return "", unavailable()
-		}
+	buildID, err := insertBuildTx(ctx, tx, opID, env, releaseID, env.RevisionID, buildSource, commit)
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET build_id=$2 WHERE id=$1`, releaseID, buildID); err != nil {
+		return "", unavailable()
 	}
 	return releaseID, nil
 }
@@ -1418,10 +1378,14 @@ func (s *Service) createRetryReleaseTx(ctx context.Context, tx pgx.Tx, opID cont
 	if err != nil {
 		return err
 	}
-	image := "eregion/" + env.App + "-" + env.Name + ":" + strings.TrimPrefix(string(opID), "op_")[:12]
-	if old.Source.Type == "image" {
-		image = old.Source.Image
+	app, err := appByNameTx(ctx, tx, env.App)
+	if err != nil {
+		return err
 	}
+	if app.ImageRepository == "" {
+		return contract.NewFault(contract.PreconditionFailed, "application has no image repository", "This app predates app-level image repositories; recreate it before retrying a build.")
+	}
+	image := app.ImageRepository + ":" + strings.TrimPrefix(string(opID), "op_")[:12]
 	if err := platform.ValidateImage(image); err != nil {
 		return err
 	}
@@ -1541,7 +1505,7 @@ func (s *Service) submitFollowupOperationTx(ctx context.Context, tx pgx.Tx, kind
 	if err != nil {
 		return err
 	}
-	_, err = s.recordPlatformSubmissionTx(ctx, tx, id, normalized, actor, key, resolved, "", nil)
+	_, err = s.recordPlatformSubmissionTx(ctx, tx, id, normalized, actor, key, resolved, nil, "", nil)
 	return err
 }
 
@@ -1815,14 +1779,14 @@ func (s *Service) inventoryNodes(ctx context.Context, query platform.InventoryQu
 
 func (s *Service) inventoryApps(ctx context.Context, query platform.InventoryQuery) ([]platform.App, error) {
 	items := []platform.App{}
-	rows, err := s.pool.Query(ctx, `SELECT id,name,created_at,updated_at FROM eregion_platform_apps WHERE ($2='' OR name=$2) ORDER BY name LIMIT $1`, query.Limit, query.App)
+	rows, err := s.pool.Query(ctx, `SELECT id,name,image_repository,created_at,updated_at FROM eregion_platform_apps WHERE ($2='' OR name=$2) ORDER BY name LIMIT $1`, query.Limit, query.App)
 	if err != nil {
 		return nil, unavailable()
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var app platform.App
-		if err := rows.Scan(&app.ID, &app.Name, &app.CreatedAt, &app.UpdatedAt); err != nil {
+		if err := rows.Scan(&app.ID, &app.Name, &app.ImageRepository, &app.CreatedAt, &app.UpdatedAt); err != nil {
 			return nil, unavailable()
 		}
 		items = append(items, app)
@@ -1830,7 +1794,7 @@ func (s *Service) inventoryApps(ctx context.Context, query platform.InventoryQue
 	return items, rows.Err()
 }
 
-const environmentSelect = `SELECT e.id,a.name,e.name,e.node_name,e.protected,coalesce(e.build_node,''),e.host_port,e.candidate_port,e.container_port,
+const environmentSelect = `SELECT e.id,a.name,e.name,a.image_repository,e.node_name,e.protected,coalesce(e.build_node,''),e.host_port,e.candidate_port,e.container_port,
     e.bind_address,e.health_type,e.health_path,e.health_timeout_seconds,e.env,e.secret_refs,e.secret_revision,
     coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,''),coalesce(e.serving_release_id,''),coalesce(e.serving_deployment_id,''),
     e.health_state,e.health_detail,e.health_checked_at,
@@ -1859,7 +1823,7 @@ func scanEnvironmentRow(row pgx.Row) (platform.Environment, error) {
 	var autoDeploy, deployIntent bool
 	var secretNames, resourceNames []string
 	var revisionCreated *time.Time
-	err := row.Scan(&env.ID, &env.App, &env.Name, &env.Node, &env.Protected, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
+	err := row.Scan(&env.ID, &env.App, &env.Name, &env.ImageRepository, &env.Node, &env.Protected, &env.BuildNode, &env.HostPort, &env.CandidatePort, &env.ContainerPort,
 		&env.Bind, &env.Health.Type, &env.Health.Path, &env.Health.TimeoutSeconds, &rawEnv, &rawRefs, &env.SecretRevision,
 		&desired, &applied, &serving, &servingDeployment, &env.HealthState, &env.HealthDetail, &env.HealthCheckedAt, &env.Domains,
 		&env.PrimaryDomain, &primaryDNS, &env.PendingCleanup, &env.ArtifactReady, &revisionID, &loadedRevisionID, &revisionNumber, &operationID,
@@ -2400,12 +2364,12 @@ func appByNameForUpdateTx(ctx context.Context, tx pgx.Tx, name string) (platform
 
 func appByNameQueryTx(ctx context.Context, tx pgx.Tx, name string, forUpdate bool) (platform.App, error) {
 	var app platform.App
-	statement := `SELECT id,name,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`
+	statement := `SELECT id,name,image_repository,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`
 	if forUpdate {
 		statement += " FOR UPDATE"
 	}
 	err := tx.QueryRow(ctx, statement, name).
-		Scan(&app.ID, &app.Name, &app.CreatedAt, &app.UpdatedAt)
+		Scan(&app.ID, &app.Name, &app.ImageRepository, &app.CreatedAt, &app.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return app, contract.NewFault(contract.NotFound, "application not found", "Create the application first.")
 	}
@@ -2494,6 +2458,7 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 	}
 	switch input := normalized.Input.(type) {
 	case *platform.DeployInput:
+		explicitArtifact := input.ImageTag != "" || input.ImageDigest != "" || input.Image != ""
 		if input.ReleaseID == "" {
 			tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 			if err != nil {
@@ -2510,25 +2475,55 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 			if env.Revision == nil {
 				return preview, contract.NewFault(contract.PreconditionFailed, "environment has no current revision", "Save an environment revision before deploying.")
 			}
-			if env.Revision.Source.Kind == "git" {
-				if env.BuildNodeName() != env.Node {
-					return preview, contract.NewFault(contract.PreconditionFailed, "build_node is distinct from the application node; moving the built image requires a shared registry", "Use build_node equal to the environment node, or deploy an image release.")
-				}
-				if err := platform.ValidateGitSourceURL(env.Revision.Source.URL); err != nil {
-					return preview, contract.NewFault(contract.PreconditionFailed, "the environment's git source is invalid", err.Error())
-				}
-				ref := input.Ref
-				if ref == "" {
-					ref = env.Revision.Source.Ref
-				}
-				if err := platform.ValidateGitRef(ref); err != nil {
+			if explicitArtifact {
+				app, err := s.appByName(ctx, input.App)
+				if err != nil {
 					return preview, err
 				}
-				if !platform.IsGitCommit(strings.TrimSpace(ref)) {
-					preview.Warnings = append(preview.Warnings, "The Git ref was not resolved in this dry run; submission must verify it against the repository.")
+				selector := input.ImageTag
+				kind := "image-tag"
+				if input.ImageDigest != "" {
+					selector, kind = input.ImageDigest, "image-digest"
+				} else if input.Image != "" {
+					selector, kind = input.Image, "image"
 				}
-			} else if input.Ref != "" {
-				return preview, contract.NewFault(contract.ValidationFailed, "ref is only valid for a git source", "Omit ref when the environment revision binds an image.")
+				preview.Warnings = append(preview.Warnings,
+					fmt.Sprintf("Artifact availability is UNVERIFIED: this read-only preview does not contact the registry. The app repository is %s and the requested selector is %s %s.", app.ImageRepository, kind, selector))
+				if err := s.checkDeployabilityTx(ctx, tx, env, true); err != nil {
+					return preview, err
+				}
+				if err := s.checkPlacementByTx(ctx, tx, env.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+					return preview, err
+				}
+				preview.Steps = deploymentSteps()
+				preview.Summary = fmt.Sprintf("Resolve %s %s from the app repository %s at submission, then deploy it to %s/%s with a blue/green switch.",
+					kind, selector, app.ImageRepository, env.App, env.Name)
+				if env.ServingRelease != "" {
+					preview.Warnings = append(preview.Warnings, "The serving release stays until the candidate passes health and the public route check.")
+				}
+				preview.Warnings = append(preview.Warnings, "This read-only preview is advisory; submission rechecks current state and resolves the artifact outside the admission transaction.")
+				break
+			}
+			if env.Revision.Source.URL == "" {
+				return preview, contract.NewFault(contract.PreconditionFailed,
+					"environment has no Git build source and no artifact was selected",
+					"Deploy an explicit artifact with --image-tag, --image-digest, or --image; use `eregion restart "+env.App+" "+env.Name+"` to reapply the serving artifact.")
+			}
+			if env.BuildNodeName() != env.Node {
+				return preview, contract.NewFault(contract.PreconditionFailed, "build_node is distinct from the application node; moving the built image requires a shared registry", "Use build_node equal to the environment node.")
+			}
+			if err := platform.ValidateGitSourceURL(env.Revision.Source.URL); err != nil {
+				return preview, contract.NewFault(contract.PreconditionFailed, "the environment's git source is invalid", err.Error())
+			}
+			ref := input.Ref
+			if ref == "" {
+				ref = env.Revision.Source.Ref
+			}
+			if err := platform.ValidateGitRef(ref); err != nil {
+				return preview, err
+			}
+			if !platform.IsGitCommit(strings.TrimSpace(ref)) {
+				preview.Warnings = append(preview.Warnings, "The Git ref was not resolved in this dry run; submission must verify it against the repository.")
 			}
 			if err := s.checkDeployabilityTx(ctx, tx, env, false); err != nil {
 				return preview, err
@@ -2538,7 +2533,7 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 			}
 			preview.Warnings = append(preview.Warnings, "This read-only preview is advisory; submission rechecks current state.")
 			preview.Steps = deploymentSteps()
-			preview.Summary = fmt.Sprintf("Build %s from %s source, then deploy it to %s/%s with a blue/green switch.", env.App, env.Revision.Source.Kind, env.App, env.Name)
+			preview.Summary = fmt.Sprintf("Build %s from its Git source, then deploy it to %s/%s with a blue/green switch.", env.App, env.App, env.Name)
 			if env.ServingRelease != "" {
 				preview.Warnings = append(preview.Warnings, "The serving release stays until the candidate passes health and the public route check.")
 			}
@@ -2603,6 +2598,15 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		if err := s.checkPreviewAppAvailable(ctx, input.Name); err != nil {
 			return preview, err
 		}
+		if strings.TrimSpace(s.registryEndpoint) != "" {
+			if err := platform.ValidateAppImageRepositoryForRegistry(input.ImageRepository, s.registryEndpoint); err != nil {
+				return preview, err
+			}
+		} else {
+			return preview, contract.NewFault(contract.PreconditionFailed,
+				"the node has no configured private registry endpoint",
+				"Start the worker with its managed loopback registry endpoint before creating an app image repository.")
+		}
 		if len(input.Environments) == 0 {
 			preview.Summary = "Create application " + input.Name + " without an environment."
 			break
@@ -2636,8 +2640,8 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 			if spec.Domain != "" {
 				preview.Steps = append(preview.Steps, "record the primary domain binding for "+spec.Name+" before any first deploy")
 			}
-			if spec.BuildNode != "" && spec.BuildNode != spec.Node && spec.Source.Kind == "git" {
-				preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
+			if spec.BuildNode != "" && spec.BuildNode != spec.Node && spec.Source.URL != "" {
+				preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; the build path refuses it until registry transfer is configured.")
 			}
 		}
 		preview.Summary += "."
@@ -2683,8 +2687,8 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 		}
 		if input.BuildNode != "" {
 			preview.Summary += " Builds run on builder node " + input.BuildNode + "."
-			if input.BuildNode != input.Node && input.Source.Kind == "git" {
-				preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; release.create refuses that path until registry transfer is configured.")
+			if input.BuildNode != input.Node && input.Source.URL != "" {
+				preview.Warnings = append(preview.Warnings, "A distinct build node needs a shared registry to move the image to the application node; the build path refuses it until registry transfer is configured.")
 			}
 		}
 		if input.Deploy {
@@ -2744,22 +2748,6 @@ func (s *Service) Preview(ctx context.Context, actor contract.Actor, normalized 
 			preview.Summary = "Detach managed resource " + input.Resource + " from " + env.App + "/" + env.Name + "; its container and named volumes are retained and no deploy is queued."
 		} else {
 			preview.Summary = "Attach managed resource " + input.Resource + " to " + env.App + "/" + env.Name + " as desired state; deployment stays blocked until the resource reports ready."
-		}
-	case *platform.ReleaseCreateInput:
-		preview.Summary = "Record release from " + input.Source.Type + " source."
-		if input.Source.Type == "image" {
-			preview.Steps = []string{"verify image on node", "mark release ready"}
-		} else {
-			env, err := s.environment(ctx, normalized.Target.App, normalized.Target.Environment)
-			if err != nil {
-				return preview, err
-			}
-			if err := crossNodeBuildUnsupported(env, input.Source.Type); err != nil {
-				return preview, err
-			}
-			preview.Steps = []string{"prepare source", "pack build", "verify image", "mark release ready"}
-			preview.Summary = "Build on " + env.BuildNodeName() + ", then mark the release ready."
-			preview.Warnings = append(preview.Warnings, "Buildpacks execution requires pack on the environment's builder-capable node.")
 		}
 	case *platform.NodeCheckInput:
 		preview.Steps = []string{"check docker", "check pack"}
@@ -2983,13 +2971,13 @@ func (s *Service) checkPreviewEnvironmentAvailable(ctx context.Context, app, env
 // checkPreviewDeploySource mirrors the deterministic refusals of a first
 // deploy from a new revision, before the CLI writes any vault value.
 func checkPreviewDeploySource(spec *platform.EnvironmentSpec, deploy bool) error {
-	if !deploy || spec.Source.Kind != "git" {
+	if !deploy || spec.Source.URL == "" {
 		return nil
 	}
 	if spec.BuildNode != "" && spec.BuildNode != spec.Node {
 		return contract.NewFault(contract.PreconditionFailed,
 			"build_node is distinct from the application node; moving the built image requires a shared registry",
-			"Use build_node equal to the environment node, or create with --no-deploy and deploy an image release.")
+			"Use build_node equal to the environment node, or create with --no-deploy and deploy an explicit artifact.")
 	}
 	return nil
 }
@@ -3061,6 +3049,21 @@ func (s *Service) releaseByID(ctx context.Context, id platform.ReleaseID) (platf
 		return release, unavailable()
 	}
 	return release, nil
+}
+
+// appByName reads one application record, including its immutable private
+// image repository, without opening a write transaction.
+func (s *Service) appByName(ctx context.Context, name string) (platform.App, error) {
+	var app platform.App
+	err := s.pool.QueryRow(ctx, `SELECT id,name,image_repository,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`, name).
+		Scan(&app.ID, &app.Name, &app.ImageRepository, &app.CreatedAt, &app.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return app, contract.NewFault(contract.NotFound, "application not found", "Create the application first.")
+	}
+	if err != nil {
+		return app, unavailable()
+	}
+	return app, nil
 }
 
 func (s *Service) node(ctx context.Context, name string) (platform.Node, error) {

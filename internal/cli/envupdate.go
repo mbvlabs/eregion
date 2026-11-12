@@ -159,27 +159,25 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 		}
 	}()
 	options := [][2]string{
-		{"HTTPS git repository", "git"},
-		{"Existing image", "image"},
+		{"Keep or set a Git build recipe", "git"},
+		{"No Git source (deploy explicit artifacts)", "none"},
 	}
-	if base.Kind == "" {
-		options = append([][2]string{{"No source (deployability gap)", ""}}, options...)
+	if base.URL == "" {
+		options = [][2]string{{"No Git source (deploy explicit artifacts)", "none"}, {"Set a Git build recipe", "git"}}
 	}
-	kind, err := ui.ChooseDefault("Source", "How this environment gets its application image", options, base.Kind)
+	kind, err := ui.ChooseDefault("Git build source", "Artifacts are selected explicitly at deploy time; there is no persistent image mode", options, func() string {
+		if base.URL == "" {
+			return "none"
+		}
+		return "git"
+	}())
 	if err != nil {
 		return platform.SourceBinding{}, nil, "", err
 	}
 	switch kind {
-	case "":
+	case "none":
 		keep = true
 		return platform.SourceBinding{}, nil, "", nil
-	case "image":
-		image, err := askValidated("Container image", "registry/repository:tag or digest", base.Image, platform.ValidateImage)
-		if err != nil {
-			return platform.SourceBinding{}, nil, "", err
-		}
-		keep = true
-		return platform.SourceBinding{Kind: "image", Image: image}, nil, "", nil
 	case "git":
 		url, err := askValidated("HTTPS git repository", "No credentials in the URL; the node checks its allowed hosts", base.URL, validateGitURLShape)
 		if err != nil {
@@ -221,10 +219,10 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 			return platform.SourceBinding{}, nil, "", err
 		}
 		source := platform.CloneRevisionState(platform.RevisionState{Source: base}).Source
-		if base.Kind != "git" {
+		if base.URL == "" {
 			source = platform.SourceBinding{}
 		}
-		source.Kind, source.URL, source.Ref, source.CredentialSecretName = "git", url, ref, name
+		source.URL, source.Ref, source.CredentialSecretName = url, ref, name
 		source.ContextPath, source.Builder = contextPath, builder
 		if err := guidedBuildpacks(&source); err != nil {
 			return platform.SourceBinding{}, nil, "", err
@@ -396,10 +394,18 @@ func validateOptionalSecretName(value string) error {
 }
 
 func sourceEqual(a, b platform.SourceBinding) bool {
-	return a.Kind == b.Kind && a.URL == b.URL && a.Ref == b.Ref &&
+	return a.URL == b.URL && a.Ref == b.Ref &&
 		a.CredentialSecretName == b.CredentialSecretName && a.ContextPath == b.ContextPath &&
-		a.Builder == b.Builder && a.Image == b.Image && maps.Equal(a.BuildEnv, b.BuildEnv) &&
-		slices.Equal(a.GoTargets, b.GoTargets) && reflect.DeepEqual(a.Buildpacks, b.Buildpacks)
+		a.Builder == b.Builder && len(a.BuildEnv) == len(b.BuildEnv) &&
+		slices.Equal(a.GoTargets, b.GoTargets) && reflect.DeepEqual(a.Buildpacks, b.Buildpacks) &&
+		func() bool {
+			for key, value := range a.BuildEnv {
+				if b.BuildEnv[key] != value {
+					return false
+				}
+			}
+			return true
+		}()
 }
 
 func runtimeEqual(a, b platform.RuntimeSpec) bool {
@@ -438,13 +444,11 @@ func sourceDiff(old, new platform.SourceBinding) []string {
 			out = append(out, "source."+name+": "+displayValue(oldValue)+" → "+displayValue(newValue))
 		}
 	}
-	field("kind", old.Kind, new.Kind)
 	field("url", old.URL, new.URL)
 	field("ref", old.Ref, new.Ref)
 	field("credential_secret_name", old.CredentialSecretName, new.CredentialSecretName)
 	field("context_path", old.ContextPath, new.ContextPath)
 	field("builder", old.Builder, new.Builder)
-	field("image", old.Image, new.Image)
 	if !maps.Equal(old.BuildEnv, new.BuildEnv) {
 		out = append(out, "source.build_env changed")
 	}

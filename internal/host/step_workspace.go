@@ -16,11 +16,12 @@ import (
 // after migrations exist. It only runs when an explicit workspace name was
 // supplied; an apply without the name never guesses or assigns an identity.
 type workspaceStep struct {
-	cfg      Config
-	database Database
+	cfg          Config
+	database     Database
+	hostIdentity *controlplane.RegistryHostIdentity
 }
 
-func (s *workspaceStep) ID() string { return "host-workspace-v1" }
+func (s *workspaceStep) ID() string { return "host-workspace-v2" }
 func (s *workspaceStep) Describe() string {
 	return "Record the portable workspace identity in PostgreSQL"
 }
@@ -30,17 +31,36 @@ func (s *workspaceStep) configPath() string {
 	return filepath.Join(s.cfg.Layout.ConfigDir, "node.json")
 }
 
+func (s *workspaceStep) registryHostIdentity() (controlplane.RegistryHostIdentity, error) {
+	if s.hostIdentity != nil {
+		if err := s.hostIdentity.Validate(); err != nil {
+			return controlplane.RegistryHostIdentity{}, err
+		}
+		return *s.hostIdentity, nil
+	}
+	return BootstrapRegistryIdentity(s.cfg)
+}
+
 func (s *workspaceStep) Inputs() ([]byte, error) {
+	hostIdentity, err := s.registryHostIdentity()
+	if err != nil {
+		return nil, err
+	}
 	return canonicalInput(struct {
-		Node      string `json:"node"`
-		Workspace string `json:"workspace"`
-		Role      Role   `json:"role"`
-	}{s.cfg.Node, s.cfg.Workspace, s.cfg.Role})
+		Node         string                            `json:"node"`
+		Workspace    string                            `json:"workspace"`
+		Role         Role                              `json:"role"`
+		RegistryHost controlplane.RegistryHostIdentity `json:"registry_host"`
+	}{s.cfg.Node, s.cfg.Workspace, s.cfg.Role, hostIdentity})
 }
 
 func (s *workspaceStep) Check(ctx context.Context, _ engine.Runtime) (engine.CheckResult, error) {
 	if s.database == nil {
 		return engine.CheckResult{}, contractError("no database adapter is configured for the workspace identity")
+	}
+	hostIdentity, err := s.registryHostIdentity()
+	if err != nil {
+		return engine.CheckResult{}, err
 	}
 	identity, err := s.database.ReadWorkspace(ctx, s.cfg.DatabaseURL)
 	if err != nil {
@@ -52,6 +72,16 @@ func (s *workspaceStep) Check(ctx context.Context, _ engine.Runtime) (engine.Che
 	if identity.Name != s.cfg.Workspace {
 		return engine.CheckResult{}, workspaceNameConflict(identity.Name, s.cfg.Workspace)
 	}
+	if identity.RegistryHost == nil {
+		return engine.CheckResult{}, contract.NewFault(contract.PreconditionFailed,
+			"the workspace has no verified registry host binding",
+			"This workspace predates the physical-host binding; it remains unverified and cannot be mutated. Use a fresh installation.")
+	}
+	if !identity.RegistryHost.Equal(hostIdentity) {
+		return engine.CheckResult{}, contract.NewFault(contract.Conflict,
+			"this physical host is not the workspace's bound registry host",
+			"Use the original bootstrap host; node names alone are not sufficient.")
+	}
 	mirrorOK, err := s.mirrorMatches(identity)
 	if err != nil {
 		return engine.CheckResult{}, err
@@ -59,7 +89,7 @@ func (s *workspaceStep) Check(ctx context.Context, _ engine.Runtime) (engine.Che
 	if !mirrorOK {
 		return incomplete("the node configuration does not mirror workspace " + identity.Name)
 	}
-	return complete("workspace " + identity.Name + " (" + identity.ID + ") is configured")
+	return complete("workspace " + identity.Name + " (" + identity.ID + ") is configured and bound to this physical host")
 }
 
 func (s *workspaceStep) mirrorMatches(identity controlplane.WorkspaceIdentity) (bool, error) {
@@ -78,7 +108,11 @@ func (s *workspaceStep) Apply(ctx context.Context, _ engine.Runtime, _ engine.Re
 	if s.database == nil {
 		return engine.ApplyResult{}, contractError("no database adapter is configured for the workspace identity")
 	}
-	identity, err := s.database.AssignWorkspace(ctx, s.cfg.DatabaseURL, s.cfg.Workspace)
+	hostIdentity, err := s.registryHostIdentity()
+	if err != nil {
+		return engine.ApplyResult{}, err
+	}
+	identity, err := s.database.AssignWorkspace(ctx, s.cfg.DatabaseURL, s.cfg.Workspace, hostIdentity)
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
@@ -86,7 +120,7 @@ func (s *workspaceStep) Apply(ctx context.Context, _ engine.Runtime, _ engine.Re
 		return engine.ApplyResult{}, err
 	}
 	return engine.ApplyResult{
-		Notes: []string{"workspace " + identity.Name + " is configured; the node configuration mirrors its portable ID"},
+		Notes: []string{"workspace " + identity.Name + " is configured and bound to this physical host; the node configuration mirrors its portable ID"},
 		Result: map[string]any{
 			"workspace": identity.Name, "workspace_id": identity.ID, "configured": true,
 		},
@@ -136,6 +170,7 @@ func workspaceNameConflict(configured, requested string) error {
 func (s *workspaceStep) Diff(context.Context, engine.Runtime) ([]string, error) {
 	return []string{
 		"+ assign the immutable portable workspace identity " + s.cfg.Workspace,
+		"+ bind the workspace to this physical registry host's public SSH key and canonical state directory",
 		"+ mirror its generated ID and name in " + s.configPath(),
 	}, nil
 }

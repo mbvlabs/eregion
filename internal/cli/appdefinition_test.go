@@ -25,13 +25,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const testDefinition = `version = 1
+const testDefinition = `version = 2
 app = "api"
 node = "main"
 secret_names = ["DATABASE_URL"]
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = "main"
 credential_secret = "GIT_READ_TOKEN"
@@ -156,12 +155,10 @@ func TestDefinitionFileAndFlagsBuildTheSameFirstRevision(t *testing.T) {
 
 func TestDefinitionFileCarriesMultipleDomains(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "eregion.toml")
-	raw := `version = 1
+	raw := `version = 2
 app = "api"
 node = "main"
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 [environments.production]
 [[environments.production.domains]]
 name = "api.example.com"
@@ -201,12 +198,11 @@ check_path = "/readyz"
 // the document, and the new environment is unprotected by default.
 func TestEnvironmentCreateFromSharedRecipeNeedsNoNamedOverride(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "eregion.toml")
-	raw := `version = 1
+	raw := `version = 2
 app = "api"
 node = "main"
 
 [source]
-kind = "git"
 url = "https://github.com/acme/api"
 ref = "main"
 
@@ -241,7 +237,7 @@ APP_ENV = "shared"
 func TestDefinitionFileRejectsSecretValuesAndConflictingFlags(t *testing.T) {
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "secret.toml")
-	if err := os.WriteFile(secretPath, []byte("version = 1\n[secrets]\nDATABASE_URL = \"postgres://user:hunter2@example/db\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(secretPath, []byte("version = 2\n[secrets]\nDATABASE_URL = \"postgres://user:hunter2@example/db\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cmd := definitionCommand(t, setupApp)
@@ -588,6 +584,7 @@ func definitionBackendForEnvironment(t *testing.T, current platform.Environment)
 	}
 	return &definitionInventoryBackend{inventory: map[string]json.RawMessage{
 		"environments": json.RawMessage(`{"items":[` + string(rawEnv) + `]}`),
+		"apps":         json.RawMessage(`{"items":[{"id":"app_1","name":"` + current.App + `","image_repository":"` + current.App + `"}]}`),
 	}}
 }
 
@@ -605,20 +602,18 @@ func resourceDefinitionEnvironment() platform.Environment {
 		App: "api", Name: "production", Node: "main",
 		RevisionID: platform.RevisionID("erv_cccccccccccccccccccccccccccccccc"),
 		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-			Source:  platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+			Source:  platform.SourceBinding{URL: "https://github.com/acme/api"},
 			Runtime: platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
 			Config:  map[string]string{"A": "1"},
 		}},
 	}
 }
 
-const resourceDefinition = `version = 1
+const resourceDefinition = `version = 2
 app = "api"
 node = "main"
 
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 
 [config]
 A = "1"
@@ -673,14 +668,12 @@ func TestDefinitionEnvironmentPlannerKeepsResourceDeclarations(t *testing.T) {
 }
 
 func TestDefinitionEnvironmentPlannerKeepsEmptyCollectionRemovals(t *testing.T) {
-	raw := `version = 1
+	raw := `version = 2
 app = "api"
 node = "main"
 secret_names = []
 resources = []
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 [config]
 `
 	current := resourceDefinitionEnvironment()
@@ -742,13 +735,11 @@ func TestDefinitionCreateAttachesOnlyAttachTrueResources(t *testing.T) {
 func TestAppCreateFromFileDryRunDoesNotWriteSecrets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "eregion.toml")
-	raw := `version = 1
+	raw := `version = 2
 app = "api"
 node = "main"
 secret_names = ["DATABASE_URL"]
 [source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 
 [[resources]]
 name = "db"
@@ -810,7 +801,7 @@ command = ["redis-cli", "ping"]
 
 func TestAppExportRejectsUnknownRevisionResource(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-		Source:    platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
+		Source:    platform.SourceBinding{URL: "https://github.com/acme/api"},
 		Resources: []string{"db"},
 	}}
 	current := platform.Environment{App: "api", Name: "production", Node: "main", Revision: revision}
@@ -857,21 +848,77 @@ func TestResourceApplyRejectsDuplicateMountDestination(t *testing.T) {
 	}
 }
 
+func TestAppExportUsesAuthoritativeCustomRepository(t *testing.T) {
+	current := platform.Environment{
+		App: "api", Name: "production", Node: "main",
+		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
+			Source:    platform.SourceBinding{URL: "https://github.com/acme/api"},
+			Runtime:   platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
+			Processes: []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+		}},
+	}
+	rawEnv, _ := json.Marshal(current)
+	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{
+		"environments": json.RawMessage(`{"items":[` + string(rawEnv) + `]}`),
+		"apps":         json.RawMessage(`{"items":[{"id":"app_1","name":"api","image_repository":"mbvlabs/custom-api"}]}`),
+	}}
+	a := &app{secrets: &secrets.Registry{}, backend: backend}
+	cmd := &cobra.Command{Use: "export"}
+	cmd.Flags().String("out", "", "out")
+	res, err := a.appExport(cmd, []string{"api", "production"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(res.data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data struct {
+		Document string `json:"document"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(data.Document, `image_repository = "mbvlabs/custom-api"`) {
+		t.Fatalf("export did not use the authoritative repository:\n%s", data.Document)
+	}
+}
+
+func TestAppExportFailsWhenAuthoritativeAppLookupIsMissing(t *testing.T) {
+	current := platform.Environment{
+		App: "api", Name: "production", Node: "main",
+		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
+			Source:    platform.SourceBinding{URL: "https://github.com/acme/api"},
+			Runtime:   platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
+			Processes: []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
+		}},
+	}
+	rawEnv, _ := json.Marshal(current)
+	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{
+		"environments": json.RawMessage(`{"items":[` + string(rawEnv) + `]}`),
+	}}
+	a := &app{secrets: &secrets.Registry{}, backend: backend}
+	cmd := &cobra.Command{Use: "export"}
+	if _, err := a.appExport(cmd, []string{"api", "production"}); err == nil || contract.Classify(err).Code != contract.NotFound {
+		t.Fatalf("missing app identity = %v, want not_found", err)
+	}
+}
+
 func TestAppExportProducesARoundTrippableDefinition(t *testing.T) {
 	revision := &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
 		Source: platform.SourceBinding{
-			Kind: "git", URL: "https://github.com/acme/api", Ref: "main", BuildEnv: map[string]string{"BP_TEST": "yes"},
+			URL: "https://github.com/acme/api", Ref: "main",
 		},
-		Runtime: platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
 		Processes: []platform.ProcessSpec{
 			{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080},
 		},
 		Config:      map[string]string{"APP_ENV": "production"},
 		SecretNames: []string{"DATABASE_URL"},
 		Resources:   []string{"db"},
+		Runtime:     platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
 		AutoDeploy:  true, WebhookSecretName: "HOOK",
 	}}
-	current := platform.Environment{App: "api", Name: "production", Node: "main", BuildNode: "builder", Revision: revision}
+	current := platform.Environment{App: "api", Name: "production", ImageRepository: "mbvlabs/api", Node: "main", BuildNode: "builder", Revision: revision}
 	rawEnv, _ := json.Marshal(current)
 	rawDomains, _ := json.Marshal(map[string]any{"items": []platform.DomainBinding{
 		{Domain: "api.example.com", App: "api", Environment: "production", Primary: true, CheckPath: "/readyz"},
@@ -899,6 +946,7 @@ func TestAppExportProducesARoundTrippableDefinition(t *testing.T) {
 		"environments": json.RawMessage(`{"items":[` + string(rawEnv) + `]}`),
 		"domains":      rawDomains,
 		"resources":    rawResources,
+		"apps":         json.RawMessage(`{"items":[{"id":"app_1","name":"api","image_repository":"mbvlabs/api"}]}`),
 	}}
 	cmd := &cobra.Command{Use: "export"}
 	cmd.Flags().String("out", "", "out")

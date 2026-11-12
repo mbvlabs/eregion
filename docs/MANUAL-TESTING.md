@@ -34,6 +34,97 @@ The reported Rails Docker/containerd export failure, worker-lease failures,
 preview/admission discrepancies and stale observations remain separate findings
 until a cause-specific fix is verified; publication alone does not close them.
 
+## 2026-11-12 — beta.4 Rails Buildpacks export investigation
+
+Operator-supplied evidence on `thelab/main`, Docker 29.1.3 with the containerd
+image store, follows the beta.4 failure recorded in the Rails fixture handoff.
+This is export diagnosis, not a successful Buildpacks deployment. Execution is
+tracked in LABS-357.
+
+- **Fail:** platform-filtered save of `heroku/heroku:24` reports no suitable
+  export target, while platform inspection selects its amd64 child and
+  unfiltered save returns successfully.
+- **Incomplete export:** the operator's streamed unfiltered archive listing
+  contains the index, amd64 manifest and attestation-related blobs, but lacks
+  the exact amd64 manifest's required config and both compressed layer blobs.
+  Those requirements were checked against the immutable public registry
+  manifest. Successful unfiltered save is not proof of a complete image.
+- **Failed repair attempt:** with explicit operator authorization, pulling
+  `heroku/heroku@sha256:9de81d37c1fc00db948739da7ad3523d42c84c9fa27f1685fca0b0ff006081c7`
+  for `linux/amd64` succeeded. Filtered save still failed for both the original
+  tag and that exact child reference. Neither pulling nor child substitution
+  is a verified remedy.
+- **Not run:** another application deployment, Rails database release command,
+  candidate health and public HTTPS qualification after a fix. No image
+  deletion, daemon restart or storage-backend change was performed in this
+  investigation. No new production health observation is inferred from these
+  image-only commands.
+
+The archive is demonstrably incomplete; the internal cause of the missing
+export content remains unverified. Keep a source-level alternative and its
+offline checks separate from authorized real-host acceptance.
+
+## 2026-11-12 — registry-backed Buildpacks publish candidate
+
+This candidate replaces the failing local-daemon export path for Git
+Buildpacks releases with `pack --publish` into the existing private registry.
+It has offline, unit and source-level evidence only. The build, deployment,
+Rails release command, candidate health, public HTTPS response, retention
+execution and fresh-server installation are **not run** here; the beta.4
+investigation above remains the operator's failure evidence.
+
+| Changed surface | Required candidate evidence |
+| --- | --- |
+| Published Git build | On the authorized fresh beta.5 server, build a Git application (including the Rails/Heroku builder fixture) with Docker 29 containerd storage. Verify pack publishes the application image to the private registry, uses the transient owned bridge and registry container without host networking or a daemon insecure-registry change, and does not perform the failing local run-image export. Verify the build node architecture is explicit for both the default Paketo profile and an explicit builder. |
+| Immutable release identity | Verify the ready release records the canonical configured-loopback `repository@sha256:<manifest>` in `image`, the Docker config digest in `image_id`, and the exact Git commit. A local tag alone must not pass the Pack step's `Check`; a pre-existing unrelated tag must not qualify. |
+| Ready-image recovery | Remove only the local Docker materialization of a ready Git release, then deploy and roll back to it. Verify the node pulls the recorded canonical digest and the resulting config ID equals the recorded `image_id`; a deliberate mismatch must fail without rewriting the release or accepting a mutable tag. |
+| Promotion | Promote a registry-backed staging release and verify production copies both the canonical reference and config ID; no rebuild occurs. |
+| Cancellation and crash recovery | Cancel a published build and interrupt one between registry publication and the local completion tag. Verify lifecycle containers and only the owned network's registry attachment are cleaned, the shared registry stays running, a stale owned network is removed on retry, and the recovered Pack step returns the exact commit and canonical digest. |
+| Retention boundaries | With the existing D30 planner, verify protected serving and rollback manifests remain when Docker `RepoDigests`/local image metadata are absent or a tag moves, and an eligible unprotected artifact is removable ordinarily. Confirm no blanket prune or immediate removal of retained artifacts is introduced. |
+
+Publication is not evidence that this table passed. The fresh target,
+database, deployment and retention execution require separate authorization;
+the unchanged live target must not be used for this candidate.
+
+## Beta.5 app repository and explicit artifact acceptance
+
+This section describes the beta.5 candidate contract; it is **not** a beta.5
+pass record and no new live target is authorized here. The operator-supplied
+beta.4 report at
+`/home/mbv/work/eregion-beta-one/deploy/beta4-test-results.md` remains the
+reference for the earlier operator evidence: supported definition plan/apply
+with old/new diff, the harmless staging marker deploy, definition-driven PR DNS
+and isolated PR deployment, deferred secret-consuming resource bootstrap,
+automation export/reapply without secret values, and refreshed TLS/public
+observations. That report also records the unresolved node-task retry
+correlation behind an unrelated build and notes that a fresh master-push
+webhook delivery was not retested. It does **not** establish the historical
+worker-lease root cause, and this candidate does not claim that cause fixed.
+
+| Changed surface | Required candidate evidence |
+| --- | --- |
+| App repository | On a fresh beta.5 server, create an app with `--image-repository mbvlabs/<app>` and without a Git source. Verify the returned/exported repository is the actual durable value, an omitted value defaults to the app slug, a second app cannot claim the same path, and no environment create/update or TOML override can change it. |
+| Admission composition | Exercise private `--image-tag`/`--image-digest` submissions through the zero-worker node API and the SSH node app service. Verify both load the strict managed loopback registry endpoint even with no River worker, classify a full reference to that endpoint as private rather than external, and fail app creation/canonical overflow closed when the managed endpoint is missing. Offline discovery remains available without registry configuration. Verify a fresh bootstrap writes full node name/state fields to node.json after the binary and before the first API/worker start, so the first worker start succeeds without a retry. |
+| Git-less app and deploy | Create an image-only app without `--deploy`; verify no first deploy is queued. Attempt an explicit create-and-deploy without Git/artifact and verify it fails before any app/environment/release row or vault write. Run `deploy` with no selector and verify the clear artifact-selection guidance rather than a latest/newest/serving guess. |
+| Selector admission | Push a local image with `eregion image push --app <app>` and verify the node resolves the durable app repository. Deploy `--image-tag`, then repeat with `--image-digest` and a fully qualified `--image`. Verify selector flags are mutually exclusive, no implicit latest exists, a full reference to this private registry with another repository is refused, and an external public digest from a different repository is admitted and pulled anonymously by canonical manifest. |
+| Upload identity fence | Delete/recreate the app (or same-name app with a new ID) while an upload is paused before payload read. Verify the upload refuses before archive bytes or Docker load/push, a paused push blocks app and last-environment final metadata deletion, and the reverse lock order leaves no deletion rows. Contend each lock with no payload read; after an error/cancel, verify both locks release only after the helper stops. |
+| Physical registry-host binding | On first fresh workspace assignment, verify the singleton records the main node name, public SSH host-key type/SHA256 fingerprint and canonical node state directory atomically. Replay with identical values succeeds; a different name, fingerprint, state directory or second host refuses. A pre-binding workspace stays unverified and upload/final deletion refuse without backfill. Cross-host tests run only with an authorized disposable DSN and no Docker. |
+| External metadata safety | Resolve a public reference through an anonymous token realm. Verify HTTP downgrade, redirects to loopback/link-local/private hosts, localhost/private-IP realms, DNS answers that include private addresses, userinfo realms, and environment proxies are refused before metadata use. Offline tests only; no external network call. |
+| Pull credential isolation | Set a sentinel `HOME`, `DOCKER_CONFIG` and credential helper on the node user. Materialize an admitted artifact and verify the child Docker process receives an explicit private empty config and never reads the ambient config/helper. A missing isolated config fails closed instead of falling back. |
+| Canonical repository bound | Create an app repository at the maximum private-path length with the actual configured registry endpoint. Verify creation is refused before any app row when the canonical `endpoint/repository@sha256:…` reference would exceed the 255-character release image bound, and a boundary-fitting repository succeeds. |
+| Pinned replay | Move the tag after acceptance and deploy/replay the same idempotency key during a registry outage. Verify the replay returns the original operation without registry I/O, the release keeps the originally admitted manifest and config digest, and a new key resolves the new tag. Recheck app/repository/environment placement after resolution; a concurrent placement change must conflict without a release row. |
+| Preview | Run `deploy --image-tag --dry-run --json`. Verify the app repository and selector are shown, availability is explicitly unverified, known runtime/process/domain/DNS/deployability blockers still appear, and no registry read, acceptance, vault write or artifact reservation occurs. Replay with the recorded key still fences the hash early. |
+| Worker identity | Delete only the local materialization of an admitted artifact, then deploy/restart it. Verify the worker pulls the pinned canonical digest, checks the config digest against the admitted `image_id`, then marks the release ready; a config-digest mismatch fails with the old release still serving and no tag fallback, rebuild or mirror. |
+| Retained foundation | Recheck the reviewed registry publish/bridge endpoint identity and node-effect ownership fences. In particular, a ready-image `docker pull` observation remains a node effect whose LIVE or UNKNOWN status retains deployment ownership until safely observed. |
+| Removed legacy admission | Verify `platform.release.create` is not a registered action and no arbitrary destination or pull-toggle route can create a weaker artifact path. Internal build retry still works. |
+| Retention | Verify all environments sharing an app repository protect accepted pending/serving/rollback manifest digests and moved tags under the unchanged D30 policy, with exact repository parsing and no external-registry deletion. |
+| Definition and export | Apply a schema-2 definition with a Git `[source]`, an empty/absent source, and root `image_repository`. Verify schema-1 documents and `source.kind`/`source.image` are rejected without aliases, an omitted or empty source clears an existing Git recipe, export omits a Git-less source, enabled automation without Git is refused rather than silently retaining an enabled webhook, `app export` writes the actual repository, and environment apply cannot change it. |
+| Git-less CLI default | Create an image-only app via flags, definition file and interactive/non-TTY paths without `--no-deploy`. Verify no first deploy is requested, while an explicit API `deploy: true` without Git/artifact still fails before any partial commit. A missing app inventory lookup for export must fail closed, never fabricate a default-slug repository. |
+
+The beta.5 PostgreSQL admission/replay/placement regressions are gated on an
+explicitly authorized disposable DSN; they were compiled but not run without
+that authorization. This is not evidence that they passed.
+
 ## Alpha.1 qualification
 
 The operator explicitly confirmed that all alpha.1 testing is done, including

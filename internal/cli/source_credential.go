@@ -33,7 +33,7 @@ func validateGitCredentialRole(name string, runtimeSecretNames []string, webhook
 // are skipped.
 func validateEnvironmentGitCredentialRoles(specs []platform.EnvironmentSpec) error {
 	for _, spec := range specs {
-		if spec.Source.Kind != "git" {
+		if spec.Source.URL == "" {
 			continue
 		}
 		if err := validateGitCredentialRole(spec.Source.CredentialSecretName, spec.SecretNames, spec.WebhookSecretName); err != nil {

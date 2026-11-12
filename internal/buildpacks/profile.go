@@ -8,6 +8,20 @@ type Profile struct {
 	RunImage string
 }
 
+// TargetPlatform renders the explicit OCI platform for a build node. Pack and
+// the lifecycle must select the build node's own architecture for both the
+// pinned default builder and an explicit builder such as Heroku's: a remote
+// publish without a platform can otherwise pick the builder index's default
+// architecture instead of this node's.
+func TargetPlatform(architecture string) (string, error) {
+	switch architecture {
+	case "amd64", "arm64":
+		return "linux/" + architecture, nil
+	default:
+		return "", fmt.Errorf("Buildpacks publishing is not available for host architecture %s", architecture)
+	}
+}
+
 // ProfileForArchitecture selects the reference's pinned noble images. It must
 // be called on the build node, not the operator's machine.
 func ProfileForArchitecture(architecture string) (Profile, error) {

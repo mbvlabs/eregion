@@ -259,8 +259,8 @@ func TestWireGuardFixtureNodeTaskOutlivesItsCaller(t *testing.T) {
 		cancel()
 	}()
 	_, err := client.Call(ctx, runRequest(t, exec, 800), nil)
-	if !node.IsStreamLost(err) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("a cancelled call is not an explicit unknown outcome: %v", err)
+	if !node.IsCallCancelled(err) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled call is not an explicit caller-cancel outcome: %v", err)
 	}
 	awaitCondition(t, 20*time.Second, "the detached effect", func() bool { return fixtureEffects(t, fixture, exec) == 1 })
 }

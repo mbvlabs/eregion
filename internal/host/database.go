@@ -48,9 +48,9 @@ type Database interface {
 	// unconfigured installation.
 	ReadWorkspace(context.Context, string) (controlplane.WorkspaceIdentity, error)
 	// AssignWorkspace is the explicit one-time assignment used by apply
-	// --workspace. Replaying the same name returns the existing identity; a
-	// different name is a conflict.
-	AssignWorkspace(context.Context, string, string) (controlplane.WorkspaceIdentity, error)
+	// --workspace. Replaying the same name and registry-host binding returns
+	// the existing identity; a different name or physical host is a conflict.
+	AssignWorkspace(context.Context, string, string, controlplane.RegistryHostIdentity) (controlplane.WorkspaceIdentity, error)
 }
 
 // PostgresDatabase uses controlplane.Open/PlanMigrations/Migrate.
@@ -100,13 +100,13 @@ func (PostgresDatabase) ReadWorkspace(ctx context.Context, dsn string) (controlp
 	return identity, nil
 }
 
-func (PostgresDatabase) AssignWorkspace(ctx context.Context, dsn, name string) (controlplane.WorkspaceIdentity, error) {
+func (PostgresDatabase) AssignWorkspace(ctx context.Context, dsn, name string, registryHost controlplane.RegistryHostIdentity) (controlplane.WorkspaceIdentity, error) {
 	pool, err := controlplane.Open(ctx, dsn)
 	if err != nil {
 		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
 	}
 	defer pool.Close()
-	identity, err := controlplane.AssignWorkspace(ctx, pool, name)
+	identity, err := controlplane.AssignWorkspace(ctx, pool, name, registryHost)
 	if err != nil {
 		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
 	}

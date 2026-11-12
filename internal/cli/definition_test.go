@@ -234,8 +234,8 @@ func TestDefinitionEnvironmentUpdateRejectsMixedOrUnapprovedInputs(t *testing.T)
 
 func TestDefinitionEnvironmentUpdatePassesFullDomainAndEmptyCollections(t *testing.T) {
 	for _, raw := range []string{
-		"version = 1\napp = \"api\"\nnode = \"main\"\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n[[domains]]\nname = \"api.example.com\"\nprimary = true\n",
-		"version = 1\napp = \"api\"\nnode = \"main\"\nsecret_names = []\n[source]\nkind = \"image\"\nimage = \"ghcr.io/acme/api:1\"\n[config]\n",
+		"version = 2\napp = \"api\"\nnode = \"main\"\n[source]\n[[domains]]\nname = \"api.example.com\"\nprimary = true\n",
+		"version = 2\napp = \"api\"\nnode = \"main\"\nsecret_names = []\n[source]\n[config]\n",
 	} {
 		path := writeDefinitionFile(t, raw)
 		b := &definitionCLIBackend{ndjsonFollowBackend: newNDJSONBackend()}
@@ -266,7 +266,7 @@ func TestDefinitionEnvironmentUpdateRemovalNeedsTargetConfirmation(t *testing.T)
 }
 
 func TestDefinitionEnvironmentUpdateAutomationIsOnlyServerInput(t *testing.T) {
-	raw := "version = 1\napp = \"api\"\nnode = \"main\"\n[source]\nkind = \"git\"\nurl = \"https://github.com/acme/api\"\n[automation]\nauto_deploy = false\n"
+	raw := "version = 2\napp = \"api\"\nnode = \"main\"\n[source]\nurl = \"https://github.com/acme/api\"\n[automation]\nauto_deploy = false\n"
 	path := writeDefinitionFile(t, raw)
 	b := &definitionCLIBackend{ndjsonFollowBackend: newNDJSONBackend()}
 	args := []string{"env", "update", "api", "production", "--from", path, "--plan-nonce", "nonce", "--confirm-plan", "digest", "--idempotency-key", "definition-key", "--json"}

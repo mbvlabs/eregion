@@ -78,10 +78,23 @@ type Service struct {
 	// submission transaction opens. Tests replace it; production leaves it nil
 	// and uses platform.ResolveGitRef.
 	resolveGitRef func(context.Context, string, string, []byte) (string, error)
+	// resolveArtifactFn resolves a private or public image selector to an
+	// immutable manifest and expected config digest before the admission
+	// transaction opens. Tests replace it with HTTP fixtures or a fake.
+	resolveArtifactFn func(context.Context, artifactRequest) (resolvedArtifact, error)
 	// redaction holds the worker's own secrets (control DSN, vault keyring
 	// material and the secret values handed to one node step). Node events are
 	// redacted with it before they are persisted.
 	redaction *secrets.Registry
+	// registryEndpoint is the node's actual configured loopback registry
+	// endpoint, injected by node composition. It has no default: a missing
+	// configuration fails a Git build instead of publishing elsewhere.
+	registryEndpoint string
+	// registryHostIdentity is the observed public identity of the physical main
+	// host. Final metadata deletion and image upload verify it against the
+	// immutable workspace binding on every operation; a nil identity fails
+	// closed. The host lock path is derived only from the verified binding.
+	registryHostIdentity *RegistryHostIdentity
 	// humanFactor verifies a transient TOTP code from protect.Store inside the
 	// submission transaction. A nil verifier fails every factor-gated action
 	// closed; HTTP submissions therefore cannot perform one.

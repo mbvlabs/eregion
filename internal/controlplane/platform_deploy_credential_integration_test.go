@@ -2,6 +2,8 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -148,7 +150,18 @@ func (t *gitReadTransport) Call(ctx context.Context, request node.Request, onEve
 		case t.packSecrets <- request.Secrets:
 		default:
 		}
-		result, _ := json.Marshal(map[string]string{"commit": t.commit})
+		var payload platform.PackPayload
+		_ = json.Unmarshal(request.Payload, &payload)
+		local := payload.Image
+		if colon := strings.LastIndexByte(local, ':'); colon > strings.LastIndexByte(local, '/') {
+			local = local[:colon]
+		}
+		sum := sha256.Sum256([]byte(payload.Image))
+		manifest := sha256.Sum256([]byte("manifest:" + payload.Image))
+		result, _ := json.Marshal(map[string]string{
+			"commit": t.commit, "image_id": "sha256:" + hex.EncodeToString(sum[:]),
+			"reference": payload.Registry + "/" + local + "@sha256:" + hex.EncodeToString(manifest[:]),
+		})
 		return node.Response{
 			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
 			Executed: true, Result: result,
@@ -191,7 +204,7 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: transport, NodeStateDir: t.TempDir(),
-		LocalNodeName: "local", SecretResolver: resolver,
+		LocalNodeName: "local", SecretResolver: resolver, RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)

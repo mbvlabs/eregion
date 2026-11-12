@@ -77,6 +77,12 @@ func (b Boundary) Valid() bool {
 type CheckResult struct {
 	Complete bool
 	Detail   string
+	// Result is the durable result a completed effect can recover when Check
+	// itself proves completion. It closes a crash gap between the effect and
+	// the engine's own record: without it, a completed step found by Check is
+	// acknowledged with no result, losing facts such as an exact commit or
+	// registry digest. Apply results remain authoritative for a fresh run.
+	Result any
 	// AppliedAttempt is the attempt that actually applied the effect, when the
 	// step can report it from a durable record. AttemptUnknown means the step
 	// did not record it; the engine then keeps the attempt it knows.

@@ -116,6 +116,9 @@ general remote-kill RPC or automatic rollback of all prior effects is promised.
   effects are acknowledged, not repeated. Hash mismatch/corrupt journal fails closed.
 - Detached tasks outlive SSH sessions. A lost stream/tunnel does not imply a stopped
   task. A retried worker asks status before starting another effect.
+- A caller context ending after dispatch is reported as `ErrCallCancelled`, not
+  `ErrStreamLost`: it means the caller stopped waiting, while the detached node
+  task may still be running and must be observed before another dispatch.
 - Per-effect/host file locks coordinate one host. PostgreSQL row/attempt fencing
   protects state writes; environment advisory locks serialize deployments across
   workers. River concurrency is not a distributed environment lock.
