@@ -1312,16 +1312,16 @@ func (s *Service) createReleaseFromRevisionTx(ctx context.Context, tx pgx.Tx, op
 	}
 	state := env.Revision.RevisionState
 	source := state.Source
+	// Revalidate the submission-time source before the ordinary current-source
+	// gate. A source cleared while an exact commit was being resolved is a
+	// conflict, not a fresh Git-less deploy with no artifact selector.
+	if err := checkResolvedGitSource(resolved, source, refOverride); err != nil {
+		return "", err
+	}
 	if source.URL == "" {
 		return "", contract.NewFault(contract.PreconditionFailed,
 			"environment has no Git build source and no artifact was selected",
 			"Deploy an explicit artifact with `eregion deploy "+env.App+" "+env.Name+" --image-tag TAG`, --image-digest, or --image. Use `eregion restart "+env.App+" "+env.Name+"` to reapply the serving artifact.")
-	}
-	if err := checkResolvedGitSource(resolved, source, refOverride); err != nil {
-		return "", err
-	}
-	if refOverride != "" && source.URL == "" {
-		return "", contract.NewFault(contract.ValidationFailed, "ref is only valid for a Git build recipe", "Bind a Git source with env update --git-url, or deploy an explicit artifact.")
 	}
 	app, err := appByNameTx(ctx, tx, env.App)
 	if err != nil {

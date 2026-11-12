@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,6 +31,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"golang.org/x/crypto/ssh"
 )
 
 var testActor = contract.Actor{Kind: "ci", Subject: "integration-ci"}
@@ -468,6 +470,38 @@ func TestIntegrationWorkerProcessCrash(t *testing.T) {
 	}
 }
 
+// executableRegistryIdentity mirrors host.LocalRegistryIdentity's public host
+// observation without importing the host package (which imports controlplane)
+// from this same-package test. It reads the actual public SSH host key and the
+// node.json the child process is explicitly pointed at.
+func executableRegistryIdentity(t *testing.T, nodeDir string) RegistryHostIdentity {
+	t.Helper()
+	matches, err := filepath.Glob("/etc/ssh/ssh_host_*_key.pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(matches)
+	if len(matches) == 0 {
+		t.Fatal("no SSH host public key is installed for the executable lifecycle fixture")
+	}
+	raw, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _, _, _, err := ssh.ParseAuthorizedKey(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := RegistryHostIdentity{
+		NodeName: "local", HostKeyType: key.Type(),
+		HostKeyFingerprint: ssh.FingerprintSHA256(key), StateDir: nodeDir,
+	}
+	if err := identity.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}
+
 func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("control-plane processes require Linux")
@@ -492,7 +526,18 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	_ = reserved.Close()
 	endpoint := "http://" + address
 	nodeDir := t.TempDir()
-	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile, "EREGION_NODE_STATE_DIR="+nodeDir, "EREGION_NODE_NAME=local")
+	nodeConfigPath := filepath.Join(t.TempDir(), "node.json")
+	nodeConfig, _ := json.Marshal(map[string]string{"node": "local", "state_dir": nodeDir})
+	if err := os.WriteFile(nodeConfigPath, nodeConfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identity := executableRegistryIdentity(t, nodeDir)
+	if _, err := AssignWorkspace(context.Background(), pool, "test", identity); err != nil {
+		t.Fatal(err)
+	}
+	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile,
+		"EREGION_NODE_STATE_DIR="+nodeDir, "EREGION_NODE_NAME=local",
+		"EREGION_NODE_CONFIG="+nodeConfigPath, "EREGION_REGISTRY_LISTEN=127.0.0.1:5000")
 	start := func(args ...string) (*exec.Cmd, <-chan error) {
 		command := exec.Command(binary, args...)
 		command.Env = environment

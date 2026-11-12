@@ -50,7 +50,7 @@ func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool, run *Runtime) (
 		t.Fatal(err)
 	}
 	appName := "shop-" + strings.TrimPrefix(string(envID), "env_")[:8]
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name) VALUES($1,$2)`, appID, appName); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name,image_repository) VALUES($1,$2,$2)`, appID, appName); err != nil {
 		t.Fatal(err)
 	}
 	var hostPort int

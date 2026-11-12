@@ -8,12 +8,22 @@ import (
 	"github.com/mbvlabs/eregion/internal/controlplane"
 )
 
+// nodeConfigPathEnv is the node daemon's existing test-fixture override for
+// the node configuration path. It changes only where the same real node.json is
+// read; node/state-dir agreement and the public host-key summary are still
+// required.
+const nodeConfigPathEnv = "EREGION_NODE_CONFIG"
+
 // LocalRegistryIdentity observes the physical main host's public registry
 // identity. The bootstrap-owned node.json and the managed node name/state-dir
 // settings must agree; the public SSH host key summary supplies the physical
 // discriminator. It never reads a private key or trusts a role/name alone.
 func LocalRegistryIdentity() (controlplane.RegistryHostIdentity, error) {
-	return localRegistryIdentityAt(DefaultNodeConfigPath())
+	path := DefaultNodeConfigPath()
+	if override := strings.TrimSpace(os.Getenv(nodeConfigPathEnv)); override != "" {
+		path = override
+	}
+	return localRegistryIdentityAt(path)
 }
 
 // localRegistryIdentityAt is the testable form of LocalRegistryIdentity. The

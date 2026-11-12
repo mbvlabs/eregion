@@ -91,6 +91,37 @@ func newTestNodeResolver(t *testing.T, pool *pgxpool.Pool, transports map[string
 	return resolver
 }
 
+// appendEnvironmentNodeRevision appends a new immutable environment revision
+// with the requested runtime node and advances the environment's current
+// revision through the production revision writer. Tests that move placement
+// after a deployment was pinned must use this instead of updating revision JSON.
+func appendEnvironmentNodeRevision(t *testing.T, fixture *deploymentRetryFixture, node string) platform.RevisionID {
+	t.Helper()
+	env, err := fixture.service.environment(fixture.ctx, "live", "production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Revision == nil {
+		t.Fatal("environment has no current revision")
+	}
+	state := platform.CloneRevisionState(env.Revision.RevisionState)
+	state.Runtime.Node = node
+	tx, err := fixture.pool.Begin(fixture.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollback(tx)
+	revisionID, err := publishEnvironmentRevisionTx(fixture.ctx, tx, env, "", testActor,
+		"environment.updated", "move environment to "+node, state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	return revisionID
+}
+
 func insertRunningNodeStep(t *testing.T, pool *pgxpool.Pool, operationID contract.OperationID, step string) {
 	t.Helper()
 	execution := engine.Execution{OperationID: operationID, Attempt: 1, Step: step}
@@ -115,28 +146,22 @@ func TestIntegrationDeploymentEffectGuardUsesPinnedNodeAfterEnvironmentMove(t *t
 	}
 	op, depID, _, _ := fixture.prepareOwnedCandidate(t, "pinned-guard", "registry.example/live:pinned-guard", "running")
 	insertRunningNodeStep(t, fixture.pool, op.ID, deploymentNetworkStep)
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions SET runtime='{"node":"node-a"}'::jsonb WHERE id=$1`, env.RevisionID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities)
-        VALUES('node-b',ARRAY['application'],ARRAY['docker']) ON CONFLICT (name) DO NOTHING`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environments SET node_name='node-b' WHERE id=$1`, env.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
-		t.Fatal(err)
-	}
+	// Register the placed nodes before the revision writer updates the
+	// environment's node FK.
 	liveA := &fixedStatusTransport{status: engine.StatusRunning}
 	absentB := &fixedStatusTransport{status: engine.StatusAbsent}
 	fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{
 		"node-a": liveA,
 		"node-b": absentB,
 	})
+	pinnedRevision := appendEnvironmentNodeRevision(t, fixture, "node-a")
+	_ = appendEnvironmentNodeRevision(t, fixture, "node-b")
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, pinnedRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
+		t.Fatal(err)
+	}
 	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -179,28 +204,22 @@ func TestIntegrationDeploymentReadyImageGuardUsesPinnedNodeAfterEnvironmentMove(
 	}
 	op, depID, _, _ := fixture.prepareOwnedCandidate(t, "ready-image-pinned", "registry.example/live:ready-image-pinned", "running")
 	insertRunningNodeStep(t, fixture.pool, op.ID, deploymentReadyImageStep)
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, env.RevisionID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environment_revisions SET runtime='{"node":"node-a"}'::jsonb WHERE id=$1`, env.RevisionID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities)
-        VALUES('node-b',ARRAY['application'],ARRAY['docker']) ON CONFLICT (name) DO NOTHING`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_environments SET node_name='node-b' WHERE id=$1`, env.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
-		t.Fatal(err)
-	}
+	// Register the placed nodes before the revision writer updates the
+	// environment's node FK.
 	liveA := &fixedStatusTransport{status: engine.StatusRunning}
 	absentB := &fixedStatusTransport{status: engine.StatusAbsent}
 	fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{
 		"node-a": liveA,
 		"node-b": absentB,
 	})
+	pinnedRevision := appendEnvironmentNodeRevision(t, fixture, "node-a")
+	_ = appendEnvironmentNodeRevision(t, fixture, "node-b")
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployments SET revision_id=$2 WHERE id=$1`, depID, pinnedRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, op.ID); err != nil {
+		t.Fatal(err)
+	}
 	current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 	if err != nil {
 		t.Fatal(err)
