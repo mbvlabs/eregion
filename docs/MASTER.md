@@ -495,6 +495,24 @@ ledger, records and credentials retryable. A primary binding is cleaned by
 environment/application deletion, or by promoting another primary before an
 explicit removal.
 
+**Approved TOML plan/apply behavior (2026-11-12; implementation authorized for
+beta.4, not yet qualified).** A definition declares the hostname, such as `mbvlabs.com` or
+`staging.mbvlabs.com`. With explicitly configured Cloudflare management and public
+origin settings, the server resolves the zone and previews the exact records:
+create missing records, leave records already matching the intended addresses
+and proxy settings unchanged, and require explicit approval of the concrete diff
+before replacing conflicting addresses or a conflicting CNAME. Without configured
+managed DNS, retain manual DNS and explain the prerequisite. Credential presence
+alone does not select DNS management; never infer public origins from WireGuard.
+The plan reports current evidence and blockers, not guaranteed provider write
+permission or application readiness. Revalidate relevant records before effects;
+material drift requires a refreshed plan and approval. An unchanged pre-existing
+record is satisfied external state, not implicitly adopted: matching it grants
+no future mutation or deletion authority. Cleanup remains restricted to exact
+ledger-backed ownership. This revises the matching-record refusal and permits
+explicit conflict replacement for the TOML workflow; the current command
+behavior described above remains unchanged until that work ships.
+
 ### 6.6 Config and secrets
 
 `config set` changes plain variables, `secret set` stores a value (write-only,

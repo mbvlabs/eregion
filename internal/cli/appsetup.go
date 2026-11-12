@@ -2158,7 +2158,7 @@ type deferredDefinitionResource struct {
 }
 
 func (r deferredDefinitionResource) warning() string {
-	return "Resource " + r.App + "/" + r.Environment + "/" + r.Resource + " requires deferral: missing or archived secrets " + strings.Join(r.SecretNames, ", ") + ". Create with --no-deploy, use `eregion secret set --app " + r.App + " --environment " + r.Environment + " --name <NAME> --file /absolute/protected/path` for each secret (use --expected-revision for archived names), then reapply with `eregion env update " + r.App + " " + r.Environment + " --from <file>`."
+	return "Resource " + r.App + "/" + r.Environment + "/" + r.Resource + " requires deferral: missing or archived secrets " + strings.Join(r.SecretNames, ", ") + ". Create with --no-deploy, use `eregion secret set --app " + r.App + " --environment " + r.Environment + " --name <NAME> --file /absolute/protected/path` for each secret (use --expected-revision for archived names), then plan with `eregion env update " + r.App + " " + r.Environment + " --from <file> --dry-run --json` and follow its exact nonce/digest approval command with a stable idempotency key."
 }
 
 func resourceAfterAcceptedFault(err error, operation contract.OperationID) error {

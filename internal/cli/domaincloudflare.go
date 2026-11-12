@@ -1,10 +1,12 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -39,9 +41,16 @@ func (a *app) domainCloudflareSpec() spec {
 		contract.Internal, contract.Cancelled,
 	}
 
-	status := platformMeta("Show configured Cloudflare zones and credential revisions without token values", "eregion domain cloudflare status --json")
-	status.Next = []string{"eregion domain cloudflare configure"}
-	status.WhenToUse = []string{"Inspect which Cloudflare zones have an encrypted credential and their current revision. It never decrypts or prints a token."}
+	status := platformMeta("Show Cloudflare credential metadata and definition DNS policy without tokens", "eregion domain cloudflare status --json")
+	status.Next = []string{"eregion domain cloudflare configure", "eregion domain cloudflare policy"}
+	status.WhenToUse = []string{"Inspect configured Cloudflare zones, credential revisions and the separate definition DNS policy. It never decrypts or prints a token."}
+
+	policy := platformMeta("Set the non-secret definition DNS policy", "eregion domain cloudflare policy --enabled --zone example.com --origin 8.8.8.8 --proxy dns-only --expected-revision 0")
+	policy.Mutating = true
+	policy.InputFlags = []string{"enabled", "zone", "origin", "proxy", "expected-revision"}
+	policy.DryRunReason = "Read current policy and revision with cloudflare status; each change requires the exact observed revision."
+	policy.WhenToUse = []string{"Enable or disable definition DNS without reading or rotating a provider token. Enabling requires a configured zone and explicit public origins. This policy does not itself change DNS records."}
+	policy.Next = []string{"eregion domain cloudflare status --json"}
 
 	return spec{
 		use:  "cloudflare",
@@ -55,6 +64,13 @@ func (a *app) domainCloudflareSpec() spec {
 			{use: "status", meta: status, args: platformReadArgs, flags: func(cmd *cobra.Command) {
 				cmd.Flags().String("zone", "", "Filter by Cloudflare zone ID or name")
 			}, run: a.domainCloudflareStatus},
+			{use: "policy", meta: policy, args: platformReadArgs, flags: func(cmd *cobra.Command) {
+				cmd.Flags().Bool("enabled", false, "Enable definition DNS; use --enabled=false to disable")
+				cmd.Flags().String("zone", "", "Configured Cloudflare zone ID or name")
+				cmd.Flags().StringArray("origin", nil, "Explicit public origin IP, repeatable")
+				cmd.Flags().String("proxy", "", "Proxy mode: dns-only or proxied")
+				cmd.Flags().Uint64("expected-revision", 0, "Exact current definition DNS policy revision")
+			}, run: a.domainCloudflarePolicy},
 		},
 	}
 }
@@ -175,18 +191,60 @@ func (a *app) domainCloudflareStatus(cmd *cobra.Command, _ []string) (result, er
 		return result{}, err
 	}
 	data := map[string]any{"credentials": credentials}
+	policyText := ""
+	if policies, ok := client.(definitionDNSPolicyClient); ok {
+		policy, err := policies.GetDefinitionDNSPolicy(cmd.Context())
+		if err != nil {
+			return result{}, err
+		}
+		data["definition_dns_policy"] = policy
+		policyText = formatDefinitionDNSPolicy(policy)
+	}
 	if len(credentials) == 0 {
 		plain := "No Cloudflare provider credential is configured"
 		if strings.TrimSpace(zone) != "" {
 			plain += " for " + strings.TrimSpace(zone)
 		}
-		return result{data: data, plain: plain + ".\nConfigure one with eregion domain cloudflare configure.\n"}, nil
+		return result{data: data, plain: plain + ".\nConfigure one with eregion domain cloudflare configure.\n" + policyText}, nil
 	}
 	lines := make([]string, 0, len(credentials))
 	for _, credential := range credentials {
 		lines = append(lines, formatCloudflareCredential(credential))
 	}
-	return result{data: data, plain: strings.Join(lines, "\n") + "\n"}, nil
+	return result{data: data, plain: strings.Join(lines, "\n") + "\n" + policyText}, nil
+}
+
+type definitionDNSPolicyClient interface {
+	GetDefinitionDNSPolicy(context.Context) (api.DefinitionDNSPolicy, error)
+	SetDefinitionDNSPolicy(context.Context, api.DefinitionDNSPolicyInput) (api.DefinitionDNSPolicy, error)
+}
+
+func (a *app) domainCloudflarePolicy(cmd *cobra.Command, _ []string) (result, error) {
+	if !cmd.Flags().Changed("enabled") || !cmd.Flags().Changed("expected-revision") {
+		return result{}, contract.NewFault(contract.InputRequired, "definition DNS policy needs explicit enabled state and expected revision", "Read cloudflare status, then pass --enabled=true or --enabled=false and --expected-revision.")
+	}
+	enabled, _ := cmd.Flags().GetBool("enabled")
+	zone, _ := cmd.Flags().GetString("zone")
+	origins, _ := cmd.Flags().GetStringArray("origin")
+	proxy, _ := cmd.Flags().GetString("proxy")
+	revision, _ := cmd.Flags().GetUint64("expected-revision")
+	client, err := a.client(cmd)
+	if err != nil {
+		return result{}, err
+	}
+	policies, ok := client.(definitionDNSPolicyClient)
+	if !ok {
+		return result{}, contract.NewFault(contract.Unavailable, "definition DNS policy is unavailable", "Use a matching node and operator build.")
+	}
+	policy, err := policies.SetDefinitionDNSPolicy(cmd.Context(), api.DefinitionDNSPolicyInput{ExpectedRevision: revision, Enabled: enabled, Zone: zone, Origins: origins, ProxyMode: proxy})
+	if err != nil {
+		return result{}, err
+	}
+	return result{data: policy, plain: formatDefinitionDNSPolicy(policy)}, nil
+}
+
+func formatDefinitionDNSPolicy(policy api.DefinitionDNSPolicy) string {
+	return fmt.Sprintf("Definition DNS policy: enabled=%t revision=%d zone=%s (%s) origins=%s proxy=%s\nPolicy configuration does not apply DNS or prove provider write access.\n", policy.Enabled, policy.Revision, policy.ZoneName, policy.ZoneID, strings.Join(policy.Origins, ","), policy.ProxyMode)
 }
 
 func formatCloudflareCredential(metadata vault.ProviderMetadata) string {

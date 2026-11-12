@@ -79,6 +79,9 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 	if !claimed {
 		return w.service.waitForNewerAttempt(ctx, op.ID, attempt)
 	}
+	if op.Kind == platform.KindDefinitionApply {
+		return w.runDefinitionApply(ctx, op, attempt)
+	}
 	// Diagnostic execution has its own cleanup-first lifecycle. It must bypass
 	// generic cancellation, settlement and target normalization entirely.
 	if op.Kind == platform.KindDiagnosticExecution {
@@ -961,6 +964,9 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 // action committed, and otherwise records failure with the serving release that
 // the environment actually had (or a switched release with unknown health).
 func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Operation) error {
+	if op.Kind == platform.KindDefinitionApply {
+		return s.requeueDefinitionDrain(ctx, op.ID)
+	}
 	if op.Kind == platform.KindDiagnosticExecution {
 		return s.requeueDiagnosticCleanup(ctx, op.ID)
 	}

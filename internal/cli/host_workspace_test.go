@@ -210,7 +210,7 @@ func TestApplyWorkspaceRefreshRefusesToReplaceAConfiguredWorkspaceID(t *testing.
 	}
 }
 
-func TestApplyCommandExposesWorkspaceWithoutANewConfirmationFlag(t *testing.T) {
+func TestApplyCommandExposesWorkspaceAndDefinitionConfirmation(t *testing.T) {
 	a := newApp()
 	cmd, _, err := a.root.Find([]string{"apply"})
 	if err != nil {
@@ -219,8 +219,8 @@ func TestApplyCommandExposesWorkspaceWithoutANewConfirmationFlag(t *testing.T) {
 	if cmd.Flags().Lookup("workspace") == nil {
 		t.Fatal("apply has no --workspace flag")
 	}
-	if cmd.Flags().Lookup("confirm") != nil {
-		t.Fatal("apply gained an unrelated confirmation flag; the existing apply semantics must be retained")
+	if cmd.Flags().Lookup("confirm") == nil {
+		t.Fatal("definition apply must expose target confirmation")
 	}
 }
 

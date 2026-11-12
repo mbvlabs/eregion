@@ -77,6 +77,14 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, environmentID, del
 	if err != nil || target.Kind != platform.TargetEnvironment {
 		return s.failWebhookAdmission(ctx, tx, record, contract.ValidationFailed, "the admitted target is not an environment deploy")
 	}
+	// Shared platform admission takes application before environment locks.
+	// The delivery row remains locked so receipt/idempotency behavior is unchanged.
+	if _, err := appByNameForUpdateTx(ctx, tx, target.App); err != nil {
+		if contract.Classify(err).Code == contract.NotFound {
+			return s.failWebhookAdmission(ctx, tx, record, contract.PreconditionFailed, "the application was deleted after the push was admitted")
+		}
+		return err
+	}
 	env, err := environmentByIDTx(ctx, tx, platform.EnvironmentID(record.EnvironmentID))
 	if err != nil {
 		if contract.Classify(err).Code == contract.NotFound {

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -25,7 +26,127 @@ type AppService struct {
 	Retention RetentionService
 	// Cloudflare is the bounded provider-credential setup surface. It is not a
 	// platform action and never enters River.
-	Cloudflare CloudflareSetupService
+	Cloudflare        CloudflareSetupService
+	DefinitionDNS     DefinitionDNSPolicyService
+	DefinitionPlanner DefinitionPlanningService
+}
+
+// DefinitionPlanInput carries a definition over the trusted operator boundary.
+// It is not an operation input and must never contain secret values.
+type DefinitionPlanInput struct {
+	App         string `json:"app"`
+	Environment string `json:"environment"`
+	Definition  string `json:"definition"`
+	Deploy      bool   `json:"deploy"`
+	PlanNonce   string `json:"plan_nonce,omitempty"`
+}
+
+type DefinitionDomainChange struct {
+	Action    string            `json:"action"`
+	Name      string            `json:"name"`
+	ID        platform.DomainID `json:"id,omitempty"`
+	Primary   bool              `json:"primary"`
+	CheckPath string            `json:"check_path,omitempty"`
+}
+
+type DefinitionPlan struct {
+	Digest            string                           `json:"digest"`
+	PlanNonce         string                           `json:"plan_nonce"`
+	CanApply          bool                             `json:"can_apply"`
+	WorkspaceID       string                           `json:"workspace_id"`
+	App               string                           `json:"app"`
+	Environment       string                           `json:"environment"`
+	ConfirmTarget     string                           `json:"confirm_target,omitempty"`
+	AppExists         bool                             `json:"app_exists"`
+	EnvironmentExists bool                             `json:"environment_exists"`
+	CurrentRevision   platform.RevisionID              `json:"current_revision,omitempty"`
+	Changes           []string                         `json:"changes"`
+	Diff              []string                         `json:"diff"`
+	Domains           []DefinitionDomainChange         `json:"domains"`
+	DNS               []integrations.DefinitionDNSPlan `json:"dns"`
+	DNSCleanup        []integrations.DomainDNSPlan     `json:"dns_cleanup"`
+	Blockers          []string                         `json:"blockers"`
+	Warnings          []string                         `json:"warnings"`
+}
+
+type DefinitionPlanningService interface {
+	PlanDefinition(context.Context, contract.Actor, DefinitionPlanInput) (DefinitionPlan, error)
+}
+
+type DefinitionApplyInput struct {
+	Plan           DefinitionPlanInput `json:"plan"`
+	ApprovedDigest string              `json:"approved_digest"`
+	IdempotencyKey string              `json:"idempotency_key"`
+	Confirm        string              `json:"confirm"`
+}
+
+type DefinitionApplyService interface {
+	ApplyDefinition(context.Context, contract.Actor, DefinitionApplyInput) (operations.SubmissionResult, error)
+}
+
+func (s AppService) ApplyDefinition(ctx context.Context, actor contract.Actor, input DefinitionApplyInput) (operations.SubmissionResult, error) {
+	if err := actor.Validate(); err != nil {
+		return operations.SubmissionResult{}, err
+	}
+	if actor.Kind != "operator" {
+		return operations.SubmissionResult{}, contract.NewFault(contract.Forbidden, "definition apply requires an operator", "Use the trusted operator boundary.")
+	}
+	service, ok := s.DefinitionPlanner.(DefinitionApplyService)
+	if !ok {
+		return operations.SubmissionResult{}, contract.NewFault(contract.Unavailable, "definition apply is unavailable", "Check node control-plane configuration.")
+	}
+	return service.ApplyDefinition(ctx, actor, input)
+}
+
+func (s AppService) PlanDefinition(ctx context.Context, actor contract.Actor, input DefinitionPlanInput) (DefinitionPlan, error) {
+	if err := actor.Validate(); err != nil {
+		return DefinitionPlan{}, err
+	}
+	if actor.Kind != "operator" {
+		return DefinitionPlan{}, contract.NewFault(contract.Forbidden, "definition planning requires an operator", "Use the trusted operator boundary.")
+	}
+	if s.DefinitionPlanner == nil {
+		return DefinitionPlan{}, contract.NewFault(contract.Unavailable, "definition planning is unavailable", "Check node control-plane configuration.")
+	}
+	return s.DefinitionPlanner.PlanDefinition(ctx, actor, input)
+}
+
+// DefinitionDNSPolicy is non-secret, installation-wide desired policy. A zero
+// revision is the initial disabled policy; credential presence never enables it.
+type DefinitionDNSPolicy struct {
+	Revision  uint64   `json:"revision"`
+	Enabled   bool     `json:"enabled"`
+	ZoneID    string   `json:"zone_id,omitempty"`
+	ZoneName  string   `json:"zone_name,omitempty"`
+	Origins   []string `json:"origins"`
+	ProxyMode string   `json:"proxy_mode"`
+}
+
+type DefinitionDNSPolicyInput struct {
+	ExpectedRevision uint64   `json:"expected_revision"`
+	Enabled          bool     `json:"enabled"`
+	Zone             string   `json:"zone,omitempty"`
+	Origins          []string `json:"origins,omitempty"`
+	ProxyMode        string   `json:"proxy_mode,omitempty"`
+}
+
+type DefinitionDNSPolicyService interface {
+	GetDefinitionDNSPolicy(context.Context, contract.Actor) (DefinitionDNSPolicy, error)
+	SetDefinitionDNSPolicy(context.Context, contract.Actor, DefinitionDNSPolicyInput) (DefinitionDNSPolicy, error)
+}
+
+func (s AppService) GetDefinitionDNSPolicy(ctx context.Context, actor contract.Actor) (DefinitionDNSPolicy, error) {
+	if s.DefinitionDNS == nil {
+		return DefinitionDNSPolicy{}, contract.NewFault(contract.Unavailable, "definition DNS policy is unavailable", "Check node control-plane configuration.")
+	}
+	return s.DefinitionDNS.GetDefinitionDNSPolicy(ctx, actor)
+}
+
+func (s AppService) SetDefinitionDNSPolicy(ctx context.Context, actor contract.Actor, input DefinitionDNSPolicyInput) (DefinitionDNSPolicy, error) {
+	if s.DefinitionDNS == nil {
+		return DefinitionDNSPolicy{}, contract.NewFault(contract.Unavailable, "definition DNS policy is unavailable", "Check node control-plane configuration.")
+	}
+	return s.DefinitionDNS.SetDefinitionDNSPolicy(ctx, actor, input)
 }
 
 // CloudflareCredentialPreview is the revision-bound, secret-free setup plan.

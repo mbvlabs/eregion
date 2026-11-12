@@ -542,7 +542,7 @@ func TestEnvUpdateFromFileRejectsEffectiveSourceCredentialAlias(t *testing.T) {
 			path := writeUpdateDefinition(t, test.credential, test.secrets)
 
 			exit, stdout, stderr := runGitHubAuthCommand(t, backend,
-				"env", "update", "api", "production", "--from", path, "--json")
+				"env", "update", "api", "production", "--from", path, "--dry-run", "--json")
 
 			assertGitHubAuthRejected(t, exit, stdout, stderr, test.fragment)
 			if backend.secretWrite != 0 || backend.secretRead != 0 {
@@ -568,24 +568,14 @@ func TestEnvUpdateFromFilePreservesUnchangedSourceCredential(t *testing.T) {
 	path := writeUpdateDefinition(t, "GIT_READ_TOKEN", `["DATABASE_URL", "REDIS_URL"]`)
 
 	exit, stdout, stderr := runGitHubAuthCommand(t, backend,
-		"env", "update", "api", "production", "--from", path, "--json")
+		"env", "update", "api", "production", "--from", path, "--dry-run", "--json")
 	if exit != 0 {
 		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
 	}
-	updates := backend.submissionsOfKind(platform.KindEnvironmentUpdate)
-	var accepted *definitionSubmission
-	for index := range updates {
-		if !updates[index].DryRun {
-			accepted = &updates[index]
-		}
+	if backend.definitionPlans != 1 {
+		t.Fatalf("expected one server plan, got %d", backend.definitionPlans)
 	}
-	if accepted == nil {
-		t.Fatalf("no accepted update: %+v", updates)
-	}
-	var patch platform.EnvironmentUpdateInput
-	if err := json.Unmarshal(accepted.Input, &patch); err != nil {
-		t.Fatal(err)
-	}
+	patch := backend.definitionPatch
 	if patch.Source != nil {
 		t.Fatalf("an unchanged source was patched: %+v", patch.Source)
 	}

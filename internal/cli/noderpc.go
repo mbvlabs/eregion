@@ -108,6 +108,10 @@ const (
 	methodSecretExport        = "vault.export"
 	methodCloudflareConfigure = "domain.cloudflare.configure"
 	methodCloudflareStatus    = "domain.cloudflare.status"
+	methodDefinitionDNSGet    = "domain.cloudflare.definition-dns.get"
+	methodDefinitionDNSSet    = "domain.cloudflare.definition-dns.set"
+	methodDefinitionPlan      = "definition.plan"
+	methodDefinitionApply     = "definition.apply"
 	methodReady               = "ready"
 	methodHostPlan            = "host.plan"
 	methodHostApply           = "host.apply"
@@ -670,6 +674,54 @@ func (n *nodeClient) ListCloudflareCredentials(ctx context.Context, zoneRef stri
 		}
 	}
 	return page.Credentials, nil
+}
+
+func (n *nodeClient) GetDefinitionDNSPolicy(ctx context.Context) (api.DefinitionDNSPolicy, error) {
+	raw, err := n.call(ctx, methodDefinitionDNSGet, struct{}{}, rpcCallOptions{})
+	if err != nil {
+		return api.DefinitionDNSPolicy{}, err
+	}
+	var policy api.DefinitionDNSPolicy
+	if json.Unmarshal(raw, &policy) != nil || (policy.ProxyMode != "dns-only" && policy.ProxyMode != "proxied") {
+		return api.DefinitionDNSPolicy{}, invalidNodeData("definition DNS policy")
+	}
+	return policy, nil
+}
+
+func (n *nodeClient) PlanDefinition(ctx context.Context, input api.DefinitionPlanInput) (api.DefinitionPlan, error) {
+	raw, err := n.call(ctx, methodDefinitionPlan, input, rpcCallOptions{})
+	if err != nil {
+		return api.DefinitionPlan{}, err
+	}
+	var plan api.DefinitionPlan
+	if err := json.Unmarshal(raw, &plan); err != nil {
+		return api.DefinitionPlan{}, invalidNodeData("definition plan")
+	}
+	return plan, nil
+}
+
+func (n *nodeClient) ApplyDefinition(ctx context.Context, input api.DefinitionApplyInput) (operations.SubmissionResult, error) {
+	raw, err := n.call(ctx, methodDefinitionApply, input, rpcCallOptions{})
+	if err != nil {
+		return operations.SubmissionResult{}, err
+	}
+	var receipt operations.SubmissionResult
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		return operations.SubmissionResult{}, invalidNodeData("definition admission receipt")
+	}
+	return receipt, nil
+}
+
+func (n *nodeClient) SetDefinitionDNSPolicy(ctx context.Context, input api.DefinitionDNSPolicyInput) (api.DefinitionDNSPolicy, error) {
+	raw, err := n.call(ctx, methodDefinitionDNSSet, input, rpcCallOptions{})
+	if err != nil {
+		return api.DefinitionDNSPolicy{}, err
+	}
+	var policy api.DefinitionDNSPolicy
+	if json.Unmarshal(raw, &policy) != nil || policy.Revision != input.ExpectedRevision+1 || policy.Enabled != input.Enabled || (policy.ProxyMode != "dns-only" && policy.ProxyMode != "proxied") {
+		return api.DefinitionDNSPolicy{}, invalidNodeData("definition DNS policy result")
+	}
+	return policy, nil
 }
 
 func (n *nodeClient) ProtectInit(ctx context.Context, rotate bool, label, code string) (protect.Setup, error) {
@@ -1616,6 +1668,8 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		)
 	})
 	appService.Retention = run.Service
+	appService.DefinitionDNS = controlplane.NewDefinitionDNSPolicyStore(pool)
+	appService.DefinitionPlanner = run.Service
 	if parts.Cloudflare != nil {
 		appService.Cloudflare = parts.Cloudflare
 	}
@@ -1880,6 +1934,32 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 			return nil, err
 		}
 		return map[string]any{"credentials": metadata}, nil
+	case methodDefinitionDNSGet:
+		return app.GetDefinitionDNSPolicy(ctx, actor)
+	case methodDefinitionPlan:
+		var params api.DefinitionPlanInput
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		return app.PlanDefinition(ctx, actor, params)
+	case methodDefinitionApply:
+		var params api.DefinitionApplyInput
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		if request.DryRun {
+			return nil, contract.NewFault(contract.Usage, "definition apply cannot be used as a dry run", "Use definition planning instead.")
+		}
+		return app.ApplyDefinition(ctx, actor, params)
+	case methodDefinitionDNSSet:
+		var params api.DefinitionDNSPolicyInput
+		if err := decodeRPCParams(request.Params, &params); err != nil {
+			return nil, err
+		}
+		if request.DryRun {
+			return nil, contract.NewFault(contract.Usage, "definition DNS policy has no dry-run mutation", "Read the policy with cloudflare status; set it with an exact expected revision.")
+		}
+		return app.SetDefinitionDNSPolicy(ctx, actor, params)
 	case methodReady:
 		if err := app.Ready(ctx); err != nil {
 			return nil, err

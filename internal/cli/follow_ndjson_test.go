@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -27,6 +28,8 @@ var followingCommands = []struct {
 	path string
 	args []string
 }{
+	{name: "definition apply", path: "eregion apply", args: []string{"apply", "--from", "testdata/definition.toml", "--app", "api", "--environment", "production", "--plan-nonce", "nonce", "--confirm-plan", "digest", "--idempotency-key", "definition-key"}},
+	{name: "env update definition", path: "eregion env update", args: []string{"env", "update", "api", "production", "--from", "testdata/definition.toml", "--plan-nonce", "nonce", "--confirm-plan", "digest", "--idempotency-key", "definition-key"}},
 	{name: "deploy", path: "eregion deploy", args: []string{"deploy", "api", "production"}},
 	{name: "prune", path: "eregion prune", args: []string{"prune", "--confirm", "main"}},
 	{name: "rollback", path: "eregion rollback", args: []string{"rollback", "api", "production", "--confirm", "api/production"}},
@@ -287,12 +290,29 @@ func prepareFollowingBackend(name string, backend *ndjsonFollowBackend) {
 
 func followingSubmits(name string) bool {
 	switch name {
-	case "deploy", "rollback", "restart", "diagnose", "build stop", "build retry",
+	case "definition apply", "env update definition", "deploy", "rollback", "restart", "diagnose", "build stop", "build retry",
 		"app create", "env create", "env protect", "env unprotect", "domain add", "domain remove", "process scale", "prune",
 		"resource apply", "resource attach", "resource detach", "resource destroy":
 		return true
 	}
 	return false
+}
+
+func (f *ndjsonFollowBackend) PlanDefinition(_ context.Context, input api.DefinitionPlanInput) (api.DefinitionPlan, error) {
+	f.calls++
+	f.dryRuns++
+	return api.DefinitionPlan{App: input.App, Environment: input.Environment, CanApply: true, Digest: "digest", PlanNonce: "nonce"}, nil
+}
+
+func (f *ndjsonFollowBackend) ApplyDefinition(_ context.Context, input api.DefinitionApplyInput) (operations.SubmissionResult, error) {
+	f.calls++
+	raw, err := f.accept("definition.apply", "env/"+input.Plan.App+"/"+input.Plan.Environment)
+	if err != nil {
+		return operations.SubmissionResult{}, err
+	}
+	var op contract.Operation
+	err = json.Unmarshal(raw, &op)
+	return operations.SubmissionResult{Operation: op}, err
 }
 
 func (f *ndjsonFollowBackend) SubmitAction(_ context.Context, kind, target string, _ json.RawMessage, _, _ string, dryRun bool) (json.RawMessage, error) {

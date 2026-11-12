@@ -217,6 +217,21 @@ An accepted credential proves read validation, not write permission, DNS
 reconciliation, valid TLS or public reachability. Missing workspace access must be fixed
 before entering the token.
 
+The non-secret, installation-wide definition DNS policy is separate from that
+credential. Read it with `eregion domain cloudflare status --json`. To configure
+it without entering or rotating a token, use `eregion domain cloudflare policy
+--enabled --zone ZONE --origin PUBLIC_IP --proxy dns-only|proxied
+--expected-revision N`; repeat `--origin` for additional explicit public IPs.
+Disable it with `--enabled=false --expected-revision N`, omitting the other
+settings. Revision 0 is the initial disabled policy; each accepted change advances
+the revision and a stale expected revision is refused. The configured zone must
+already have a read-validated credential. Private, management and other non-public
+origins are rejected; no address is derived from WireGuard or SSH. Disabling
+retains previous settings but enabling requires an explicit complete policy.
+This metadata change does not contact Cloudflare or apply DNS records; the
+definition planner and its approved effects are not implemented by this policy
+configuration alone.
+
 For setup followed by DNS changes, create a Cloudflare API token with
 **Zone → DNS → Edit**, scoped to **Include → Specific zone → the configured
 zone**. Edit includes read/list access, so a separate DNS Read grant is not
@@ -268,6 +283,7 @@ bin/eregion help app create --json
 | `rollback <app> <env> [--to ID]` | Node-mode `platform.rollback`; requires `--confirm <app>/<env>`, validated by the node and control plane against the current target (D12). There is no plan-token scheme for rollback. |
 | `build list/logs/stop/retry`, `release list`, `restart <app> <env>` | Build lifecycle over `platform_builds`; `build logs` reads (and with `--follow` streams) the build operation's events. `build get` is served by the `builds` inventory filter. `restart` reapplies the serving release through the blue/green path. |
 | `domain add/remove <app> <environment> <hostname> [--primary] [--check-path PATH] [--dns cloudflare --dns-zone ZONE (add also needs --dns-origin ADDRESS --dns-proxy dns-only\|proxied)]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized Caddy writes and separate route/DNS/certificate/public observations. Manual DNS is default. Explicit Cloudflare DNS resolves the configured zone and encrypted credential freshly from PostgreSQL; token values never enter argv, action input, River arguments, events or ordinary output. Add requires explicit validated public origins and proxy choice; the WireGuard endpoint is never an origin. Dry-run returns a real read-only provider snapshot. Immutable per-binding ownership, newest-intent fences and exact-owned cleanup preserve foreign records and retain the ledger on failure. Remove needs exact hostname confirmation and refuses the primary; app/environment deletion supports primary cleanup. Provider success is not public readiness, and multi-binding/provider/node effects are not one atomic transaction or an availability guarantee. The detailed DNS section below describes cleanup and recovery boundaries. |
+
 | `domain cloudflare configure [--zone ID --zone-name NAME]`, `domain cloudflare status [--zone ID_OR_NAME]` | Human-only hidden-token setup/rotation plus agent-safe metadata status. Configure read-validates the exact zone, previews current/next revision, confirms, then atomically commits CAS-fenced encrypted vault state and sanitized audit attribution. JSON/NDJSON/no-TTY configuration refuses before token read/RPC; no token flag, file, environment or stdin fallback. Current credentials resolve without restart. Status never decrypts or prints a token. Setup proves DNS-list access only, not write capability. |
 | `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secret export` carries the code in the same node request that returns the value (`vault.export`); there is no separate pre-check request to skip. `secrets export` rebuilds the server-init handoff (including the vault keyring and the local telemetry credential when present) and honours `--secrets-out`; a missing telemetry credential is reported as a warning, never invented. |
 | `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
@@ -342,6 +358,41 @@ and `system migrate` are not operator commands; they live under the hidden
 Linux-only `node` group (`node rpc`, `node unlock-ssh`, `node serve`,
 `node worker`, `node migrate`, `node bootstrap …`) and `commands --json` lists
 only the section 5 tree plus `help`.
+
+Definition reconciliation uses one server-backed plan/apply flow for an explicitly
+selected existing app and environment. `plan --from FILE --app APP --environment
+ENV` reads a repeatable-read database snapshot before provider reads, including
+DNS evidence when the TOML and bindings are unchanged. Apply supplies the returned
+`--plan-nonce`, exact `--confirm-plan` digest and `--idempotency-key`; removals also
+require `--confirm APP/ENV`. The digest binds the exact definition bytes, target,
+current inventory, policy and provider evidence. Neither `--yes` nor a fresh plan
+silently replaces an earlier approval. `env update APP ENV --from FILE` uses the
+same service; its dry run only plans. Host-only plan/apply remains unchanged.
+
+Admission atomically journals the approved intent, permanently reserves its nonce
+and new binding identities, and enqueues one parent operation. The parent admits
+one ordinary child at a time and resumes from its durable cursor. Resources,
+revision changes, primary promotion, remaining domains and alias cleanup are
+ordered server-side. Omitted resources are detached, not destroyed. Updates never
+deploy; new app/environment creation retains the existing explicit setup flow.
+Apply is a resumable sequence, not an atomic external transaction or rollback.
+
+Managed DNS creates missing records, preserves every matching external record
+without adoption, and executes replacements only from the approved record-specific
+plan. Per-change intent precedes provider requests; observed results permit safe
+recovery from lost responses. CNAME replacement has an explicitly reported
+resolution gap. Cleanup deletes only approved exact-owned records and preserves
+external records, including when definition DNS policy is disabled. Parent and
+child attempts, cancellation, binding/ledger identity and policy are rechecked
+at effect boundaries. Parent cancellation and exhaustion drain linked children
+before terminalization releases the reservation. Provider reads occur outside SQL
+transactions; Cloudflare's lack of conditional writes leaves a final external
+writer race, not a guarantee of provider atomicity.
+
+Offline checks and source review do not establish database concurrency, provider
+execution or real-host acceptance. The PostgreSQL regressions exercise admission,
+replay, reservation, draining and lock contention in the existing CI database
+job; retain their actual execution results separately from compilation evidence.
 
 ## Human presentation and waiting
 
@@ -2028,8 +2079,8 @@ Provider previews authorize `dns.read` before token
 access; admission authorizes `dns.write` before any ledger/operation mutation,
 and the worker rechecks `dns.write` before token access and each specific
 create/update/delete action before its mutation. The provider plan invokes the
-attempt/cancellation guard immediately before each A/AAAA mutation. Foreign
-A/AAAA records and legacy `eregion:managed` records are conflicts; any CNAME is
+attempt/cancellation guard immediately before each A/AAAA mutation. In explicit
+add plans, foreign A/AAAA records and legacy `eregion:managed` records are conflicts; any CNAME is
 a conflict even when its comment exactly matches the binding marker, because the
 managed policy is A/AAAA only. None are adopted, updated or deleted. Non-managed
 TXT/CNAME content, comments, TTL and proxy state are redacted from preview
@@ -2059,14 +2110,16 @@ reported as success. Removal
 and app/environment deletion mark the ledger `cleanup_pending` and verify
 provider cleanup before removing serving workload containers. Deletion first
 preflights every managed binding: the operation-ownership fence, authorization,
-zone/host recovery, a real provider read and exact ownership/conflict checks. An
+zone/host recovery, a real provider read and exact ownership checks. An
 obvious refusal therefore stops before the first provider mutation. After that
 point Cloudflare effects are not atomic: a later binding's read/delete failure or
 a cancellation can leave earlier bindings cleaned while later bindings are
 unchanged or partially changed. The worker removes only exact-owned provider
 records, re-reads the exact hostname and marks `cleanup_verified` only when no
-exact-owned A/AAAA remains and no conflict appeared. A read failure, reappeared
-owned record or conflict leaves the ledger retryable, refuses deletion without
+exact-owned A/AAAA remains. Foreign records, including CNAMEs, remain untouched
+and do not block cleanup. Each planned deletion rechecks the exact owned record's
+identity, content, TTL and proxy state. A read failure, changed or reappeared
+owned record leaves the ledger retryable, refuses deletion without
 touching workloads, and records how many bindings the pass processed. It never
 claims all records were preserved or that public availability was maintained.
 Retry re-plans the remaining bindings and converges the cleanup. After verification

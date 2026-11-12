@@ -163,6 +163,9 @@ func (s *Service) SubmitWithReceipt(ctx context.Context, sub operations.Submissi
 	if sub.Kind == platform.KindDiagnosticExecution {
 		return zero, contract.NewFault(contract.ValidationFailed, "diagnostic execution is not available through generic submission", "Use the authenticated operator SSH diagnostic execution flow when available.")
 	}
+	if sub.Kind == platform.KindDefinitionApply {
+		return zero, contract.NewFault(contract.ValidationFailed, "definition apply is not available through generic submission", "Use the trusted operator boundary.")
+	}
 	if err := sub.Actor.Validate(); err != nil {
 		return zero, err
 	}

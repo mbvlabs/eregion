@@ -152,10 +152,11 @@ terminal, some need a human, and a retry may need the same idempotency key.
 - For a definition with secret-consuming resources, create with `--no-deploy`.
   Missing or archived resource secrets defer automatic provisioning, with names
   in `deferred_resources`; the environment's desired attachments remain. Set
-  each secret using `secret set --file /absolute/protected/path`, then reapply
-  the definition with `env update <app> <env> --from <file>`. A dry run checks
-  metadata only. An accepted apply is not proof of resource health, and a
-  secret may still be archived after admission.
+   each secret using `secret set --file /absolute/protected/path`, then plan with
+   `env update <app> <env> --from <file> --dry-run --json`. Apply using the returned
+   nonce and digest, a stable idempotency key, and the explicit target confirmation
+   when removals require it. A dry run checks metadata only. An accepted apply is
+   not proof of resource health, and a secret may still be archived after admission.
 - `app create`, `env create` and `env update` accept explicit `--github-auth`
   for an `https://github.com/...` git source. It reads the operator's
   authenticated `gh auth token` in memory and writes it as the repository read
@@ -175,6 +176,16 @@ terminal, some need a human, and a retry may need the same idempotency key.
   metadata-only read an agent may use after the human finishes. Then preview
   exact DNS changes before applying them; saved/read-validated credentials do
   not prove DNS-write permission or a ready application.
+- Definition DNS policy is separate from the credential and disabled by
+  default. `domain cloudflare status --json` shows its revision. An operator
+  can configure non-secret metadata without a token prompt using `domain
+  cloudflare policy --enabled --zone ZONE --origin PUBLIC_IP --proxy dns-only
+  --expected-revision N`; repeat `--origin` as needed, or use `--enabled=false
+  --expected-revision N` to disable. The zone must already be configured and
+  origins must be explicit public addresses, not SSH or WireGuard addresses.
+  Policy changes alone do not apply DNS. Plan the definition, review the exact
+  DNS diff, then apply with its nonce and digest. An accepted apply is not proof
+  of valid TLS or public reachability.
 - A command that prints a secret once is a human handoff: ask the human to run
   it in their own terminal. Never capture the one-time value for them.
 - `metrics endpoint` reports the configured main hostname's public HTTPS

@@ -197,6 +197,23 @@ func (s *Service) recoverOrphanedPlatformJob(ctx context.Context, job orphanedPl
 	// not visible until commit. No new River attempt can claim the operation
 	// between the state change and this event.
 	if exhausted {
+		if op.Kind == platform.KindDefinitionApply && !op.State.Terminal() && op.Attempt <= uint32(job.Attempt) {
+			if op.State != contract.Cancelling {
+				if err := definitionFailureTx(ctx, tx, &op, contract.Unavailable, "Definition worker attempts were exhausted; linked work is being drained."); err != nil {
+					return false, false, err
+				}
+			}
+			if _, err := definitionDrainTx(ctx, tx, &op); err != nil {
+				return false, false, err
+			}
+			if _, err := tx.Exec(ctx, `UPDATE river_job SET state='scheduled',finalized_at=NULL,max_attempts=GREATEST(max_attempts,attempt+1),scheduled_at=clock_timestamp()+interval '2 seconds' WHERE id=$1`, job.ID); err != nil {
+				return false, false, unavailable(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return false, false, unavailable(err)
+			}
+			return true, false, nil
+		}
 		if op.Kind == platform.KindDiagnosticExecution && !op.State.Terminal() && op.Attempt <= uint32(job.Attempt) {
 			var raw json.RawMessage
 			if err := tx.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {
@@ -887,6 +904,9 @@ func (w *workloadRepairWorker) Work(ctx context.Context, _ *river.Job[workloadRe
 // returned by Work. Domain terminal state cannot depend on an in-process callback.
 func (s *Service) Reconcile(ctx context.Context) error {
 	var failures []error
+	if err := s.reconcileTerminalDefinitionRuns(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("reconcile terminal definition runs: %w", err))
+	}
 	if err := s.reconcileWebhookAdmissions(ctx); err != nil {
 		failures = append(failures, fmt.Errorf("reconcile webhook admissions: %w", err))
 	}
@@ -939,6 +959,9 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 	}
 	if op.Kind == platform.KindDiagnosticExecution {
 		return s.requeueDiagnosticCleanup(ctx, id)
+	}
+	if op.Kind == platform.KindDefinitionApply {
+		return s.requeueDefinitionDrain(ctx, id)
 	}
 	if s.transport == nil {
 		return contract.NewFault(contract.Unavailable, "node transport is not configured", "Reconciliation requires a worker node transport.")

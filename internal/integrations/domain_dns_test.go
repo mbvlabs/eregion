@@ -687,10 +687,10 @@ func TestDomainDNSExactMarkerCNAMEIsNeverOwned(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(removePlan.Conflicts) == 0 || len(removePlan.Changes) != 0 {
+	if len(removePlan.Conflicts) != 0 || len(removePlan.Changes) != 0 {
 		t.Fatalf("exact-marker CNAME removal plan = %+v", removePlan)
 	}
-	if _, err := domainDNS.Remove(context.Background(), contract.Actor{Kind: "operator", Subject: "ops"}, "op_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", removeRequest); contract.Classify(err).Code != contract.PreconditionFailed {
+	if _, err := domainDNS.Remove(context.Background(), contract.Actor{Kind: "operator", Subject: "ops"}, "op_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", removeRequest); err != nil {
 		t.Fatalf("exact-marker CNAME removal = %v", err)
 	}
 	if countMutations(fixture.calls) != 0 {
@@ -780,19 +780,38 @@ func TestDomainDNSRemoveDeletesOnlyExactOwnedRecords(t *testing.T) {
 	}
 }
 
-func TestDomainDNSRemoveRefusesForeignAddressRecord(t *testing.T) {
+func TestDomainDNSRemovePreservesForeignAddressRecord(t *testing.T) {
 	fixture := newCloudflareFixture(testZoneID)
-	fixture.records["foreign"] = DNSRecord{ID: "foreign", Name: "app.example.com", Type: "CNAME", Content: "other.example.net", TTL: 1, Comment: "operator"}
+	marker := DomainDNSOwnership(testDomainID, testZoneID)
+	fixture.records["owned"] = DNSRecord{ID: "owned", Name: "app.example.com", Type: "A", Content: "8.8.8.8", TTL: 1, Comment: marker}
+	fixture.records["foreign"] = DNSRecord{ID: "foreign", Name: "app.example.com", Type: "A", Content: "8.8.8.8", TTL: 1, Comment: "operator"}
 	domainDNS := testDomainDNS(t, fixture, dnsAuthorizer(t), NewMemoryAudit())
 	_, err := domainDNS.Remove(context.Background(), contract.Actor{Kind: "operator", Subject: "ops"}, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", DomainDNSRequest{ZoneID: testZoneID, ZoneName: "example.com", DomainID: testDomainID, Ownership: DomainDNSOwnership(testDomainID, testZoneID), Host: "app.example.com"})
-	if contract.Classify(err).Code != contract.PreconditionFailed {
+	if err != nil {
 		t.Fatalf("remove error = %v", err)
 	}
-	if countMutations(fixture.calls) != 0 {
-		t.Fatalf("conflicting remove mutated: %v", fixture.calls)
+	if countMutations(fixture.calls) != 1 {
+		t.Fatalf("expected only owned deletion: %v", fixture.calls)
+	}
+	if _, ok := fixture.records["owned"]; ok {
+		t.Fatal("owned record was not deleted")
 	}
 	if _, ok := fixture.records["foreign"]; !ok {
 		t.Fatal("foreign record was deleted")
+	}
+}
+
+func TestDomainDNSRemoveCleansDuplicateOwnedRecords(t *testing.T) {
+	fixture := newCloudflareFixture(testZoneID)
+	marker := DomainDNSOwnership(testDomainID, testZoneID)
+	for _, id := range []string{"one", "two"} {
+		fixture.records[id] = DNSRecord{ID: id, Name: "app.example.com", Type: "A", Content: "8.8.8.8", TTL: 1, Comment: marker}
+	}
+	domainDNS := testDomainDNS(t, fixture, dnsAuthorizer(t), NewMemoryAudit())
+	request := DomainDNSRequest{ZoneID: testZoneID, ZoneName: "example.com", DomainID: testDomainID, Ownership: marker, Host: "app.example.com"}
+	plan, err := domainDNS.Remove(context.Background(), contract.Actor{Kind: "operator", Subject: "ops"}, "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", request)
+	if err != nil || plan.Applied != 2 || len(fixture.records) != 0 {
+		t.Fatalf("duplicate owned cleanup = %+v, records=%+v, err=%v", plan, fixture.records, err)
 	}
 }
 

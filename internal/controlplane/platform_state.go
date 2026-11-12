@@ -265,7 +265,79 @@ func platformAcceptedMessageFor(normalized platform.Normalized) string {
 	return platformAcceptedMessage(normalized.Kind)
 }
 
+// lockDefinitionTargetTx is the shared order for app/environment admission.
+// An empty environment denotes an application-wide operation.
+func lockDefinitionTargetTx(ctx context.Context, tx pgx.Tx, app, environment string) error {
+	if _, err := appByNameForUpdateTx(ctx, tx, app); err != nil {
+		return err
+	}
+	if environment != "" {
+		_, err := environmentByNameTx(ctx, tx, app, environment)
+		return err
+	}
+	rows, err := tx.Query(ctx, `SELECT e.id FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 ORDER BY e.id FOR UPDATE OF e`, app)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return unavailable(err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return unavailable(err)
+	}
+	return nil
+}
+
+func fenceDefinitionAdmissionTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, n platform.Normalized, actor contract.Actor) error {
+	app, environment := n.Target.App, n.Target.Environment
+	if n.Target.Kind == platform.TargetBuild {
+		err := tx.QueryRow(ctx, `SELECT a.name,e.name FROM eregion_platform_builds b JOIN eregion_platform_apps a ON a.id=b.app_id JOIN eregion_platform_environments e ON e.id=b.environment_id WHERE b.id=$1`, n.Target.Build).Scan(&app, &environment)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return unavailable(err)
+		}
+	}
+	if app == "" {
+		return nil
+	}
+	if n.Kind == platform.KindPromote {
+		environment = ""
+	}
+	// Environment creation names a not-yet-existing environment only in input;
+	// its target is the application and is intentionally application-wide.
+	if err := lockDefinitionTargetTx(ctx, tx, app, environment); err != nil {
+		return err
+	}
+	var blocked bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+        SELECT 1 FROM eregion_definition_runs r
+        JOIN eregion_platform_environments e ON e.id=r.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id
+        WHERE a.name=$1 AND r.finished_at IS NULL AND ($8='' OR e.name=$8)
+          AND NOT EXISTS (
+            SELECT 1 FROM eregion_definition_steps st
+            JOIN eregion_operations p ON p.id=r.operation_id
+            WHERE st.parent_operation_id=r.operation_id AND st.ordinal=r.next_step
+              AND st.child_operation_id=$2 AND st.kind=$3 AND st.target=$4
+              AND st.input=$5::jsonb AND p.state='running' AND p.kind=$9
+              AND p.actor_kind=$6 AND p.actor_subject=$7))`, app, id, n.Kind,
+		n.Target.String(), n.Canonical, actor.Kind, actor.Subject, environment, platform.KindDefinitionApply).Scan(&blocked)
+	if err != nil {
+		return unavailable(err)
+	}
+	if blocked {
+		return contract.NewFault(contract.Conflict, "target is reserved by an active definition run", "Wait for definition work to finish before submitting other changes.")
+	}
+	return nil
+}
+
 func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.OperationID, normalized platform.Normalized, actor contract.Actor, resolved *resolvedGitRef, humanFactor string, webhookSecret []byte, webhookActivated *bool) error {
+	if err := fenceDefinitionAdmissionTx(ctx, tx, id, normalized, actor); err != nil {
+		return err
+	}
 	switch input := normalized.Input.(type) {
 	case *platform.AppCreateInput:
 		appID, err := platform.NewAppID()
@@ -522,6 +594,25 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 		if err != nil {
 			return err
 		}
+		step, err := loadDefinitionDNSChildTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if step != nil {
+			if step.Actor != actor || step.Kind != normalized.Kind || step.Target != normalized.Target.String() || step.InputHash != hashInput(normalized.Canonical) || step.EnvironmentID != env.ID {
+				return definitionDNSConflict()
+			}
+			if normalized.Kind == platform.KindDomainRemove || step.AllocatedID == "" {
+				var existing platform.DomainID
+				err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_domains WHERE name=$1 AND environment_id=$2 FOR UPDATE`, input.Domain, env.ID).Scan(&existing)
+				if errors.Is(err, pgx.ErrNoRows) || (err == nil && existing != step.DomainID) {
+					return definitionDNSConflict()
+				}
+				if err != nil {
+					return unavailable()
+				}
+			}
+		}
 		if err := s.ensureNoActiveDomainChangeTx(ctx, tx, id, input.App, input.Environment); err != nil {
 			return err
 		}
@@ -600,7 +691,12 @@ func (s *Service) preparePlatform(ctx context.Context, tx pgx.Tx, id contract.Op
 			}
 			return insertDomainDNSCleanupIntentTx(ctx, tx, domainID, zone, id)
 		}
-		domainID, err := s.insertDomainTx(ctx, tx, env, *input)
+		var domainID platform.DomainID
+		if step != nil {
+			domainID, err = s.insertDomainWithIDTx(ctx, tx, env, *input, step.DomainID)
+		} else {
+			domainID, err = s.insertDomainTx(ctx, tx, env, *input)
+		}
 		if err != nil {
 			return err
 		}
@@ -968,6 +1064,12 @@ func lastEnvironmentTx(ctx context.Context, tx pgx.Tx, appID, envID string) (boo
 // platform.domain.add and by app/environment creation, which carry the first
 // binding so it commits before any first deploy is queued.
 func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.Environment, input platform.DomainInput) (platform.DomainID, error) {
+	return s.insertDomainWithIDTx(ctx, tx, env, input, "")
+}
+
+// insertDomainWithIDTx accepts only an internally allocated binding identity.
+// Callers must establish its authority from the durable definition journal.
+func (s *Service) insertDomainWithIDTx(ctx context.Context, tx pgx.Tx, env platform.Environment, input platform.DomainInput, allocatedID platform.DomainID) (platform.DomainID, error) {
 	var zero platform.DomainID
 	addresses := input.Addresses
 	if input.DNSMode == integrations.DomainDNSModeCloudflare && len(input.DNSOrigins) > 0 {
@@ -987,6 +1089,9 @@ func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.En
 	case err == nil && existingEnvironment != string(env.ID):
 		return zero, contract.NewFault(contract.Conflict, input.Domain+" is already routed to another environment", "Remove it from that environment first, or use another hostname.")
 	case err == nil:
+		if allocatedID != "" && existingID != allocatedID {
+			return zero, contract.NewFault(contract.Conflict, "domain binding identity changed since approval", "Obtain a new definition plan before changing this binding.")
+		}
 		// Re-adding the same binding is idempotent; --primary promotes it and
 		// refreshes the recorded main-node addresses for DNS observation.
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET check_path=$2 WHERE name=$1`, input.Domain, input.CheckPath); err != nil {
@@ -1007,9 +1112,13 @@ func (s *Service) insertDomainTx(ctx context.Context, tx pgx.Tx, env platform.En
 		}
 		return existingID, nil
 	case errors.Is(err, pgx.ErrNoRows):
-		id, idErr := platform.NewDomainID()
-		if idErr != nil {
-			return zero, unavailable()
+		id := allocatedID
+		if id == "" {
+			var idErr error
+			id, idErr = platform.NewDomainID()
+			if idErr != nil {
+				return zero, unavailable()
+			}
 		}
 		primary := input.Primary
 		if !primary {

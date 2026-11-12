@@ -15,8 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -315,6 +317,8 @@ type definitionInventoryBackend struct {
 	secretNamespaces []vault.Namespace
 	secretPayloads   map[string]string
 	submissions      []definitionSubmission
+	definitionPatch  platform.EnvironmentUpdateInput
+	definitionPlans  int
 	previewReplay    bool
 	// webhookStateful models the control plane's canonical-hash operation
 	// table for first-call-then-repeat CLI tests.
@@ -322,6 +326,37 @@ type definitionInventoryBackend struct {
 	webhookOps            map[string]storedWebhookOperation
 	webhookForceReplay    bool
 	webhookSkipActivation bool
+}
+
+// Model the server-side definition planner for tests that exercise the
+// canonical patch and credential alias checks; no inventory RPC is made.
+func (f *definitionInventoryBackend) PlanDefinition(_ context.Context, input api.DefinitionPlanInput) (api.DefinitionPlan, error) {
+	f.definitionPlans++
+	definition, err := appdef.Parse([]byte(input.Definition))
+	if err != nil {
+		return api.DefinitionPlan{}, definitionFault(err)
+	}
+	resolved, err := definition.Resolve(input.Environment)
+	if err != nil {
+		return api.DefinitionPlan{}, definitionFault(err)
+	}
+	resolved.App = input.App
+	var page struct {
+		Items []platform.Environment `json:"items"`
+	}
+	if err := json.Unmarshal(f.inventory["environments"], &page); err != nil || len(page.Items) == 0 {
+		return api.DefinitionPlan{}, contract.NewFault(contract.NotFound, "environment not found", "Use an existing environment.")
+	}
+	patch, changed, diff, err := resolved.UpdatePatch(page.Items[0], nil)
+	if err != nil {
+		return api.DefinitionPlan{}, definitionFault(err)
+	}
+	f.definitionPatch = patch
+	return api.DefinitionPlan{App: input.App, Environment: input.Environment, CanApply: true, Digest: "digest", PlanNonce: "nonce", Changes: changed, Diff: diff}, nil
+}
+
+func (f *definitionInventoryBackend) ApplyDefinition(context.Context, api.DefinitionApplyInput) (operations.SubmissionResult, error) {
+	return operations.SubmissionResult{}, contract.NewFault(contract.Unavailable, "fake admission not configured", "Use a planning test.")
 }
 
 type storedWebhookOperation struct {
@@ -545,302 +580,6 @@ func (f *definitionInventoryBackend) submissionsOfKind(kind string) []definition
 	return out
 }
 
-func TestPlanDomainChangesOrdersPromotionBeforeRemoval(t *testing.T) {
-	current := []platform.DomainBinding{
-		{Domain: "old.example.com", Primary: true},
-		{Domain: "alias.example.com", Primary: false, CheckPath: "/healthz"},
-	}
-	want := []appdef.Domain{
-		{Name: "alias.example.com", Primary: true, CheckPath: "/readyz"},
-		{Name: "new.example.com", Primary: false},
-	}
-	plan, err := planDomainChanges(want, current)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(plan.Adds) != 1 || plan.Adds[0].Name != "new.example.com" {
-		t.Fatalf("adds = %+v", plan.Adds)
-	}
-	if len(plan.Updates) != 1 || plan.Updates[0].Name != "alias.example.com" || !plan.Updates[0].Primary {
-		t.Fatalf("updates = %+v", plan.Updates)
-	}
-	if len(plan.Removes) != 1 || plan.Removes[0].Domain != "old.example.com" {
-		t.Fatalf("removes = %+v", plan.Removes)
-	}
-	if _, err := planDomainChanges(nil, current); err == nil {
-		t.Fatal("allowed removal of every domain")
-	}
-	if err := validateDomainRemovalConfirmation(plan.Removes, nil); contract.Classify(err).Code != contract.ConfirmationRequired {
-		t.Fatalf("missing domain confirmation = %v", err)
-	}
-	if err := validateDomainRemovalConfirmation(plan.Removes, []string{"old.example.com"}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestEnvUpdateFromFileRemovesNonPrimaryDomainWithConfirmation(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "eregion.toml")
-	raw := `version = 1
-app = "api"
-node = "main"
-
-[source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
-
-[[domains]]
-name = "api.example.com"
-primary = true
-`
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	current := platform.Environment{
-		App: "api", Name: "production", Node: "main",
-		Domains: []string{"api.example.com", "alias.example.com"}, PrimaryDomain: "api.example.com",
-		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-			Source:  platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
-			Runtime: platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
-		}},
-	}
-	rawEnv, _ := json.Marshal(current)
-	rawDomains, _ := json.Marshal(map[string]any{"items": []platform.DomainBinding{
-		{Domain: "api.example.com", App: "api", Environment: "production", Primary: true},
-		{Domain: "alias.example.com", App: "api", Environment: "production"},
-	}})
-	newBackend := func() *definitionInventoryBackend {
-		return &definitionInventoryBackend{inventory: map[string]json.RawMessage{
-			"environments": json.RawMessage(`{"items":[` + string(rawEnv) + `]}`),
-			"domains":      rawDomains,
-		}}
-	}
-	newCommand := func(flags ...string) *cobra.Command {
-		cmd := &cobra.Command{Use: "update"}
-		addEnvironmentUpdateFlags(cmd)
-		if err := cmd.ParseFlags(append([]string{"--from", path}, flags...)); err != nil {
-			t.Fatal(err)
-		}
-		return cmd
-	}
-
-	backend := newBackend()
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	if _, err := a.envUpdate(newCommand(), []string{"api", "production"}); err == nil {
-		t.Fatal("removed a domain without --confirm-domain")
-	} else if contract.Classify(err).Code != contract.ConfirmationRequired {
-		t.Fatalf("missing confirmation = %v", contract.Classify(err).Code)
-	}
-	if removes := backend.submissionsOfKind(platform.KindDomainRemove); len(removes) != 0 {
-		t.Fatalf("unconfirmed domain removal was submitted: %+v", removes)
-	}
-
-	backend = newBackend()
-	a = &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(newCommand("--confirm-domain", "alias.example.com"), []string{"api", "production"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok || len(data.DomainOperations) != 1 {
-		t.Fatalf("domain operations = %+v", res.data)
-	}
-	removes := backend.submissionsOfKind(platform.KindDomainRemove)
-	if len(removes) != 1 || removes[0].Confirm != "alias.example.com" {
-		t.Fatalf("domain removals = %+v", removes)
-	}
-	if updates := backend.submissionsOfKind(platform.KindEnvironmentUpdate); len(updates) != 0 {
-		t.Fatalf("domain-only change wrote a revision: %+v", updates)
-	}
-}
-
-func TestEnvUpdateFromFileDetectsOmittedDomainRemoval(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "eregion.toml")
-	raw := `version = 1
-app = "api"
-node = "main"
-[source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
-`
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	current := platform.Environment{
-		App: "api", Name: "production", Node: "main",
-		RevisionID:    platform.RevisionID("erv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-		Domains:       []string{"api.example.com"},
-		PrimaryDomain: "api.example.com",
-		Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-			Source: platform.SourceBinding{Kind: "image", Image: "ghcr.io/acme/api:1"},
-		}},
-	}
-	rawEnv, _ := json.Marshal(current)
-	rawDomains, _ := json.Marshal(map[string]any{"items": []platform.DomainBinding{
-		{Domain: "api.example.com", App: "api", Environment: "production", Primary: true},
-	}})
-	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{
-		"environments": json.RawMessage(`{"items":[` + string(rawEnv) + `]}`),
-		"domains":      rawDomains,
-	}}
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path, "--dry-run"}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	if _, err := a.envUpdate(cmd, []string{"api", "production"}); err == nil {
-		t.Fatal("an omitted domain was silently retained")
-	} else if contract.Classify(err).Code != contract.ValidationFailed {
-		t.Fatalf("domain-removal error = %v", contract.Classify(err).Code)
-	}
-}
-
-func TestEnvUpdateFromFileRejectsWebhookFlags(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "eregion.toml")
-	if err := os.WriteFile(path, []byte(testDefinition), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path, "--auto-deploy"}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}}
-	if _, err := a.envUpdate(cmd, []string{"api", "production"}); err == nil {
-		t.Fatal("accepted --from with a webhook flag")
-	} else if contract.Classify(err).Code != contract.ValidationFailed {
-		t.Fatalf("webhook flag error = %v", contract.Classify(err).Code)
-	}
-}
-
-func TestEnvUpdateFromFileDisablesAutomationWithoutWebhookSideEffects(t *testing.T) {
-	installFakeGH(t)
-	generated := countWebhookGenerations(t)
-	current := platform.Environment{App: "api", Name: "production", Node: "main", Revision: &platform.EnvironmentRevision{RevisionState: platform.RevisionState{
-		Source:     platform.SourceBinding{Kind: "git", URL: "https://github.com/acme/api", Ref: "main"},
-		Runtime:    platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/healthz", HealthTimeoutSeconds: 30},
-		Processes:  []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
-		AutoDeploy: true, WebhookSecretName: "HOOK",
-	}}}
-	document, err := appdef.Export("api", "production", "", current.Revision, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	document = strings.Replace(document, "auto_deploy = true", "auto_deploy = false", 1)
-	path := writeDefinitionFile(t, document)
-	backend := definitionBackendForEnvironment(t, current)
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	if _, err := a.envUpdate(cmd, []string{"api", "production"}); err != nil {
-		t.Fatal(err)
-	}
-	updates := backend.submissionsOfKind(platform.KindEnvironmentUpdate)
-	if len(updates) != 2 || !updates[0].DryRun || updates[1].DryRun {
-		t.Fatalf("environment updates = %+v", updates)
-	}
-	var patch platform.EnvironmentUpdateInput
-	if err := json.Unmarshal(updates[1].Input, &patch); err != nil {
-		t.Fatal(err)
-	}
-	if patch.AutoDeploy == nil || *patch.AutoDeploy || patch.WebhookSecretName != nil || patch.RotateWebhookSecret {
-		t.Fatalf("unexpected automation patch: %+v", patch)
-	}
-	next := platform.ApplyEnvironmentPatch(current.Revision.RevisionState, patch)
-	if next.AutoDeploy || next.WebhookSecretName != "HOOK" {
-		t.Fatalf("disable lost existing reference: %+v", next)
-	}
-	if *generated != 0 || backend.secretWrite != 0 || backend.secretRead != 0 || len(fakeGHCalls(t)) != 0 {
-		t.Fatalf("unexpected webhook side effect: generated=%d writes=%d reads=%d gh=%v", *generated, backend.secretWrite, backend.secretRead, fakeGHCalls(t))
-	}
-}
-
-func TestEnvUpdateFromFileDryRunBuildsTheSupportedPatch(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "eregion.toml")
-	raw := `version = 1
-app = "api"
-node = "main"
-[config]
-B = "3"
-[source]
-kind = "git"
-url = "https://github.com/acme/api"
-ref = "next"
-[[processes]]
-name = "web"
-kind = "web"
-container_port = 8080
-replicas = 2
-`
-	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	revisionID := platform.RevisionID("erv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	current := platform.Environment{
-		App: "api", Name: "production", Node: "main", RevisionID: revisionID,
-		Revision: &platform.EnvironmentRevision{ID: revisionID, RevisionState: platform.RevisionState{
-			Source: platform.SourceBinding{
-				Kind: "git", URL: "https://github.com/acme/api", Ref: "main", Builder: "paketobuildpacks/builder-jammy-base",
-			},
-			Runtime:     platform.RuntimeSpec{Node: "main", HealthType: "http", HealthPath: "/", HealthTimeoutSeconds: 30},
-			Processes:   []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
-			Config:      map[string]string{"A": "1", "B": "2"},
-			SecretNames: []string{"DATABASE_URL"},
-		}},
-	}
-	rawEnv, _ := json.Marshal(current)
-	backend := &definitionInventoryBackend{inventory: map[string]json.RawMessage{
-		"environments": json.RawMessage(`{"items":[` + string(rawEnv) + `]}`),
-	}}
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path, "--dry-run"}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(cmd, []string{"api", "production"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok {
-		t.Fatalf("result = %T %+v", res.data, res.data)
-	}
-	if !data.DryRun || data.OperationID != "" {
-		t.Fatalf("dry run result = %+v", data)
-	}
-	if got := strings.Join(data.Changed, ","); got != "source,processes,config,secret_names" {
-		t.Fatalf("changed = %s", got)
-	}
-	if data.Patch.SecretNames == nil || len(*data.Patch.SecretNames) != 0 {
-		t.Fatalf("secret names were not treated as full desired state: %+v", data.Patch.SecretNames)
-	}
-	if data.Patch.ExpectedRevisionID != revisionID {
-		t.Fatalf("expected revision fence = %q, want %q", data.Patch.ExpectedRevisionID, revisionID)
-	}
-	if data.Patch.Source == nil || data.Patch.Source.Ref != "next" ||
-		data.Patch.Source.URL != "https://github.com/acme/api" {
-		t.Fatalf("source patch = %+v", data.Patch.Source)
-	}
-	if data.Patch.Processes == nil || len(*data.Patch.Processes) != 1 || (*data.Patch.Processes)[0].Replicas != 2 {
-		t.Fatalf("process patch = %+v", data.Patch.Processes)
-	}
-	if data.Patch.Config == nil || (*data.Patch.Config)["B"] != "3" || len(*data.Patch.Config) != 1 {
-		t.Fatalf("config patch = %+v", data.Patch.Config)
-	}
-	if backend.submitted != platform.KindEnvironmentUpdate || !backend.dryRun {
-		t.Fatalf("preview submission = %q dry=%t", backend.submitted, backend.dryRun)
-	}
-	if strings.Contains(data.Plain, "No work was accepted") == false {
-		t.Fatalf("dry-run text = %q", data.Plain)
-	}
-}
-
 func definitionBackendForEnvironment(t *testing.T, current platform.Environment) *definitionInventoryBackend {
 	t.Helper()
 	rawEnv, err := json.Marshal(current)
@@ -904,341 +643,75 @@ attach = false
 command = ["redis-cli", "ping"]
 `
 
-func TestEnvUpdateFromFileAppliesDeclaredResources(t *testing.T) {
+func TestDefinitionEnvironmentPlannerKeepsResourceDeclarations(t *testing.T) {
 	path := writeDefinitionFile(t, resourceDefinition)
 	backend := definitionBackendForEnvironment(t, resourceDefinitionEnvironment())
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path}); err != nil {
-		t.Fatal(err)
+	exit, stdout, stderr := runGitHubAuthCommand(t, backend, "env", "update", "api", "production", "--from", path, "--dry-run", "--json")
+	if exit != 0 || stderr != "" || backend.definitionPlans != 1 || len(backend.submissions) != 0 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s plans=%d submissions=%+v", exit, stdout, stderr, backend.definitionPlans, backend.submissions)
 	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(cmd, []string{"api", "production"})
+	definition, err := appdef.Parse([]byte(resourceDefinition))
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok {
-		t.Fatalf("result = %T %+v", res.data, res.data)
-	}
-	if data.OperationID == "" {
-		t.Fatal("the environment revision was not accepted")
-	}
-	if data.Patch.Resources == nil || strings.Join(*data.Patch.Resources, ",") != "db" {
-		t.Fatalf("revision attachments = %+v, want only db", data.Patch.Resources)
-	}
-	if len(data.ResourceOperations) != 2 {
-		t.Fatalf("resource operations = %v", data.ResourceOperations)
-	}
-	applies := backend.submissionsOfKind(platform.KindResourceApply)
-	if len(applies) != 2 {
-		t.Fatalf("resource apply submissions = %+v", applies)
-	}
-	inputs := map[string]platform.ResourceApplyInput{}
-	for _, submission := range applies {
-		if submission.DryRun {
-			t.Fatalf("resource apply was submitted as a dry run: %+v", submission)
-		}
-		var input platform.ResourceApplyInput
-		if err := json.Unmarshal(submission.Input, &input); err != nil {
-			t.Fatal(err)
-		}
-		inputs[input.Name] = input
-	}
-	db, ok := inputs["db"]
-	if !ok {
-		t.Fatalf("db resource apply missing: %+v", inputs)
-	}
-	if db.App != "api" || db.Environment != "production" || db.Image != "postgres:17" ||
-		db.Port != 5432 || db.SecretEnv["POSTGRES_PASSWORD"] != "DATABASE_PASSWORD" ||
-		len(db.Health.Command) != 1 || db.Health.Command[0] != "pg_isready" {
-		t.Fatalf("db apply input = %+v", db)
-	}
-	cache, ok := inputs["cache"]
-	if !ok || cache.Image != "redis:7" || cache.Health.Command[1] != "ping" {
-		t.Fatalf("cache apply input = %+v", cache)
-	}
-}
-
-func TestEnvUpdateFromFileDryRunDoesNotProvisionResources(t *testing.T) {
-	path := writeDefinitionFile(t, resourceDefinition)
-	backend := definitionBackendForEnvironment(t, resourceDefinitionEnvironment())
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path, "--dry-run"}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(cmd, []string{"api", "production"})
+	resolved, err := definition.Resolve("production")
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok || !data.DryRun {
-		t.Fatalf("dry-run result = %T %+v", res.data, res.data)
-	}
-	if len(data.ResourceOperations) != 0 {
-		t.Fatalf("dry run accepted resource operations: %v", data.ResourceOperations)
-	}
-	if applies := backend.submissionsOfKind(platform.KindResourceApply); len(applies) != 0 {
-		t.Fatalf("dry run submitted resource applies: %+v", applies)
-	}
-	if backend.submitted != platform.KindEnvironmentUpdate || !backend.dryRun {
-		t.Fatalf("dry run last submission = %q dry=%t", backend.submitted, backend.dryRun)
-	}
-}
-
-func TestEnvUpdateFromFileDryRunDoesNotProvisionAttachFalseOnlyResource(t *testing.T) {
-	raw := `version = 1
-app = "api"
-node = "main"
-
-[source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
-
-[config]
-A = "1"
-
-[[resources]]
-name = "cache"
-image = "redis:7"
-attach = false
-
-[resources.health]
-command = ["redis-cli", "ping"]
-`
-	path := writeDefinitionFile(t, raw)
-	backend := definitionBackendForEnvironment(t, resourceDefinitionEnvironment())
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path, "--dry-run"}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(cmd, []string{"api", "production"})
+	resolved.App = "api"
+	specs, err := resolved.ResourceApplySpecs()
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok || !data.DryRun {
-		t.Fatalf("dry-run result = %T %+v", res.data, res.data)
+	attached, set := resolved.ResourceAttachments()
+	if len(specs) != 2 || specs[0].Name != "db" || specs[1].Name != "cache" || !set || len(attached) != 1 || attached[0] != "db" {
+		t.Fatalf("specs=%+v attached=%v", specs, attached)
 	}
-	if len(data.ResourceOperations) != 0 {
-		t.Fatalf("dry run accepted resource operations: %v", data.ResourceOperations)
-	}
-	if len(backend.submissions) != 0 {
-		t.Fatalf("dry run submitted actions: %+v", backend.submissions)
+	if backend.definitionPatch.Resources == nil || len(*backend.definitionPatch.Resources) != 1 || (*backend.definitionPatch.Resources)[0] != "db" {
+		t.Fatalf("patch resources = %+v", backend.definitionPatch.Resources)
 	}
 }
 
-func TestEnvUpdateFromFileAppliesAttachFalseResourceWithoutRevisionChange(t *testing.T) {
-	raw := `version = 1
-app = "api"
-node = "main"
-
-[source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
-
-[config]
-A = "1"
-
-[[resources]]
-name = "cache"
-image = "redis:7"
-attach = false
-
-[resources.health]
-command = ["redis-cli", "ping"]
-`
-	path := writeDefinitionFile(t, raw)
-	backend := definitionBackendForEnvironment(t, resourceDefinitionEnvironment())
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(cmd, []string{"api", "production"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok {
-		t.Fatalf("result = %T %+v", res.data, res.data)
-	}
-	if data.OperationID != "" {
-		t.Fatalf("an unchanged revision was submitted again: %s", data.OperationID)
-	}
-	if len(data.ResourceOperations) != 1 {
-		t.Fatalf("attach=false resource was not provisioned: %+v", data)
-	}
-	if envUpdates := backend.submissionsOfKind(platform.KindEnvironmentUpdate); len(envUpdates) != 0 {
-		t.Fatalf("unchanged revision submitted an update: %+v", envUpdates)
-	}
-	applies := backend.submissionsOfKind(platform.KindResourceApply)
-	if len(applies) != 1 {
-		t.Fatalf("resource applies = %+v", applies)
-	}
-	var input platform.ResourceApplyInput
-	if err := json.Unmarshal(applies[0].Input, &input); err != nil {
-		t.Fatal(err)
-	}
-	if input.Name != "cache" || input.Image != "redis:7" {
-		t.Fatalf("resource apply input = %+v", input)
-	}
-	if !strings.Contains(data.Plain, "No revision changes") {
-		t.Fatalf("plain result = %q", data.Plain)
-	}
-}
-
-func TestEnvUpdateFromFileRequiresConfirmationForResourceRemoval(t *testing.T) {
-	raw := `version = 1
-app = "api"
-node = "main"
-
-[source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
-
-[config]
-A = "1"
-`
-	path := writeDefinitionFile(t, raw)
-	current := resourceDefinitionEnvironment()
-	current.Revision.Resources = []string{"db"}
-	backend := definitionBackendForEnvironment(t, current)
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path}); err != nil {
-		t.Fatal(err)
-	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	if _, err := a.envUpdate(cmd, []string{"api", "production"}); err == nil {
-		t.Fatal("a resource dependency removal was accepted without confirmation")
-	} else if contract.Classify(err).Code != contract.ConfirmationRequired {
-		t.Fatalf("removal error = %v", contract.Classify(err).Code)
-	}
-	for _, submission := range backend.submissions {
-		if !submission.DryRun {
-			t.Fatalf("an unconfirmed removal reached submission: %+v", submission)
-		}
-	}
-
-	backend = definitionBackendForEnvironment(t, current)
-	cmd = &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path, "--confirm", "api/production"}); err != nil {
-		t.Fatal(err)
-	}
-	a = &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(cmd, []string{"api", "production"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok {
-		t.Fatalf("result = %T %+v", res.data, res.data)
-	}
-	if data.Patch.Resources == nil || len(*data.Patch.Resources) != 0 {
-		t.Fatalf("confirmed removal patch = %+v", data.Patch.Resources)
-	}
-	if data.Patch.Confirm != "api/production" {
-		t.Fatalf("confirmation was not carried into the patch: %q", data.Patch.Confirm)
-	}
-	if data.OperationID == "" {
-		t.Fatal("confirmed removal was not accepted")
-	}
-	if applies := backend.submissionsOfKind(platform.KindResourceApply); len(applies) != 0 {
-		t.Fatalf("removal applied resources: %+v", applies)
-	}
-}
-
-func TestEnvUpdateFromFileRemovingLastCollectionsSubmitsEmptyArrays(t *testing.T) {
+func TestDefinitionEnvironmentPlannerKeepsEmptyCollectionRemovals(t *testing.T) {
 	raw := `version = 1
 app = "api"
 node = "main"
 secret_names = []
 resources = []
-
 [source]
 kind = "image"
 image = "ghcr.io/acme/api:1"
-
 [config]
 `
-	path := writeDefinitionFile(t, raw)
 	current := resourceDefinitionEnvironment()
 	current.Revision.Processes = []platform.ProcessSpec{{Name: "worker", Kind: "worker", Command: "./worker", Replicas: 1}}
 	current.Revision.SecretNames = []string{"DATABASE_URL"}
 	current.Revision.Resources = []string{"db"}
-	current.Revision.Config = map[string]string{"A": "1"}
 	backend := definitionBackendForEnvironment(t, current)
-	cmd := &cobra.Command{Use: "update"}
-	addEnvironmentUpdateFlags(cmd)
-	if err := cmd.ParseFlags([]string{"--from", path, "--confirm", "api/production"}); err != nil {
-		t.Fatal(err)
+	path := writeDefinitionFile(t, raw)
+	exit, stdout, stderr := runGitHubAuthCommand(t, backend, "env", "update", "api", "production", "--from", path, "--dry-run", "--json")
+	if exit != 0 || stderr != "" || backend.definitionPlans != 1 || len(backend.submissions) != 0 {
+		t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
 	}
-	a := &app{secrets: &secrets.Registry{}, backend: backend}
-	res, err := a.envUpdate(cmd, []string{"api", "production"})
+	patch := backend.definitionPatch
+	if patch.Processes == nil || len(*patch.Processes) != 0 || patch.Config == nil || len(*patch.Config) != 0 || patch.SecretNames == nil || len(*patch.SecretNames) != 0 || patch.Resources == nil || len(*patch.Resources) != 0 {
+		t.Fatalf("removal patch = %+v", patch)
+	}
+	encoded, err := json.Marshal(patch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, ok := res.data.(definitionUpdateResult)
-	if !ok || data.OperationID == "" {
-		t.Fatalf("result = %T %+v", res.data, res.data)
-	}
-	if got := strings.Join(data.Changed, ","); got != "processes,config,secret_names,resources" {
-		t.Fatalf("changed = %s", got)
-	}
-	if data.Patch.Processes == nil || len(*data.Patch.Processes) != 0 ||
-		data.Patch.Config == nil || len(*data.Patch.Config) != 0 ||
-		data.Patch.SecretNames == nil || len(*data.Patch.SecretNames) != 0 ||
-		data.Patch.Resources == nil || len(*data.Patch.Resources) != 0 {
-		t.Fatalf("removal patch = %+v", data.Patch)
-	}
-
-	updates := backend.submissionsOfKind(platform.KindEnvironmentUpdate)
-	if len(updates) != 2 {
-		t.Fatalf("environment update submissions = %+v, want preview and accepted action", updates)
-	}
-	var accepted definitionSubmission
-	for _, submission := range updates {
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(submission.Input, &fields); err != nil {
-			t.Fatal(err)
-		}
-		for _, name := range []string{"processes", "secret_names", "resources"} {
-			if got := string(fields[name]); got != "[]" {
-				t.Fatalf("%s on the wire = %s, want an explicit empty array; input = %s", name, got, submission.Input)
-			}
-		}
-		if got := string(fields["config"]); got != "{}" {
-			t.Fatalf("config on the wire = %s, want an explicit empty object; input = %s", got, submission.Input)
-		}
-		if !submission.DryRun {
-			accepted = submission
-		}
-	}
-	if accepted.Input == nil {
-		t.Fatal("the accepted environment update was not captured")
-	}
-
-	normalized, err := platform.Default().Normalize(platform.KindEnvironmentUpdate, "env/api/production", accepted.Input)
-	if err != nil {
-		t.Fatalf("the node refused the CLI's accepted input: %v", err)
-	}
-	patch, ok := normalized.Input.(*platform.EnvironmentUpdateInput)
-	if !ok {
-		t.Fatalf("normalized input = %T", normalized.Input)
-	}
-	next := platform.ApplyEnvironmentPatch(platform.CloneRevisionState(current.Revision.RevisionState), *patch)
-	if err := platform.NormalizeRevisionState(&next); err != nil {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
 		t.Fatal(err)
 	}
-	if len(next.Processes) != 0 || len(next.Config) != 0 || len(next.SecretNames) != 0 || len(next.Resources) != 0 {
-		t.Fatalf("the accepted revision retained removed collections: %+v", next)
+	for _, name := range []string{"processes", "secret_names", "resources"} {
+		if string(fields[name]) != "[]" {
+			t.Fatalf("%s = %s", name, fields[name])
+		}
+	}
+	if string(fields["config"]) != "{}" {
+		t.Fatalf("config = %s", fields["config"])
 	}
 }
 

@@ -24,12 +24,21 @@ import (
 func (a *app) hostSpecs() []spec {
 	planMeta := operationMeta("Show the host steps an apply would change", "eregion plan --json")
 	planMeta.Next = []string{"eregion apply", "eregion doctor"}
-	applyMeta := operationMeta("Converge the node to its recorded host intent", "eregion apply --json")
+	planMeta.WhenToUse = append(planMeta.WhenToUse, "With --from, preview an existing app/environment definition; can_apply is eligibility, not readiness.")
+	planMeta.Examples = append(planMeta.Examples, "eregion plan --from eregion.toml --app api --environment production --json")
+	planMeta.InputFlags = []string{"from", "app", "environment"}
+	applyMeta := followingMeta(operationMeta("Converge the node to its recorded host intent", "eregion apply --json"))
 	applyMeta.Mutating, applyMeta.DryRun = true, true
 	applyMeta.NeedsRestart = "possible"
 	applyMeta.WhenToUse = []string{
 		"Converge the node to its recorded host intent. --workspace selects an existing verified workspace.",
+		"With --from, apply an existing app/environment definition using the exact digest and nonce returned by plan. Acceptance is not completion.",
 	}
+	applyMeta.Examples = append(applyMeta.Examples, "eregion apply --from eregion.toml --app api --environment production --plan-nonce NONCE --confirm-plan DIGEST --idempotency-key KEY --json")
+	applyMeta.DurableSubmission = true
+	applyMeta.DestructiveFlags = []string{"from"}
+	applyMeta.Confirmation = "plan-bound"
+	applyMeta.InputFlags = []string{"from", "app", "environment", "plan-nonce", "confirm-plan", "idempotency-key", "confirm"}
 	applyMeta.Next = []string{"eregion doctor", "eregion server status"}
 	doctorMeta := operationMeta("Check host drift, security, certificates, disk, versions and services", "eregion doctor --json")
 	doctorMeta.Next = []string{"eregion plan", "eregion apply"}
@@ -40,9 +49,17 @@ func (a *app) hostSpecs() []spec {
 	sshMeta.Prompts = false
 	sshMeta.Next = []string{"eregion server status"}
 	return []spec{
-		{use: "plan", meta: planMeta, run: a.hostPlan},
+		{use: "plan", meta: planMeta, flags: definitionPlanFlags, run: a.hostPlan},
 		{use: "apply", meta: applyMeta, flags: func(cmd *cobra.Command) {
 			cmd.Flags().Bool("dry-run", false, "Show the plan without changing the host")
+			definitionPlanFlags(cmd)
+			cmd.Flags().String("plan-nonce", "", "Nonce from the approved definition plan")
+			cmd.Flags().String("confirm-plan", "", "Exact digest from the approved definition plan")
+			cmd.Flags().String("idempotency-key", "", "Stable definition submission key")
+			cmd.Flags().String("confirm", "", "Confirm removal with the exact app/environment target")
+			cmd.Flags().Bool("yes", false, "Does not replace definition plan approval")
+			cmd.Flags().Bool("detach", false, "Return after accepting a definition operation")
+			followFlags(cmd)
 		}, run: a.hostApply},
 		{use: "doctor", meta: doctorMeta, run: a.hostDoctor},
 		{use: "ssh [node]", meta: sshMeta, args: cobra.MaximumNArgs(1), flags: func(cmd *cobra.Command) {
@@ -52,6 +69,12 @@ func (a *app) hostSpecs() []spec {
 }
 
 func (a *app) hostPlan(cmd *cobra.Command, _ []string) (result, error) {
+	if flagString(cmd, "from") != "" {
+		return a.definitionPlan(cmd)
+	}
+	if err := rejectDefinitionFlagsWithoutFrom(cmd); err != nil {
+		return result{}, err
+	}
 	client, err := a.nodeClient(cmd)
 	if err != nil {
 		return result{}, err
@@ -64,6 +87,15 @@ func (a *app) hostPlan(cmd *cobra.Command, _ []string) (result, error) {
 }
 
 func (a *app) hostApply(cmd *cobra.Command, _ []string) (result, error) {
+	if flagString(cmd, "from") != "" {
+		return a.definitionApply(cmd)
+	}
+	if err := rejectDefinitionFlagsWithoutFrom(cmd); err != nil {
+		return result{}, err
+	}
+	if streamsNDJSON(cmd) {
+		return result{}, contract.NewFault(contract.InvalidOutputMode, "host apply does not stream NDJSON", "Use plain or JSON output for host apply.")
+	}
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	client, err := a.nodeClient(cmd)
 	if err != nil {

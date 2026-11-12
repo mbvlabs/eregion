@@ -101,6 +101,7 @@ type DomainDNSPlan struct {
 	// desired is the complete verified target set for an apply plan. It is not
 	// serialized; deletion is held until this set is visible at the provider.
 	desired []DNSRecord
+	cleanup bool
 }
 
 func NewDomainDNS(cfg DomainDNSConfig) (*DomainDNS, error) {
@@ -227,7 +228,7 @@ func (d *DomainDNS) planApply(ctx context.Context, zone DNSZone, client *Cloudfl
 }
 
 // PlanRemove returns the exact owned records an explicit removal would delete.
-// Foreign address records make the removal fail closed instead of guessing.
+// Foreign records are left untouched and do not prevent exact-owned cleanup.
 func (d *DomainDNS) PlanRemove(ctx context.Context, req DomainDNSRequest) (DomainDNSPlan, error) {
 	zone, client, err := d.clientFor(ctx, req.ZoneID, req.ZoneName)
 	if err != nil {
@@ -256,10 +257,9 @@ func (d *DomainDNS) planRemove(ctx context.Context, zone DNSZone, client *Cloudf
 		return DomainDNSPlan{}, err
 	}
 	plan.DomainID = req.DomainID
-	owned, conflicts := domainDNSClassify(plan.Records, marker)
-	plan.Conflicts = conflicts
-	for _, records := range owned {
-		for _, record := range records {
+	plan.cleanup = true
+	for _, record := range plan.Records {
+		if record.Ownership == "owned" && record.Comment == marker {
 			before := record
 			plan.Changes = append(plan.Changes, DomainDNSChange{Action: "delete", Type: record.Type, Before: &before})
 		}
@@ -269,9 +269,6 @@ func (d *DomainDNS) planRemove(ctx context.Context, zone DNSZone, client *Cloudf
 		"Only records whose comment exactly matches this binding's ownership marker are removed; unrelated records are preserved.",
 		"Cloudflare has no conditional-write API; ownership is re-read immediately before each deletion, but a concurrent external writer can still race the final request.",
 		"Foreign record content, comments, TTL and proxy state are redacted from this snapshot.")
-	if len(conflicts) > 0 {
-		plan.Warnings = append(plan.Warnings, "Removal would fail closed: the hostname has address records this binding does not own.")
-	}
 	return plan, nil
 }
 
@@ -307,7 +304,7 @@ func (d *DomainDNS) apply(ctx context.Context, actor contract.Actor, opID contra
 }
 
 // Remove authorizes, audits and deletes only this binding's exact owned
-// address records. A hostname with foreign address records fails closed.
+// address records. Foreign records are preserved.
 func (d *DomainDNS) Remove(ctx context.Context, actor contract.Actor, opID contract.OperationID, req DomainDNSRequest) (DomainDNSPlan, error) {
 	return d.remove(ctx, actor, opID, req, nil)
 }
@@ -338,8 +335,7 @@ func (d *DomainDNS) remove(ctx context.Context, actor contract.Actor, opID contr
 		return plan, err
 	}
 	// A delete acknowledgement is not cleanup proof. Re-read the hostname and
-	// refuse verification while any exact-owned A/AAAA remains or any conflict
-	// (including a CNAME) is present.
+	// refuse verification while any exact-owned A/AAAA remains.
 	if err := d.verifyRemoved(ctx, zone, client, req); err != nil {
 		return plan, err
 	}
@@ -485,9 +481,8 @@ func (d *DomainDNS) verifyDesired(ctx context.Context, zone DNSZone, client *Clo
 }
 
 // verifyRemoved proves that the post-delete provider state has no exact-owned
-// A/AAAA records and no conflicts. A failed read, a reappearance, a CNAME or a
-// foreign address record refuses cleanup verification so the caller retains the
-// ledger for retry.
+// A/AAAA records. A failed read or a reappearance retains the ledger for retry;
+// unrelated provider records do not become this binding's responsibility.
 func (d *DomainDNS) verifyRemoved(ctx context.Context, zone DNSZone, client *Cloudflare, req DomainDNSRequest) error {
 	host, err := normalizeDomainDNSHost(req.Host)
 	if err != nil {
@@ -497,19 +492,17 @@ func (d *DomainDNS) verifyRemoved(ctx context.Context, zone DNSZone, client *Clo
 	if err != nil {
 		return err
 	}
-	owned, conflicts := domainDNSClassify(current.Records, req.Ownership)
-	if len(conflicts) > 0 {
-		fault := contract.NewFault(contract.PreconditionFailed,
-			"Cloudflare DNS records changed before cleanup could be verified",
-			"The cleanup is not verified; the ledger is retained. Inspect the hostname and retry.")
-		fault.Details = map[string]any{"zone": zone.ZoneName, "host": req.Host, "conflicts": conflicts}
-		return fault
+	owned := 0
+	for _, record := range current.Records {
+		if record.Ownership == "owned" && record.Comment == req.Ownership {
+			owned++
+		}
 	}
-	if len(owned["A"])+len(owned["AAAA"]) > 0 {
+	if owned > 0 {
 		fault := contract.NewFault(contract.PreconditionFailed,
 			"exact-owned DNS records remain after deletion requests",
 			"The cleanup is not verified; the ledger is retained. Retry the cleanup.")
-		fault.Details = map[string]any{"zone": zone.ZoneName, "host": req.Host, "owned_a": len(owned["A"]), "owned_aaaa": len(owned["AAAA"])}
+		fault.Details = map[string]any{"zone": zone.ZoneName, "host": req.Host, "owned_records": owned}
 		return fault
 	}
 	return nil
@@ -525,7 +518,7 @@ func (d *DomainDNS) confirmDomainDNSChange(ctx context.Context, zone DNSZone, cl
 		return false, err
 	}
 	owned, conflicts := domainDNSClassify(current.Records, plan.Ownership)
-	if len(conflicts) > 0 {
+	if len(conflicts) > 0 && !plan.cleanup {
 		fault := contract.NewFault(contract.PreconditionFailed,
 			"Cloudflare DNS ownership changed immediately before the mutation",
 			"No record was changed by this attempt; inspect the hostname and retry from a fresh plan.")
@@ -583,6 +576,9 @@ func (d *DomainDNS) confirmDomainDNSChange(ctx context.Context, zone DNSZone, cl
 				return false, contract.NewFault(contract.PreconditionFailed,
 					"the owned record changed immediately before deletion",
 					"No deletion was made; inspect the hostname and retry from a fresh plan.")
+			}
+			if !domainDNSContentEqual(change.Type, record.Content, change.Before.Content) || record.TTL != change.Before.TTL || record.Proxied != change.Before.Proxied {
+				return false, contract.NewFault(contract.PreconditionFailed, "the owned record changed immediately before deletion", "No deletion was made; inspect the hostname and retry from a fresh plan.")
 			}
 			return false, nil
 		}

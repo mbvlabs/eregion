@@ -29,6 +29,62 @@ type cloudflareCLIBackend struct {
 	calls       int
 }
 
+type definitionDNSCLIBackend struct {
+	*cloudflareCLIBackend
+	input  api.DefinitionDNSPolicyInput
+	writes int
+}
+
+func (b *definitionDNSCLIBackend) GetDefinitionDNSPolicy(context.Context) (api.DefinitionDNSPolicy, error) {
+	return api.DefinitionDNSPolicy{Revision: 2, Enabled: false, ProxyMode: "dns-only"}, nil
+}
+
+func (b *definitionDNSCLIBackend) SetDefinitionDNSPolicy(_ context.Context, input api.DefinitionDNSPolicyInput) (api.DefinitionDNSPolicy, error) {
+	b.writes++
+	b.input = input
+	return api.DefinitionDNSPolicy{Revision: input.ExpectedRevision + 1, Enabled: input.Enabled, ProxyMode: input.ProxyMode}, nil
+}
+
+func TestDefinitionDNSPolicyCLIUsesMetadataOnlyAndExplicitRevision(t *testing.T) {
+	backend := &definitionDNSCLIBackend{cloudflareCLIBackend: &cloudflareCLIBackend{}}
+	a := &app{backend: backend}
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("enabled", false, "")
+	cmd.Flags().String("zone", "", "")
+	cmd.Flags().StringArray("origin", nil, "")
+	cmd.Flags().String("proxy", "", "")
+	cmd.Flags().Uint64("expected-revision", 0, "")
+	if _, err := a.domainCloudflarePolicy(cmd, nil); contract.Classify(err).Code != contract.InputRequired {
+		t.Fatalf("missing flags: %v", err)
+	}
+	for key, value := range map[string]string{"enabled": "true", "zone": "example.com", "origin": "8.8.8.8", "proxy": "dns-only", "expected-revision": "2"} {
+		if err := cmd.Flags().Set(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := a.domainCloudflarePolicy(cmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	if backend.writes != 1 || backend.input.ExpectedRevision != 2 || !backend.input.Enabled || backend.input.Zone != "example.com" || len(backend.input.Origins) != 1 {
+		t.Fatalf("policy input = %+v, writes=%d", backend.input, backend.writes)
+	}
+}
+
+func TestDefinitionDNSPolicyIncludedInCloudflareStatus(t *testing.T) {
+	backend := &definitionDNSCLIBackend{cloudflareCLIBackend: &cloudflareCLIBackend{}}
+	a := &app{backend: backend}
+	cmd := &cobra.Command{}
+	cmd.Flags().String("zone", "", "")
+	res, err := a.domainCloudflareStatus(cmd, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(res.data)
+	if err != nil || !strings.Contains(string(data), `"definition_dns_policy"`) || !strings.Contains(string(data), `"revision":2`) || !strings.Contains(res.plain, "Definition DNS policy") {
+		t.Fatalf("status = %s / %s, %v", data, res.plain, err)
+	}
+}
+
 func (b *cloudflareCLIBackend) ListCloudflareCredentials(_ context.Context, zone string) ([]vault.ProviderMetadata, error) {
 	b.calls++
 	b.listedZone = zone
@@ -213,6 +269,7 @@ type cloudflareRPCTransport struct {
 	requests []rpc.Request
 	preview  api.CloudflareCredentialPreview
 	metadata vault.ProviderMetadata
+	policy   api.DefinitionDNSPolicy
 }
 
 func (*cloudflareRPCTransport) Dial(context.Context) (*ssh.Client, error) {
@@ -241,6 +298,8 @@ func (f *cloudflareRPCTransport) Run(_ context.Context, _ string, stdin io.Reade
 		}
 	case methodCloudflareStatus:
 		data = map[string]any{"credentials": []vault.ProviderMetadata{f.metadata}}
+	case methodDefinitionDNSGet, methodDefinitionDNSSet:
+		data = f.policy
 	default:
 		return contract.NewFault(contract.Usage, "unexpected method", "Check the test transport.")
 	}
@@ -254,6 +313,25 @@ func (f *cloudflareRPCTransport) Run(_ context.Context, _ string, stdin io.Reade
 	}
 	_, err = stdout.Write(line)
 	return err
+}
+
+func TestDefinitionDNSPolicyNodeRPCUsesNoSecrets(t *testing.T) {
+	transport := &cloudflareRPCTransport{policy: api.DefinitionDNSPolicy{Revision: 3, Enabled: true, ZoneID: "0123456789abcdef0123456789abcdef", ZoneName: "example.com", Origins: []string{"8.8.8.8"}, ProxyMode: "dns-only"}}
+	client := &nodeClient{remote: transport, operator: "ops", stderr: io.Discard, checked: true}
+	if _, err := client.GetDefinitionDNSPolicy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.SetDefinitionDNSPolicy(context.Background(), api.DefinitionDNSPolicyInput{ExpectedRevision: 2, Enabled: true, Zone: "example.com", Origins: []string{"8.8.8.8"}, ProxyMode: "dns-only"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(transport.requests) != 2 {
+		t.Fatalf("requests = %d", len(transport.requests))
+	}
+	for _, request := range transport.requests {
+		if len(request.Secrets) != 0 {
+			t.Fatal("policy request carried secrets")
+		}
+	}
 }
 
 func TestCloudflareNodeClientKeepsTokenOnlyInTransientSecrets(t *testing.T) {

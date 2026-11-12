@@ -12,10 +12,41 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
+
+func TestDefinitionDNSPolicyValidationAndAuthority(t *testing.T) {
+	valid := api.DefinitionDNSPolicyInput{Enabled: true, Zone: "example.com", Origins: []string{"2001:4860:4860::8888", "8.8.8.8", "8.8.8.8"}, ProxyMode: "dns-only"}
+	origins, err := validateDefinitionDNSPolicyInput(valid)
+	if err != nil || strings.Join(origins, ",") != "2001:4860:4860::8888,8.8.8.8" {
+		t.Fatalf("canonical origins = %v, %v", origins, err)
+	}
+	for _, address := range []string{"10.0.0.1", "100.64.0.1", "127.0.0.1", "192.0.2.1", "::1", "fd00::1", "not-an-ip"} {
+		input := valid
+		input.Origins = []string{address}
+		if _, err := validateDefinitionDNSPolicyInput(input); contract.Classify(err).Code != contract.ValidationFailed {
+			t.Fatalf("origin %q: %v", address, err)
+		}
+	}
+	for _, input := range []api.DefinitionDNSPolicyInput{{Enabled: true, Zone: "example.com", ProxyMode: "dns-only"}, {Enabled: true, Origins: []string{"8.8.8.8"}, ProxyMode: "dns-only"}, {Enabled: true, Zone: "example.com", Origins: []string{"8.8.8.8"}}, {Zone: "example.com"}} {
+		if _, err := validateDefinitionDNSPolicyInput(input); contract.Classify(err).Code != contract.ValidationFailed {
+			t.Fatalf("invalid policy %+v: %v", input, err)
+		}
+	}
+	store := NewDefinitionDNSPolicyStore(nil)
+	for _, kind := range []string{"ci", "webhook", "system"} {
+		actor := contract.Actor{Kind: kind, Subject: "ops"}
+		if _, err := store.SetDefinitionDNSPolicy(context.Background(), actor, valid); contract.Classify(err).Code != contract.Forbidden {
+			t.Fatalf("%s write: %v", kind, err)
+		}
+		if _, err := store.GetDefinitionDNSPolicy(context.Background(), actor); contract.Classify(err).Code != contract.Forbidden {
+			t.Fatalf("%s read: %v", kind, err)
+		}
+	}
+}
 
 type cloudflareValidationFixture struct {
 	mu    sync.Mutex
