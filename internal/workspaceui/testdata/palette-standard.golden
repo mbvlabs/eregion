@@ -9,9 +9,9 @@ Every action lists its exact noninteractive CLI equivalent. Enter opens the guid
     --json
   Restart an environment       -   deployment.restart
     cli: eregion restart <app> <environment> --idempotency-key <key> --json
+  Follow an operation          enter (deployments), f (result) operations.follow
+    cli: eregion operations follow <operation_id> --interactive
 j/k move · type filter · enter open · esc close
-
-
 
 
 

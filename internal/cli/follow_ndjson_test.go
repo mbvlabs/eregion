@@ -31,6 +31,7 @@ var followingCommands = []struct {
 	{name: "prune", path: "eregion prune", args: []string{"prune", "--confirm", "main"}},
 	{name: "rollback", path: "eregion rollback", args: []string{"rollback", "api", "production", "--confirm", "api/production"}},
 	{name: "restart", path: "eregion restart", args: []string{"restart", "api", "production"}},
+	{name: "diagnose", path: "eregion diagnose", args: []string{"diagnose", "op_" + strings.Repeat("b", 32), "--execute", "--confirm", "op_" + strings.Repeat("b", 32), "--", "/app/check"}},
 	{name: "build stop", path: "eregion build stop", args: []string{"build", "stop", "bld_" + strings.Repeat("a", 32)}},
 	{name: "build retry", path: "eregion build retry", args: []string{"build", "retry", "bld_" + strings.Repeat("a", 32)}},
 	{name: "build logs", path: "eregion build logs", args: []string{"build", "logs", "bld_" + strings.Repeat("a", 32)}},
@@ -52,6 +53,18 @@ var followingCommands = []struct {
 	{name: "logs", path: "eregion logs", args: []string{"logs", "api", "production"}},
 }
 
+// Follow flags belong before the diagnostic executable's argv separator.
+func followingArgs(args []string, flags ...string) []string {
+	for i, arg := range args {
+		if arg == "--" {
+			result := append([]string{}, args[:i]...)
+			result = append(result, flags...)
+			return append(result, args[i:]...)
+		}
+	}
+	return append(append([]string{}, args...), flags...)
+}
+
 func TestFollowingCommandsAdvertiseNDJSON(t *testing.T) {
 	a := newApp()
 	for _, test := range followingCommands {
@@ -64,7 +77,7 @@ func TestFollowingCommandsAdvertiseNDJSON(t *testing.T) {
 			if !containsValue(meta.OutputModes, "ndjson") {
 				t.Fatalf("%s does not advertise ndjson: %v", test.path, meta.OutputModes)
 			}
-			selection := a.followSelection(append(append([]string{}, test.args...), "--output", "ndjson"))
+			selection := a.followSelection(followingArgs(test.args, "--output", "ndjson"))
 			if !selection.Active || !selection.NDJSON {
 				t.Fatalf("%s: selection = %+v", test.args, selection)
 			}
@@ -131,7 +144,7 @@ func TestCommandCatalogListsOutputModes(t *testing.T) {
 func TestFollowingCommandsRefuseJSONWithNDJSON(t *testing.T) {
 	for _, test := range followingCommands {
 		t.Run(test.name, func(t *testing.T) {
-			args := append(append([]string{}, test.args...), "--json", "--output", "ndjson")
+			args := followingArgs(test.args, "--json", "--output", "ndjson")
 			code, stdout, stderr := invoke(t, args...)
 			if code != 2 {
 				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
@@ -274,7 +287,7 @@ func prepareFollowingBackend(name string, backend *ndjsonFollowBackend) {
 
 func followingSubmits(name string) bool {
 	switch name {
-	case "deploy", "rollback", "restart", "build stop", "build retry",
+	case "deploy", "rollback", "restart", "diagnose", "build stop", "build retry",
 		"app create", "env create", "env protect", "env unprotect", "domain add", "domain remove", "process scale", "prune",
 		"resource apply", "resource attach", "resource detach", "resource destroy":
 		return true
@@ -302,6 +315,17 @@ func (f *ndjsonFollowBackend) SubmitAction(_ context.Context, kind, target strin
 
 func (f *ndjsonFollowBackend) SubmitActionWithSecrets(ctx context.Context, kind, target string, input json.RawMessage, key, confirm string, dryRun bool, _ map[string]string) (json.RawMessage, error) {
 	return f.SubmitAction(ctx, kind, target, input, key, confirm, dryRun)
+}
+
+func (f *ndjsonFollowBackend) DiagnosticExecution(_ context.Context, id contract.OperationID, _ []string, _, _ string, _ bool) (json.RawMessage, error) {
+	f.calls++
+	raw, err := f.accept(platform.KindDiagnosticExecution, "operation/"+string(id))
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		Operation json.RawMessage `json:"operation"`
+	}{Operation: raw})
 }
 
 func (f *ndjsonFollowBackend) NodeInfo(context.Context) (rpcNodeInfoResult, error) {
@@ -414,7 +438,7 @@ func TestFollowingCommandsStreamNDJSON(t *testing.T) {
 			}
 			a := newApp()
 			a.backend = backend
-			args := append(append([]string{}, test.args...), "--output", "ndjson")
+			args := followingArgs(test.args, "--output", "ndjson")
 			var stdout, stderr bytes.Buffer
 			exit := runApp(context.Background(), args, panicReader{}, &stdout, &stderr, &secrets.Registry{}, a)
 			if test.name == "app delete" || test.name == "env delete" {
@@ -479,7 +503,7 @@ func TestFollowingSubmitValidatesViewerBeforeSubmit(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			backend := newNDJSONBackend()
 			prepareFollowingBackend(test.name, backend)
-			args := append(append([]string{}, test.args...), "--output", "ndjson", "--poll-interval", "0")
+			args := followingArgs(test.args, "--output", "ndjson", "--poll-interval", "0")
 			exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)
 			if exit != wantExit || stderr != "" {
 				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
@@ -514,7 +538,7 @@ func TestFollowingSubmitNDJSONOutcomes(t *testing.T) {
 				backend := newNDJSONBackend()
 				backend.state, backend.errorCode = outcome.state, outcome.errorCode
 				prepareFollowingBackend(test.name, backend)
-				args := append(append([]string{}, test.args...), "--output", "ndjson")
+				args := followingArgs(test.args, "--output", "ndjson")
 				exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)
 				if exit != outcome.wantExit || stderr != "" {
 					t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
@@ -543,7 +567,7 @@ func TestFollowingSubmitNDJSONDetach(t *testing.T) {
 			backend.state = contract.Running
 			backend.cancelOn, backend.cancel = followTestID, cancel
 			prepareFollowingBackend(test.name, backend)
-			args := append(append([]string{}, test.args...), "--output", "ndjson")
+			args := followingArgs(test.args, "--output", "ndjson")
 			exit, stdout, stderr := runWithBackend(t, ctx, backend, args)
 			if exit != 130 || stderr != "" {
 				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
@@ -611,8 +635,15 @@ func TestFollowingSubmitNDJSONDryRun(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			backend := newNDJSONBackend()
 			prepareFollowingBackend(test.name, backend)
-			args := append(append([]string{}, test.args...), "--dry-run", "--output", "ndjson")
+			args := followingArgs(test.args, "--dry-run", "--output", "ndjson")
 			exit, stdout, stderr := runWithBackend(t, context.Background(), backend, args)
+			if test.name == "diagnose" {
+				envelope := decodeNDJSONResult(t, stdout)
+				if exit != 2 || stderr != "" || envelope.Error == nil || envelope.Error.Code != contract.Usage || backend.calls != 0 {
+					t.Fatalf("exit=%d stdout=%s stderr=%s calls=%d", exit, stdout, stderr, backend.calls)
+				}
+				return
+			}
 			if exit != 0 || stderr != "" {
 				t.Fatalf("exit=%d stdout=%s stderr=%s", exit, stdout, stderr)
 			}
