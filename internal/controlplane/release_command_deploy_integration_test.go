@@ -40,11 +40,8 @@ func TestIntegrationReleaseCommandLostResponseStaysRunning(t *testing.T) {
 		"domain": "live.example.com", "domain_primary": true,
 	}), contract.Succeeded)
 
-	platformAwait(t, s, platformSubmit(t, s, platform.KindReleaseCreate, "env/live/production", "lost-release", map[string]any{
-		"source":  map[string]any{"type": "image", "image": "registry.example/live:v1"},
-		"command": map[string]any{"argv": []string{"/bin/migrate"}},
-	}), contract.Succeeded)
-	releaseID := platform.ReleaseID(latestRelease(t, pool))
+	releaseID := seedArtifactRelease(t, s, "live", "production", "registry.example/live:v1",
+		withSeededReleaseCommand(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})).ID
 	digest := platform.ReleaseCommandDigest(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})
 
 	deploy := platformSubmit(t, s, platform.KindDeploy, "env/live/production", "lost-deploy", map[string]any{"release_id": releaseID})
@@ -115,11 +112,8 @@ func TestIntegrationReleaseCommandTerminalOwnerRecovery(t *testing.T) {
 		"name": "production", "node": "local", "container_port": 80, "health": map[string]any{"timeout_seconds": 2},
 		"domain": "live.example.com", "domain_primary": true,
 	}), contract.Succeeded)
-	platformAwait(t, s, platformSubmit(t, s, platform.KindReleaseCreate, "env/live/production", "recover-release", map[string]any{
-		"source":  map[string]any{"type": "image", "image": "registry.example/live:v1"},
-		"command": map[string]any{"argv": []string{"/bin/migrate"}},
-	}), contract.Succeeded)
-	releaseID := platform.ReleaseID(latestRelease(t, pool))
+	releaseID := seedArtifactRelease(t, s, "live", "production", "registry.example/live:v1",
+		withSeededReleaseCommand(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})).ID
 	digest := platform.ReleaseCommandDigest(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})
 
 	original := platformSubmit(t, s, platform.KindDeploy, "env/live/production", "recover-deploy-1", map[string]any{"release_id": releaseID})

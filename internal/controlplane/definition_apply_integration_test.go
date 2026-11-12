@@ -19,12 +19,9 @@ import (
 
 var definitionIntegrationActor = contract.Actor{Kind: "operator", Subject: "definition-test"}
 
-const integrationDefinition = `version = 1
+const integrationDefinition = `version = 2
 app = "api"
 node = "local"
-[source]
-kind = "image"
-image = "ghcr.io/acme/api:1"
 [automation]
 auto_deploy = false
 [config]
@@ -53,7 +50,7 @@ func definitionIntegrationFixture(t *testing.T) (*pgxpool.Pool, *Service, api.Ap
 	}{
 		{platform.KindNodeRegister, "platform", "definition-node", map[string]any{"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker}}},
 		{platform.KindAppCreate, "platform", "definition-app", map[string]any{"name": "api"}},
-		{platform.KindEnvironmentCreate, "app/api", "definition-env", map[string]any{"name": "production", "node": "local", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}, "config": map[string]string{"OLD": "value"}}},
+		{platform.KindEnvironmentCreate, "app/api", "definition-env", map[string]any{"name": "production", "node": "local", "config": map[string]string{"OLD": "value"}}},
 	} {
 		op := platformSubmitAs(t, s, definitionIntegrationActor, action.kind, action.target, action.key, action.input)
 		if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
@@ -96,7 +93,7 @@ func TestIntegrationDefinitionAdmissionReplayAndFences(t *testing.T) {
 	baseline := readCounts(t)
 	var servingBefore string
 	var releasesBefore, buildsBefore, deploymentsBefore, lifecycleBefore int
-	if err := pool.QueryRow(ctx, `SELECT (SELECT coalesce(e.serving_release_id,'') FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='api' AND e.name='production'), (SELECT count(*) FROM eregion_platform_releases), (SELECT count(*) FROM eregion_platform_builds), (SELECT count(*) FROM eregion_platform_deployments), (SELECT count(*) FROM eregion_operations WHERE kind IN ($1,$2,$3,$4))`, platform.KindReleaseCreate, platform.KindBuildStop, platform.KindBuildRetry, platform.KindDeploy).Scan(&servingBefore, &releasesBefore, &buildsBefore, &deploymentsBefore, &lifecycleBefore); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT (SELECT coalesce(e.serving_release_id,'') FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='api' AND e.name='production'), (SELECT count(*) FROM eregion_platform_releases), (SELECT count(*) FROM eregion_platform_builds), (SELECT count(*) FROM eregion_platform_deployments), (SELECT count(*) FROM eregion_operations WHERE kind IN ($1,$2,$3))`, platform.KindBuildStop, platform.KindBuildRetry, platform.KindDeploy).Scan(&servingBefore, &releasesBefore, &buildsBefore, &deploymentsBefore, &lifecycleBefore); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -222,7 +219,7 @@ func TestIntegrationDefinitionAdmissionReplayAndFences(t *testing.T) {
 	}
 	var servingAfter string
 	var releasesAfter, buildsAfter, deploymentsAfter, lifecycleAfter int
-	if err := pool.QueryRow(ctx, `SELECT (SELECT coalesce(e.serving_release_id,'') FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='api' AND e.name='production'), (SELECT count(*) FROM eregion_platform_releases), (SELECT count(*) FROM eregion_platform_builds), (SELECT count(*) FROM eregion_platform_deployments), (SELECT count(*) FROM eregion_operations WHERE kind IN ($1,$2,$3,$4))`, platform.KindReleaseCreate, platform.KindBuildStop, platform.KindBuildRetry, platform.KindDeploy).Scan(&servingAfter, &releasesAfter, &buildsAfter, &deploymentsAfter, &lifecycleAfter); err != nil || servingAfter != servingBefore || releasesAfter != releasesBefore || buildsAfter != buildsBefore || deploymentsAfter != deploymentsBefore || lifecycleAfter != lifecycleBefore {
+	if err := pool.QueryRow(ctx, `SELECT (SELECT coalesce(e.serving_release_id,'') FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='api' AND e.name='production'), (SELECT count(*) FROM eregion_platform_releases), (SELECT count(*) FROM eregion_platform_builds), (SELECT count(*) FROM eregion_platform_deployments), (SELECT count(*) FROM eregion_operations WHERE kind IN ($1,$2,$3))`, platform.KindBuildStop, platform.KindBuildRetry, platform.KindDeploy).Scan(&servingAfter, &releasesAfter, &buildsAfter, &deploymentsAfter, &lifecycleAfter); err != nil || servingAfter != servingBefore || releasesAfter != releasesBefore || buildsAfter != buildsBefore || deploymentsAfter != deploymentsBefore || lifecycleAfter != lifecycleBefore {
 		t.Fatalf("unexpected deployment effects serving=%q releases=%d builds=%d deployments=%d lifecycle=%d err=%v", servingAfter, releasesAfter, buildsAfter, deploymentsAfter, lifecycleAfter, err)
 	}
 }

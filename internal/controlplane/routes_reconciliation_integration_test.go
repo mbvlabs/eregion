@@ -81,10 +81,7 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 		"name": "production", "node": "local", "container_port": 80, "health": map[string]any{"timeout_seconds": 2},
 		"domain": "route.example.com", "domain_primary": true,
 	}), contract.Succeeded)
-	platformAwait(t, s, platformSubmit(t, s, platform.KindReleaseCreate, "env/route/production", "route-release", map[string]any{
-		"source": map[string]any{"type": "image", "image": "registry.example/route:v1"},
-	}), contract.Succeeded)
-	release := latestRelease(t, pool)
+	release := seedArtifactRelease(t, s, "route", "production", "registry.example/route:v1").ID
 	platformAwait(t, s, platformSubmit(t, s, platform.KindDeploy, "env/route/production", "route-first", map[string]any{"release_id": release}), contract.Succeeded)
 	previous, err := routeInstancesForTest(ctx, s, "route.example.com")
 	if err != nil {

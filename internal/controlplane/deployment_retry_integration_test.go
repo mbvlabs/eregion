@@ -115,11 +115,8 @@ func newDeploymentRetryFixtureWithTransport(t *testing.T, transport node.Transpo
 	}))
 	return &deploymentRetryFixture{
 		pool: pool, dsn: dsn, service: s, ctx: ctx, run: runOperation,
-		createRelease: func(key, image string) platform.ReleaseID {
-			runOperation(platformSubmit(t, s, platform.KindReleaseCreate, "env/live/production", key, map[string]any{
-				"source": map[string]any{"type": "image", "image": image},
-			}))
-			return platform.ReleaseID(latestRelease(t, pool))
+		createRelease: func(_, image string) platform.ReleaseID {
+			return seedArtifactRelease(t, s, "live", "production", image).ID
 		},
 	}
 }
@@ -499,10 +496,7 @@ func TestIntegrationDeploymentDifferentEnvironmentIsNotBlocked(t *testing.T) {
 		"health": map[string]any{"timeout_seconds": 2},
 		"domain": "staging.example.com", "domain_primary": true,
 	}))
-	fixture.run(platformSubmit(t, fixture.service, platform.KindReleaseCreate, "env/live/staging", "staging-release", map[string]any{
-		"source": map[string]any{"type": "image", "image": "registry.example/live:staging"},
-	}))
-	stagingRelease := platform.ReleaseID(latestRelease(t, fixture.pool))
+	stagingRelease := seedArtifactRelease(t, fixture.service, "live", "staging", "registry.example/live:staging").ID
 	fixture.run(platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/staging", "staging-deploy", map[string]any{"release_id": stagingRelease}))
 	staging, err := fixture.service.environment(fixture.ctx, "live", "staging")
 	if err != nil {

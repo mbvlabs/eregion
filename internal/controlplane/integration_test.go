@@ -84,10 +84,15 @@ func testRuntime(t *testing.T, pool *pgxpool.Pool, workers int, stateDirs ...str
 	if len(stateDirs) > 0 && stateDirs[0] != "" {
 		stateDir = stateDirs[0]
 	}
-	if stateDir == "" {
-		stateDir = t.TempDir()
-	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: workers, TestOnly: true, NodeStateDir: stateDir, LocalNodeName: "local", RegistryEndpoint: "127.0.0.1:5000"})
+	// The worker's delete and upload guards require the same verified public
+	// host identity and state directory as the workspace binding. A runtime
+	// restarted on this pool reuses that binding instead of inventing another.
+	identity := ensureTestRegistryHost(t, pool, stateDir)
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+		Concurrency: workers, TestOnly: true,
+		NodeStateDir: identity.StateDir, LocalNodeName: "local",
+		RegistryEndpoint: "127.0.0.1:5000", RegistryHostIdentity: &identity,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +258,8 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 
 func TestIntegrationAPIWorkersAndReplay(t *testing.T) {
 	pool, _ := testPool(t, true)
-	apiRun := testRuntime(t, pool, 0)
+	nodeDir := t.TempDir()
+	apiRun := testRuntime(t, pool, 0, nodeDir)
 	token := strings.Repeat("d", 64)
 	hash := sha256.Sum256([]byte(token))
 	auth, err := api.NewAuth([]api.Principal{{Actor: testActor, TokenSHA256: hex.EncodeToString(hash[:]), Scopes: []string{"operations:submit", "operations:read", "operations:cancel", "system:read"}}})
@@ -277,7 +283,6 @@ func TestIntegrationAPIWorkersAndReplay(t *testing.T) {
 	}
 	// The submitting connection/client can disappear; a new client finds the same op.
 	client, _ = api.NewClient(server.URL, token)
-	nodeDir := t.TempDir()
 	startWorkers(t, testRuntime(t, pool, 2, nodeDir))
 	startWorkers(t, testRuntime(t, pool, 2, nodeDir))
 	await(t, 15*time.Second, func() bool {

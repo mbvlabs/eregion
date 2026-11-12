@@ -202,14 +202,37 @@ func TestIntegrationNodesApplicationAndBuilderEnrollAndReceiveOnlyTheirWork(t *t
 
 	// ---- work dispatches to the node it is placed on, over SSH
 	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindAppCreate, "platform", "app-api", map[string]any{"name": "api"}), contract.Succeeded)
-	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindEnvironmentCreate, "app/api", "env-api", map[string]any{"name": "production", "node": "app-1"}), contract.Succeeded)
-	release := platformSubmit(t, l.s, platform.KindReleaseCreate, "env/api/production", "rel-1", map[string]any{"source": map[string]any{"type": "image", "image": "example/api:1"}})
-	platformAwait(t, l.s, release, contract.Succeeded)
-	onApp, onBuilder := nodeEffects(ctx, appNode, release.ID), nodeEffects(ctx, buildNode, release.ID)
+	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindEnvironmentCreate, "app/api", "env-api", map[string]any{
+		"name": "production", "node": "app-1",
+		"source": map[string]any{"url": "https://github.com/acme/api.git", "ref": submittedGitCommit},
+		"domain": "api.example.com", "domain_primary": true,
+	}), contract.Succeeded)
+	release := seedArtifactRelease(t, l.s, "api", "production", "example/api:1",
+		withSeededReleaseImageID(stubSHA), withSeededReleasePending(),
+		withSeededReleaseOperation(contract.Running, 1))
+	tr, err := l.s.resolver.TransportFor(ctx, "app-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseRow, err := l.s.releaseByID(ctx, release.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := (&platformWorker{service: l.s}).verifyReleaseImage(ctx, release.OperationID, 1, releaseRow, tr, false)
+	if err != nil {
+		t.Fatalf("release image inspection on the application node: %v", err)
+	}
+	if verified.ImageID != stubSHA {
+		t.Fatalf("release image ID = %q, want the node's inspected %q", verified.ImageID, stubSHA)
+	}
+	if _, err := l.pool.Exec(ctx, `UPDATE eregion_operations SET state='succeeded' WHERE id=$1`, release.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	onApp, onBuilder := nodeEffects(ctx, appNode, release.OperationID), nodeEffects(ctx, buildNode, release.OperationID)
 	if onApp == 0 || onBuilder != 0 {
 		t.Fatalf("the release must run only on the application node: app=%d builder=%d", onApp, onBuilder)
 	}
-	if r, err := l.s.releaseForOperation(ctx, release.ID); err != nil || r.ImageID != stubSHA {
+	if r, err := l.s.releaseForOperation(ctx, release.OperationID); err != nil || r.ImageID != stubSHA {
 		t.Fatalf("release %+v %v", r, err)
 	}
 
@@ -218,9 +241,11 @@ func TestIntegrationNodesApplicationAndBuilderEnrollAndReceiveOnlyTheirWork(t *t
 	_, err = l.s.Submit(ctx, platformSubmission(platform.KindEnvironmentCreate, "app/api", "env-on-builder", map[string]any{"name": "staging", "node": "build-1"}))
 	wantViolation(t, err, ReasonRoleMissing)
 	// A build never runs on a node that only has the application role.
-	_, err = l.s.Submit(ctx, platformSubmission(platform.KindReleaseCreate, "env/api/production", "build-on-app", map[string]any{
-		"source": map[string]any{"type": "git", "url": "https://github.com/example/api.git"}}))
-	wantViolation(t, err, ReasonBuilderRequired)
+	buildOnApp := platformSubmit(t, l.s, platform.KindDeploy, "env/api/production", "build-on-app", map[string]any{})
+	buildOnApp = platformAwait(t, l.s, buildOnApp, contract.Failed)
+	if events := l.events(t, buildOnApp); !strings.Contains(events, "reason="+ReasonBuilderRequired) {
+		t.Fatalf("a build on an application-only node did not report %q: %s", ReasonBuilderRequired, events)
+	}
 	// A node that is not enrolled receives nothing, even if it was registered.
 	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindNodeRegister, "platform", "reg-ghost", map[string]any{
 		"name": "ghost", "roles": []string{"application"}, "capabilities": []string{"docker"}}), contract.Succeeded)

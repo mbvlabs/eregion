@@ -1211,7 +1211,9 @@ func (s *Service) resolveSubmissionGitRef(ctx context.Context, normalized platfo
 		}
 		if env.Revision.Source.URL == "" {
 			if input.Ref != "" {
-				return nil, contract.NewFault(contract.ValidationFailed, "--ref requires a Git build recipe", "Bind a Git source with env update --git-url, or deploy an explicit artifact with --image-tag, --image-digest, or --image.")
+				return nil, contract.NewFault(contract.ValidationFailed,
+					"--ref requires a Git build recipe; deploy an explicit artifact with --image-tag, --image-digest, or --image instead",
+					"Bind a Git source with env update --git-url, or deploy an explicit artifact with --image-tag, --image-digest, or --image.")
 			}
 			return &resolvedGitRef{}, nil
 		}

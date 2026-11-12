@@ -28,7 +28,6 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 		"name": "retention",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-11-03"},
 			"domain":           "retention.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
 			"retention":        map[string]any{"keep_releases": 3},
@@ -133,7 +132,6 @@ func TestIntegrationPrunedReleaseRefusesDeployAndRollback(t *testing.T) {
 		"name": "pruned",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/pruned:2026-11-03"},
 			"domain":           "pruned.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
 		}},
@@ -204,7 +202,7 @@ func insertRetentionRelease(t *testing.T, pool *pgxpool.Pool, app, environment s
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
         (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
         VALUES($1,$2,$3,'system','retention-test',$4,'retention-test','{}'::jsonb,'succeeded')`,
-		operationID, platform.KindReleaseCreate, "env/"+app+"/"+environment, "retention-release:"+string(releaseID)); err != nil {
+		operationID, platform.KindDeploy, "env/"+app+"/"+environment, "retention-release:"+string(releaseID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases
@@ -233,7 +231,6 @@ func TestIntegrationPrunedReleasePreviewsRefuse(t *testing.T) {
 		"name": "preview",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/preview:2026-11-03"},
 			"domain":           "preview.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
 		}},

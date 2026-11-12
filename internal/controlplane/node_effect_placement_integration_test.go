@@ -427,7 +427,7 @@ func newBuildCancellationFixture(t *testing.T, transport node.Transport) (*Servi
 			"health": map[string]any{"timeout_seconds": 2},
 			"domain": "cancel.example.com", "domain_primary": true,
 			"source": map[string]any{
-				"kind": "git", "url": "https://github.com/acme/private.git",
+				"url": "https://github.com/acme/private.git",
 				"ref": submittedGitCommit, "builder": "paketobuildpacks/builder-jammy-base",
 			},
 		}),

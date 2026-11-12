@@ -25,8 +25,8 @@ func TestIntegrationAppCreateMaterialisesProductionAndStaging(t *testing.T) {
 	input := map[string]any{
 		"name": "protected",
 		"environments": []map[string]any{
-			{"name": "production", "node": "local", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
-			{"name": "staging", "node": "local", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
+			{"name": "production", "node": "local"},
+			{"name": "staging", "node": "local"},
 		},
 	}
 	op := platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "protected-create", input)
@@ -63,8 +63,8 @@ func TestIntegrationAppCreateMaterialisesProductionAndStaging(t *testing.T) {
 	_, err = s.Submit(ctx, platformSubmission(platform.KindAppCreate, platform.PlatformTarget().String(), "protected-bad", map[string]any{
 		"name": "protectedbad",
 		"environments": []map[string]any{
-			{"name": "production", "node": "local", "domain": "same.example.com", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
-			{"name": "staging", "node": "local", "domain": "same.example.com", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
+			{"name": "production", "node": "local", "domain": "same.example.com"},
+			{"name": "staging", "node": "local", "domain": "same.example.com"},
 		},
 	}))
 	if err == nil {
@@ -102,7 +102,6 @@ func TestIntegrationDeleteFactorIsDecidedServerSide(t *testing.T) {
 	env := func(name string, protected bool) map[string]any {
 		return map[string]any{
 			"name": name, "node": "local", "protected": protected,
-			"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"},
 		}
 	}
 	makeApp("factor", env("production", true), env("staging", true))
@@ -156,7 +155,6 @@ func TestIntegrationUnprotectRequiresFactorAndProtectDoesNot(t *testing.T) {
 		"name": "unprotect",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"},
 		}},
 	})
 	run.Service.humanFactor = func(code string) error {
@@ -193,8 +191,8 @@ func TestIntegrationDirectDeleteWithRealTOTPCode(t *testing.T) {
 	platformSubmit(t, s, platform.KindAppCreate, platform.PlatformTarget().String(), "real-totp-create", map[string]any{
 		"name": "realtotp",
 		"environments": []map[string]any{
-			{"name": "production", "node": "local", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
-			{"name": "staging", "node": "local", "source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:1"}},
+			{"name": "production", "node": "local"},
+			{"name": "staging", "node": "local"},
 		},
 	})
 

@@ -18,14 +18,18 @@ func TestIntegrationCreateExposesTheFirstDeployAtAcceptance(t *testing.T) {
 	s := run.Service
 	ctx := context.Background()
 	platformSubmit(t, s, platform.KindNodeRegister, "platform", "node-guided", map[string]any{
-		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+		"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
+		"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
 	})
 	const createKey = "cli:guided:create"
 	op := platformSubmit(t, s, platform.KindAppCreate, "platform", createKey, map[string]any{
 		"name": "guided",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
+			"source": map[string]any{
+				"url": "https://github.com/acme/api.git", "ref": submittedGitCommit,
+				"builder": "paketobuildpacks/builder-jammy-base",
+			},
 			"domain":           "guided.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
 		}},
@@ -57,7 +61,10 @@ func TestIntegrationCreateExposesTheFirstDeployAtAcceptance(t *testing.T) {
 		"name": "guided",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source":           map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
+			"source": map[string]any{
+				"url": "https://github.com/acme/api.git", "ref": submittedGitCommit,
+				"builder": "paketobuildpacks/builder-jammy-base",
+			},
 			"domain":           "guided.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
 		}},
@@ -82,7 +89,6 @@ func TestIntegrationCreateWithoutDeployHasNoFirstDeployOperation(t *testing.T) {
 		"name": "plain",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "image", "image": "ghcr.io/acme/api:2026-10-28"},
 		}},
 	})
 	if op.FirstDeployOperationID != "" {

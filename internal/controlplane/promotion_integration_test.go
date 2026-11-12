@@ -79,7 +79,6 @@ func TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState(t *tes
 			"name": name, "node": "local", "container_port": 80,
 			"health": map[string]any{"timeout_seconds": 2},
 			"domain": domain, "domain_primary": true,
-			"source":       map[string]any{"kind": "image", "image": "registry.example/live:base"},
 			"config":       map[string]string{"ROLE": role},
 			"secret_names": []string{secret},
 			"runtime": map[string]any{
@@ -90,11 +89,8 @@ func TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState(t *tes
 	createEnvironment("promote-prod-env", "production", "prod.example.com", "production", "PROD_ONLY", "production")
 	createEnvironment("promote-stage-env", "staging", "staging.example.com", "staging", "STAGE_ONLY", "staging")
 
-	createRelease := func(key, environment, image string) platform.ReleaseID {
-		runOperation(platformSubmit(t, s, platform.KindReleaseCreate, "env/live/"+environment, key, map[string]any{
-			"source": map[string]any{"type": "image", "image": image},
-		}))
-		return platform.ReleaseID(latestRelease(t, pool))
+	createRelease := func(_, environment, image string) platform.ReleaseID {
+		return seedArtifactRelease(t, s, "live", environment, image).ID
 	}
 	productionRelease := createRelease("promote-prod-release", "production", "registry.example/live:v1")
 	runOperation(platformSubmit(t, s, platform.KindDeploy, "env/live/production", "promote-prod-deploy", map[string]any{"release_id": productionRelease}))
@@ -297,14 +293,10 @@ func TestIntegrationPromotionAdmissionSerializesProductionDeployments(t *testing
 			"name": env.name, "node": "local", "container_port": 80,
 			"health": map[string]any{"timeout_seconds": 2},
 			"domain": env.domain, "domain_primary": true,
-			"source": map[string]any{"kind": "image", "image": "registry.example/live:base"},
 		}))
 	}
-	createRelease := func(key, environment, image string) platform.ReleaseID {
-		runOperation(platformSubmit(t, s, platform.KindReleaseCreate, "env/live/"+environment, key, map[string]any{
-			"source": map[string]any{"type": "image", "image": image},
-		}))
-		return platform.ReleaseID(latestRelease(t, pool))
+	createRelease := func(_, environment, image string) platform.ReleaseID {
+		return seedArtifactRelease(t, s, "live", environment, image).ID
 	}
 	first := createRelease("serialize-prod-a", "production", "registry.example/live:a")
 	runOperation(platformSubmit(t, s, platform.KindDeploy, "env/live/production", "serialize-deploy-a", map[string]any{"release_id": first}))

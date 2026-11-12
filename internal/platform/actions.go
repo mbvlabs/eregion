@@ -249,20 +249,6 @@ func (in *EnvironmentResourceInput) Target() Target {
 }
 func (in *EnvironmentResourceInput) Preview() any { return in }
 
-type ReleaseCreateInput struct {
-	App         string       `json:"app,omitempty"`
-	Environment string       `json:"environment,omitempty"`
-	Source      Source       `json:"source"`
-	Build       *Build       `json:"build,omitempty"`
-	Command     *CommandSpec `json:"command,omitempty"`
-	Pull        bool         `json:"pull,omitempty"`
-}
-
-func (in *ReleaseCreateInput) Target() Target {
-	return Target{Kind: TargetEnvironment, App: in.App, Environment: in.Environment}
-}
-func (in *ReleaseCreateInput) Preview() any { return in }
-
 type DeployInput struct {
 	App         string    `json:"app,omitempty"`
 	Environment string    `json:"environment,omitempty"`
@@ -1468,32 +1454,6 @@ func validAbsolutePath(path string) bool {
 	return true
 }
 
-func normalizeReleaseCreate(target Target, raw json.RawMessage) (ActionInput, error) {
-	if target.Kind != TargetEnvironment {
-		return nil, invalid("target", "platform.release.create requires target env/<app>/<env>.")
-	}
-	var input ReleaseCreateInput
-	if err := strictDecode(raw, &input); err != nil {
-		return nil, err
-	}
-	if input.App != "" && input.App != target.App {
-		return nil, invalid("app", "The app field must match the target app, or be omitted.")
-	}
-	if input.Environment != "" && input.Environment != target.Environment {
-		return nil, invalid("environment", "The environment field must match the target environment, or be omitted.")
-	}
-	input.App, input.Environment = target.App, target.Environment
-	if err := normalizeSource(&input); err != nil {
-		return nil, err
-	}
-	if input.Command != nil {
-		if err := validateCommand(input.Command); err != nil {
-			return nil, err
-		}
-	}
-	return &input, nil
-}
-
 func validateCommand(command *CommandSpec) error {
 	if len(command.Argv) == 0 || len(command.Argv) > 32 {
 		return invalid("release command", "Use 1–32 arguments; the command runs directly without a shell.")
@@ -1510,82 +1470,6 @@ func validateCommand(command *CommandSpec) error {
 		return invalid("release command timeout", "Use 1–600 seconds.")
 	}
 	return nil
-}
-
-func normalizeSource(input *ReleaseCreateInput) error {
-	input.Source.CredentialSecretName = strings.TrimSpace(input.Source.CredentialSecretName)
-	switch input.Source.Type {
-	case "image":
-		if input.Build != nil {
-			return invalid("build", "An image release does not run Buildpacks; omit build.")
-		}
-		if err := ValidateImage(input.Source.Image); err != nil {
-			return err
-		}
-		if input.Source.Path != "" || input.Source.URL != "" || input.Source.Ref != "" || input.Source.CredentialSecretName != "" {
-			return invalid("source", "An image source uses only source.image.")
-		}
-	case "directory":
-		if input.Source.Image != "" || input.Source.URL != "" || input.Source.Ref != "" || input.Source.CredentialSecretName != "" {
-			return invalid("source", "A directory source uses only source.path.")
-		}
-		if !filepath.IsAbs(input.Source.Path) || strings.ContainsRune(input.Source.Path, 0) || strings.ContainsAny(input.Source.Path, "\r\n") {
-			return invalid("source path", "Use an absolute path available on the target node.")
-		}
-		if err := normalizeBuild(input); err != nil {
-			return err
-		}
-	case "git":
-		if input.Source.Image != "" || input.Source.Path != "" {
-			return invalid("source", "A git source uses source.url and optional source.ref.")
-		}
-		if err := ValidateGitSourceURL(input.Source.URL); err != nil {
-			return invalid("source URL", err.Error())
-		}
-		if input.Source.CredentialSecretName != "" {
-			if !secretNamePattern.MatchString(input.Source.CredentialSecretName) {
-				return invalid("credential secret name", "Use a vault secret NAME such as GIT_READ_TOKEN; the value is never part of the release.")
-			}
-		}
-		if input.Source.Ref != "" && !validGitRef(input.Source.Ref) {
-			return invalid("source ref", "Use a branch or tag of 1–128 letters, digits, dot, underscore, slash, or hyphen; it cannot contain .. or start with -.")
-		}
-		if err := normalizeBuild(input); err != nil {
-			return err
-		}
-	default:
-		return invalid("source type", "Use image, directory, or git.")
-	}
-	return nil
-}
-
-func normalizeBuild(input *ReleaseCreateInput) error {
-	if input.Build == nil {
-		input.Build = &Build{}
-	}
-	if input.Build.Builder != "" {
-		if err := ValidateImage(input.Build.Builder); err != nil {
-			return err
-		}
-	}
-	if input.Build.Image != "" {
-		if err := ValidateImage(input.Build.Image); err != nil {
-			return err
-		}
-	}
-	if input.Build.Env == nil {
-		input.Build.Env = map[string]string{}
-	}
-	var err error
-	input.Build.GoTargets, err = buildpacks.NormalizeTargets(input.Build.GoTargets)
-	if err != nil {
-		return invalid("Go targets", err.Error())
-	}
-	input.Build.Buildpacks, err = buildpacks.NormalizeSettings(input.Build.Buildpacks)
-	if err != nil {
-		return invalid("Buildpacks settings", err.Error())
-	}
-	return validateEnv(input.Build.Env, "build environment")
 }
 
 func normalizeDeploy(target Target, raw json.RawMessage) (ActionInput, error) {

@@ -227,7 +227,7 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 			"health": map[string]any{"timeout_seconds": 2},
 			"domain": "private.example.com", "domain_primary": true,
 			"source": map[string]any{
-				"kind": "git", "url": "https://github.com/acme/private.git",
+				"url": "https://github.com/acme/private.git",
 				"ref": submittedGitCommit, "builder": "paketobuildpacks/builder-jammy-base",
 				"credential_secret_name": gitReadSecretName,
 			},

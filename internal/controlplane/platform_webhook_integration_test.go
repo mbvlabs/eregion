@@ -52,7 +52,7 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 		"name": "webhook",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
 
@@ -219,7 +219,7 @@ func TestIntegrationPlatformWebhookConcurrentAdmissionLoser(t *testing.T) {
 		"name": "concurrent",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
 	base := operations.Submission{
@@ -321,7 +321,7 @@ func TestIntegrationPlatformWebhookAdmissionRollback(t *testing.T) {
 		"name": "rollback",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
 	originalEnqueue := s.enqueuePlatform
@@ -388,7 +388,7 @@ func TestIntegrationPlatformWebhookAdmissionAndDeletionLockOrder(t *testing.T) {
 		"name": "order",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
 	enable := operations.Submission{
@@ -461,7 +461,7 @@ func TestIntegrationPlatformWebhookCredentialCollisionRollsBackActivation(t *tes
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
 			"source": map[string]any{
-				"kind": "git", "url": "https://github.com/acme/api", "ref": "main",
+				"url": "https://github.com/acme/api", "ref": "main",
 				"credential_secret_name": "GIT_READ_TOKEN",
 			},
 		}},
@@ -497,7 +497,7 @@ func TestIntegrationPlatformWebhookCredentialCollisionRollsBackActivation(t *tes
 		Kind: platform.KindEnvironmentUpdate, Target: "env/collision/production", Actor: testActor,
 		IdempotencyKey: "webhook-credential-collision",
 		Input: json.RawMessage(`{
-            "source":{"kind":"git","url":"https://github.com/acme/api","ref":"main",
+            "source":{"url":"https://github.com/acme/api","ref":"main",
                       "credential_secret_name":"EREGION_WEBHOOK_SECRET"},
             "auto_deploy":true,
             "webhook_secret_name":"EREGION_WEBHOOK_SECRET",
@@ -556,7 +556,7 @@ func TestIntegrationPlatformWebhookHTTPRotationWithoutTransientRejected(t *testi
 		"name": "httpwebhook",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
 	enable := operations.Submission{
@@ -640,7 +640,7 @@ func TestIntegrationPlatformWebhookRotationOnlyWorkerSemantics(t *testing.T) {
 		"name": "workerhook",
 		"environments": []map[string]any{{
 			"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
 	enable := operations.Submission{
@@ -757,7 +757,7 @@ func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
 	})
 	platformSubmit(t, s, platform.KindAppCreate, "platform", "name-app", map[string]any{
 		"name": "nametest", "environments": []map[string]any{{"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"}}},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"}}},
 	})
 	for _, name := range []string{"ACTIVE", "ARCHIVED"} {
 		ns, err := vault.NewNamespace("nametest", "production", name)
@@ -882,7 +882,7 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 	})
 	platformSubmit(t, run.Service, platform.KindAppCreate, "platform", "archive-app", map[string]any{
 		"name": "archivetest", "environments": []map[string]any{{"name": "production", "node": "local",
-			"source": map[string]any{"kind": "git", "url": "https://github.com/acme/api", "ref": "main"}}},
+			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"}}},
 	})
 	ns, err := vault.NewNamespace("archivetest", "production", "HOOK")
 	if err != nil {

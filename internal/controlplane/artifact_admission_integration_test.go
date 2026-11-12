@@ -111,8 +111,12 @@ func TestIntegrationArtifactAdmissionPinsCanonicalManifestAndConfigBeforeDeploym
 	if image != wantImage+"/live@"+manifest || imageID != config {
 		t.Fatalf("release image/config = %s/%s", image, imageID)
 	}
-	if !strings.Contains(rawSource, `"selector":"v1"`) || !strings.Contains(rawSource, `"selector_kind":"image-tag"`) || !strings.Contains(rawSource, `"type":"image"`) {
-		t.Fatalf("release source provenance = %s", rawSource)
+	var provenance platform.Source
+	if err := json.Unmarshal([]byte(rawSource), &provenance); err != nil {
+		t.Fatalf("decode release source provenance %s: %v", rawSource, err)
+	}
+	if provenance.Type != "image" || provenance.Image != "v1" || provenance.Selector != "v1" || provenance.SelectorKind != "image-tag" {
+		t.Fatalf("release source provenance = %+v", provenance)
 	}
 	var depRelease, depState string
 	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT release_id,state FROM eregion_platform_deployments WHERE operation_id=$1`, op.ID).Scan(&depRelease, &depState); err != nil {
@@ -404,7 +408,13 @@ func TestIntegrationArtifactNoGitImageOnlyAdmissionNeedsNoBuildPlacement(t *test
 	if builds != 0 {
 		t.Fatalf("explicit artifact admission created %d build rows", builds)
 	}
-	if _, err := service.Submit(fixture.ctx, platformSubmission(platform.KindDeploy, "env/live/production", "artifact-guidance", map[string]any{"ref": "main"})); err == nil || !strings.Contains(err.Error(), "artifact") {
-		t.Fatalf("Git-less ref deploy = %v, want explicit artifact guidance", err)
+	_, err = service.Submit(fixture.ctx, platformSubmission(platform.KindDeploy, "env/live/production", "artifact-guidance", map[string]any{"ref": "main"}))
+	if err == nil {
+		t.Fatal("a Git-less --ref deploy was accepted")
+	}
+	fault := contract.Classify(err)
+	if fault.Code != contract.ValidationFailed || !strings.Contains(fault.Message, "Git build recipe") ||
+		!strings.Contains(fault.Message, "--image-tag") || !strings.Contains(fault.Message, "--image-digest") || !strings.Contains(fault.Message, "--image") {
+		t.Fatalf("Git-less ref deploy = %v, want a Git recipe requirement with explicit artifact selector guidance", err)
 	}
 }

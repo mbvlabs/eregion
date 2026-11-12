@@ -27,7 +27,7 @@ func gitDeployFixture(t *testing.T) (*Service, *pgxpool.Pool) {
 	platformSubmit(t, s, platform.KindEnvironmentCreate, "app/shop", "env-production", map[string]any{
 		"name": "production", "node": "local",
 		"source": map[string]any{
-			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "main",
+			"url": "https://github.com/acme/app.git", "ref": "main",
 			"builder": "paketobuildpacks/builder-jammy-base",
 		},
 		"domain": "shop.example.com", "domain_addresses": []string{"203.0.113.10"},
@@ -79,7 +79,7 @@ func TestIntegrationDeployRefusesARevisionThatChangedAfterResolution(t *testing.
 		// Publish a new revision after the source was read for resolution but
 		// before the submission transaction reads it again.
 		moveEnvironmentSource(t, s, "move-ref", map[string]any{
-			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
+			"url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
 		})
 		return submittedGitCommit, nil
 	}
@@ -96,18 +96,20 @@ func TestIntegrationDeployRefusesARevisionThatChangedAfterResolution(t *testing.
 	}
 }
 
-func TestIntegrationDeployRefusesAGitToImageRevisionChange(t *testing.T) {
+func TestIntegrationDeployRefusesAGitSourceClearedAfterResolution(t *testing.T) {
 	s, pool := gitDeployFixture(t)
 	ctx := context.Background()
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
-		// A new revision binds an image after the ref was resolved but before
-		// the submission transaction reads it again.
-		moveEnvironmentSource(t, s, "move-kind", map[string]any{"kind": "image", "image": "example/app:1"})
+		// A new revision clears the Git recipe after the ref was resolved but
+		// before the submission transaction reads it again. Git absence is
+		// explicit now, so a resolved commit can never fall through to an
+		// artifact deploy.
+		moveEnvironmentSource(t, s, "move-kind", map[string]any{})
 		return submittedGitCommit, nil
 	}
 	_, err := s.Submit(ctx, platformSubmission(platform.KindDeploy, "env/shop/production", "deploy-kind-moved", map[string]any{}))
 	if code := contract.Classify(err).Code; code != contract.Conflict || !strings.Contains(err.Error(), "environment source changed during submission") {
-		t.Fatalf("source-kind change refusal = %s, %v", code, err)
+		t.Fatalf("cleared source refusal = %s, %v", code, err)
 	}
 	var operations int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE kind=$1`, platform.KindDeploy).Scan(&operations); err != nil {
@@ -125,7 +127,7 @@ func TestIntegrationDeployRefChangeWithOverrideDoesNotConflict(t *testing.T) {
 	s.resolveGitRef = func(ctx context.Context, url, ref string, credential []byte) (string, error) {
 		resolvedRef = ref
 		moveEnvironmentSource(t, s, "move-ref", map[string]any{
-			"kind": "git", "url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
+			"url": "https://github.com/acme/app.git", "ref": "other", "builder": "paketobuildpacks/builder-jammy-base",
 		})
 		return submittedGitCommit, nil
 	}

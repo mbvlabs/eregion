@@ -37,12 +37,12 @@ race:
 # Run live PostgreSQL/River/API/process-crash tests against isolated test databases.
 integration:
     @test -n "${EREGION_TEST_DATABASE_URL:-}" || { echo "Set EREGION_TEST_DATABASE_URL to a disposable PostgreSQL test server (role requires CREATEDB)." >&2; exit 1; }
-    go test -race -count=1 ./internal/controlplane -run TestIntegration -timeout 600s
+    go test -race -count=1 -v ./internal/controlplane -run TestIntegration -timeout 600s
 
 # Run the integration suite without the race detector, for hosts without a C compiler.
 integration-norace:
     @test -n "${EREGION_TEST_DATABASE_URL:-}" || { echo "Set EREGION_TEST_DATABASE_URL to a disposable PostgreSQL test server (role requires CREATEDB)." >&2; exit 1; }
-    go test -count=1 ./internal/controlplane -run TestIntegration -timeout 600s
+    go test -count=1 -v ./internal/controlplane -run TestIntegration -timeout 600s
 
 # Run a throwaway PostgreSQL 17 for the integration suite.
 postgres:

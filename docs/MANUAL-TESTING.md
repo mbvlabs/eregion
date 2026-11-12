@@ -122,8 +122,29 @@ worker-lease root cause, and this candidate does not claim that cause fixed.
 | Git-less CLI default | Create an image-only app via flags, definition file and interactive/non-TTY paths without `--no-deploy`. Verify no first deploy is requested, while an explicit API `deploy: true` without Git/artifact still fails before any partial commit. A missing app inventory lookup for export must fail closed, never fabricate a default-slug repository. |
 
 The beta.5 PostgreSQL admission/replay/placement regressions are gated on an
-explicitly authorized disposable DSN; they were compiled but not run without
-that authorization. This is not evidence that they passed.
+explicitly authorized disposable DSN. Local verification compiled them without
+running them. The CI attempt below used its isolated PostgreSQL service; it did
+not establish a complete integration pass.
+
+### Beta.5 source CI attempt
+
+The operator authorized committing and pushing the reviewed candidate and
+publishing beta.5 only after the release gates pass. Source
+`b9d09df05594b5b9643520200a46a7b70761b1c1` passed Linux checks, race tests,
+build/discovery and macOS CI in run `43305307319`. Its PostgreSQL 17 integration
+job failed artifact-admission assertions and then timed out during build-slot
+test cleanup. No complete SQL integration pass is claimed. Edge publication
+`43305307263` succeeded; beta.5 was not tagged or published at this gate.
+
+Earlier local verification mistakenly selected Docker-backed SSH/WireGuard
+fixtures despite the local test restriction. Their caller-cancellation
+assertions failed against the new explicit cancellation classification. The
+assertions were corrected without rerunning those fixtures locally. A subsequent
+read-only inventory of the local system Docker socket found no remaining
+`eregion-ssh-fixture-*` containers; cached fixture images and temporary key
+directories were not removed or claimed clean. This incident is not live
+application qualification, and no application or production resource cleanup
+was performed.
 
 ## Alpha.1 qualification
 

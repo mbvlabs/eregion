@@ -98,7 +98,6 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 		"name": app,
 		"environments": []map[string]any{{
 			"name": environment, "node": "local",
-			"source":           map[string]any{"kind": "image", "image": "127.0.0.1:5000/api:new"},
 			"domain":           "retention-worker.example.com",
 			"domain_addresses": []string{"203.0.113.10"},
 			"retention": map[string]any{
@@ -164,7 +163,7 @@ func insertRetentionWorkerRelease(t *testing.T, pool *pgxpool.Pool, app, environ
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
         (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
         VALUES($1,$2,$3,'system','retention-worker-test',$4,'retention-worker-test','{}'::jsonb,'succeeded')`,
-		operationID, platform.KindReleaseCreate, "env/"+app+"/"+environment, "retention-worker-release:"+string(releaseID)); err != nil {
+		operationID, platform.KindDeploy, "env/"+app+"/"+environment, "retention-worker-release:"+string(releaseID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases

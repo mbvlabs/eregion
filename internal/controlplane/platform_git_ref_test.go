@@ -12,13 +12,12 @@ func TestCheckResolvedGitSourceRefusesARevisionChange(t *testing.T) {
 	const (
 		sha      = "0123456789abcdef0123456789abcdef01234567"
 		gitURL   = "https://github.com/acme/app.git"
-		imageRef = "example/app:1"
 		conflict = "environment source changed during submission"
 	)
 	gitSource := platform.SourceBinding{URL: gitURL, Ref: "main"}
-	imageSource := platform.SourceBinding{}
+	noSource := platform.SourceBinding{}
 	resolvedGit := &resolvedGitRef{URL: gitURL, Ref: "main", SHA: sha}
-	resolvedImage := &resolvedGitRef{}
+	resolvedNoSource := &resolvedGitRef{}
 
 	for _, tc := range []struct {
 		name      string
@@ -31,11 +30,11 @@ func TestCheckResolvedGitSourceRefusesARevisionChange(t *testing.T) {
 		{name: "ref changed without override", resolved: resolvedGit, source: platform.SourceBinding{URL: gitURL, Ref: "other"}, wantError: true},
 		{name: "ref changed with override", resolved: resolvedGit, source: platform.SourceBinding{URL: gitURL, Ref: "other"}, override: "main"},
 		{name: "url changed", resolved: resolvedGit, source: platform.SourceBinding{URL: "https://github.com/acme/other.git", Ref: "main"}, wantError: true},
-		{name: "git became image", resolved: resolvedGit, source: imageSource, wantError: true},
-		{name: "image became git", resolved: resolvedImage, source: gitSource, wantError: true},
+		{name: "git source cleared", resolved: resolvedGit, source: noSource, wantError: true},
+		{name: "no-source revision became git", resolved: resolvedNoSource, source: gitSource, wantError: true},
 		{name: "override differs from the resolution", resolved: resolvedGit, source: gitSource, override: "other", wantError: true},
 		{name: "no resolution", resolved: nil, source: gitSource, wantError: true},
-		{name: "unchanged image source", resolved: resolvedImage, source: imageSource},
+		{name: "unchanged no-source revision", resolved: resolvedNoSource, source: noSource},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := checkResolvedGitSource(tc.resolved, tc.source, tc.override)

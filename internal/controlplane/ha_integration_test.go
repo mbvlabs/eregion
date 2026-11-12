@@ -394,11 +394,8 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 		"domain": "live.example.com", "domain_primary": true,
 	}), contract.Succeeded)
 
-	createRelease := func(key, image string) string {
-		platformAwait(t, s, platformSubmit(t, s, platform.KindReleaseCreate, "env/live/production", key, map[string]any{
-			"source": map[string]any{"type": "image", "image": image},
-		}), contract.Succeeded)
-		return latestRelease(t, pool)
+	createRelease := func(_, image string) string {
+		return string(seedArtifactRelease(t, s, "live", "production", image).ID)
 	}
 	first := createRelease("ha-release-1", "registry.example/live:v1")
 	platformAwait(t, s, platformSubmit(t, s, platform.KindDeploy, "env/live/production", "ha-deploy-1", map[string]any{"release_id": first}), contract.Succeeded)

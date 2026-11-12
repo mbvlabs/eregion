@@ -6,7 +6,7 @@ One Go binary sets up, secures, deploys and operates applications on servers
 you own. Agent-first JSON commands and a polished human terminal experience; no
 web UI.
 
-**Status: beta.1 fresh-test prerelease; fresh-install qualification is pending.**
+**Status: beta fresh-install prereleases; fresh-install qualification is pending.**
 Setup, the private operator channel, durable operations, builds, deployments,
 domain routes, extensions, staging-to-production promotion and upgrades have
 code. Authenticated public HTTPS telemetry and external collection passed on the
@@ -48,6 +48,24 @@ Servers run Debian 13 or Ubuntu 26.04 (amd64/arm64) with Docker, Buildpacks, a
 local registry and Caddy, and keep their state in an external PostgreSQL 17+
 with River. The operator CLI targets Linux and macOS; today's `server init`
 needs a Linux operator binary matching the server architecture.
+
+## Application images
+
+Each app owns a private image repository, optionally named with
+`app create --image-repository mbvlabs/andurel`. Buildpacks and image uploads
+produce artifacts in that repository. Git/build settings remain separate from
+the image selected for a deployment.
+
+Use `deploy --image-tag TAG` or `--image-digest sha256:...` to select an app's
+private artifact, or `--image REGISTRY/REPOSITORY:TAG` for a fully qualified
+public image. Releases pin immutable digests; selecting an image does not
+replace Git settings or webhook configuration. Retention protects serving and
+rollback artifacts.
+
+The beta.5 contract is fresh-install only: definitions use schema 2, and the
+old persistent environment image-source mode is removed without aliases or
+compatibility fallbacks. See MANUAL-TESTING for checks still requiring a real
+server; source and CI verification are not host acceptance.
 
 ## Focused references
 
