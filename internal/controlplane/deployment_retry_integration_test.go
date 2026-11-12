@@ -2382,9 +2382,10 @@ func TestIntegrationCleanupEvidenceReadFailureRetainsOwner(t *testing.T) {
 }
 
 // TestIntegrationDeploymentTerminalRetryWithRetainedCandidates covers a retry
-// that turns terminal before any new transport work. Cleanup intent for the
-// containers retained by the first attempt must be durable before the prepared
-// owner is released, even when no resolver is configured.
+// that turns terminal before any new transport work. An unknown prior effect
+// must retain the owner; when that prior effect is observably quiescent, the
+// durable cleanup-intent failpoint must be reached before the prepared owner is
+// released.
 func TestIntegrationDeploymentTerminalRetryWithRetainedCandidates(t *testing.T) {
 	run := func(t *testing.T) (contract.Operation, []platform.PlannedContainer, *deploymentRetryFixture, *healthFaultTransport) {
 		t.Helper()
@@ -2429,51 +2430,70 @@ func TestIntegrationDeploymentTerminalRetryWithRetainedCandidates(t *testing.T) 
 		return op, plan, fixture, transport
 	}
 
-	t.Run("placement failure records durable cleanup", func(t *testing.T) {
+	t.Run("placement failure retains owner while effect is unknown", func(t *testing.T) {
 		op, plan, fixture, transport := run(t)
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err != nil {
-			t.Fatalf("terminal placement attempt: %v", err)
+		// The first attempt reported a retryable health transport failure. The
+		// step outcome is unknown, and this retry removes the resolver and the
+		// application capability. A terminal placement refusal must therefore
+		// retain the owner and candidate cleanup intent instead of acting as if
+		// the detached health effect were absent.
+		err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1)
+		if err == nil {
+			t.Fatal("placement retry unexpectedly succeeded while a detached effect was unknown")
+		}
+		if fault := contract.Classify(err); fault.Code != contract.Unavailable {
+			t.Fatalf("placement retry error = %s, %v; want unavailable", fault.Code, err)
 		}
 		final, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if final.State != contract.Failed || final.ErrorCode != contract.PreconditionFailed {
-			t.Fatalf("placement retry = %+v, want failed/precondition_failed", final)
+		if final.State.Terminal() {
+			t.Fatalf("placement retry terminalized while a detached effect was unknown: %+v", final)
 		}
 		env := fixture.environment(t)
-		if owner, has := ownerForFixture(t, fixture, env); has {
-			t.Fatalf("owner remained after terminal placement failure: %+v", owner)
+		if _, has := ownerForFixture(t, fixture, env); !has {
+			t.Fatal("owner released while a detached node effect was unknown")
 		}
 		if index := transport.eventIndex("run:" + cleanupStepID(plan[0].Name)); index >= 0 {
-			t.Fatalf("cleanup ran without a resolver: %v", transport.events)
+			t.Fatalf("cleanup ran while a detached effect was unknown: %v", transport.events)
 		}
 		for _, planned := range plan {
 			var count int
-			var nodeName, deploymentID string
-			if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*),coalesce(min(node),''),coalesce(min(deployment_id),'')
+			if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*)
                 FROM eregion_platform_container_cleanup WHERE container_name=$1`, planned.Name).
-				Scan(&count, &nodeName, &deploymentID); err != nil {
+				Scan(&count); err != nil {
 				t.Fatal(err)
 			}
-			if count != 1 {
-				t.Fatalf("cleanup rows for retained container %s = %d, want 1", planned.Name, count)
-			}
-			if nodeName != env.Node {
-				t.Fatalf("cleanup node for %s = %q, want %q", planned.Name, nodeName, env.Node)
-			}
-			if deploymentID == "" {
-				t.Fatalf("cleanup row for %s lost its deployment identity", planned.Name)
+			if count != 0 {
+				t.Fatalf("cleanup rows for retained container %s = %d, want 0 while the effect is unknown", planned.Name, count)
 			}
 		}
 	})
 
 	t.Run("cleanup record failure retains owner", func(t *testing.T) {
 		op, _, fixture, _ := run(t)
+		env := fixture.environment(t)
+		// Model the previous health/live effect as quiescent with an observable
+		// terminal-safe status on the pinned node. This exercises the real
+		// terminal cleanup insert failpoint instead of accidentally stopping at
+		// the unknown-effect guard.
+		absent := &fixedStatusTransport{status: engine.StatusAbsent}
+		fixture.service.resolver = newTestNodeResolver(t, fixture.pool, map[string]node.Transport{env.Node: absent})
 		dropBlock := blockContainerCleanupInserts(t, fixture.pool)
 		defer dropBlock()
-		if err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1); err == nil {
+		err := runPlatformAttempt(fixture.ctx, fixture.service, op.ID, 1)
+		if err == nil {
 			t.Fatal("terminal placement failure settled without durable cleanup intent")
+		}
+		fault := contract.Classify(err)
+		if fault.Code != contract.Unavailable ||
+			!strings.Contains(fault.Message, "candidate cleanup intent could not be recorded durably") ||
+			!strings.Contains(fault.Hint, "Keep the deployment owner and candidate containers") {
+			t.Fatalf("cleanup failpoint error = %+v, want the durable cleanup-intent fault", fault)
+		}
+		if absent.callCount() == 0 {
+			t.Fatal("cleanup retry did not observe the pinned node before the cleanup insert")
 		}
 		current, err := fixture.service.Get(fixture.ctx, testActor, op.ID)
 		if err != nil {
@@ -2482,7 +2502,6 @@ func TestIntegrationDeploymentTerminalRetryWithRetainedCandidates(t *testing.T) 
 		if current.State.Terminal() {
 			t.Fatalf("terminal placement failure settled without durable cleanup intent: %+v", current)
 		}
-		env := fixture.environment(t)
 		if owner, has := ownerForFixture(t, fixture, env); !has {
 			t.Fatalf("owner released without durable cleanup intent: %+v", owner)
 		}

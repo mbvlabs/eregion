@@ -925,10 +925,12 @@ var errNodeEffectOutcomeUnknown = errors.New("node effect outcome is unknown")
 var errNodeEffectAlreadyCompleted = errors.New("node effect was acknowledged by another writer")
 
 // nodeEffectLoop drives one node effect without starting a second Run while an
-// earlier task may still be live. Status is always observed before Run. A live
-// running task is polled, a pre-Check/Apply deferral is backed off, and a
-// durable cancellation stops new dispatch. The caller owns the database step
-// row, so beginStep happens once outside this loop.
+// earlier task may still be live. Status is always observed before Run. A first
+// absent observation dispatches immediately; later absence and staleness are
+// reconciled with a backoff. A live running task is polled, a pre-Check/Apply
+// deferral is backed off, and a durable cancellation stops new dispatch. The
+// caller owns the database step row, so beginStep happens once outside this
+// loop.
 type nodeEffectLoop struct {
 	Status    func(context.Context) (node.Response, error)
 	Dispatch  func(context.Context) (node.Response, error)
@@ -945,6 +947,7 @@ type nodeEffectLoop struct {
 func (l nodeEffectLoop) run(ctx context.Context) (node.Response, error) {
 	policy := l.Policy.withDefaults()
 	retriedPriorFailure := false
+	firstObservation := true
 	for {
 		if err := ctx.Err(); err != nil {
 			return node.Response{}, nodeEffectWaitInterrupted()
@@ -958,6 +961,8 @@ func (l nodeEffectLoop) run(ctx context.Context) (node.Response, error) {
 			// An unknown outcome is never reinterpreted as cancellation.
 			return node.Response{}, err
 		}
+		firstStatus := firstObservation
+		firstObservation = false
 		switch response.Status {
 		case engine.StatusCompleted:
 			l.observe(response)
@@ -1034,8 +1039,16 @@ func (l nodeEffectLoop) run(ctx context.Context) (node.Response, error) {
 			if cancelErr != nil {
 				return response, cancelErr
 			}
-			if err := l.wait(ctx, policy.RetryBackoff); err != nil {
-				return response, nodeEffectWaitInterrupted()
+			// The first status observation in this loop is not a reconciliation
+			// poll: no live status was observed before it, so dispatch
+			// immediately. The engine effect lock and durable step state are
+			// the actual safety fence, not the pre-dispatch sleep. After the
+			// first observation, absence/staleness keeps its reconciliation
+			// backoff; stale always keeps it.
+			if !firstStatus || response.Status != engine.StatusAbsent {
+				if err := l.wait(ctx, policy.RetryBackoff); err != nil {
+					return response, nodeEffectWaitInterrupted()
+				}
 			}
 			done, out, err := l.dispatch(ctx)
 			if done {

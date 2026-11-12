@@ -24,22 +24,44 @@ const buildSlotCommit = "1234567890abcdef1234567890abcdef12345678"
 // pack. It implements the authenticated identity so registered-node placement
 // still has to match the transport.
 type scriptedPlatformTransport struct {
-	mu      sync.Mutex
-	runs    []string
-	results map[string]json.RawMessage
+	mu        sync.Mutex
+	runs      []string
+	results   map[string]json.RawMessage
+	completed map[string]json.RawMessage
+	hashes    map[string]string
 }
 
 func (*scriptedPlatformTransport) Name() string         { return "scripted" }
 func (*scriptedPlatformTransport) NodeIdentity() string { return "local" }
 
 func (s *scriptedPlatformTransport) Call(_ context.Context, request node.Request, _ func(node.Event)) (node.Response, error) {
+	key := string(request.Execution.OperationID) + "|" + request.Execution.Step
 	if request.Method == node.MethodStatus {
-		return node.Response{}, nil
+		s.mu.Lock()
+		result, done := s.completed[key]
+		hash := s.hashes[key]
+		s.mu.Unlock()
+		if !done {
+			return node.Response{Status: engine.StatusAbsent, ExecutionID: request.Execution.ExecutionID()}, nil
+		}
+		return node.Response{
+			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
+			InputsHash: hash, Executed: true, Result: result,
+		}, nil
 	}
+	hash := scriptedInputsHash(request)
 	s.mu.Lock()
+	if s.results == nil {
+		s.results = map[string]json.RawMessage{}
+	}
+	if s.completed == nil {
+		s.completed = map[string]json.RawMessage{}
+	}
+	if s.hashes == nil {
+		s.hashes = map[string]string{}
+	}
 	s.runs = append(s.runs, request.Execution.Step)
 	result := s.results[request.Execution.Step]
-	s.mu.Unlock()
 	if result == nil {
 		switch {
 		case strings.HasPrefix(request.Execution.Step, deploymentContainerStepPrefix):
@@ -48,9 +70,14 @@ func (s *scriptedPlatformTransport) Call(_ context.Context, request node.Request
 			result = json.RawMessage(`{"healthy":true}`)
 		}
 	}
+	s.completed[key] = result
+	s.hashes[key] = hash
+	s.mu.Unlock()
 	return node.Response{
 		Status:      engine.StatusCompleted,
 		ExecutionID: request.Execution.ExecutionID(),
+		InputsHash:  hash,
+		Executed:    true,
 		Result:      result,
 	}, nil
 }
@@ -123,8 +150,9 @@ func TestIntegrationEnvironmentBuildNodeIsValidatedAndGated(t *testing.T) {
 func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	pool, _ := testPool(t, true)
 	transport := &scriptedPlatformTransport{results: map[string]json.RawMessage{
-		deploymentPackStep:  json.RawMessage(`{"reference":"127.0.0.1:5000/live@sha256:` + strings.Repeat("b", 64) + `","image_id":"sha256:` + strings.Repeat("a", 64) + `","commit":"` + buildSlotCommit + `"}`),
-		deploymentImageStep: json.RawMessage(`{"stdout":"sha256:` + strings.Repeat("a", 64) + `"}`),
+		deploymentPackStep:       json.RawMessage(`{"reference":"127.0.0.1:5000/live@sha256:` + strings.Repeat("b", 64) + `","image_id":"sha256:` + strings.Repeat("a", 64) + `","commit":"` + buildSlotCommit + `"}`),
+		deploymentImageStep:      json.RawMessage(`{"stdout":"sha256:` + strings.Repeat("a", 64) + `"}`),
+		deploymentReadyImageStep: json.RawMessage(`{"image":"127.0.0.1:5000/live@sha256:` + strings.Repeat("b", 64) + `","image_id":"sha256:` + strings.Repeat("a", 64) + `"}`),
 	}}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: 2, TestOnly: true, Transport: transport, RegistryEndpoint: "127.0.0.1:5000"})
 	if err != nil {

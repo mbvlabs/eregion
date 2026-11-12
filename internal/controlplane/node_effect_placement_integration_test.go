@@ -71,7 +71,7 @@ func (t *unknownStatusTransport) callCount() int {
 // placement lookup and node-name resolution still run.
 func newTestNodeResolver(t *testing.T, pool *pgxpool.Pool, transports map[string]node.Transport) *NodeResolver {
 	t.Helper()
-	resolver := &NodeResolver{cache: map[string]*cachedTransport{}}
+	resolver := &NodeResolver{pool: pool, cache: map[string]*cachedTransport{}}
 	for name, transport := range transports {
 		if _, err := pool.Exec(context.Background(), `INSERT INTO eregion_platform_nodes
             (name,roles,capabilities,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key)

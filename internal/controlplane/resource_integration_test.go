@@ -70,7 +70,7 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		SecretResolver: secretResolver, Vault: vaultService,
+		SecretResolver: secretResolver, Vault: vaultService, RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)

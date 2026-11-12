@@ -46,6 +46,7 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 			run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 				Concurrency: 0, TestOnly: true, Transport: transport,
 				NodeStateDir: identity.StateDir, RegistryHostIdentity: &identity,
+				RegistryEndpoint: "127.0.0.1:5000",
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -154,6 +155,7 @@ func setupMultiBindingDelete(t *testing.T, app string) (*Service, *scriptedPlatf
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: transport,
 		NodeStateDir: identity.StateDir, RegistryHostIdentity: &identity,
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)

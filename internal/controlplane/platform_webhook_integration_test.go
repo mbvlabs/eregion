@@ -37,6 +37,7 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -205,6 +206,7 @@ func TestIntegrationPlatformWebhookConcurrentAdmissionLoser(t *testing.T) {
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -307,6 +309,7 @@ func TestIntegrationPlatformWebhookAdmissionRollback(t *testing.T) {
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -374,6 +377,7 @@ func TestIntegrationPlatformWebhookAdmissionAndDeletionLockOrder(t *testing.T) {
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -737,7 +741,7 @@ func newWebhookIntegrationRuntime(t *testing.T, concurrency int) (*pgxpool.Pool,
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: concurrency, TestOnly: true, LocalNodeName: "local",
-		NodeStateDir: t.TempDir(), Vault: secrets,
+		NodeStateDir: t.TempDir(), Vault: secrets, RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)

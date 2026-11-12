@@ -237,6 +237,122 @@ func TestNodeEffectLoopStaleAndAbsentReconcileBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestNodeEffectLoopInitialAbsentDispatchesWithoutWait(t *testing.T) {
+	script := &scriptedNodeEffect{
+		statuses:   []node.Response{{Status: engine.StatusAbsent}},
+		dispatches: []node.Response{completedResponse()},
+	}
+	var order []string
+	loop := scriptedLoop(script, nil)
+	loop.Status = func(ctx context.Context) (node.Response, error) {
+		order = append(order, "status")
+		return script.Status(ctx)
+	}
+	loop.Begin = func(context.Context) error {
+		order = append(order, "begin")
+		return nil
+	}
+	loop.Dispatch = func(ctx context.Context) (node.Response, error) {
+		order = append(order, "dispatch")
+		return script.Dispatch(ctx)
+	}
+	response, err := loop.run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusCompleted || script.completed != 1 {
+		t.Fatalf("response=%+v completed=%d", response, script.completed)
+	}
+	if script.waits != 0 {
+		t.Fatalf("initial absent observation waited %d time(s), want zero", script.waits)
+	}
+	if script.dispatchCalls != 1 {
+		t.Fatalf("initial absent dispatch count = %d, want 1", script.dispatchCalls)
+	}
+	if len(order) != 3 || order[0] != "status" || order[1] != "begin" || order[2] != "dispatch" {
+		t.Fatalf("status/begin/dispatch order = %v", order)
+	}
+}
+
+func TestNodeEffectLoopInitialAbsentCancellationBeforeDispatchDoesNotRun(t *testing.T) {
+	script := &scriptedNodeEffect{
+		statuses:   []node.Response{{Status: engine.StatusAbsent}},
+		dispatches: []node.Response{completedResponse()},
+	}
+	checks := 0
+	began := false
+	loop := scriptedLoop(script, func(context.Context) error {
+		checks++
+		if checks == 1 {
+			return nil
+		}
+		return errPlatformCancelled
+	})
+	loop.Begin = func(context.Context) error {
+		began = true
+		return nil
+	}
+	_, err := loop.run(context.Background())
+	if !errors.Is(err, errPlatformCancelled) {
+		t.Fatalf("initial absent cancellation = %v", err)
+	}
+	if began || script.dispatchCalls != 0 {
+		t.Fatalf("cancellation after status began=%t dispatch=%d, want false/0", began, script.dispatchCalls)
+	}
+	if script.statusCalls != 1 {
+		t.Fatalf("status calls = %d, want 1", script.statusCalls)
+	}
+}
+
+func TestNodeEffectLoopRunningThenAbsentStillBacksOff(t *testing.T) {
+	script := &scriptedNodeEffect{
+		statuses: []node.Response{
+			{Status: engine.StatusRunning, ExecutionID: "op:1:step", Phase: engine.PhaseApplying},
+			{Status: engine.StatusAbsent},
+		},
+		dispatches: []node.Response{completedResponse()},
+	}
+	response, err := scriptedLoop(script, nil).run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusCompleted || script.completed != 1 {
+		t.Fatalf("response=%+v completed=%d", response, script.completed)
+	}
+	if script.dispatchCalls != 1 {
+		t.Fatalf("dispatch count = %d, want 1", script.dispatchCalls)
+	}
+	if script.waits < 2 {
+		t.Fatalf("running then absent waits = %d, want running poll and absent reconciliation", script.waits)
+	}
+}
+
+func TestNodeEffectLoopRepeatedAbsentStillBacksOff(t *testing.T) {
+	script := &scriptedNodeEffect{
+		statuses: []node.Response{
+			{Status: engine.StatusAbsent},
+			{Status: engine.StatusAbsent},
+		},
+		dispatches: []node.Response{
+			{Status: engine.StatusAbsent},
+			completedResponse(),
+		},
+	}
+	response, err := scriptedLoop(script, nil).run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != engine.StatusCompleted || script.completed != 1 {
+		t.Fatalf("response=%+v completed=%d", response, script.completed)
+	}
+	if script.dispatchCalls != 2 {
+		t.Fatalf("repeated absent dispatch count = %d, want 2", script.dispatchCalls)
+	}
+	if script.waits < 2 {
+		t.Fatalf("repeated absent waits = %d, want reconciliation backoff before the second dispatch", script.waits)
+	}
+}
+
 func TestNodeEffectLoopInterruptedWaitIsRetryableNotCancellationCleanup(t *testing.T) {
 	script := &scriptedNodeEffect{
 		statuses: []node.Response{{Status: engine.StatusRunning, ExecutionID: "op:1:step", Phase: engine.PhaseApplying}},

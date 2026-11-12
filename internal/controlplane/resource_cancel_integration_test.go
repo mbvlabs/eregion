@@ -63,7 +63,8 @@ func TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy(t *testin
 	fake := newBlockingResourceTransport("-run-")
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		SecretResolver: newSnapshotSecretResolver(),
+		RegistryEndpoint: "127.0.0.1:5000",
+		SecretResolver:   newSnapshotSecretResolver(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +178,8 @@ func TestIntegrationResourceCancelAfterSuccessfulStepIsHonored(t *testing.T) {
 	fake := newBlockingResourceTransport("-health-")
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		SecretResolver: newSnapshotSecretResolver(),
+		RegistryEndpoint: "127.0.0.1:5000",
+		SecretResolver:   newSnapshotSecretResolver(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +251,8 @@ func TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored(t *testing.T)
 	fake := newBlockingResourceTransport("-health-")
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		SecretResolver: newSnapshotSecretResolver(),
+		RegistryEndpoint: "127.0.0.1:5000",
+		SecretResolver:   newSnapshotSecretResolver(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -312,7 +315,8 @@ func TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored(t *testing.
 	fake := newBlockingResourceTransport("")
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		SecretResolver: newSnapshotSecretResolver(),
+		RegistryEndpoint: "127.0.0.1:5000",
+		SecretResolver:   newSnapshotSecretResolver(),
 	})
 	if err != nil {
 		t.Fatal(err)

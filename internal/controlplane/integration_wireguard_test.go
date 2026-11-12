@@ -117,7 +117,10 @@ func (b *lockedBuffer) String() string {
 // prove that the WireGuard key never reaches it.
 func wireGuardRuntime(t *testing.T, pool *pgxpool.Pool, workers int, log io.Writer) *Runtime {
 	t.Helper()
-	run, err := New(pool, slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelDebug})), WorkerConfig{Concurrency: workers, TestOnly: true, NodeStateDir: t.TempDir(), LocalNodeName: "local"})
+	run, err := New(pool, slog.New(slog.NewTextHandler(log, &slog.HandlerOptions{Level: slog.LevelDebug})), WorkerConfig{
+		Concurrency: workers, TestOnly: true, NodeStateDir: t.TempDir(), LocalNodeName: "local",
+		RegistryEndpoint: "127.0.0.1:5000",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

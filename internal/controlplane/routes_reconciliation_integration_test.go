@@ -21,6 +21,7 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 	pool, _ := testPool(t, true)
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 2, TestOnly: true, Transport: newScriptedDeployTransport(), NodeStateDir: t.TempDir(),
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)

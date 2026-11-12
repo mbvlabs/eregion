@@ -39,6 +39,7 @@ func definitionIntegrationFixture(t *testing.T) (*pgxpool.Pool, *Service, api.Ap
 	}
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: newScriptedDeployTransport(), NodeStateDir: t.TempDir(), LocalNodeName: "local",
+		RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)

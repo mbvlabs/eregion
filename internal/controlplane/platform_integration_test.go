@@ -43,14 +43,23 @@ func platformSubmit(t *testing.T, s *Service, kind, target, key string, input an
 
 func platformAwait(t *testing.T, s *Service, op contract.Operation, want contract.State) contract.Operation {
 	t.Helper()
-	await(t, 60*time.Second, func() bool {
+	deadline := time.Now().Add(60 * time.Second)
+	for {
 		current, err := s.Get(context.Background(), testActor, op.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		op = current
-		return op.State.Terminal()
-	})
+		if op.State.Terminal() {
+			break
+		}
+		if time.Now().After(deadline) {
+			page, _ := s.Events(context.Background(), testActor, contract.Cursor{OperationID: op.ID}, 200)
+			raw, _ := json.Marshal(page)
+			t.Fatalf("%s did not become %s within 60s; last=%+v events=%s", op.Kind, want, op, raw)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
 	if op.State != want {
 		page, _ := s.Events(context.Background(), testActor, contract.Cursor{OperationID: op.ID}, 200)
 		raw, _ := json.Marshal(page)

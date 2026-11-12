@@ -234,11 +234,36 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 		}
 	}
 	workerB := &platformWorker{service: serviceB}
-	if err := workerB.deleteApplication(fixture.ctx, contract.OperationID(appOp), 1, "live"); err == nil {
-		t.Fatal("B app delete worker accepted another host's binding")
+	// deleteApplication/deleteEnvironment settle a terminal guard refusal
+	// durably and return nil to their worker caller. The operation row is the
+	// observable outcome: it must be failed/conflict and the app/environment
+	// rows must survive.
+	if err := workerB.deleteApplication(fixture.ctx, contract.OperationID(appOp), 1, "live"); err != nil {
+		t.Fatalf("B app delete worker returned an unclassified error: %v", err)
 	}
-	if err := workerB.deleteEnvironment(fixture.ctx, contract.OperationID(envOp), 1, "live", "production"); err == nil {
-		t.Fatal("B last-environment delete worker accepted another host's binding")
+	if err := workerB.deleteEnvironment(fixture.ctx, contract.OperationID(envOp), 1, "live", "production"); err != nil {
+		t.Fatalf("B environment delete worker returned an unclassified error: %v", err)
+	}
+	for _, row := range []struct{ id, kind string }{
+		{appOp, platform.KindAppDelete},
+		{envOp, platform.KindEnvironmentDelete},
+	} {
+		var state, code string
+		if err := fixture.pool.QueryRow(fixture.ctx, `SELECT state,error_code FROM eregion_operations WHERE id=$1`, row.id).Scan(&state, &code); err != nil {
+			t.Fatal(err)
+		}
+		if state != string(contract.Failed) || code != string(contract.Conflict) {
+			t.Fatalf("%s operation state/code = %s/%s, want failed/conflict", row.kind, state, code)
+		}
+	}
+	var cleanupRows int
+	if err := fixture.pool.QueryRow(fixture.ctx, `SELECT count(*) FROM eregion_platform_container_cleanup c
+        JOIN eregion_platform_environments e ON e.id=c.environment_id
+        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name='live'`).Scan(&cleanupRows); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupRows != 0 {
+		t.Fatalf("cross-host refusal recorded %d durable cleanup row(s)", cleanupRows)
 	}
 	var appID platform.AppID
 	var repo string

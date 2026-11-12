@@ -50,7 +50,7 @@ func TestIntegrationPromotionPinsTheServingArtifactAndUsesProductionState(t *tes
 	fake := newScriptedDeployTransport()
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		LocalNodeName: "local", SecretResolver: resolver,
+		LocalNodeName: "local", SecretResolver: resolver, RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +263,7 @@ func TestIntegrationPromotionAdmissionSerializesProductionDeployments(t *testing
 	fake := newScriptedDeployTransport()
 	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
-		LocalNodeName: "local",
+		LocalNodeName: "local", RegistryEndpoint: "127.0.0.1:5000",
 	})
 	if err != nil {
 		t.Fatal(err)

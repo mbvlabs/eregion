@@ -373,7 +373,10 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	fake := newScriptedDeployTransport()
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: 2, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir()})
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+		Concurrency: 2, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
+		RegistryEndpoint: "127.0.0.1:5000",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

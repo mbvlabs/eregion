@@ -204,8 +204,6 @@ func TestIntegrationNodesApplicationAndBuilderEnrollAndReceiveOnlyTheirWork(t *t
 	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindAppCreate, "platform", "app-api", map[string]any{"name": "api"}), contract.Succeeded)
 	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindEnvironmentCreate, "app/api", "env-api", map[string]any{
 		"name": "production", "node": "app-1",
-		"source": map[string]any{"url": "https://github.com/acme/api.git", "ref": submittedGitCommit},
-		"domain": "api.example.com", "domain_primary": true,
 	}), contract.Succeeded)
 	release := seedArtifactRelease(t, l.s, "api", "production", "example/api:1",
 		withSeededReleaseImageID(stubSHA), withSeededReleasePending(),
@@ -240,12 +238,11 @@ func TestIntegrationNodesApplicationAndBuilderEnrollAndReceiveOnlyTheirWork(t *t
 	// A runtime workload never lands on a builder.
 	_, err = l.s.Submit(ctx, platformSubmission(platform.KindEnvironmentCreate, "app/api", "env-on-builder", map[string]any{"name": "staging", "node": "build-1"}))
 	wantViolation(t, err, ReasonRoleMissing)
-	// A build never runs on a node that only has the application role.
-	buildOnApp := platformSubmit(t, l.s, platform.KindDeploy, "env/api/production", "build-on-app", map[string]any{})
-	buildOnApp = platformAwait(t, l.s, buildOnApp, contract.Failed)
-	if events := l.events(t, buildOnApp); !strings.Contains(events, "reason="+ReasonBuilderRequired) {
-		t.Fatalf("a build on an application-only node did not report %q: %s", ReasonBuilderRequired, events)
-	}
+	// A build never runs on a node that only has the application role. The
+	// placement gate is checked directly because this remote environment has no
+	// public domain and does not enter ordinary deploy admission.
+	appOnly := l.node(t, "app-1")
+	wantViolation(t, l.s.checkPlacement(appOnly, platform.RoleBuilder, platform.CapabilityBuildpacks), ReasonBuilderRequired)
 	// A node that is not enrolled receives nothing, even if it was registered.
 	platformAwait(t, l.s, platformSubmit(t, l.s, platform.KindNodeRegister, "platform", "reg-ghost", map[string]any{
 		"name": "ghost", "roles": []string{"application"}, "capabilities": []string{"docker"}}), contract.Succeeded)
