@@ -5,6 +5,25 @@ Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 tracks execution. This file says what must work on a real server and what has
 been observed.
 
+## CLI help correction (2026-11-13, unpublished)
+
+Compared the installed vaire CLI and its local command construction. The
+corrected operator overview removes experimental branding, shares one plain
+presentation across no arguments, `help` and `--help`, and presents usage,
+commands, flags and examples. Group help lists visible children early; leaf
+help preserves safety details and adds typed flags and meaningful defaults.
+JSON help retains command contracts; root JSON retains version/catalog and
+removes the obsolete stage label.
+
+Independent source review, fresh builds, vet and offline CLI verification
+passed. The three root help forms are byte-identical; the visible JSON catalog
+is unchanged (102 commands), and metadata validation covers all 117 contracts,
+including hidden node paths. Group/leaf help, search, exact-path discovery and
+structured typo errors passed. Tracing recorded no network calls or credential
+file access with an empty home and nonexistent workspace store.
+These checks do not qualify server setup or deployment behavior. No unit tests
+were added or run, and no installed-binary replacement occurred.
+
 ## Current test boundary (operator decision, 2026-11-13)
 
 Automated behavioral coverage is integration-only: real PostgreSQL and/or

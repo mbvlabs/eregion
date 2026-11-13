@@ -116,6 +116,12 @@ eregion help env update --json
 eregion guide agents
 ```
 
+The no-argument overview, `--help` and `help` share the human operator map.
+Group help lists its visible subcommands before detailed safety and flags; leaf
+help retains safety, examples and typed flag information. JSON help and the
+catalog retain the full machine-readable metadata; the no-argument JSON result
+contains the version and catalog.
+
 For a node operation, identify the selected **workspace** first. The default
 private store is the OS configuration directory's `eregion/workspaces.json`; the
 `--workspace-file` flag or `EREGION_WORKSPACE_FILE` selects another existing

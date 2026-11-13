@@ -71,8 +71,8 @@ func newApp() *app {
 		run: func(cmd *cobra.Command, _ []string) (result, error) {
 			commands := a.meta.catalog(a.root)
 			return result{
-				data:  map[string]any{"version": buildinfo.Current().Version, "stage": "experimental application platform", "commands": commands},
-				plain: a.overview(commands),
+				data:  map[string]any{"version": buildinfo.Current().Version, "commands": commands},
+				plain: a.overview(),
 			}, nil
 		},
 	}
@@ -257,31 +257,24 @@ func (a *app) commands(cmd *cobra.Command, _ []string) (result, error) {
 
 // overview is the no-argument operator map. It is generated from the same
 // catalog as `commands --json`, so it never needs a workspace, server, or TUI.
-func (a *app) overview(commands []Command) string {
+func (a *app) overview() string {
 	var plain strings.Builder
-	fmt.Fprintf(&plain, "eregion — experimental application platform\nversion: %s\n\n", buildinfo.Current().Version)
-	plain.WriteString("Top-level commands:\n")
+	fmt.Fprintf(&plain, "eregion — application platform\nversion: %s\n\n", buildinfo.Current().Version)
+	plain.WriteString("Usage:\n  eregion [flags]\n  eregion [command]\n\nAvailable commands:\n")
 	children := make([]*cobra.Command, 0, len(a.root.Commands()))
 	for _, child := range a.root.Commands() {
-		if !commandHidden(child) {
+		if !child.Hidden {
 			children = append(children, child)
 		}
 	}
 	sort.Slice(children, func(i, j int) bool { return children[i].CommandPath() < children[j].CommandPath() })
 	for _, child := range children {
-		visible := 0
-		for _, command := range commands {
-			if command.Path == child.CommandPath() || strings.HasPrefix(command.Path, child.CommandPath()+" ") {
-				visible++
-			}
-		}
 		meta := a.meta[child]
-		if visible > 1 {
-			fmt.Fprintf(&plain, "  %-22s %s (%d commands)\n", child.CommandPath(), meta.Summary, visible)
-		} else {
-			fmt.Fprintf(&plain, "  %-22s %s\n", child.CommandPath(), meta.Summary)
-		}
+		fmt.Fprintf(&plain, "  %-20s %s\n", child.Name(), meta.Summary)
 	}
+	plain.WriteString("\nFlags:\n")
+	writePlainFlags(&plain, a.meta.describe(a.root).Flags)
+	plain.WriteString("\nExamples:\n  eregion server --help\n  eregion app --help\n  eregion help env update\n")
 	plain.WriteString("\nOffline discovery:\n")
 	plain.WriteString("  eregion commands --json                 full catalog with flags and safety metadata\n")
 	plain.WriteString("  eregion commands --search TEXT          search paths, summaries and examples\n")
@@ -323,16 +316,16 @@ func (a *app) resolve(args []string) (*cobra.Command, error) {
 
 func (a *app) help(cmd *cobra.Command) result {
 	command := a.meta.describe(cmd)
-	text := plainHelp(command)
-	if cmd.HasSubCommands() {
-		text += "\nCommands:\n"
-		for _, child := range cmd.Commands() {
-			if child.Hidden {
-				continue
-			}
-			text += fmt.Sprintf("  %-12s %s\n", child.Name(), child.Short)
+	if cmd == a.root {
+		return result{command: cmd.CommandPath(), data: command, plain: a.overview(), next: a.meta[cmd].Next}
+	}
+	var children []Command
+	for _, child := range cmd.Commands() {
+		if !commandHidden(child) {
+			children = append(children, a.meta.describe(child))
 		}
 	}
+	text := plainHelp(command, children)
 	return result{command: cmd.CommandPath(), data: command, plain: text, next: a.meta[cmd].Next}
 }
 
