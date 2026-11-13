@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -14,14 +15,16 @@ func TestIntegrationDefinitionDrainReservesUntilChildSettles(t *testing.T) {
 	ctx := context.Background()
 	parent := contract.OperationID("op_11111111111111111111111111111111")
 	child := contract.OperationID("op_22222222222222222222222222222222")
+	childInput := `{"app":"app","environment":"prod","config":{"EXAMPLE":"value"}}`
 	for _, row := range []struct {
 		id               contract.OperationID
 		kind, key, state string
+		input            string
 	}{
-		{parent, "platform.definition.apply", "parent", "cancelling"},
-		{child, "platform.environment.update", "child", "running"},
+		{parent, "platform.definition.apply", "parent", "cancelling", "{}"},
+		{child, "platform.environment.update", fmt.Sprintf("definition:%s:0", parent), "running", childInput},
 	} {
-		_, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code) VALUES ($1,$2,'env/app/prod','operator','test',$3,'hash','{}'::jsonb,$4,1,0,0,clock_timestamp(),clock_timestamp(),'')`, row.id, row.kind, row.key, row.state)
+		_, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code) VALUES ($1,$2,'env/app/prod','operator','test',$3,'hash',$5::jsonb,$4,1,0,0,clock_timestamp(),clock_timestamp(),'')`, row.id, row.kind, row.key, row.state, row.input)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -29,7 +32,7 @@ func TestIntegrationDefinitionDrainReservesUntilChildSettles(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_runs(operation_id,plan_nonce,environment_id,approved,next_step,failure_code,failure_message) VALUES ($1,'nonce','env-id','{}',0,'','')`, parent); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_steps(parent_operation_id,ordinal,kind,target,input,child_operation_id,dns_progress) VALUES ($1,0,'platform.environment.update','env/app/prod','{}',$2,'[]')`, parent, child); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_steps(parent_operation_id,ordinal,kind,target,input,child_operation_id,dns_progress) VALUES ($1,0,'platform.environment.update','env/app/prod',$3::jsonb,$2,'[]')`, parent, child, childInput); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := pool.Begin(ctx)

@@ -18,6 +18,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/retention"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
@@ -25,9 +26,21 @@ import (
 // Other retention effects and inventory use the existing service fixture.
 type sweepRetentionTransport struct {
 	*retentionFakeTransport
-	engine   *engine.Engine
-	canceled bool
-	gcErr    error
+	engine *engine.Engine
+	status engine.TaskStatus
+	gcErr  error
+}
+
+var errScriptRefused = errors.New("fixture refuses all script execution")
+
+// refusingScriptExecutor never starts a subprocess, regardless of script or step.
+type refusingScriptExecutor struct {
+	steps []string
+}
+
+func (r *refusingScriptExecutor) Run(_ context.Context, step, _ string, _ map[string]string, _ engine.Reporter) error {
+	r.steps = append(r.steps, step)
+	return errScriptRefused
 }
 
 func (t *sweepRetentionTransport) Call(ctx context.Context, request node.Request, report func(node.Event)) (node.Response, error) {
@@ -45,25 +58,19 @@ func (t *sweepRetentionTransport) Call(ctx context.Context, request node.Request
 	if err != nil {
 		return node.Response{}, err
 	}
-	child, cancel := context.WithCancel(ctx)
-	defer cancel()
-	status, err := t.engine.Run(child, step, request.Execution, func(event engine.Event) {
-		if event.Kind == "warning" && event.Message == "completed build network sweep was incomplete" {
-			t.canceled = true
-			cancel()
-		}
-	})
+	status, err := t.engine.Run(ctx, step, request.Execution, nil)
+	t.status = status
 	t.gcErr = err
 	return node.Response{
 		Status: status.Status, ExecutionID: status.ExecutionID, InputsHash: status.InputsHash,
-		Attempt: status.Attempt, ErrorCode: status.ErrorCode, Retryable: false, Detail: status.Detail,
+		Attempt: status.Attempt, ErrorCode: status.ErrorCode, Retryable: status.Retryable, Detail: status.Detail,
 	}, nil
 }
 
 // TestIntegrationRetentionSweepOwnedBuildNetworks runs an accepted retention
 // operation through the real worker and GC effect. The test-owned executable
-// models Docker metadata only. Its final sentinel forces the sweep warning;
-// synchronous cancellation exercises the guard that prevents the real GC shell.
+// models Docker metadata only. An independent executor refuses every script,
+// including the GC shell, after the sweep without relying on cancellation.
 func TestIntegrationRetentionSweepOwnedBuildNetworks(t *testing.T) {
 	fixture := newRetentionFixture(t)
 	ctx := context.Background()
@@ -72,6 +79,8 @@ func TestIntegrationRetentionSweepOwnedBuildNetworks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	scripts := &refusingScriptExecutor{}
+	eng.Scripts = scripts
 	type candidate struct {
 		execution      engine.Execution
 		status         string
@@ -133,8 +142,8 @@ func TestIntegrationRetentionSweepOwnedBuildNetworks(t *testing.T) {
 	for _, item := range candidates {
 		fmt.Fprintf(&script, " %s", quote(name(item)))
 	}
-	// The sentinel always fails its metadata read after all candidates. This
-	// produces the exact warning whose synchronous callback cancels the child.
+	// The sentinel fails its metadata read after all candidates, exercising
+	// the incomplete-sweep path without controlling whether the shell runs.
 	script.WriteString(" sentinel ;;\nnetwork:inspect) case \"$5\" in\n")
 	for _, item := range candidates {
 		details, err := json.Marshal(map[string]any{
@@ -162,10 +171,39 @@ func TestIntegrationRetentionSweepOwnedBuildNetworks(t *testing.T) {
 	op := submitRetentionWorkerPrune(t, fixture.service, "owned-network-sweep")
 	err = (&retentionWorker{service: fixture.service}).Work(ctx, retentionWorkerJob(op.ID, 1, 8))
 	if err == nil {
-		t.Fatal("canceled GC unexpectedly succeeded")
+		t.Fatal("retryable refused GC unexpectedly settled without a retry")
 	}
-	if !transport.canceled || !errors.Is(transport.gcErr, context.Canceled) {
-		t.Fatalf("GC did not stop at the pre-shell cancellation guard: warning=%v error=%v", transport.canceled, transport.gcErr)
+	if errors.Is(err, errNodeStepPermanentFailure) {
+		t.Fatalf("retryable GC failure classified as permanent: %v", err)
+	}
+	if !errors.Is(transport.gcErr, errScriptRefused) || transport.status.Status != engine.StatusFailed || !transport.status.Retryable {
+		t.Fatalf("GC refusal not reported as retryable failure: status=%+v error=%v", transport.status, transport.gcErr)
+	}
+	if len(scripts.steps) != 1 || scripts.steps[0] != platform.RetentionGCStepID(1) {
+		t.Fatalf("unexpected script attempts: %v", scripts.steps)
+	}
+	run, exists, err := fixture.service.retentionRunForOperation(ctx, op.ID)
+	if err != nil || !exists || run.Status != retention.RunFailed || run.GCGeneration != 1 {
+		t.Fatalf("retention run not failed: exists=%v run=%+v err=%v", exists, run, err)
+	}
+	var opState contract.State
+	if err := fixture.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&opState); err != nil || opState != contract.Running {
+		t.Fatalf("retryable operation state=%q err=%v", opState, err)
+	}
+	var gcFailure bool
+	for _, item := range run.Errors {
+		if item.Stage == "registry_gc" {
+			gcFailure = true
+		}
+	}
+	for _, item := range run.Removed {
+		if item.Kind == retention.ItemRegistryGC {
+			t.Fatal("refused GC was recorded as completed")
+		}
+	}
+	pending, err := fixture.service.retentionGCPending(ctx)
+	if err != nil || !pending || !gcFailure {
+		t.Fatalf("GC failure/pending not retained: failure=%v pending=%v err=%v", gcFailure, pending, err)
 	}
 	logged, err := os.ReadFile(logPath)
 	if err != nil {

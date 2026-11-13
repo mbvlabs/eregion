@@ -113,6 +113,8 @@ type Engine struct {
 	Node        string
 	Secrets     *secrets.Registry
 	LockTimeout time.Duration
+	// Scripts overrides the script execution boundary; nil uses Shell.
+	Scripts ScriptExecutor
 	// SecretValues are request-scoped and transient. The dispatcher sets this
 	// copy per request; it is never journaled. Steps may pass values only into
 	// child-process environments.
@@ -517,7 +519,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	}
 
 	// Check again after locking: another effect may have changed state.
-	check, err := step.Check(ctx, Runtime{DryRun: false, Secrets: e.registry(), SecretValues: e.SecretValues, Root: e.StateDir})
+	check, err := step.Check(ctx, Runtime{DryRun: false, Secrets: e.registry(), Scripts: e.Scripts, SecretValues: e.SecretValues, Root: e.StateDir})
 	if err != nil {
 		return e.fail(exec, running, fmt.Errorf("check %s: %w", step.ID(), err))
 	}
@@ -542,7 +544,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 			return TaskStatus{}, err
 		}
 		report.emit(Event{Kind: "log", Step: step.ID(), Message: message})
-		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), SecretValues: e.SecretValues, Root: e.StateDir}, report)
+		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), Scripts: e.Scripts, SecretValues: e.SecretValues, Root: e.StateDir}, report)
 		if err != nil {
 			return e.fail(exec, running, err)
 		}

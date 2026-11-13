@@ -853,7 +853,7 @@ func (s *RetentionGCStep) Apply(ctx context.Context, rt engine.Runtime, report e
 	if err := ctx.Err(); err != nil {
 		return engine.ApplyResult{}, err
 	}
-	if err := (engine.Shell{Secrets: rt.Secrets}).Run(ctx, s.ID(), s.script(), nil, report); err != nil {
+	if err := rt.RunScript(ctx, s.ID(), s.script(), nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}
 	return engine.ApplyResult{Result: map[string]any{"unit": s.payload.Unit, "collected": true}}, nil

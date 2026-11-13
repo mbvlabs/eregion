@@ -275,12 +275,9 @@ script override; omitted fields are preserved.
 non-secret metadata already present in inventory, including automation,
 retention, protection, release timeout and managed DNS metadata.
 Strict definition parsing refuses the inspection marker before any node call.
-Current recipe files use `version = 1`. To adjust an older recipe, remove
-unsupported `source.kind` and `source.image`, retaining the optional Git recipe
-and its actual builder, buildpack order, targets and keep-file settings.
-Artifact selectors belong to `deploy`, not `[source]`. The strict parser
-provides no old-field aliases, and a recipe edit is not database migration,
-upgrade or adoption.
+Recipe files use `version = 1`. `[source]` is an optional Git build recipe with
+builder, buildpack order, targets and keep-file settings. Artifact selectors
+belong to `deploy`, not `[source]`.
 It does not query providers or claim DNS automation can round-trip. Normal export
 includes automation desired state and a webhook secret name, never its value;
 retention and non-default release timeouts are refused. Protection remains

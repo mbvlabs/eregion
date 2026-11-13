@@ -293,11 +293,9 @@ values override corresponding raw build environment keys; clearing one removes
 the override. `env update --build-env ''`, `--target ''`, and
 `--buildpack ''` clear their lists; `--builder ''` resets the builder. TOML
 definitions use `[source.buildpacks] order = [...]` via `--from`.
-Current definitions use `version = 1`. When adjusting an older recipe, remove
-unsupported `source.kind` and `source.image`; keep the optional Git recipe and
-its actual builder, buildpack order, targets and keep-file settings. Image
-selectors belong to `deploy`, not the definition's source. There is no old-field
-alias, compatibility parser or implied database upgrade/adoption.
+Definitions use `version = 1`. `[source]` is an optional Git build recipe with
+builder, buildpack order, targets and keep-file settings. Image selectors belong
+to `deploy`, not `[source]`.
 In TOML, `[source]` can include `targets = [{ process = "web", target = "./cmd/web" }]`.
 Targets currently require repository-relative Go package paths and map to Paketo
 `BP_GO_TARGETS`; no automatic language target discovery is added. Omit them for

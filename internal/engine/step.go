@@ -104,10 +104,16 @@ type ApplyResult struct {
 	Result any
 }
 
+// ScriptExecutor runs an embedded script with the same contract as Shell.Run.
+type ScriptExecutor interface {
+	Run(context.Context, string, string, map[string]string, Reporter) error
+}
+
 // Runtime is what a step may use while it runs.
 type Runtime struct {
 	DryRun  bool
 	Secrets *secrets.Registry
+	Scripts ScriptExecutor
 	// SecretValues are transient request-scoped values for the current effect.
 	// They are never included in step inputs, the node journal, or events; steps
 	// that use them must pass them only to the child process environment.
@@ -115,6 +121,15 @@ type Runtime struct {
 	// Root is the node's private state directory. Steps that write node-local
 	// diagnostic state must stay beneath it.
 	Root string
+}
+
+// RunScript executes a script through the configured executor or the standard
+// redacting shell when none is configured.
+func (rt Runtime) RunScript(ctx context.Context, stepID, script string, env map[string]string, report Reporter) error {
+	if rt.Scripts != nil {
+		return rt.Scripts.Run(ctx, stepID, script, env, report)
+	}
+	return (Shell{Secrets: rt.Secrets}).Run(ctx, stepID, script, env, report)
 }
 
 // Reporter receives redacted step and log events. It may be nil.
