@@ -178,11 +178,3 @@ func TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize(t *testing.T) 
 		t.Fatal("assignment succeeded without the application schema")
 	}
 }
-
-func TestIntegrationAssignWorkspaceRejectsAnInvalidNameBeforeDatabaseAccess(t *testing.T) {
-	pool, _ := testPool(t, false)
-	_, err := AssignWorkspace(context.Background(), pool, "The Lab", testRegistryHostIdentity())
-	if contract.Classify(err).Code != contract.ValidationFailed {
-		t.Fatalf("invalid name = %v, want validation_failed", err)
-	}
-}

@@ -5,6 +5,36 @@ Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 tracks execution. This file says what must work on a real server and what has
 been observed.
 
+## Current test boundary (operator decision, 2026-11-13)
+
+Automated behavioral coverage is integration-only: real PostgreSQL and/or
+running API/application services. All unit tests are removed, including
+mock-only HTTP/RPC, parser-only and offline shell fixture tests. Do not rename
+those tests to retain them. Database/service tests may fake external host
+effects, but their application behavior and persistence must be real.
+
+Server setup/provisioning, SSH/WireGuard host behavior and real deployment-host
+qualification are manual on an explicitly authorized server. Automated test
+recipes do not start local PostgreSQL or SSH/WireGuard fixture containers.
+Build, formatting, vet and actual production release-verification safeguards
+remain automated.
+
+The normal and race integration recipes require a disposable database DSN.
+CI supplies its isolated PostgreSQL service; an ambient installation DSN is
+never an authorized substitute. Historical unit-test counts and shell-harness
+results below describe earlier candidates, not the current verification gate.
+
+The local integration-only candidate adds database-backed assertions for
+Go-owned defaults, admission atomicity and invalid enum/data rejection across
+application/environment creation, domains/resources, deployment records,
+retention, vault/provider revisions, audit allocation, cleanup and release
+commands. It also exercises authenticated HTTP resource admission against the
+real database-backed service and checks corrupted stored resource/secret
+snapshots fail closed. These additions have source review and compile evidence,
+not PostgreSQL execution evidence. Existing worker, migration, recovery and
+concurrency integrations remain; the real API/worker executable lifecycle test
+is retained, with its explicit Linux/database/public-host-key prerequisites.
+
 ## Unpublished three-channel correction (2026-11-13)
 
 The reviewed local correction routes development/alpha/beta to edge, release
@@ -23,10 +53,12 @@ Historical beta.5 may reject later tag-signed edge pointers and may fail closed
 during a moving manifest/bundle race. No compatibility guarantee, new release
 or existing-server upgrade is claimed.
 
-## Unpublished fresh Goose baseline (2026-11-13)
+## Unpublished separate Goose history (2026-11-13)
 
-Current local source replaces the old SQL chain with Goose baseline 1, including
-vault tables. Published beta.5 remains schema 33. The new baseline has no
+The correction must retain separate, dependency-ordered Goose migrations for
+the original schema areas, including vault tables, rather than one baseline.
+Each table is created in its final shape without subsequent ALTER migrations.
+Published beta.5 remains schema 33. The replacement history has no
 application defaults, domain CHECKs, business triggers or policy seeds; Go
 supplies initial values and validates references and domain policy. Source
 review covered schema parity, write values, read validation, migration refusal
@@ -52,6 +84,13 @@ regressions passed. This is partial evidence, not an overall suite pass.
 Linux also failed an SSH deadline assertion, and macOS failed the conditional
 AWS adapter fixture. Corrections and a full CI rerun are required. Only CI ran:
 no publication or existing-server/database change occurred.
+
+Candidate `5d3eecc` subsequently passed all CI jobs, including 229 top-level
+PostgreSQL passes and one expected helper skip. **That result covers the
+incorrect single-file layout only.** The operator then clarified that the
+history must use separate migrations. The split requires fresh source,
+ordering, pending-version and partial-migration retry verification; the earlier
+green CI must not be presented as qualification of the corrected layout.
 
 ## Beta.4 incremental acceptance
 

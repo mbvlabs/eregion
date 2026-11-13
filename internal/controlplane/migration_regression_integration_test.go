@@ -57,6 +57,15 @@ func migrationExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name
 	return exists
 }
 
+func requiredApplicationVersion(t *testing.T) int {
+	t.Helper()
+	files, err := fs.Glob(dbschema.GooseFS, "migrations/*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("migration sources: %v", err)
+	}
+	return len(files)
+}
+
 func migrationPool(t *testing.T, ctx context.Context, dsn, path string, max int32) *pgxpool.Pool {
 	t.Helper()
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -79,7 +88,7 @@ func TestIntegrationGooseFreshPlanReadOnly(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := migrationContext(t)
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 0 || plan.Required != 1 || plan.RiverCurrent != 0 {
+	if err != nil || plan.Current != 0 || plan.Required != requiredApplicationVersion(t) || plan.RiverCurrent != 0 {
 		t.Fatalf("fresh plan: %+v, %v", plan, err)
 	}
 	if migrationExists(t, ctx, pool, "goose_db_version") || migrationExists(t, ctx, pool, "river_migration") {
@@ -133,7 +142,8 @@ func TestIntegrationGooseRejectsMalformedHistory(t *testing.T) {
 		{"missing-zero", "(1,true)"},
 		{"duplicate", "(0,true),(1,true),(1,true)"},
 		{"down", "(0,true),(1,false)"},
-		{"unknown", "(0,true),(2,true)"},
+		{"unknown", "(0,true),(99,true)"},
+		{"gap", "(0,true),(1,true),(3,true)"},
 		{"out-of-order", "(1,true),(0,true)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -180,6 +190,25 @@ func TestIntegrationGooseZeroHistoryRefusesExistingRiver(t *testing.T) {
 	}
 }
 
+func TestIntegrationGooseZeroHistoryRefusesOrphan(t *testing.T) {
+	pool, _ := testPool(t, false)
+	ctx := migrationContext(t)
+	migrationExec(t, ctx, pool, `CREATE TABLE goose_db_version (id bigserial PRIMARY KEY, version_id bigint NOT NULL, is_applied boolean NOT NULL);
+		INSERT INTO goose_db_version(version_id,is_applied) VALUES (0,true);
+		CREATE TABLE eregion_orphan (id int)`)
+	_, err := PlanMigrations(ctx, pool)
+	requireMigrationCode(t, err, contract.PreconditionFailed)
+	_, err = Migrate(ctx, pool)
+	requireMigrationCode(t, err, contract.PreconditionFailed)
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("Goose ledger changed: %d %v", count, err)
+	}
+	if migrationExists(t, ctx, pool, "river_migration") || migrationExists(t, ctx, pool, "eregion_operations") {
+		t.Fatal("refusal created migration objects")
+	}
+}
+
 func TestIntegrationGooseTransactionalFailureAndRetry(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := migrationContext(t)
@@ -194,11 +223,120 @@ func TestIntegrationGooseTransactionalFailureAndRetry(t *testing.T) {
 		t.Fatalf("failed baseline history: rows=%d version=%d error=%v", rows, version, err)
 	}
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 0 || plan.Required != 1 {
+	if err != nil || plan.Current != 0 || plan.Required != requiredApplicationVersion(t) {
 		t.Fatalf("zero-only retry plan: %+v %v", plan, err)
 	}
 	if _, err := Migrate(ctx, pool); err != nil {
 		t.Fatalf("retry: %v", err)
+	}
+}
+
+func TestIntegrationGooseMidChainFailureAndRetry(t *testing.T) {
+	pool, _ := testPool(t, false)
+	ctx := migrationContext(t)
+	files, err := fs.Glob(dbschema.GooseFS, "migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := fstest.MapFS{}
+	for _, file := range files {
+		data, err := fs.ReadFile(dbschema.GooseFS, file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(file, "migrations/00008_") {
+			data = append(data, []byte("\nSELECT no_such_migration_function();\n")...)
+		}
+		broken[strings.TrimPrefix(file, "migrations/")] = &fstest.MapFile{Data: data}
+	}
+	_, err = migrateWithFS(ctx, pool, broken, nil)
+	requireMigrationPostgresError(t, err, "42883")
+	if !migrationExists(t, ctx, pool, "eregion_platform_environment_revisions") ||
+		migrationExists(t, ctx, pool, "eregion_platform_releases") ||
+		migrationExists(t, ctx, pool, "river_migration") {
+		t.Fatal("mid-chain transaction did not preserve only earlier migrations")
+	}
+	plan, err := PlanMigrations(ctx, pool)
+	if err != nil || plan.Current != 7 || plan.Required != requiredApplicationVersion(t) {
+		t.Fatalf("partial plan: %+v %v", plan, err)
+	}
+	requireMigrationCode(t, Ready(ctx, pool), contract.PreconditionFailed)
+	migrationExec(t, ctx, pool, `CREATE TABLE river_job (marker int)`)
+	_, err = PlanMigrations(ctx, pool)
+	requireMigrationCode(t, err, contract.PreconditionFailed)
+	migrationExec(t, ctx, pool, `DROP TABLE river_job`)
+	if _, err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if err := Ready(ctx, pool); err != nil {
+		t.Fatalf("retry not ready: %v", err)
+	}
+}
+
+func TestIntegrationGoosePartialPrefixRefusesOrphans(t *testing.T) {
+	for _, tc := range []struct{ name, setup string }{
+		{"table", `CREATE TABLE eregion_orphan (id int)`},
+		{"future-table", `CREATE TABLE eregion_platform_releases (id text)`},
+		{"function", `CREATE FUNCTION eregion_orphan() RETURNS integer LANGUAGE sql AS 'SELECT 1'`},
+		{"index", `CREATE INDEX eregion_orphan ON eregion_operations (id)`},
+		{"trigger", `CREATE FUNCTION orphan_trigger() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END'; CREATE TRIGGER eregion_orphan BEFORE INSERT ON eregion_operations FOR EACH ROW EXECUTE FUNCTION orphan_trigger()`},
+		{"river-empty", `CREATE TABLE river_migration (version int)`},
+		{"river-populated", `CREATE TABLE river_migration (version int); INSERT INTO river_migration VALUES (1)`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, _ := testPool(t, false)
+			ctx := migrationContext(t)
+			files, err := fs.Glob(dbschema.GooseFS, "migrations/*.sql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			broken := fstest.MapFS{}
+			for _, file := range files {
+				data, err := fs.ReadFile(dbschema.GooseFS, file)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.HasPrefix(file, "migrations/00008_") {
+					data = append(data, []byte("\nSELECT no_such_migration_function();\n")...)
+				}
+				broken[strings.TrimPrefix(file, "migrations/")] = &fstest.MapFile{Data: data}
+			}
+			_, err = migrateWithFS(ctx, pool, broken, nil)
+			requireMigrationPostgresError(t, err, "42883")
+			migrationExec(t, ctx, pool, tc.setup)
+			var before, after, max int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version`).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			_, err = PlanMigrations(ctx, pool)
+			requireMigrationCode(t, err, contract.PreconditionFailed)
+			_, err = Migrate(ctx, pool)
+			requireMigrationCode(t, err, contract.PreconditionFailed)
+			if err := pool.QueryRow(ctx, `SELECT count(*), max(version_id) FROM goose_db_version`).Scan(&after, &max); err != nil || before != after || max != 7 {
+				t.Fatalf("history changed: %d -> %d, max %d, %v", before, after, max, err)
+			}
+			if tc.name != "river-empty" && tc.name != "river-populated" && migrationExists(t, ctx, pool, "river_migration") {
+				t.Fatal("refusal created River metadata")
+			}
+		})
+	}
+}
+
+func TestIntegrationGooseCompleteHistoryRefusesOrphanFunction(t *testing.T) {
+	pool, _ := testPool(t, false)
+	ctx := migrationContext(t)
+	if _, err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	migrationExec(t, ctx, pool, `CREATE FUNCTION eregion_orphan() RETURNS integer LANGUAGE sql AS 'SELECT 1'`)
+	_, err := PlanMigrations(ctx, pool)
+	requireMigrationCode(t, err, contract.PreconditionFailed)
+	requireMigrationCode(t, Ready(ctx, pool), contract.PreconditionFailed)
+	_, err = Migrate(ctx, pool)
+	requireMigrationCode(t, err, contract.PreconditionFailed)
+	var count, max int
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(version_id) FROM goose_db_version`).Scan(&count, &max); err != nil || count != requiredApplicationVersion(t)+1 || max != requiredApplicationVersion(t) {
+		t.Fatalf("history changed: count %d, max %d, %v", count, max, err)
 	}
 }
 
@@ -215,7 +353,7 @@ func TestIntegrationRiverPartialFailureRetry(t *testing.T) {
 	})
 	requireMigrationPostgresError(t, err, "42P07")
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 1 || plan.RiverCurrent != 1 {
+	if err != nil || plan.Current != requiredApplicationVersion(t) || plan.RiverCurrent != 1 {
 		t.Fatalf("partial River plan: %+v %v", plan, err)
 	}
 	migrationExec(t, ctx, pool, `DROP TABLE river_job`)

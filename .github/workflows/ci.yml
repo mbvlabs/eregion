@@ -21,8 +21,6 @@ jobs:
           tool: just
       - run: go mod download
       - run: just check
-      - run: just race
-      - run: just build
       - run: bin/eregion commands --json
       - run: git diff --exit-code -- go.mod go.sum
   portable-cli:
@@ -36,7 +34,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test ./...
       - run: go build ./cmd/eregion
 
   integration:
@@ -63,5 +60,8 @@ jobs:
         with:
           tool: just
       - run: just integration
+        env:
+          EREGION_TEST_DATABASE_URL: postgres://postgres:eregion-ci-only@127.0.0.1:5432/postgres?sslmode=disable
+      - run: just integration-race
         env:
           EREGION_TEST_DATABASE_URL: postgres://postgres:eregion-ci-only@127.0.0.1:5432/postgres?sslmode=disable

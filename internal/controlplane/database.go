@@ -177,6 +177,12 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 	versions := make([]int64, len(sources))
 	for i, source := range sources {
 		versions[i] = source.Version
+		if source.Version != int64(i+1) {
+			return plan, identity, schemaFault("invalid application migration sources")
+		}
+	}
+	if len(versions) == 0 {
+		return plan, identity, schemaFault("missing application migration sources")
 	}
 	if len(versions) > 0 {
 		plan.Required = int(versions[len(versions)-1])
@@ -224,30 +230,58 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 			return plan, identity, schemaFault("invalid application migration history")
 		}
 	}
-	if plan.Current == 0 {
+	{
+		tables, indexes, err := applicationInventory(plan.Current)
+		if err != nil {
+			return plan, identity, schemaFault("invalid application migration inventory")
+		}
 		var orphan bool
-		err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		err = tx.QueryRowContext(ctx, `SELECT EXISTS (
 			SELECT 1 FROM pg_catalog.pg_class c
 			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 			WHERE n.nspname = ANY(current_schemas(false))
 			AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'i', 'I')
-			AND (c.relname LIKE 'eregion\_%' ESCAPE '\' OR c.relname LIKE 'river\_%' ESCAPE '\')
+			AND (($3 AND c.relname LIKE 'river\_%' ESCAPE '\') OR
+			  (c.relname LIKE 'eregion\_%' ESCAPE '\' AND NOT (
+			    (c.relkind IN ('r', 'p') AND c.relname = ANY($1::text[]))
+			    OR (c.relkind IN ('i', 'I') AND EXISTS (
+			      SELECT 1 FROM pg_catalog.pg_index i
+			      JOIN pg_catalog.pg_class owner ON owner.oid = i.indrelid
+			      WHERE i.indexrelid = c.oid AND owner.relname = ANY($1::text[])
+			      AND (c.relname || ':' || owner.relname = ANY($2::text[]) OR EXISTS (
+			        SELECT 1 FROM pg_catalog.pg_constraint con
+			        WHERE con.conindid = c.oid AND con.conrelid = owner.oid AND con.contype IN ('p', 'u')
+			      ))
+			    ))
+			  )))
 			UNION ALL
 			SELECT 1 FROM pg_catalog.pg_type t
 			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
 			WHERE n.nspname = ANY(current_schemas(false))
-			AND (t.typname LIKE 'eregion\_%' ESCAPE '\' OR t.typname LIKE 'river\_%' ESCAPE '\')
+			AND (($3 AND t.typname LIKE 'river\_%' ESCAPE '\') OR
+			  (t.typname LIKE 'eregion\_%' ESCAPE '\' AND NOT (
+			    t.typtype = 'c' AND t.typname = ANY($1::text[]) AND EXISTS (
+			      SELECT 1 FROM pg_catalog.pg_class owner
+			      WHERE owner.oid = t.typrelid AND owner.relkind IN ('r', 'p') AND owner.relname = t.typname
+			    )
+			  )))
 			UNION ALL
 			SELECT 1 FROM pg_catalog.pg_proc p
 			JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
 			WHERE n.nspname = ANY(current_schemas(false))
-			AND (p.proname LIKE 'eregion\_%' ESCAPE '\' OR p.proname LIKE 'river\_%' ESCAPE '\')
-		)`).Scan(&orphan)
+			AND (p.proname LIKE 'eregion\_%' ESCAPE '\' OR ($3 AND p.proname LIKE 'river\_%' ESCAPE '\'))
+			UNION ALL
+			SELECT 1 FROM pg_catalog.pg_trigger tr
+			JOIN pg_catalog.pg_class owner ON owner.oid = tr.tgrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = owner.relnamespace
+			WHERE n.nspname = ANY(current_schemas(false)) AND NOT tr.tgisinternal
+			AND (tr.tgname LIKE 'eregion\_%' ESCAPE '\' OR owner.relname = ANY($1::text[]))
+		)`, tables, indexes, plan.Current < plan.Required).Scan(&orphan)
 		if err != nil {
 			return plan, identity, unavailable(err)
 		}
 		if orphan {
-			return plan, identity, schemaFault("application or River metadata exists without an applied baseline")
+			return plan, identity, schemaFault("unexpected application or River metadata before application migrations complete")
 		}
 	}
 	if err := tx.Commit(); err != nil {

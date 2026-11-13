@@ -8,18 +8,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
-	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -31,7 +26,6 @@ import (
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/secrets"
-	"golang.org/x/crypto/ssh"
 )
 
 var testActor = contract.Actor{Kind: "ci", Subject: "integration-ci"}
@@ -139,7 +133,7 @@ func TestIntegrationMigrations(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := context.Background()
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 0 || plan.Required != 1 || plan.RiverCurrent != 0 {
+	if err != nil || plan.Current != 0 || plan.Required != requiredApplicationVersion(t) || plan.RiverCurrent != 0 {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	if Ready(ctx, pool) == nil {
@@ -382,13 +376,6 @@ func TestIntegrationCrashWorkerHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := testRuntime(t, pool, 1, os.Getenv("EREGION_NODE_STATE_DIR"))
-	if address := os.Getenv("EREGION_CRASH_SSH_ADDRESS"); address != "" {
-		transport, err := sshTransportFromEnvironment()
-		if err != nil {
-			t.Fatal(err)
-		}
-		run.Service.transport = transport
-	}
 	if err := run.Jobs.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -462,142 +449,6 @@ func TestIntegrationWorkerProcessCrash(t *testing.T) {
 	}
 	if got := completedStepRows(t, pool, op.ID); got != 8 {
 		t.Fatalf("crash duplicated/lost step rows: %d", got)
-	}
-}
-
-// executableRegistryIdentity mirrors host.LocalRegistryIdentity's public host
-// observation without importing the host package (which imports controlplane)
-// from this same-package test. It reads the actual public SSH host key and the
-// node.json the child process is explicitly pointed at.
-func executableRegistryIdentity(t *testing.T, nodeDir string) RegistryHostIdentity {
-	t.Helper()
-	matches, err := filepath.Glob("/etc/ssh/ssh_host_*_key.pub")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sort.Strings(matches)
-	if len(matches) == 0 {
-		t.Fatal("no SSH host public key is installed for the executable lifecycle fixture")
-	}
-	raw, err := os.ReadFile(matches[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	key, _, _, _, err := ssh.ParseAuthorizedKey(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity := RegistryHostIdentity{
-		NodeName: "local", HostKeyType: key.Type(),
-		HostKeyFingerprint: ssh.FingerprintSHA256(key), StateDir: nodeDir,
-	}
-	if err := identity.Validate(); err != nil {
-		t.Fatal(err)
-	}
-	return identity
-}
-
-func TestIntegrationExecutableLifecycle(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("control-plane processes require Linux")
-	}
-	pool, dsn := testPool(t, true)
-	binary := filepath.Join(t.TempDir(), "eregion")
-	if out, err := exec.Command("go", "build", "-o", binary, "../../cmd/eregion").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v %s", err, out)
-	}
-	credential := strings.Repeat("e", 64)
-	hash := sha256.Sum256([]byte(credential))
-	authFile := filepath.Join(t.TempDir(), "auth.json")
-	raw, _ := json.Marshal([]api.Principal{{Actor: testActor, TokenSHA256: hex.EncodeToString(hash[:]), Scopes: []string{"operations:submit", "operations:read", "operations:cancel", "system:read"}}})
-	if err := os.WriteFile(authFile, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	reserved, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := reserved.Addr().String()
-	_ = reserved.Close()
-	endpoint := "http://" + address
-	nodeDir := t.TempDir()
-	nodeConfigPath := filepath.Join(t.TempDir(), "node.json")
-	nodeConfig, _ := json.Marshal(map[string]string{"node": "local", "state_dir": nodeDir})
-	if err := os.WriteFile(nodeConfigPath, nodeConfig, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	identity := executableRegistryIdentity(t, nodeDir)
-	if _, err := AssignWorkspace(context.Background(), pool, "test", identity); err != nil {
-		t.Fatal(err)
-	}
-	environment := append(os.Environ(), "EREGION_DATABASE_URL="+dsn, "EREGION_AUTH_FILE="+authFile,
-		"EREGION_NODE_STATE_DIR="+nodeDir, "EREGION_NODE_NAME=local",
-		"EREGION_NODE_CONFIG="+nodeConfigPath, "EREGION_REGISTRY_LISTEN=127.0.0.1:5000")
-	start := func(args ...string) (*exec.Cmd, <-chan error) {
-		command := exec.Command(binary, args...)
-		command.Env = environment
-		command.Stdout, command.Stderr = io.Discard, io.Discard
-		if err := command.Start(); err != nil {
-			t.Fatal(err)
-		}
-		done := make(chan error, 1)
-		go func() { done <- command.Wait() }()
-		t.Cleanup(func() { _ = command.Process.Kill() })
-		return command, done
-	}
-	server, serverDone := start("node", "serve", "--workers=false", "--listen", address, "--json")
-	await(t, 10*time.Second, func() bool {
-		request, _ := http.NewRequest(http.MethodGet, endpoint+"/readyz", nil)
-		client := &http.Client{Timeout: time.Second}
-		response, err := client.Do(request)
-		if err != nil {
-			return false
-		}
-		_ = response.Body.Close()
-		return response.StatusCode == 200
-	})
-	client, err := api.NewClient(endpoint, credential)
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err = client.Test(context.Background(), operations.TestInput{Steps: 5, StepDelayMS: 25}, "cli:durable-1", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var accepted contract.Operation
-	if err := json.Unmarshal(raw, &accepted); err != nil || accepted.State != contract.Queued {
-		t.Fatalf("API did not durably queue: %s %v", raw, err)
-	}
-	worker, workerDone := start("node", "worker", "--concurrency", "2", "--json")
-	service := testRuntime(t, pool, 0, nodeDir).Service
-	await(t, 10*time.Second, func() bool {
-		op, err := service.Get(context.Background(), testActor, accepted.ID)
-		return err == nil && op.State == contract.Succeeded
-	})
-	if got := effectCount(t, nodeDir, accepted.ID, 5); got != 5 {
-		t.Fatalf("executable lifecycle effects: %d", got)
-	}
-	command := exec.Command(binary, "version", "--json")
-	command.Env = environment
-	raw, err = command.Output()
-	if err != nil || !json.Valid(raw) {
-		t.Fatalf("built CLI did not run: %s %v", raw, err)
-	}
-	for _, process := range []struct {
-		cmd  *exec.Cmd
-		done <-chan error
-	}{{worker, workerDone}, {server, serverDone}} {
-		if err := process.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case err := <-process.done:
-			if err != nil {
-				t.Fatalf("unclean service shutdown: %v", err)
-			}
-		case <-time.After(20 * time.Second):
-			t.Fatal("service ignored graceful shutdown")
-		}
 	}
 }
 

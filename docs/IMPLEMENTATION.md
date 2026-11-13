@@ -785,14 +785,18 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: fresh Goose baseline 1
+## Database: separate CREATE-only Goose migrations
 
 Authority: `internal/controlplane/database.go` and
-`internal/dbschema/migrations/00001_baseline.sql`. JSON output schema (`eregion/v1`),
+`internal/dbschema/migrations/*.sql`. JSON output schema (`eregion/v1`),
 node protocol version and database migration version are independent.
 
-Current source replaces the old application chain with one embedded Goose
-baseline covering platform and vault tables. Application DDL is CREATE-only:
+The required history preserves separate migrations for the original schema
+areas, including platform and vault. Do not consolidate them into one baseline.
+Each owning migration creates its tables in their final shape; former
+ALTER-only changes are incorporated into those CREATE definitions. Dependencies
+determine execution order, and each migration contains substantive schema
+creation rather than empty placeholders. Application DDL is CREATE-only:
 no defaults (including implicit serial/identity generation), domain CHECKs,
 business triggers/functions or policy seeds. Structural keys, uniqueness,
 ownership foreign keys and NOT NULL remain. Application writers supply initial
@@ -808,8 +812,10 @@ own history. Planning uses read-only store inspection, not Goose provider
 status methods that initialize metadata. Migration holds the outer advisory
 lock through refusal checks and Goose/River execution. Existing legacy or
 orphan application state, and River-only state without an applied application
-baseline, refuse before metadata writes. Zero-only Goose retry and an applied
-baseline with incomplete River migrations can resume.
+history, refuse before metadata writes. Zero-only Goose retry, a valid applied
+prefix with pending application migrations, and complete application history
+with incomplete River migrations must resume without adoption or replay of
+already-applied migrations.
 
 Exactly one resolved installation schema is supported. Multiple resolved
 search-path schemas refuse explicitly; acquired sessions must agree on schema

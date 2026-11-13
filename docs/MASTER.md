@@ -68,7 +68,10 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
   store for platform entities.
 - **Fresh pre-RC schema, Go-owned domain policy (2026-11-13).** Replace the
   project's application migration history outright with one coherent Goose
-  baseline, including vault tables. The current tree must not retain an old
+  history of separate migrations for the original schema areas, including vault
+  tables—not one consolidated baseline. Each table's final definition belongs
+  in its owning CREATE migration; incorporate former ALTER-only changes there.
+  The current tree must not retain an old
   chain or archive. Application DDL has no `ALTER`, defaults, domain `CHECK`s,
   policy seeds or business triggers/functions. Keep structural primary keys,
   foreign keys, uniqueness and `NOT NULL`; Go owns initial values and domain
@@ -89,6 +92,13 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 - **Agent-first, human-friendly.** Interactive prompts are a thin layer over
   flags. Guided commands follow `server init`: defaults, clear questions, a plan,
   confirmation, live progress, a result card.
+- **Integration-only automated tests (2026-11-13).** Remove all unit tests.
+  Automated behavioral coverage exercises real PostgreSQL and/or running
+  API/application services, including defaults and validation owned by Go.
+  Pure mocks, parser-only checks and fixture-only protocol tests are not
+  retained or relabeled as integrations. Server setup/provisioning and
+  SSH/WireGuard host qualification are manual. Build, vet and static checks
+  remain automated; release verification safeguards remain production checks.
 
 ## 3. Decisions
 

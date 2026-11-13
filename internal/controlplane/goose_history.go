@@ -10,6 +10,11 @@ import (
 // order returned by Goose, rather than treating the maximum version as proof of
 // a complete, unmodified migration history.
 func validateGooseHistory(history []*database.ListMigrationsResult, versions []int64) (int, error) {
+	for i, version := range versions {
+		if version != int64(i+1) {
+			return 0, fmt.Errorf("invalid Goose source inventory")
+		}
+	}
 	if len(history) == 0 || history[len(history)-1] == nil ||
 		history[len(history)-1].Version != 0 || !history[len(history)-1].IsApplied {
 		return 0, fmt.Errorf("missing Goose initial version")
