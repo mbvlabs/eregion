@@ -29,7 +29,7 @@ func TestPinnedManifestUsesExactTagIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity, err := Identity(ChannelStable, m.Version)
+	identity, err := Identity(ChannelEdge, m.Version)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,9 +44,53 @@ func TestPinnedManifestUsesExactTagIdentity(t *testing.T) {
 			}
 			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
 		})}}
-		_, err := client.Resolve(context.Background(), ChannelStable, m.Version)
+		_, err := client.Resolve(context.Background(), ChannelEdge, m.Version)
 		if (err == nil) != (signer == identity) {
 			t.Errorf("signer %q: %v", signer, err)
 		}
+	}
+}
+
+func TestMovingManifestUsesImmutableBundle(t *testing.T) {
+	m := sampleManifest(t)
+	m.Version = "1.0.0"
+	m.Channel = ChannelStable
+	m.ReleaseBaseURL = versionRoot(m.Version)
+	for key, art := range m.Artifacts {
+		art.URL = m.ReleaseBaseURL + "/" + key + "/eregion"
+		m.Artifacts[key] = art
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := Identity(ChannelStable, m.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mismatch := range []bool{false, true} {
+		t.Run(fmt.Sprint(mismatch), func(t *testing.T) {
+			client := &Client{Verifier: identityVerifier{want: identity}, HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				var body string
+				switch r.URL.Path {
+				case "/manifest.json":
+					body = string(raw)
+				case "/releases/1.0.0/manifest.json":
+					body = string(raw)
+					if mismatch {
+						body += " "
+					}
+				case "/releases/1.0.0/manifest.json.sigstore.json":
+					body = "signed-by:" + identity
+				default:
+					t.Fatalf("unexpected request %s", r.URL.Path)
+				}
+				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			})}}
+			_, err := client.Resolve(context.Background(), ChannelStable, "")
+			if (err != nil) != mismatch {
+				t.Fatalf("mismatch %v: %v", mismatch, err)
+			}
+		})
 	}
 }

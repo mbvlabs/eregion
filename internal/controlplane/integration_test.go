@@ -42,7 +42,8 @@ func testPool(t *testing.T, migrate bool) (*pgxpool.Pool, string) {
 	if dsn == "" {
 		t.Skip("set EREGION_TEST_DATABASE_URL to run isolated PostgreSQL integration tests")
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	admin, err := Open(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +139,7 @@ func TestIntegrationMigrations(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := context.Background()
 	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 0 || plan.Required != len(migrations) || plan.RiverCurrent != 0 {
+	if err != nil || plan.Current != 0 || plan.Required != 1 || plan.RiverCurrent != 0 {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	if Ready(ctx, pool) == nil {
@@ -159,13 +160,7 @@ func TestIntegrationMigrations(t *testing.T) {
 	if _, err := Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "UPDATE eregion_schema_migrations SET checksum='edited'"); err != nil {
-		t.Fatal(err)
-	}
-	if err := Ready(ctx, pool); contract.Classify(err).Code != contract.PreconditionFailed {
-		t.Fatalf("did not detect edited migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, "DELETE FROM eregion_schema_migrations WHERE version=1"); err != nil {
+	if _, err := pool.Exec(ctx, "DELETE FROM goose_db_version WHERE version_id=0"); err != nil {
 		t.Fatal(err)
 	}
 	if err := Ready(ctx, pool); contract.Classify(err).Code != contract.PreconditionFailed {
@@ -1079,35 +1074,6 @@ func TestIntegrationReconcileDoesNotFailLiveNodeEffect(t *testing.T) {
 	}
 	if got := effectCount(t, nodeDir, op.ID, 1); got != 0 {
 		t.Fatalf("reconciliation created an effect: %d", got)
-	}
-}
-
-func TestIntegrationUpgradeFromVersion1(t *testing.T) {
-	pool, _ := testPool(t, false)
-	ctx := context.Background()
-	if _, err := pool.Exec(ctx, migration001); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `CREATE TABLE eregion_schema_migrations (version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
-		t.Fatal(err)
-	}
-	first, _ := migrationByVersion(1)
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_schema_migrations(version,checksum) VALUES (1,$1)`, migrationHash(first)); err != nil {
-		t.Fatal(err)
-	}
-	plan, err := PlanMigrations(ctx, pool)
-	if err != nil || plan.Current != 1 || plan.Required != len(migrations) {
-		t.Fatalf("version 1 plan: %+v %v", plan, err)
-	}
-	if _, err := Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	var exists bool
-	if err := pool.QueryRow(ctx, `SELECT to_regclass('eregion_operation_steps') IS NOT NULL`).Scan(&exists); err != nil || !exists {
-		t.Fatalf("version 2 table missing: %v %v", exists, err)
-	}
-	if err := Ready(ctx, pool); err != nil {
-		t.Fatal(err)
 	}
 }
 

@@ -19,8 +19,10 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// Version is the only accepted file schema version.
-const Version = 2
+// Version is the only accepted file schema version. The published beta.5
+// artifact used version 2; the current pre-RC line accepts version 1 only and
+// does not provide a compatibility parser for the published marker.
+const Version = 1
 
 // Definition is one strict eregion.toml document. Pointer fields distinguish an
 // absent value (inherit/default) from an explicitly empty value (clear).

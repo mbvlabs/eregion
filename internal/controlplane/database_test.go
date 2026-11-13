@@ -1,46 +1,42 @@
 package controlplane
 
 import (
-	"os"
+	"database/sql"
 	"strings"
 	"testing"
-
-	"github.com/mbvlabs/eregion/internal/vault"
 )
 
-// Migration 005 is a frozen copy of the vault package schema, so a later edit to
-// vault/schema.sql must be a new migration, never a silent divergence.
-func TestMigration005MatchesVaultSchema(t *testing.T) {
-	if migration005 != vault.SchemaSQL {
-		t.Fatal("005_vault.sql differs from vault/schema.sql; add a new migration instead of editing an applied one")
-	}
-	if migration027 != vault.ProviderSchemaSQL {
-		t.Fatal("027_provider_credentials.sql differs from vault/provider_schema.sql; add a new migration instead of editing an applied one")
-	}
-	for index, m := range migrations {
-		if m.version != index+1 {
-			t.Fatalf("migration %d is out of order at index %d", m.version, index)
-		}
-	}
-	if requiredVersion() != len(migrations) {
-		t.Fatalf("required schema version = %d, want %d", requiredVersion(), len(migrations))
-	}
-	entries, err := os.ReadDir("migrations")
+func TestGooseSourcesAreAvailableWithoutDatabase(t *testing.T) {
+	db, err := sql.Open("pgx", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var files []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
-			files = append(files, entry.Name())
-		}
+	defer db.Close()
+	provider, err := gooseProvider(db)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(files) != len(migrations) {
-		t.Fatalf("migration files = %d, registered migrations = %d; register every SQL migration", len(files), len(migrations))
+	sources := provider.ListSources()
+	if len(sources) != 1 || sources[0].Version != 1 {
+		t.Fatalf("unexpected sources: %+v", sources)
 	}
-	for index, name := range files {
-		if migrations[index].name != name || strings.TrimSpace(migrations[index].sql) == "" {
-			t.Fatalf("migration %s is missing or empty in the registry", name)
+}
+
+func TestMigrationIdentityRequiresSingleSchema(t *testing.T) {
+	for _, tc := range []struct {
+		count        int
+		schema, role string
+		ok           bool
+	}{
+		{1, "public", "operator", true},
+		{1, "tenant", "operator", true},
+		{0, "", "operator", false},
+		{2, "tenant", "operator", false},
+		{1, "tenant", "", false},
+	} {
+		got, err := checkedIdentity(tc.count, tc.schema, tc.role)
+		if (err == nil) != tc.ok || (tc.ok && got != (migrationIdentity{tc.schema, tc.role})) {
+			t.Fatalf("identity %+v: got %+v, %v", tc, got, err)
 		}
 	}
 }

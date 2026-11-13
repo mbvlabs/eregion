@@ -93,8 +93,8 @@ func (s *Store) Set(ctx context.Context, tx pgx.Tx, namespace Namespace, value [
 		_, err = tx.Exec(ctx, `
 			INSERT INTO eregion_secrets
 				(app, environment, name, latest_revision, state,
-				 created_by_kind, created_by_subject, updated_by_kind, updated_by_subject)
-			VALUES ($1,$2,$3,1,'active',$4,$5,$4,$5)`,
+				 created_by_kind, created_by_subject, updated_by_kind, updated_by_subject, created_at, updated_at)
+			VALUES ($1,$2,$3,1,'active',$4,$5,$4,$5,clock_timestamp(),clock_timestamp())`,
 			namespace.App, namespace.Environment, namespace.Name, actor.Kind, actor.Subject)
 		if err != nil {
 			if isUniqueViolation(err) {
@@ -119,8 +119,8 @@ func (s *Store) Set(ctx context.Context, tx pgx.Tx, namespace Namespace, value [
 	_, err = tx.Exec(ctx, `
 		INSERT INTO eregion_secret_revisions
 			(app, environment, name, revision, key_id, ciphertext, ciphertext_sha256,
-			 revision_hash, created_by_kind, created_by_subject)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			 revision_hash, created_by_kind, created_by_subject, operation_id, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'',clock_timestamp())`,
 		namespace.App, namespace.Environment, namespace.Name, revision, keyID, ciphertext,
 		ciphertextHash, revisionHash, actor.Kind, actor.Subject)
 	if err != nil {

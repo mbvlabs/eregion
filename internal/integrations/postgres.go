@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -73,7 +74,7 @@ func (s *PostgresGrantStore) Put(ctx context.Context, grant DeviceGrant) error {
 		return storeUnavailable(err)
 	}
 	defer func() { _ = tx.Rollback(context.Background()) }()
-	if _, err := tx.Exec(ctx, "INSERT INTO eregion_access_grants (id,record) VALUES ($1,$2) ON CONFLICT DO NOTHING", grant.ID, raw); err != nil {
+	if _, err := tx.Exec(ctx, "INSERT INTO eregion_access_grants (id,record,created_at) VALUES ($1,$2,clock_timestamp()) ON CONFLICT DO NOTHING", grant.ID, raw); err != nil {
 		return storeUnavailable(err)
 	}
 	var existingRaw []byte
@@ -112,8 +113,39 @@ func (s *PostgresAudit) Record(ctx context.Context, entry AuditEntry) error {
 	if err != nil {
 		return storeUnavailable(err)
 	}
-	if _, err := s.pool.Exec(ctx, "INSERT INTO eregion_integration_audit (entry) VALUES ($1)", raw); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return storeUnavailable(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if err := InsertAuditTx(ctx, tx, raw); err != nil {
 		return contract.NewFault(contract.Unavailable, "durable integration audit is unavailable", "Repair database connectivity before performing the action.")
 	}
-	return nil
+	return tx.Commit(ctx)
+}
+
+// InsertAuditTx serializes all audit writers until commit, preserving ID order
+// without relying on a database sequence or wall-clock uniqueness.
+func InsertAuditTx(ctx context.Context, tx pgx.Tx, raw []byte) error {
+	const auditLock int64 = 0x6572656175646974
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, auditLock); err != nil {
+		return err
+	}
+	var last int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(id),0) FROM eregion_integration_audit`).Scan(&last); err != nil {
+		return err
+	}
+	next, err := nextAuditID(last)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO eregion_integration_audit (id,entry,recorded_at) VALUES ($1,$2,clock_timestamp())`, next, raw)
+	return err
+}
+
+func nextAuditID(last int64) (int64, error) {
+	if last < 0 || last == math.MaxInt64 {
+		return 0, errors.New("invalid or exhausted integration audit identity")
+	}
+	return last + 1, nil
 }

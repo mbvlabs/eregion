@@ -39,12 +39,13 @@ func TestSelectChannel(t *testing.T) {
 		want    string
 		err     bool
 	}{
-		{"stable release follows its line", "", "stable", "1.4.2", "stable-1.x", false},
-		{"alpha follows its line", "", "stable", "1.0.0-alpha.1", "stable-1.x", false},
+		{"stable release follows stable", "", "stable", "1.4.2", "stable", false},
+		{"alpha follows edge", "", "edge", "1.0.0-alpha.1", "edge", false},
+		{"beta follows edge", "", "edge", "1.0.0-beta.5", "edge", false},
 		{"rc follows rc", "", "stable", "1.0.0-rc.1", "rc", false},
-		{"next major follows its line", "", "stable", "2.0.0", "stable-2.x", false},
+		{"next major follows stable", "", "stable", "2.0.0", "stable", false},
 		{"flag wins", "stable", "stable", "1.4.2", "stable", false},
-		{"explicit line", "stable-2.x", "stable", "1.4.2", "stable-2.x", false},
+		{"explicit line rejected", "stable-2.x", "stable", "1.4.2", "", true},
 		{"edge follows edge", "", "edge", "edge-0123456789ab", "edge", false},
 		{"dev needs a flag", "", "dev", "dev", "", true},
 		{"dev with a flag", "edge", "dev", "dev", "edge", false},
@@ -64,7 +65,7 @@ func TestSelectChannel(t *testing.T) {
 
 func TestSelectVersionChannel(t *testing.T) {
 	for _, c := range []struct{ flag, version, want string }{
-		{"", "1.0.0-alpha.1", "stable"}, {"", "edge-0123456789ab", "edge"}, {"rc", "1.0.0-rc.1", "rc"},
+		{"", "1.0.0-alpha.1", "edge"}, {"", "1.0.0-beta.5", "edge"}, {"", "1.0.0-rc.1", "rc"}, {"", "1.0.0", "stable"}, {"", "edge-0123456789ab", "edge"}, {"rc", "1.0.0-rc.1", "rc"},
 	} {
 		got, err := SelectVersionChannel(c.flag, c.version)
 		if err != nil || got != c.want {

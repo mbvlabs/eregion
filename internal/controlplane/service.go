@@ -211,8 +211,8 @@ func (s *Service) SubmitWithReceipt(ctx context.Context, sub operations.Submissi
 	// ON CONFLICT waits for the winning transaction; the next READ COMMITTED query
 	// observes its complete operation/job/event, never a partially accepted record.
 	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued')
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,error_code,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued',0,0,0,'',clock_timestamp(),clock_timestamp())
         ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`,
 		id, sub.Kind, sub.Target, sub.Actor.Kind, sub.Actor.Subject, sub.IdempotencyKey, inputHash, canonical)
 	if err != nil {

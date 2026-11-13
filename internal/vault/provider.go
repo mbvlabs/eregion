@@ -169,8 +169,8 @@ func (s *Store) SetProviderCredential(ctx context.Context, tx pgx.Tx, scope Prov
 		_, err = tx.Exec(ctx, `
 			INSERT INTO eregion_provider_credentials
 				(provider, zone_id, zone_name, latest_revision,
-				 created_by_kind, created_by_subject, updated_by_kind, updated_by_subject)
-			VALUES ($1,$2,$3,1,$4,$5,$4,$5)`,
+				 created_by_kind, created_by_subject, updated_by_kind, updated_by_subject, created_at, updated_at)
+			VALUES ($1,$2,$3,1,$4,$5,$4,$5,clock_timestamp(),clock_timestamp())`,
 			scope.Provider, scope.ZoneID, zoneName, actor.Kind, actor.Subject)
 		if err != nil {
 			if isUniqueViolation(err) {
@@ -195,8 +195,8 @@ func (s *Store) SetProviderCredential(ctx context.Context, tx pgx.Tx, scope Prov
 	_, err = tx.Exec(ctx, `
 		INSERT INTO eregion_provider_credential_revisions
 			(provider, zone_id, revision, key_id, ciphertext, ciphertext_sha256,
-			 revision_hash, created_by_kind, created_by_subject)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			 revision_hash, created_by_kind, created_by_subject, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,clock_timestamp())`,
 		scope.Provider, scope.ZoneID, revision, keyID, ciphertext,
 		ciphertextHash, revisionHash, actor.Kind, actor.Subject)
 	if err != nil {

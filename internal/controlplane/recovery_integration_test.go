@@ -218,7 +218,24 @@ func mustParseURL(t *testing.T, value string) *url.URL {
 	return parsed
 }
 
-func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (string, MigrationPlan) {
+type recoveryHistory struct {
+	Goose string
+	River string
+}
+
+func recoveryDrillHistory(t *testing.T, ctx context.Context, pool *pgxpool.Pool) recoveryHistory {
+	t.Helper()
+	var history recoveryHistory
+	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(id::text || ':' || version_id::text || ':' || is_applied::text, ',' ORDER BY id), '') FROM goose_db_version`).Scan(&history.Goose); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(line || ':' || version::text, ',' ORDER BY line, version), '') FROM river_migration`).Scan(&history.River); err != nil {
+		t.Fatal(err)
+	}
+	return history
+}
+
+func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (recoveryHistory, MigrationPlan) {
 	t.Helper()
 	pool, err := Open(ctx, dsn)
 	if err != nil {
@@ -236,7 +253,7 @@ func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (string,
 		t.Fatalf("restored migration plan = %+v", plan)
 	}
 	for _, table := range []string{
-		"eregion_schema_migrations", "eregion_operations", "eregion_operation_events",
+		"goose_db_version", "eregion_operations", "eregion_operation_events",
 		"eregion_operation_steps", "eregion_platform_nodes", "river_job", "river_migration",
 	} {
 		var exists bool
@@ -247,11 +264,7 @@ func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (string,
 			t.Fatalf("restored database is missing key table %s", table)
 		}
 	}
-	var fingerprint string
-	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(version::text || ':' || checksum, ',' ORDER BY version), '') FROM eregion_schema_migrations`).Scan(&fingerprint); err != nil {
-		t.Fatal(err)
-	}
-	return fingerprint, plan
+	return recoveryDrillHistory(t, ctx, pool), plan
 }
 
 // TestIntegrationControlPlaneRecoveryDrill exercises the documented separate
@@ -267,16 +280,12 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 	defer cancel()
 
 	sourcePool, sourceDSN := testPool(t, true)
-	sourceFingerprint, sourcePlan := func() (string, MigrationPlan) {
+	sourceFingerprint, sourcePlan := func() (recoveryHistory, MigrationPlan) {
 		plan, err := PlanMigrations(ctx, sourcePool)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var fingerprint string
-		if err := sourcePool.QueryRow(ctx, `SELECT coalesce(string_agg(version::text || ':' || checksum, ',' ORDER BY version), '') FROM eregion_schema_migrations`).Scan(&fingerprint); err != nil {
-			t.Fatal(err)
-		}
-		return fingerprint, plan
+		return recoveryDrillHistory(t, ctx, sourcePool), plan
 	}()
 
 	admin, err := Open(ctx, os.Getenv("EREGION_TEST_DATABASE_URL"))
@@ -328,7 +337,7 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 	recoveryDrillDrop(t, ctx, admin, created, second)
 
 	// The source must still be ready and unchanged; the drill only read it.
-	afterFingerprint, afterPlan := func() (string, MigrationPlan) {
+	afterFingerprint, afterPlan := func() (recoveryHistory, MigrationPlan) {
 		if err := Ready(ctx, sourcePool); err != nil {
 			t.Fatal(err)
 		}
@@ -336,11 +345,7 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var fingerprint string
-		if err := sourcePool.QueryRow(ctx, `SELECT coalesce(string_agg(version::text || ':' || checksum, ',' ORDER BY version), '') FROM eregion_schema_migrations`).Scan(&fingerprint); err != nil {
-			t.Fatal(err)
-		}
-		return fingerprint, plan
+		return recoveryDrillHistory(t, ctx, sourcePool), plan
 	}()
 	if afterFingerprint != sourceFingerprint || afterPlan != sourcePlan {
 		t.Fatal("the recovery drill changed the source database")

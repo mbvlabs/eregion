@@ -14,20 +14,21 @@ import (
 func ptr[T any](value T) *T { return &value }
 
 func TestParseIsStrictAndVersioned(t *testing.T) {
-	valid := []byte("version = 2\napp = \"api\"\n")
+	valid := []byte("version = 1\napp = \"api\"\n")
 	definition, err := Parse(valid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if definition.App != "api" {
+	if definition.App != "api" || definition.Version == nil || *definition.Version != 1 {
 		t.Fatalf("definition = %+v", definition)
 	}
 	for name, raw := range map[string]string{
-		"missing version": "app = \"api\"\n",
-		"wrong version":   "version = 23\napp = \"api\"\n",
-		"unknown key":     "version = 2\nunknown = \"x\"\n",
-		"secret values":   "version = 2\n[secrets]\nDATABASE_URL = \"postgres://user:pass@example/db\"\n",
-		"duplicate key":   "version = 2\napp = \"one\"\napp = \"two\"\n",
+		"missing version":          "app = \"api\"\n",
+		"wrong version":            "version = 23\napp = \"api\"\n",
+		"published beta.5 version": "version = 2\napp = \"api\"\n",
+		"unknown key":              "version = 1\nunknown = \"x\"\n",
+		"secret values":            "version = 1\n[secrets]\nDATABASE_URL = \"postgres://user:pass@example/db\"\n",
+		"duplicate key":            "version = 1\napp = \"one\"\napp = \"two\"\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Parse([]byte(raw))
@@ -39,14 +40,40 @@ func TestParseIsStrictAndVersioned(t *testing.T) {
 			}
 		})
 	}
+	if _, err := Parse([]byte("version = 2\napp = \"api\"\n")); err == nil || !strings.Contains(err.Error(), "unsupported schema 2") {
+		t.Fatalf("published beta.5 version was not rejected by version: %v", err)
+	}
+}
+
+func TestParseRejectsRemovedSourceModesUnderCurrentVersion(t *testing.T) {
+	for name, raw := range map[string]string{
+		"source.kind":  "version = 1\napp = \"api\"\n[source]\nkind = \"image\"\n",
+		"source.image": "version = 1\napp = \"api\"\n[source]\nimage = \"registry.example/api:1\"\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Parse([]byte(raw))
+			if err == nil {
+				t.Fatal("accepted a removed source mode under version 1")
+			}
+			if !strings.Contains(err.Error(), "unknown or unsupported field") {
+				t.Fatalf("removed source field was not rejected as unknown: %v", err)
+			}
+			if !strings.Contains(err.Error(), name) {
+				t.Fatalf("removed source field error did not name %s: %v", name, err)
+			}
+			if strings.Contains(err.Error(), "unsupported schema") {
+				t.Fatalf("removed source field was rejected only by version: %v", err)
+			}
+		})
+	}
 }
 
 func TestResourceDeclarationValidation(t *testing.T) {
-	if _, err := Parse([]byte("version = 2\napp = \"api\"\n[[resources]]\nname = \"db\"\n")); err == nil {
+	if _, err := Parse([]byte("version = 1\napp = \"api\"\n[[resources]]\nname = \"db\"\n")); err == nil {
 		t.Fatal("accepted a resource without an image or health command")
 	}
 	definition, err := Parse([]byte(`
-version = 2
+version = 1
 app = "api"
 
 [[resources]]
@@ -86,7 +113,7 @@ destination = "/var/lib/postgresql/data"
 
 func TestResolveMergesSharedFieldsAndSelectedOverride(t *testing.T) {
 	definition, err := Parse([]byte(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 secret_names = ["DATABASE_URL", "API_KEY"]
@@ -172,10 +199,10 @@ C = "4"
 	if _, err := definition.Resolve("pr-42"); err != nil {
 		t.Fatalf("shared recipe was not reusable for an arbitrary environment: %v", err)
 	}
-	if _, err := Parse([]byte("version = 2\n")); err != nil {
+	if _, err := Parse([]byte("version = 1\n")); err != nil {
 		t.Fatal(err)
 	}
-	disagree, err := Parse([]byte("version = 2\n[source]\nurl = \"https://github.com/acme/api\"\n"))
+	disagree, err := Parse([]byte("version = 1\n[source]\nurl = \"https://github.com/acme/api\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +213,7 @@ C = "4"
 
 func TestDefinitionCollectionLimits(t *testing.T) {
 	processes := strings.Builder{}
-	processes.WriteString("version = 2\napp = \"api\"\n[source]\nurl = \"https://github.com/acme/api\"\n")
+	processes.WriteString("version = 1\napp = \"api\"\n[source]\nurl = \"https://github.com/acme/api\"\n")
 	for index := 0; index < 33; index++ {
 		fmt.Fprintf(&processes, "\n[[processes]]\nname = \"p%d\"\nkind = \"worker\"\ncommand = \"./worker\"\n", index)
 	}
@@ -205,7 +232,7 @@ func TestDefinitionCollectionLimits(t *testing.T) {
 	for index := 0; index < 129; index++ {
 		names = append(names, fmt.Sprintf("SECRET_%d", index))
 	}
-	raw := "version = 2\napp = \"api\"\nsecret_names = [\"" + strings.Join(names, `", "`) + "\"]\n[source]\nurl = \"https://github.com/acme/api\"\n"
+	raw := "version = 1\napp = \"api\"\nsecret_names = [\"" + strings.Join(names, `", "`) + "\"]\n[source]\nurl = \"https://github.com/acme/api\"\n"
 	definition, err = Parse([]byte(raw))
 	if err != nil {
 		t.Fatal(err)
@@ -216,7 +243,7 @@ func TestDefinitionCollectionLimits(t *testing.T) {
 }
 
 func TestResolveDistinguishesAbsentFromEmpty(t *testing.T) {
-	absent, err := Parse([]byte("version = 2\napp = \"api\"\n[source]\nurl = \"https://github.com/acme/api\"\n"))
+	absent, err := Parse([]byte("version = 1\napp = \"api\"\n[source]\nurl = \"https://github.com/acme/api\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +254,7 @@ func TestResolveDistinguishesAbsentFromEmpty(t *testing.T) {
 	if resolved.ProcessesSet || resolved.ConfigSet || resolved.SecretNamesSet || resolved.DomainsSet {
 		t.Fatalf("absent collections were reported as set: %+v", resolved)
 	}
-	empty, err := Parse([]byte(`version = 2
+	empty, err := Parse([]byte(`version = 1
 app = "api"
 secret_names = []
 processes = []
@@ -252,7 +279,7 @@ domains = []
 
 func TestCreateSpecMapsTheSupportedDefinition(t *testing.T) {
 	raw := []byte(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 build_node = "builder"
@@ -331,7 +358,7 @@ check_path = "/custom"
 }
 
 func TestCreateSpecRefusesUnrepresentableCollections(t *testing.T) {
-	base := `version = 2
+	base := `version = 1
 app = "api"
 [source]
 `
@@ -344,9 +371,9 @@ app = "api"
 			raw := base + extra
 			switch name {
 			case "empty processes":
-				raw = "version = 2\napp = \"api\"\nprocesses = []\n" + base[len("version = 2\napp = \"api\"\n"):]
+				raw = "version = 1\napp = \"api\"\nprocesses = []\n" + base[len("version = 1\napp = \"api\"\n"):]
 			case "credential in app":
-				raw = `version = 2
+				raw = `version = 1
 app = "api"
 secret_names = ["GIT_READ_TOKEN"]
 [source]
@@ -371,7 +398,7 @@ credential_secret = "GIT_READ_TOKEN"
 
 func TestCreateSpecCarriesMultipleDomains(t *testing.T) {
 	raw := []byte(`
-version = 2
+version = 1
 app = "api"
 [source]
 [[domains]]
@@ -409,7 +436,7 @@ check_path = "/readyz"
 
 func TestUpdatePatchChangesOnlySupportedFields(t *testing.T) {
 	raw := []byte(`
-version = 2
+version = 1
 app = "api"
 node = "main2"
 secret_names = []
@@ -530,7 +557,7 @@ func TestUpdatePatchRejectsSourceCredentialRoleAliasing(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			raw := fmt.Sprintf(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 secret_names = %s
@@ -570,7 +597,7 @@ replicas = 1
 
 func TestUpdatePatchClearsExplicitEmptyCollections(t *testing.T) {
 	raw := []byte(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 secret_names = []
@@ -658,7 +685,7 @@ release_command = []
 }
 
 func TestUpdatePatchRequiresNodeAndAllowsNoSource(t *testing.T) {
-	base := "version = 2\napp = \"api\"\n"
+	base := "version = 1\napp = \"api\"\n"
 	definition, err := Parse([]byte(base + "[source]\nurl = \"https://github.com/acme/api\"\n"))
 	if err != nil {
 		t.Fatal(err)
@@ -686,7 +713,7 @@ func TestUpdatePatchRequiresNodeAndAllowsNoSource(t *testing.T) {
 
 func TestUpdatePatchDetectsAnOmittedDomainRemoval(t *testing.T) {
 	raw := []byte(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 [source]
@@ -716,7 +743,7 @@ node = "main"
 
 func TestUpdatePatchLeavesDomainChangesToTheDomainPlan(t *testing.T) {
 	raw := []byte(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 [source]
@@ -774,6 +801,12 @@ func TestExportIsDeterministicAndRoundTrips(t *testing.T) {
 	}
 	if first != second {
 		t.Fatalf("export is not deterministic:\n%s\n---\n%s", first, second)
+	}
+	if !strings.HasPrefix(first, "version = 1\n") {
+		t.Fatalf("export does not use the current definition version:\n%s", first)
+	}
+	if strings.Contains(first, "version = 2\n") {
+		t.Fatalf("export retained the published beta.5 version:\n%s", first)
 	}
 	if strings.Index(first, `app = "api"`) > strings.Index(first, "[source]") {
 		t.Fatalf("root keys are not before tables:\n%s", first)
@@ -865,7 +898,7 @@ func TestExportResourcesRoundTrip(t *testing.T) {
 
 func TestResourceAttachmentsHonorAttachFalse(t *testing.T) {
 	definition, err := Parse([]byte(`
-version = 2
+version = 1
 app = "api"
 [source]
 
@@ -917,7 +950,7 @@ command = ["redis-cli", "ping"]
 
 func TestResourceDeclarationRejectsDuplicateMountDestination(t *testing.T) {
 	_, err := Parse([]byte(`
-version = 2
+version = 1
 app = "api"
 [source]
 
@@ -1044,7 +1077,7 @@ func TestExportRejectsAttachedResourceWithoutDefinition(t *testing.T) {
 
 func TestUpdatePatchRefusesWhenCurrentBindingsAreMissing(t *testing.T) {
 	raw := []byte(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 [source]
@@ -1095,7 +1128,7 @@ func TestUpdatePatchOmittedSourceClearsGitAndEnforcesAutomationInvariant(t *test
 			Processes:         []platform.ProcessSpec{{Name: "web", Kind: "web", Replicas: 1, ContainerPort: 8080}},
 		}},
 	}
-	definition, err := Parse([]byte("version = 2\napp = \"api\"\nnode = \"main\"\n"))
+	definition, err := Parse([]byte("version = 1\napp = \"api\"\nnode = \"main\"\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1108,7 +1141,7 @@ func TestUpdatePatchOmittedSourceClearsGitAndEnforcesAutomationInvariant(t *test
 	} else if fault := contract.Classify(err); fault.Code != contract.ValidationFailed || !strings.Contains(fault.Hint, "Automatic deployment requires") {
 		t.Fatalf("clearing Git with enabled automation = %+v", fault)
 	}
-	disabled, err := Parse([]byte("version = 2\napp = \"api\"\nnode = \"main\"\n[automation]\nauto_deploy = false\n"))
+	disabled, err := Parse([]byte("version = 1\napp = \"api\"\nnode = \"main\"\n[automation]\nauto_deploy = false\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

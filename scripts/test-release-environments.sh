@@ -42,7 +42,7 @@ fi
 grep -Fq 'Promote the opt-in rc channel' "${work}/prerelease"
 grep -Fq 'invalid final release tag' "${work}/final"
 grep -Fq 'upload-release.sh "dist/release-${line}" "${line}"' "${work}/final"
-grep -Fq 'channel=snapshot' "${work}/prerelease"
+grep -Fq 'channel=edge' "${work}/prerelease"
 grep -Fq 'upload-release.sh "dist/release-${channel}" "${channel}"' "${work}/prerelease"
 grep -Fq 'channel=rc' "${work}/prerelease"
 if grep -Fq 'stable-${version%%.*}.x' "${work}/prerelease"; then

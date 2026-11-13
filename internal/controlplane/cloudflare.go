@@ -287,7 +287,7 @@ func recordAuditTx(ctx context.Context, tx pgx.Tx, entry integrations.AuditEntry
 	if err != nil {
 		return contract.NewFault(contract.Internal, "could not encode the provider audit entry", "Do not activate the credential; report the binary version.")
 	}
-	if _, err := tx.Exec(ctx, "INSERT INTO eregion_integration_audit (entry) VALUES ($1)", raw); err != nil {
+	if err := integrations.InsertAuditTx(ctx, tx, raw); err != nil {
 		return contract.NewFault(contract.Unavailable, "durable integration audit is unavailable", "The provider credential was not activated; repair database connectivity and retry.")
 	}
 	return nil

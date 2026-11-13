@@ -899,6 +899,9 @@ func (w *platformWorker) runDeployment(ctx context.Context, id contract.Operatio
 		if op.State == contract.Cancelling {
 			return errDeploymentCancelledAtFinalize
 		}
+		if err := lockDeploymentOperationParentsTx(ctx, tx, id, env.ID, dep.ID, release.ID); err != nil {
+			return err
+		}
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
             SET state='succeeded',completed_at=$2,updated_at=$2,message=$3,error_code=''
@@ -944,6 +947,9 @@ func (s *Service) recordServing(ctx context.Context, env platform.Environment, r
 		return unavailable()
 	}
 	defer rollback(tx)
+	if err := lockServingPointersTx(ctx, tx, env.ID, release.ID, dep.ID); err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments SET instances=$2,updated_at=$3 WHERE id=$1`,
 		dep.ID, mustJSON(instances), now); err != nil {
@@ -1257,6 +1263,9 @@ func (s *Service) markBuildSucceeded(ctx context.Context, id platform.BuildID, r
 		return unavailable()
 	}
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	if err := lockBuildParentsTx(ctx, tx, id, releaseID); err != nil {
+		return err
+	}
 	buildTag, err := tx.Exec(ctx, `UPDATE eregion_platform_builds
         SET state='succeeded',commit_sha=$2,completed_at=clock_timestamp(),error='',error_code=''
         WHERE id=$1 AND state IN ('pending','running')`, id, commit)

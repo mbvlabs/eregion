@@ -25,7 +25,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const testDefinition = `version = 2
+const testDefinition = `version = 1
 app = "api"
 node = "main"
 secret_names = ["DATABASE_URL"]
@@ -155,7 +155,7 @@ func TestDefinitionFileAndFlagsBuildTheSameFirstRevision(t *testing.T) {
 
 func TestDefinitionFileCarriesMultipleDomains(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "eregion.toml")
-	raw := `version = 2
+	raw := `version = 1
 app = "api"
 node = "main"
 [source]
@@ -198,7 +198,7 @@ check_path = "/readyz"
 // the document, and the new environment is unprotected by default.
 func TestEnvironmentCreateFromSharedRecipeNeedsNoNamedOverride(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "eregion.toml")
-	raw := `version = 2
+	raw := `version = 1
 app = "api"
 node = "main"
 
@@ -237,7 +237,7 @@ APP_ENV = "shared"
 func TestDefinitionFileRejectsSecretValuesAndConflictingFlags(t *testing.T) {
 	dir := t.TempDir()
 	secretPath := filepath.Join(dir, "secret.toml")
-	if err := os.WriteFile(secretPath, []byte("version = 2\n[secrets]\nDATABASE_URL = \"postgres://user:hunter2@example/db\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(secretPath, []byte("version = 1\n[secrets]\nDATABASE_URL = \"postgres://user:hunter2@example/db\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cmd := definitionCommand(t, setupApp)
@@ -609,7 +609,7 @@ func resourceDefinitionEnvironment() platform.Environment {
 	}
 }
 
-const resourceDefinition = `version = 2
+const resourceDefinition = `version = 1
 app = "api"
 node = "main"
 
@@ -668,7 +668,7 @@ func TestDefinitionEnvironmentPlannerKeepsResourceDeclarations(t *testing.T) {
 }
 
 func TestDefinitionEnvironmentPlannerKeepsEmptyCollectionRemovals(t *testing.T) {
-	raw := `version = 2
+	raw := `version = 1
 app = "api"
 node = "main"
 secret_names = []
@@ -735,7 +735,7 @@ func TestDefinitionCreateAttachesOnlyAttachTrueResources(t *testing.T) {
 func TestAppCreateFromFileDryRunDoesNotWriteSecrets(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "eregion.toml")
-	raw := `version = 2
+	raw := `version = 1
 app = "api"
 node = "main"
 secret_names = ["DATABASE_URL"]

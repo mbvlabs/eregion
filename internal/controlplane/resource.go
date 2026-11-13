@@ -48,7 +48,34 @@ func scanResourceRow(row pgx.Row) (platform.Resource, error) {
 			return resource, err
 		}
 	}
+	if err := validateStoredResource(resource); err != nil {
+		return resource, err
+	}
 	return resource, nil
+}
+
+func validateStoredResource(resource platform.Resource) error {
+	if !resource.State.Valid() || (resource.HealthState != platform.HealthUnknown && resource.HealthState != platform.HealthHealthy && resource.HealthState != platform.HealthUnhealthy) || resource.ID.Validate() != nil || resource.Volumes == nil {
+		return pointerIntegrityFault()
+	}
+	spec, err := platform.NormalizeResourceSpec(resource.Spec)
+	if err != nil {
+		return pointerIntegrityFault()
+	}
+	prefix := "er-res-" + strings.TrimPrefix(string(resource.ID), "res_") + "-"
+	seen := map[string]bool{}
+	for _, volume := range resource.Volumes {
+		if !platform.ResourceVolumeNameValid(volume.Name) || !strings.HasPrefix(volume.Name, prefix) || seen[volume.Name] {
+			return pointerIntegrityFault()
+		}
+		seen[volume.Name] = true
+		check := spec
+		check.Mounts = []platform.ResourceMount{{Name: strings.TrimPrefix(volume.Name, prefix), Destination: volume.Destination, ReadOnly: volume.ReadOnly}}
+		if _, err := platform.NormalizeResourceSpec(check); err != nil {
+			return pointerIntegrityFault()
+		}
+	}
+	return nil
 }
 
 func resourceByNameTx(ctx context.Context, tx pgx.Tx, app, environment, name string, lock bool) (platform.Resource, error) {
@@ -166,8 +193,8 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx pgx.Tx, id contra
 		return unavailable()
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_resources
-        (id,app_id,environment_id,name,node_name,spec,state,image,operation_id)
-        VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8)`,
+        (id,app_id,environment_id,name,node_name,spec,state,image,operation_id,image_id,image_digest,container_name,network_name,volumes,health_state,health_detail,error_code,error,created_at,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,'','','','','[]'::jsonb,'unknown','','','',clock_timestamp(),clock_timestamp())`,
 		resourceID, envAppID(ctx, tx, input.App), env.ID, input.Name, env.Node, raw, input.Image, id); err != nil {
 		return platformWriteError(err, "resource name already exists in this environment")
 	}

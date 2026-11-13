@@ -47,8 +47,8 @@ func markDiagnosticCleanupTx(ctx context.Context, tx pgx.Tx, op *contract.Operat
 	}
 	hash := engine.InputsHash(step.ID(), inputs)
 	tag, err := tx.Exec(ctx, `INSERT INTO eregion_operation_steps
-        (operation_id,step,inputs_hash,state,attempt,execution_id)
-        VALUES ($1,$2,$3,'running',$4,'') ON CONFLICT (operation_id,step) DO NOTHING`,
+        (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,error,error_code)
+        VALUES ($1,$2,$3,'running',$4,'',clock_timestamp(),'','') ON CONFLICT (operation_id,step) DO NOTHING`,
 		op.ID, step.ID(), hash, op.Attempt)
 	if err != nil {
 		return err

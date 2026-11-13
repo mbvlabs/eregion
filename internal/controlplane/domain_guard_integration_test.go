@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -27,10 +28,7 @@ func TestIntegrationDomainAdmissionGuardAndRevalidation(t *testing.T) {
         WHERE a.name='guard' AND e.name='production'`).Scan(&envID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary)
-        VALUES('app.example.com',$1,false)`, envID); err != nil {
-		t.Fatal(err)
-	}
+	insertFixtureDomain(t, ctx, pool, "app.example.com", envID, false, time.Now())
 
 	removeInput := map[string]any{"domain": "app.example.com", "confirm": "app.example.com"}
 	removeOp := platformSubmit(t, s, platform.KindDomainRemove, "env/guard/production", "guard-remove", removeInput)
@@ -61,10 +59,7 @@ func TestIntegrationDomainAdmissionGuardAndRevalidation(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DELETE FROM eregion_platform_domains WHERE name='app.example.com'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary,created_at)
-        VALUES('app.example.com',$1,false,$2)`, envID, op.CreatedAt.Add(1_000_000_000)); err != nil {
-		t.Fatal(err)
-	}
+	insertFixtureDomain(t, ctx, pool, "app.example.com", envID, false, op.CreatedAt.Add(time.Second))
 	if err := s.revalidateDomainOperation(ctx, op, input); contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("readd revalidation = %v", err)
 	}

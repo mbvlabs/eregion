@@ -185,8 +185,7 @@ func TestIntegrationArtifactAdmissionRechecksPlacementFactsInsideTransaction(t *
 	manifest := "sha256:" + strings.Repeat("6", 64)
 	config := "sha256:" + strings.Repeat("7", 64)
 	service.resolveArtifactFn = func(ctx context.Context, request artifactRequest) (resolvedArtifact, error) {
-		if _, err := fixture.pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities)
-            VALUES('other',ARRAY['application'],ARRAY['docker']) ON CONFLICT (name) DO NOTHING`); err != nil {
+		if err := insertFixtureNode(ctx, fixture.pool, "other", []string{"application"}, []string{"docker"}, ""); err != nil {
 			return resolvedArtifact{}, err
 		}
 		// Simulate a concurrent placement change after the read-only resolution

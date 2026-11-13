@@ -58,7 +58,7 @@ func (a *app) upgradeSpecs() []spec {
 		meta: meta,
 		flags: func(cmd *cobra.Command) {
 			cmd.Flags().String("version", "", "Release version to install; defaults to the channel's current manifest")
-			cmd.Flags().String("channel", "", "Release channel: stable, stable-<major>.x, rc or edge")
+			cmd.Flags().String("channel", "", "Release channel: edge, rc or stable")
 			cmd.Flags().Bool("yes", false, "Replace the binary without an interactive confirmation")
 			cmd.Flags().Bool("dry-run", false, "Resolve and print the from/to plan without downloading or replacing")
 		},
@@ -170,7 +170,6 @@ func (a *app) upgradeRun(cmd *cobra.Command, _ []string) (result, error) {
 	return result{data: data, plain: strings.Join(lines, "\n") + "\n"}, nil
 }
 
-// The manifest channel identifies its signing family, not release stability.
 func upgradeReleaseLabel(version string) string {
 	parsed, ok := release.ParseStable(strings.TrimPrefix(version, "v"))
 	if ok && !parsed.Prerelease() {

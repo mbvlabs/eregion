@@ -633,6 +633,9 @@ func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *co
 	if op.State.Terminal() {
 		return nil
 	}
+	if err := lockOperationParentsTx(ctx, tx, op.ID, operationRequiresPlacement(op.Kind)); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_builds SET state='failed',error_code=$2,error=$3,completed_at=clock_timestamp()
         WHERE operation_id=$1 AND state IN ('pending','running')`, op.ID, string(code), message); err != nil {
 		return err
@@ -689,6 +692,9 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
+		}
+		if err := lockOperationParentsTx(ctx, tx, id, operationRequiresPlacement(op.Kind)); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_builds
             SET state='cancelled',error_code=$2,error=$3,completed_at=clock_timestamp()
@@ -2236,6 +2242,9 @@ func (s *Service) finishDeploymentAfterSwitch(ctx context.Context, op contract.O
 		if current.State == contract.Cancelling {
 			return errDeploymentCancelledAtFinalize
 		}
+		if err := lockServingPointersTx(ctx, tx, env.ID, dep.ReleaseID, dep.ID); err != nil {
+			return err
+		}
 		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
             SET state='succeeded',completed_at=$2,updated_at=$2,message=$3,error_code=''
@@ -2294,10 +2303,13 @@ func insertPlatformChange(ctx context.Context, tx pgx.Tx, op *contract.Operation
 	if err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&appID); err != nil {
 		return err
 	}
+	if err := lockAppKeyShareTx(ctx, tx, appID); err != nil {
+		return err
+	}
 	var envID any
 	if environment != "" {
 		var id string
-		if err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_environments WHERE app_id=$1 AND name=$2`, appID, environment).Scan(&id); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_environments WHERE app_id=$1 AND name=$2 FOR KEY SHARE`, appID, environment).Scan(&id); err != nil {
 			return err
 		}
 		envID = id
@@ -2319,8 +2331,8 @@ func insertPlatformChange(ctx context.Context, tx pgx.Tx, op *contract.Operation
 	desiredJSON, _ := json.Marshal(desired)
 	appliedJSON, _ := json.Marshal(applied)
 	_, err = tx.Exec(ctx, `INSERT INTO eregion_platform_changes
-        (id,app_id,environment_id,sequence,kind,operation_id,actor_kind,actor_subject,summary,desired,applied)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        (id,app_id,environment_id,sequence,kind,operation_id,actor_kind,actor_subject,summary,desired,applied,created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,clock_timestamp())
         ON CONFLICT (operation_id,kind) DO NOTHING`,
 		changeID, appID, envID, sequence, kind, op.ID, op.Actor.Kind, op.Actor.Subject, summary,
 		nullableJSON(desiredJSON), nullableJSON(appliedJSON))

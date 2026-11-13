@@ -35,10 +35,11 @@ func TestUpgradeRCResolution(t *testing.T) {
 		{"missing rc", "rc", "", "1.0.0-rc.1", "1.0.0", true, map[string]release.Manifest{"stable-1.x": {Version: "1.0.0"}}, map[string]error{"rc": notFound}, []string{"rc ", "stable-1.x "}, false},
 		{"bad rc signature", "rc", "", "1.0.0-rc.1", "", true, nil, map[string]error{"rc": badSignature}, []string{"rc "}, true},
 		{"bad final signature", "rc", "", "1.0.0-rc.1", "", true, map[string]release.Manifest{"rc": {Version: "1.0.0-rc.2"}}, map[string]error{"stable-1.x": badSignature}, []string{"rc ", "stable-1.x "}, true},
+		{"absent final retains rc", "rc", "", "1.0.0-rc.1", "1.0.0-rc.2", true, map[string]release.Manifest{"rc": {Version: "1.0.0-rc.2"}}, map[string]error{"stable-1.x": notFound}, []string{"rc ", "stable-1.x "}, false},
 		{"missing both pointers", "rc", "", "1.0.0-rc.1", "", true, nil, map[string]error{"rc": notFound, "stable-1.x": notFound}, []string{"rc ", "stable-1.x "}, true},
 		{"explicit rc opt in", "rc", "", "1.0.0", "1.1.0-rc.1", false, map[string]release.Manifest{"rc": {Version: "1.1.0-rc.1"}}, nil, []string{"rc "}, false},
-		{"stable default", "stable-1.x", "", "1.0.0", "1.0.1", true, map[string]release.Manifest{"stable-1.x": {Version: "1.0.1"}}, nil, []string{"stable-1.x "}, false},
-		{"exact pin", "stable", "1.1.0-beta.1", "1.0.0", "1.1.0-beta.1", true, map[string]release.Manifest{"stable": {Version: "1.1.0-beta.1"}}, nil, []string{"stable 1.1.0-beta.1"}, false},
+		{"stable default", "stable", "", "1.0.0", "1.0.1", true, map[string]release.Manifest{"stable": {Version: "1.0.1"}}, nil, []string{"stable "}, false},
+		{"exact pin", "edge", "1.1.0-beta.1", "1.0.0", "1.1.0-beta.1", true, map[string]release.Manifest{"edge": {Version: "1.1.0-beta.1"}}, nil, []string{"edge 1.1.0-beta.1"}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &upgradeResolverStub{values: tc.values, errors: tc.errors}

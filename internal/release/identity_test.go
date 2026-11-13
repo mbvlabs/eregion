@@ -11,7 +11,9 @@ func TestChannelIdentity(t *testing.T) {
 	}{
 		{"edge", "edge-0123456789ab", "https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master"},
 		{"stable", "1.0.0", "https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0"},
-		{"stable-1.x", "1.0.0-alpha.2", "https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0-alpha.2"},
+		{"edge", "1.0.0-alpha.2", "https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0-alpha.2"},
+		{"edge", "1.0.0-beta.5", "https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0-beta.5"},
+		{"rc", "1.0.0-rc.1", "https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v1.0.0-rc.1"},
 	}
 	for _, c := range cases {
 		got, err := Identity(c.channel, c.version)

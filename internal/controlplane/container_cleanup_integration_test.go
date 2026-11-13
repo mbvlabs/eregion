@@ -24,14 +24,13 @@ func TestIntegrationContainerCleanupRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities) VALUES('main',ARRAY['application'],ARRAY['docker'])`); err != nil {
+	if err := insertFixtureNode(ctx, pool, "main", []string{"application"}, []string{"docker"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name) VALUES($1,'demo')`, appID); err != nil {
+	if err := insertFixtureApp(ctx, pool, string(appID), "demo", "demo"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environments(id,app_id,name,node_name,host_port,candidate_port,container_port)
-        VALUES($1,$2,'production','main',20001,30001,8080)`, envID, appID); err != nil {
+	if err := insertFixtureEnvironment(ctx, pool, string(envID), string(appID), "production", "main", 20001, 30001, 8080); err != nil {
 		t.Fatal(err)
 	}
 

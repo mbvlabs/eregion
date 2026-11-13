@@ -5,6 +5,44 @@ Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 tracks execution. This file says what must work on a real server and what has
 been observed.
 
+## Unpublished three-channel correction (2026-11-13)
+
+The reviewed local correction routes development/alpha/beta to edge, release
+candidates to rc and finals to stable. Focused release/upgrade tests, offline
+publication harnesses, temporary-Git ordering tests and conditional-write
+adapter tests passed. The pinned AWS CLI passed offline model checks and a
+local fake-HTTP conditional-header/412 test. These are not live R2 evidence;
+the downloaded CLI's official artifact checksum was not independently verified.
+
+Before publication qualification, verify conditional pointer writes on an
+explicitly authorized R2 target. Publish and verify the first corrected
+anonymous edge build separately, including historical beta.5's edge upgrade,
+before attesting bootstrap completion or allowing a tagged alpha/beta to
+replace the pointer. The bootstrap attestation is not set by this work.
+Historical beta.5 may reject later tag-signed edge pointers and may fail closed
+during a moving manifest/bundle race. No compatibility guarantee, new release
+or existing-server upgrade is claimed.
+
+## Unpublished fresh Goose baseline (2026-11-13)
+
+Current local source replaces the old SQL chain with Goose baseline 1, including
+vault tables. Published beta.5 remains schema 33. The new baseline has no
+application defaults, domain CHECKs, business triggers or policy seeds; Go
+supplies initial values and validates references and domain policy. Source
+review covered schema parity, write values, read validation, migration refusal
+and parent/reference locking. These reviews do not establish PostgreSQL passes.
+
+Qualification must use an explicitly authorized fresh disposable PostgreSQL
+target, never an ambient installation DSN. Required evidence includes read-only
+planning, refusal of legacy/orphan/River-only schemas without writes, supported
+schema resolution, transactional migration retry, concurrent migrators,
+cancellation/pool lifetime, Goose/River recovery histories, fresh definition
+apply without a DNS-policy row, explicit-value fixtures, and coordinated
+pointer/build/diagnostic/deletion/retention races. Preserve stale-attempt,
+unknown-effect and restore-owner protections. Tests added for these mechanisms
+remain unexecuted until that authorization; no existing database migration,
+adoption or compatibility path is promised.
+
 ## Beta.4 incremental acceptance
 
 These checks describe the candidate changes, not a pass record. Publication is
@@ -120,6 +158,15 @@ worker-lease root cause, and this candidate does not claim that cause fixed.
 | Retention | Verify all environments sharing an app repository protect accepted pending/serving/rollback manifest digests and moved tags under the unchanged D30 policy, with exact repository parsing and no external-registry deletion. |
 | Definition and export | Apply a schema-2 definition with a Git `[source]`, an empty/absent source, and root `image_repository`. Verify schema-1 documents and `source.kind`/`source.image` are rejected without aliases, an omitted or empty source clears an existing Git recipe, export omits a Git-less source, enabled automation without Git is refused rather than silently retaining an enabled webhook, `app export` writes the actual repository, and environment apply cannot change it. |
 | Git-less CLI default | Create an image-only app via flags, definition file and interactive/non-TTY paths without `--no-deploy`. Verify no first deploy is requested, while an explicit API `deploy: true` without Git/artifact still fails before any partial commit. A missing app inventory lookup for export must fail closed, never fabricate a default-slug repository. |
+
+**Pre-RC definition version decision (2026-11-13):** published
+`v1.0.0-beta.5` remains the immutable historical record and used definition
+version 2. The current pre-RC source returns the marker to version 1 for the
+next prerelease: it accepts version-1 documents only, rejects version 2 as
+unsupported, and still rejects `source.kind`/`source.image` as unknown fields
+under version 1. The approved app repository, optional Git source and
+no-environment-image-mode model is unchanged. The beta.5 row above keeps its
+published criteria; current definition/export checks use version 1.
 
 The beta.5 PostgreSQL admission/replay/placement regressions are gated on an
 explicitly authorized disposable DSN. Local verification compiled them without

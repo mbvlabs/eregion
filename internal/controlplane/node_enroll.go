@@ -102,8 +102,10 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.
 	}
 	_, err = tx.Exec(ctx, `INSERT INTO eregion_platform_nodes
         (name,roles,capabilities,address,status,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key,
-         ssh_host_key_fingerprint,expected_identity_fingerprint,build_concurrency,build_user,wg_enabled,wg_address,wg_endpoint,wg_ssh_port,enroll_operation_id)
-        VALUES($1,$2,$3,$4,'registered',$5,'ssh',$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         ssh_host_key_fingerprint,expected_identity_fingerprint,build_concurrency,build_user,wg_enabled,wg_address,wg_endpoint,wg_ssh_port,enroll_operation_id,
+         created_at,updated_at,enrollment_error,identity_public_key,identity_fingerprint,os_id,os_version,arch,wg_public_key,control_wg_public_key,wg_state,last_check_state,last_check_detail)
+        VALUES($1,$2,$3,$4,'registered',$5,'ssh',$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+         clock_timestamp(),clock_timestamp(),'','','','','','','','','none','unknown','')
         ON CONFLICT (name) DO UPDATE SET roles=EXCLUDED.roles, address=EXCLUDED.address, enrollment_state=EXCLUDED.enrollment_state,
             enrollment_error='', transport='ssh', ssh_address=EXCLUDED.ssh_address, ssh_user=EXCLUDED.ssh_user,
             ssh_host_key=EXCLUDED.ssh_host_key, ssh_host_key_fingerprint=EXCLUDED.ssh_host_key_fingerprint,

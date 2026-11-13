@@ -47,8 +47,8 @@ func (s *Service) SetServerRetentionPolicy(ctx context.Context, policy retention
 	if err != nil {
 		return unavailable(err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention,updated_at)
-        VALUES (true,$1,clock_timestamp())
+	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention,retention_gc_pending,updated_at)
+        VALUES (true,$1,false,clock_timestamp())
         ON CONFLICT (singleton) DO UPDATE SET retention=EXCLUDED.retention, updated_at=clock_timestamp()`, raw); err != nil {
 		return unavailable()
 	}

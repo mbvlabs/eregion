@@ -633,7 +633,7 @@ func writeUpdateDefinition(t *testing.T, credential, secretNames string) string 
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "eregion.toml")
 	raw := fmt.Sprintf(`
-version = 2
+version = 1
 app = "api"
 node = "main"
 secret_names = %s

@@ -18,7 +18,11 @@ jobs:
     environment: edge
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: Check pinned AWS CLI conditional writes
+        run: bash scripts/check-release-aws.sh
       - name: Validate release configuration
         env:
           RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
@@ -38,6 +42,8 @@ jobs:
           }
       - name: Verify source
         run: |
+          git fetch --force --tags origin master:refs/remotes/origin/master
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           test -z "$(gofmt -l cmd internal schema examples)"
           go vet ./...
           go build ./...
@@ -47,11 +53,13 @@ jobs:
         run: scripts/build-release.sh "edge-${GITHUB_SHA::12}" edge "${RELEASE_BASE_URL}"
       - name: Sign and verify edge release
         run: scripts/sign-release.sh dist/release-edge
-      - name: Upload immutable artifacts and channel files
+      - name: Upload immutable artifacts and promote edge
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
           RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-        run: scripts/upload-release.sh dist/release-edge edge "${RELEASE_BUCKET}" "${R2_ENDPOINT}"
+        run: |
+          scripts/upload-release.sh dist/release-edge edge "${RELEASE_BUCKET}" "${R2_ENDPOINT}" artifacts
+          go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key edge/manifest.json --endpoint "${R2_ENDPOINT}" --channel edge --root dist/release-edge --version "edge-${GITHUB_SHA::12}" --commit "${GITHUB_SHA}"

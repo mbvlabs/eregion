@@ -161,14 +161,14 @@ func insertRetentionWorkerRelease(t *testing.T, pool *pgxpool.Pool, app, environ
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,$2,$3,'system','retention-worker-test',$4,'retention-worker-test','{}'::jsonb,'succeeded')`,
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,$2,$3,'system','retention-worker-test',$4,'retention-worker-test','{}'::jsonb,'succeeded',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, platform.KindDeploy, "env/"+app+"/"+environment, "retention-worker-release:"+string(releaseID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases
-        (id,operation_id,app_id,environment_id,image,image_id,source,status,created_at)
-        VALUES($1,$2,$3,$4,$5,$6,'{"type":"image"}'::jsonb,'ready',$7)`,
+        (id,operation_id,app_id,environment_id,image,image_id,source,status,error_code,error,created_at,commit_sha)
+        VALUES($1,$2,$3,$4,$5,$6,'{"type":"image"}'::jsonb,'ready','','',$7,'')`,
 		releaseID, operationID, appID, environmentID, image, imageID, createdAt); err != nil {
 		t.Fatal(err)
 	}
@@ -777,8 +777,8 @@ func TestIntegrationRetentionPendingGCRunsWithoutNewDeletions(t *testing.T) {
 	if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_platform_releases SET pruned_at=clock_timestamp() WHERE id=$1`, fixture.oldID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention_gc_pending)
-        VALUES (true,true) ON CONFLICT (singleton) DO UPDATE SET retention_gc_pending=true`); err != nil {
+	if _, err := fixture.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention,updated_at,retention_gc_pending)
+        VALUES (true,'{}'::jsonb,clock_timestamp(),true) ON CONFLICT (singleton) DO UPDATE SET retention_gc_pending=true`); err != nil {
 		t.Fatal(err)
 	}
 	fixture.transport.failSteps[platform.RetentionGCStepID(1)] = 1

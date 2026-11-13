@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/dbschema"
 	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
@@ -367,10 +368,14 @@ func TestMetadataValidation(t *testing.T) {
 	}
 }
 
-func TestSchemaSQLIsExported(t *testing.T) {
+func TestBaselineContainsSecretSchema(t *testing.T) {
+	data, err := dbschema.GooseFS.ReadFile("migrations/00001_baseline.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, fragment := range []string{"eregion_secrets", "eregion_secret_revisions", "ciphertext bytea", "revision_hash"} {
-		if !strings.Contains(SchemaSQL, fragment) {
-			t.Fatalf("SchemaSQL is missing %q", fragment)
+		if !strings.Contains(string(data), fragment) {
+			t.Fatalf("baseline is missing %q", fragment)
 		}
 	}
 }

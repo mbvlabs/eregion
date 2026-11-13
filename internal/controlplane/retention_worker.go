@@ -923,8 +923,8 @@ func (s *Service) retentionGCPending(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) setRetentionGCPending(ctx context.Context, pending bool) error {
-	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention_gc_pending)
-        VALUES (true,$1)
+	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention_gc_pending,retention,updated_at)
+        VALUES (true,$1,'{}'::jsonb,clock_timestamp())
         ON CONFLICT (singleton) DO UPDATE SET retention_gc_pending=EXCLUDED.retention_gc_pending, updated_at=clock_timestamp()`, pending); err != nil {
 		return unavailable(err)
 	}
@@ -950,17 +950,17 @@ func (s *Service) markRetentionRelease(ctx context.Context, releaseID string) (b
 	}
 	defer rollback(tx)
 
-	var environmentID, serving string
-	if err := tx.QueryRow(ctx, `SELECT e.id,coalesce(e.serving_release_id,'')
+	var environmentID, serving, desired, applied string
+	if err := tx.QueryRow(ctx, `SELECT e.id,coalesce(e.serving_release_id,''),coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,'')
         FROM eregion_platform_releases r
         JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE r.id=$1 FOR UPDATE OF e`, releaseID).Scan(&environmentID, &serving); err != nil {
+        WHERE r.id=$1 FOR UPDATE OF e`, releaseID).Scan(&environmentID, &serving, &desired, &applied); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, contract.NewFault(contract.NotFound, "release not found while pruning", "Inspect the release row and retry the operation.")
 		}
 		return false, unavailable(err)
 	}
-	if serving == releaseID {
+	if serving == releaseID || desired == releaseID || applied == releaseID {
 		return false, nil
 	}
 	var active int

@@ -21,7 +21,8 @@ manifest_value() {
 version="$(manifest_value version "${version_root}/manifest.json")"
 [ -n "${version}" ] || { echo "version manifest is missing its version" >&2; exit 1; }
 case "${version}" in
-  edge-*) expected_channel=edge ;;
+  edge-* | *-alpha.* | *-beta.*) expected_channel=edge ;;
+  *-rc.*) expected_channel=rc ;;
   *) expected_channel=stable ;;
 esac
 manifest_channel="$(manifest_value channel "${version_root}/manifest.json")"

@@ -49,10 +49,11 @@ if COSIGN_STATUS=0 bash "${work}/install.sh" >"${work}/out" 2>&1; then
 fi
 grep -Fq 'stable channel requires a final release' "${work}/out"
 sed -e 's|stable-1.x|rc|g' -e 's|/1.x|/rc|g' "${work}/install.sh" >"${work}/rc-install.sh"
+sed -i 's/^release_channel="stable"$/release_channel="rc"/' "${work}/rc-install.sh"
 if COSIGN_STATUS=0 bash "${work}/rc-install.sh" >"${work}/out" 2>&1; then
   echo 'rc pointer unexpectedly accepted an alpha' >&2; exit 1
 fi
-grep -Fq 'rc channel requires an rc release' "${work}/out"
+grep -Fq 'release manifest channel is invalid' "${work}/out"
 : >"${work}/urls"
 if bash "${work}/install.sh" --version '../escape' >"${work}/out" 2>&1; then
   echo 'invalid version unexpectedly succeeded' >&2; exit 1

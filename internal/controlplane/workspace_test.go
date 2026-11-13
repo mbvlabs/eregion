@@ -3,7 +3,6 @@ package controlplane
 import (
 	"context"
 	"errors"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -45,28 +44,6 @@ func TestNewWorkspaceIDIsPortableAndRandom(t *testing.T) {
 			t.Fatalf("duplicate generated ID %q", id)
 		}
 		ids[id] = true
-	}
-}
-
-func TestWorkspaceMigrationIsForwardOnlyAndDoesNotSeedAnIdentity(t *testing.T) {
-	if !strings.Contains(strings.ToLower(migration028), "create table eregion_workspace") {
-		t.Fatal("migration 028 does not create the workspace table")
-	}
-	if !strings.Contains(strings.ToLower(migration028), "immutable") {
-		t.Fatal("migration 028 does not protect the identity from updates")
-	}
-	var statements []string
-	for _, line := range strings.Split(migration028, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "--") {
-			continue
-		}
-		statements = append(statements, line)
-	}
-	if regexp.MustCompile(`(?im)^\s*(insert|update|delete)\b`).MatchString(strings.Join(statements, "\n")) {
-		t.Fatal("migration 028 seeds, changes or deletes identity rows; an alpha.6 database must stay unconfigured")
-	}
-	if m, ok := migrationByVersion(28); !ok || m.name != "028_workspace_identity.sql" {
-		t.Fatal("migration 028 is not registered")
 	}
 }
 

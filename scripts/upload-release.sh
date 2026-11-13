@@ -5,10 +5,10 @@ release_root="${1:?usage: scripts/upload-release.sh RELEASE_ROOT CHANNEL BUCKET 
 channel="${2:?usage: scripts/upload-release.sh RELEASE_ROOT CHANNEL BUCKET ENDPOINT}"
 bucket="${3:?usage: scripts/upload-release.sh RELEASE_ROOT CHANNEL BUCKET ENDPOINT}"
 endpoint="${4:?usage: scripts/upload-release.sh RELEASE_ROOT CHANNEL BUCKET ENDPOINT}"
-mode="${5:-all}"
+mode="${5:-artifacts}"
 case "${mode}" in
-  all | artifacts | channel) ;;
-  *) echo "upload mode must be all, artifacts or channel" >&2; exit 1 ;;
+  artifacts) ;;
+  *) echo "moving pointers must be published by the conditional promoter" >&2; exit 1 ;;
 esac
 
 case "${channel}" in
@@ -47,9 +47,7 @@ manifest_value() {
   sed -n "s/.*\"${1}\": *\"\\([^\"]*\\)\".*/\\1/p" "$2" | head -1
 }
 
-# Defense in depth independent of the workflow's promotion step. Alpha/beta
-# snapshots also say channel stable because stable is their signing family, so
-# the pointer guard must inspect the version itself, not the signing family.
+# Defense in depth independent of the workflow's promotion step.
 guard_channel_manifest() {
   local manifest="$1"
   local want_channel="$2"
@@ -63,12 +61,6 @@ guard_channel_manifest() {
   }
   case "${want_channel}" in
     stable)
-      if [ "${channel}" = rc ]; then
-        [[ "${version}" =~ -rc\.[0-9]+$ ]] || {
-          echo "refusing to publish ${version} as the rc pointer" >&2
-          exit 1
-        }
-      else
         [[ "${version}" != *-* ]] || {
           echo "refusing to publish prerelease ${version} as a stable pointer" >&2
           exit 1
@@ -81,10 +73,12 @@ guard_channel_manifest() {
             exit 1
           }
         fi
-      fi
+      ;;
+    rc)
+      [[ "${version}" =~ -rc\.[0-9]+$ ]] || { echo "refusing to publish ${version} as the rc pointer" >&2; exit 1; }
       ;;
     edge)
-      [[ "${version}" =~ ^edge-[0-9a-f]{12}$ ]] || {
+      [[ "${version}" =~ ^edge-[0-9a-f]{12}$ || "${version}" =~ -(alpha|beta)\.[0-9]+$ ]] || {
         echo "refusing to publish ${version} as the edge pointer" >&2
         exit 1
       }
@@ -106,7 +100,7 @@ if [ "${mode}" != artifacts ]; then
   case "${channel}" in
     stable) guard_channel_manifest "${channel_dir}/manifest.json" stable ;;
     stable-[0-9]*.x) guard_channel_manifest "${channel_dir}/manifest.json" stable ;;
-    rc) guard_channel_manifest "${channel_dir}/manifest.json" stable ;;
+    rc) guard_channel_manifest "${channel_dir}/manifest.json" rc ;;
     edge) guard_channel_manifest "${channel_dir}/manifest.json" edge ;;
   esac
 fi
@@ -159,15 +153,3 @@ if [ "${mode}" != channel ]; then
     }
   done
 fi
-if [ "${mode}" = artifacts ]; then
-  exit 0
-fi
-aws s3 cp "${channel_dir}/install.sh" "${dest_prefix}/install.sh" \
-  --cache-control no-cache --content-type text/x-shellscript --endpoint-url "${endpoint}"
-aws s3 cp "${channel_dir}/manifest.json.sigstore.json" \
-  "${dest_prefix}/manifest.json.sigstore.json" \
-  --content-type application/json --cache-control no-cache \
-  --endpoint-url "${endpoint}"
-aws s3 cp "${channel_dir}/manifest.json" "${dest_prefix}/manifest.json" \
-  --content-type application/json --cache-control no-cache \
-  --endpoint-url "${endpoint}"

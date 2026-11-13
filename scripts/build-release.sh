@@ -16,28 +16,23 @@ case "${channel}" in
     exit 1
     ;;
 esac
-if [ "${channel}" = edge ] && [[ ! "${version}" =~ ^edge-[0-9a-f]{12}$ ]]; then
-  echo "edge versions must use edge- followed by a 12-character commit hash" >&2
-  exit 1
-fi
-if [ "${channel}" != edge ] && [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]]; then
+if [[ ! "${version}" =~ ^edge-[0-9a-f]{12}$ && ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]]; then
   echo "stable versions must use MAJOR.MINOR.PATCH, optionally -alpha.N, -beta.N or -rc.N" >&2
   exit 1
 fi
 
-# The manifest channel is the signing family, not the moving promotion
-# channel: root, line, RC and immutable alpha/beta snapshots are all signed by
-# the stable workflow and say stable. Edge says edge.
 signing_channel=stable
-if [ "${channel}" = edge ]; then
-  signing_channel=edge
-fi
+case "${version}" in
+  edge-* | *-alpha.* | *-beta.*) signing_channel=edge ;;
+  *-rc.*) signing_channel=rc ;;
+esac
 out="dist/release-${channel}"
 channel_dir=""
 line_dir=""
 channel_root="${base_url%/}"
 case "${channel}" in
   edge)
+    [ "${signing_channel}" = edge ] || { echo "edge channel requires edge, alpha or beta" >&2; exit 1; }
     channel_dir="${out}/edge"
     channel_root="${base_url%/}/edge"
     ;;
@@ -178,7 +173,7 @@ if [ -n "${line_dir}" ]; then
   sed \
     -e "s|@@CHANNEL_ROOT@@|$(sed_escape "${base_url}")|g" \
     -e "s|@@CHANNEL@@|$(sed_escape "${signing_channel}")|g" \
-    -e "s|@@POINTER_CHANNEL@@|stable|g" \
+    -e "s|@@POINTER_CHANNEL@@|$(sed_escape "${signing_channel}")|g" \
     -e "s|@@ORIGIN@@|$(sed_escape "${base_url}")|g" \
     scripts/install.sh >"${out}/install.sh"
   chmod 0755 "${out}/install.sh"
@@ -189,8 +184,7 @@ if [ -n "${line_dir}" ]; then
 fi
 
 # A snapshot must be installable before any moving channel has been published.
-# Its immutable installer is pinned to its own version and still uses the stable
-# signing family that every tagged artifact uses.
+# Its immutable installer is pinned to its own version and logical channel.
 if [ -n "${channel_dir}" ]; then
   sed "s|^snapshot_version=\"\"$|snapshot_version=\"${version}\"|" \
     "${channel_dir}/install.sh" >"${out}/releases/${version}/install.sh"
@@ -198,7 +192,7 @@ else
   sed \
     -e "s|@@CHANNEL_ROOT@@|$(sed_escape "${base_url}")|g" \
     -e "s|@@CHANNEL@@|$(sed_escape "${signing_channel}")|g" \
-    -e "s|@@POINTER_CHANNEL@@|stable|g" \
+    -e "s|@@POINTER_CHANNEL@@|$(sed_escape "${signing_channel}")|g" \
     -e "s|@@ORIGIN@@|$(sed_escape "${base_url}")|g" \
     -e "s|^snapshot_version=\"\"$|snapshot_version=\"${version}\"|" \
     scripts/install.sh >"${out}/releases/${version}/install.sh"

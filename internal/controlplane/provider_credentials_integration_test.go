@@ -47,63 +47,6 @@ func (f *providerSetupFixture) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-func TestIntegrationProviderMigrationPreservesApplicationSecrets(t *testing.T) {
-	pool, _ := testPool(t, false)
-	ctx := context.Background()
-	for _, migration := range migrations {
-		if migration.version > 26 {
-			break
-		}
-		if _, err := pool.Exec(ctx, migration.sql); err != nil {
-			t.Fatalf("apply migration %d: %v", migration.version, err)
-		}
-	}
-	ring, err := vault.GenerateKeyRing()
-	if err != nil {
-		t.Fatal(err)
-	}
-	secrets, err := vault.NewService(pool, ring)
-	if err != nil {
-		t.Fatal(err)
-	}
-	namespace, err := vault.NewNamespace("api", "production", "DATABASE_URL")
-	if err != nil {
-		t.Fatal(err)
-	}
-	actor := contract.Actor{Kind: "operator", Subject: "migration-test"}
-	if _, err := secrets.Set(ctx, namespace, []byte("postgres://before-migration"), 0, actor); err != nil {
-		t.Fatal(err)
-	}
-	opID := "op_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-		VALUES($1,'platform.app.create','platform',$2,$3,'provider-migration',$4,'{}','succeeded')`, opID, actor.Kind, actor.Subject, strings.Repeat("a", 64)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, migration027); err != nil {
-		t.Fatalf("migration 027: %v", err)
-	}
-	metadata, err := secrets.Get(ctx, namespace)
-	if err != nil || metadata.LatestRevision != 1 {
-		t.Fatalf("application secret after migration = %+v, %v", metadata, err)
-	}
-	_, value, err := secrets.Export(ctx, namespace)
-	if err != nil || string(value) != "postgres://before-migration" {
-		t.Fatalf("application secret value after migration = %q, %v", value, err)
-	}
-	var operationKind, operationTarget string
-	if err := pool.QueryRow(ctx, `SELECT kind,target FROM eregion_operations WHERE id=$1`, opID).Scan(&operationKind, &operationTarget); err != nil {
-		t.Fatalf("operation history after migration: %v", err)
-	}
-	if operationKind != "platform.app.create" || operationTarget != "platform" {
-		t.Fatalf("operation history changed after migration: kind=%q target=%q", operationKind, operationTarget)
-	}
-	for _, table := range []string{"eregion_provider_credentials", "eregion_provider_credential_revisions"} {
-		if _, err := pool.Exec(ctx, "SELECT 1 FROM "+table+" LIMIT 1"); err != nil {
-			t.Fatalf("migration did not create %s: %v", table, err)
-		}
-	}
-}
-
 func TestIntegrationProviderCredentialValidationAtomicityAndRotation(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()

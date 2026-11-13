@@ -133,8 +133,8 @@ func (s *Service) releaseCommandRun(ctx context.Context, releaseID platform.Rele
 // caller's pre-read raced another writer.
 func (s *Service) startReleaseCommandRun(ctx context.Context, releaseID platform.ReleaseID, digest string, operationID contract.OperationID) error {
 	tag, err := s.pool.Exec(ctx, `INSERT INTO eregion_platform_release_command_runs
-        (release_id,command_digest,operation_id,state,started_at)
-        VALUES($1,$2,$3,'running',clock_timestamp())
+        (release_id,command_digest,operation_id,state,started_at,error_code,error)
+        VALUES($1,$2,$3,'running',clock_timestamp(),'','')
         ON CONFLICT (release_id,command_digest) DO UPDATE
         SET operation_id=$3,state='running',error_code='',error='',
             started_at=clock_timestamp(),completed_at=NULL

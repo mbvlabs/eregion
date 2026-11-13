@@ -8,7 +8,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 )
 
@@ -52,12 +51,14 @@ func TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable(t *test
 		t.Fatalf("read identity = %+v, want %+v", read, assigned)
 	}
 
-	// The database refuses a direct rewrite even if application code is buggy.
-	if _, err := pool.Exec(ctx, `UPDATE eregion_workspace SET name = 'renamed'`); err == nil {
-		t.Fatal("an UPDATE of the immutable workspace identity succeeded")
+	otherHost := testRegistryHostIdentity()
+	otherHost.HostKeyFingerprint = "SHA256:" + strings.Repeat("B", 43)
+	if _, err := AssignWorkspace(ctx, pool, "thelab", otherHost); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("different registry host assignment = %v, want conflict", err)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM eregion_workspace`); err == nil {
-		t.Fatal("a DELETE of the immutable workspace identity succeeded")
+	read, err = ReadWorkspace(ctx, pool)
+	if err != nil || !reflect.DeepEqual(read, assigned) {
+		t.Fatalf("identity after conflicting assignment = %+v, err %v; want %+v", read, err, assigned)
 	}
 }
 
@@ -81,8 +82,8 @@ func TestIntegrationWorkspaceRegistryHostBindingIsExactAndNeverBackfilled(t *tes
 	}
 
 	unboundPool, _ := testPool(t, true)
-	if _, err := unboundPool.Exec(ctx, `INSERT INTO eregion_workspace (singleton, workspace_id, name)
-        VALUES (true,'ws_0123456789abcdef01234567','thelab')`); err != nil {
+	if _, err := unboundPool.Exec(ctx, `INSERT INTO eregion_workspace (singleton, workspace_id, name, created_at)
+        VALUES (true,'ws_0123456789abcdef01234567','thelab',clock_timestamp())`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := AssignWorkspace(ctx, unboundPool, "thelab", identity); contract.Classify(err).Code != contract.PreconditionFailed {
@@ -174,125 +175,7 @@ func TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize(t *testing.T) 
 		t.Fatalf("a read created the workspace table: %v", *table)
 	}
 	if _, err := AssignWorkspace(context.Background(), pool, "thelab", testRegistryHostIdentity()); err == nil {
-		t.Fatal("assignment succeeded without migration 028")
-	}
-}
-
-// applyMigrationsThrough applies the domain migrations up to version and
-// records their checksums, as Migrate does, without starting River. It is only
-// used to construct an authentic 027 database for the forward-migration test.
-func applyMigrationsThrough(t *testing.T, pool *pgxpool.Pool, version int) {
-	t.Helper()
-	ctx := context.Background()
-	if _, err := pool.Exec(ctx, `CREATE TABLE eregion_schema_migrations (version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
-		t.Fatal(err)
-	}
-	for _, m := range migrations {
-		if m.version > version {
-			break
-		}
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := tx.Exec(ctx, m.sql); err != nil {
-			_ = tx.Rollback(ctx)
-			t.Fatalf("migration %d: %v", m.version, err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_schema_migrations(version,checksum) VALUES ($1,$2)`, m.version, migrationHash(m)); err != nil {
-			_ = tx.Rollback(ctx)
-			t.Fatalf("record migration %d: %v", m.version, err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-func TestIntegrationWorkspaceMigration027To028PreservesStateAndDoesNotSeedAnIdentity(t *testing.T) {
-	pool, _ := testPool(t, false)
-	ctx := context.Background()
-	applyMigrationsThrough(t, pool, 27)
-
-	plan, err := PlanMigrations(ctx, pool)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Current != 27 || plan.Required != 33 {
-		t.Fatalf("pre-028 plan = %+v", plan)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES ('op_11111111111111111111111111111111','diagnostic.test','control-plane','ci','tester','key-027','sha256:hash','{}','queued')`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credentials
-        (provider, zone_id, zone_name, latest_revision, created_by_kind, created_by_subject, updated_by_kind, updated_by_subject)
-        VALUES ('cloudflare','0123456789abcdef0123456789abcdef','example.com',0,'operator','tester','operator','tester')`); err != nil {
-		t.Fatal(err)
-	}
-
-	// Reading before the forward migration must neither create the table nor
-	// add an identity row.
-	before, err := ReadWorkspace(ctx, pool)
-	if !errors.Is(err, ErrWorkspaceSchemaMissing) {
-		t.Fatalf("027 read = %+v, %v; want missing schema", before, err)
-	}
-	if before.Configured {
-		t.Fatalf("027 read reported a workspace: %+v", before)
-	}
-	var tableExists bool
-	if err := pool.QueryRow(ctx, `SELECT to_regclass('eregion_workspace') IS NOT NULL`).Scan(&tableExists); err != nil {
-		t.Fatal(err)
-	}
-	if tableExists {
-		t.Fatal("pre-migration identity read created the workspace table")
-	}
-
-	if _, err := Migrate(ctx, pool); err != nil {
-		t.Fatal(err)
-	}
-	plan, err = PlanMigrations(ctx, pool)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plan.Current != 33 || plan.Required != 33 {
-		t.Fatalf("post-migration plan = %+v", plan)
-	}
-	var rows int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_workspace`).Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 0 {
-		t.Fatalf("migration 028 seeded %d workspace rows", rows)
-	}
-	if after, err := ReadWorkspace(ctx, pool); err != nil || after.Configured {
-		t.Fatalf("post-028 read = %+v, %v; want explicit unconfigured", after, err)
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_workspace`).Scan(&rows); err != nil {
-		t.Fatal(err)
-	}
-	if rows != 0 {
-		t.Fatalf("a read initialized the workspace table: %d rows", rows)
-	}
-	var marker int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE id = 'op_11111111111111111111111111111111'`).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker != 1 {
-		t.Fatal("migration 027 state did not survive 028")
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credentials WHERE zone_id = '0123456789abcdef0123456789abcdef'`).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker != 1 {
-		t.Fatal("provider credential metadata did not survive 028")
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_schema_migrations WHERE version <= 27`).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker != 27 {
-		t.Fatalf("migration history rows through 027 = %d, want 27", marker)
+		t.Fatal("assignment succeeded without the application schema")
 	}
 }
 

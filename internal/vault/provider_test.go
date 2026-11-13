@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/dbschema"
 )
 
 func testProviderScope(t *testing.T) ProviderScope {
@@ -118,15 +119,26 @@ func TestProviderMetadataIsSecretFreeAndValidates(t *testing.T) {
 }
 
 func TestProviderSchemaIsSeparateFromApplicationSecrets(t *testing.T) {
+	data, err := dbschema.GooseFS.ReadFile("migrations/00001_baseline.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := string(data)
 	for _, table := range []string{"eregion_provider_credentials", "eregion_provider_credential_revisions"} {
-		if !strings.Contains(ProviderSchemaSQL, table) {
+		if !strings.Contains(baseline, "CREATE TABLE "+table+" (") {
 			t.Fatalf("provider schema is missing %s", table)
 		}
 	}
-	if strings.Contains(ProviderSchemaSQL, "eregion_secrets") || strings.Contains(ProviderSchemaSQL, "environment text") {
+	start := strings.Index(baseline, "CREATE TABLE eregion_provider_credentials (")
+	end := strings.Index(baseline[start:], "CREATE TABLE eregion_access_grants (")
+	if end < 0 {
+		t.Fatal("provider schema boundary missing")
+	}
+	providerSchema := baseline[start : start+end]
+	if strings.Contains(providerSchema, "eregion_secrets") || strings.Contains(providerSchema, "environment text") {
 		t.Fatal("provider schema reuses the application secret namespace")
 	}
-	if !strings.Contains(ProviderSchemaSQL, "PRIMARY KEY (provider, zone_id)") {
+	if !strings.Contains(providerSchema, "PRIMARY KEY (provider, zone_id)") {
 		t.Fatal("provider metadata is not keyed by provider and zone ID")
 	}
 }

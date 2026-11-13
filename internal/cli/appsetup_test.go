@@ -122,7 +122,7 @@ func TestAppCreateGitLessDefaultsToNoFirstDeploy(t *testing.T) {
 }
 
 func TestAppCreateGitLessFromFileDefaultsToNoFirstDeploy(t *testing.T) {
-	definition := writeDefinitionFile(t, "version = 2\napp = \"api\"\nnode = \"main\"\nimage_repository = \"mbvlabs/api\"\n")
+	definition := writeDefinitionFile(t, "version = 1\napp = \"api\"\nnode = \"main\"\nimage_repository = \"mbvlabs/api\"\n")
 	cmd := &cobra.Command{Use: "create"}
 	cmd.Flags().String("name", "", "app")
 	cmd.Flags().String("image-repository", "", "repository")

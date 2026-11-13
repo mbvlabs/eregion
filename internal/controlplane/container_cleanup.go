@@ -105,8 +105,8 @@ func (s *Service) recordContainerCleanup(ctx context.Context, containerName stri
 	}
 	var attempts int
 	if err := s.pool.QueryRow(ctx, `INSERT INTO eregion_platform_container_cleanup
-        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,next_attempt_at)
-        VALUES($1,$2,$3,$4,$5,1,$6,clock_timestamp())
+        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,next_attempt_at,created_at)
+        VALUES($1,$2,$3,$4,$5,1,$6,clock_timestamp(),clock_timestamp())
         ON CONFLICT (container_name) DO UPDATE
         SET environment_id=EXCLUDED.environment_id,node=EXCLUDED.node,
             deployment_id=EXCLUDED.deployment_id,reason=EXCLUDED.reason,
@@ -133,8 +133,8 @@ func (s *Service) ensureContainerCleanup(ctx context.Context, containerName stri
 		detail = s.cleanupCauseText(cause)
 	}
 	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_platform_container_cleanup
-        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,next_attempt_at)
-        VALUES($1,$2,$3,$4,$5,1,$6,clock_timestamp())
+        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,next_attempt_at,created_at)
+        VALUES($1,$2,$3,$4,$5,1,$6,clock_timestamp(),clock_timestamp())
         ON CONFLICT (container_name) DO UPDATE
         SET environment_id=EXCLUDED.environment_id,node=EXCLUDED.node,
             deployment_id=EXCLUDED.deployment_id,reason=EXCLUDED.reason,

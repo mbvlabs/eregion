@@ -29,7 +29,10 @@ done
 printf '%s\n' "${url}" >>"${TEST_WORK}/urls"
 case "${url}" in
   *cosign-*) cp "${TEST_WORK}/fixtures/cosign" "${out}" ;;
-  */manifest.json) cp "${TEST_WORK}/fixtures/manifest" "${out}" ;;
+  */manifest.json)
+    cp "${TEST_WORK}/fixtures/manifest" "${out}"
+    if [ "${TEST_MISMATCH:-}" = 1 ] && [[ "${url}" = */releases/* ]]; then printf ' ' >>"${out}"; fi
+    ;;
   *.sigstore.json) printf '%s' "${TEST_SIGNER}" >"${out}" ;;
   */eregion) cp "${TEST_WORK}/fixtures/eregion" "${out}" ;;
   *) exit 1 ;;
@@ -66,7 +69,7 @@ fixture() {
   "artifacts": { "linux/amd64": { "sha256": "${hash}" } }
 }
 EOF
-  if [ "${family}" = edge ]; then
+  if [[ "${version}" = edge-* ]]; then
     TEST_EXPECTED_SIGNER='https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master'
   else
     TEST_EXPECTED_SIGNER="https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v${version}"
@@ -77,12 +80,19 @@ make_installer stable stable-1.x 1.x "${work}/stable.sh"
 make_installer edge edge edge "${work}/edge.sh"
 fixture edge-0123456789ab edge
 bash "${work}/stable.sh" --version edge-0123456789ab >/dev/null
-fixture 1.0.0-beta.1 stable
+fixture 1.0.0-beta.1 edge
 bash "${work}/edge.sh" --version 1.0.0-beta.1 >/dev/null
+bash "${work}/edge.sh" >/dev/null
 sed 's|^snapshot_version=""$|snapshot_version="1.0.0-beta.1"|' "${work}/stable.sh" >"${work}/snapshot.sh"
 : >"${work}/urls"
 bash "${work}/snapshot.sh" >/dev/null
 grep -Fxq 'https://eregion.mbvlabs.com/releases/1.0.0-beta.1/manifest.json' "${work}/urls"
 if bash "${work}/snapshot.sh" --version 1.0.0-beta.2 >/dev/null 2>&1; then echo 'snapshot accepted a different pin' >&2; exit 1; fi
 if TEST_SIGNER=wrong bash "${work}/edge.sh" --version 1.0.0-beta.1 >/dev/null 2>&1; then echo 'wrong signer accepted' >&2; exit 1; fi
+fixture 1.0.0 stable
+: >"${work}/urls"
+bash "${work}/stable.sh" >/dev/null
+grep -Fxq 'https://eregion.mbvlabs.com/releases/1.0.0/manifest.json.sigstore.json' "${work}/urls"
+if grep -Fq '1.x/manifest.json.sigstore.json' "${work}/urls"; then echo 'moving signature was used' >&2; exit 1; fi
+if TEST_MISMATCH=1 bash "${work}/stable.sh" >/dev/null 2>&1; then echo 'mismatched pointer accepted' >&2; exit 1; fi
 echo 'cross-channel and snapshot installer checks passed'

@@ -11,7 +11,7 @@ func sampleManifest(t *testing.T) Manifest {
 	base := versionRoot("1.0.0-alpha.2")
 	m := Manifest{
 		SchemaVersion:  1,
-		Channel:        ChannelStable,
+		Channel:        ChannelEdge,
 		Version:        "1.0.0-alpha.2",
 		ReleaseBaseURL: base,
 		Artifacts:      map[string]Artifact{},
@@ -24,15 +24,12 @@ func sampleManifest(t *testing.T) Manifest {
 
 func TestManifestValidate(t *testing.T) {
 	m := sampleManifest(t)
-	if err := Validate(m, ChannelStable, "1.0.0-alpha.2"); err != nil {
+	if err := Validate(m, ChannelEdge, "1.0.0-alpha.2"); err != nil {
 		t.Fatalf("valid manifest refused: %v", err)
-	}
-	if err := Validate(m, "stable-1.x", "1.0.0-alpha.2"); err != nil {
-		t.Fatalf("valid line manifest refused: %v", err)
 	}
 
 	cases := map[string]func(*Manifest){
-		"wrong channel":    func(m *Manifest) { m.Channel = ChannelEdge },
+		"wrong channel":    func(m *Manifest) { m.Channel = ChannelStable },
 		"wrong version":    func(m *Manifest) { m.Version = "1.0.0-alpha.3" },
 		"wrong schema":     func(m *Manifest) { m.SchemaVersion = 2 },
 		"wrong base":       func(m *Manifest) { m.ReleaseBaseURL = "https://elsewhere.example" },
@@ -48,13 +45,13 @@ func TestManifestValidate(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			broken := sampleManifest(t)
 			change(&broken)
-			if err := Validate(broken, ChannelStable, "1.0.0-alpha.2"); err == nil {
+			if err := Validate(broken, ChannelEdge, "1.0.0-alpha.2"); err == nil {
 				t.Fatal("invalid manifest accepted")
 			}
 		})
 	}
-	if err := Validate(m, ChannelEdge, ""); err == nil {
-		t.Fatal("stable manifest accepted on the edge channel")
+	if err := Validate(m, ChannelStable, ""); err == nil {
+		t.Fatal("edge manifest accepted on the stable channel")
 	}
 	if err := Validate(m, "stable-2.x", ""); err == nil {
 		t.Fatal("1.x manifest accepted on the 2.x channel")
@@ -65,19 +62,28 @@ func TestPointerPolicy(t *testing.T) {
 	for _, v := range []string{"1.0.0-alpha.1", "1.0.0-beta.1", "1.0.0-rc.1", "1.0.0"} {
 		m := sampleManifest(t)
 		m.Version = v
+		m.Channel, _ = VersionChannel(v)
 		m.ReleaseBaseURL = versionRoot(v)
 		for _, key := range artifactKeys {
 			m.Artifacts[key] = Artifact{URL: m.ReleaseBaseURL + "/" + key + "/eregion", SHA256: strings.Repeat("a", 64)}
 		}
-		for _, channel := range []string{ChannelStable, "stable-1.x", ChannelRC} {
-			want := (channel == ChannelRC && strings.Contains(v, "-rc.")) || (channel != ChannelRC && !strings.Contains(v, "-"))
+		for _, channel := range []string{ChannelStable, "stable-1.x", ChannelRC, ChannelEdge} {
+			want := channel == m.Channel || (channel == "stable-1.x" && m.Channel == ChannelStable)
 			if got := Validate(m, channel, "") == nil; got != want {
 				t.Errorf("pointer %s %s accepted = %v", channel, v, got)
 			}
 		}
-		if err := Validate(m, ChannelStable, v); err != nil {
+		if err := Validate(m, m.Channel, v); err != nil {
 			t.Errorf("pinned %s: %v", v, err)
 		}
+	}
+}
+
+func TestHistoricalBetaMetadataIsRejected(t *testing.T) {
+	m := sampleManifest(t)
+	m.Channel = ChannelStable
+	if err := Validate(m, ChannelEdge, m.Version); err == nil {
+		t.Fatal("historical signing-family metadata was accepted as logical edge")
 	}
 }
 
@@ -112,6 +118,7 @@ func TestStableAndLinePointersRejectPrereleases(t *testing.T) {
 	for _, version := range []string{"1.0.0-alpha.1", "1.0.0-beta.1", "1.0.0-rc.1"} {
 		m := sampleManifest(t)
 		m.Version = version
+		m.Channel, _ = VersionChannel(version)
 		m.ReleaseBaseURL = versionRoot(version)
 		for _, key := range artifactKeys {
 			m.Artifacts[key] = Artifact{URL: m.ReleaseBaseURL + "/" + key + "/eregion", SHA256: strings.Repeat("a", 64)}
@@ -121,8 +128,8 @@ func TestStableAndLinePointersRejectPrereleases(t *testing.T) {
 				t.Errorf("%s pointer accepted signing-family-stable prerelease %s", channel, version)
 			}
 		}
-		if err := Validate(m, ChannelStable, version); err != nil {
-			t.Errorf("pinned %s with stable signing family was refused: %v", version, err)
+		if err := Validate(m, m.Channel, version); err != nil {
+			t.Errorf("pinned %s was refused: %v", version, err)
 		}
 	}
 }

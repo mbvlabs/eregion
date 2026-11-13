@@ -12,7 +12,7 @@ import (
 )
 
 func TestDefinitionPlanDigestBindsAutomationAndProviderSnapshot(t *testing.T) {
-	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: "version = 2\n[automation]\nauto_deploy = false\n"}
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: "version = 1\n[automation]\nauto_deploy = false\n"}
 	snapshot := definitionSnapshot{Workspace: WorkspaceIdentity{Configured: true, ID: "ws_123456789012345678901234", Name: "main"}, ProviderRevision: 1}
 	plan := api.DefinitionPlan{DNS: []integrations.DefinitionDNSPlan{{Host: "api.example.com"}}}
 	want, err := definitionPlanDigest(input, snapshot, plan)
@@ -23,12 +23,12 @@ func TestDefinitionPlanDigestBindsAutomationAndProviderSnapshot(t *testing.T) {
 	if err != nil || again != want {
 		t.Fatalf("unstable digest: %s %s %v", want, again, err)
 	}
-	input.Definition = "version = 2\n[automation]\n"
+	input.Definition = "version = 1\n[automation]\n"
 	changed, _ := definitionPlanDigest(input, snapshot, plan)
 	if changed == want {
 		t.Fatal("omitted automation field did not change digest")
 	}
-	input.Definition = "version = 2\n[automation]\nauto_deploy = false\n"
+	input.Definition = "version = 1\n[automation]\nauto_deploy = false\n"
 	snapshot.ProviderRevision++
 	changed, _ = definitionPlanDigest(input, snapshot, plan)
 	if changed == want {
@@ -49,7 +49,7 @@ func TestDefinitionPlanDigestBindsAutomationAndProviderSnapshot(t *testing.T) {
 }
 
 func TestDefinitionFrozenRemovalConfirmation(t *testing.T) {
-	const definition = `version = 2
+	const definition = `version = 1
 app = "api"
 node = "main"
 [source]
@@ -144,7 +144,7 @@ auto_deploy = false
 }
 
 func TestCompileDefinitionWorkOrderingAndIdentity(t *testing.T) {
-	input := api.DefinitionPlanInput{App: "api", Environment: "production", PlanNonce: "nonce", Definition: `version = 2
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", PlanNonce: "nonce", Definition: `version = 1
 app = "api"
 node = "main"
 [source]

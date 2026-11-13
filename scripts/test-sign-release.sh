@@ -54,14 +54,14 @@ expect_fail() {
   fi
 }
 
-make_tree "${work}/snapshot" stable 1.0.0-alpha.3 "" ""
+make_tree "${work}/snapshot" edge 1.0.0-alpha.3 "" ""
 expect_ok "alpha snapshot tree" "${work}/snapshot"
 make_tree "${work}/final" stable 1.0.0 "1.x" stable
 expect_ok "final line tree" "${work}/final"
-make_tree "${work}/rc" stable 1.0.0-rc.1 rc stable
+make_tree "${work}/rc" rc 1.0.0-rc.1 rc rc
 expect_ok "rc tree" "${work}/rc"
-make_tree "${work}/wrong" edge 1.0.0-alpha.3 "" ""
-expect_fail "tagged version with edge signing family" "${work}/wrong"
+make_tree "${work}/wrong" stable 1.0.0-alpha.3 "" ""
+expect_fail "alpha with stable channel metadata" "${work}/wrong"
 make_tree "${work}/missing" stable 1.0.0 "" ""
 expect_fail "final without channel manifest" "${work}/missing"
 echo 'sign-release metadata checks passed'

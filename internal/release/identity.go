@@ -43,11 +43,9 @@ func ChannelRoot(channel string) (string, error) {
 	return "", invalidChannel(channel)
 }
 
-// SigningChannel is the channel a channel's manifests are built and signed
-// for: a major line is published by the stable workflow, so its manifests
-// say stable.
+// SigningChannel maps the internal major partition to its logical channel.
 func SigningChannel(channel string) string {
-	if _, ok := lineMajor(channel); ok || channel == ChannelRC {
+	if _, ok := lineMajor(channel); ok {
 		return ChannelStable
 	}
 	return channel
@@ -60,32 +58,21 @@ func Identity(channel, version string) (string, error) {
 	if err := matchVersion(channel, version); err != nil {
 		return "", err
 	}
-	switch SigningChannel(channel) {
-	case ChannelStable:
-		return "https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v" + version, nil
-	case ChannelEdge:
+	if edgeVersionPattern.MatchString(version) {
 		return "https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master", nil
-	default:
-		return "", invalidChannel(channel)
 	}
+	return "https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v" + version, nil
 }
 
 func matchVersion(channel, version string) error {
+	logical, ok := VersionChannel(version)
+	if !ok {
+		return fmt.Errorf("release version %q is invalid", version)
+	}
 	switch channel {
-	case ChannelRC:
-		v, ok := ParseStable(version)
-		if !ok || v.Pre != "rc" {
-			return fmt.Errorf("rc release version %q is invalid", version)
-		}
-		return nil
-	case ChannelStable:
-		if _, ok := ParseStable(version); !ok {
-			return fmt.Errorf("stable release version %q is invalid", version)
-		}
-		return nil
-	case ChannelEdge:
-		if !edgeVersionPattern.MatchString(version) {
-			return fmt.Errorf("edge release version %q is invalid", version)
+	case ChannelRC, ChannelStable, ChannelEdge:
+		if logical != channel {
+			return fmt.Errorf("release version %q is not on the %s channel", version, channel)
 		}
 		return nil
 	}
@@ -97,7 +84,7 @@ func matchVersion(channel, version string) error {
 	if !ok {
 		return fmt.Errorf("stable release version %q is invalid", version)
 	}
-	if v.Major != major {
+	if v.Major != major || logical != ChannelStable {
 		return fmt.Errorf("release version %q is not on the %s channel", version, channel)
 	}
 	return nil
@@ -107,7 +94,7 @@ func invalidChannel(channel string) error {
 	return &contract.Fault{
 		Code:    contract.ValidationFailed,
 		Message: "release channel " + channel + " is invalid",
-		Hint:    "Use stable, stable-<major>.x, rc or edge.",
+		Hint:    "Use stable, rc or edge.",
 		Details: map[string]any{"channel": channel},
 	}
 }

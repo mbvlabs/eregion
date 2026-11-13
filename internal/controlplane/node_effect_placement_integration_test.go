@@ -73,11 +73,12 @@ func newTestNodeResolver(t *testing.T, pool *pgxpool.Pool, transports map[string
 	t.Helper()
 	resolver := &NodeResolver{pool: pool, cache: map[string]*cachedTransport{}}
 	for name, transport := range transports {
-		if _, err := pool.Exec(context.Background(), `INSERT INTO eregion_platform_nodes
-            (name,roles,capabilities,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key)
-            VALUES($1,ARRAY['application'],ARRAY['docker'],'enrolled','ssh','127.0.0.1:1','test','test')
-            ON CONFLICT (name) DO UPDATE SET enrollment_state='enrolled',transport='ssh',
-                ssh_address='127.0.0.1:1',ssh_user='test',ssh_host_key='test'`, name); err != nil {
+		if err := insertFixtureNode(context.Background(), pool, name, []string{"application"}, []string{"docker"}, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(context.Background(), `UPDATE eregion_platform_nodes SET
+            enrollment_state='enrolled',transport='ssh',ssh_address='127.0.0.1:1',ssh_user='test',ssh_host_key='test'
+            WHERE name=$1`, name); err != nil {
 			t.Fatal(err)
 		}
 		rec, err := loadNodeConn(context.Background(), pool, name)
@@ -126,8 +127,8 @@ func insertRunningNodeStep(t *testing.T, pool *pgxpool.Pool, operationID contrac
 	t.Helper()
 	execution := engine.Execution{OperationID: operationID, Attempt: 1, Step: step}
 	if _, err := pool.Exec(context.Background(), `INSERT INTO eregion_operation_steps
-        (operation_id,step,inputs_hash,state,attempt,execution_id,started_at)
-        VALUES($1,$2,$3,'running',1,$4,clock_timestamp())`,
+        (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,error,error_code)
+        VALUES($1,$2,$3,'running',1,$4,clock_timestamp(),'','')`,
 		operationID, step, strings.Repeat("a", 64), execution.ExecutionID()); err != nil {
 		t.Fatal(err)
 	}
