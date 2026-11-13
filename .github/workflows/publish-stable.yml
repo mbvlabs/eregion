@@ -48,6 +48,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: Check pinned AWS CLI conditional writes
+        run: bash scripts/check-release-aws.sh
       - name: Validate release configuration
         env:
           RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
@@ -74,8 +76,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           major="${version%%.*}"
           # A stable tag is on its own major line, not on master.
-          git fetch --no-tags origin "${major}.x"
-          git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD
+          git fetch --no-tags origin "+refs/heads/${major}.x:refs/remotes/origin/${major}.x"
+          git fetch --force --tags origin master:refs/remotes/origin/master
+          git merge-base --is-ancestor "${GITHUB_SHA}" "refs/remotes/origin/${major}.x"
           test -z "$(gofmt -l cmd internal schema examples)"
           go vet ./...
           go build ./...
@@ -120,10 +123,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           line="${version%%.*}.x"
-          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key "${line}/manifest.json" --endpoint "${R2_ENDPOINT}" "${version}")"
-          if [ "${promote}" = yes ]; then
-            scripts/upload-release.sh "dist/release-stable-${line}" "stable-${line}" "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
-          fi
+          go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key "${line}/manifest.json" --endpoint "${R2_ENDPOINT}" --channel "stable-${line}" --root "dist/release-stable-${line}" --version "${version}" --commit "${GITHUB_SHA}"
       - name: Move the root channel when this is the highest version
         if: ${{ !contains(github.ref_name, '-') }}
         env:
@@ -134,15 +134,8 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          promote="$(go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key manifest.json --endpoint "${R2_ENDPOINT}" "${version}")"
-          if [ "${promote}" != yes ]; then
-            echo "the root channel stays unchanged: ${version} does not move it"
-            exit 0
-          fi
           release_root="dist/release-stable-${version%%.*}.x"
-          cp "${release_root}/${version%%.*}.x/manifest.json" "${release_root}/manifest.json"
-          cp "${release_root}/${version%%.*}.x/manifest.json.sigstore.json" "${release_root}/manifest.json.sigstore.json"
-          scripts/upload-release.sh "${release_root}" stable "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
+          go run ./internal/release/cmd/promote --bucket "${RELEASE_BUCKET}" --key manifest.json --endpoint "${R2_ENDPOINT}" --channel stable --root "${release_root}" --version "${version}" --commit "${GITHUB_SHA}"
   publish_prerelease:
     name: ${{ contains(github.ref_name, '-rc.') && 'Publish RC' || 'Publish prerelease snapshot' }}
     needs: classify
@@ -154,6 +147,17 @@ jobs:
         with:
           fetch-depth: 0
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+      - name: Check pinned AWS CLI conditional writes
+        run: bash scripts/check-release-aws.sh
+      - name: Require edge bootstrap qualification for alpha and beta
+        if: ${{ !contains(github.ref_name, '-rc.') }}
+        env:
+          EDGE_CHANNEL_BOOTSTRAP_QUALIFIED: ${{ vars.EDGE_CHANNEL_BOOTSTRAP_QUALIFIED }}
+        run: |
+          [[ "${EDGE_CHANNEL_BOOTSTRAP_QUALIFIED}" =~ ^edge-[0-9a-f]{12}$ ]] || {
+            echo "Set EDGE_CHANNEL_BOOTSTRAP_QUALIFIED to the operator-verified edge bootstrap version before publishing alpha or beta." >&2
+            exit 1
+          }
       - name: Validate release configuration
         env:
           RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
@@ -180,8 +184,9 @@ jobs:
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           major="${version%%.*}"
           # A stable tag is on its own major line, not on master.
-          git fetch --no-tags origin "${major}.x"
-          git merge-base --is-ancestor "${GITHUB_SHA}" FETCH_HEAD
+          git fetch --no-tags origin "+refs/heads/${major}.x:refs/remotes/origin/${major}.x"
+          git fetch --force --tags origin master:refs/remotes/origin/master
+          git merge-base --is-ancestor "${GITHUB_SHA}" "refs/remotes/origin/${major}.x"
           test -z "$(gofmt -l cmd internal schema examples)"
           go vet ./...
           go build ./...
@@ -190,13 +195,13 @@ jobs:
           RELEASE_BASE_URL: ${{ vars.RELEASE_BASE_URL }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          channel=snapshot
+          channel=edge
           [[ "${version}" != *-rc.* ]] || channel=rc
           scripts/build-release.sh "${version}" "${channel}" "${RELEASE_BASE_URL}"
       - name: Sign and verify the tagged release
         run: |
           version="${GITHUB_REF_NAME#v}"
-          channel=snapshot
+          channel=edge
           [[ "${version}" != *-rc.* ]] || channel=rc
           scripts/sign-release.sh "dist/release-${channel}"
       - name: Upload the immutable artifacts
@@ -208,7 +213,7 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          channel=snapshot
+          channel=edge
           [[ "${version}" != *-rc.* ]] || channel=rc
           existing="$(aws s3api list-objects-v2 \
             --bucket "${RELEASE_BUCKET}" --prefix "releases/${version}/" --max-keys 1 \
@@ -228,7 +233,15 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
         run: |
           version="${GITHUB_REF_NAME#v}"
-          promote="$(go run ./internal/release/cmd/promote --channel rc --bucket "${RELEASE_BUCKET}" --key rc/manifest.json --endpoint "${R2_ENDPOINT}" "${version}")"
-          if [ "${promote}" = yes ]; then
-            scripts/upload-release.sh dist/release-rc rc "${RELEASE_BUCKET}" "${R2_ENDPOINT}" channel
-          fi
+          go run ./internal/release/cmd/promote --channel rc --bucket "${RELEASE_BUCKET}" --key rc/manifest.json --endpoint "${R2_ENDPOINT}" --root dist/release-rc --version "${version}" --commit "${GITHUB_SHA}"
+      - name: Promote alpha and beta to edge
+        if: ${{ !contains(github.ref_name, '-rc.') }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          RELEASE_BUCKET: ${{ vars.RELEASE_BUCKET }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          go run ./internal/release/cmd/promote --channel edge --bucket "${RELEASE_BUCKET}" --key edge/manifest.json --endpoint "${R2_ENDPOINT}" --root dist/release-edge --version "${version}" --commit "${GITHUB_SHA}"

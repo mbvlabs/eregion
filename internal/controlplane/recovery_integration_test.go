@@ -2,7 +2,6 @@ package controlplane
 
 import (
 	"context"
-	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
@@ -71,13 +70,8 @@ func boundedOutput(value []byte) string {
 	return string(value)
 }
 
-// recoveryDrillRunner runs pg_dump/pg_restore where they can read the server.
-// A local client older than the server aborts the dump, so a newer server gets
-// tools from the matching postgres image. Both paths receive the same PG*
-// environment; the container receives the archive through one mounted
-// directory and reaches a loopback test server through the host gateway.
+// recoveryDrillRunner runs locally installed PostgreSQL client tools.
 type recoveryDrillRunner struct {
-	image     string
 	directory string
 }
 
@@ -92,16 +86,10 @@ func recoveryDrillTools(t *testing.T, ctx context.Context, admin *pgxpool.Pool) 
 		t.Fatalf("read the server version %q: %v", version, err)
 	}
 	major := number / 10000
-	if pgToolMajor("pg_dump") >= major && pgToolMajor("pg_restore") >= major {
-		return recoveryDrillRunner{directory: t.TempDir()}
+	if pgToolMajor("pg_dump") < major || pgToolMajor("pg_restore") < major {
+		t.Fatalf("pg_dump and pg_restore version %d or newer are required", major)
 	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skipf("pg_dump/pg_restore are older than PostgreSQL %d and docker is unavailable", major)
-	}
-	return recoveryDrillRunner{
-		image:     fmt.Sprintf("postgres:%d-alpine", major),
-		directory: t.TempDir(),
-	}
+	return recoveryDrillRunner{directory: t.TempDir()}
 }
 
 // pgToolMajor reports the client major version, or zero when the tool is not
@@ -121,50 +109,12 @@ func pgToolMajor(name string) int {
 }
 
 func (r recoveryDrillRunner) path(hostPath string) string {
-	if r.image == "" {
-		return hostPath
-	}
-	return "/archive/" + filepath.Base(hostPath)
+	return hostPath
 }
 
 func (r recoveryDrillRunner) run(t *testing.T, env []string, name string, args ...string) []byte {
 	t.Helper()
-	if r.image == "" {
-		return recoveryDrillRun(t, env, name, args...)
-	}
-	dockerArgs := []string{
-		"run", "--rm", "--add-host", "host.docker.internal:host-gateway",
-		"-v", r.directory + ":/archive", "-w", "/archive",
-		"-e", "PGHOST", "-e", "PGPORT", "-e", "PGDATABASE", "-e", "PGUSER",
-		"-e", "PGPASSWORD", "-e", "PGCONNECT_TIMEOUT", "-e", "PGAPPNAME",
-		"-e", "PGSSLMODE", "-e", "PGSSLROOTCERT", "-e", "PGSSLCERT",
-		"-e", "PGSSLKEY", "-e", "PGSSLCRL",
-		r.image, name,
-	}
-	command := exec.Command("docker", append(dockerArgs, args...)...)
-	command.Env = recoveryDrillContainerEnv(env)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%s in %s failed: %v: %s", name, r.image, err, boundedOutput(output))
-	}
-	return output
-}
-
-// recoveryDrillContainerEnv points a loopback database host at the host
-// running Docker; a container's own loopback is not the test server.
-func recoveryDrillContainerEnv(env []string) []string {
-	container := append([]string(nil), env...)
-	for i, entry := range container {
-		host, ok := strings.CutPrefix(entry, "PGHOST=")
-		if !ok {
-			continue
-		}
-		switch host {
-		case "127.0.0.1", "localhost", "::1", "[::1]":
-			container[i] = "PGHOST=host.docker.internal"
-		}
-	}
-	return container
+	return recoveryDrillRun(t, env, name, args...)
 }
 
 func recoveryDrillCreate(t *testing.T, ctx context.Context, admin *pgxpool.Pool, created map[string]bool) string {
@@ -218,7 +168,24 @@ func mustParseURL(t *testing.T, value string) *url.URL {
 	return parsed
 }
 
-func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (string, MigrationPlan) {
+type recoveryHistory struct {
+	Goose string
+	River string
+}
+
+func recoveryDrillHistory(t *testing.T, ctx context.Context, pool *pgxpool.Pool) recoveryHistory {
+	t.Helper()
+	var history recoveryHistory
+	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(id::text || ':' || version_id::text || ':' || is_applied::text, ',' ORDER BY id), '') FROM goose_db_version`).Scan(&history.Goose); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(line || ':' || version::text, ',' ORDER BY line, version), '') FROM river_migration`).Scan(&history.River); err != nil {
+		t.Fatal(err)
+	}
+	return history
+}
+
+func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (recoveryHistory, MigrationPlan) {
 	t.Helper()
 	pool, err := Open(ctx, dsn)
 	if err != nil {
@@ -236,7 +203,7 @@ func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (string,
 		t.Fatalf("restored migration plan = %+v", plan)
 	}
 	for _, table := range []string{
-		"eregion_schema_migrations", "eregion_operations", "eregion_operation_events",
+		"goose_db_version", "eregion_operations", "eregion_operation_events",
 		"eregion_operation_steps", "eregion_platform_nodes", "river_job", "river_migration",
 	} {
 		var exists bool
@@ -247,11 +214,7 @@ func recoveryDrillVerify(t *testing.T, ctx context.Context, dsn string) (string,
 			t.Fatalf("restored database is missing key table %s", table)
 		}
 	}
-	var fingerprint string
-	if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(version::text || ':' || checksum, ',' ORDER BY version), '') FROM eregion_schema_migrations`).Scan(&fingerprint); err != nil {
-		t.Fatal(err)
-	}
-	return fingerprint, plan
+	return recoveryDrillHistory(t, ctx, pool), plan
 }
 
 // TestIntegrationControlPlaneRecoveryDrill exercises the documented separate
@@ -267,16 +230,12 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 	defer cancel()
 
 	sourcePool, sourceDSN := testPool(t, true)
-	sourceFingerprint, sourcePlan := func() (string, MigrationPlan) {
+	sourceFingerprint, sourcePlan := func() (recoveryHistory, MigrationPlan) {
 		plan, err := PlanMigrations(ctx, sourcePool)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var fingerprint string
-		if err := sourcePool.QueryRow(ctx, `SELECT coalesce(string_agg(version::text || ':' || checksum, ',' ORDER BY version), '') FROM eregion_schema_migrations`).Scan(&fingerprint); err != nil {
-			t.Fatal(err)
-		}
-		return fingerprint, plan
+		return recoveryDrillHistory(t, ctx, sourcePool), plan
 	}()
 
 	admin, err := Open(ctx, os.Getenv("EREGION_TEST_DATABASE_URL"))
@@ -328,7 +287,7 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 	recoveryDrillDrop(t, ctx, admin, created, second)
 
 	// The source must still be ready and unchanged; the drill only read it.
-	afterFingerprint, afterPlan := func() (string, MigrationPlan) {
+	afterFingerprint, afterPlan := func() (recoveryHistory, MigrationPlan) {
 		if err := Ready(ctx, sourcePool); err != nil {
 			t.Fatal(err)
 		}
@@ -336,11 +295,7 @@ func TestIntegrationControlPlaneRecoveryDrill(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var fingerprint string
-		if err := sourcePool.QueryRow(ctx, `SELECT coalesce(string_agg(version::text || ':' || checksum, ',' ORDER BY version), '') FROM eregion_schema_migrations`).Scan(&fingerprint); err != nil {
-			t.Fatal(err)
-		}
-		return fingerprint, plan
+		return recoveryDrillHistory(t, ctx, sourcePool), plan
 	}()
 	if afterFingerprint != sourceFingerprint || afterPlan != sourcePlan {
 		t.Fatal("the recovery drill changed the source database")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -27,28 +28,25 @@ func TestIntegrationPrimaryCheckPathUsesPinnedRevision(t *testing.T) {
 	}
 	pinnedID := platform.RevisionID("erv_" + strings.Repeat("a", 32))
 	desiredID := platform.RevisionID("erv_" + strings.Repeat("b", 32))
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities) VALUES('main',ARRAY['application'],ARRAY['docker'])`); err != nil {
+	if err := insertFixtureNode(ctx, pool, "main", []string{"application"}, []string{"docker"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name) VALUES($1,'demo')`, appID); err != nil {
+	if err := insertFixtureApp(ctx, pool, string(appID), "demo", "demo"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environments(id,app_id,name,node_name,host_port,candidate_port,container_port)
-        VALUES($1,$2,'production','main',20002,30002,8080)`, envID, appID); err != nil {
+	if err := insertFixtureEnvironment(ctx, pool, string(envID), string(appID), "production", "main", 20002, 30002, 8080); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions(id,environment_id,number,operation,runtime)
-        VALUES($1,$2,1,'env.changed','{"health_path":"/pinned"}'),($3,$2,2,'env.changed','{"health_path":"/desired"}')`,
-		pinnedID, envID, desiredID); err != nil {
+	if err := insertFixtureRevision(ctx, pool, string(pinnedID), string(envID), 1, `{"health_path":"/pinned"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertFixtureRevision(ctx, pool, string(desiredID), string(envID), 2, `{"health_path":"/desired"}`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2 WHERE id=$1`, envID, desiredID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary)
-        VALUES('live.example.com',$1,true)`, envID); err != nil {
-		t.Fatal(err)
-	}
+	insertFixtureDomain(t, ctx, pool, "live.example.com", string(envID), true, time.Now())
 
 	env := platform.Environment{
 		ID: envID, App: "demo", Name: "production", PrimaryDomain: "live.example.com",

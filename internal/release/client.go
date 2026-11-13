@@ -1,6 +1,7 @@
 package release
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -35,8 +36,8 @@ func (c *Client) verifier() Verifier {
 }
 
 // Resolve fetches and verifies the channel manifest (version == "") or a
-// version manifest. channel is stable, edge or a major line such as
-// stable-1.x; a line's manifest is signed by the stable workflow.
+// version manifest. channel is edge, rc or stable, or an internal stable
+// major partition used for RC-to-final resolution.
 func (c *Client) Resolve(ctx context.Context, channel, version string) (Manifest, error) {
 	var manifestURL string
 	var wantVersion string
@@ -52,14 +53,13 @@ func (c *Client) Resolve(ctx context.Context, channel, version string) (Manifest
 			return Manifest{}, &contract.Fault{
 				Code:    contract.ValidationFailed,
 				Message: err.Error(),
-				Hint:    "Pass a stable MAJOR.MINOR.PATCH (optionally -alpha.N, -beta.N or -rc.N) on the channel's major line, or an edge-<12-hex> version.",
+				Hint:    "Pass a version belonging to the selected logical channel.",
 				Details: map[string]any{"version": version},
 			}
 		}
 		wantVersion = version
 		manifestURL = versionRoot(version) + "/manifest.json"
 	}
-	bundleURL := manifestURL + ".sigstore.json"
 	raw, status, err := getCapped(ctx, c.httpClient(), manifestURL, maxMetadata)
 	if err != nil {
 		return Manifest{}, err
@@ -73,6 +73,29 @@ func (c *Client) Resolve(ctx context.Context, channel, version string) (Manifest
 	if status != http.StatusOK {
 		return Manifest{}, unreachable(manifestURL, fmt.Errorf("status %d", status))
 	}
+	// A moving manifest and its signature are separate objects. Never pair the
+	// pointer with the moving signature: a concurrent publication can replace
+	// either between reads. Pin both verification inputs to the immutable
+	// version and require its bytes to match the observed pointer exactly.
+	identityVersion := version
+	if identityVersion == "" {
+		identityVersion = peekVersion(raw)
+		if err := matchVersion(channel, identityVersion); err != nil {
+			return Manifest{}, verificationFailed("release manifest version is invalid")
+		}
+		immutableURL := versionRoot(identityVersion) + "/manifest.json"
+		immutable, immutableStatus, err := getCapped(ctx, c.httpClient(), immutableURL, maxMetadata)
+		if err != nil {
+			return Manifest{}, err
+		}
+		if immutableStatus != http.StatusOK {
+			return Manifest{}, unreachable(immutableURL, fmt.Errorf("status %d", immutableStatus))
+		}
+		if !bytes.Equal(raw, immutable) {
+			return Manifest{}, verificationFailed("channel manifest differs from immutable version manifest")
+		}
+	}
+	bundleURL := versionRoot(identityVersion) + "/manifest.json.sigstore.json"
 	bundleBytes, status, err := getCapped(ctx, c.httpClient(), bundleURL, maxMetadata)
 	if err != nil {
 		return Manifest{}, err
@@ -81,10 +104,6 @@ func (c *Client) Resolve(ctx context.Context, channel, version string) (Manifest
 		return Manifest{}, unreachable(bundleURL, fmt.Errorf("status %d", status))
 	}
 
-	identityVersion := version
-	if identityVersion == "" {
-		identityVersion = peekVersion(raw)
-	}
 	identity, err := Identity(channel, identityVersion)
 	if err != nil {
 		return Manifest{}, verificationFailed("release manifest version is invalid")

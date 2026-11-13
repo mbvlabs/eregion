@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -46,53 +45,4 @@ func TestMain(m *testing.M) {
 	}
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
-}
-
-// TestSecureTestTempRootCanonicalizesSymlinkedBase simulates the macOS
-// /tmp -> /private/tmp layout and proves a credential below the resolved root
-// is accepted by the production reader without weakening its no-follow walk.
-func TestSecureTestTempRootCanonicalizesSymlinkedBase(t *testing.T) {
-	got := os.Getenv("GOTMPDIR")
-	if got == "" {
-		t.Fatal("TestMain did not set GOTMPDIR")
-	}
-	if resolved, err := filepath.EvalSymlinks(got); err != nil || resolved != got {
-		t.Fatalf("GOTMPDIR %q is not canonical: resolved=%q err=%v", got, resolved, err)
-	}
-	gotInfo, err := os.Stat(got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotInfo.Mode().Perm() != 0o700 {
-		t.Fatalf("GOTMPDIR mode = %o, want 700", gotInfo.Mode().Perm())
-	}
-
-	base := t.TempDir()
-	real := filepath.Join(base, "real")
-	if err := os.Mkdir(real, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(base, "link")
-	if err := os.Symlink(real, link); err != nil {
-		t.Fatal(err)
-	}
-	root, err := secureTestTempRoot(link, "canonical-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	resolved, err := filepath.EvalSymlinks(root)
-	if err != nil || resolved != root {
-		t.Fatalf("test root %q is not canonical: resolved=%q err=%v", root, resolved, err)
-	}
-	if !strings.HasPrefix(root, real+string(os.PathSeparator)) {
-		t.Fatalf("test root %q is outside the resolved base %q", root, real)
-	}
-	info, err := os.Stat(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o700 {
-		t.Fatalf("test root mode = %o, want 700", info.Mode().Perm())
-	}
 }

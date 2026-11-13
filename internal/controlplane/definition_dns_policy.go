@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"strings"
 	"time"
@@ -30,13 +31,33 @@ func NewDefinitionDNSPolicyStore(pool *pgxpool.Pool) *DefinitionDNSPolicyStore {
 	return &DefinitionDNSPolicyStore{pool: pool}
 }
 
-const definitionDNSPolicySelect = `SELECT p.revision, p.enabled, COALESCE(p.zone_id,''), COALESCE(c.zone_name,''), p.origins, p.proxy_mode
+const definitionDNSPolicySelect = `SELECT p.revision, p.enabled, p.provider, p.zone_id, c.zone_name, p.origins, p.proxy_mode
  FROM eregion_definition_dns_policy p LEFT JOIN eregion_provider_credentials c ON c.provider=p.provider AND c.zone_id=p.zone_id WHERE p.singleton=true`
+
+func defaultDefinitionDNSPolicy() api.DefinitionDNSPolicy {
+	return api.DefinitionDNSPolicy{Origins: []string{}, ProxyMode: "dns-only"}
+}
 
 func scanDefinitionDNSPolicy(row pgx.Row) (api.DefinitionDNSPolicy, error) {
 	var policy api.DefinitionDNSPolicy
-	if err := row.Scan(&policy.Revision, &policy.Enabled, &policy.ZoneID, &policy.ZoneName, &policy.Origins, &policy.ProxyMode); err != nil {
+	var revision int64
+	var provider, zone, zoneName *string
+	err := row.Scan(&revision, &policy.Enabled, &provider, &zone, &zoneName, &policy.Origins, &policy.ProxyMode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return defaultDefinitionDNSPolicy(), nil
+	}
+	if err != nil || revision < 0 || (provider == nil) != (zone == nil) ||
+		(provider != nil && (*provider != "cloudflare" || zone == nil || *zone == "" || zoneName == nil || *zoneName == "")) ||
+		(policy.ProxyMode != "dns-only" && policy.ProxyMode != "proxied") ||
+		(policy.Enabled && (zone == nil || len(policy.Origins) == 0)) {
 		return api.DefinitionDNSPolicy{}, contract.NewFault(contract.Unavailable, "definition DNS policy could not be read", "Check database connectivity and schema; do not infer that DNS is disabled.")
+	}
+	if _, err := platform.NormalizeDNSOrigins(policy.Origins); err != nil {
+		return api.DefinitionDNSPolicy{}, contract.NewFault(contract.Unavailable, "definition DNS policy is invalid", "Repair the stored policy before using definition DNS.")
+	}
+	policy.Revision = uint64(revision)
+	if zone != nil {
+		policy.ZoneID, policy.ZoneName = *zone, *zoneName
 	}
 	return policy, nil
 }
@@ -79,11 +100,20 @@ func (s *DefinitionDNSPolicyStore) SetDefinitionDNSPolicy(ctx context.Context, a
 	if active {
 		return api.DefinitionDNSPolicy{}, contract.NewFault(contract.Conflict, "definition DNS policy is reserved by an active definition run", "Wait for definition work to finish before changing policy.")
 	}
-	var revision uint64
-	if err := tx.QueryRow(ctx, `SELECT revision FROM eregion_definition_dns_policy WHERE singleton=true FOR UPDATE`).Scan(&revision); err != nil {
+	// The advisory lock makes insertion and revision comparison one serialized
+	// operation, including when no singleton row exists yet.
+	_, err = tx.Exec(ctx, `INSERT INTO eregion_definition_dns_policy
+		(singleton, revision, enabled, provider, zone_id, origins, proxy_mode, updated_at)
+		VALUES (true, 0, false, NULL, NULL, $1, $2, $3) ON CONFLICT (singleton) DO NOTHING`,
+		[]string{}, "dns-only", time.Now().UTC())
+	if err != nil {
 		return api.DefinitionDNSPolicy{}, contract.NewFault(contract.Unavailable, "definition DNS policy could not be locked", "Check database connectivity and schema.")
 	}
-	if revision != input.ExpectedRevision {
+	current, err := scanDefinitionDNSPolicy(tx.QueryRow(ctx, definitionDNSPolicySelect+` FOR UPDATE OF p`))
+	if err != nil {
+		return api.DefinitionDNSPolicy{}, err
+	}
+	if current.Revision != input.ExpectedRevision {
 		return api.DefinitionDNSPolicy{}, contract.NewFault(contract.Conflict, "definition DNS policy revision changed", "Read cloudflare status and retry with its current policy revision.")
 	}
 	if input.Enabled {

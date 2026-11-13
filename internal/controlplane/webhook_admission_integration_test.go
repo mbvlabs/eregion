@@ -44,22 +44,18 @@ func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool, run *Runtime) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities,address,status)
-        VALUES('local','{application,builder,control-plane}','{docker,buildpacks}','127.0.0.1:2222','registered')
-        ON CONFLICT (name) DO NOTHING`); err != nil {
+	if err := insertFixtureNode(ctx, pool, "local", []string{"application", "builder", "control-plane"}, []string{"docker", "buildpacks"}, "127.0.0.1:2222"); err != nil {
 		t.Fatal(err)
 	}
 	appName := "shop-" + strings.TrimPrefix(string(envID), "env_")[:8]
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name,image_repository) VALUES($1,$2,$2)`, appID, appName); err != nil {
+	if err := insertFixtureApp(ctx, pool, string(appID), appName, appName); err != nil {
 		t.Fatal(err)
 	}
 	var hostPort int
 	if err := pool.QueryRow(ctx, `SELECT coalesce(max(host_port),29998)+2 FROM eregion_platform_environments`).Scan(&hostPort); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environments
-        (id,app_id,name,node_name,host_port,candidate_port,container_port)
-        VALUES($1,$2,'production','local',$3,$4,3000)`, envID, appID, hostPort, hostPort+1); err != nil {
+	if err := insertFixtureEnvironment(ctx, pool, string(envID), string(appID), "production", "local", hostPort, hostPort+1, 3000); err != nil {
 		t.Fatal(err)
 	}
 	source, _ := json.Marshal(platform.SourceBinding{URL: "https://github.com/mbvlabs/hello.git", Ref: "main"})
@@ -67,18 +63,16 @@ func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool, run *Runtime) (
 	processes, _ := json.Marshal([]platform.ProcessSpec{{Name: "web", Kind: "web", Command: "./app", Replicas: 1, ContainerPort: 3000}})
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
         (id,environment_id,number,actor_kind,actor_subject,operation,summary,source,auto_deploy,
-         webhook_secret_name,runtime,processes,config,secret_names,deploy_intent)
+         webhook_secret_name,runtime,processes,config,secret_names,deploy_intent,created_at,retention,resources)
         VALUES($1,$2,1,'system','integration','environment.created','integration fixture',
-         $3,true,'WEBHOOK_SECRET',$4,$5,'{}'::jsonb,'{}',false)`, revisionID, envID, source, runtime, processes); err != nil {
+         $3,true,'WEBHOOK_SECRET',$4,$5,'{}'::jsonb,'{}',false,clock_timestamp(),'{}'::jsonb,ARRAY[]::text[])`, revisionID, envID, source, runtime, processes); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2 WHERE id=$1`, envID, revisionID); err != nil {
 		t.Fatal(err)
 	}
 	domain := appName + ".example.test"
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_domains(name,environment_id,is_primary) VALUES($1,$2,true)`, domain, envID); err != nil {
-		t.Fatal(err)
-	}
+	insertFixtureDomain(t, ctx, pool, domain, string(envID), true, time.Now())
 	ring, err := vault.GenerateKeyRing()
 	if err != nil {
 		t.Fatal(err)
@@ -445,8 +439,8 @@ func TestIntegrationWebhookLegacyReconcileNeverResubmits(t *testing.T) {
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash([]byte("legacy body"))
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
-        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id,first_seen_at,revision_id,secret_revision,secret_revision_hash,repository,branch,commit_sha,error_code,error_detail,admission_attempts)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7,clock_timestamp(),'',0,'','','','','','',0)`,
 		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
@@ -454,8 +448,8 @@ func TestIntegrationWebhookLegacyReconcileNeverResubmits(t *testing.T) {
 	canonical, _ := json.Marshal(platform.DeployInput{App: appName, Environment: envName, Ref: record.Commit})
 	operationID, _ := contract.NewOperationID()
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'succeeded')`,
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'succeeded',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, record.Kind, record.Target, record.Actor.Kind, record.Actor.Subject,
 		"ghdelivery-"+rawDelivery, sha256Hex(canonical), canonical); err != nil {
 		t.Fatal(err)
@@ -482,8 +476,8 @@ func TestIntegrationWebhookLegacyMissingOperationIsAmbiguous(t *testing.T) {
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash([]byte("legacy missing body"))
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
-        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id,first_seen_at,revision_id,secret_revision,secret_revision_hash,repository,branch,commit_sha,error_code,error_detail,admission_attempts)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7,clock_timestamp(),'',0,'','','','','','',0)`,
 		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
@@ -510,16 +504,16 @@ func TestIntegrationWebhookHTTPLegacyPendingRetainsOperation(t *testing.T) {
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash(body)
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
-        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id,first_seen_at,revision_id,secret_revision,secret_revision_hash,repository,branch,commit_sha,error_code,error_detail,admission_attempts)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7,clock_timestamp(),'',0,'','','','','','',0)`,
 		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
 	canonical, _ := json.Marshal(platform.DeployInput{App: appName, Environment: envName, Ref: record.Commit})
 	operationID, _ := contract.NewOperationID()
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'succeeded')`,
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,'succeeded',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, record.Kind, record.Target, record.Actor.Kind, record.Actor.Subject,
 		"ghdelivery-"+rawDelivery, sha256Hex(canonical), canonical); err != nil {
 		t.Fatal(err)
@@ -561,8 +555,8 @@ func TestIntegrationWebhookHTTPLegacyPendingMissingReportsAmbiguous(t *testing.T
 	record.DeliveryIDHash = api.WebhookDeliveryHash(rawDelivery)
 	record.BodySHA256 = api.WebhookBodyHash(body)
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_webhook_deliveries
-        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id)
-        VALUES($1,$2,$3,$4,$5,$6,'pending',$7)`,
+        (delivery_id_hash,body_sha256,actor_kind,actor_subject,kind,target,state,environment_id,first_seen_at,revision_id,secret_revision,secret_revision_hash,repository,branch,commit_sha,error_code,error_detail,admission_attempts)
+        VALUES($1,$2,$3,$4,$5,$6,'pending',$7,clock_timestamp(),'',0,'','','','','','',0)`,
 		record.DeliveryIDHash, record.BodySHA256, record.Actor.Kind, record.Actor.Subject, record.Kind, record.Target, record.EnvironmentID); err != nil {
 		t.Fatal(err)
 	}
@@ -731,9 +725,9 @@ func TestIntegrationWebhookWorkerRejectsRebindAndDeletedEnvironment(t *testing.T
 	processes, _ := json.Marshal([]platform.ProcessSpec{{Name: "web", Kind: "web", Command: "./app", Replicas: 1, ContainerPort: 3000}})
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
         (id,environment_id,number,actor_kind,actor_subject,operation,summary,source,auto_deploy,
-         webhook_secret_name,runtime,processes,config,secret_names,deploy_intent)
+         webhook_secret_name,runtime,processes,config,secret_names,deploy_intent,created_at,retention,resources)
         SELECT $1,environment_id,2,'system','integration','environment.updated','rebind',$2,true,
-         'WEBHOOK_SECRET',$3,$4,'{}'::jsonb,'{}',false
+         'WEBHOOK_SECRET',$3,$4,'{}'::jsonb,'{}',false,clock_timestamp(),'{}'::jsonb,ARRAY[]::text[]
         FROM eregion_platform_environment_revisions WHERE id=$5`, newRevisionID, otherSource, runtime, processes, record.RevisionID); err != nil {
 		t.Fatal(err)
 	}

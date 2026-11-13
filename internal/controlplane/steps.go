@@ -133,7 +133,7 @@ func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attemp
 		record, err := scanStep(tx.QueryRow(ctx, "SELECT "+stepColumns+" FROM eregion_operation_steps WHERE operation_id=$1 AND step=$2 FOR UPDATE", id, step))
 		if errors.Is(err, pgx.ErrNoRows) {
 			if _, err := tx.Exec(ctx, `INSERT INTO eregion_operation_steps
-                (operation_id,step,inputs_hash,state,attempt,execution_id) VALUES ($1,$2,$3,'running',$4,$5)`,
+                (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,error,error_code) VALUES ($1,$2,$3,'running',$4,$5,clock_timestamp(),'','')`,
 				id, step, inputsHash, attempt, executionID); err != nil {
 				return err
 			}

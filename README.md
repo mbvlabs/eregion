@@ -62,10 +62,12 @@ public image. Releases pin immutable digests; selecting an image does not
 replace Git settings or webhook configuration. Retention protects serving and
 rollback artifacts.
 
-The beta.5 contract is fresh-install only: definitions use schema 2, and the
-old persistent environment image-source mode is removed without aliases or
-compatibility fallbacks. See MANUAL-TESTING for checks still requiring a real
-server; source and CI verification are not host acceptance.
+The current pre-RC contract is fresh-install only: definitions use schema 1.
+Published beta.5 used schema 2 and remains an immutable historical record;
+current source accepts no schema-2 compatibility path. The old persistent
+environment image-source mode stays removed without aliases or compatibility
+fallbacks. See MANUAL-TESTING for checks still requiring a real server; source
+and CI verification are not host acceptance.
 
 ## Focused references
 

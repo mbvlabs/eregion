@@ -410,20 +410,7 @@ func (t *SSHTransport) awaitTerminal(ctx context.Context, client *ssh.Client, re
 	var last node.Response
 	for {
 		if !time.Now().Before(deadline) {
-			if last.Status == engine.StatusDeferred {
-				last.Retryable = true
-				return last, nil
-			}
-			if last.Status == engine.StatusRunning {
-				last.Retryable = true
-				if last.Detail == "" {
-					last.Detail = "the node task is still running at the transport poll window; the node may still finish it"
-				} else {
-					last.Detail += "\nthe node task is still running at the transport poll window; the node may still finish it"
-				}
-				return last, nil
-			}
-			return node.Response{}, fmt.Errorf("%w: the node did not report a status before the transport poll window ended", node.ErrStreamLost)
+			return pollWindowResult(ctx, last)
 		}
 		waitFor := interval
 		if remaining := time.Until(deadline); remaining < waitFor {
@@ -468,6 +455,33 @@ func (t *SSHTransport) awaitTerminal(ctx context.Context, client *ssh.Client, re
 			return retryableFailure(response, "the node task did not start"), nil
 		}
 	}
+}
+
+func pollWindowResult(ctx context.Context, last node.Response) (node.Response, error) {
+	// The poll timer can fire before the context's deadline callback sets Err.
+	err := ctx.Err()
+	if err == nil {
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			err = context.DeadlineExceeded
+		}
+	}
+	if err != nil {
+		return node.Response{}, fmt.Errorf("%w: the node task wait ended before the node reported an outcome: %w", node.ErrCallCancelled, err)
+	}
+	if last.Status == engine.StatusDeferred {
+		last.Retryable = true
+		return last, nil
+	}
+	if last.Status == engine.StatusRunning {
+		last.Retryable = true
+		if last.Detail == "" {
+			last.Detail = "the node task is still running at the transport poll window; the node may still finish it"
+		} else {
+			last.Detail += "\nthe node task is still running at the transport poll window; the node may still finish it"
+		}
+		return last, nil
+	}
+	return node.Response{}, fmt.Errorf("%w: the node did not report a status before the transport poll window ended", node.ErrStreamLost)
 }
 
 // retryableFailure reports a node task that cannot make progress on this

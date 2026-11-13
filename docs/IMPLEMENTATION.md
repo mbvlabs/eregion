@@ -88,7 +88,7 @@ re-queue the older one's live platform jobs.
 | `internal/cli/host.go`, `internal/cli/serverstatus.go`, `internal/cli/nodeunlock.go` | `plan`, `apply`, `doctor`, `ssh`, `server status` and hidden `node unlock-ssh`. |
 | `internal/protect`, `internal/totp`, `internal/tokens` | Root-only TOTP gate on the node and hashed per-use deploy tokens in `/etc/eregion/auth.json`. Every protect-state mutation (`Init`/rotate, `Confirm`, `Verify`) takes an exclusive `flock` on the stable `<protect.json>.lock` file before its load-verify-save sequence, so independent node RPC processes cannot replay a code step, lose failure counts or confirm/rotate twice. `Status` stays lock-free because `save` publishes a complete file by rename; the lock file is never renamed and is released by the kernel on process death. |
 | `internal/cli/protect.go`, `token.go`, `webhook.go`, `github_webhook.go`, `secretexport.go` | TOTP setup/status, token mint/list/revoke, manual and optional `gh`-assisted push-to-deploy setup, and the protected handoff re-export. |
-| `internal/appdef` | Strict versioned `eregion.toml` parsing and resolution (schema 2): a shared recipe plus optional production/staging/named overrides (the selected name need not appear), an optional Git `[source]` recipe with no image/kind mode, root app `image_repository` metadata, complete-state update patches, deterministic export with domains under the selected environment override, and managed-resource declarations. Input only; never a state store. |
+| `internal/appdef` | Strict versioned `eregion.toml` parsing and resolution (current pre-RC schema 1; published beta.5 used schema 2 and there is no compatibility parser): a shared recipe plus optional production/staging/named overrides (the selected name need not appear), an optional Git `[source]` recipe with no image/kind mode, root app `image_repository` metadata, complete-state update patches, deterministic export with domains under the selected environment override, and managed-resource declarations. Input only; never a state store. |
 | `internal/cli/resource.go`, `internal/platform/resource*.go`, `internal/controlplane/resource.go` | Generic environment-owned Docker resources: durable identity and desired state, private per-environment networking, image identity, vault secret-name injection, a cumulative owned-volume ledger written before volume creation, exec health gating, attach/detach revisions, deployment-aware destroy refusals and container destroy that retains data by default. |
 | `internal/rpc` | `eregion-rpc/v1` request/event/result wire types and bounded request decoding. |
 | `internal/api` | Shared application services plus the HTTP authentication/grants, operation/inventory routes, vault, CI deploy, per-environment push webhook and private proxy adapters. |
@@ -103,6 +103,13 @@ re-queue the older one's live platform jobs.
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
 | `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement plus the verified linux/<node arch> binary used by `apply --auto-upgrade-nodes`. |
 
+Before artifact upload, release publication qualifies the configured storage
+target with a unique disposable probe. It requires create-only collision and
+stale-ETag writes to return precondition failures, verifies unchanged content
+and ETags, and checks a matching-ETag replacement succeeds. Only the confirmed
+owned probe key is deleted; qualification or cleanup failure stops publication.
+This production preflight does not write a channel pointer or release artifact.
+
 ## Current command surface
 
 ### Operator and agent quick reference
@@ -115,6 +122,12 @@ eregion commands --json
 eregion help env update --json
 eregion guide agents
 ```
+
+The no-argument overview, `--help` and `help` share the human operator map.
+Group help lists its visible subcommands before detailed safety and flags; leaf
+help retains safety, examples and typed flag information. JSON help and the
+catalog retain the full machine-readable metadata; the no-argument JSON result
+contains the version and catalog.
 
 For a node operation, identify the selected **workspace** first. The default
 private store is the OS configuration directory's `eregion/workspaces.json`; the
@@ -728,26 +741,35 @@ the pinned publish workflow identity, validates the manifest against the
 channel, and caches the platform binary only after its signed SHA256 matches.
 TUF/sigstore trust material is cached, not pinned in the binary.
 
-Edge combines development and published `master` builds. Alpha and beta tags
-are exact immutable snapshots with no moving pointer; RC tags advance the opt-in
-`rc` pointer, and only final tags advance stable pointers. Manifests remain
-schema 1. Their `channel` field is the signing family, not the promotion
-channel: every tagged artifact, including alpha/beta and RC, says `stable` and
-is signed by `publish-stable.yml@refs/tags/v<version>`; edge says `edge`. This
-is the protocol already understood by alpha.2 clients and is not itself proof
-of stable-channel membership. Stable and major-line build, pointer-install,
-upload and promotion paths reject every prerelease by inspecting the version;
-the rc pointer accepts only rc. An explicit `--version` remains the snapshot
-install path. Alpha/beta use the build script's `snapshot` channel,
-which creates no pointer; RC uses `rc`; final tags use their stable line. The
-stable publish job accepts only a final tag whose commit is on
-`origin/<major>.x`, while alpha/beta/RC tags use the `edge` environment. RC
-clients also check their stable major line for a newer final; publishing a
-final does not move the RC pointer. Channel manifests and signature bundles are
-two separately published objects, so the existing publication race can
-temporarily fail verification; an interrupted tagged upload can leave a partial
-prefix that blocks retry. These are follow-up risks, not a change to the
-channel model.
+Current source uses exactly `edge` (development/alpha/beta), `rc` (release
+candidates) and `stable` (finals). Manifest schema remains 1; binary and manifest
+channel metadata now identify the logical channel. Signer identity is derived
+separately: anonymous edge builds use the master edge workflow, while tagged
+versions use their exact tagged workflow identity. Published beta.5 retains its
+historical signing-family metadata; it is not rewritten or silently accepted
+as the new format.
+
+Both publishing workflows upload immutable artifacts first, then use the same
+conditional-pointer promoter. ETag conflicts cause bounded rereads and policy
+reevaluation. Edge ordering uses verified source ancestry; at the same commit,
+an alpha/beta tag outranks an anonymous edge build, then prerelease version
+ordering applies. Divergent or ambiguous ancestry refuses promotion. Tagged
+sources must also belong to their explicit major Git release line. The AWS CLI
+version and conditional-write model are checked before uploads.
+
+Upgrade defaults follow the version's logical channel. Public major-line
+channel aliases are rejected; RC-to-final lookup retains an internal major
+partition and distinguishes absent pointers from other errors. Clients and
+installers compare moving manifests with immutable version bytes and verify
+using that version's immutable bundle. Moving compatibility bundles remain
+separate objects, so old clients can still fail closed during publication.
+
+Before tagged alpha/beta publication, the bootstrap attestation must name an
+operator-qualified anonymous `edge-<12hex>` release. The first corrected edge
+must be published and verified separately so historical beta.5 clients can
+bootstrap through the master signer. The gate is operational attestation, not
+proof of installation. Real R2 conditional writes and this bootstrap are not
+yet qualified; no publication is implied by the source changes.
 The container resolver and these schema-1 safety guards were introduced for
 alpha.3. Publication and qualification provenance is in MANUAL-TESTING; this
 mechanism reference is not a release-status tracker or permission to publish.
@@ -776,11 +798,49 @@ There is no Ed25519 manifest, trusted public-key file, rollback journal or
 one-host operator/node replacement state any more. Release mechanics are in
 [upgrades](upgrades.md).
 
-## Database: embedded schema 029
+## Database: separate CREATE-only Goose migrations
 
 Authority: `internal/controlplane/database.go` and
-`internal/controlplane/migrations/*.sql`. JSON output schema (`eregion/v1`),
+`internal/dbschema/migrations/*.sql`. JSON output schema (`eregion/v1`),
 node protocol version and database migration version are independent.
+
+The required history preserves separate migrations for the original schema
+areas, including platform and vault. Do not consolidate them into one baseline.
+Each owning migration creates its tables in their final shape; former
+ALTER-only changes are incorporated into those CREATE definitions. Dependencies
+determine execution order, and each migration contains substantive schema
+creation rather than empty placeholders. Application DDL is CREATE-only:
+no defaults (including implicit serial/identity generation), domain CHECKs,
+business triggers/functions or policy seeds. Structural keys, uniqueness,
+ownership foreign keys and NOT NULL remain. Application writers supply initial
+values and validate domain policy. Cyclic backpointer setters validate
+existence and ownership transactionally: app gates precede environment gates,
+reference reads use key-share locks, and mutations retain the stronger
+environment lock. Multi-row finalization and diagnostic admission acquire
+their parent gates before child locks. This protocol has passed source review,
+not PostgreSQL concurrency qualification.
+
+Goose's `goose_db_version` is the sole application ledger; River retains its
+own history. Planning uses read-only store inspection, not Goose provider
+status methods that initialize metadata. Migration holds the outer advisory
+lock through refusal checks and Goose/River execution. Existing legacy or
+orphan application state, and River-only state without an applied application
+history, refuse before metadata writes. Zero-only Goose retry, a valid applied
+prefix with pending application migrations, and complete application history
+with incomplete River migrations must resume without adoption or replay of
+already-applied migrations.
+
+Exactly one resolved installation schema is supported. Multiple resolved
+search-path schemas refuse explicitly; acquired sessions must agree on schema
+and role. Application and River plan status use separate read-only snapshots,
+not an atomic whole-plan snapshot. Actual PostgreSQL, concurrency and recovery
+qualification remains pending.
+
+### Historical published beta.5 chain
+
+The following describes the immutable beta.5 release, **not current migration
+sources or an upgrade path**. Its schema version was 33. These SQL files are
+removed from the current tree and remain only in Git history and release tags.
 
 | Migration | Change |
 | --- | --- |
@@ -818,11 +878,13 @@ node protocol version and database migration version are independent.
 | `032_app_image_repository.sql` | Adds the immutable app-level `image_repository` path with a partial unique index over non-empty values. It is the exact private-workspace repository used by builds and uploads; environments cannot override it. Existing pre-beta.5 apps keep an empty value and are refused clearly rather than guessed or backfilled. |
 | `033_workspace_registry_host.sql` | Adds the all-or-none immutable workspace registry-host binding: main node name, public SSH host-key type/SHA256 fingerprint and canonical node state directory. Existing workspace rows stay unbound and unverified; there is no backfill, role/default inference or remote lock. The binding is written atomically with first workspace assignment. |
 
-Tables below have the literal `eregion_` prefix:
+### Current application tables
+
+Tables below have the literal `eregion_` prefix. Goose's separate
+`goose_db_version` ledger does not:
 
 | Table(s) | Key and authoritative facts |
 | --- | --- |
-| `schema_migrations` | Version/checksum/application time. River maintains its own schema history. |
 | `workspace` | Singleton workspace ID/name (`ws_…`, slug), creation time and the all-or-none immutable public registry-host binding: main node name, public SSH host-key type/SHA256 fingerprint and canonical node state directory. Authoritative installation identity, not a tenant, team, multi-node or fleet boundary; an absent row is explicitly unconfigured, and an unbound row is explicitly unverified and mutation-refused. |
 | `operations` | `op_…` ID; actor, kind, target, normalized input/hash, idempotency key, state, attempt, step count, cursor, River job ID and error code. |
 | `operation_events` | `(operation_id, sequence)`; JSON event. |
@@ -830,7 +892,7 @@ Tables below have the literal `eregion_` prefix:
 | `platform_nodes` | Name; roles/capabilities, status, SSH address/user/**host key**, attested identity, probes, build concurrency/user and WireGuard public state. Private keys stay in files. |
 | `platform_apps` | Opaque app ID, unique name and immutable `image_repository` private-workspace path (unique when non-empty). No stored setup wizard/source configuration. |
 | `platform_environments` | App FK + name; runtime/build node, stable/candidate/container ports, bind, health settings/observation, config, pinned secret refs, desired/applied/serving release IDs, `serving_deployment_id`, `current_revision_id` and persistent `protected`. The deploy worker reads the revision and the serving deployment's recorded instance ports; the mutable legacy config/health/port fields remain only as mirrored compatibility columns for the older CLI surface. `secret_refs` remains the transitional pinned form, used only when the current revision names no secrets. |
-| `platform_environment_revisions` | Immutable `erv_…` ID and per-environment number; operation/actor/operation/summary change record; optional Git build recipe (no kind or image mode), auto-deploy flag, webhook secret NAME, runtime JSON, processes JSON, plain config and secret NAMEs, the `retention` override JSON, plus the first-deploy intent flag. An UPDATE trigger refuses edits; deleting the environment still cascades. |
+| `platform_environment_revisions` | Immutable `erv_…` ID and per-environment number; operation/actor/operation/summary change record; optional Git build recipe (no kind or image mode), auto-deploy flag, webhook secret NAME, runtime JSON, processes JSON, plain config and secret NAMEs, the `retention` override JSON, plus the first-deploy intent flag. Application writers append revisions rather than updating them; deleting the environment still cascades. |
 | `platform_builds` | `bld_…` ID and unique operation FK; app/env, pinned revision and release, source, exact commit, pending/running/succeeded/failed/cancelled lifecycle, timestamps and error. Logs are the owning operation's events. |
 | `platform_releases` | Release ID and unique operation FK; app/env FKs, source/build/command JSON, canonical manifest reference (Git builds and artifact admission store loopback/registry `repository@sha256:<manifest>`), immutable expected Docker image config digest, build link, exact commit, requested-selector provenance for image releases, pending/ready/failed status and error, and `pruned_at` when disk retention removed the artifact. Manifest digest and config digest are distinct identities. The row is never deleted. |
 | `platform_deployments` | Deployment ID and unique operation FK; action (`deploy`, `rollback`, `restart`), release, previous release/deployment, environment revision ID, exact resolved secret revisions (name -> non-secret vault revision identity), recorded process instances/ports, state and errors. |
@@ -1252,11 +1314,12 @@ eregion node migrate --dry-run --json
 eregion node migrate --json
 ```
 
-Migrations serialize with a dedicated PostgreSQL session advisory lock. Domain
-versions commit transactionally; River versions commit separately. Services do
-not auto-migrate; readiness fails until both are current. A newer schema, gap or
-changed applied checksum fails closed. Never edit an applied SQL file, forge
-history or reset a database to make an upgrade pass. Add the next migration.
+Migrations serialize with a dedicated PostgreSQL session advisory lock. Goose
+application versions commit transactionally; River versions commit separately.
+Services do not auto-migrate; readiness fails until both are current. Invalid,
+unknown or out-of-order application history fails closed. Goose does not retain
+the removed custom checksum ledger. Once published, migrations remain immutable:
+never forge history or reset a database to make it pass.
 
 ### Readiness budget and diagnostics
 
@@ -1267,15 +1330,11 @@ timeout; it is cancellation containment, not a demonstrated fix for the
 intermittent alpha.6 timeout. The handler remains synchronous and public errors
 are generic. HTTP server `ReadTimeout` is not the handler-execution deadline.
 
-Readiness still validates Eregion migration history/checksums and River
-versions through the persistent API pool. Three top-level read stages include
-River's internal table/column/version queries: the initialized path involves
-five logical SQL executions. The redundant outer River-table lookup is removed;
-River still performs its own existence check and handles an absent table. This
-eliminates one serial exchange on the initialized path without weakening
-migration validation, but is not a demonstrated timeout fix. The API's pool
-maximum remains 12; worker connections belong to a separate process/pool in the
-installed layout.
+Readiness validates Goose application history and River versions through the
+persistent API pool, without initializing either ledger. Historical query counts
+for the removed custom planner do not describe the Goose path. This replacement
+is not a demonstrated readiness-timeout fix. The API's pool maximum remains 12;
+worker connections belong to a separate process/pool in the installed layout.
 
 Request-scoped pgx acquire/query/release traces record fixed stage names,
 durations and counts, including row lifetime. Each stage also retains bounded

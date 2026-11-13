@@ -273,7 +273,7 @@ func allIn(items, allowed []string) bool {
 	return true
 }
 
-func plainHelp(command Command) string {
+func plainHelp(command Command, children []Command) string {
 	var out strings.Builder
 	fmt.Fprintf(&out, "%s\n\n%s\n\n", command.Path, command.Summary)
 	if len(command.WhenToUse) > 0 {
@@ -283,7 +283,17 @@ func plainHelp(command Command) string {
 		}
 		out.WriteString("\n")
 	}
-	fmt.Fprintf(&out, "Usage: %s\n\n", command.Use)
+	fmt.Fprintf(&out, "Usage: %s\n", command.Use)
+	if len(children) > 0 {
+		fmt.Fprintf(&out, "       %s [command]\n", command.Path)
+		out.WriteString("\nAvailable commands:\n")
+		for _, child := range children {
+			fmt.Fprintf(&out, "  %-16s %s\n", strings.TrimPrefix(child.Path, command.Path+" "), child.Summary)
+		}
+		out.WriteString("\n")
+	} else {
+		out.WriteString("\n")
+	}
 	fmt.Fprintf(&out, "Audience: %s\n", strings.Join(command.Audience, ", "))
 	if command.TerminalOnly {
 		out.WriteString("Machine output: not supported (requires an interactive terminal)\n")
@@ -330,13 +340,7 @@ func plainHelp(command Command) string {
 		out.WriteString("Result: an event stream over durable operation state; this command does not submit work.\n")
 	}
 	out.WriteString("\nFlags:\n")
-	for _, flag := range command.Flags {
-		required := ""
-		if flag.Required {
-			required = " (required)"
-		}
-		fmt.Fprintf(&out, "  --%-12s %s%s\n", flag.Name, flag.Usage, required)
-	}
+	writePlainFlags(&out, command.Flags)
 	out.WriteString("\nExamples:\n")
 	for _, example := range command.Examples {
 		fmt.Fprintf(&out, "  %s\n", example)
@@ -348,4 +352,30 @@ func plainHelp(command Command) string {
 		}
 	}
 	return out.String()
+}
+
+func writePlainFlags(out *strings.Builder, flags []Flag) {
+	names := make([]string, 0, len(flags))
+	width := 0
+	for _, flag := range flags {
+		name := "--" + flag.Name
+		if flag.Shorthand != "" {
+			name = "-" + flag.Shorthand + ", " + name
+		}
+		if flag.Type != "bool" {
+			name += " " + flag.Type
+		}
+		names = append(names, name)
+		width = max(width, len(name))
+	}
+	for i, flag := range flags {
+		required := ""
+		if flag.Required {
+			required = " (required)"
+		}
+		if flag.Default != "" && flag.Default != "false" && flag.Default != "0" && flag.Default != "[]" {
+			required += fmt.Sprintf(" (default %q)", flag.Default)
+		}
+		fmt.Fprintf(out, "  %-*s  %s%s\n", width, names[i], flag.Usage, required)
+	}
 }

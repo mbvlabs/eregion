@@ -250,6 +250,12 @@ func isHexDigest(value string) bool {
 	return err == nil
 }
 
+// ValidRevisionIdentity applies the same identity formats used by the keyring
+// and revision metadata to an already-recorded reference.
+func ValidRevisionIdentity(revision uint64, hash, keyID string) bool {
+	return revision > 0 && isHexDigest(hash) && keyIDPattern.MatchString(keyID)
+}
+
 // String never exposes key material.
 func (k *KeyRing) String() string {
 	if k == nil {

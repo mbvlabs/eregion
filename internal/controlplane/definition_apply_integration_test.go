@@ -19,7 +19,7 @@ import (
 
 var definitionIntegrationActor = contract.Actor{Kind: "operator", Subject: "definition-test"}
 
-const integrationDefinition = `version = 2
+const integrationDefinition = `version = 1
 app = "api"
 node = "local"
 [automation]

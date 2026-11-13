@@ -32,23 +32,22 @@ func TestIntegrationReleaseCommandRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities) VALUES('main',ARRAY['application'],ARRAY['docker'])`); err != nil {
+	if err := insertFixtureNode(ctx, pool, "main", []string{"application"}, []string{"docker"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name) VALUES($1,'demo')`, appID); err != nil {
+	if err := insertFixtureApp(ctx, pool, string(appID), "demo", "demo"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environments(id,app_id,name,node_name,host_port,candidate_port,container_port)
-        VALUES($1,$2,'production','main',20001,30001,8080)`, envID, appID); err != nil {
+	if err := insertFixtureEnvironment(ctx, pool, string(envID), string(appID), "production", "main", 20001, 30001, 8080); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,'platform.deploy','env/demo/production','operator','tester','release-command',$2,'{}','running')`,
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,'platform.deploy','env/demo/production','operator','tester','release-command',$2,'{}','running',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, "hash"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases(id,operation_id,app_id,environment_id,image,source,status)
-        VALUES($1,$2,$3,$4,'demo:one','{}','ready')`, releaseID, operationID, appID, envID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases(id,operation_id,app_id,environment_id,image,image_id,source,status,error_code,error,created_at,commit_sha)
+        VALUES($1,$2,$3,$4,'demo:one','','{}','ready','','',clock_timestamp(),'')`, releaseID, operationID, appID, envID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -71,8 +70,8 @@ func TestIntegrationReleaseCommandRuns(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-            VALUES($1,'platform.deploy','env/demo/production','operator','tester',$2,'hash','{}','failed')`, id, key); err != nil {
+		if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+            VALUES($1,'platform.deploy','env/demo/production','operator','tester',$2,'hash','{}','failed',1,0,0,clock_timestamp(),clock_timestamp(),'')`, id, key); err != nil {
 			t.Fatal(err)
 		}
 		return id

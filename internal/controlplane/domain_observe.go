@@ -150,6 +150,12 @@ func (s *Service) observeDomain(ctx context.Context, domain domainObservation) e
 	if dnsError == "" && dnsState == platform.DNSWrong {
 		dnsError = "the public resolvers do not return the recorded address"
 	}
+	if dnsAddresses == nil {
+		dnsAddresses = []string{}
+	}
+	if err := validateDomainObservationWrite(dnsState, certificateState, publicState, publicStatus); err != nil {
+		return err
+	}
 	var statusArg any
 	if publicStatus != 0 {
 		statusArg = publicStatus
@@ -164,6 +170,16 @@ func (s *Service) observeDomain(ctx context.Context, domain domainObservation) e
 		publicState, statusArg, boundedRouteError(publicError), publicObservedAt, now)
 	if err != nil {
 		return unavailable()
+	}
+	return nil
+}
+
+func validateDomainObservationWrite(dns platform.DNSState, certificate platform.CertificateState, public platform.PublicState, status int) error {
+	validDNS := dns == platform.DNSPending || dns == platform.DNSOK || dns == platform.DNSWrong || dns == platform.DNSProxied
+	validCert := certificate == platform.CertificatePending || certificate == platform.CertificateValid || certificate == platform.CertificateFailed
+	validPublic := public == platform.PublicPending || public == platform.PublicOK || public == platform.PublicFailed
+	if !validDNS || !validCert || !validPublic || (status != 0 && (status < 100 || status > 599)) {
+		return contract.NewFault(contract.ValidationFailed, "invalid domain observation", "Check the DNS, certificate and public observation before saving.")
 	}
 	return nil
 }

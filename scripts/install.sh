@@ -84,24 +84,34 @@ if [ -n "${version}" ]; then
     resolved_channel=edge
   else
     [[ "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || fail "invalid version"
-    resolved_channel=stable
+    case "${version}" in
+      *-alpha.* | *-beta.*) resolved_channel=edge ;;
+      *-rc.*) resolved_channel=rc ;;
+      *) resolved_channel=stable ;;
+    esac
   fi
   manifest_root="${origin}/releases/${version}"
 fi
 curl -fsSL --proto '=https' --tlsv1.2 \
   "${manifest_root}/manifest.json" -o "${work_dir}/manifest.json"
-curl -fsSL --proto '=https' --tlsv1.2 \
-  "${manifest_root}/manifest.json.sigstore.json" -o "${work_dir}/manifest.json.sigstore.json"
 
 manifest_version="$(json_string version "${work_dir}/manifest.json")"
-if [ "${resolved_channel}" = edge ]; then
-  [[ "${manifest_version}" =~ ^edge-[0-9a-f]{12}$ ]] || fail "release manifest version is invalid"
+if [[ "${manifest_version}" =~ ^edge-[0-9a-f]{12}$ ]]; then
   identity='https://github.com/mbvlabs/eregion/.github/workflows/publish-edge.yml@refs/heads/master'
 else
   [[ "${manifest_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || fail "release manifest version is invalid"
   identity="https://github.com/mbvlabs/eregion/.github/workflows/publish-stable.yml@refs/tags/v${manifest_version}"
 fi
 [ -z "${version}" ] || [ "${manifest_version}" = "${version}" ] || fail "release manifest version is invalid"
+# The pointer and its signature move independently. Bind the observed bytes to
+# the immutable version and verify only that version's immutable signature.
+if [ -z "${version}" ]; then
+  curl -fsSL --proto '=https' --tlsv1.2 \
+    "${origin}/releases/${manifest_version}/manifest.json" -o "${work_dir}/immutable-manifest.json"
+  cmp -s "${work_dir}/manifest.json" "${work_dir}/immutable-manifest.json" || fail "channel manifest differs from immutable version manifest"
+fi
+curl -fsSL --proto '=https' --tlsv1.2 \
+  "${origin}/releases/${manifest_version}/manifest.json.sigstore.json" -o "${work_dir}/manifest.json.sigstore.json"
 if ! verify_out="$("${work_dir}/cosign" verify-blob "${work_dir}/manifest.json" \
   --bundle "${work_dir}/manifest.json.sigstore.json" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity "${identity}" 2>&1)"; then
@@ -112,21 +122,15 @@ manifest_channel="$(json_string channel "${work_dir}/manifest.json")"
 [ "${manifest_channel}" = "${resolved_channel}" ] || fail "release manifest channel is invalid"
 manifest_version="$(json_string version "${work_dir}/manifest.json")"
 [ -z "${version}" ] || [ "${manifest_version}" = "${version}" ] || fail "release manifest version is invalid"
-if [ "${resolved_channel}" = stable ]; then
-  [[ "${manifest_version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.(0|[1-9][0-9]*))?$ ]] || fail "release manifest version is invalid"
-  if [ -z "${version}" ]; then
-    if [ "${pointer_channel}" = rc ]; then
-      [[ "${manifest_version}" =~ -rc\.[0-9]+$ ]] || fail "rc channel requires an rc release"
-    else
-      [[ "${manifest_version}" != *-* ]] || fail "stable channel requires a final release"
-      if [[ "${pointer_channel}" == stable-*.x ]]; then
-        line="${pointer_channel#stable-}"
-        [ "${manifest_version%%.*}.x" = "${line}" ] || fail "release manifest is on the wrong major line"
-      fi
-    fi
-  fi
-else
-  [[ "${manifest_version}" =~ ^edge-[0-9a-f]{12}$ ]] || fail "release manifest version is invalid"
+case "${resolved_channel}" in
+  edge) [[ "${manifest_version}" =~ ^edge-[0-9a-f]{12}$ || "${manifest_version}" =~ -(alpha|beta)\.[0-9]+$ ]] || fail "edge channel requires an edge, alpha or beta release" ;;
+  rc) [[ "${manifest_version}" =~ -rc\.[0-9]+$ ]] || fail "rc channel requires an rc release" ;;
+  stable) [[ "${manifest_version}" != *-* ]] || fail "stable channel requires a final release" ;;
+  *) fail "release channel is invalid" ;;
+esac
+if [ -z "${version}" ] && [[ "${pointer_channel}" == stable-*.x ]]; then
+  line="${pointer_channel#stable-}"
+  [ "${manifest_version%%.*}.x" = "${line}" ] || fail "release manifest is on the wrong major line"
 fi
 release_base_url="$(json_string releaseBaseUrl "${work_dir}/manifest.json")"
 # The site origin holds /releases/<version>/ and every channel directory
@@ -140,9 +144,12 @@ esac
 
 manifest_sha256="$(awk -v key="\"${os}/${arch}\"" '
   index($0, key) { found = 1 }
-  found && match($0, /"sha256": "[0-9a-f]{64}"/) {
-    print substr($0, RSTART + 11, 64)
-    exit
+  found && match($0, /"sha256": "[0-9a-f]+"/) {
+    value = substr($0, RSTART + 11, RLENGTH - 12)
+    if (length(value) == 64) {
+      print value
+      exit
+    }
   }
 ' "${work_dir}/manifest.json")"
 [ -n "${manifest_sha256}" ] || fail "release manifest is missing ${os}/${arch}"

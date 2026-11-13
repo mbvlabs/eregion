@@ -176,8 +176,8 @@ func AssignWorkspace(ctx context.Context, pool *pgxpool.Pool, name string, regis
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO eregion_workspace
             (singleton, workspace_id, name, registry_host_node, registry_host_key_type,
-             registry_host_key_fingerprint, registry_host_state_dir)
-         VALUES (true, $1, $2, $3, $4, $5, $6)
+             registry_host_key_fingerprint, registry_host_state_dir, created_at)
+         VALUES (true, $1, $2, $3, $4, $5, $6, clock_timestamp())
          ON CONFLICT (singleton) DO NOTHING`,
 		id, name, registryHost.NodeName, registryHost.HostKeyType,
 		registryHost.HostKeyFingerprint, registryHost.StateDir); err != nil {

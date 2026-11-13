@@ -16,6 +16,25 @@ var stableVersionPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)
 // lineChannelPattern matches a major line's channel, such as stable-1.x.
 var lineChannelPattern = regexp.MustCompile(`^stable-(0|[1-9][0-9]*)\.x$`)
 
+// VersionChannel returns the logical channel, independently of signing identity.
+func VersionChannel(version string) (string, bool) {
+	if edgeVersionPattern.MatchString(version) {
+		return ChannelEdge, true
+	}
+	v, ok := ParseStable(version)
+	if !ok {
+		return "", false
+	}
+	switch v.Pre {
+	case "alpha", "beta":
+		return ChannelEdge, true
+	case "rc":
+		return ChannelRC, true
+	default:
+		return ChannelStable, true
+	}
+}
+
 // StableVersion is a parsed stable release version.
 type StableVersion struct {
 	Major int

@@ -29,8 +29,8 @@ func insertRouteStep(t *testing.T, pool *pgxpool.Pool, operationID contract.Oper
 		completedAt = "clock_timestamp()"
 	}
 	query := `INSERT INTO eregion_operation_steps
-        (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,completed_at,error)
-        VALUES($1,$2,$3,$4,1,$5,clock_timestamp(),` + completedAt + `,$6)`
+        (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,completed_at,error,error_code)
+        VALUES($1,$2,$3,$4,1,$5,clock_timestamp(),` + completedAt + `,$6,'')`
 	if _, err := pool.Exec(context.Background(), query,
 		operationID, deploymentRouteStep, strings.Repeat("a", 64), state, execution.ExecutionID(), errorText); err != nil {
 		t.Fatal(err)
@@ -51,8 +51,8 @@ func insertCompletedStep(t *testing.T, pool *pgxpool.Pool, operationID contract.
 	t.Helper()
 	execution := engine.Execution{OperationID: operationID, Attempt: 1, Step: step}
 	if _, err := pool.Exec(context.Background(), `INSERT INTO eregion_operation_steps
-        (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,completed_at)
-        VALUES($1,$2,$3,'completed',1,$4,clock_timestamp(),clock_timestamp())`,
+        (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,completed_at,error,error_code)
+        VALUES($1,$2,$3,'completed',1,$4,clock_timestamp(),clock_timestamp(),'','')`,
 		operationID, step, hash, execution.ExecutionID()); err != nil {
 		t.Fatal(err)
 	}
@@ -146,8 +146,8 @@ func (f *deploymentRetryFixture) deploy(t *testing.T) platform.ReleaseID {
 func insertDeploymentOwner(t *testing.T, pool *pgxpool.Pool, env platform.Environment, owner deploymentOwner) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `INSERT INTO eregion_platform_deployment_owners
-        (environment_id,operation_id,deployment_id,owner_attempt,phase,route_target_deployment_id,restore_release_id,restore_deployment_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+        (environment_id,operation_id,deployment_id,owner_attempt,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp(),clock_timestamp())`,
 		env.ID, nullableOperationID(owner.OperationID), nullableDeploymentID(owner.DeploymentID), owner.Attempt,
 		string(owner.Phase), nullableDeploymentID(owner.RouteTarget),
 		nullableReleaseID(owner.RestoreReleaseID), nullableDeploymentID(owner.RestoreDeploymentID)); err != nil {
@@ -520,8 +520,8 @@ func TestIntegrationContainerCleanupDefersServingAndOwnerTarget(t *testing.T) {
 
 	makeRow := func(name string, deployment platform.DeploymentID) containerCleanupRow {
 		if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_container_cleanup
-            (container_name,environment_id,node,deployment_id,reason)
-            VALUES($1,$2,'local',$3,'candidate')`, name, env.ID, deployment); err != nil {
+            (container_name,environment_id,node,deployment_id,reason,attempts,last_error,created_at,next_attempt_at)
+            VALUES($1,$2,'local',$3,'candidate',0,'',clock_timestamp(),clock_timestamp())`, name, env.ID, deployment); err != nil {
 			t.Fatal(err)
 		}
 		return containerCleanupRow{ContainerName: name, EnvironmentID: env.ID, App: "live", Environment: "production", Node: "local", DeploymentID: deployment}
@@ -579,8 +579,8 @@ func TestIntegrationDeploymentLegacyAmbiguousOwnerRecoversConservatively(t *test
 		ops = append(ops, op)
 	}
 	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_deployment_owners
-        (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id)
-        VALUES($1,'ambiguous',$2,$3,$4)`, env.ID, firstDeployment, firstRelease, firstDeployment); err != nil {
+        (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
+        VALUES($1,'ambiguous',$2,$3,$4,clock_timestamp(),clock_timestamp())`, env.ID, firstDeployment, firstRelease, firstDeployment); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := routeNames(t, fixture), instanceNames(servingInstances); !reflect.DeepEqual(got, want) {
@@ -936,8 +936,8 @@ func TestIntegrationDeploymentCleanupRecordFailureRetainsOwnership(t *testing.T)
 					ops = append(ops, op)
 				}
 				if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_deployment_owners
-                    (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id)
-                    VALUES($1,'ambiguous',$2,$3,$4)`, env.ID, env.ServingDeploymentID, env.ServingRelease, env.ServingDeploymentID); err != nil {
+                    (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
+                    VALUES($1,'ambiguous',$2,$3,$4,clock_timestamp(),clock_timestamp())`, env.ID, env.ServingDeploymentID, env.ServingRelease, env.ServingDeploymentID); err != nil {
 					t.Fatal(err)
 				}
 				defer func() {
@@ -970,15 +970,15 @@ func TestIntegrationContainerCleanupDeferredRowsDoNotStarveQueue(t *testing.T) {
 	for index := 0; index < containerCleanupPageSize; index++ {
 		name := fmt.Sprintf("aaa-protected-%02d", index)
 		if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_container_cleanup
-            (container_name,environment_id,node,deployment_id,reason,attempts,next_attempt_at)
-            VALUES($1,$2,'local',$3,'previous',1,clock_timestamp()-interval '1 hour')`,
+            (container_name,environment_id,node,deployment_id,reason,attempts,last_error,created_at,next_attempt_at)
+            VALUES($1,$2,'local',$3,'previous',1,'',clock_timestamp(),clock_timestamp()-interval '1 hour')`,
 			name, env.ID, env.ServingDeploymentID); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_container_cleanup
-        (container_name,environment_id,node,deployment_id,reason,attempts,next_attempt_at)
-        VALUES('zzz-unprotected',$1,'local',NULL,'previous',1,clock_timestamp()-interval '1 hour')`, env.ID); err != nil {
+        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,created_at,next_attempt_at)
+        VALUES('zzz-unprotected',$1,'local',NULL,'previous',1,'',clock_timestamp(),clock_timestamp()-interval '1 hour')`, env.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := fixture.service.retryDueContainerCleanups(fixture.ctx); err != nil {
@@ -1434,8 +1434,8 @@ func TestIntegrationAmbiguousCleanupUsesPostRestoreState(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_deployment_owners
-        (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id)
-        VALUES($1,'ambiguous',$2,$3,$4)`, env.ID, previousDeployment, previousRelease, previousDeployment); err != nil {
+        (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
+        VALUES($1,'ambiguous',$2,$3,$4,clock_timestamp(),clock_timestamp())`, env.ID, previousDeployment, previousRelease, previousDeployment); err != nil {
 		t.Fatal(err)
 	}
 	fixture.service.routeSync = func(context.Context) error {
@@ -1765,8 +1765,8 @@ func TestIntegrationAmbiguousDeploymentLookupFailureRetainsOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_platform_deployment_owners
-        (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id)
-        VALUES($1,'ambiguous',$2,$3,$4)`, env.ID, previousDeployment, previousRelease, previousDeployment); err != nil {
+        (environment_id,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
+        VALUES($1,'ambiguous',$2,$3,$4,clock_timestamp(),clock_timestamp())`, env.ID, previousDeployment, previousRelease, previousDeployment); err != nil {
 		t.Fatal(err)
 	}
 	fixture.service.routeSync = func(context.Context) error { return nil }

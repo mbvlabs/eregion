@@ -64,8 +64,8 @@ func (s *PostgresWebhookDeliveries) Admit(ctx context.Context, incoming api.Webh
 	err = insertTx.QueryRow(ctx, `INSERT INTO eregion_webhook_deliveries
         (delivery_id_hash, body_sha256, actor_kind, actor_subject, kind, target, state,
          environment_id, revision_id, secret_revision, secret_revision_hash,
-         repository, branch, commit_sha, job_id, admitted_at, admission_attempts)
-        VALUES ($1,$2,$3,$4,$5,$6,'admitted',$7,$8,$9,$10,$11,$12,$13,$14,clock_timestamp(),1)
+         repository, branch, commit_sha, job_id, admitted_at, admission_attempts, first_seen_at, error_code, error_detail)
+        VALUES ($1,$2,$3,$4,$5,$6,'admitted',$7,$8,$9,$10,$11,$12,$13,$14,clock_timestamp(),1,clock_timestamp(),'','')
         ON CONFLICT (environment_id, delivery_id_hash) DO NOTHING
         RETURNING first_seen_at`,
 		incoming.DeliveryIDHash, incoming.BodySHA256, incoming.Actor.Kind, incoming.Actor.Subject,

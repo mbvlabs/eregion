@@ -73,40 +73,38 @@ func TestIntegrationReleaseCommandRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	revisionID := platform.RevisionID("erv_" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_nodes(name,roles,capabilities) VALUES('main',ARRAY['application'],ARRAY['docker'])`); err != nil {
+	if err := insertFixtureNode(ctx, pool, "main", []string{"application"}, []string{"docker"}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name) VALUES($1,'demo')`, appID); err != nil {
+	if err := insertFixtureApp(ctx, pool, string(appID), "demo", "demo"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environments(id,app_id,name,node_name,host_port,candidate_port,container_port)
-        VALUES($1,$2,'production','main',20003,30003,8080)`, envID, appID); err != nil {
+	if err := insertFixtureEnvironment(ctx, pool, string(envID), string(appID), "production", "main", 20003, 30003, 8080); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions(id,environment_id,number,operation,runtime)
-        VALUES($1,$2,1,'env.changed','{"node":"main","health_path":"/"}')`, revisionID, envID); err != nil {
+	if err := insertFixtureRevision(ctx, pool, string(revisionID), string(envID), 1, `{"node":"main","health_path":"/"}`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,'platform.deploy','env/demo/production','operator','tester','original-command','hash','{}','failed')`, original); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations(id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,'platform.deploy','env/demo/production','operator','tester','original-command','hash','{}','failed',1,0,0,clock_timestamp(),clock_timestamp(),'')`, original); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases(id,operation_id,app_id,environment_id,image,source,status)
-        VALUES($1,$2,$3,$4,'demo:one','{}','ready')`, releaseID, original, appID, envID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases(id,operation_id,app_id,environment_id,image,image_id,source,status,error_code,error,created_at,commit_sha)
+        VALUES($1,$2,$3,$4,'demo:one','','{}','ready','','',clock_timestamp(),'')`, releaseID, original, appID, envID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_deployments(id,operation_id,app_id,environment_id,action,release_id,revision_id,state)
-        VALUES('dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',$1,$2,$3,'deploy',$4,$5,'succeeded')`, original, appID, envID, releaseID, revisionID); err != nil {
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_deployments(id,operation_id,app_id,environment_id,action,release_id,revision_id,state,error_code,message,created_at,updated_at,secret_revisions,instances)
+        VALUES('dep_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',$1,$2,$3,'deploy',$4,$5,'succeeded','','',clock_timestamp(),clock_timestamp(),'{}','[]')`, original, appID, envID, releaseID, revisionID); err != nil {
 		t.Fatal(err)
 	}
 	digest := platform.ReleaseCommandDigest(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})
 	inputsHash := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_release_command_runs
-        (release_id,command_digest,operation_id,state) VALUES($1,$2,$3,'running')`, releaseID, digest, original); err != nil {
+        (release_id,command_digest,operation_id,state,error_code,error,started_at) VALUES($1,$2,$3,'running','','',clock_timestamp())`, releaseID, digest, original); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operation_steps(operation_id,step,inputs_hash,state,attempt,execution_id)
-        VALUES($1,$2,$3,'running',1,$4)`, original, deploymentCommandStep, inputsHash,
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operation_steps(operation_id,step,inputs_hash,state,attempt,execution_id,started_at,error,error_code)
+        VALUES($1,$2,$3,'running',1,$4,clock_timestamp(),'','')`, original, deploymentCommandStep, inputsHash,
 		engine.Execution{OperationID: original, Attempt: 1, Step: deploymentCommandStep}.ExecutionID()); err != nil {
 		t.Fatal(err)
 	}

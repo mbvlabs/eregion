@@ -129,8 +129,8 @@ func (s *Service) acquireDeploymentOwner(ctx context.Context, dep platform.Deplo
 	}
 	defer rollback(tx)
 	tag, err := tx.Exec(ctx, `INSERT INTO eregion_platform_deployment_owners
-        (environment_id,operation_id,deployment_id,owner_attempt,phase,route_target_deployment_id,restore_release_id,restore_deployment_id)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        (environment_id,operation_id,deployment_id,owner_attempt,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp(),clock_timestamp())
         ON CONFLICT (environment_id) DO NOTHING`,
 		env.ID, dep.OperationID, dep.ID, attempt, string(phase),
 		nullableDeploymentID(target), nullableReleaseID(restoreRelease), nullableDeploymentID(restoreDeployment))
@@ -423,12 +423,23 @@ func isNotFound(err error) bool {
 // owner's instances. Maintenance removes them only after ownership is released
 // and the guards prove they are neither serving nor the current route target.
 func (s *Service) recordDeploymentRestoreServing(ctx context.Context, env platform.Environment, release platform.ReleaseID, deployment platform.DeploymentID) error {
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_environments
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return unavailable(err)
+	}
+	defer rollback(tx)
+	if err := lockServingPointersTx(ctx, tx, env.ID, release, deployment); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
         SET serving_release_id=$2,serving_deployment_id=$3,applied_release_id=$2,
             health_state='unknown',health_detail='the recorded serving route was restored; restore health was not observed',
             health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
         WHERE id=$1`, env.ID, nullableReleaseID(release), nullableDeploymentID(deployment)); err != nil {
 		return unavailable(fmt.Errorf("record restored serving state: %w", err))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }

@@ -5,6 +5,131 @@ Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 tracks execution. This file says what must work on a real server and what has
 been observed.
 
+## CLI help correction (2026-11-13, unpublished)
+
+Compared the installed vaire CLI and its local command construction. The
+corrected operator overview removes experimental branding, shares one plain
+presentation across no arguments, `help` and `--help`, and presents usage,
+commands, flags and examples. Group help lists visible children early; leaf
+help preserves safety details and adds typed flags and meaningful defaults.
+JSON help retains command contracts; root JSON retains version/catalog and
+removes the obsolete stage label.
+
+Independent source review, fresh builds, vet and offline CLI verification
+passed. The three root help forms are byte-identical; the visible JSON catalog
+is unchanged (102 commands), and metadata validation covers all 117 contracts,
+including hidden node paths. Group/leaf help, search, exact-path discovery and
+structured typo errors passed. Tracing recorded no network calls or credential
+file access with an empty home and nonexistent workspace store.
+These checks do not qualify server setup or deployment behavior. No unit tests
+were added or run, and no installed-binary replacement occurred.
+
+Candidate `2fad8a3` passed CI `43432621075`: build/static checks, macOS build,
+and normal/race PostgreSQL integrations. Each database run passed 225 top-level
+tests with one expected crash-helper skip; durations were 176.926 and 182.896
+seconds. Release publication still requires the storage/bootstrap gates below.
+
+## Current test boundary (operator decision, 2026-11-13)
+
+Automated behavioral coverage is integration-only: real PostgreSQL and/or
+running API/application services. All unit tests are removed, including
+mock-only HTTP/RPC, parser-only and offline shell fixture tests. Do not rename
+those tests to retain them. Database/service tests may fake external host
+effects, but their application behavior and persistence must be real.
+
+Server setup/provisioning, SSH/WireGuard host behavior and real deployment-host
+qualification are manual on an explicitly authorized server. Automated test
+recipes do not start local PostgreSQL or SSH/WireGuard fixture containers.
+Build, formatting, vet and actual production release-verification safeguards
+remain automated.
+
+The normal and race integration recipes require a disposable database DSN.
+CI supplies its isolated PostgreSQL service; an ambient installation DSN is
+never an authorized substitute. Historical unit-test counts and shell-harness
+results below describe earlier candidates, not the current verification gate.
+
+The local integration-only candidate adds database-backed assertions for
+Go-owned defaults, admission atomicity and invalid enum/data rejection across
+application/environment creation, domains/resources, deployment records,
+retention, vault/provider revisions, audit allocation, cleanup and release
+commands. It also exercises authenticated HTTP resource admission against the
+real database-backed service and checks corrupted stored resource/secret
+snapshots fail closed. Existing worker, migration, recovery and
+concurrency integrations remain; the real API/worker executable lifecycle test
+is retained, with its explicit Linux/database/public-host-key prerequisites.
+
+Candidate `6ae7b0a` ran in CI `43426626454`. Build/static checks and macOS passed.
+The normal PostgreSQL suite completed in 192.894 seconds with 223 top-level
+passes, one expected helper skip, and two failures in new node-initialization
+and retention-run default assertions. The 21-file Goose migration, partial
+history retry and orphan-refusal integrations passed. The race step did not
+run because the normal suite failed. This is partial qualification only;
+corrections and a complete normal/race rerun are required.
+
+## Unpublished three-channel correction (2026-11-13)
+
+The reviewed local correction routes development/alpha/beta to edge, release
+candidates to rc and finals to stable. Focused release/upgrade tests, offline
+publication harnesses, temporary-Git ordering tests and conditional-write
+adapter tests passed. The pinned AWS CLI passed offline model checks and a
+local fake-HTTP conditional-header/412 test. These are not live R2 evidence;
+the downloaded CLI's official artifact checksum was not independently verified.
+
+Before publication qualification, verify conditional pointer writes on an
+explicitly authorized R2 target. Publish and verify the first corrected
+anonymous edge build separately, including historical beta.5's edge upgrade,
+before attesting bootstrap completion or allowing a tagged alpha/beta to
+replace the pointer. The bootstrap attestation is not set by this work.
+Historical beta.5 may reject later tag-signed edge pointers and may fail closed
+during a moving manifest/bundle race. No compatibility guarantee, new release
+or existing-server upgrade is claimed.
+
+Artifact upload now runs a fail-closed live storage preflight before writing
+any release artifact. Against one unique disposable key it requires create-only
+collision and stale-ETag rejection, unchanged content/ETags, successful matching
+replacement and exact owned-key cleanup. Static review and shell syntax checks
+passed; this is not live qualification until the authorized publisher records
+all checks and successful cleanup.
+
+## Unpublished separate Goose history (2026-11-13)
+
+The correction must retain separate, dependency-ordered Goose migrations for
+the original schema areas, including vault tables, rather than one baseline.
+Each table is created in its final shape without subsequent ALTER migrations.
+Published beta.5 remains schema 33. The replacement history has no
+application defaults, domain CHECKs, business triggers or policy seeds; Go
+supplies initial values and validates references and domain policy. Source
+review covered schema parity, write values, read validation, migration refusal
+and parent/reference locking. These reviews do not establish PostgreSQL passes.
+
+Qualification must use an explicitly authorized fresh disposable PostgreSQL
+target, never an ambient installation DSN. Required evidence includes read-only
+planning, refusal of legacy/orphan/River-only schemas without writes, supported
+schema resolution, transactional migration retry, concurrent migrators,
+cancellation/pool lifetime, Goose/River recovery histories, fresh definition
+apply without a DNS-policy row, explicit-value fixtures, and coordinated
+pointer/build/diagnostic/deletion/retention races. Preserve stale-attempt,
+unknown-effect and restore-owner protections. No existing database migration,
+adoption or compatibility path is promised.
+
+The operator authorized a CI-only branch submission. Candidate `e6f5eab` ran
+against the existing isolated PostgreSQL 17 service in CI `43416047287`.
+Integration completed in 329.793 seconds with 228 top-level passes, one expected
+helper skip and one resource-reconciliation failure. Goose fresh/read-only
+planning, refusal, history validation, transactional retry, schema selection,
+two-connection concurrency/cancellation and the added pointer-locking
+regressions passed. This is partial evidence, not an overall suite pass.
+Linux also failed an SSH deadline assertion, and macOS failed the conditional
+AWS adapter fixture. Corrections and a full CI rerun are required. Only CI ran:
+no publication or existing-server/database change occurred.
+
+Candidate `5d3eecc` subsequently passed all CI jobs, including 229 top-level
+PostgreSQL passes and one expected helper skip. **That result covers the
+incorrect single-file layout only.** The operator then clarified that the
+history must use separate migrations. The split requires fresh source,
+ordering, pending-version and partial-migration retry verification; the earlier
+green CI must not be presented as qualification of the corrected layout.
+
 ## Beta.4 incremental acceptance
 
 These checks describe the candidate changes, not a pass record. Publication is
@@ -120,6 +245,15 @@ worker-lease root cause, and this candidate does not claim that cause fixed.
 | Retention | Verify all environments sharing an app repository protect accepted pending/serving/rollback manifest digests and moved tags under the unchanged D30 policy, with exact repository parsing and no external-registry deletion. |
 | Definition and export | Apply a schema-2 definition with a Git `[source]`, an empty/absent source, and root `image_repository`. Verify schema-1 documents and `source.kind`/`source.image` are rejected without aliases, an omitted or empty source clears an existing Git recipe, export omits a Git-less source, enabled automation without Git is refused rather than silently retaining an enabled webhook, `app export` writes the actual repository, and environment apply cannot change it. |
 | Git-less CLI default | Create an image-only app via flags, definition file and interactive/non-TTY paths without `--no-deploy`. Verify no first deploy is requested, while an explicit API `deploy: true` without Git/artifact still fails before any partial commit. A missing app inventory lookup for export must fail closed, never fabricate a default-slug repository. |
+
+**Pre-RC definition version decision (2026-11-13):** published
+`v1.0.0-beta.5` remains the immutable historical record and used definition
+version 2. The current pre-RC source returns the marker to version 1 for the
+next prerelease: it accepts version-1 documents only, rejects version 2 as
+unsupported, and still rejects `source.kind`/`source.image` as unknown fields
+under version 1. The approved app repository, optional Git source and
+no-environment-image-mode model is unchanged. The beta.5 row above keeps its
+published criteria; current definition/export checks use version 1.
 
 The beta.5 PostgreSQL admission/replay/placement regressions are gated on an
 explicitly authorized disposable DSN. Local verification compiled them without

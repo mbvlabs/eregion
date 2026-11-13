@@ -106,8 +106,8 @@ func TestIntegrationRetentionPolicyRepository(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_retention_runs
-        (id,status,planned_items,removed_items,planned_bytes,reclaimed_bytes,errors,finished_at)
-        VALUES($1,'succeeded','[{"kind":"release","reference":"rel_1"}]'::jsonb,'[]'::jsonb,2048,1024,'[]'::jsonb,clock_timestamp())`,
+        (id,status,planned_items,removed_items,planned_bytes,reclaimed_bytes,errors,started_at,finished_at,cache_measurement_error,gc_generation)
+        VALUES($1,'succeeded','[{"kind":"release","reference":"rel_1"}]'::jsonb,'[]'::jsonb,2048,1024,'[]'::jsonb,clock_timestamp(),clock_timestamp(),'',0)`,
 		runID); err != nil {
 		t.Fatal(err)
 	}
@@ -200,14 +200,14 @@ func insertRetentionRelease(t *testing.T, pool *pgxpool.Pool, app, environment s
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,$2,$3,'system','retention-test',$4,'retention-test','{}'::jsonb,'succeeded')`,
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,$2,$3,'system','retention-test',$4,'retention-test','{}'::jsonb,'succeeded',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, platform.KindDeploy, "env/"+app+"/"+environment, "retention-release:"+string(releaseID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_releases
-        (id,operation_id,app_id,environment_id,image,source,status,pruned_at)
-        VALUES($1,$2,$3,$4,'ghcr.io/acme/pruned:2026-11-03','{"type":"image"}'::jsonb,'ready',$5)`,
+        (id,operation_id,app_id,environment_id,image,image_id,source,status,error_code,error,created_at,commit_sha,pruned_at)
+        VALUES($1,$2,$3,$4,'ghcr.io/acme/pruned:2026-11-03','','{"type":"image"}'::jsonb,'ready','','',clock_timestamp(),'',$5)`,
 		releaseID, operationID, appID, environmentID, prunedAt); err != nil {
 		t.Fatal(err)
 	}
@@ -325,14 +325,14 @@ func insertRetentionDeployment(t *testing.T, pool *pgxpool.Pool, app, environmen
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES($1,$2,$3,'system','retention-test',$4,'retention-test','{}'::jsonb,'succeeded')`,
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,$2,$3,'system','retention-test',$4,'retention-test','{}'::jsonb,'succeeded',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, platform.KindDeploy, "env/"+app+"/"+environment, "retention-deployment:"+string(deploymentID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_deployments
-        (id,operation_id,app_id,environment_id,action,release_id,state)
-        VALUES($1,$2,$3,$4,'deploy',$5,'succeeded')`,
+        (id,operation_id,app_id,environment_id,action,release_id,state,error_code,message,created_at,updated_at,secret_revisions,instances)
+        VALUES($1,$2,$3,$4,'deploy',$5,'succeeded','','',clock_timestamp(),clock_timestamp(),'{}'::jsonb,'[]'::jsonb)`,
 		deploymentID, operationID, appID, environmentID, releaseID); err != nil {
 		t.Fatal(err)
 	}

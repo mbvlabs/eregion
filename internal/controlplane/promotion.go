@@ -32,6 +32,9 @@ func (s *Service) preparePromotionTx(ctx context.Context, tx pgx.Tx, operationID
 	if err != nil {
 		return err
 	}
+	if _, err := lockPointerEnvironmentTx(ctx, tx, plan.TargetEnvironment.ID); err != nil {
+		return err
+	}
 	releaseID, err := platform.NewReleaseID()
 	if err != nil {
 		return unavailable()
@@ -41,8 +44,8 @@ func (s *Service) preparePromotionTx(ctx context.Context, tx pgx.Tx, operationID
 		return contract.NewFault(contract.Internal, "could not encode the promoted artifact source", "Report the command and binary version.")
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_releases
-        (id,operation_id,app_id,environment_id,image,image_id,source,status,commit_sha,completed_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp())`,
+        (id,operation_id,app_id,environment_id,image,image_id,source,status,commit_sha,completed_at,error_code,error,created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp(),'','',clock_timestamp())`,
 		releaseID, operationID, envAppID(ctx, tx, plan.TargetEnvironment.App), plan.TargetEnvironment.ID,
 		plan.SourceRelease.Image, plan.SourceRelease.ImageID, sourceJSON, plan.SourceRelease.CommitSHA); err != nil {
 		return platformWriteError(err, "promoted release could not be recorded")

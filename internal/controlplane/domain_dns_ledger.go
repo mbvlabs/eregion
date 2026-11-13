@@ -221,8 +221,8 @@ func upsertDomainDNSIntentTx(ctx context.Context, tx pgx.Tx, domainID platform.D
 		}
 	case errors.Is(err, pgx.ErrNoRows):
 		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domain_dns
-            (domain_id,provider,zone_id,zone_name,ownership_marker,generation,desired_origins,desired_proxied,state,last_operation_id)
-            VALUES($1,'cloudflare',$2,$3,$4,1,$5,$6,'pending',$7)`,
+            (domain_id,provider,zone_id,zone_name,ownership_marker,generation,desired_origins,desired_proxied,state,last_operation_id,last_error,applied_generation,cleanup_error,created_at,updated_at)
+            VALUES($1,'cloudflare',$2,$3,$4,1,$5,$6,'pending',$7,'',0,'',clock_timestamp(),clock_timestamp())`,
 			domainID, zone.ZoneID, zone.ZoneName, marker, origins, proxied, opID); err != nil {
 			return unavailable()
 		}
@@ -247,8 +247,8 @@ func insertDomainDNSCleanupIntentTx(ctx context.Context, tx pgx.Tx, domainID pla
 	marker := integrations.DomainDNSOwnership(string(domainID), zone.ZoneID)
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domain_dns
         (domain_id,provider,zone_id,zone_name,ownership_marker,generation,desired_origins,desired_proxied,
-         state,last_operation_id,cleanup_requested_at)
-        VALUES($1,'cloudflare',$2,$3,$4,1,'{}',false,'cleanup_pending',$5,clock_timestamp())`,
+         state,last_operation_id,cleanup_requested_at,last_error,applied_generation,cleanup_error,created_at,updated_at)
+        VALUES($1,'cloudflare',$2,$3,$4,1,'{}',false,'cleanup_pending',$5,clock_timestamp(),'',0,'',clock_timestamp(),clock_timestamp())`,
 		domainID, zone.ZoneID, zone.ZoneName, marker, opID); err != nil {
 		return unavailable()
 	}

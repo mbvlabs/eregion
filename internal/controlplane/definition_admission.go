@@ -144,9 +144,10 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return zero, unavailable(err)
 	}
-	var revision int64
-	if err = tx.QueryRow(ctx, `SELECT revision FROM eregion_definition_dns_policy WHERE singleton=true FOR SHARE`).Scan(&revision); err != nil {
-		return zero, unavailable(err)
+	// Absence is the typed revision-zero disabled policy, not a storage error.
+	// The advisory lock above also serializes creation of the singleton.
+	if _, err = scanDefinitionDNSPolicy(tx.QueryRow(ctx, definitionDNSPolicySelect+` FOR SHARE OF p`)); err != nil {
+		return zero, err
 	}
 	// Lock existing secret and provider metadata rows in deterministic order.
 	for _, query := range []string{
@@ -199,7 +200,7 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 	if err != nil {
 		return zero, err
 	}
-	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued') ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`, id, platform.KindDefinitionApply, target, actor.Kind, actor.Subject, input.IdempotencyKey, requestHash, canonical)
+	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,error_code,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued',0,0,0,'',clock_timestamp(),clock_timestamp()) ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`, id, platform.KindDefinitionApply, target, actor.Kind, actor.Subject, input.IdempotencyKey, requestHash, canonical)
 	if err != nil {
 		return zero, unavailable(err)
 	}
@@ -210,7 +211,7 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 	if err != nil {
 		return zero, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO eregion_definition_runs (operation_id,plan_nonce,environment_id,approved) VALUES ($1,$2,$3,$4)`, id, input.Plan.PlanNonce, current.EnvironmentID, approved)
+	_, err = tx.Exec(ctx, `INSERT INTO eregion_definition_runs (operation_id,plan_nonce,environment_id,approved,next_step,failure_code,failure_message) VALUES ($1,$2,$3,$4,0,'','')`, id, input.Plan.PlanNonce, current.EnvironmentID, approved)
 	if err != nil {
 		var pgerr *pgconn.PgError
 		if errors.As(err, &pgerr) && pgerr.Code == "23505" {
@@ -232,7 +233,7 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 				return zero, err
 			}
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO eregion_definition_steps (parent_operation_id,ordinal,kind,target,input,domain_id,allocated_domain_id,dns_plan,dns_cleanup) VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$8,$9)`, id, i, step.Kind, step.Target, step.Input, string(step.DomainID), string(step.AllocatedDomainID), dns, cleanup)
+		_, err = tx.Exec(ctx, `INSERT INTO eregion_definition_steps (parent_operation_id,ordinal,kind,target,input,domain_id,allocated_domain_id,dns_plan,dns_cleanup,dns_progress) VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$8,$9,'[]'::jsonb)`, id, i, step.Kind, step.Target, step.Input, string(step.DomainID), string(step.AllocatedDomainID), dns, cleanup)
 		if err != nil {
 			var pgerr *pgconn.PgError
 			if errors.As(err, &pgerr) && pgerr.Code == "23505" {

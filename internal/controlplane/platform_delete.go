@@ -338,6 +338,9 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 	}
 	defer hostRelease()
 	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+		if _, err := appByNameForUpdateTx(ctx, tx, env.App); err != nil {
+			return err
+		}
 		if err := deleteEnvironmentRowsTx(ctx, tx, env); err != nil {
 			return err
 		}
@@ -423,6 +426,13 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 	}
 	defer hostRelease()
 	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+		lockedApp, err := appByNameForUpdateTx(ctx, tx, app.Name)
+		if err != nil {
+			return err
+		}
+		if lockedApp.ID != app.ID {
+			return pointerIntegrityFault()
+		}
 		for _, env := range environments {
 			if err := deleteEnvironmentRowsTx(ctx, tx, env); err != nil {
 				return err
@@ -442,6 +452,33 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 }
 
 func deleteEnvironmentRowsTx(ctx context.Context, tx pgx.Tx, env platform.Environment) error {
+	appID, err := lockPointerEnvironmentTx(ctx, tx, env.ID)
+	if err != nil {
+		return err
+	}
+	var name string
+	if err := tx.QueryRow(ctx, `SELECT name FROM eregion_platform_apps WHERE id=$1`, appID).Scan(&name); err != nil || name != env.App {
+		return pointerIntegrityFault()
+	}
+	// Never cascade through a corrupt cross-environment reference. All supported
+	// pointer writers validate ownership while holding the target environment.
+	var foreign bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM eregion_platform_environments e WHERE e.id<>$1 AND (
+			e.current_revision_id IN (SELECT id FROM eregion_platform_environment_revisions WHERE environment_id=$1)
+			OR e.desired_release_id IN (SELECT id FROM eregion_platform_releases WHERE environment_id=$1)
+			OR e.applied_release_id IN (SELECT id FROM eregion_platform_releases WHERE environment_id=$1)
+			OR e.serving_release_id IN (SELECT id FROM eregion_platform_releases WHERE environment_id=$1)
+			OR e.serving_deployment_id IN (SELECT id FROM eregion_platform_deployments WHERE environment_id=$1))
+		UNION ALL
+		SELECT 1 FROM eregion_platform_releases r WHERE r.environment_id<>$1 AND
+			r.build_id IN (SELECT id FROM eregion_platform_builds WHERE environment_id=$1)
+	)`, env.ID).Scan(&foreign); err != nil {
+		return unavailable(err)
+	}
+	if foreign {
+		return pointerIntegrityFault()
+	}
 	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
         SET desired_release_id=NULL,applied_release_id=NULL,serving_release_id=NULL,
             serving_deployment_id=NULL,current_revision_id=NULL,updated_at=clock_timestamp()
@@ -493,8 +530,15 @@ func deleteApplicationRowsTx(ctx context.Context, tx pgx.Tx, app platform.App) e
 	if app.ID == "" {
 		return contract.NewFault(contract.Internal, "application identity is missing for deletion", "Reload the application and retry; deletion is bound to the durable app ID, not its name alone.")
 	}
-	// Changes and any remaining environments cascade with the app row. Secret
-	// namespaces are not foreign keys to platform apps and are removed here.
+	// Do not let the app cascade bypass per-environment pointer validation.
+	var remaining bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM eregion_platform_environments WHERE app_id=$1)`, app.ID).Scan(&remaining); err != nil {
+		return unavailable(err)
+	}
+	if remaining {
+		return contract.NewFault(contract.Conflict, "application still has environments", "Reload the application and retry deletion.")
+	}
+	// Secret namespaces are not foreign keys to platform apps.
 	tag, err := tx.Exec(ctx, `DELETE FROM eregion_platform_apps WHERE id=$1`, app.ID)
 	if err != nil {
 		return unavailable()

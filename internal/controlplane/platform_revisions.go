@@ -14,6 +14,12 @@ import (
 // row lock held by the caller (or the just-inserted row in this transaction)
 // serializes the per-environment number.
 func insertEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, envID platform.EnvironmentID, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState) (platform.RevisionID, int, error) {
+	if err := actor.Validate(); err != nil {
+		return "", 0, err
+	}
+	if len(operation) < 1 || len(operation) > 64 {
+		return "", 0, contract.NewFault(contract.ValidationFailed, "invalid revision operation", "Use an operation name between 1 and 64 bytes.")
+	}
 	if err := platform.NormalizeRevisionState(&state); err != nil {
 		return "", 0, err
 	}
@@ -32,8 +38,8 @@ func insertEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, envID platform.
 	retentionOverride, _ := json.Marshal(state.Retention)
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
         (id,environment_id,number,operation_id,actor_kind,actor_subject,operation,summary,
-         source,auto_deploy,webhook_secret_name,runtime,processes,config,secret_names,resources,deploy_intent,retention)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+         source,auto_deploy,webhook_secret_name,runtime,processes,config,secret_names,resources,deploy_intent,retention,created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,clock_timestamp())`,
 		revisionID, envID, number, nullableOperationID(opID), actor.Kind, actor.Subject, operation, summary,
 		source, state.AutoDeploy, state.WebhookSecretName, runtime, processes, config, state.SecretNames, state.Resources, state.DeployIntent,
 		retentionOverride); err != nil {
@@ -86,6 +92,9 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	}
 	config, _ := json.Marshal(state.Config)
 	secretRefs := spec.SecretRefs
+	if secretRefs == nil {
+		secretRefs = map[string]string{}
+	}
 	if len(state.SecretNames) > 0 {
 		secretRefs = map[string]string{}
 	}
@@ -102,14 +111,20 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 		protected = *spec.Protected
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environments
-        (id,app_id,name,node_name,build_node,host_port,candidate_port,container_port,bind_address,health_type,health_path,health_timeout_seconds,env,secret_refs,protected)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        (id,app_id,name,node_name,build_node,host_port,candidate_port,container_port,bind_address,health_type,health_path,health_timeout_seconds,env,secret_refs,protected,secret_revision,health_state,health_detail,created_at,updated_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0,'unknown','',clock_timestamp(),clock_timestamp())`,
 		envID, app.ID, spec.Name, node.Name, buildNode, hostPort, candidatePort, containerPort, spec.Bind,
 		state.Runtime.HealthType, state.Runtime.HealthPath, state.Runtime.HealthTimeoutSeconds, config, refs, protected); err != nil {
 		return "", platformWriteError(err, "environment name or port already exists")
 	}
 	revisionID, _, err := insertEnvironmentRevisionTx(ctx, tx, envID, opID, actor, operation, summary, state)
 	if err != nil {
+		return "", err
+	}
+	if _, err := lockPointerEnvironmentTx(ctx, tx, envID); err != nil {
+		return "", err
+	}
+	if err := lockRevisionPointerTx(ctx, tx, envID, revisionID); err != nil {
 		return "", err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2,updated_at=clock_timestamp() WHERE id=$1`, envID, revisionID); err != nil {
@@ -172,11 +187,17 @@ func revisionStateFromSpec(spec platform.EnvironmentSpec, node string, deployInt
 // columns the current deploy worker still reads. The mirror goes away with the
 // per-process container work in work list row 5.
 func publishEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, env platform.Environment, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState, buildNode *string) (platform.RevisionID, error) {
+	if _, err := lockPointerEnvironmentTx(ctx, tx, env.ID); err != nil {
+		return "", err
+	}
 	if err := platform.NormalizeRevisionState(&state); err != nil {
 		return "", err
 	}
 	revisionID, _, err := insertEnvironmentRevisionTx(ctx, tx, env.ID, opID, actor, operation, summary, state)
 	if err != nil {
+		return "", err
+	}
+	if err := lockRevisionPointerTx(ctx, tx, env.ID, revisionID); err != nil {
 		return "", err
 	}
 	node := state.Runtime.Node

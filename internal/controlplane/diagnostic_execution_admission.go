@@ -48,10 +48,37 @@ func resolveDiagnosticExecutionPlacement(ctx context.Context, tx pgx.Tx, origina
 		return pin, refuse()
 	}
 	lockDeployment, lockRevision := "", ""
+	deploymentQuery := deploymentSelect + " WHERE d.operation_id=$1"
+	args := []any{original}
 	if lock {
+		var depID, appID, envID, releaseID string
+		var revisionID *string
+		err := tx.QueryRow(ctx, `SELECT id,app_id,environment_id,release_id,revision_id FROM eregion_platform_deployments WHERE operation_id=$1`, original).Scan(&depID, &appID, &envID, &releaseID, &revisionID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return pin, refuse()
+		}
+		if err != nil {
+			return pin, unavailable(err)
+		}
+		if revisionID == nil || *revisionID == "" {
+			return pin, refuse()
+		}
+		if err := lockAppKeyShareTx(ctx, tx, appID); err != nil {
+			return pin, err
+		}
+		var lockedEnv string
+		err = tx.QueryRow(ctx, `SELECT id FROM eregion_platform_environments WHERE id=$1 AND app_id=$2 FOR KEY SHARE`, envID, appID).Scan(&lockedEnv)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return pin, refuse()
+		}
+		if err != nil {
+			return pin, unavailable(err)
+		}
+		deploymentQuery += ` AND d.id=$2 AND d.app_id=$3 AND d.environment_id=$4 AND d.release_id=$5 AND d.revision_id=$6`
+		args = append(args, depID, appID, envID, releaseID, *revisionID)
 		lockDeployment, lockRevision = " FOR SHARE OF d", " FOR SHARE OF r"
 	}
-	dep, err := scanDeploymentRow(tx.QueryRow(ctx, deploymentSelect+" WHERE d.operation_id=$1"+lockDeployment, original))
+	dep, err := scanDeploymentRow(tx.QueryRow(ctx, deploymentQuery+lockDeployment, args...))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pin, refuse()
 	}
@@ -180,8 +207,8 @@ func (s *Service) SubmitDiagnosticExecution(ctx context.Context, actor contract.
 		return zero, err
 	}
 	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued')
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,error_code,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued',0,0,0,'',clock_timestamp(),clock_timestamp())
         ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`,
 		id, platform.KindDiagnosticExecution, target, actor.Kind, actor.Subject, key, inputHash, canonical)
 	if err != nil {

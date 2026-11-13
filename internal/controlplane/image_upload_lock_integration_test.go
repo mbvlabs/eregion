@@ -125,8 +125,7 @@ func TestIntegrationImageUploadLeaseRefusesStaleDeleteRecreateBeforePayload(t *t
 		if _, err := fixture.pool.Exec(ctx, `DELETE FROM eregion_platform_apps WHERE name='live'`); err != nil {
 			return err
 		}
-		_, err := fixture.pool.Exec(ctx, `INSERT INTO eregion_platform_apps(id,name,image_repository) VALUES($1,'live','live')`, recreated)
-		return err
+		return insertFixtureApp(ctx, fixture.pool, string(recreated), "live", "live")
 	})
 	if lease != nil {
 		lease.Release()
@@ -227,8 +226,8 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 		{envOp, platform.KindEnvironmentDelete, "env/live/production"},
 	} {
 		if _, err := fixture.pool.Exec(fixture.ctx, `INSERT INTO eregion_operations
-            (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt)
-            VALUES($1,$2,$3,'operator','cross-host',$1,'sha256:hash','{}','running',1)`,
+            (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+            VALUES($1,$2,$3,'operator','cross-host',$1,'sha256:hash','{}','running',1,0,0,clock_timestamp(),clock_timestamp(),'')`,
 			row.id, row.kind, row.target); err != nil {
 			t.Fatal(err)
 		}

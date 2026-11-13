@@ -101,8 +101,8 @@ func seedArtifactRelease(t *testing.T, s *Service, app, environment, image strin
 	}
 	inputHash := hex.EncodeToString(sha256Sum("release-fixture:" + image))
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_operations
-        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,created_at,updated_at,error_code)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,clock_timestamp(),clock_timestamp(),'')`,
 		operationID, platform.KindDeploy, "env/"+app+"/"+environment,
 		testActor.Kind, testActor.Subject, string(operationID), inputHash,
 		`{"seed":"release-fixture"}`,

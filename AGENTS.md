@@ -59,8 +59,12 @@ sketches as the design reference; `docs/workspace.md` describes current views.
   flow rather than isolated handlers. Repository product decisions constrain the
   implementation. Record implementation and manual qualification separately.
 - Fix root causes in the release; do not add ad-hoc repair commands as substitutes.
-- Add isolated unit/regression tests, build and vet. No new Docker, Incus or
-  scratch-VM harnesses. Host qualification is manual on an authorized real server.
+- Test policy (operator decision, 2026-11-13): no unit tests. Add regressions
+  through real PostgreSQL and/or running API/application-service integration.
+  Retain helpers only where those integrations need them; do not rename pure
+  mock tests as integration tests. Server setup/provisioning and SSH/WireGuard
+  host qualification are manual. Keep build, vet and static checks. No new
+  Docker, Incus or scratch-VM harnesses.
 - Existing tests can start Docker automatically. Inspect selected tests before
   running them; do not assume `go test ./...` is an offline-only suite.
 - Never use an ambient production DSN/context as a test target. Do not change a

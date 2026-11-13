@@ -68,42 +68,40 @@ func managedByPackageManager(path string) bool {
 	return false
 }
 
-// SelectChannel returns the release channel to follow. Without --channel, a
-// stable build follows its own major line (stable-1.x for 1.y.z), so moving
-// to the next major is an explicit --channel stable or stable-<major>.x.
+// SelectChannel returns the logical release channel to follow.
 func SelectChannel(flag string) (string, error) {
 	return selectChannel(flag, buildinfo.Channel, buildinfo.Version)
 }
 
 func selectChannel(flag, channel, version string) (string, error) {
 	if strings.TrimSpace(flag) != "" {
-		return flag, nil
+		switch flag {
+		case release.ChannelEdge, release.ChannelRC, release.ChannelStable:
+			return flag, nil
+		default:
+			return "", contract.NewFault(contract.ValidationFailed, "invalid release channel", "Use edge, rc or stable.")
+		}
 	}
 	if channel == "dev" {
 		return "", contract.NewFault(
 			contract.InputRequired,
 			"upgrade needs --channel",
-			"A dev build has no channel to follow. Pass --channel stable, --channel stable-<major>.x or --channel edge.",
+			"A dev build has no channel to follow. Pass --channel stable, --channel rc or --channel edge.",
 		)
 	}
-	if channel == release.ChannelStable {
-		if v, ok := release.ParseStable(version); ok {
-			if v.Pre == "rc" {
-				return release.ChannelRC, nil
-			}
-			return v.Channel(), nil
-		}
+	if logical, ok := release.VersionChannel(version); ok {
+		return logical, nil
 	}
 	return channel, nil
 }
 
-// SelectVersionChannel selects a signing family for an explicitly pinned version.
+// SelectVersionChannel selects the logical channel for an explicitly pinned version.
 func SelectVersionChannel(flag, version string) (string, error) {
 	if flag == "" && version != "" {
-		if strings.HasPrefix(version, "edge-") {
-			return release.ChannelEdge, nil
+		if channel, ok := release.VersionChannel(version); ok {
+			return channel, nil
 		}
-		return release.ChannelStable, nil
+		return "", contract.NewFault(contract.ValidationFailed, "invalid release version", "Pass a valid release version.")
 	}
 	return SelectChannel(flag)
 }
@@ -128,7 +126,9 @@ func Decide(from Version, m release.Manifest, requested bool) Plan {
 	if from.Version == m.Version && from.Channel == m.Channel {
 		return plan
 	}
-	tagged := from.Channel == release.ChannelStable && m.Channel == release.ChannelStable
+	_, fromTagged := release.ParseStable(from.Version)
+	_, toTagged := release.ParseStable(m.Version)
+	tagged := fromTagged && toTagged
 	older := cmpSemver(m.Version, from.Version) < 0
 	if tagged && !requested && older {
 		plan.To = from

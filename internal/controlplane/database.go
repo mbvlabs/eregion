@@ -1,14 +1,14 @@
 // Package controlplane implements PostgreSQL state and River orchestration.
-// It is not imported by rendering or transport-independent domain packages.
 package controlplane
 
 import (
 	"context"
-	"crypto/sha256"
-	_ "embed"
-	"encoding/hex"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/netip"
 	"net/url"
@@ -16,165 +16,17 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/dbschema"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
 	"github.com/riverqueue/river/rivermigrate"
 )
 
-//go:embed migrations/001_operations.sql
-var migration001 string
-
-//go:embed migrations/002_node_execution.sql
-var migration002 string
-
-//go:embed migrations/003_operation_error_code.sql
-var migration003 string
-
-//go:embed migrations/004_platform.sql
-var migration004 string
-
-// 005 is a byte-for-byte copy of vault/schema.sql so the migration stays
-// explicit and immutable even if the package schema is edited later. A test
-// keeps the two identical until 005 is applied anywhere.
-//
-//go:embed migrations/005_vault.sql
-var migration005 string
-
-//go:embed migrations/006_integrations.sql
-var migration006 string
-
-//go:embed migrations/007_nodes.sql
-var migration007 string
-
-//go:embed migrations/008_webhook_deliveries.sql
-var migration008 string
-
-//go:embed migrations/009_platform_build_node.sql
-var migration009 string
-
-//go:embed migrations/010_platform_domains.sql
-var migration010 string
-
-//go:embed migrations/011_environment_revisions.sql
-var migration011 string
-
-//go:embed migrations/012_platform_deploy.sql
-var migration012 string
-
-//go:embed migrations/013_domain_state.sql
-var migration013 string
-
-//go:embed migrations/014_release_command_runs.sql
-var migration014 string
-
-//go:embed migrations/015_domain_check_path.sql
-var migration015 string
-
-//go:embed migrations/016_container_cleanup.sql
-var migration016 string
-
-//go:embed migrations/017_retention.sql
-var migration017 string
-
-//go:embed migrations/018_retention_measurements.sql
-var migration018 string
-
-//go:embed migrations/019_retention_gc_generation.sql
-var migration019 string
-
-//go:embed migrations/020_retention_skipped_status.sql
-var migration020 string
-
-//go:embed migrations/021_webhook_admissions.sql
-var migration021 string
-
-//go:embed migrations/022_managed_resources.sql
-var migration022 string
-
-//go:embed migrations/023_environment_resources.sql
-var migration023 string
-
-//go:embed migrations/024_environment_protection.sql
-var migration024 string
-
-//go:embed migrations/025_domain_dns_ownership.sql
-var migration025 string
-
-//go:embed migrations/026_deployment_lifecycle_owner.sql
-var migration026 string
-
-// 027 is a byte-for-byte copy of vault/provider_schema.sql so the migration
-// stays explicit and immutable even if the package schema is edited later.
-//
-//go:embed migrations/027_provider_credentials.sql
-var migration027 string
-
-//go:embed migrations/028_workspace_identity.sql
-var migration028 string
-
-//go:embed migrations/029_webhook_environment_identity.sql
-var migration029 string
-
-//go:embed migrations/030_definition_dns_policy.sql
-var migration030 string
-
-//go:embed migrations/031_definition_runs.sql
-var migration031 string
-
-//go:embed migrations/032_app_image_repository.sql
-var migration032 string
-
-//go:embed migrations/033_workspace_registry_host.sql
-var migration033 string
-
-type migration struct {
-	version int
-	name    string
-	sql     string
-}
-
-// migrations are applied in order. Never edit an applied migration; add a new
-// version instead. Each version has its own checksum so adding 002 does not make
-// an existing 001 database look edited.
-var migrations = []migration{
-	{version: 1, name: "001_operations.sql", sql: migration001},
-	{version: 2, name: "002_node_execution.sql", sql: migration002},
-	{version: 3, name: "003_operation_error_code.sql", sql: migration003},
-	{version: 4, name: "004_platform.sql", sql: migration004},
-	{version: 5, name: "005_vault.sql", sql: migration005},
-	{version: 6, name: "006_integrations.sql", sql: migration006},
-	{version: 7, name: "007_nodes.sql", sql: migration007},
-	{version: 8, name: "008_webhook_deliveries.sql", sql: migration008},
-	{version: 9, name: "009_platform_build_node.sql", sql: migration009},
-	{version: 10, name: "010_platform_domains.sql", sql: migration010},
-	{version: 11, name: "011_environment_revisions.sql", sql: migration011},
-	{version: 12, name: "012_platform_deploy.sql", sql: migration012},
-	{version: 13, name: "013_domain_state.sql", sql: migration013},
-	{version: 14, name: "014_release_command_runs.sql", sql: migration014},
-	{version: 15, name: "015_domain_check_path.sql", sql: migration015},
-	{version: 16, name: "016_container_cleanup.sql", sql: migration016},
-	{version: 17, name: "017_retention.sql", sql: migration017},
-	{version: 18, name: "018_retention_measurements.sql", sql: migration018},
-	{version: 19, name: "019_retention_gc_generation.sql", sql: migration019},
-	{version: 20, name: "020_retention_skipped_status.sql", sql: migration020},
-	{version: 21, name: "021_webhook_admissions.sql", sql: migration021},
-	{version: 22, name: "022_managed_resources.sql", sql: migration022},
-	{version: 23, name: "023_environment_resources.sql", sql: migration023},
-	{version: 24, name: "024_environment_protection.sql", sql: migration024},
-	{version: 25, name: "025_domain_dns_ownership.sql", sql: migration025},
-	{version: 26, name: "026_deployment_lifecycle_owner.sql", sql: migration026},
-	{version: 27, name: "027_provider_credentials.sql", sql: migration027},
-	{version: 28, name: "028_workspace_identity.sql", sql: migration028},
-	{version: 29, name: "029_webhook_environment_identity.sql", sql: migration029},
-	{version: 30, name: "030_definition_dns_policy.sql", sql: migration030},
-	{version: 31, name: "031_definition_runs.sql", sql: migration031},
-	{version: 32, name: "032_app_image_repository.sql", sql: migration032},
-	{version: 33, name: "033_workspace_registry_host.sql", sql: migration033},
-}
-
-const migrationLock int64 = 0x657265676d696772 // "eregmigr", separate from River locks.
+const migrationLock int64 = 0x657265676d696772
 
 type MigrationPlan struct {
 	Current       int `json:"current"`
@@ -201,8 +53,6 @@ func ParseDatabaseConfig(dsn string) (*pgxpool.Config, error) {
 	config.MaxConns = 12
 	config.ConnConfig.ConnectTimeout = 5 * time.Second
 	config.ConnConfig.RuntimeParams["application_name"] = "eregion"
-	// Readiness diagnostics are context-scoped on this shared pool. Attaching
-	// the tracer before pool creation keeps ordinary queries untouched.
 	config.ConnConfig.Tracer = &readinessTracer{}
 	return config, nil
 }
@@ -232,105 +82,242 @@ func migrator(pool *pgxpool.Pool) (*rivermigrate.Migrator[pgx.Tx], error) {
 	return rivermigrate.New(riverpgxv5.New(pool), &rivermigrate.Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 }
 
-func migrationHash(m migration) string {
-	hash := sha256.Sum256([]byte(m.sql))
-	return hex.EncodeToString(hash[:])
+func schemaMigrator(pool *pgxpool.Pool, schema string) (*rivermigrate.Migrator[pgx.Tx], error) {
+	return rivermigrate.New(riverpgxv5.New(pool), &rivermigrate.Config{Schema: schema, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 }
 
-func requiredVersion() int {
-	return migrations[len(migrations)-1].version
+func gooseProvider(db *sql.DB) (*goose.Provider, error) {
+	migrations, err := fs.Sub(dbschema.GooseFS, "migrations")
+	if err != nil {
+		return nil, err
+	}
+	return goose.NewProvider(goose.DialectPostgres, db, migrations)
 }
 
-func migrationByVersion(version int) (migration, bool) {
-	for _, m := range migrations {
-		if m.version == version {
-			return m, true
+func schemaFault(message string) error {
+	return contract.NewFault(contract.PreconditionFailed, message, "Use a fresh database; existing application schemas cannot be adopted or upgraded.")
+}
+
+type migrationIdentity struct{ schema, role string }
+
+const identityQuery = `SELECT cardinality(current_schemas(false)), current_schema(), current_user`
+
+func checkedIdentity(count int, schema, role string) (migrationIdentity, error) {
+	if count != 1 || schema == "" || role == "" {
+		return migrationIdentity{}, contract.NewFault(contract.PreconditionFailed, "unsupported database search_path", "Configure exactly one existing installation schema in search_path for every pool connection.")
+	}
+	return migrationIdentity{schema: schema, role: role}, nil
+}
+
+// Every connection Goose acquires is checked before it can issue any SQL.
+type migrationConnector struct {
+	driver.Connector
+	want migrationIdentity
+}
+
+func (c migrationConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.Connector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pgxConn, ok := conn.(*stdlib.Conn)
+	if !ok {
+		conn.Close()
+		return nil, fmt.Errorf("unexpected PostgreSQL connector")
+	}
+	var count int
+	var schema, role string
+	err = pgxConn.Conn().QueryRow(ctx, identityQuery).Scan(&count, &schema, &role)
+	if err == nil {
+		var got migrationIdentity
+		got, err = checkedIdentity(count, schema, role)
+		if err == nil && got != c.want {
+			err = contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
 		}
 	}
-	return migration{}, false
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
-// PlanMigrations performs no DDL. Newer/inconsistent schemas fail closed.
-// Each top-level read is labelled for readiness diagnostics; River's
-// ExistingVersions owns the river_migration existence/legacy checks and
-// performs several queries inside the river_versions stage.
+// PlanMigrations reads the Goose ledger in a read-only snapshot. Provider status
+// methods are deliberately not used: they can initialize the version table.
 func PlanMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
-	plan := MigrationPlan{Required: requiredVersion()}
-	exists, err := schemaMigrationsTableExists(ctx, pool)
+	plan, _, err := planMigrations(ctx, pool)
+	return plan, err
+}
+
+func planMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, migrationIdentity, error) {
+	plan, identity, err := inspectApplicationMigrations(ctx, pool)
 	if err != nil {
-		return plan, unavailable(err)
+		return plan, identity, err
+	}
+	m, err := schemaMigrator(pool, identity.schema)
+	if err != nil {
+		return plan, identity, err
+	}
+	riverVersions := m.AllVersions()
+	plan.RiverRequired = riverVersions[len(riverVersions)-1].Version
+	if err := readRiverMigrations(ctx, pool, m, identity, &plan); err != nil {
+		return plan, identity, err
+	}
+	return plan, identity, nil
+}
+
+func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan MigrationPlan, identity migrationIdentity, resultErr error) {
+	db := stdlib.OpenDBFromPool(pool)
+	defer db.Close() // releases wrapper connections, not the underlying pgx pool
+	provider, err := gooseProvider(db)
+	if err != nil {
+		return plan, identity, err
+	}
+	sources := provider.ListSources()
+	versions := make([]int64, len(sources))
+	for i, source := range sources {
+		versions[i] = source.Version
+		if source.Version != int64(i+1) {
+			return plan, identity, schemaFault("invalid application migration sources")
+		}
+	}
+	if len(versions) == 0 {
+		return plan, identity, schemaFault("missing application migration sources")
+	}
+	if len(versions) > 0 {
+		plan.Required = int(versions[len(versions)-1])
+	}
+	store, err := database.NewStore(database.DialectPostgres, goose.DefaultTablename)
+	if err != nil {
+		return plan, identity, err
+	}
+	extended, ok := store.(database.StoreExtender)
+	if !ok {
+		return plan, identity, schemaFault("Goose store cannot inspect its ledger")
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return plan, identity, unavailable(err)
+	}
+	defer tx.Rollback()
+	var count int
+	var schema, role sql.NullString
+	if err := tx.QueryRowContext(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+		return plan, identity, unavailable(err)
+	}
+	identity, err = checkedIdentity(count, schema.String, role.String)
+	if err != nil {
+		return plan, identity, err
+	}
+	var old bool
+	if err := tx.QueryRowContext(ctx, "SELECT to_regclass('eregion_schema_migrations') IS NOT NULL").Scan(&old); err != nil {
+		return plan, identity, unavailable(err)
+	}
+	if old {
+		return plan, identity, schemaFault("legacy application migration ledger exists")
+	}
+	exists, err := extended.TableExists(ctx, tx)
+	if err != nil {
+		return plan, identity, unavailable(err)
 	}
 	if exists {
-		if err := readSchemaMigrations(ctx, pool, &plan); err != nil {
-			return plan, err
+		history, err := store.ListMigrations(ctx, tx)
+		if err != nil {
+			return plan, identity, unavailable(err)
+		}
+		plan.Current, err = validateGooseHistory(history, versions)
+		if err != nil {
+			return plan, identity, schemaFault("invalid application migration history")
 		}
 	}
-	m, err := migrator(pool)
-	if err != nil {
-		return plan, err
+	{
+		tables, indexes, err := applicationInventory(plan.Current)
+		if err != nil {
+			return plan, identity, schemaFault("invalid application migration inventory")
+		}
+		var orphan bool
+		err = tx.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_catalog.pg_class c
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = ANY(current_schemas(false))
+			AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'i', 'I')
+			AND (($3 AND c.relname LIKE 'river\_%' ESCAPE '\') OR
+			  (c.relname LIKE 'eregion\_%' ESCAPE '\' AND NOT (
+			    (c.relkind IN ('r', 'p') AND c.relname = ANY($1::text[]))
+			    OR (c.relkind IN ('i', 'I') AND EXISTS (
+			      SELECT 1 FROM pg_catalog.pg_index i
+			      JOIN pg_catalog.pg_class owner ON owner.oid = i.indrelid
+			      WHERE i.indexrelid = c.oid AND owner.relname = ANY($1::text[])
+			      AND (c.relname || ':' || owner.relname = ANY($2::text[]) OR EXISTS (
+			        SELECT 1 FROM pg_catalog.pg_constraint con
+			        WHERE con.conindid = c.oid AND con.conrelid = owner.oid AND con.contype IN ('p', 'u')
+			      ))
+			    ))
+			  )))
+			UNION ALL
+			SELECT 1 FROM pg_catalog.pg_type t
+			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+			WHERE n.nspname = ANY(current_schemas(false))
+			AND (($3 AND t.typname LIKE 'river\_%' ESCAPE '\') OR
+			  (t.typname LIKE 'eregion\_%' ESCAPE '\' AND NOT (
+			    t.typtype = 'c' AND t.typname = ANY($1::text[]) AND EXISTS (
+			      SELECT 1 FROM pg_catalog.pg_class owner
+			      WHERE owner.oid = t.typrelid AND owner.relkind IN ('r', 'p') AND owner.relname = t.typname
+			    )
+			  )))
+			UNION ALL
+			SELECT 1 FROM pg_catalog.pg_proc p
+			JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = ANY(current_schemas(false))
+			AND (p.proname LIKE 'eregion\_%' ESCAPE '\' OR ($3 AND p.proname LIKE 'river\_%' ESCAPE '\'))
+			UNION ALL
+			SELECT 1 FROM pg_catalog.pg_trigger tr
+			JOIN pg_catalog.pg_class owner ON owner.oid = tr.tgrelid
+			JOIN pg_catalog.pg_namespace n ON n.oid = owner.relnamespace
+			WHERE n.nspname = ANY(current_schemas(false)) AND NOT tr.tgisinternal
+			AND (tr.tgname LIKE 'eregion\_%' ESCAPE '\' OR owner.relname = ANY($1::text[]))
+		)`, tables, indexes, plan.Current < plan.Required).Scan(&orphan)
+		if err != nil {
+			return plan, identity, unavailable(err)
+		}
+		if orphan {
+			return plan, identity, schemaFault("unexpected application or River metadata before application migrations complete")
+		}
 	}
-	versions := m.AllVersions()
-	plan.RiverRequired = versions[len(versions)-1].Version
-	// River's ExistingVersions checks river_migration and its legacy line
-	// column itself, returning no versions when the table is absent. An outer
-	// table-existence query would only duplicate that first round trip.
-	if err := readRiverMigrations(ctx, m, &plan); err != nil {
-		return plan, err
+	if err := tx.Commit(); err != nil {
+		return plan, identity, unavailable(err)
 	}
-	return plan, nil
+	return plan, identity, nil
 }
 
-func schemaMigrationsTableExists(ctx context.Context, pool *pgxpool.Pool) (exists bool, err error) {
-	ctx, end := beginReadyStage(ctx, "schema_table")
+// River's pgx transaction API cannot share the database/sql Goose transaction;
+// its status is a separate read-only snapshot, not an atomic whole-plan view.
+func readRiverMigrations(ctx context.Context, pool *pgxpool.Pool, m *rivermigrate.Migrator[pgx.Tx], identity migrationIdentity, plan *MigrationPlan) (err error) {
+	ctx, end := beginReadyStage(ctx, "river_versions")
 	defer func() { end(err) }()
-	err = pool.QueryRow(ctx, "SELECT to_regclass('eregion_schema_migrations') IS NOT NULL").Scan(&exists)
-	return exists, err
-}
-
-func readSchemaMigrations(ctx context.Context, pool *pgxpool.Pool, plan *MigrationPlan) (err error) {
-	ctx, end := beginReadyStage(ctx, "schema_migrations")
-	defer func() { end(err) }()
-	rows, err := pool.Query(ctx, "SELECT version, checksum FROM eregion_schema_migrations ORDER BY version")
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return unavailable(err)
 	}
-	// The stage ends after rows.Close so the query trace includes row lifetime.
-	defer rows.Close()
-	expected := 1
-	for rows.Next() {
-		var version int
-		var checksum string
-		if scanErr := rows.Scan(&version, &checksum); scanErr != nil {
-			return unavailable(scanErr)
-		}
-		applied, known := migrationByVersion(version)
-		if !known || version > requiredVersion() {
-			return contract.NewFault(contract.PreconditionFailed, "database schema is newer than this binary", "Upgrade the binary before using this database; never rewrite applied migrations.")
-		}
-		if version != expected {
-			return contract.NewFault(contract.PreconditionFailed, "database migration history has a gap", "Restore the missing migration history from a backup; do not guess at applied versions.")
-		}
-		if checksum != migrationHash(applied) {
-			return contract.NewFault(contract.PreconditionFailed, "applied migration content differs", "Use a compatible binary; never rewrite applied migrations.")
-		}
-		if version > plan.Current {
-			plan.Current = version
-		}
-		expected++
+	defer conn.Release()
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return unavailable(err)
 	}
-	if rowsErr := rows.Err(); rowsErr != nil {
-		return unavailable(rowsErr)
+	defer rollback(tx)
+	var count int
+	var schema, role string
+	if err := tx.QueryRow(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+		return unavailable(err)
 	}
-	return nil
-}
-
-// readRiverMigrations also handles an absent river_migration table: River's
-// ExistingVersions checks the table and legacy line column itself and returns
-// no versions when the table is missing.
-func readRiverMigrations(ctx context.Context, m *rivermigrate.Migrator[pgx.Tx], plan *MigrationPlan) (err error) {
-	ctx, end := beginReadyStage(ctx, "river_versions")
-	defer func() { end(err) }()
-	applied, err := m.ExistingVersions(ctx)
+	got, err := checkedIdentity(count, schema, role)
+	if err != nil {
+		return err
+	}
+	if got != identity {
+		return contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
+	}
+	applied, err := m.ExistingVersionsTx(ctx, tx)
 	if err != nil {
 		return unavailable(err)
 	}
@@ -339,7 +326,13 @@ func readRiverMigrations(ctx context.Context, m *rivermigrate.Migrator[pgx.Tx], 
 			plan.RiverCurrent = version.Version
 		}
 	}
-	return checkRiverPlan(*plan)
+	if err := checkRiverPlan(*plan); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return unavailable(err)
+	}
+	return nil
 }
 
 func checkRiverPlan(plan MigrationPlan) error {
@@ -349,12 +342,53 @@ func checkRiverPlan(plan MigrationPlan) error {
 	return nil
 }
 
-// Migrate serializes across processes using a dedicated session advisory lock.
-// River must commit each version separately (enum additions cannot be used in the
-// transaction that adds them). Domain DDL is transactional; a partially migrated
-// River schema is resumable and never ready. No service migrates automatically.
+// Do not wait for the advisory lock while holding a pooled connection:
+// concurrent migrators must leave a connection available to the lock owner.
+func acquireMigrationLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Conn, error) {
+	for {
+		conn, err := pool.Acquire(ctx)
+		if err != nil {
+			return nil, unavailable(err)
+		}
+		var locked bool
+		if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", migrationLock).Scan(&locked); err != nil {
+			// A lost response can leave the session locked; discard it.
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = conn.Conn().Close(closeCtx)
+			cancel()
+			conn.Release()
+			return nil, unavailable(err)
+		}
+		if locked {
+			return conn, nil
+		}
+		conn.Release()
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, unavailable(ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// Migrate holds the session lock across inspection, Goose and River writes.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
-	conn, err := pool.Acquire(ctx)
+	migrations, err := fs.Sub(dbschema.GooseFS, "migrations")
+	if err != nil {
+		return MigrationPlan{}, err
+	}
+	return migrateWithFS(ctx, pool, migrations, nil)
+}
+
+// migrateWithFS lets tests exercise a transactional baseline failure without
+// changing the production embedded migration inventory.
+func migrateWithFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS, afterGoose func(context.Context, *pgxpool.Pool) error) (MigrationPlan, error) {
+	if pool.Config().MaxConns < 2 {
+		return MigrationPlan{}, contract.NewFault(contract.PreconditionFailed, "migration requires at least two database connections", "Increase the database pool capacity before migrating.")
+	}
+	conn, err := acquireMigrationLock(ctx, pool)
 	if err != nil {
 		return MigrationPlan{}, unavailable(err)
 	}
@@ -363,52 +397,88 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, error) {
 		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if _, err := conn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", migrationLock); err != nil {
-			_ = conn.Conn().Close(unlockCtx) // Never return a lock-holding session to the pool.
+			_ = conn.Conn().Close(unlockCtx)
 		}
 	}()
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLock); err != nil {
-		return MigrationPlan{}, unavailable(err)
-	}
-	plan, err := PlanMigrations(ctx, pool)
+	plan, identity, err := planMigrations(ctx, pool)
 	if err != nil {
 		return plan, err
 	}
-	m, err := migrator(pool)
+	var count int
+	var schema, role string
+	if err := conn.QueryRow(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+		return plan, unavailable(err)
+	}
+	lockIdentity, err := checkedIdentity(count, schema, role)
 	if err != nil {
 		return plan, err
 	}
-	if _, err := m.Migrate(ctx, rivermigrate.DirectionUp, nil); err != nil {
-		return plan, unavailable(err)
+	if lockIdentity != identity {
+		return plan, contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
 	}
-	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS eregion_schema_migrations (version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
-		return plan, unavailable(err)
+	db := sql.OpenDB(migrationConnector{Connector: stdlib.GetPoolConnector(pool), want: identity})
+	defer db.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations)
+	if err != nil {
+		return plan, err
 	}
-	for _, m := range migrations {
-		if m.version <= plan.Current {
-			continue
+	if _, err := provider.Up(ctx); err != nil {
+		var fault *contract.Fault
+		if errors.As(err, &fault) {
+			return plan, fault
 		}
-		tx, err := conn.Begin(ctx)
+		return plan, unavailable(err)
+	}
+	// Release the checked Goose session before River acquires the second pool
+	// connection. Closing the wrapper never closes the pgx pool.
+	if err := db.Close(); err != nil {
+		return plan, unavailable(err)
+	}
+	plan.Current = plan.Required
+	if afterGoose != nil {
+		if err := afterGoose(ctx, pool); err != nil {
+			return plan, err
+		}
+	}
+	m, err := schemaMigrator(pool, identity.schema)
+	if err != nil {
+		return plan, err
+	}
+	riverConn, err := pool.Acquire(ctx)
+	if err != nil {
+		return plan, unavailable(err)
+	}
+	defer riverConn.Release()
+	if err := riverConn.QueryRow(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+		return plan, unavailable(err)
+	}
+	riverIdentity, err := checkedIdentity(count, schema, role)
+	if err != nil {
+		return plan, err
+	}
+	if riverIdentity != identity {
+		return plan, contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
+	}
+	// River versions require separate commits (some use new enum values).
+	// One version per outer transaction pins all work to the checked session.
+	for {
+		tx, err := riverConn.Begin(ctx)
 		if err != nil {
 			return plan, unavailable(err)
 		}
-		if _, err := tx.Exec(ctx, m.sql); err != nil {
-			rollback(tx)
-			var pgErr *pgconn.PgError
-			if m.version == 29 && errors.As(err, &pgErr) && pgErr.Code == "ER029" {
-				return plan, contract.NewFault(contract.PreconditionFailed, pgErr.Message, "Pause webhook admission and drain or resolve the affected work on an explicitly authorized target, then retry migration.")
-			}
-			return plan, unavailable(err)
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_schema_migrations(version,checksum) VALUES ($1,$2)`, m.version, migrationHash(m)); err != nil {
+		result, err := m.MigrateTx(ctx, tx, rivermigrate.DirectionUp, &rivermigrate.MigrateOpts{MaxSteps: 1})
+		if err != nil {
 			rollback(tx)
 			return plan, unavailable(err)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return plan, unavailable(err)
 		}
-		plan.Current = m.version
+		if len(result.Versions) == 0 {
+			break
+		}
 	}
-	plan.Current, plan.RiverCurrent = plan.Required, plan.RiverRequired
+	plan.RiverCurrent = plan.RiverRequired
 	return plan, nil
 }
 
@@ -431,9 +501,6 @@ var tailnetPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("fd7a:115c:a1e0::/48"),
 }
 
-// PlaintextDatabaseHostAllowed reports whether a database host may be reached
-// with sslmode=disable: a literal loopback address, or a tailnet address or
-// MagicDNS name, where WireGuard already encrypts the path.
 func PlaintextDatabaseHostAllowed(host string) bool {
 	if addr, err := netip.ParseAddr(host); err == nil {
 		addr = addr.Unmap()

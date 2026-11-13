@@ -486,6 +486,9 @@ func sha256HexBytes(body []byte) string {
 // release, pending deployment and initial state in one commit. It never reads
 // the registry.
 func (s *Service) createArtifactReleaseTx(ctx context.Context, tx pgx.Tx, opID contract.OperationID, env platform.Environment, artifact *resolvedArtifact) (platform.ReleaseID, error) {
+	if _, err := lockPointerEnvironmentTx(ctx, tx, env.ID); err != nil {
+		return "", err
+	}
 	app, err := appByNameForUpdateTx(ctx, tx, env.App)
 	if err != nil {
 		return "", err
@@ -511,8 +514,8 @@ func (s *Service) createArtifactReleaseTx(ctx context.Context, tx pgx.Tx, opID c
 		Selector: artifact.Requested, SelectorKind: artifact.Kind,
 	})
 	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_releases
-        (id,operation_id,app_id,environment_id,image,image_id,source,status)
-        VALUES($1,$2,$3,$4,$5,$6,$7,'pending')`,
+        (id,operation_id,app_id,environment_id,image,image_id,source,status,commit_sha,error_code,error,created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'pending','','','',clock_timestamp())`,
 		releaseID, opID, app.ID, env.ID, artifact.CanonicalImage, artifact.ConfigDigest, source); err != nil {
 		return "", platformWriteError(err, "artifact release could not be recorded")
 	}
