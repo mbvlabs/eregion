@@ -291,6 +291,54 @@ func TestSSHTransportWaitFollowsTheContextDeadline(t *testing.T) {
 	server.waitTaskExit(t, exec)
 }
 
+// delayedDeadlineContext models the interval after a deadline has passed but
+// before the context's timer callback has recorded its cancellation.
+type delayedDeadlineContext struct {
+	context.Context
+	deadline time.Time
+}
+
+func (c delayedDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+
+func TestSSHPollWindowDeadlineClassification(t *testing.T) {
+	expired := delayedDeadlineContext{Context: context.Background(), deadline: time.Now().Add(-time.Second)}
+	cancelled, cancel := context.WithCancel(expired)
+	cancel()
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want error
+	}{
+		{"deadline callback pending", expired, context.DeadlineExceeded},
+		{"caller cancelled", cancelled, context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, status := range []engine.Status{engine.StatusRunning, engine.StatusDeferred, engine.StatusAbsent} {
+				_, err := pollWindowResult(tc.ctx, node.Response{Status: status})
+				if !node.IsCallCancelled(err) || !errors.Is(err, tc.want) || node.IsStreamLost(err) {
+					t.Fatalf("status %v: got %v, want call cancellation wrapping %v", status, err, tc.want)
+				}
+			}
+		})
+	}
+	for _, status := range []engine.Status{engine.StatusRunning, engine.StatusDeferred} {
+		future := delayedDeadlineContext{Context: context.Background(), deadline: time.Now().Add(time.Hour)}
+		response, err := pollWindowResult(future, node.Response{Status: status})
+		if err != nil || response.Status != status || !response.Retryable {
+			t.Fatalf("poll window status %v: response %+v, error %v", status, response, err)
+		}
+	}
+	_, err := pollWindowResult(context.Background(), node.Response{})
+	if !node.IsStreamLost(err) {
+		t.Fatalf("poll window without status: got %v, want stream lost", err)
+	}
+	transport := &SSHTransport{config: SSHConfig{MaxWait: time.Second}}
+	_, err = transport.awaitTerminal(expired, nil, node.Request{}, nil)
+	if !node.IsCallCancelled(err) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired awaitTerminal: got %v, want deadline cancellation", err)
+	}
+}
+
 // TestSSHTransportReturnsTheObservedRunningTaskAtThePollWindow proves that the
 // transport's own poll window is not reported as a fabricated lost stream. The
 // node task is detached and keeps running; the last observed running response

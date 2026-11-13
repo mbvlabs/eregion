@@ -39,9 +39,19 @@ schema resolution, transactional migration retry, concurrent migrators,
 cancellation/pool lifetime, Goose/River recovery histories, fresh definition
 apply without a DNS-policy row, explicit-value fixtures, and coordinated
 pointer/build/diagnostic/deletion/retention races. Preserve stale-attempt,
-unknown-effect and restore-owner protections. Tests added for these mechanisms
-remain unexecuted until that authorization; no existing database migration,
+unknown-effect and restore-owner protections. No existing database migration,
 adoption or compatibility path is promised.
+
+The operator authorized a CI-only branch submission. Candidate `e6f5eab` ran
+against the existing isolated PostgreSQL 17 service in CI `43416047287`.
+Integration completed in 329.793 seconds with 228 top-level passes, one expected
+helper skip and one resource-reconciliation failure. Goose fresh/read-only
+planning, refusal, history validation, transactional retry, schema selection,
+two-connection concurrency/cancellation and the added pointer-locking
+regressions passed. This is partial evidence, not an overall suite pass.
+Linux also failed an SSH deadline assertion, and macOS failed the conditional
+AWS adapter fixture. Corrections and a full CI rerun are required. Only CI ran:
+no publication or existing-server/database change occurred.
 
 ## Beta.4 incremental acceptance
 

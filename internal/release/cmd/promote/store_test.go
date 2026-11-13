@@ -23,7 +23,7 @@ if [ "$2" = get-object ]; then
   for arg do dest="$arg"; done
   printf 'pointer bytes' >"$dest"
 fi
-printf '{"ETag":"\"object-etag\""}\n'
+printf '%s\n' '{"ETag":"\"object-etag\""}'
 `
 	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte(aws), 0755); err != nil {
 		t.Fatal(err)

@@ -399,17 +399,22 @@ func TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows(t *t
 	if _, err := pool.Exec(ctx, `UPDATE eregion_operations SET state='cancelled' WHERE id=$1`, apply.ID); err != nil {
 		t.Fatal(err)
 	}
+	var resourceID string
+	if err := pool.QueryRow(ctx, `SELECT id FROM eregion_platform_resources WHERE operation_id=$1`, apply.ID).Scan(&resourceID); err != nil {
+		t.Fatal(err)
+	}
+	volumeName := "er-res-" + strings.TrimPrefix(resourceID, "res_") + "-data"
 	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources
         SET state='provisioning',
-            volumes='[{"name":"er-res-stuck-data","destination":"/var/lib/postgresql/data"}]'::jsonb
-        WHERE operation_id=$1`, apply.ID); err != nil {
+            volumes=jsonb_build_array(jsonb_build_object('name',$2::text,'destination','/var/lib/postgresql/data'))
+        WHERE operation_id=$1`, apply.ID, volumeName); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
 	state, volumes, errorCode, detail := resourceState(t, pool, "stuckapi", "db")
-	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) || !strings.Contains(volumes, "er-res-") || !strings.Contains(detail, "apply") {
+	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Cancelled) || !strings.Contains(volumes, volumeName) || !strings.Contains(detail, "apply") {
 		t.Fatalf("cancelled stuck row = state=%s error=%s detail=%q volumes=%s", state, errorCode, detail, volumes)
 	}
 
@@ -424,7 +429,7 @@ func TestIntegrationReconcileTerminalResourceStatesRepairsExistingStuckRows(t *t
 		t.Fatal(err)
 	}
 	state, volumes, errorCode, detail = resourceState(t, pool, "stuckapi", "db")
-	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Unavailable) || !strings.Contains(volumes, "er-res-") || !strings.Contains(detail, "destroy") {
+	if state != string(platform.ResourceDegraded) || errorCode != string(contract.Unavailable) || !strings.Contains(volumes, volumeName) || !strings.Contains(detail, "destroy") {
 		t.Fatalf("failed stuck row = state=%s error=%s detail=%q volumes=%s", state, errorCode, detail, volumes)
 	}
 
