@@ -1706,7 +1706,7 @@ type DomainInput struct {
 	// DNSMode selects provider automation. Empty and "manual" leave DNS
 	// untouched; "cloudflare" explicitly plans/applies this one hostname.
 	DNSMode string `json:"dns_mode,omitempty"`
-	// DNSZone names one zone configured with eregion domain cloudflare configure. The credential is
+	// DNSZone names one zone configured with eregion dns configure --provider cloudflare. The credential is
 	// encrypted server state and never enters this action input.
 	DNSZone string `json:"dns_zone,omitempty"`
 	// DNSOrigins are the explicitly supplied public origin addresses used for
@@ -1847,7 +1847,7 @@ func normalizeDomain(target Target, raw json.RawMessage) (ActionInput, error) {
 	case "cloudflare":
 		input.DNSZone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(input.DNSZone), "."))
 		if !validDNSZoneReference(input.DNSZone) {
-			return nil, invalid("dns zone", "Use a configured zone name or its lowercase 32-character ID; configure it with eregion domain cloudflare configure.")
+			return nil, invalid("dns zone", "Use a configured zone name or its lowercase 32-character ID; configure it with eregion dns configure --provider cloudflare.")
 		}
 		if len(input.DNSOrigins) > 0 {
 			origins, err := NormalizeDNSOrigins(input.DNSOrigins)

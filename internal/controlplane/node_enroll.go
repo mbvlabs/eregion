@@ -11,10 +11,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -525,16 +527,13 @@ func buildSlotKey(nodeName string, slot int) int64 {
 	return advisoryKey("eregion-build-slot\x00" + nodeName + "\x00" + strconv.Itoa(slot))
 }
 
-// acquireBuildSlot takes one of a node's build slots, waiting for a free one.
-// The limit is per node and enforced across every control-plane process with
-// session advisory locks, so a dead worker releases its slot. onWait reports
-// once that the build is queued behind others.
-func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, limit int, onWait func()) (func(), error) {
-	if limit < 1 {
-		limit = 1
-	}
+// acquireBuildSlot serializes each admission with capacity changes on the node
+// row and counts occupied locks across the entire supported keyspace. Only a
+// session advisory lease remains after the short admission transaction.
+func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, onWait func()) (func(), error) {
 	waited := false
 	deadline := time.Now().Add(buildSlotWait)
+	limit := 0
 	for {
 		conn, err := s.pool.Acquire(ctx)
 		if err != nil {
@@ -543,22 +542,93 @@ func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, limit i
 			}
 			return nil, unavailable(err)
 		}
-		for slot := range limit {
+		// A session with an uncertain advisory-lock result must never return
+		// to the pool. Closing it also rolls back an uncertain transaction.
+		discard := func(conn *pgxpool.Conn) {
+			raw := conn.Hijack()
+			closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = raw.Close(closeCtx)
+		}
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			discard(conn)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, unavailable(err)
+		}
+		err = tx.QueryRow(ctx, `SELECT build_concurrency FROM eregion_platform_nodes WHERE name=$1 FOR UPDATE`, nodeName).Scan(&limit)
+		if err != nil {
+			discard(conn)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, contract.NewFault(contract.PreconditionFailed, "build node is no longer registered", "Register the node before building.")
+			}
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, unavailable(err)
+		}
+		if limit < 1 || limit > platform.MaxBuildConcurrency {
+			discard(conn)
+			return nil, contract.NewFault(contract.PreconditionFailed, "build node concurrency is invalid", "Correct the node's build concurrency before building.")
+		}
+		var held []int64
+		busy := 0
+		for slot := range platform.MaxBuildConcurrency {
 			var got bool
-			if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, buildSlotKey(nodeName, slot)).Scan(&got); err != nil {
-				conn.Release()
+			key := buildSlotKey(nodeName, slot)
+			if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&got); err != nil {
+				discard(conn)
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
 				}
 				return nil, unavailable(err)
 			}
 			if got {
-				key := buildSlotKey(nodeName, slot)
-				return func() {
-					_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
-					conn.Release()
-				}, nil
+				held = append(held, key)
+			} else {
+				busy++
 			}
+		}
+		var chosen int64
+		admitted := busy < limit && len(held) > 0
+		if admitted {
+			chosen = held[0]
+			held = held[1:]
+		}
+		for _, key := range held {
+			var unlocked bool
+			if err := tx.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&unlocked); err != nil || !unlocked {
+				discard(conn)
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return nil, contract.NewFault(contract.Unavailable, "build slot probe cleanup is uncertain", "Retry when the control database is available.")
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			discard(conn)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, unavailable(err)
+		}
+		if admitted {
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					defer cancel()
+					var unlocked bool
+					err := conn.QueryRow(releaseCtx, `SELECT pg_advisory_unlock($1)`, chosen).Scan(&unlocked)
+					if err != nil || !unlocked {
+						discard(conn)
+						return
+					}
+					conn.Release()
+				})
+			}, nil
 		}
 		conn.Release()
 		if !waited && onWait != nil {

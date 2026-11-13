@@ -33,11 +33,21 @@ func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID,
 		return w.settle(ctx, id, attempt, err)
 	}
 	if err := w.service.applyDomainDNSEffect(ctx, op, attempt, input, normalized.Kind == platform.KindDomainRemove); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			if handled, recoveryErr := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
+				return recoveryErr
+			}
+		}
 		return w.settle(ctx, id, attempt, err)
 	}
 	// A cancellation accepted after provider effects but before the binding
 	// row is deleted must stop here and retain the ledger/cleanup state.
 	if err := w.service.checkDomainDNSBoundary(ctx, id, attempt); err != nil {
+		if errors.Is(err, errPlatformCancelled) {
+			if handled, recoveryErr := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
+				return recoveryErr
+			}
+		}
 		return w.settle(ctx, id, attempt, err)
 	}
 	if normalized.Kind == platform.KindDomainRemove {

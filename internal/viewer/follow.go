@@ -53,11 +53,13 @@ type Observation struct {
 type FollowOptions struct {
 	PollInterval time.Duration
 	PageLimit    int
-	EventLimit   int
-	StaleAfter   time.Duration
-	StalePolls   int
-	Clean        Cleaner
-	Now          func() time.Time
+	// After resumes a session after this already-processed event sequence.
+	After      uint64
+	EventLimit int
+	StaleAfter time.Duration
+	StalePolls int
+	Clean      Cleaner
+	Now        func() time.Time
 }
 
 const (
@@ -100,9 +102,13 @@ type Summary struct {
 // is terminal and every event up to the snapshot's last_sequence was applied.
 // Context cancellation ends the loop as a detach; it never calls RequestCancel.
 func Follow(ctx context.Context, client Client, id contract.OperationID, opts FollowOptions, emit func(Observation) error) (Summary, error) {
+	if streaming, ok := client.(SessionClient); ok {
+		return followSession(ctx, streaming, id, opts, emit)
+	}
 	opts = opts.normalized()
 	modelOptions := Options{EventLimit: opts.EventLimit, StaleAfter: opts.StaleAfter, StalePolls: opts.StalePolls, Clean: opts.Clean}
 	model := New(id, modelOptions)
+	model.Cursor = opts.After
 
 	emitObservation := func(observation Observation) error {
 		if emit == nil {
@@ -119,6 +125,7 @@ func Follow(ctx context.Context, client Client, id contract.OperationID, opts Fo
 
 	backoff := opts.PollInterval
 	gapRefetches := 0
+	tailNoProgress := 0
 	for {
 		now := opts.Now()
 		if err := ctx.Err(); err != nil {
@@ -145,16 +152,11 @@ func Follow(ctx context.Context, client Client, id contract.OperationID, opts Fo
 			continue
 		}
 		snapshot, err := decodeOperation(raw)
+		if err == nil && snapshot.ID != id {
+			err = invalidFollowData()
+		}
 		if err != nil {
-			model.PollFailed(err, now)
-			if emitErr := emitObservation(Observation{Kind: ObservationFailed, At: now, Err: err}); emitErr != nil {
-				return modelSummary(model), emitErr
-			}
-			backoff = nextBackoff(backoff)
-			if !wait(ctx, backoff, opts.Now, model) {
-				return detach(model, opts.Now(), emitObservation, ctx.Err())
-			}
-			continue
+			return modelSummary(model), err
 		}
 		model.Snapshot(snapshot, now)
 		model.PollSucceeded(now)
@@ -164,6 +166,7 @@ func Follow(ctx context.Context, client Client, id contract.OperationID, opts Fo
 		}
 
 		pageFailed := false
+		cursorBeforePages := model.Cursor
 		for {
 			previousCursor := model.Cursor
 			page, err := fetchPage(ctx, client, id, model.Cursor, opts.PageLimit)
@@ -220,13 +223,23 @@ func Follow(ctx context.Context, client Client, id contract.OperationID, opts Fo
 			continue
 		}
 
-		if model.Terminal() && model.Cursor >= model.LastSequence {
+		// A terminal event can arrive after the snapshot was fetched. Do not
+		// finish until a fresh authoritative terminal snapshot includes it.
+		if snapshot.State.Terminal() && model.Terminal() && model.Cursor == snapshot.LastSequence {
 			now = opts.Now()
 			model.Close(now)
 			if err := emitObservation(Observation{Kind: ObservationClosed, At: now}); err != nil {
 				return modelSummary(model), err
 			}
 			return modelSummary(model), nil
+		}
+		if snapshot.State.Terminal() && model.Cursor < snapshot.LastSequence && model.Cursor == cursorBeforePages {
+			tailNoProgress++
+			if tailNoProgress > 2 {
+				return modelSummary(model), contract.NewFault(contract.PreconditionFailed, "operation terminal event tail is unavailable", "Inspect the operation history; missing events were not skipped.")
+			}
+		} else {
+			tailNoProgress = 0
 		}
 		if !wait(ctx, opts.PollInterval, opts.Now, model) {
 			return detach(model, opts.Now(), emitObservation, ctx.Err())
@@ -272,6 +285,9 @@ func wait(ctx context.Context, d time.Duration, now func() time.Time, model *Mod
 func nextBackoff(current time.Duration) time.Duration {
 	if current <= 0 {
 		current = DefaultPollInterval
+	}
+	if current >= maxBackoff/2 {
+		return maxBackoff
 	}
 	next := current * 2
 	if next > maxBackoff {
@@ -343,7 +359,7 @@ func fetchPage(ctx context.Context, client Client, id contract.OperationID, afte
 }
 
 func invalidFollowData() error {
-	return contract.NewFault(contract.Unavailable, "API returned unreadable operation data", "Check binary compatibility; do not assume an unrecognized result means work did not happen.")
+	return contract.NewFault(contract.ValidationFailed, "API returned unreadable operation data", "Check binary compatibility; do not assume an unrecognized result means work did not happen.")
 }
 
 func fatalFollowError(err error) bool {
@@ -355,7 +371,7 @@ func fatalFollowError(err error) bool {
 		return false
 	}
 	switch fault.Code {
-	case contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.PreconditionFailed, contract.Conflict:
+	case contract.Usage, contract.InvalidOutputMode, contract.InputRequired, contract.ValidationFailed, contract.NotFound, contract.Unauthenticated, contract.Forbidden, contract.PreconditionFailed, contract.Conflict, contract.NodeVersionMismatch:
 		return true
 	default:
 		return false

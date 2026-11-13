@@ -39,11 +39,13 @@ type spec struct {
 }
 
 type app struct {
-	root    *cobra.Command
-	meta    registry
-	result  result
-	started bool
-	secrets *secrets.Registry
+	root        *cobra.Command
+	meta        registry
+	result      result
+	started     bool
+	helpErr     error
+	helpCommand *cobra.Command
+	secrets     *secrets.Registry
 	// nodeClients holds one client per resolved workspace access for the command's life.
 	nodeClients map[string]*nodeClient
 	// backend overrides the node transport in tests; nil uses the saved workspace access.
@@ -92,7 +94,7 @@ func newApp() *app {
 		}
 		return contract.NewFault(contract.Usage, err.Error(), "Inspect flags with eregion help --json.")
 	})
-	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.workspaceCommandSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.uiSpecs(), a.logsSpecs(), a.metricsSpecs(), a.diagnoseSpecs()} {
+	for _, specs := range [][]spec{a.specs(), a.runtimeSpecs(), a.nodeSpecs(), a.tunnelSpecs(), a.serverSpecs(), a.hostSpecs(), a.loginSpecs(), a.domainSpecs(), a.dnsProviderSpecs(), a.workspaceCommandSpecs(), a.appSpecs(), a.envSpecs(), a.processSpecs(), a.configSpecs(), a.deliverySpecs(), a.imageSpecs(), a.retentionSpecs(), a.resourceSpecs(), a.secretSpecs(), a.secretsSpecs(), a.protectSpecs(), a.tokenSpecs(), a.upgradeSpecs(), a.guideSpecs(), a.uiSpecs(), a.logsSpecs(), a.metricsSpecs(), a.diagnoseSpecs()} {
 		for _, s := range specs {
 			a.attach(a.root, s)
 		}
@@ -100,6 +102,21 @@ func newApp() *app {
 	a.attachServerExtras()
 	a.root.SetHelpFunc(func(cmd *cobra.Command, _ []string) {
 		a.started = true
+		args := cmd.Flags().Args()
+		// Cobra handles --help before validating positional arguments. A
+		// group with no positional usage must not turn an unknown child into
+		// successful parent help. Commands that declare positional inputs keep
+		// their normal help behavior, including leaf arguments.
+		if cmd.HasSubCommands() && len(strings.Fields(cmd.Use)) == 1 && len(args) > 0 {
+			a.helpErr = unknownCommandFault(fmt.Sprintf("unknown command %q for %q", args[0], cmd.CommandPath()), suggestCommandPaths(cmd, args[0]))
+			return
+		}
+		if cmd == a.helpCommand && len(args) > 0 {
+			if _, err := a.resolve(args); err != nil {
+				a.helpErr = err
+				return
+			}
+		}
 		a.result = a.help(cmd)
 		a.result.command = cmd.CommandPath()
 	})
@@ -149,6 +166,7 @@ func (a *app) attach(parent *cobra.Command, s spec) {
 	parent.AddCommand(cmd)
 	if parent == a.root && cmd.Name() == "help" {
 		a.root.SetHelpCommand(cmd)
+		a.helpCommand = cmd
 	}
 	for _, child := range s.children {
 		a.attach(cmd, child)

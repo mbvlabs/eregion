@@ -105,13 +105,20 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 		} else if found {
 			return operations.SubmissionResult{Operation: op, Replay: true}, nil
 		}
-		return zero, contract.NewFault(contract.Conflict, "definition plan changed", "Review and approve a new plan.")
+		return zero, contract.NewFault(contract.Conflict, "definition plan changed", "Workspace, target, binding/resource/secret metadata, DNS policy/credential, placement, relevant operations or provider observations may have changed. Review and approve a new plan.")
 	}
 	if err := definitionConfirm(plan, input.Confirm); err != nil {
 		return zero, err
 	}
 	if !plan.CanApply {
 		return zero, contract.NewFault(contract.PreconditionFailed, "definition plan cannot be applied", "Resolve the reported blockers, then review and approve a new plan.")
+	}
+	// Even a converged provider snapshot requires the same operator authority
+	// as a DNS child; a no-op must not turn read access into write approval.
+	if len(plan.DNS) > 0 {
+		if err := s.authorizeDomainDNSWrite(ctx, actor); err != nil {
+			return zero, err
+		}
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -177,12 +184,52 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 			return zero, unavailable(err)
 		}
 	}
-	current, _, err := readDefinitionSnapshotTx(ctx, tx, plan.App, plan.Environment)
+	// Pin existing selected placement rows until admission commits. Registration
+	// of a missing planned node cannot make an otherwise blocked plan applicable.
+	var nodeNames []string
+	for _, node := range material.Snapshot.Nodes {
+		nodeNames = append(nodeNames, node.Name)
+	}
+	rows, err := tx.Query(ctx, `SELECT name FROM eregion_platform_nodes WHERE name=ANY($1::text[]) ORDER BY name FOR SHARE`, nodeNames)
+	if err != nil {
+		return zero, unavailable(err)
+	}
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	rows.Close()
+	if err != nil {
+		return zero, unavailable(err)
+	}
+	current, _, err := readDefinitionSnapshotTx(ctx, tx, material.Resolved)
 	if err != nil {
 		return zero, err
 	}
 	if !reflect.DeepEqual(current, material.Snapshot) {
-		return zero, contract.NewFault(contract.Conflict, "definition snapshot changed", "Review and approve a new plan.")
+		return zero, contract.NewFault(contract.Conflict, definitionSnapshotChange(current, material.Snapshot), "Review and approve a new plan.")
+	}
+	// Hostnames are installation-wide, not environment-local. Recheck existing
+	// bindings even though unrelated application inventory is not fingerprinted.
+	// The domain table's global uniqueness constraint remains the final fence
+	// against a concurrent insertion after this read.
+	for _, domain := range plan.Domains {
+		if domain.Action == "remove" {
+			continue
+		}
+		var owner platform.EnvironmentID
+		err = tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE name=$1`, domain.Name).Scan(&owner)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return zero, unavailable(err)
+		}
+		if err == nil && owner != current.EnvironmentID {
+			return zero, contract.NewFault(contract.Conflict, "hostname belongs to another environment", "Remove the existing binding or review a plan using another hostname.")
+		}
 	}
 	for _, active := range current.ActiveOperations {
 		if active.Target == "app/"+plan.App || active.Target == target || strings.HasPrefix(active.Target, "resource/"+plan.App+"/") || strings.HasPrefix(active.Target, "env/"+plan.App+"/") {

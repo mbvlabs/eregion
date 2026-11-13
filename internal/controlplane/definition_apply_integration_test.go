@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -63,6 +64,234 @@ func definitionIntegrationFixture(t *testing.T) (*pgxpool.Pool, *Service, api.Ap
 		}
 	}
 	return pool, s, api.AppService{DefinitionPlanner: s}
+}
+
+func TestIntegrationDefinitionSnapshotIgnoresUnrelatedOperation(t *testing.T) {
+	_, s, app := definitionIntegrationFixture(t)
+	ctx := context.Background()
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: integrationDefinition}
+	plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || !plan.CanApply {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+	input.PlanNonce = plan.PlanNonce
+	// Leave unrelated platform work queued between approval and admission.
+	platformSubmitAs(t, s, definitionIntegrationActor, platform.KindAppCreate, "platform", "unrelated-app", map[string]any{"name": "other"})
+	again, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || again.Digest != plan.Digest {
+		t.Fatalf("unrelated work changed plan: digest=%s err=%v", again.Digest, err)
+	}
+	result, err := app.ApplyDefinition(ctx, definitionIntegrationActor, api.DefinitionApplyInput{
+		Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "unrelated-operation-apply", Confirm: "api/production",
+	})
+	if err != nil || result.Replay || result.Operation.State != contract.Queued {
+		t.Fatalf("apply=%+v err=%v", result, err)
+	}
+}
+
+func TestIntegrationDefinitionSnapshotRelevantChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{"placement", `UPDATE eregion_platform_nodes SET status='offline' WHERE name='local'`},
+		{"target protection", `UPDATE eregion_platform_environments SET protected=NOT protected WHERE name='production'`},
+		{"secret metadata", `INSERT INTO eregion_secrets(app,environment,name,latest_revision,state,created_by_kind,created_by_subject,updated_by_kind,updated_by_subject,created_at,updated_at)
+		 VALUES('api','production','example',1,'active','operator','test','operator','test',clock_timestamp(),clock_timestamp())`},
+		{"policy", `INSERT INTO eregion_definition_dns_policy(singleton,revision,enabled,provider,zone_id,origins,proxy_mode,updated_at)
+		 VALUES(true,1,false,NULL,NULL,'{}','dns-only',clock_timestamp()) ON CONFLICT (singleton) DO UPDATE SET revision=eregion_definition_dns_policy.revision+1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool, _, app := definitionIntegrationFixture(t)
+			ctx := context.Background()
+			input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: integrationDefinition}
+			plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+			if err != nil || !plan.CanApply {
+				t.Fatalf("plan=%+v err=%v", plan, err)
+			}
+			input.PlanNonce = plan.PlanNonce
+			if _, err := pool.Exec(ctx, tc.query); err != nil {
+				t.Fatal(err)
+			}
+			_, err = app.ApplyDefinition(ctx, definitionIntegrationActor, api.DefinitionApplyInput{
+				Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "stale", Confirm: "api/production",
+			})
+			if contract.Classify(err).Code != contract.Conflict {
+				t.Fatalf("stale %s accepted: %v", tc.name, err)
+			}
+			var parents int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_definition_runs`).Scan(&parents); err != nil || parents != 0 {
+				t.Fatalf("stale admission left runs=%d err=%v", parents, err)
+			}
+		})
+	}
+}
+
+func TestIntegrationDefinitionSnapshotIgnoresUnrelatedNode(t *testing.T) {
+	pool, s, app := definitionIntegrationFixture(t)
+	ctx := context.Background()
+	op := platformSubmitAs(t, s, definitionIntegrationActor, platform.KindNodeRegister, "platform", "other-node", map[string]any{
+		"name": "other", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: integrationDefinition}
+	plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || !plan.CanApply {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+	input.PlanNonce = plan.PlanNonce
+	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_nodes SET status='offline' WHERE name='other'`); err != nil {
+		t.Fatal(err)
+	}
+	again, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || again.Digest != plan.Digest {
+		t.Fatalf("unrelated node changed plan: digest=%s err=%v", again.Digest, err)
+	}
+	_, err = app.ApplyDefinition(ctx, definitionIntegrationActor, api.DefinitionApplyInput{
+		Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "unrelated-node-apply", Confirm: "api/production",
+	})
+	if err != nil {
+		t.Fatalf("unrelated node blocked apply: %v", err)
+	}
+}
+
+func TestIntegrationDefinitionPlannedNodeAndCredentialFences(t *testing.T) {
+	pool, s, app := definitionIntegrationFixture(t)
+	ctx := context.Background()
+	op := platformSubmitAs(t, s, definitionIntegrationActor, platform.KindNodeRegister, "platform", "planned-node", map[string]any{
+		"name": "next", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	op = platformSubmitAs(t, s, definitionIntegrationActor, platform.KindNodeRegister, "platform", "planned-builder", map[string]any{
+		"name": "builder", "roles": []string{platform.RoleBuilder}, "capabilities": []string{platform.CapabilityBuildpacks},
+	})
+	if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credentials
+		(provider,zone_id,zone_name,latest_revision,created_by_kind,created_by_subject,updated_by_kind,updated_by_subject,created_at,updated_at)
+		VALUES('cloudflare','zone','example.com',1,'operator','test','operator','test',clock_timestamp(),clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_dns_policy(singleton,revision,enabled,provider,zone_id,origins,proxy_mode,updated_at)
+		VALUES(true,1,false,'cloudflare','zone','{}','dns-only',clock_timestamp())
+		ON CONFLICT (singleton) DO UPDATE SET revision=1,enabled=false,provider='cloudflare',zone_id='zone'`); err != nil {
+		t.Fatal(err)
+	}
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: strings.Replace(integrationDefinition, `node = "local"`, "node = \"next\"\nbuild_node = \"builder\"", 1)}
+	for _, mutation := range []string{
+		`UPDATE eregion_platform_nodes SET status='offline' WHERE name='next'`,
+		`UPDATE eregion_platform_nodes SET status='offline' WHERE name='builder'`,
+		`UPDATE eregion_provider_credentials SET latest_revision=latest_revision+1 WHERE provider='cloudflare' AND zone_id='zone'`,
+	} {
+		input.PlanNonce = ""
+		plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+		if err != nil || !plan.CanApply {
+			t.Fatalf("plan=%+v err=%v", plan, err)
+		}
+		input.PlanNonce = plan.PlanNonce
+		if _, err := pool.Exec(ctx, mutation); err != nil {
+			t.Fatal(err)
+		}
+		_, err = app.ApplyDefinition(ctx, definitionIntegrationActor, api.DefinitionApplyInput{
+			Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "planned-fence", Confirm: "api/production",
+		})
+		if contract.Classify(err).Code != contract.Conflict {
+			t.Fatalf("changed placement or credential accepted: %v", err)
+		}
+	}
+}
+
+func TestIntegrationDefinitionRefusesActiveSameAppWork(t *testing.T) {
+	_, s, app := definitionIntegrationFixture(t)
+	ctx := context.Background()
+	platformSubmitAs(t, s, definitionIntegrationActor, platform.KindConfigSet, "env/api/production", "active-config", map[string]any{"config": map[string]string{"OTHER": "value"}})
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: integrationDefinition}
+	plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || !plan.CanApply {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+	input.PlanNonce = plan.PlanNonce
+	_, err = app.ApplyDefinition(ctx, definitionIntegrationActor, api.DefinitionApplyInput{
+		Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "active-work", Confirm: "api/production",
+	})
+	if contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("active same-app work accepted: %v", err)
+	}
+}
+
+func TestIntegrationDefinitionHostnameConflictAfterPlan(t *testing.T) {
+	pool, s, app := definitionIntegrationFixture(t)
+	ctx := context.Background()
+	for _, action := range []struct {
+		kind, target, key string
+		input             map[string]any
+	}{
+		{platform.KindAppCreate, "platform", "other-app", map[string]any{"name": "other"}},
+		{platform.KindEnvironmentCreate, "app/other", "other-env", map[string]any{"name": "production", "node": "local"}},
+	} {
+		op := platformSubmitAs(t, s, definitionIntegrationActor, action.kind, action.target, action.key, action.input)
+		if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: integrationDefinition + `
+[[environments.production.domains]]
+name = "shared.example.com"
+primary = true
+`}
+	plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || !plan.CanApply {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+	input.PlanNonce = plan.PlanNonce
+	platformSubmitAs(t, s, definitionIntegrationActor, platform.KindDomainAdd, "env/other/production", "claim-host", map[string]any{"domain": "shared.example.com", "primary": true})
+	_, err = app.ApplyDefinition(ctx, definitionIntegrationActor, api.DefinitionApplyInput{
+		Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "hostname-conflict", Confirm: "api/production",
+	})
+	if contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("cross-app hostname accepted: %v", err)
+	}
+	var runs, owners int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM eregion_definition_runs), (SELECT count(*) FROM eregion_platform_domains WHERE name='shared.example.com')`).Scan(&runs, &owners); err != nil || runs != 0 || owners != 1 {
+		t.Fatalf("runs=%d owners=%d err=%v", runs, owners, err)
+	}
+}
+
+func TestIntegrationDefinitionConcurrentReplay(t *testing.T) {
+	pool, _, app := definitionIntegrationFixture(t)
+	ctx := context.Background()
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: integrationDefinition}
+	plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || !plan.CanApply {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+	input.PlanNonce = plan.PlanNonce
+	apply := api.DefinitionApplyInput{Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "concurrent-replay", Confirm: "api/production"}
+	var wg sync.WaitGroup
+	results := make([]contract.OperationID, 2)
+	replays := make([]bool, 2)
+	errs := make([]error, 2)
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			result, err := app.ApplyDefinition(ctx, definitionIntegrationActor, apply)
+			results[i], replays[i], errs[i] = result.Operation.ID, result.Replay, err
+		}(i)
+	}
+	wg.Wait()
+	if errs[0] != nil || errs[1] != nil || results[0] == "" || results[0] != results[1] || replays[0] == replays[1] {
+		t.Fatalf("results=%v replays=%v errors=%v", results, replays, errs)
+	}
+	var runs, parents int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM eregion_definition_runs), (SELECT count(*) FROM eregion_operations WHERE kind=$1)`, platform.KindDefinitionApply).Scan(&runs, &parents); err != nil || runs != 1 || parents != 1 {
+		t.Fatalf("runs=%d parents=%d err=%v", runs, parents, err)
+	}
 }
 
 func TestIntegrationDefinitionAdmissionReplayAndFences(t *testing.T) {

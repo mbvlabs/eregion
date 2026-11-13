@@ -149,7 +149,7 @@ a node name identifies that server. Neither is an application environment.
 ```sh
 eregion workspace list --json
 eregion --workspace thelab server status --json
-eregion --workspace thelab domain cloudflare status --json
+eregion --workspace NAME dns status --provider cloudflare --json
 ```
 
 Use explicit workspace selection in automation rather than relying on a human's
@@ -228,8 +228,9 @@ between the local tag and the engine journal: `Check` requires that record plus
 a local tag whose config ID and repository digest still match it, so a
 pre-existing local-only tag never satisfies the new step. The Pack effect is
 versioned as `platform-pack-02-v1`; historical `01` journal entries remain
-readable and untouched. A retry or a new Pack step also removes stale owned
-build networks left by an interrupted attempt before creating its own.
+readable and untouched. Pack startup removes only proven retry-owned networks
+for its own effect's current or earlier attempts, never another operation's
+network or registry attachment.
 
 The release row records the canonical registry manifest digest in `image` and
 the Docker config digest in `image_id`. A ready release whose recorded local
@@ -239,6 +240,20 @@ release. An explicit artifact admission records the same two identities before
 the worker runs: it pulls only the pinned manifest and refuses a config-digest
 mismatch. A historical local-only release with no canonical reference fails
 clearly when its image is missing; there is no mutable-tag or rebuild fallback.
+
+**Identity discrepancy under investigation (2026-11-13).** The config-digest
+language above states the artifact contract, but the current Pack producer
+actually persists unfiltered Docker inspect `.Id`. On Docker 29.1.3's containerd
+store that can be a manifest/index target digest, not `config.digest`; explicit
+artifact admission instead reads the config digest from verified manifest
+metadata. Materialization, containers, retention and diagnostics consume the
+same field, so changing one producer alone is unsafe. Historical rows have no
+identity-format discriminator and must not be silently reinterpreted.
+Source research does not establish the reported diagnostic failure's cause.
+Exact allowlisted host/API/store/image observations are still required before
+the correction gate; no identity fallback, pull-enabled diagnostic or row
+rewrite is introduced by this work. The producer/consumer map and primary-source
+research are retained in the beta.6 correction evidence under W06.
 
 Repeated `--keep-file` values (TOML `source.buildpacks.keep_files`) map to
 `BP_KEEP_FILES`; they preserve matching paths in the application source, not
@@ -260,6 +275,12 @@ script override; omitted fields are preserved.
 non-secret metadata already present in inventory, including automation,
 retention, protection, release timeout and managed DNS metadata.
 Strict definition parsing refuses the inspection marker before any node call.
+Current recipe files use `version = 1`. To adjust an older recipe, remove
+unsupported `source.kind` and `source.image`, retaining the optional Git recipe
+and its actual builder, buildpack order, targets and keep-file settings.
+Artifact selectors belong to `deploy`, not `[source]`. The strict parser
+provides no old-field aliases, and a recipe edit is not database migration,
+upgrade or adoption.
 It does not query providers or claim DNS automation can round-trip. Normal export
 includes automation desired state and a webhook secret name, never its value;
 retention and non-default release timeouts are refused. Protection remains
@@ -278,8 +299,8 @@ reconciliation, valid TLS or public reachability. Missing workspace access must 
 before entering the token.
 
 The non-secret, installation-wide definition DNS policy is separate from that
-credential. Read it with `eregion domain cloudflare status --json`. To configure
-it without entering or rotating a token, use `eregion domain cloudflare policy
+credential. Read it with `eregion dns status --provider cloudflare --json`. To configure
+it without entering or rotating a token, use `eregion dns policy --provider cloudflare
 --enabled --zone ZONE --origin PUBLIC_IP --proxy dns-only|proxied
 --expected-revision N`; repeat `--origin` for additional explicit public IPs.
 Disable it with `--enabled=false --expected-revision N`, omitting the other
@@ -344,7 +365,7 @@ bin/eregion help app create --json
 | `build list/logs/stop/retry`, `release list`, `restart <app> <env>` | Build lifecycle over `platform_builds`; `build logs` reads (and with `--follow` streams) the build operation's events. `build get` is served by the `builds` inventory filter. `restart` reapplies the serving release through the blue/green path. |
 | `domain add/remove <app> <environment> <hostname> [--primary] [--check-path PATH] [--dns cloudflare --dns-zone ZONE (add also needs --dns-origin ADDRESS --dns-proxy dns-only\|proxied)]`, `domain list [--app --environment]` | Node-mode domain bindings, one primary per environment, serialized Caddy writes and separate route/DNS/certificate/public observations. Manual DNS is default. Explicit Cloudflare DNS resolves the configured zone and encrypted credential freshly from PostgreSQL; token values never enter argv, action input, River arguments, events or ordinary output. Add requires explicit validated public origins and proxy choice; the WireGuard endpoint is never an origin. Dry-run returns a real read-only provider snapshot. Immutable per-binding ownership, newest-intent fences and exact-owned cleanup preserve foreign records and retain the ledger on failure. Remove needs exact hostname confirmation and refuses the primary; app/environment deletion supports primary cleanup. Provider success is not public readiness, and multi-binding/provider/node effects are not one atomic transaction or an availability guarantee. The detailed DNS section below describes cleanup and recovery boundaries. |
 
-| `domain cloudflare configure [--zone ID --zone-name NAME]`, `domain cloudflare status [--zone ID_OR_NAME]` | Human-only hidden-token setup/rotation plus agent-safe metadata status. Configure read-validates the exact zone, previews current/next revision, confirms, then atomically commits CAS-fenced encrypted vault state and sanitized audit attribution. JSON/NDJSON/no-TTY configuration refuses before token read/RPC; no token flag, file, environment or stdin fallback. Current credentials resolve without restart. Status never decrypts or prints a token. Setup proves DNS-list access only, not write capability. |
+| `dns configure --provider cloudflare [--zone ID --zone-name NAME]`, `dns status --provider cloudflare [--zone ID_OR_NAME]`, `dns policy --provider cloudflare …` | Human-only hidden-token setup/rotation plus agent-safe metadata status and non-secret definition policy. Each leaf requires the explicit provider before prompts/RPC; the old `domain cloudflare` path is removed without an alias. Configure read-validates the exact zone, previews current/next revision, confirms, then atomically commits CAS-fenced encrypted vault state and sanitized audit attribution. JSON/NDJSON/no-TTY configuration refuses before token read/RPC; no token flag, file, environment or stdin fallback. Current credentials resolve without restart. Status never decrypts or prints a token. Setup proves DNS-list access only, not write capability. Policy alone does not write DNS. Bindings remain under `domain add/list/remove` with their binding-level DNS flags. |
 | `secret set/list/archive/export`, `secrets export` | Metadata/write-only storage and explicit file export; `set` writes the value and then attaches the name to the environment as a new revision. No plaintext `get`. Both exports need a TTY and a TOTP code; `--yes`, `--json`, and a pipe are refused, and their command metadata declares that they prompt. `secret export` carries the code in the same node request that returns the value (`vault.export`); there is no separate pre-check request to skip. `secrets export` rebuilds the server-init handoff (including the vault keyring and the local telemetry credential when present) and honours `--secrets-out`; a missing telemetry credential is reported as a warning, never invented. |
 | `token create/list/revoke` | Per-use deploy tokens for one app/environment, expiring, hashed in `/etc/eregion/auth.json`, shown once. `create` needs a TTY and TOTP code, never `--json`/`--yes`. |
 | `protect init/status` | Node-root TOTP setup (`/etc/eregion/protect.json`, shown once as QR/otpauth) and non-secret status. |
@@ -408,8 +429,7 @@ surface and the backup code are deleted (MASTER D19); alpha.2's singular
 `resource apply|attach|detach|list|status|destroy` lifecycle is registered.
 The Docker Compose telemetry stack install is deleted (D5); the local textfile
 directory and narrow systemd collector are node_exporter unit arguments, not a
-telemetry stack. `dns …`,
-`access …`, `platform …` and `operations test` are no longer registered
+telemetry stack. `access …`, `platform …` and `operations test` are no longer registered
 (D6, D19, D22, D26); `metrics show`, `metrics endpoint`, `metrics config` and
 `metrics rotate` are registered as the node-local read/config primitives
 described above. The DNS/access internal packages remain for the after-v1
@@ -417,7 +437,9 @@ phases only after a product scope decision. `bootstrap …`, `serve`, `worker`
 and `system migrate` are not operator commands; they live under the hidden
 Linux-only `node` group (`node rpc`, `node unlock-ssh`, `node serve`,
 `node worker`, `node migrate`, `node bootstrap …`) and `commands --json` lists
-only the section 5 tree plus `help`.
+only the section 5 tree plus `help`. Provider setup now lives under
+`dns configure|status|policy --provider cloudflare`; this is distinct from the
+removed historical DNS-management surface and adds no extra provider.
 
 Definition reconciliation uses one server-backed plan/apply flow for an explicitly
 selected existing app and environment. `plan --from FILE --app APP --environment
@@ -428,6 +450,20 @@ require `--confirm APP/ENV`. The digest binds the exact definition bytes, target
 current inventory, policy and provider evidence. Neither `--yes` nor a fresh plan
 silently replaces an earlier approval. `env update APP ENV --from FILE` uses the
 same service; its dry run only plans. Host-only plan/apply remains unchanged.
+
+Approval snapshots include current/planned runtime and builder nodes and existing
+resource nodes, rather than unrelated installation-wide node churn. Current
+placement selectors use exact names, with an omitted builder falling back to
+the runtime node; no broader candidate discovery is implied. Same-app active
+work remains relevant and admission still refuses it. Normalized ordering
+excludes unrelated operation transitions while preserving target/revision,
+secret/resource/binding, DNS policy/credential and exact provider observations.
+Invalidation offers bounded reason categories and replan guidance, not raw
+fingerprints or secret/provider bodies. Admission rechecks installation-wide
+hostname ownership; the global name constraint remains the insertion fence if
+a hostname is claimed after parent admission. Such a later conflict can fail
+the corresponding child; approval is not a global hostname reservation or
+all-or-nothing external apply.
 
 Admission atomically journals the approved intent, permanently reserves its nonce
 and new binding identities, and enqueues one parent operation. The parent admits
@@ -448,6 +484,45 @@ at effect boundaries. Parent cancellation and exhaustion drain linked children
 before terminalization releases the reservation. Provider reads occur outside SQL
 transactions; Cloudflare's lack of conditional writes leaves a final external
 writer race, not a guarantee of provider atomicity.
+
+Repeated definition apply distinguishes provider writes, externally satisfied
+records, missing bookkeeping and a fully applied desired generation. The first
+zero-write apply may still create a child to commit required ledger state.
+A later unchanged apply omits that child only when the approved exact provider
+snapshot and matching applied ledger generation, zone, ownership, origins and
+proxy mode are satisfied. It does not churn DNS/binding generation or
+last-operation identity. Planning still reads enabled-policy provider state for
+unchanged desired bindings; authority, policy/credential revision and drift
+checks remain. Matching foreign records stay unowned, including alongside
+separately owned records.
+
+Provider failures expose fixed bounded categories and numeric HTTP status,
+never upstream messages/bodies, Cloudflare codes, Ray IDs, credential values,
+URL queries or raw transport errors. Known authorization/client rejection can
+stop retries; 408/429, provider unavailability and unknown transport outcomes
+retain retry/reconciliation semantics. A later read denial cannot turn an
+unresolved earlier write into a definite failure. Parent diagnosis reports
+completed revision/resource work separately from failed DNS work and serving,
+route, TLS and public readiness. Apply is not an all-or-nothing provider rollback.
+
+Cancellation, exhaustion and orphan recovery latch read-only recovery before
+rescheduling unresolved DNS work. A durable intent can mean either “not sent”
+or “sent with a lost/delayed response”; observing only the approved pre-state
+does not distinguish them. Recovery never repeats that ambiguous write or
+cleanup deletion. It revalidates exact linkage, approval, binding/ledger,
+attempt and policy/credential identity around bounded provider reads, then
+persists sufficient proof before settling the resolved prefix. Undispatched
+changes are abandoned, not reported applied.
+
+Unknown, unavailable, divergent or malformed evidence retains the child and
+parent reservation, including an independent finish veto for unresolved linked
+evidence after a terminal child. Exact approved post-state or a durably known
+definitive rejection can resolve the pending transition; a later read rejection
+cannot. Reservations may therefore remain pending indefinitely if proof never
+arrives or authority drifts. No timeout-based forced settlement, automatic
+ambiguous rerun, operator repair command or provider rollback guarantee is
+added. These recovery source changes received independent review; authorized
+PostgreSQL/provider qualification remains outstanding. Compilation is not acceptance.
 
 Offline checks and source review do not establish database concurrency, provider
 execution or real-host acceptance. The PostgreSQL regressions exercise admission,
@@ -490,6 +565,33 @@ accepts `--output ndjson` and streams the same event records as
 `--json` on a submitting command keeps returning the accepted operation without
 waiting. NDJSON never prompts: a guided command with missing input, or a
 factor-gated delete, refuses instead of asking.
+
+Operation follow uses one read-only `operations.follow` node RPC session,
+opening the shared application service and performing startup readiness once
+per uninterrupted session. It sends typed snapshot/event observations inside
+the existing NDJSON event envelope, not log-message payloads. Request `Stream`
+remains false because it denotes streamed stdin, not response streaming.
+Frames are bounded to 4 MiB; event pages split without skipping sequences, and
+an individually oversized observation is a protocol failure. The existing
+polling interval remains configurable, defaulting to 500ms.
+
+The shared viewer validates cursor progression and terminal-tail consistency.
+Completion needs a valid final result and authoritative terminal snapshot with
+its events drained; bare EOF is not success. A transient disconnect reconnects
+with bounded backoff from the processed cursor, and each new session performs
+startup checks again. Fatal authority/not-found/protocol failures stop instead.
+Individual service reads remain bounded; the read session has no arbitrary
+operation-lifetime deadline.
+
+Plain, interactive, JSON and public NDJSON consume the same observations.
+The running client retains its per-operation emitted sequence across reconnects,
+advancing only after successful output. Output failure terminates the stream
+rather than reconnecting and re-emitting. Internal RPC frames are not public
+operation events. This is not exactly-once delivery across client crashes or
+partially written external output. Ctrl-C/detach closes only read resources;
+it never requests operation cancellation or repeats a submission.
+Database/service integration execution and the privileged SSH framing boundary
+remain separate qualification gates.
 
 ## Node-local telemetry
 
@@ -1336,6 +1438,17 @@ for the removed custom planner do not describe the Goose path. This replacement
 is not a demonstrated readiness-timeout fix. The API's pool maximum remains 12;
 worker connections belong to a separate process/pool in the installed layout.
 
+The beta.6 findings correction consolidates application identity, legacy-ledger
+presence and current-schema Goose-table presence into one query within the
+existing read-only repeatable-read transaction. It reads exact history only
+after presence is established and retains orphan inventory validation. River
+inspection remains a separate read-only snapshot with a connection schema/role
+consistency check; the two snapshots are not atomic together. Source-derived
+healthy traced command count falls from 13 to 11 (5 application, 6 River),
+without changing pool size, timeout or per-session startup validation. Counts
+are not measured wire round trips or a latency guarantee; real PostgreSQL
+regressions and same-target timing remain qualification gates.
+
 Request-scoped pgx acquire/query/release traces record fixed stage names,
 durations and counts, including row lifetime. Each stage also retains bounded
 per-query ordinal timing (first eight queries, fixed `ok`/`failed` outcomes);
@@ -1728,16 +1841,76 @@ window.
 | `/etc/sudoers.d/eregion-node` | Admin's passwordless `/usr/local/bin/eregion node rpc` rule, validated by `visudo`. |
 
 Node effect identity is `operation:step`, stable across attempts. Execution
-identity is `operation:attempt:step`. The engine serializes host mutations with
-a node-local host lock. The build-stop step alone opts out through the trusted
-`HostLockIndependent` step interface: it only writes an operation-private
-cancellation marker and must run while pack holds the host lock. It still takes
-its own effect lock and uses the normal durable journal; the request payload
+identity is `operation:attempt:step`. The engine fences host mutations with
+a node-local host lock. Narrow signal/sandbox effects opt out through the trusted
+`HostLockIndependent` step interface. Build-stop only writes an operation-private
+cancellation marker and must run while Pack holds the host fence. Independent
+effects still take their own effect locks and use the normal durable journal; the request payload
 cannot select this behaviour. Check durable status before dispatch;
 acknowledge completed matching effects rather than reapply. Locks on the node
 are host-local. Per-environment PostgreSQL advisory locks serialize deployments
 across workers; River queue concurrency is not that lock. Journal compaction
 does not automatically delete durable effect records. Corruption fails closed.
+
+### Build lock compatibility
+
+Trusted constructors, not request payloads or arbitrary command patterns, select
+shared mode. All unclassified effects retain exclusive host fencing.
+
+| Effect | Host fence | Additional exclusive resources |
+| --- | --- | --- |
+| Exact Pack `platform-pack-02-v1` | Shared for Check/Apply | Validated build/launch cache identities |
+| Exact deployment network ensure `platform-network-01-v1` | Shared for Check/Apply | Exact environment network identity |
+| Host, route/container, registry removal/GC and retention effects | Exclusive | Existing targeted fences |
+| Existing narrow build-stop/diagnostic opt-outs | Existing independent mode | Existing private/effect fences |
+
+Order is effect lock → host fence → sorted, deduplicated physical resource
+identities; release unwinds in reverse. Resource lock paths use hashed identities
+beneath engine state. Contention defers before Check/Apply rather than consuming
+a failure attempt. Shared mode never upgrades in place. Different cache writers
+may overlap; the same cache or network serializes. Exclusive effects can still
+wait behind builds: this does not promise fairness or lock-free deployment
+completion. Upload/removal/GC host fences remain independent of PostgreSQL
+advisory-session lifetime.
+
+Registry-GC maintenance opportunistically sweeps only exact completed Pack
+attempt networks. With exclusive host fencing it tries the corresponding effect
+lock nonblockingly, then rechecks matching journal and durable effect-record
+identity before exact owned cleanup. It never waits for an effect lock while
+holding host exclusivity. Locked, failed, deferred, running, ambiguous and
+newer-attempt candidates remain untouched. This conservatively leaves some
+abandoned resources behind and is neither prompt nor complete reclamation.
+Real Docker overlap/cleanup and database-backed scheduling remain separate
+qualification gates.
+
+### Build capacity and admission
+
+The authenticated application service reads/updates the verified current main
+node's PostgreSQL capacity. The operator surface is
+`server build-concurrency set N [--dry-run]`, with current capacity projected in
+`server status`. Bounds are 1–16, default 1; results name the node, previous and
+effective values, preview state and resource-pressure warnings. Dry-run takes
+the same validation path without writing. Missing/unverified host placement
+fails closed.
+
+Setting updates and every admission attempt serialize on the same node row.
+Admission rereads current committed capacity and probes the entire 16-key
+session-advisory slot space, including occupied slots above a lowered capacity.
+It retains at most one free key only when total occupancy permits it, releases
+temporary probes, commits the short row transaction and retains only the
+selected session lease. Busy attempts release transaction/connection before
+sleeping. An uncertain probe, unlock or commit discards the underlying session
+rather than returning possible advisory locks to the pool; cleanup is bounded
+independently of caller cancellation.
+
+Concurrent setting writes use ordinary last-committed-setting behavior.
+Reduction leaves existing builds running and prevents additional admissions
+until occupancy falls below the new capacity, even if a low-numbered slot
+becomes free first. No worker restart, cancellation or local override is added.
+Worker concurrency (default 2), the 12-connection pool and other locks can
+constrain achievable parallelism. Advisory admission is not a strict host-Pack
+process ceiling after session loss or a detached worker outcome. Real database
+reduction-race and Docker overlap qualification remain required.
 
 A non-independent execution journals its typed phase (`waiting_host_lock`,
 `checking`, `applying`) and non-negative wait time. A bounded host-lock timeout
@@ -2220,8 +2393,8 @@ Use the operator CLI in a human terminal; no server file or environment editing
 is needed:
 
 ```sh
-eregion --workspace thelab domain cloudflare configure --zone ZONE_ID --zone-name mbvlabs.com
-eregion --workspace thelab domain cloudflare status --json
+eregion --workspace NAME dns configure --provider cloudflare --zone ZONE_ID --zone-name example.com
+eregion --workspace NAME dns status --provider cloudflare --json
 ```
 
 Zone fields also prompt when omitted. The token is accepted only by a no-echo

@@ -841,6 +841,18 @@ systemctl is-active --quiet "$unit"`
 }
 
 func (s *RetentionGCStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
+	// This effect holds the exclusive host fence. Sweep only completed Pack
+	// effects, taking their effect locks nonblockingly to avoid reversing the
+	// normal effect -> host lock order.
+	sweepCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	err := sweepCompletedBuildNetworks(sweepCtx, rt, s.ID(), report)
+	cancel()
+	if err != nil && report != nil {
+		report(engine.Event{Kind: "warning", Step: s.ID(), Message: "completed build network sweep was incomplete"})
+	}
+	if err := ctx.Err(); err != nil {
+		return engine.ApplyResult{}, err
+	}
 	if err := (engine.Shell{Secrets: rt.Secrets}).Run(ctx, s.ID(), s.script(), nil, report); err != nil {
 		return engine.ApplyResult{}, err
 	}

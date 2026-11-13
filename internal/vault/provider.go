@@ -402,7 +402,7 @@ func decryptProviderRow(ring *KeyRing, scope ProviderScope, row *providerEncrypt
 }
 
 func providerNotFound(scope ProviderScope) *contract.Fault {
-	fault := contract.NewFault(contract.NotFound, "provider credential was not found", "Configure it with eregion domain cloudflare configure, then retry.")
+	fault := contract.NewFault(contract.NotFound, "provider credential was not found", "Configure it with eregion dns configure --provider cloudflare, then retry.")
 	fault.Details = map[string]any{"provider": scope.Provider, "zone_id": scope.ZoneID}
 	return fault
 }

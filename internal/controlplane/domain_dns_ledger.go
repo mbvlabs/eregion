@@ -18,6 +18,7 @@ const (
 	domainDNSStateCleanupPending  = "cleanup_pending"
 	domainDNSStateCleanupVerified = "cleanup_verified"
 	domainDNSStateCleanupFailed   = "cleanup_failed"
+	definitionCleanupUnknown      = "definition cleanup outcome unknown"
 )
 
 type domainDNSLedger struct {
@@ -140,14 +141,14 @@ func (s *Service) checkDomainDNSBoundary(ctx context.Context, id contract.Operat
 
 func (s *Service) authorizeDomainDNSWrite(ctx context.Context, actor contract.Actor) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; retry.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; retry.")
 	}
 	return s.domainDNS.AuthorizeWrite(ctx, actor)
 }
 
 func (s *Service) resolveDomainDNSZone(ctx context.Context, ref string) (integrations.DNSZone, error) {
 	if s.domainDNS == nil {
-		return integrations.DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; manual DNS remains the default.")
+		return integrations.DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; manual DNS remains the default.")
 	}
 	zone, err := s.domainDNS.ResolveZone(ctx, ref)
 	if err != nil {
@@ -310,10 +311,14 @@ func markDomainDNSApplied(ctx context.Context, tx pgx.Tx, ledger domainDNSLedger
 }
 
 func markDomainDNSFailed(ctx context.Context, tx pgx.Tx, ledger domainDNSLedger, opID contract.OperationID, message string) error {
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
+	tag, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
         SET state='failed',last_error=$2,updated_at=clock_timestamp()
-        WHERE domain_id=$1 AND last_operation_id=$3`, ledger.DomainID, boundedRouteError(message), opID); err != nil {
+        WHERE domain_id=$1 AND last_operation_id=$3 AND generation=$4`, ledger.DomainID, boundedRouteError(message), opID, ledger.Generation)
+	if err != nil {
 		return unavailable()
+	}
+	if tag.RowsAffected() != 1 {
+		return definitionDNSConflict()
 	}
 	return nil
 }
@@ -342,7 +347,7 @@ func (s *Service) finishDomainOperation(ctx context.Context, id contract.Operati
 
 func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion domain cloudflare configure; the durable binding is retained.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion dns configure --provider cloudflare; the durable binding is retained.")
 	}
 	if ledger.LastOperationID != op.ID {
 		return contract.NewFault(contract.Conflict, "a newer domain operation owns this managed binding", "This operation is stale and did not apply DNS; retry the current intent.")
@@ -377,7 +382,9 @@ func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operatio
 	}
 	if err != nil {
 		if !dnsBoundaryStop(err) {
-			s.recordDomainDNSFailure(ctx, op, attempt, ledger, err)
+			if recordErr := s.recordDomainDNSFailure(ctx, op, attempt, ledger, err); recordErr != nil {
+				return recordErr
+			}
 		}
 		return err
 	}
@@ -420,7 +427,7 @@ func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operatio
 // unsafe ledger therefore stops the whole deletion before its first DNS write.
 func (s *Service) preflightDomainDNSLedger(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion domain cloudflare configure; no workload was removed.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion dns configure --provider cloudflare; no workload was removed.")
 	}
 	if ledger.LastOperationID != op.ID {
 		return contract.NewFault(contract.Conflict, "a newer operation owns this managed binding cleanup", "No provider mutation was attempted; retry the current deletion.")
@@ -460,7 +467,7 @@ func (s *Service) preflightDomainDNSLedger(ctx context.Context, op contract.Oper
 
 func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger) error {
 	if s.domainDNS == nil {
-		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion domain cloudflare configure; the binding and cleanup ledger are retained.")
+		return contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure the missing provider credential with eregion dns configure --provider cloudflare; the binding and cleanup ledger are retained.")
 	}
 	if ledger.LastOperationID != op.ID {
 		return contract.NewFault(contract.Conflict, "a newer operation owns this managed binding cleanup", "This deletion is stale; retry the current deletion after the newer operation finishes.")
@@ -513,6 +520,30 @@ func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operat
 		if err := guard(ctx); err != nil {
 			return err
 		}
+		if len(step.Cleanup.Changes) > 0 {
+			// Persist a conservative in-flight fence before any DELETE. A
+			// restarted attempt must read back, never redispatch the cleanup.
+			_, owned, err := s.mutateOwned(ctx, op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+				if current.State != contract.Running {
+					return errPlatformCancelled
+				}
+				tag, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns SET cleanup_error=$4,updated_at=clock_timestamp()
+					WHERE domain_id=$1 AND last_operation_id=$2 AND generation=$3 AND state='cleanup_pending' AND cleanup_error=''`, ledger.DomainID, op.ID, ledger.Generation, definitionCleanupUnknown)
+				if err != nil {
+					return unavailable(err)
+				}
+				if tag.RowsAffected() != 1 {
+					return definitionDNSConflict()
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			if !owned {
+				return errNotOwned
+			}
+		}
 	}
 	plan, err := s.domainDNS.RemoveWithGuard(ctx, op.Actor, op.ID, request, guard)
 	if err != nil {
@@ -543,7 +574,9 @@ func (s *Service) markCleanupFailure(ctx context.Context, op contract.Operation,
 	// DNS authority before writing it, so a revoked actor leaves the cleanup
 	// state exactly as the authorized work left it. An action-specific denial
 	// is also not recorded as a provider failure.
-	if contract.Classify(cause).Code == contract.Forbidden {
+	var providerFailure *integrations.ProviderFailure
+	isProviderFailure := errors.As(cause, &providerFailure)
+	if contract.Classify(cause).Code == contract.Forbidden && !isProviderFailure {
 		return
 	}
 	if err := s.authorizeDomainDNSWrite(context.WithoutCancel(ctx), op.Actor); err != nil {
@@ -552,6 +585,9 @@ func (s *Service) markCleanupFailure(ctx context.Context, op contract.Operation,
 	message := ""
 	if cause != nil {
 		message = s.redact(cause.Error())
+		if providerFailure != nil && providerFailure.DefinitiveWrite && providerFailure.DefinitiveRecordDigest != "" {
+			message = "definitive cleanup rejection: " + providerFailure.DefinitiveRecordDigest + " " + message
+		}
 	}
 	_, _, _ = s.mutateOwned(context.WithoutCancel(ctx), op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
 		if current.State.Terminal() {
@@ -561,24 +597,36 @@ func (s *Service) markCleanupFailure(ctx context.Context, op contract.Operation,
 	})
 }
 
-func (s *Service) recordDomainDNSFailure(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, cause error) {
+func (s *Service) recordDomainDNSFailure(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, cause error) error {
 	// An unauthorized worker must not turn the admitted intent into a failure
 	// record, and a missing authorization configuration fails closed without
 	// mutating the ledger. An action-specific denial is not a provider failure.
-	if contract.Classify(cause).Code == contract.Forbidden {
-		return
+	var providerFailure *integrations.ProviderFailure
+	isProviderFailure := errors.As(cause, &providerFailure)
+	if contract.Classify(cause).Code == contract.Forbidden && !isProviderFailure {
+		return nil
 	}
 	if err := s.authorizeDomainDNSWrite(context.WithoutCancel(ctx), op.Actor); err != nil {
-		return
+		return err
 	}
 	message := ""
 	if cause != nil {
 		message = s.redact(cause.Error())
+		if providerFailure != nil && providerFailure.DefinitiveWrite {
+			message = "definitive write rejection: " + message
+		}
 	}
-	_, _, _ = s.mutateOwned(context.WithoutCancel(ctx), op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+	_, owned, err := s.mutateOwned(context.WithoutCancel(ctx), op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
 		if current.State.Terminal() {
 			return nil
 		}
 		return markDomainDNSFailed(context.WithoutCancel(ctx), tx, ledger, op.ID, message)
 	})
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errNotOwned
+	}
+	return nil
 }

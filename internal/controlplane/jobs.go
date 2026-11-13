@@ -197,6 +197,21 @@ func (s *Service) recoverOrphanedPlatformJob(ctx context.Context, job orphanedPl
 	// not visible until commit. No new River attempt can claim the operation
 	// between the state change and this event.
 	if exhausted {
+		if (op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove) && op.Attempt <= uint32(job.Attempt) {
+			handled, err := prepareDefinitionDNSRecoveryTx(ctx, tx, &op)
+			if err != nil {
+				return false, false, err
+			}
+			if handled {
+				if _, err := tx.Exec(ctx, `UPDATE river_job SET state='scheduled',finalized_at=NULL,max_attempts=GREATEST(max_attempts,attempt+1),scheduled_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, job.ID); err != nil {
+					return false, false, unavailable(err)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					return false, false, unavailable(err)
+				}
+				return true, false, nil
+			}
+		}
 		if op.Kind == platform.KindDefinitionApply && !op.State.Terminal() && op.Attempt <= uint32(job.Attempt) {
 			if op.State != contract.Cancelling {
 				if err := definitionFailureTx(ctx, tx, &op, contract.Unavailable, "Definition worker attempts were exhausted; linked work is being drained."); err != nil {

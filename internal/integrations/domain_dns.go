@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -137,14 +138,14 @@ func (d *DomainDNS) AuthorizeWrite(ctx context.Context, actor contract.Actor) er
 
 func (d *DomainDNS) clientFor(ctx context.Context, zoneID, zoneName string) (DNSZone, *Cloudflare, error) {
 	if d == nil || d.zones == nil || d.creds == nil {
-		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; manual DNS remains the default.")
+		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; manual DNS remains the default.")
 	}
 	zone, ok, err := d.zones.DNSZone(ctx, zoneID, zoneName)
 	if err != nil {
 		return DNSZone{}, nil, err
 	}
 	if !ok {
-		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Configure it with eregion domain cloudflare configure; manual DNS remains the default.")
+		return DNSZone{}, nil, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Configure it with eregion dns configure --provider cloudflare; manual DNS remains the default.")
 	}
 	raw, err := d.creds.DNSCredential(ctx, DNSProviderCloudflare, zone.ZoneID)
 	if err != nil {
@@ -167,14 +168,14 @@ func (d *DomainDNS) clientFor(ctx context.Context, zoneID, zoneName string) (DNS
 // later cleanup does not depend on operator flags.
 func (d *DomainDNS) ResolveZone(ctx context.Context, ref string) (DNSZone, error) {
 	if d == nil || d.zones == nil {
-		return DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; manual DNS remains the default.")
+		return DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; manual DNS remains the default.")
 	}
 	zone, ok, err := d.zones.DNSZone(ctx, "", ref)
 	if err != nil {
 		return DNSZone{}, err
 	}
 	if !ok {
-		return DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Configure it with eregion domain cloudflare configure; manual DNS remains the default.")
+		return DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Configure it with eregion dns configure --provider cloudflare; manual DNS remains the default.")
 	}
 	return zone, nil
 }
@@ -432,6 +433,15 @@ func (d *DomainDNS) applyOneChange(ctx context.Context, actor contract.Actor, op
 	}
 	if err := client.apply(ctx, domainDNSChangeToDNSChange(change)); err != nil {
 		_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "zone="+zone.ZoneName)})
+		var failure *ProviderFailure
+		if change.Action == "delete" && change.Before != nil && errors.As(err, &failure) &&
+			(contract.Classify(err).Code == contract.Forbidden || contract.Classify(err).Code == contract.PreconditionFailed) {
+			copy := *failure
+			copy.DefinitiveWrite = true
+			digest := sha256.Sum256([]byte(change.Before.ID))
+			copy.DefinitiveRecordDigest = hex.EncodeToString(digest[:])
+			return &copy
+		}
 		return err
 	}
 	plan.Applied++

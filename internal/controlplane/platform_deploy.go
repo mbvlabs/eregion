@@ -185,10 +185,9 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 	if err != nil {
 		return release, err
 	}
-	limit := buildLimit(buildNode)
-	releaseSlot, err := w.service.acquireBuildSlot(ctx, buildNode.Name, limit, func() {
+	releaseSlot, err := w.service.acquireBuildSlot(ctx, buildNode.Name, func() {
 		w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
-			fmt.Sprintf("build_queued on node %s; all %d build slot(s) are busy", buildNode.Name, limit))
+			fmt.Sprintf("build_queued on node %s; build capacity is busy", buildNode.Name))
 	})
 	if err != nil {
 		return release, err
@@ -201,7 +200,7 @@ func (w *platformWorker) buildRelease(ctx context.Context, id contract.Operation
 		return release, err
 	}
 	w.service.appendWorkerEvent(ctx, id, attempt, deploymentBuildStageLabel,
-		fmt.Sprintf("build_running on node %s; %d of %d build slot(s) in use; %s", buildNode.Name, 1, limit, build.Source.Type))
+		fmt.Sprintf("build_running on node %s; %s", buildNode.Name, build.Source.Type))
 	buildSecrets := map[string]string{}
 	if build.Source.CredentialSecretName != "" {
 		value := secretValues[build.Source.CredentialSecretName]

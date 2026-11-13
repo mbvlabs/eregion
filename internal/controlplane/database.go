@@ -167,6 +167,8 @@ func planMigrations(ctx context.Context, pool *pgxpool.Pool) (MigrationPlan, mig
 }
 
 func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan MigrationPlan, identity migrationIdentity, resultErr error) {
+	ctx, end := beginReadyStage(ctx, "application_versions")
+	defer func() { end(resultErr) }()
 	db := stdlib.OpenDBFromPool(pool)
 	defer db.Close() // releases wrapper connections, not the underlying pgx pool
 	provider, err := gooseProvider(db)
@@ -191,10 +193,6 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 	if err != nil {
 		return plan, identity, err
 	}
-	extended, ok := store.(database.StoreExtender)
-	if !ok {
-		return plan, identity, schemaFault("Goose store cannot inspect its ledger")
-	}
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return plan, identity, unavailable(err)
@@ -202,23 +200,22 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 	defer tx.Rollback()
 	var count int
 	var schema, role sql.NullString
-	if err := tx.QueryRowContext(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+	var old, exists bool
+	// Match Goose's PostgreSQL TableExists predicate, including its restriction
+	// to tables in current_schema. Neither ledger is read before presence is known.
+	if err := tx.QueryRowContext(ctx, `SELECT cardinality(current_schemas(false)), current_schema(), current_user,
+		to_regclass('eregion_schema_migrations') IS NOT NULL,
+		EXISTS (SELECT 1 FROM pg_catalog.pg_tables WHERE
+			(current_schema() IS NULL OR schemaname = current_schema()) AND tablename = 'goose_db_version')`).
+		Scan(&count, &schema, &role, &old, &exists); err != nil {
 		return plan, identity, unavailable(err)
 	}
 	identity, err = checkedIdentity(count, schema.String, role.String)
 	if err != nil {
 		return plan, identity, err
 	}
-	var old bool
-	if err := tx.QueryRowContext(ctx, "SELECT to_regclass('eregion_schema_migrations') IS NOT NULL").Scan(&old); err != nil {
-		return plan, identity, unavailable(err)
-	}
 	if old {
 		return plan, identity, schemaFault("legacy application migration ledger exists")
-	}
-	exists, err := extended.TableExists(ctx, tx)
-	if err != nil {
-		return plan, identity, unavailable(err)
 	}
 	if exists {
 		history, err := store.ListMigrations(ctx, tx)

@@ -329,7 +329,8 @@ commands are marked Linux-only and hidden from the operator listing.
 
 ```
 eregion server init [--workspace-name NAME] [--node NAME] [--resume | --discard] [--answers FILE] | status
-eregion plan | apply [--auto-upgrade-nodes] [--assign-workspace NAME] | doctor  # explicit alpha workspace assignment; converge/check host steps
+eregion server build-concurrency set N [--dry-run]      # selected workspace main node, 1–16; default 1
+eregion plan | apply [--auto-upgrade-nodes] | doctor      # converge/check host steps
 eregion login [--replace WORKSPACE] | workspace list|show|use|remove
                                                        # every node command: --workspace NAME / EREGION_WORKSPACE
 eregion secrets export                                 # server handoff, human factor
@@ -342,7 +343,7 @@ eregion image push <local-image> --app <app> [--tag <tag>]   # local image into 
 eregion build list|logs|stop|retry  ·  release list
 eregion domain add|list|remove [--primary] [--check-path PATH]
                                                          # optional explicit --dns cloudflare --dns-zone ZONE --dns-origin ADDRESS --dns-proxy dns-only|proxied
-eregion domain cloudflare configure|status               # configure: human-only hidden token -> encrypted provider vault
+eregion dns configure|status|policy --provider cloudflare # configure: human-only hidden token -> encrypted provider vault
 eregion config set|unset|list                          # plain variables
 eregion secret set|list|archive|export                 # values write-only
 eregion logs <app> <env> [--process NAME] [--follow]  ·  restart <app> <env>
@@ -357,8 +358,20 @@ eregion ui  ·  commands [--path PATH | --search TEXT | --check-meta] | guide ag
 eregion node …                                         # node mode, not for operators
 ```
 
-Beta: explicit Cloudflare DNS automation under the existing domain flow, with
-human-only credential configuration under `domain cloudflare`.
+Beta: explicit Cloudflare DNS automation under the existing domain binding flow,
+with provider setup under `dns configure|status|policy --provider cloudflare`.
+Each leaf requires the provider explicitly; there is no default provider or old
+`domain cloudflare` alias. Credential setup is human-only, while status and
+non-secret definition policy are agent-operable. Policy alone does not apply DNS.
+Build capacity is PostgreSQL node state, default 1 and valid from 1 through 16.
+`server status` reports the selected workspace main node's effective value;
+`server build-concurrency set N` supports explicit numeric JSON/no-TTY input and
+read-only `--dry-run`. Reducing it does not cancel active builds: new admissions
+wait until occupied slots fall below the new value. Higher capacity trades CPU,
+memory, disk and cache pressure for possible overlap, not guaranteed throughput.
+The setting bounds live advisory-slot admissions, not detached host processes
+after worker/session loss, and does not override worker/pool limits. Inspection
+and verification never raise a live value automatically.
 `env promote` is in the alpha/beta surface as D23.
 After v1: `node add|list|status|remove`, access modes, `server init --local` and
 HA. There is no telemetry node or telemetry server in beta/v1; a later optional
@@ -506,11 +519,11 @@ application, certificate and public response separately as
 pending/applied/failed. Routes are reconciled on worker start and after a
 failed reload. One primary per environment; others are aliases.
 
-For managed Cloudflare DNS, a human first runs `domain cloudflare configure`
+For managed Cloudflare DNS, a human first runs `dns configure --provider cloudflare`
 and enters zone identity plus a hidden token. The CLI read-validates and
 previews the credential revision before confirmation; configuration and
 encrypted provider-scope vault state commit atomically. Rotation uses the same
-flow and takes effect without restart. `domain cloudflare status` is an
+flow and takes effect without restart. `dns status --provider cloudflare` is an
 agent-safe metadata read. No token file or service-environment editing is part
 of this flow, and credential setup is not DNS-write or public qualification.
 

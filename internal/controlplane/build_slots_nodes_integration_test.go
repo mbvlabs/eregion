@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 func wantViolation(t *testing.T, err error, reason string) {
@@ -32,25 +33,33 @@ func TestIntegrationBuildSlotsBoundConcurrentBuildsPerNode(t *testing.T) {
 	run := testRuntime(t, pool, 0)
 	s := run.Service
 	ctx := context.Background()
+	for _, name := range []string{"build-1", "build-2", "build-3"} {
+		if err := insertFixtureNode(ctx, pool, name, []string{platform.RoleBuilder}, []string{platform.CapabilityBuildpacks}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_nodes SET build_concurrency=2 WHERE name IN ('build-1','build-2')`); err != nil {
+		t.Fatal(err)
+	}
 	oldPoll, oldWait := buildSlotPoll, buildSlotWait
 	buildSlotPoll, buildSlotWait = 20*time.Millisecond, 400*time.Millisecond
 	t.Cleanup(func() { buildSlotPoll, buildSlotWait = oldPoll, oldWait })
 
-	first, err := s.acquireBuildSlot(ctx, "build-1", 2, nil)
+	first, err := s.acquireBuildSlot(ctx, "build-1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.acquireBuildSlot(ctx, "build-1", 2, nil)
+	second, err := s.acquireBuildSlot(ctx, "build-1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var queued sync.WaitGroup
 	queued.Add(1)
-	_, err = s.acquireBuildSlot(ctx, "build-1", 2, queued.Done)
+	_, err = s.acquireBuildSlot(ctx, "build-1", queued.Done)
 	wantViolation(t, err, ReasonBuildCapacity)
 	queued.Wait()
 
-	other, err := s.acquireBuildSlot(ctx, "build-2", 2, nil)
+	other, err := s.acquireBuildSlot(ctx, "build-2", nil)
 	if err != nil {
 		t.Fatalf("slots are per node: %v", err)
 	}
@@ -59,7 +68,7 @@ func TestIntegrationBuildSlotsBoundConcurrentBuildsPerNode(t *testing.T) {
 	buildSlotWait = 5 * time.Second
 	got := make(chan func(), 1)
 	go func() {
-		release, err := s.acquireBuildSlot(ctx, "build-1", 2, nil)
+		release, err := s.acquireBuildSlot(ctx, "build-1", nil)
 		if err != nil {
 			t.Error(err)
 			close(got)
@@ -81,13 +90,13 @@ func TestIntegrationBuildSlotsBoundConcurrentBuildsPerNode(t *testing.T) {
 	}
 	second()
 
-	one, err := s.acquireBuildSlot(ctx, "build-3", 1, nil)
+	one, err := s.acquireBuildSlot(ctx, "build-3", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cancelCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
-	if _, err := s.acquireBuildSlot(cancelCtx, "build-3", 1, nil); err == nil {
+	if _, err := s.acquireBuildSlot(cancelCtx, "build-3", nil); err == nil {
 		t.Fatal("a node with one slot ran two builds")
 	}
 	one()

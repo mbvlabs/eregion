@@ -197,11 +197,11 @@ func providerCommitFault(err error) *contract.Fault {
 	if errors.Is(err, pgx.ErrTxCommitRollback) {
 		return contract.NewFault(contract.Unavailable,
 			"provider credential commit was rolled back",
-			"The existing credential was not changed. Run eregion domain cloudflare status to read the observed revision, then retry with that revision.")
+			"The existing credential was not changed. Run eregion dns status --provider cloudflare to read the observed revision, then retry with that revision.")
 	}
 	return contract.NewFault(contract.Unavailable,
 		"provider credential commit outcome is unknown",
-		"Run eregion domain cloudflare status and inspect the observed revision before retrying; do not assume the previous credential is still active.")
+		"Run eregion dns status --provider cloudflare and inspect the observed revision before retrying; do not assume the previous credential is still active.")
 }
 
 func (s *CloudflareSetup) ListCloudflareCredentials(ctx context.Context, actor contract.Actor, zoneRef string) ([]vault.ProviderMetadata, error) {

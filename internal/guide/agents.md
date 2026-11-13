@@ -169,17 +169,17 @@ terminal, some need a human, and a retry may need the same idempotency key.
   the effective desired revision of a definition-file update, even when its
   source binding is unchanged. A dry run or idempotent replay does not read gh.
 - Cloudflare provider setup is a human handoff: ask the operator to run
-  `eregion --workspace NAME domain cloudflare configure` in their own terminal.
+  `eregion --workspace NAME dns configure --provider cloudflare` in their own terminal.
   They enter the zone and token through its hidden prompt; never request the
   token in chat, a file, flags or service-environment edits. The command stores
-  it encrypted in the provider vault. `domain cloudflare status --json` is a
+  it encrypted in the provider vault. `dns status --provider cloudflare --json` is a
   metadata-only read an agent may use after the human finishes. Then preview
   exact DNS changes before applying them; saved/read-validated credentials do
   not prove DNS-write permission or a ready application.
 - Definition DNS policy is separate from the credential and disabled by
-  default. `domain cloudflare status --json` shows its revision. An operator
-  can configure non-secret metadata without a token prompt using `domain
-  cloudflare policy --enabled --zone ZONE --origin PUBLIC_IP --proxy dns-only
+  default. `dns status --provider cloudflare --json` shows its revision. An operator
+  can configure non-secret metadata without a token prompt using `dns
+  policy --provider cloudflare --enabled --zone ZONE --origin PUBLIC_IP --proxy dns-only
   --expected-revision N`; repeat `--origin` as needed, or use `--enabled=false
   --expected-revision N` to disable. The zone must already be configured and
   origins must be explicit public addresses, not SSH or WireGuard addresses.
@@ -258,17 +258,24 @@ A human must refresh `secrets export` after identity or recoverable credential
 changes; old exports do not update themselves. Agents inspect only metadata and
 human confirmation, never the exported content.
 
-Fresh setup requires `--workspace-name NAME` independently of `--node`. An upgraded
-alpha.6 installation remains unconfigured until explicitly assigned through
-`apply --assign-workspace NAME`; preview first and obtain authorization for that target.
-Reads and migration never assign a workspace from a private access alias. Old bundles
-remain unconfigured access artifacts; ask for a human-refreshed export to carry
-the portable identity. If an old pending init already applied its host phase,
-finish that pending flow before assigning through `apply`; do not edit its
-private JSON. Repeating an existing workspace choice on resume must not change
+Fresh setup requires `--workspace-name NAME` independently of `--node`. Beta is
+fresh-install only; it provides no alpha assignment-upgrade command, old-bundle
+import or legacy pending-init fallback. Reads and migration never assign a
+workspace from a private access alias. Preserve old access files rather than
+editing their private JSON or treating them as current beta access. Current-format
+interrupted setup can resume; repeating its workspace choice must not change
 its identity.
 
 ### Deploy, rollback and promotion
+
+`server status --json` reports the selected workspace main node's build
+capacity. It defaults to 1 and accepts 1–16 through
+`server build-concurrency set N --dry-run --json` and an explicitly authorized
+real update. Higher values increase CPU, memory, disk and cache pressure and
+do not override worker/pool limits or promise throughput. Lowering capacity
+does not stop existing builds; new admissions wait for occupancy to fall below
+the value. Do not raise capacity merely to verify a build. The slot setting is
+not a hard live-process ceiling after worker/database-session loss.
 
 An environment has an optional Git Buildpacks recipe; there is no persistent
 image source or `source.kind` mode. Omit `[source]`/`--git-url` for an
@@ -286,6 +293,11 @@ values override corresponding raw build environment keys; clearing one removes
 the override. `env update --build-env ''`, `--target ''`, and
 `--buildpack ''` clear their lists; `--builder ''` resets the builder. TOML
 definitions use `[source.buildpacks] order = [...]` via `--from`.
+Current definitions use `version = 1`. When adjusting an older recipe, remove
+unsupported `source.kind` and `source.image`; keep the optional Git recipe and
+its actual builder, buildpack order, targets and keep-file settings. Image
+selectors belong to `deploy`, not the definition's source. There is no old-field
+alias, compatibility parser or implied database upgrade/adoption.
 In TOML, `[source]` can include `targets = [{ process = "web", target = "./cmd/web" }]`.
 Targets currently require repository-relative Go package paths and map to Paketo
 `BP_GO_TARGETS`; no automatic language target discovery is added. Omit them for
@@ -313,8 +325,17 @@ disables auto-deploy without clearing the name; an empty name clears it only
 when disabled. Create an environment before enabling it through `env update
 --auto-deploy`; TOML activation or a name change requires an existing active
 vault secret and never generates or rotates it. TOML does not manage external
-GitHub hook objects, delivery settings or provider credentials. Unchanged domain
-bindings are left alone; a new binding does not reconstruct managed DNS.
+GitHub hook objects, delivery settings or provider credentials. With enabled
+definition DNS policy, server-backed planning reads exact provider state even
+for unchanged bindings. First bookkeeping may still need a child; a repeated
+fully satisfied apply avoids a DNS child and generation churn. Matching foreign
+records remain unowned: satisfaction is not permission to mutate or delete them.
+Review the concrete plan and submit its exact nonce/digest, never regenerate
+approval silently. Unknown provider-write outcomes can retain child and parent
+reservations indefinitely; inspect the safe diagnosis rather than blindly
+retrying, deleting records or assuming cancellation undid the effect. Provider
+errors expose bounded categories/status, not upstream messages or proof of
+serving, routing, TLS or public readiness.
 
 Processes are `web` (domains), `worker` (no port), or `service` (private
 port). Web and service processes answer on their process-name DNS alias and

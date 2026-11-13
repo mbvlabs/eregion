@@ -184,7 +184,7 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	buildSlotWait, buildSlotPoll = 250*time.Millisecond, 25*time.Millisecond
 	t.Cleanup(func() { buildSlotWait, buildSlotPoll = previousWait, previousPoll })
 
-	held, err := s.acquireBuildSlot(ctx, "local", 1, nil)
+	held, err := s.acquireBuildSlot(ctx, "local", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

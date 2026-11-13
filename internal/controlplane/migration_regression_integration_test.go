@@ -84,6 +84,96 @@ func migrationPool(t *testing.T, ctx context.Context, dsn, path string, max int3
 	return pool
 }
 
+func TestIntegrationReadinessRoundTripsPreserveInspection(t *testing.T) {
+	pool, _ := testPool(t, false)
+	ctx := migrationContext(t)
+	check := func(wantQueries int, wantCode contract.Code) {
+		t.Helper()
+		trace := newReadyTrace(time.Now)
+		traced := context.WithValue(ctx, readyTraceKey{}, trace)
+		_, err := PlanMigrations(traced, pool)
+		if wantCode == "" {
+			if err != nil {
+				t.Fatalf("plan: %v", err)
+			}
+		} else {
+			requireMigrationCode(t, err, wantCode)
+		}
+		if got := trace.report().queries; got != wantQueries {
+			t.Fatalf("traced commands = %d, want %d", got, wantQueries)
+		}
+	}
+	check(8, "")
+	if migrationExists(t, ctx, pool, "goose_db_version") || migrationExists(t, ctx, pool, "river_migration") {
+		t.Fatal("fresh inspection created metadata")
+	}
+	requireMigrationCode(t, Ready(ctx, pool), contract.PreconditionFailed)
+	migrationExec(t, ctx, pool, `CREATE TABLE eregion_schema_migrations (version int)`)
+	check(3, contract.PreconditionFailed)
+	requireMigrationCode(t, Ready(ctx, pool), contract.PreconditionFailed)
+	migrationExec(t, ctx, pool, `DROP TABLE eregion_schema_migrations;
+		CREATE TABLE goose_db_version (id bigserial PRIMARY KEY, version_id bigint NOT NULL, is_applied boolean NOT NULL);
+		INSERT INTO goose_db_version(version_id,is_applied) VALUES (0,true),(2,true)`)
+	check(4, contract.PreconditionFailed)
+	requireMigrationCode(t, Ready(ctx, pool), contract.PreconditionFailed)
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version`).Scan(&count); err != nil || count != 2 {
+		t.Fatalf("malformed history changed: %d, %v", count, err)
+	}
+	migrationExec(t, ctx, pool, `DROP TABLE goose_db_version`)
+	if _, err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	check(11, "")
+	if err := Ready(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM goose_db_version`).Scan(&count); err != nil || count != requiredApplicationVersion(t)+1 {
+		t.Fatalf("migrated history changed: %d, %v", count, err)
+	}
+	plan, identity, err := planMigrations(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := schemaMigrator(pool, identity.schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong := identity
+	wrong.role += "_different"
+	requireMigrationCode(t, readRiverMigrations(ctx, pool, m, wrong, &plan), contract.PreconditionFailed)
+	wrong = identity
+	wrong.schema += "_different"
+	requireMigrationCode(t, readRiverMigrations(ctx, pool, m, wrong, &plan), contract.PreconditionFailed)
+	if _, err := pool.Exec(ctx, `INSERT INTO river_migration (line, version, created_at) VALUES ('main', $1, now())`, plan.RiverRequired+1); err != nil {
+		t.Fatal(err)
+	}
+	var riverBefore, riverAfter int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_migration`).Scan(&riverBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PlanMigrations(ctx, pool); err == nil {
+		t.Fatal("future River history accepted")
+	}
+	if err := Ready(ctx, pool); err == nil {
+		t.Fatal("future River history marked ready")
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_migration`).Scan(&riverAfter); err != nil || riverAfter != riverBefore {
+		t.Fatalf("River history changed: %d -> %d, %v", riverBefore, riverAfter, err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM river_migration WHERE line = 'main' AND version = $1`, plan.RiverRequired+1); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := PlanMigrations(canceled, pool); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled plan: %v", err)
+	}
+	if err := Ready(ctx, pool); err != nil {
+		t.Fatalf("pool unusable after cancellation: %v", err)
+	}
+}
+
 func TestIntegrationGooseFreshPlanReadOnly(t *testing.T) {
 	pool, _ := testPool(t, false)
 	ctx := migrationContext(t)

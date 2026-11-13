@@ -17,9 +17,16 @@ func (a *app) attachServerExtras() {
 	if err != nil {
 		return
 	}
-	meta := operationMeta("Show the node's versions, services, schema, uptime and disk", "eregion server status --json")
-	meta.Next = []string{"eregion doctor"}
+	meta := operationMeta("Show the node's versions, services, schema, uptime, disk and build capacity", "eregion server status --json")
+	meta.Next = []string{"eregion doctor", "eregion server build-concurrency set 1 --dry-run"}
 	a.attach(server, spec{use: "status", meta: meta, run: a.serverStatus})
+	a.attach(server, a.buildConcurrencySpec())
+}
+
+type serverStatusResult struct {
+	host.NodeStatus
+	BuildConcurrency      *int   `json:"build_concurrency"`
+	BuildConcurrencyError string `json:"build_concurrency_error,omitempty"`
 }
 
 func (a *app) serverStatus(cmd *cobra.Command, _ []string) (result, error) {
@@ -31,10 +38,20 @@ func (a *app) serverStatus(cmd *cobra.Command, _ []string) (result, error) {
 	if err != nil {
 		return result{}, err
 	}
-	return result{data: status, plain: statusText(status)}, nil
+	projection := serverStatusResult{NodeStatus: status}
+	capacity, capacityErr := client.GetBuildConcurrency(cmd.Context())
+	if err := cmd.Context().Err(); err != nil {
+		return result{}, err
+	}
+	if capacityErr == nil && capacity.Node == status.Node {
+		projection.BuildConcurrency = &capacity.Effective
+	} else {
+		projection.BuildConcurrencyError = "unavailable: verified main-node build capacity could not be read"
+	}
+	return result{data: projection, plain: statusText(projection)}, nil
 }
 
-func statusText(status host.NodeStatus) string {
+func statusText(status serverStatusResult) string {
 	var out strings.Builder
 	out.WriteString(ui.Header("Server "+status.Node, 72))
 	field := func(name, value string) {
@@ -51,6 +68,11 @@ func statusText(status host.NodeStatus) string {
 	}
 	field("role", status.Role)
 	field("eregion", status.NodeVersion)
+	if status.BuildConcurrency != nil {
+		field("build capacity", fmt.Sprint(*status.BuildConcurrency))
+	} else {
+		field("build capacity", "unknown: "+status.BuildConcurrencyError)
+	}
 	if status.CLI != "" && status.CLI != status.NodeVersion {
 		field("cli", status.CLI)
 	}

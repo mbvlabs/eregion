@@ -27,6 +27,7 @@ func (a *app) domainSpecs() []spec {
 	add.WhenToUse = []string{
 		"Give an environment a public HTTPS URL. Manual DNS is the default: create the exact record it shows and Caddy gets the certificate once it resolves.",
 		"With explicit --dns cloudflare --dns-zone ZONE --dns-origin ADDRESS --dns-proxy dns-only|proxied, a dry run reads a real Cloudflare snapshot and apply reconciles only this hostname's exact owned A/AAAA records. Origins are never derived from the WireGuard management endpoint.",
+		"Set up the provider credential with eregion dns configure --provider cloudflare; definition DNS policy is separate and configured with eregion dns policy --provider cloudflare.",
 	}
 	add.Examples = []string{
 		"eregion domain add hello production hello.example.com",
@@ -74,7 +75,6 @@ func (a *app) domainSpecs() []spec {
 			{use: "list", meta: platformMeta("List public hostnames with route, DNS, certificate and public-response state", "eregion domain list --app hello --environment production --json"), args: platformReadArgs,
 				flags: listFlags,
 				run:   a.domainList},
-			a.domainCloudflareSpec(),
 		},
 	}}
 }
@@ -126,7 +126,7 @@ func applyDomainDNSFlags(cmd *cobra.Command, input *platform.DomainInput, forAdd
 		return contract.NewFault(contract.Usage, "unknown --dns mode", "Use manual (the default) or cloudflare.")
 	}
 	if zone == "" {
-		return contract.NewFault(contract.Usage, "--dns cloudflare needs --dns-zone", "Configure the zone with eregion domain cloudflare configure first.")
+		return contract.NewFault(contract.Usage, "--dns cloudflare needs --dns-zone", "Configure the zone with eregion dns configure --provider cloudflare first.")
 	}
 	input.DNSMode, input.DNSZone = "cloudflare", zone
 	if !forAdd {

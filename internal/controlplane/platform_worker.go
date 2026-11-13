@@ -89,6 +89,20 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 		return w.runDiagnosticExecution(ctx, op, raw, attempt)
 	}
 	if op.State == contract.Cancelling {
+		if op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove {
+			normalized, err := platform.Default().Normalize(op.Kind, op.Target, raw)
+			if err != nil {
+				return err
+			}
+			release, err := w.service.lockPlatformTargets(ctx, normalized)
+			if err != nil {
+				return err
+			}
+			defer release()
+			if handled, err := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
+				return err
+			}
+		}
 		if deploymentLifecycleKind(op.Kind) {
 			release, acquired, lockErr := w.service.tryLockTargets(ctx, []string{op.Target})
 			if lockErr != nil {
@@ -131,7 +145,38 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 	}
 	defer releaseLock()
 
+	// Definition cleanup has no per-delete intent journal. Once any cleanup
+	// attempt failed, never redispatch a DELETE: latch read-only recovery.
+	if op.Kind == platform.KindDomainRemove {
+		step, err := w.service.definitionDNSChild(ctx, op.ID)
+		if err != nil {
+			return err
+		}
+		if step != nil && step.Cleanup != nil {
+			ledger, err := w.service.loadDomainDNSLedger(ctx, step.Input.App, step.Input.Environment, step.Input.Domain)
+			if err != nil {
+				return err
+			}
+			if ledger == nil {
+				return contract.NewFault(contract.Unavailable, "definition DNS cleanup ledger is unavailable", "Retain the operation and reservation.")
+			}
+			if ledger.State == domainDNSStateCleanupFailed || ledger.CleanupError == definitionCleanupUnknown {
+				if err := w.service.latchDefinitionDNSRecovery(ctx, op.ID); err != nil {
+					return err
+				}
+				if handled, err := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
+					return err
+				}
+				return contract.NewFault(contract.Unavailable, "definition DNS recovery is unresolved", "Retain the operation and reservation.")
+			}
+		}
+	}
 	if err := w.service.checkCancelled(ctx, op.ID); err != nil {
+		if errors.Is(err, errPlatformCancelled) && (op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove) {
+			if handled, recoveryErr := w.stopDefinitionDNSChild(ctx, op, attempt); handled {
+				return recoveryErr
+			}
+		}
 		if errors.Is(err, errPlatformCancelled) && deploymentLifecycleKind(op.Kind) {
 			return w.cancelOwnedDeployment(ctx, op.ID, attempt)
 		}
@@ -176,6 +221,8 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 func (s *Service) claimPlatform(ctx context.Context, id contract.OperationID, attempt uint32) (contract.Operation, json.RawMessage, bool, error) {
 	var raw json.RawMessage
 	op, claimed, err := s.mutateOwnedOrClaim(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+		routine := (op.Kind == platform.KindDefinitionApply && op.State != contract.Queued) ||
+			((op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove) && op.State == contract.Cancelling)
 		if op.State == contract.Queued {
 			if err := transition(ctx, tx, op, contract.Running, "", "Platform worker started durable execution."); err != nil {
 				return err
@@ -191,6 +238,9 @@ func (s *Service) claimPlatform(ctx context.Context, id contract.OperationID, at
             WHERE operation_id=$1 AND state IN ('pending','running')`, id)
 		if err != nil {
 			return err
+		}
+		if routine {
+			return nil
 		}
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: "platform", Message: "Platform execution attempt started under the target lock."})
 	})
@@ -633,6 +683,9 @@ func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *co
 	if op.State.Terminal() {
 		return nil
 	}
+	if err := guardDefinitionDNSTerminalTx(ctx, tx, op); err != nil {
+		return err
+	}
 	if err := lockOperationParentsTx(ctx, tx, op.ID, operationRequiresPlacement(op.Kind)); err != nil {
 		return err
 	}
@@ -692,6 +745,9 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
+		}
+		if err := guardDefinitionDNSTerminalTx(ctx, tx, op); err != nil {
+			return err
 		}
 		if err := lockOperationParentsTx(ctx, tx, id, operationRequiresPlacement(op.Kind)); err != nil {
 			return err
@@ -1428,6 +1484,11 @@ func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Op
 	}
 	if op.Kind == platform.KindDiagnosticExecution {
 		return s.requeueDiagnosticCleanup(ctx, op.ID)
+	}
+	if op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove {
+		if handled, err := s.requeueDefinitionDNSRecovery(ctx, op.ID); handled || err != nil {
+			return err
+		}
 	}
 	if op.Kind == platform.KindDeploy || op.Kind == platform.KindRollback || op.Kind == platform.KindRestart || op.Kind == platform.KindPromote {
 		return s.reconcileDeployment(ctx, op)

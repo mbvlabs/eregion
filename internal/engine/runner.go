@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -139,6 +140,15 @@ func (e *Engine) hostLockPath() string { return filepath.Join(e.StateDir, "host.
 func (e *Engine) effectLockPath(exec Execution) string {
 	sum := sha256.Sum256([]byte(exec.EffectKey()))
 	return filepath.Join(e.StateDir, "locks", hex.EncodeToString(sum[:])+".lock")
+}
+
+// TryEffectLock takes an effect lock without waiting. Maintenance may call it
+// while holding the exclusive host fence; it must never wait in that order.
+func TryEffectLock(ctx context.Context, stateDir string, exec Execution) (Release, error) {
+	if err := exec.Validate(); err != nil {
+		return nil, err
+	}
+	return Acquire(ctx, (&Engine{StateDir: stateDir}).effectLockPath(exec), LockExclusive, 0)
 }
 
 // EffectRecordPath is the durable effect location for operation+step.
@@ -431,7 +441,13 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		if err := e.saveTask(exec, running); err != nil {
 			return TaskStatus{}, err
 		}
-		hostLock, err := Acquire(ctx, e.hostLockPath(), LockExclusive, e.lockTimeout())
+		mode := LockExclusive
+		var resources []string
+		if shared, ok := step.(SharedHostResources); ok {
+			mode = LockShared
+			resources = shared.SharedHostResources()
+		}
+		hostLock, err := Acquire(ctx, e.hostLockPath(), mode, e.lockTimeout())
 		if err != nil {
 			if errors.Is(err, ErrLockHeld) {
 				// The process exits before Check or Apply. Persist that explicit
@@ -459,6 +475,40 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		}
 		defer hostLock()
 		running.WaitMS = nonNegativeMillis(running.WaitMS) + elapsedMillis(waitStarted)
+		sort.Strings(resources)
+		last := ""
+		for _, resource := range resources {
+			if resource == "" {
+				return TaskStatus{}, errors.New("empty shared host resource identity")
+			}
+			if resource == last {
+				continue
+			}
+			last = resource
+			sum := sha256.Sum256([]byte(resource))
+			path := filepath.Join(e.StateDir, "resource-locks", hex.EncodeToString(sum[:])+".lock")
+			waitStarted = time.Now()
+			running.Phase = PhaseWaitingHostLock
+			running.PhaseStartedAt = waitStarted.UTC().Format(time.RFC3339Nano)
+			running.Detail = "waiting for an exclusive resource lock"
+			if err := e.saveTask(exec, running); err != nil {
+				return TaskStatus{}, err
+			}
+			release, err := Acquire(ctx, path, LockExclusive, e.lockTimeout())
+			running.WaitMS += elapsedMillis(waitStarted)
+			if err != nil {
+				if errors.Is(err, ErrLockHeld) {
+					running.Status = string(TaskDeferred)
+					running.Detail = "exited while waiting for a resource lock before Check/Apply; no effect was attempted"
+					if saveErr := e.saveTask(exec, running); saveErr != nil {
+						return TaskStatus{}, saveErr
+					}
+					return TaskStatus{Status: StatusDeferred, ExecutionID: running.ExecutionID, Attempt: running.Attempt, InputsHash: inputsHash, Phase: running.Phase, PhaseStartedAt: running.PhaseStartedAt, WaitMS: running.WaitMS, Detail: running.Detail}, ErrLockHeld
+				}
+				return TaskStatus{}, err
+			}
+			defer release()
+		}
 	}
 	running.Phase = PhaseChecking
 	running.PhaseStartedAt = now()

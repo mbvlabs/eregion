@@ -212,7 +212,7 @@ func (m *Model) Snapshot(op contract.Operation, at time.Time) {
 
 // Page applies one page of events in sequence order. Duplicates are dropped.
 // A skipped sequence records a Gap and returns *GapError without advancing the
-// cursor, so a refetch can replay the missing observations.
+// cursor, so a refetch can replay the complete page.
 func (m *Model) Page(events []contract.Event, at time.Time) error {
 	if at.IsZero() {
 		at = time.Now()
@@ -221,9 +221,9 @@ func (m *Model) Page(events []contract.Event, at time.Time) error {
 
 	ordered := append([]contract.Event(nil), events...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Sequence < ordered[j].Sequence })
-	// Validate every event before applying any so a malformed page cannot
-	// partially mutate the reducer. Sequence gaps are handled below, after the
-	// valid prefix has been applied so a refetch resumes from the real cursor.
+	// Validate the entire page before applying it. Otherwise a gap after a valid
+	// prefix would advance the cursor without emitting that prefix to a caller.
+	next := m.Cursor
 	for _, event := range ordered {
 		if m.OperationID != "" && event.OperationID != m.OperationID {
 			return fmt.Errorf("event belongs to a different operation")
@@ -231,6 +231,15 @@ func (m *Model) Page(events []contract.Event, at time.Time) error {
 		if event.Validate() != nil {
 			return fmt.Errorf("invalid event page")
 		}
+		if event.Sequence <= next {
+			continue
+		}
+		if event.Sequence != next+1 {
+			m.Gap = true
+			m.ExpectedSequence = next + 1
+			return &GapError{Expected: next + 1, Actual: event.Sequence}
+		}
+		next = event.Sequence
 	}
 	for _, event := range ordered {
 		if event.Sequence <= m.Cursor {

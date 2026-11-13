@@ -73,6 +73,7 @@ type definitionOperation struct{ ID, Kind, Target, State string }
 type definitionResource struct {
 	ID          string
 	Name        string
+	Node        string
 	Spec        json.RawMessage
 	State       string
 	OperationID string
@@ -83,7 +84,27 @@ type definitionSecret struct {
 	State    string
 }
 
-func (s *Service) readDefinitionSnapshot(ctx context.Context, app, environment string) (definitionSnapshot, platform.Environment, error) {
+// Only compare non-secret metadata and report a bounded category. Several
+// categories can change concurrently; this is the first observed difference.
+func definitionSnapshotChange(a, b definitionSnapshot) string {
+	switch {
+	case !reflect.DeepEqual(a.Workspace, b.Workspace), a.AppID != b.AppID, a.ImageRepository != b.ImageRepository,
+		a.EnvironmentID != b.EnvironmentID, a.RevisionID != b.RevisionID, a.Protected != b.Protected:
+		return "definition workspace, target or revision changed"
+	case !reflect.DeepEqual(a.Bindings, b.Bindings), !reflect.DeepEqual(a.Resources, b.Resources), !reflect.DeepEqual(a.Secrets, b.Secrets):
+		return "definition binding, resource or secret metadata changed"
+	case !reflect.DeepEqual(a.Policy, b.Policy), a.ProviderRevision != b.ProviderRevision, !reflect.DeepEqual(a.Credentials, b.Credentials):
+		return "definition DNS policy or credential changed"
+	case !reflect.DeepEqual(a.Nodes, b.Nodes):
+		return "definition placement changed"
+	case !reflect.DeepEqual(a.ActiveOperations, b.ActiveOperations):
+		return "definition relevant operations changed"
+	default:
+		return "definition snapshot changed"
+	}
+}
+
+func (s *Service) readDefinitionSnapshot(ctx context.Context, r *appdef.Resolved) (definitionSnapshot, platform.Environment, error) {
 	var snap definitionSnapshot
 	var env platform.Environment
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -91,7 +112,7 @@ func (s *Service) readDefinitionSnapshot(ctx context.Context, app, environment s
 		return snap, env, unavailable()
 	}
 	defer rollback(tx)
-	snap, env, err = readDefinitionSnapshotTx(ctx, tx, app, environment)
+	snap, env, err = readDefinitionSnapshotTx(ctx, tx, r)
 	if err != nil {
 		return snap, env, err
 	}
@@ -103,10 +124,11 @@ func (s *Service) readDefinitionSnapshot(ctx context.Context, app, environment s
 
 // readDefinitionSnapshotTx also permits admission to reread the exact same
 // material under its own transaction and locks.
-func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, app, environment string) (definitionSnapshot, platform.Environment, error) {
+func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, r *appdef.Resolved) (definitionSnapshot, platform.Environment, error) {
 	var snap definitionSnapshot
 	var env platform.Environment
 	var err error
+	app, environment := r.App, r.Environment
 	if snap.Workspace, err = readWorkspace(ctx, tx); err != nil {
 		return snap, env, unavailable()
 	}
@@ -144,13 +166,13 @@ func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, app, environment s
 	if err != nil {
 		return snap, env, unavailable()
 	}
-	rows, err = tx.Query(ctx, `SELECT id,name,spec,state,coalesce(operation_id,'') FROM eregion_platform_resources WHERE environment_id=$1 ORDER BY name`, snap.EnvironmentID)
+	rows, err = tx.Query(ctx, `SELECT id,name,node_name,spec,state,coalesce(operation_id,'') FROM eregion_platform_resources WHERE environment_id=$1 ORDER BY name`, snap.EnvironmentID)
 	if err != nil {
 		return snap, env, unavailable()
 	}
 	for rows.Next() {
 		var r definitionResource
-		if err = rows.Scan(&r.ID, &r.Name, &r.Spec, &r.State, &r.OperationID); err != nil {
+		if err = rows.Scan(&r.ID, &r.Name, &r.Node, &r.Spec, &r.State, &r.OperationID); err != nil {
 			break
 		}
 		snap.Resources = append(snap.Resources, r)
@@ -207,9 +229,27 @@ func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, app, environment s
 	if err != nil {
 		return snap, env, unavailable()
 	}
-	// Capture all placement candidates and unfinished operations: admission will
-	// decide the precise conflict scope under locks, without weakening the pin.
-	rows, err = tx.Query(ctx, `SELECT name,roles,capabilities,status,enrollment_state,transport,last_check_state FROM eregion_platform_nodes ORDER BY name`)
+	// Updates select nodes by exact name, not by discovery over the node table.
+	// Resources run on the current environment node before the revision update
+	// and retain their existing node identity. Include both current and proposed
+	// runtime/build nodes, as well as every existing resource node.
+	placement := map[string]bool{}
+	for _, name := range []string{env.Node, env.BuildNodeName(), r.Node, r.BuildNode} {
+		if name != "" {
+			placement[name] = true
+		}
+	}
+	for _, resource := range snap.Resources {
+		if resource.Node != "" {
+			placement[resource.Node] = true
+		}
+	}
+	names := make([]string, 0, len(placement))
+	for name := range placement {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	rows, err = tx.Query(ctx, `SELECT name,roles,capabilities,status,enrollment_state,transport,last_check_state FROM eregion_platform_nodes WHERE name=ANY($1::text[]) ORDER BY name`, names)
 	if err != nil {
 		return snap, env, unavailable()
 	}
@@ -218,6 +258,8 @@ func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, app, environment s
 		if err = rows.Scan(&n.Name, &n.Roles, &n.Capabilities, &n.Status, &n.EnrollmentState, &n.Transport, &n.LastCheckState); err != nil {
 			break
 		}
+		sort.Strings(n.Roles)
+		sort.Strings(n.Capabilities)
 		snap.Nodes = append(snap.Nodes, n)
 	}
 	if err == nil {
@@ -227,7 +269,14 @@ func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, app, environment s
 	if err != nil {
 		return snap, env, unavailable()
 	}
-	rows, err = tx.Query(ctx, `SELECT id,kind,target,state FROM eregion_operations WHERE state IN ('queued','running','cancelling') ORDER BY id`)
+	// Unrelated work cannot affect this application's definition. Keep all
+	// same-app environment/resource work and builds, including other environments,
+	// since admission fences the whole application.
+	rows, err = tx.Query(ctx, `SELECT o.id,o.kind,o.target,o.state FROM eregion_operations o
+		WHERE o.state IN ('queued','running','cancelling') AND (
+			o.target=$1 OR left(o.target,length($2))=$2 OR left(o.target,length($3))=$3
+			OR EXISTS (SELECT 1 FROM eregion_platform_builds b WHERE o.target='build/'||b.id AND b.app_id=$4)
+		) ORDER BY o.id`, "app/"+app, "env/"+app+"/", "resource/"+app+"/", snap.AppID)
 	if err != nil {
 		return snap, env, unavailable()
 	}
@@ -283,11 +332,20 @@ func (s *Service) planDefinition(ctx context.Context, actor contract.Actor, inpu
 	if s == nil || s.pool == nil {
 		return p, unavailable()
 	}
-	snap, env, err := s.readDefinitionSnapshot(ctx, r.App, r.Environment)
+	snap, env, err := s.readDefinitionSnapshot(ctx, r)
 	if err != nil {
 		return p, err
 	}
 	p = api.DefinitionPlan{PlanNonce: input.PlanNonce, WorkspaceID: snap.Workspace.ID, App: r.App, Environment: r.Environment, AppExists: snap.AppID != "", EnvironmentExists: snap.EnvironmentID != "", CurrentRevision: snap.RevisionID, Changes: []string{}, Diff: []string{}, Domains: []api.DefinitionDomainChange{}, DNS: []integrations.DefinitionDNSPlan{}, DNSCleanup: []integrations.DomainDNSPlan{}, Blockers: []string{}, Warnings: []string{}}
+	knownNodes := make(map[string]bool, len(snap.Nodes))
+	for _, node := range snap.Nodes {
+		knownNodes[node.Name] = true
+	}
+	for _, name := range []string{r.Node, r.BuildNode} {
+		if name != "" && !knownNodes[name] {
+			p.Blockers = append(p.Blockers, "placement node is not registered: "+name)
+		}
+	}
 	if snap.AppID != "" && r.ImageRepository != "" && r.ImageRepository != snap.ImageRepository {
 		p.Blockers = append(p.Blockers, fmt.Sprintf("image_repository: definition value %q does not match the app's repository %q", r.ImageRepository, snap.ImageRepository))
 	}
@@ -622,8 +680,24 @@ func compileDefinitionWork(input api.DefinitionPlanInput, r *appdef.Resolved, sn
 				}
 			}
 		}
-		if d.Action == "unchanged" && dns == nil {
-			continue
+		if d.Action == "unchanged" {
+			if dns == nil {
+				continue
+			}
+			// A provider read is still part of the approved plan. Skip the
+			// domain child only when no provider change or ledger work remains.
+			for _, b := range snap.Bindings {
+				if b.ID == id && len(dns.Changes) == 0 && b.Provider == "cloudflare" &&
+					b.ZoneID == dns.ZoneID && b.ZoneName == dns.Zone && b.Ownership == dns.Ownership &&
+					b.State == domainDNSStateApplied && b.Generation > 0 && b.AppliedGeneration == b.Generation &&
+					reflect.DeepEqual(b.Origins, snap.Policy.Origins) && b.Proxied == (snap.Policy.ProxyMode == "proxied") {
+					dns = nil
+					break
+				}
+			}
+			if dns == nil {
+				continue
+			}
 		}
 		kind := platform.KindDomainAdd
 		v := platform.DomainInput{Domain: d.Name, Primary: d.Primary, CheckPath: d.CheckPath}

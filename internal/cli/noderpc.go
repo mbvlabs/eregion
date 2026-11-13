@@ -97,6 +97,9 @@ const (
 	methodSubmit              = "operations.submit"
 	methodGet                 = "operations.get"
 	methodEvents              = "operations.events"
+	methodFollow              = "operations.follow"
+	methodBuildConcurrencyGet = "server.build-concurrency.get"
+	methodBuildConcurrencySet = "server.build-concurrency.set"
 	methodDiagnose            = "operations.diagnose"
 	methodDiagnosticExecute   = "operations.diagnostic-execute"
 	methodCancel              = "operations.cancel"
@@ -1340,6 +1343,11 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	if err := checkNodeClientVersion(request); err != nil {
 		return writeRPCResult(stdout, nil, err)
 	}
+	if request.Method == methodFollow {
+		if _, err := validateFollowRPC(request); err != nil {
+			return writeRPCResult(stdout, nil, err)
+		}
+	}
 	if request.Method == methodDiagnosticExecute {
 		if _, err := validateDiagnosticExecutionRPC(request); err != nil {
 			return writeRPCResult(stdout, nil, err)
@@ -1380,11 +1388,14 @@ func serveNodeRPC(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer
 	}
 
 	logger := slog.New(slog.NewTextHandler(safeLogWriter{out: stderr, registry: registry}, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	app, closeRuntime, err := openNodeApp(ctx, logger, registry, request.Method == methodDiagnosticExecute)
+	app, closeRuntime, err := openNodeApp(ctx, logger, registry, request.Method == methodDiagnosticExecute, request.Method == methodBuildConcurrencyGet || request.Method == methodBuildConcurrencySet)
 	if err != nil {
 		return writeRPCResult(stdout, nil, err)
 	}
 	defer closeRuntime()
+	if request.Method == methodFollow {
+		return serveOperationFollow(ctx, app, request, stdout)
+	}
 	data, err := dispatchStartedNodeMethod(ctx, app, request)
 	registerRPCMethodSecrets(registry, request.Method, data)
 	if err != nil {
@@ -1608,7 +1619,7 @@ func readWorkspaceFromDSN(ctx context.Context, dsn string) (controlplane.Workspa
 	return controlplane.ReadWorkspace(ctx, pool)
 }
 
-func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry, diagnosticExecution bool) (api.AppService, func(), error) {
+func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry, diagnosticExecution, buildConcurrency bool) (api.AppService, func(), error) {
 	if err := host.LoadServiceEnv(host.ServiceEnvPath); err != nil {
 		return api.AppService{}, nil, contract.NewFault(contract.Unavailable, "the node service configuration is not readable", err.Error())
 	}
@@ -1653,12 +1664,22 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		pool.Close()
 		return api.AppService{}, nil, endpointErr
 	}
+	var registryHostIdentity *controlplane.RegistryHostIdentity
+	if buildConcurrency {
+		identity, identityErr := host.LocalRegistryIdentity()
+		if identityErr != nil {
+			pool.Close()
+			return api.AppService{}, nil, contract.NewFault(contract.PreconditionFailed, "the main node identity is not verified", "Check the managed node configuration and public SSH host identity.")
+		}
+		registryHostIdentity = &identity
+	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		DiagnosticAdmissionNode: diagnosticNode,
 		Redaction:               registry, Vault: parts.Vault,
-		RegistryEndpoint: registryEndpoint,
-		DomainDNS:        parts.DomainDNS,
+		RegistryEndpoint:     registryEndpoint,
+		RegistryHostIdentity: registryHostIdentity,
+		DomainDNS:            parts.DomainDNS,
 		HumanFactor: func(code string) error {
 			return protect.NewStore().Verify(code)
 		},
@@ -1708,6 +1729,8 @@ func dispatchNodeMethod(ctx context.Context, app api.AppService, request rpc.Req
 	// Submissions keep the operator actor for the audit trail.
 	authority := operations.OperatorAuthority(actor)
 	switch request.Method {
+	case methodBuildConcurrencyGet, methodBuildConcurrencySet:
+		return dispatchBuildConcurrency(ctx, app, actor, request)
 	case methodDiagnosticExecute:
 		params, err := validateDiagnosticExecutionRPC(request)
 		if err != nil {

@@ -84,7 +84,7 @@ var (
 
 func NewCloudflare(cfg CloudflareConfig) (*Cloudflare, error) {
 	if len(cfg.APIToken) < 20 || len(cfg.APIToken) > 512 || strings.TrimSpace(cfg.APIToken) != cfg.APIToken || strings.ContainsAny(cfg.APIToken, "\r\n") {
-		return nil, contract.NewFault(contract.InputRequired, "a Cloudflare API token is required", "Configure it with eregion domain cloudflare configure; never put it in action input or a command line.")
+		return nil, contract.NewFault(contract.InputRequired, "a Cloudflare API token is required", "Configure it with eregion dns configure --provider cloudflare; never put it in action input or a command line.")
 	}
 	if !zoneIDPattern.MatchString(cfg.ZoneID) {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid Cloudflare zone ID", "Use the lowercase 32-character zone identifier.")
@@ -523,6 +523,27 @@ type cloudflareError struct {
 	Code int `json:"code"`
 }
 
+// ProviderFailure contains only a fixed category and an HTTP status. It never
+// retains an upstream body, URL, token or transport error.
+type ProviderFailure struct {
+	Category               string
+	Status                 int
+	DefinitiveWrite        bool
+	DefinitiveRecordDigest string
+	fault                  *contract.Fault
+}
+
+func (e *ProviderFailure) Error() string { return e.fault.Message }
+func (e *ProviderFailure) Unwrap() error { return e.fault }
+
+func cloudflareFailure(category string, status int, code contract.Code, hint string) error {
+	message := "Cloudflare provider: " + category
+	if status != 0 {
+		message += fmt.Sprintf(" (HTTP %d)", status)
+	}
+	return &ProviderFailure{Category: category, Status: status, fault: contract.NewFault(code, message, hint)}
+}
+
 type cloudflareEnvelope struct {
 	Success    bool              `json:"success"`
 	Errors     []cloudflareError `json:"errors"`
@@ -557,40 +578,45 @@ func (c *Cloudflare) requestWithInfo(ctx context.Context, method, endpoint strin
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return contract.NewFault(contract.Unavailable, "Cloudflare API is unreachable", "Retry through the same operation; reconciliation is idempotent.")
+		return cloudflareFailure("network/timeout", 0, contract.Unavailable, "Inspect connectivity and retry the same operation; reconcile any uncertain write first.")
 	}
 	defer response.Body.Close()
+	switch {
+	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
+		return cloudflareFailure("authorization", response.StatusCode, contract.Forbidden, "Check credential scope and zone permissions, then review the operation.")
+	case response.StatusCode == http.StatusTooManyRequests:
+		return cloudflareFailure("rate-limit", response.StatusCode, contract.Unavailable, "Wait and retry the same operation; reconcile any uncertain write first.")
+	case response.StatusCode == http.StatusRequestTimeout:
+		return cloudflareFailure("network/timeout", response.StatusCode, contract.Unavailable, "Retry the same operation after reconciling any uncertain write.")
+	case response.StatusCode >= 400 && response.StatusCode < 500:
+		return cloudflareFailure("client-rejection", response.StatusCode, contract.PreconditionFailed, "Inspect the approved DNS request and provider configuration before replanning.")
+	case response.StatusCode >= 500:
+		return cloudflareFailure("provider-unavailable", response.StatusCode, contract.Unavailable, "Wait and retry the same operation; reconcile any uncertain write first.")
+	case response.StatusCode < 200 || response.StatusCode > 299:
+		return cloudflareFailure("invalid-response", response.StatusCode, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
+	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, c.maxBody+1))
 	if err != nil {
-		return contract.NewFault(contract.Unavailable, "Cloudflare response could not be read", "Retry through the same operation; reconciliation is idempotent.")
+		return cloudflareFailure("network/timeout", 0, contract.Unavailable, "Retry the same operation after reconciling any uncertain write.")
 	}
 	if int64(len(raw)) > c.maxBody {
-		return contract.NewFault(contract.Unavailable, "Cloudflare response exceeded the bound", "Check the Cloudflare API and retry.")
-	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return contract.NewFault(contract.Forbidden, "Cloudflare rejected the API token", "Configure a replacement credential with eregion domain cloudflare configure; no DNS change was authorized by Cloudflare.")
-	}
-	if response.StatusCode == http.StatusTooManyRequests {
-		return contract.NewFault(contract.Unavailable, "Cloudflare rate limited the request", "Retry the operation later; reconciliation is idempotent.")
-	}
-	if response.StatusCode < 200 || response.StatusCode > 299 {
-		return contract.NewFault(contract.Unavailable, "Cloudflare returned an error", "Inspect Cloudflare status and the credential scope; no upstream error body is exposed.")
+		return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
 	}
 	var envelope cloudflareEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return contract.NewFault(contract.Unavailable, "Cloudflare returned an invalid response", "Retry later; do not assume the change failed.")
+		return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
 	}
 	if !envelope.Success {
-		return contract.NewFault(contract.Unavailable, "Cloudflare refused the request", "Inspect token scope and zone permissions; no upstream error text is exposed.")
+		return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
 	}
 	if target != nil && len(envelope.Result) > 0 && string(envelope.Result) != "null" {
 		if err := json.Unmarshal(envelope.Result, target); err != nil {
-			return contract.NewFault(contract.Unavailable, "Cloudflare returned an unexpected result shape", "Retry later; do not assume the change failed.")
+			return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
 		}
 	}
 	if info != nil && len(envelope.ResultInfo) > 0 && string(envelope.ResultInfo) != "null" {
 		if err := json.Unmarshal(envelope.ResultInfo, info); err != nil {
-			return contract.NewFault(contract.Unavailable, "Cloudflare returned invalid pagination data", "Retry later; do not assume the change failed.")
+			return cloudflareFailure("invalid-response", 0, contract.Unavailable, "Inspect provider availability and reconcile any uncertain write.")
 		}
 	}
 	return nil

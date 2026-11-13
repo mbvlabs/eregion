@@ -57,6 +57,13 @@ type HostLockIndependent interface {
 	IndependentOfHostLock() bool
 }
 
+// SharedHostResources is implemented only by trusted, validated step types.
+// Resource identities name physical resources, not payload-selected lock modes.
+// All other steps retain the exclusive host fence.
+type SharedHostResources interface {
+	SharedHostResources() []string
+}
+
 // Boundary is where a cancellation request may take effect for a step.
 type Boundary string
 

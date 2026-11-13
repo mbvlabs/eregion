@@ -1,10 +1,13 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +17,25 @@ import (
 )
 
 const definitionPoll = 2 * time.Second
+
+var definitionProviderFailure = regexp.MustCompile(`^Cloudflare provider: (authorization|client-rejection|rate-limit|provider-unavailable|network/timeout|invalid-response)( \(HTTP [1-5][0-9][0-9]\))?$`)
+var definitionDefinitiveProviderFailure = regexp.MustCompile(`^Cloudflare provider: (authorization \(HTTP (401|403)\)|client-rejection \(HTTP 4[0-9][0-9]\))$`)
+var definitionCleanupRejectionPrefix = regexp.MustCompile(`^definitive cleanup rejection: [a-f0-9]{64} `)
+
+func definitionDefinitiveRejection(message string) bool {
+	return definitionDefinitiveProviderFailure.MatchString(message) &&
+		!strings.HasSuffix(message, "(HTTP 408)") && !strings.HasSuffix(message, "(HTTP 429)") &&
+		!strings.Contains(message, "client-rejection (HTTP 401)") && !strings.Contains(message, "client-rejection (HTTP 403)")
+}
+
+func definitionSafeProviderDiagnostic(message string) string {
+	message = strings.TrimPrefix(message, "definitive write rejection: ")
+	message = definitionCleanupRejectionPrefix.ReplaceAllString(message, "")
+	if definitionProviderFailure.MatchString(message) {
+		return message
+	}
+	return ""
+}
 
 // definitionFinalState never permits a parent to finish while a linked child
 // remains active. Failure intent is private journal state, not operation.error_code.
@@ -100,10 +122,68 @@ func definitionFinishTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, 
 	if active {
 		return errors.New("definition parent cannot finish while a child is active")
 	}
+	if err := guardDefinitionChildrenTerminalTx(ctx, tx, op.ID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `UPDATE eregion_definition_runs SET finished_at=clock_timestamp() WHERE operation_id=$1 AND finished_at IS NULL`, op.ID); err != nil {
 		return err
 	}
 	return transition(ctx, tx, op, state, code, message)
+}
+
+func guardDefinitionChildrenTerminalTx(ctx context.Context, tx pgx.Tx, parent contract.OperationID) error {
+	var broken bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM eregion_definition_steps s
+		WHERE s.parent_operation_id=$1 AND s.child_operation_id IS NULL AND (
+			s.dns_progress <> '[]'::jsonb OR EXISTS (
+				SELECT 1 FROM eregion_operations c JOIN eregion_platform_domain_dns x ON x.last_operation_id=c.id
+				WHERE c.idempotency_key='definition:'||s.parent_operation_id||':'||s.ordinal::text
+			) OR EXISTS (SELECT 1 FROM eregion_platform_domain_dns x WHERE x.domain_id=s.domain_id AND x.state IN ('pending','failed','cleanup_pending','cleanup_failed'))
+		))`, parent).Scan(&broken); err != nil {
+		return unavailable(err)
+	}
+	if broken {
+		return definitionDNSConflict()
+	}
+	rows, err := tx.Query(ctx, `SELECT s.ordinal,s.kind,s.target,s.input,coalesce(c.id,''),coalesce(c.kind,''),coalesce(c.target,''),coalesce(c.input,'null'::jsonb),coalesce(c.state,''),coalesce(c.actor_kind,''),coalesce(c.actor_subject,''),coalesce(c.idempotency_key,''),p.actor_kind,p.actor_subject
+		FROM eregion_definition_steps s
+		JOIN eregion_operations p ON p.id=s.parent_operation_id
+		LEFT JOIN eregion_operations c ON c.id=s.child_operation_id
+		WHERE s.parent_operation_id=$1 AND s.child_operation_id IS NOT NULL ORDER BY s.ordinal`, parent)
+	if err != nil {
+		return unavailable(err)
+	}
+	var children []contract.Operation
+	for rows.Next() {
+		var child contract.Operation
+		var ordinal int
+		var kind, target, childTarget, actorKind, actorSubject, parentKind, parentSubject, key string
+		var input, childInput []byte
+		if err := rows.Scan(&ordinal, &kind, &target, &input, &child.ID, &child.Kind, &childTarget, &childInput, &child.State, &actorKind, &actorSubject, &key, &parentKind, &parentSubject); err != nil {
+			rows.Close()
+			return unavailable(err)
+		}
+		step, stepErr := platform.Default().Normalize(kind, target, input)
+		linked, linkedErr := platform.Default().Normalize(child.Kind, childTarget, childInput)
+		if child.ID == "" || kind != child.Kind || target != childTarget || actorKind != parentKind || actorSubject != parentSubject ||
+			key != fmt.Sprintf("definition:%s:%d", parent, ordinal) || stepErr != nil || linkedErr != nil || !bytes.Equal(step.Canonical, linked.Canonical) {
+			rows.Close()
+			return definitionDNSConflict()
+		}
+		children = append(children, child)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return unavailable(err)
+	}
+	for _, child := range children {
+		if err := guardDefinitionDNSTerminalTx(ctx, tx, &child); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *platformWorker) runDefinitionApply(ctx context.Context, claimed contract.Operation, attempt uint32) error {
@@ -247,7 +327,38 @@ func (w *platformWorker) runDefinitionApply(ctx context.Context, claimed contrac
 				return err
 			}
 		default:
-			if err := definitionFailureTx(ctx, tx, &op, childCode, "Definition child "+*childID+" failed; completed changes were not rolled back."); err != nil {
+			message := "Definition child " + *childID + " failed; completed changes were not rolled back."
+			if kind == platform.KindDomainAdd || kind == platform.KindDomainRemove {
+				var resources, revisions int
+				var provider string
+				err := tx.QueryRow(ctx, `SELECT
+					count(*) FILTER (WHERE s.kind=$2 AND c.state='succeeded'),
+					count(*) FILTER (WHERE s.kind=$3 AND c.state='succeeded'),
+					coalesce((SELECT CASE WHEN failed.kind=$6 THEN x.cleanup_error ELSE x.last_error END FROM eregion_definition_steps failed
+						JOIN eregion_platform_domain_dns x ON x.domain_id=failed.domain_id
+						WHERE failed.parent_operation_id=$1 AND failed.ordinal=$4 AND x.last_operation_id=$5),'')
+					FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id
+					WHERE s.parent_operation_id=$1 AND s.ordinal<$4`, op.ID, platform.KindResourceApply, platform.KindEnvironmentUpdate, next, *childID, platform.KindDomainRemove).Scan(&resources, &revisions, &provider)
+				if err != nil {
+					return unavailable(err)
+				}
+				prior := false
+				if provider == "" && kind == platform.KindDomainRemove {
+					if err := tx.QueryRow(ctx, `SELECT coalesce((SELECT event->>'message' FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'='dns_prior_provider_failure' ORDER BY sequence DESC LIMIT 1),'')`, *childID).Scan(&provider); err != nil {
+						return unavailable(err)
+					}
+					prior = provider != ""
+				}
+				message = fmt.Sprintf("Definition DNS child %s failed; completed resource steps=%d, revision steps=%d were not rolled back. Inspect serving, route, TLS and public status separately.", *childID, resources, revisions)
+				if safeProvider := definitionSafeProviderDiagnostic(provider); safeProvider != "" {
+					if prior {
+						message += " Prior provider diagnostic: " + safeProvider + "; cleanup was subsequently verified."
+					} else {
+						message += " " + safeProvider + "; inspect the child and provider configuration before replanning."
+					}
+				}
+			}
+			if err := definitionFailureTx(ctx, tx, &op, childCode, message); err != nil {
 				return err
 			}
 		}
@@ -318,6 +429,15 @@ func (w *platformWorker) createDefinitionChild(ctx context.Context, parent contr
 	}
 	result, err := w.service.recordPlatformSubmissionTx(ctx, tx, id, n, op.Actor, fmt.Sprintf("definition:%s:%d", op.ID, ordinal), nil, nil, "", nil)
 	if err != nil {
+		fault := contract.Classify(err)
+		switch fault.Code {
+		case contract.ValidationFailed, contract.PreconditionFailed, contract.NotFound, contract.Forbidden, contract.Conflict:
+			// Roll back the uncommitted child link before recording the parent
+			// failure. A hostname claimed after approval is a durable conflict,
+			// not a reason to retry admission until the job is exhausted.
+			rollback(tx)
+			return w.failDefinition(ctx, parent.ID, attempt, fault.Code, "Definition child admission failed: "+fault.Message+"; completed changes were not rolled back.")
+		}
 		return err
 	}
 	if result.Operation.ID != id {
@@ -449,6 +569,10 @@ func (s *Service) reconcileTerminalDefinitionRuns(ctx context.Context) error {
 			return err
 		}
 		if !active {
+			if err := guardDefinitionChildrenTerminalTx(ctx, tx, id); err != nil {
+				rollback(tx)
+				continue
+			}
 			if _, err := tx.Exec(ctx, `UPDATE eregion_definition_runs SET finished_at=clock_timestamp() WHERE operation_id=$1 AND finished_at IS NULL`, id); err != nil {
 				rollback(tx)
 				return err

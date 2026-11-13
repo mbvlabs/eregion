@@ -5,6 +5,53 @@ Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 tracks execution. This file says what must work on a real server and what has
 been observed.
 
+## Beta.6 findings correction (2026-11-13, unpublished source verification)
+
+Execution started on `master` at
+`b1fcd6fed2ff4979e65095e06497e8e6c62b1eaa`. The approved correction covers
+application-level startup/follow overhead, safe build concurrency, exact-image
+diagnosis, definition/DNS convergence and operator guidance. Infrastructure-route
+investigation is excluded. Evidence is retained under
+`.local/planning/beta6-findings-20261113/evidence/`.
+
+Supplied historical beta.6 reports are baseline evidence, not tests of this
+candidate:
+
+- `/home/mbv/work/eregion-beta-one/deploy/beta6-test-results.md`,
+  SHA-256 `66f05665ad595b310b7265fe7e3428970eda27ad8a60005c57417d5329d372f9`.
+- `/home/mbv/work/store-eregion-test/diagnostics/buildpacks-rails-20261111/HANDOFF.md`,
+  SHA-256 `51002f4bca58c970584b680b7779ca61ef40958f0cfe549c20be62e49d976047`.
+
+Those reports record successful registry-backed Go/SSR and Rails deployments,
+contention during Pack execution, a refused isolated diagnostic and a failed
+definition DNS child followed by a successful later deploy. Neither the
+diagnostic failure nor the provider rejection has a demonstrated root cause.
+Historical invocations below retain their original namespace; current provider
+setup is `dns configure|status|policy --provider cloudflare`, without an old-path
+alias. Application bindings remain `domain add/list/remove`.
+
+Scoped explicit formatting, non-CLI vet, example vet, official binary build,
+control-plane integration-test compilation and offline CLI discovery/validation
+passed on the recorded source snapshots. The catalog contains 104 visible
+entries and metadata validation covers 119 contracts. Root human forms match.
+Offline traces observed no network connection or user-store access for the
+recorded invalid-input cases. A removed-command help fallback found by this
+verification was corrected; exact source hashes and rebuilt recheck scope
+belong to the W09/W10 evidence, not a blanket command-surface pass.
+
+These checks are not behavioral acceptance. Broad formatting/vet recipes and
+CLI test compilation were skipped to avoid the protected untracked CLI test;
+the explicit checks are scoped substitutes. Disposable PostgreSQL authorization
+is pending, so candidate database/service and race tests have not run. Live
+application timing samples, Docker identity inspection, safe Pack overlap,
+sandbox execution/cleanup, actual provider effects and SSH/WireGuard qualification
+have not run. No installed CLI/node, database, capacity, DNS, webhook or release
+was changed. W06 identity logic remains unchanged pending exact host evidence;
+its producer/consumer investigation is not a cause-specific diagnostic fix.
+Actual process-death and multi-candidate DNS-prefix coverage remain gaps.
+Independent review findings/fixes and final verification scope are recorded in
+the evidence index. No host-qualified or publication-ready claim follows.
+
 ## CLI help correction (2026-11-13, unpublished)
 
 Compared the installed vaire CLI and its local command construction. The

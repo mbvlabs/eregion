@@ -95,6 +95,9 @@ func runApp(ctx context.Context, args []string, in io.Reader, out, stderr io.Wri
 			command = cmd.CommandPath()
 		}
 		err = executeErr
+		if err == nil && a.helpErr != nil {
+			err = a.helpErr
+		}
 		var fault *contract.Fault
 		if err != nil && !a.started && !errors.As(err, &fault) {
 			suggestions := suggestCommandPaths(cmd, unknownCommandToken(err))

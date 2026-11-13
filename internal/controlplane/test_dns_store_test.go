@@ -64,7 +64,7 @@ func (s *testDNSStore) DNSCredential(_ context.Context, provider, zoneID string)
 	}
 	token, ok := s.tokens[zoneID]
 	if !ok {
-		return nil, contract.NewFault(contract.NotFound, "provider credential was not found", "Configure it with eregion domain cloudflare configure, then retry.")
+		return nil, contract.NewFault(contract.NotFound, "provider credential was not found", "Configure it with eregion dns configure --provider cloudflare, then retry.")
 	}
 	return []byte(token), nil
 }

@@ -261,7 +261,7 @@ func (e *actionExecutor) Execute(ctx context.Context, exec platform.Execution) (
 
 func (e *actionExecutor) dns(ctx context.Context, exec platform.Execution) (platform.Result, error) {
 	if e.runtime.Zones == nil || e.runtime.Credentials == nil {
-		return platform.Result{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; there is no environment or file fallback.")
+		return platform.Result{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; there is no environment or file fallback.")
 	}
 	if e.runtime.Authorizer == nil || e.runtime.Audit == nil {
 		return platform.Result{}, contract.NewFault(contract.Unavailable, "DNS reconciliation is not configured", "Wire explicit authorization and a durable audit sink; DNS changes fail closed.")
@@ -280,7 +280,7 @@ func (e *actionExecutor) dns(ctx context.Context, exec platform.Execution) (plat
 		return platform.Result{}, err
 	}
 	if !ok {
-		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "Cloudflare zone is not configured on this control plane", "Configure the exact zone ID and name with eregion domain cloudflare configure; reconcile never accepts a zone that is not configured.")
+		return platform.Result{}, contract.NewFault(contract.PreconditionFailed, "Cloudflare zone is not configured on this control plane", "Configure the exact zone ID and name with eregion dns configure --provider cloudflare; reconcile never accepts a zone that is not configured.")
 	}
 	raw, err := e.runtime.Credentials.DNSCredential(ctx, DNSProviderCloudflare, zone.ZoneID)
 	if err != nil {
@@ -402,14 +402,14 @@ func (dnsInventory) Collection() string { return InventoryCollectionDNS }
 
 func (p dnsInventory) Read(ctx context.Context, query platform.InventoryQuery) (any, error) {
 	if p.zones == nil || p.credentials == nil {
-		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; the DNS inventory does not guess a zone.")
+		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; the DNS inventory does not guess a zone.")
 	}
 	zones, err := p.zones.DNSZones(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if len(zones) == 0 {
-		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion domain cloudflare configure; the DNS inventory does not guess a zone.")
+		return nil, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; the DNS inventory does not guess a zone.")
 	}
 	limit := boundedLimit(query.Limit)
 	routes := make([]DNSRoute, 0)

@@ -23,6 +23,9 @@ const Schema = "eregion-rpc/v1"
 // MaxRequestBytes caps the request read from stdin.
 const MaxRequestBytes = 1 << 20
 
+// MaxFollowFrameBytes includes the terminating newline.
+const MaxFollowFrameBytes = 4 << 20
+
 // Request is one node RPC call. Secrets carries transient values that are never
 // logged, persisted or copied into an operation input.
 type Request struct {
@@ -81,10 +84,20 @@ type Event struct {
 // container-log line when Kind is "log"; Message remains the redacted plain
 // text for ordinary progress events.
 type EventBody struct {
-	Kind    string   `json:"kind,omitempty"`
-	Step    string   `json:"step,omitempty"`
-	Message string   `json:"message,omitempty"`
-	Log     *LogLine `json:"log,omitempty"`
+	Kind    string         `json:"kind,omitempty"`
+	Step    string         `json:"step,omitempty"`
+	Message string         `json:"message,omitempty"`
+	Log     *LogLine       `json:"log,omitempty"`
+	Follow  *FollowPayload `json:"follow,omitempty"`
+}
+
+// FollowPayload carries one snapshot or a contiguous page fragment.
+type FollowPayload struct {
+	Kind        string               `json:"kind"`
+	OperationID contract.OperationID `json:"operation_id"`
+	Snapshot    *contract.Operation  `json:"snapshot,omitempty"`
+	Events      []contract.Event     `json:"events,omitempty"`
+	Cursor      contract.Cursor      `json:"cursor"`
 }
 
 // LogLine is one container-log line streamed by the node before the final RPC

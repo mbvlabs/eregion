@@ -2,6 +2,7 @@ package integrations
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"reflect"
@@ -64,10 +65,10 @@ func definitionRecords(ctx context.Context, client *Cloudflare, host, marker str
 			return nil, err
 		}
 		if records == nil {
-			return nil, contract.NewFault(contract.Unavailable, "Cloudflare returned no hostname record list", "Retry the read before planning DNS changes.")
+			return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "Retry the read before planning DNS changes.")
 		}
 		if info.TotalPages > 100 {
-			return nil, contract.NewFault(contract.Unavailable, "Cloudflare hostname recordset exceeds the read limit", "Reduce the recordset before planning DNS changes.")
+			return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "The hostname recordset exceeds the read limit; review provider state before planning.")
 		}
 		for _, r := range records {
 			if !hostnameEqual(r.Name, host) {
@@ -78,7 +79,7 @@ func definitionRecords(ctx context.Context, client *Cloudflare, host, marker str
 				continue
 			}
 			if r.ID == "" || seen[r.ID] {
-				return nil, contract.NewFault(contract.Unavailable, "Cloudflare returned an ambiguous hostname recordset", "Retry the read before planning DNS changes.")
+				return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "Retry the read before planning DNS changes.")
 			}
 			seen[r.ID] = true
 			owner := "foreign"
@@ -93,7 +94,7 @@ func definitionRecords(ctx context.Context, client *Cloudflare, host, marker str
 		}
 	}
 	if !complete {
-		return nil, contract.NewFault(contract.Unavailable, "Cloudflare hostname recordset exceeds the read limit", "Reduce the recordset before planning DNS changes.")
+		return nil, cloudflareFailure("invalid-response", 0, contract.Unavailable, "The hostname recordset exceeds the read limit; review provider state before planning.")
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Type != out[j].Type {
@@ -270,6 +271,12 @@ func definitionPost(before, after []DomainDNSRecord, change DomainDNSChange, mar
 	return reflect.DeepEqual(expected, after)
 }
 
+// DefinitionDNSObserved verifies the exact approved transition in durable
+// progress; an arbitrary non-nil result is not recovery evidence.
+func DefinitionDNSObserved(entry DefinitionDNSProgress, marker string) bool {
+	return entry.Result != nil && definitionPost(entry.Before, entry.Result, entry.Expected, marker)
+}
+
 // ExecuteApprovedDefinitionDNS executes only the supplied, independently
 // approved plan. No fresh plan can enlarge its authority. Progress must be
 // durable; there is deliberately no in-memory fallback.
@@ -319,6 +326,15 @@ func (d *DomainDNS) ExecuteApprovedDefinitionDNS(ctx context.Context, actor cont
 	}
 	current, err := definitionRecords(ctx, client, plan.Host, plan.Ownership)
 	if err != nil {
+		// A previous request may have taken effect. Even a deterministic read
+		// rejection cannot settle that unknown write without a successful
+		// exact-record readback.
+		if len(entries) > 0 && entries[len(entries)-1].Result == nil {
+			var failure *ProviderFailure
+			if errors.As(err, &failure) {
+				return 0, cloudflareFailure(failure.Category, failure.Status, contract.Unavailable, "Restore provider read access and reconcile the pending write before deciding its outcome.")
+			}
+		}
 		return 0, err
 	}
 	start := len(entries)
@@ -336,8 +352,7 @@ func (d *DomainDNS) ExecuteApprovedDefinitionDNS(ctx context.Context, actor cont
 			}
 			expected = current
 		} else if reflect.DeepEqual(current, e.Before) {
-			start--
-			expected = e.Before
+			return start - 1, contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Keep the operation and reservation; retry read-only reconciliation.")
 		} else {
 			return start - 1, definitionDrift()
 		}
@@ -372,11 +387,21 @@ func (d *DomainDNS) ExecuteApprovedDefinitionDNS(ctx context.Context, actor cont
 		}
 		if err = client.apply(ctx, domainDNSChangeToDNSChange(change)); err != nil {
 			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "provider outcome unknown")})
+			var failure *ProviderFailure
+			if errors.As(err, &failure) && (contract.Classify(err).Code == contract.Forbidden || contract.Classify(err).Code == contract.PreconditionFailed) {
+				copy := *failure
+				copy.DefinitiveWrite = true
+				return i, &copy
+			}
 			return i, err
 		}
 		current, err = definitionRecords(ctx, client, plan.Host, plan.Ownership)
 		if err != nil {
 			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "provider result unverified")})
+			var failure *ProviderFailure
+			if errors.As(err, &failure) {
+				return i, cloudflareFailure(failure.Category, failure.Status, contract.Unavailable, "Restore provider read access and reconcile the pending write before deciding its outcome.")
+			}
 			return i, err
 		}
 		if !definitionPost(expected, current, change, plan.Ownership) {
@@ -393,4 +418,62 @@ func (d *DomainDNS) ExecuteApprovedDefinitionDNS(ctx context.Context, actor cont
 		expected = current
 	}
 	return len(plan.Changes), nil
+}
+
+// ResolveApprovedDefinitionDNS performs no mutations. A pending intent is
+// resolved only by observing its exact approved post-state; a pre-state read
+// cannot exclude a delayed provider effect.
+func (d *DomainDNS) ResolveApprovedDefinitionDNS(ctx context.Context, actor contract.Actor, opID contract.OperationID, req DomainDNSRequest, plan DefinitionDNSPlan, progress DefinitionDNSProgressStore) error {
+	if d == nil || progress == nil || d.audit == nil {
+		return contract.NewFault(contract.Unavailable, "DNS recovery is unavailable", "Retain the operation and retry read-only recovery.")
+	}
+	if err := d.AuthorizeWrite(ctx, actor); err != nil {
+		return err
+	}
+	zone, client, err := d.clientFor(ctx, req.ZoneID, req.ZoneName)
+	if err != nil {
+		return err
+	}
+	canonical, err := definitionPlan(zone, req, plan.Before)
+	if err != nil || !reflect.DeepEqual(canonical, plan) {
+		return definitionDrift()
+	}
+	entries, err := progress.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if len(entries) > len(plan.Changes) {
+		return definitionDrift()
+	}
+	expected := plan.Before
+	for i, entry := range entries {
+		if entry.Index != i || !reflect.DeepEqual(entry.Before, expected) || !reflect.DeepEqual(entry.Expected, plan.Changes[i]) {
+			return definitionDrift()
+		}
+		if entry.Result == nil {
+			if i != len(entries)-1 {
+				return definitionDrift()
+			}
+			if err := progress.Guard(ctx); err != nil {
+				return err
+			}
+			current, err := definitionRecords(ctx, client, plan.Host, plan.Ownership)
+			if err != nil {
+				return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Restore provider read access; the reservation remains held.")
+			}
+			if !definitionPost(entry.Before, current, entry.Expected, plan.Ownership) {
+				return contract.NewFault(contract.Unavailable, "approved DNS write outcome remains unknown", "Keep the reservation and retry read-only recovery; no provider write will be repeated.")
+			}
+			entry.Result = current
+			if err := progress.Observed(ctx, entry); err != nil {
+				return err
+			}
+			return nil
+		}
+		if !definitionPost(entry.Before, entry.Result, entry.Expected, plan.Ownership) {
+			return definitionDrift()
+		}
+		expected = entry.Result
+	}
+	return nil
 }

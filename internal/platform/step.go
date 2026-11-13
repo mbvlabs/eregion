@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -158,7 +159,31 @@ func buildArgvStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 			return nil, errors.New("invalid secret environment key")
 		}
 	}
-	return &ArgvStep{exec: exec, payload: payload}, nil
+	step := &ArgvStep{exec: exec, payload: payload}
+	if exec.Step == "platform-network-01-v1" {
+		if len(payload.Argv) != 10 || !slices.Equal(payload.Argv[:5], []string{"docker", "network", "create", "--driver", "bridge"}) ||
+			payload.Argv[5] != "--label" || payload.Argv[7] != "--label" ||
+			!strings.HasPrefix(payload.Argv[6], "io.eregion.app=") || !strings.HasPrefix(payload.Argv[8], "io.eregion.environment=") ||
+			ValidateName(strings.TrimPrefix(payload.Argv[6], "io.eregion.app=")) != nil ||
+			ValidateName(strings.TrimPrefix(payload.Argv[8], "io.eregion.environment=")) != nil ||
+			!strings.HasPrefix(payload.Argv[9], "er-") ||
+			EnvironmentID(strings.TrimPrefix(payload.Argv[9], "er-")).Validate() != nil ||
+			!slices.Equal(payload.CheckArgv, []string{"docker", "network", "inspect", "--format", "{{.Name}}", payload.Argv[9]}) ||
+			len(payload.Env) != 0 || len(payload.SecretEnvKeys) != 0 || payload.AllowFailure || payload.MissingOK || payload.IsolatedDocker || payload.TimeoutSeconds != 30 {
+			return nil, errors.New("invalid exact deployment network ensure")
+		}
+		return &deploymentNetworkStep{ArgvStep: step, network: payload.Argv[9]}, nil
+	}
+	return step, nil
+}
+
+type deploymentNetworkStep struct {
+	*ArgvStep
+	network string
+}
+
+func (s *deploymentNetworkStep) SharedHostResources() []string {
+	return []string{"docker-network\x00" + s.network}
 }
 
 func (s *ArgvStep) ID() string                      { return s.payload.Step }
@@ -1052,7 +1077,24 @@ func buildPackStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if payload.LaunchCache != "" && !cacheVolumePattern.MatchString(payload.LaunchCache) {
 		return nil, errors.New("a launch cache must be an eregion launch cache volume name")
 	}
-	return &PackStep{exec: exec, payload: payload}, nil
+	step := &PackStep{exec: exec, payload: payload}
+	if exec.Step == "platform-pack-02-v1" {
+		return &sharedPackStep{PackStep: step}, nil
+	}
+	return step, nil
+}
+
+type sharedPackStep struct{ *PackStep }
+
+func (s *sharedPackStep) SharedHostResources() []string {
+	resources := []string{"docker-image\x00" + s.payload.Image}
+	if s.payload.Cache != "" {
+		resources = append(resources, "docker-volume\x00"+s.payload.Cache)
+	}
+	if s.payload.LaunchCache != "" {
+		resources = append(resources, "docker-volume\x00"+s.payload.LaunchCache)
+	}
+	return resources
 }
 
 func (s *PackStep) ID() string { return s.payload.Step }
@@ -1225,7 +1267,7 @@ func (s *PackStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 		}
 		return engine.ApplyResult{}, err
 	}
-	if err := removeStaleBuildNetworks(buildCtx, rt, isolation, registry.ID, s.ID(), report); err != nil {
+	if err := removeStaleBuildNetworks(buildCtx, rt, isolation, registry.ID, s.exec, report); err != nil {
 		if buildCtx.Err() != nil {
 			return engine.ApplyResult{}, engine.ErrInterrupted
 		}
@@ -1533,13 +1575,12 @@ func removeBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []stri
 	return nil
 }
 
-// removeStaleBuildNetworks cleanly removes owned build networks left by an
-// interrupted or crashed attempt. The host lock serializes Pack steps, so any
-// other network carrying the exact pack ownership label is stale. Each network
-// is validated against its own labels before anything is removed; an
-// unreadable or inconsistent owned network fails closed.
-func removeStaleBuildNetworks(ctx context.Context, rt engine.Runtime, isolation []string, registryID, step string, report engine.Reporter) error {
-	listed, stderr, err := runArgvClean(ctx, []string{"docker", "network", "ls", "-q", "--filter", "label=" + buildNetworkOwnerLabel + "=" + buildNetworkOwner}, isolation, rt, step, nil)
+// removeStaleBuildNetworks cleans only this or earlier attempts of this exact effect.
+// The engine holds its effect lock throughout this call. Other effects may be
+// live or resumable even when no process currently holds the host lock.
+func removeStaleBuildNetworks(ctx context.Context, rt engine.Runtime, isolation []string, registryID string, execution engine.Execution, report engine.Reporter) error {
+	step := execution.Step
+	listed, stderr, err := runArgvClean(ctx, []string{"docker", "network", "ls", "-q", "--filter", "label=" + buildNetworkOwnerLabel + "=" + buildNetworkOwner, "--filter", "label=" + buildNetworkOperationLabel + "=" + string(execution.OperationID), "--filter", "label=" + buildNetworkStepLabel + "=" + execution.Step}, isolation, rt, step, nil)
 	if err != nil {
 		return fmt.Errorf("listing stale build networks failed: %s", commandDetail(err, stderr))
 	}
@@ -1570,6 +1611,9 @@ func removeStaleBuildNetworks(ctx context.Context, rt engine.Runtime, isolation 
 		if expectedName := buildNetworkName(operationID, networkStep, uint32(attempt)); inspection.Name != expectedName {
 			return fmt.Errorf("refusing to clean build network %s: it is not the deterministic network %s", inspection.Name, expectedName)
 		}
+		if operationID != execution.OperationID || networkStep != execution.Step || uint32(attempt) > execution.Attempt {
+			continue
+		}
 		if err := removeBuildNetwork(ctx, rt, isolation, inspection.Name, operationID, networkStep, uint32(attempt), registryID); err != nil {
 			return err
 		}
@@ -1578,6 +1622,82 @@ func removeStaleBuildNetworks(ctx context.Context, rt engine.Runtime, isolation 
 		}
 	}
 	return nil
+}
+
+// sweepCompletedBuildNetworks runs only under the retention effect's exclusive
+// host fence. Failed, resumable, unreadable and locked effects remain untouched.
+func sweepCompletedBuildNetworks(ctx context.Context, rt engine.Runtime, step string, report engine.Reporter) error {
+	isolation, cleanup, err := IsolatedDockerEnvironment()
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	out, _, err := runArgvClean(ctx, []string{"docker", "inspect", "--type=container", "--format", "{{.Id}}|{{.Name}}|{{.Config.Image}}", RegistryContainer}, isolation, rt, step, nil)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(strings.TrimSpace(out), "|")
+	if len(parts) != 3 || len(parts[0]) != 64 || !shaPattern.MatchString(parts[0]) || strings.TrimPrefix(parts[1], "/") != RegistryContainer || parts[2] != RegistryImage {
+		return errors.New("private registry identity is not verifiable")
+	}
+	registryID := parts[0]
+	listed, _, err := runArgvClean(ctx, []string{"docker", "network", "ls", "-q", "--filter", "label=" + buildNetworkOwnerLabel + "=" + buildNetworkOwner}, isolation, rt, step, nil)
+	if err != nil {
+		return err
+	}
+	for _, id := range strings.Fields(listed) {
+		inspection, exists, err := inspectBuildNetwork(ctx, rt, isolation, id, step)
+		if err != nil {
+			return err
+		}
+		if !exists || inspection.Labels[buildNetworkOwnerLabel] != buildNetworkOwner {
+			continue
+		}
+		op := contract.OperationID(inspection.Labels[buildNetworkOperationLabel])
+		networkStep := inspection.Labels[buildNetworkStepLabel]
+		attempt, err := strconv.ParseUint(inspection.Labels[buildNetworkAttemptLabel], 10, 32)
+		if op.Validate() != nil || networkStep != "platform-pack-02-v1" || err != nil || attempt == 0 ||
+			strconv.FormatUint(attempt, 10) != inspection.Labels[buildNetworkAttemptLabel] ||
+			inspection.Name != buildNetworkName(op, networkStep, uint32(attempt)) {
+			continue
+		}
+		execution := engine.Execution{OperationID: op, Step: networkStep, Attempt: uint32(attempt)}
+		release, err := engine.TryEffectLock(ctx, rt.Root, execution)
+		if errors.Is(err, engine.ErrLockHeld) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		err = sweepCompletedBuildNetwork(ctx, rt, isolation, registryID, execution)
+		release()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sweepCompletedBuildNetwork(ctx context.Context, rt engine.Runtime, isolation []string, registryID string, execution engine.Execution) error {
+	journal, err := engine.LoadJournal(engine.JournalPath(rt.Root))
+	if err != nil {
+		return err
+	}
+	task, ok := journal.Tasks[execution.EffectKey()]
+	if !ok || task.Status != engine.TaskCompleted || task.OperationID != string(execution.OperationID) || task.Step != execution.Step ||
+		task.AppliedAttempt < execution.Attempt || task.Attempt < execution.Attempt || task.CompletedAt == "" || len(task.InputsHash) != 64 || !shaPattern.MatchString(task.InputsHash) {
+		return nil
+	}
+	record, ok, err := engine.LoadEffectRecord((&engine.Engine{StateDir: rt.Root}).EffectRecordPath(execution))
+	if err != nil {
+		return err
+	}
+	if !ok || record.OperationID != task.OperationID || record.Step != task.Step || record.InputsHash != task.InputsHash ||
+		record.AppliedAttempt != task.AppliedAttempt || record.AppliedAttempt < execution.Attempt || record.CompletedAt == "" {
+		return nil
+	}
+	name := buildNetworkName(execution.OperationID, execution.Step, execution.Attempt)
+	return removeBuildNetwork(ctx, rt, isolation, name, execution.OperationID, execution.Step, execution.Attempt, registryID)
 }
 
 func buildNetworkGone(stderr string) bool {
