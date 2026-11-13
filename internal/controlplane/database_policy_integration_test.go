@@ -34,9 +34,31 @@ func TestIntegrationDatabasePolicyAdmissionDefaults(t *testing.T) {
 		}
 		return op
 	}
+	if err := s.ensureLocalNode(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var localCreated, localUpdated time.Time
+	if err := pool.QueryRow(ctx, `SELECT created_at,updated_at FROM eregion_platform_nodes WHERE name='local'`).
+		Scan(&localCreated, &localUpdated); err != nil {
+		t.Fatal(err)
+	}
 	node := submit(platform.KindNodeRegister, "platform", "policy-node", map[string]any{
 		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
 	})
+	freshNode := submit(platform.KindNodeRegister, "platform", "policy-fresh-node", map[string]any{
+		"name": "policy-node", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	var localOK bool
+	var localActual string
+	err := pool.QueryRow(ctx, `SELECT address='' AND status='ready' AND enrollment_state='registered'
+		AND created_at=$1 AND updated_at>=$2,
+		jsonb_build_object('address',address,'status',status,'enrollment_state',enrollment_state,
+		'created_at',created_at,'updated_at',updated_at)::text
+		FROM eregion_platform_nodes WHERE name='local'`, localCreated, localUpdated).Scan(&localOK, &localActual)
+	if err != nil || !localOK {
+		t.Fatalf("local node registration update: ok=%v actual=%s previous_created=%s previous_updated=%s err=%v",
+			localOK, localActual, localCreated, localUpdated, err)
+	}
 	app := submit(platform.KindAppCreate, "platform", "policy-app", map[string]any{
 		"name": "policy", "environments": []map[string]any{
 			{"name": "production", "node": "local", "domain": "policy.example.com"},
@@ -50,42 +72,58 @@ func TestIntegrationDatabasePolicyAdmissionDefaults(t *testing.T) {
 	resource := submit(platform.KindResourceApply, "resource/policy/production/cache", "policy-resource", map[string]any{
 		"image": "redis:7", "health": map[string]any{"type": "exec", "command": []string{"true"}},
 	})
-	for _, op := range []contract.Operation{node, app, extra, resource} {
+	for _, op := range []contract.Operation{node, freshNode, app, extra, resource} {
 		var ok bool
+		var actual string
 		err := pool.QueryRow(ctx, `SELECT state='queued' AND attempt=0 AND completed_steps=0 AND last_sequence=1
 			AND error_code='' AND job_id IS NOT NULL AND created_at IS NOT NULL AND updated_at IS NOT NULL
-			FROM eregion_operations WHERE id=$1`, op.ID).Scan(&ok)
+			, jsonb_build_object('state',state,'attempt',attempt,'completed_steps',completed_steps,
+				'last_sequence',last_sequence,'error_code',error_code,'has_job',job_id IS NOT NULL,
+				'created_at',created_at,'updated_at',updated_at)::text
+			FROM eregion_operations WHERE id=$1`, op.ID).Scan(&ok, &actual)
 		if err != nil || !ok {
-			t.Fatalf("operation %s initial state: ok=%v err=%v", op.ID, ok, err)
+			t.Fatalf("operation %s initial state: ok=%v actual=%s err=%v", op.ID, ok, actual, err)
 		}
 	}
-	checks := []struct{ name, query string }{
+	checks := []struct{ name, query, diagnostic string }{
 		{"node", `SELECT address='' AND status='registered' AND enrollment_state='registered'
 			AND enrollment_error='' AND transport='local' AND build_concurrency=1 AND build_user=''
 			AND NOT wg_enabled AND wg_state='none' AND last_check_state='unknown'
-			FROM eregion_platform_nodes WHERE name='local'`},
-		{"app", `SELECT image_repository=$1 FROM eregion_platform_apps WHERE name='policy'`},
+			FROM eregion_platform_nodes WHERE name='policy-node'`,
+			`SELECT jsonb_build_object('address',address,'status',status,'enrollment_state',enrollment_state,
+			'enrollment_error_empty',enrollment_error='', 'transport',transport,'build_concurrency',build_concurrency,
+			'build_user',build_user,'wg_enabled',wg_enabled,'wg_state',wg_state,'last_check_state',last_check_state)::text
+			FROM eregion_platform_nodes WHERE name='policy-node'`},
+		{"app", `SELECT image_repository='policy' FROM eregion_platform_apps WHERE name='policy'`,
+			`SELECT jsonb_build_object('image_repository',image_repository)::text FROM eregion_platform_apps WHERE name='policy'`},
 		{"domain", `SELECT is_primary AND desired_revision=1 AND applied_revision=0 AND route_state='pending'
 			AND route_error='' AND dns_state='pending' AND cardinality(dns_addresses)=0
 			AND cardinality(expected_addresses)=0 AND dns_error='' AND certificate_state='pending'
 			AND certificate_error='' AND public_state='pending' AND public_error=''
-			AND check_path='' AND observed_at IS NULL FROM eregion_platform_domains WHERE name='policy.example.com'`},
+			AND check_path='' AND observed_at IS NULL FROM eregion_platform_domains WHERE name='policy.example.com'`,
+			`SELECT jsonb_build_object('is_primary',is_primary,'desired_revision',desired_revision,'applied_revision',applied_revision,
+			'route_state',route_state,'route_error_empty',route_error='','dns_state',dns_state,
+			'dns_address_count',cardinality(dns_addresses),'expected_address_count',cardinality(expected_addresses),
+			'dns_error_empty',dns_error='','certificate_state',certificate_state,'certificate_error_empty',certificate_error='',
+			'public_state',public_state,'public_error_empty',public_error='','check_path',check_path,'observed_at',observed_at)::text
+			FROM eregion_platform_domains WHERE name='policy.example.com'`},
 		{"resource", `SELECT state='pending' AND health_state='unknown' AND health_detail=''
 			AND image='redis:7' AND image_id='' AND image_digest='' AND container_name='' AND network_name=''
 			AND volumes='[]'::jsonb AND error_code='' AND error='' AND destroyed_at IS NULL
-			FROM eregion_platform_resources WHERE name='cache'`},
+			FROM eregion_platform_resources WHERE name='cache'`,
+			`SELECT jsonb_build_object('state',state,'health_state',health_state,'health_detail_empty',health_detail='',
+			'image',image,'image_id',image_id,'image_digest',image_digest,'container_name',container_name,
+			'network_name',network_name,'volumes_empty',volumes='[]'::jsonb,'error_code',error_code,
+			'error_empty',error='','destroyed_at',destroyed_at)::text FROM eregion_platform_resources WHERE name='cache'`},
 	}
 	for _, check := range checks {
 		t.Run(check.name, func(t *testing.T) {
 			var ok bool
-			var err error
-			if check.name == "app" {
-				err = pool.QueryRow(ctx, check.query, "policy").Scan(&ok)
-			} else {
-				err = pool.QueryRow(ctx, check.query).Scan(&ok)
-			}
+			err := pool.QueryRow(ctx, check.query).Scan(&ok)
 			if err != nil || !ok {
-				t.Fatalf("initial state: ok=%v err=%v", ok, err)
+				var actual string
+				diagnosticErr := pool.QueryRow(ctx, check.diagnostic).Scan(&actual)
+				t.Fatalf("initial state: ok=%v actual=%s err=%v diagnostic_err=%v", ok, actual, err, diagnosticErr)
 			}
 		})
 	}
@@ -109,7 +147,20 @@ func TestIntegrationDatabasePolicyAdmissionDefaults(t *testing.T) {
 				tc.name, tc.protected, "127.0.0.1", "/", 30,
 				tc.op.ID, testActor.Kind, testActor.Subject).Scan(&ok)
 			if err != nil || !ok {
-				t.Fatalf("environment and revision: ok=%v err=%v", ok, err)
+				var actual string
+				diagnosticErr := pool.QueryRow(ctx, `SELECT jsonb_build_object(
+					'protected',e.protected,'bind_address',e.bind_address,'health_type',e.health_type,
+					'health_path',e.health_path,'health_timeout_seconds',e.health_timeout_seconds,
+					'env_empty',e.env='{}'::jsonb,'secret_refs_empty',e.secret_refs='{}'::jsonb,
+					'secret_revision',e.secret_revision,'health_state',e.health_state,'health_detail_empty',e.health_detail='',
+					'health_checked_at',e.health_checked_at,'desired_release_id',e.desired_release_id,
+					'applied_release_id',e.applied_release_id,'serving_release_id',e.serving_release_id,
+					'number',r.number,'operation_id',r.operation_id,'actor_kind',r.actor_kind,'actor_subject',r.actor_subject,
+					'auto_deploy',r.auto_deploy,'deploy_intent',r.deploy_intent,
+					'secret_names_count',cardinality(r.secret_names),'resources_count',cardinality(r.resources))::text
+					FROM eregion_platform_environments e JOIN eregion_platform_environment_revisions r
+					ON r.id=e.current_revision_id AND r.environment_id=e.id WHERE e.name=$1`, tc.name).Scan(&actual)
+				t.Fatalf("environment and revision: ok=%v actual=%s err=%v diagnostic_err=%v", ok, actual, err, diagnosticErr)
 			}
 		})
 	}
@@ -642,17 +693,24 @@ func TestIntegrationDatabasePolicyRetentionWorkerRunLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sawRunning bool
-	f.transport.onRun = func(string) {
+	// Inspect immediately after insertion, before the worker marks releases and
+	// persists those removals ahead of its first node effect.
+	f.service.beforeRetentionMark = func(_ context.Context, _ contract.OperationID) {
 		if sawRunning {
 			return
 		}
 		var ok bool
+		var actual string
 		err := f.pool.QueryRow(ctx, `SELECT status='running' AND reclaimed_bytes=0
 			AND removed_items='[]'::jsonb AND errors='[]'::jsonb AND finished_at IS NULL
 			AND cache_measurement_error='' AND gc_generation=0 AND started_at IS NOT NULL
-			FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&ok)
+			, jsonb_build_object('status',status,'planned_bytes',planned_bytes,'reclaimed_bytes',reclaimed_bytes,
+			'removed_items',removed_items,'errors_empty',errors='[]'::jsonb,'finished_at',finished_at,
+			'cache_measurement_error_empty',cache_measurement_error='','gc_generation',gc_generation,
+			'started_at',started_at)::text
+			FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&ok, &actual)
 		if err != nil || !ok {
-			t.Errorf("initial running retention row: ok=%v err=%v", ok, err)
+			t.Errorf("initial running retention row: ok=%v actual=%s err=%v", ok, actual, err)
 		}
 		sawRunning = true
 	}
@@ -660,15 +718,19 @@ func TestIntegrationDatabasePolicyRetentionWorkerRunLifecycle(t *testing.T) {
 		t.Fatalf("retention worker: %v", err)
 	}
 	if !sawRunning {
-		t.Fatal("worker did not execute a node effect")
+		t.Fatal("worker did not reach the initial retention run")
 	}
 	var ok bool
+	var actual string
 	err = f.pool.QueryRow(ctx, `SELECT r.status='succeeded' AND r.finished_at>=r.started_at
 		AND r.errors='[]'::jsonb AND r.planned_bytes=100 AND r.reclaimed_bytes=100
 		AND o.state='succeeded' AND o.attempt=1
+		, jsonb_build_object('status',r.status,'started_at',r.started_at,'finished_at',r.finished_at,
+		'errors_empty',r.errors='[]'::jsonb,'planned_bytes',r.planned_bytes,'reclaimed_bytes',r.reclaimed_bytes,
+		'operation_state',o.state,'attempt',o.attempt)::text
 		FROM eregion_retention_runs r JOIN eregion_operations o ON o.id=r.operation_id
-		WHERE r.operation_id=$1`, op.ID).Scan(&ok)
+		WHERE r.operation_id=$1`, op.ID).Scan(&ok, &actual)
 	if err != nil || !ok {
-		t.Fatalf("completed retention run: ok=%v err=%v", ok, err)
+		t.Fatalf("completed retention run: ok=%v actual=%s err=%v", ok, actual, err)
 	}
 }

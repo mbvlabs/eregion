@@ -30,10 +30,17 @@ application/environment creation, domains/resources, deployment records,
 retention, vault/provider revisions, audit allocation, cleanup and release
 commands. It also exercises authenticated HTTP resource admission against the
 real database-backed service and checks corrupted stored resource/secret
-snapshots fail closed. These additions have source review and compile evidence,
-not PostgreSQL execution evidence. Existing worker, migration, recovery and
+snapshots fail closed. Existing worker, migration, recovery and
 concurrency integrations remain; the real API/worker executable lifecycle test
 is retained, with its explicit Linux/database/public-host-key prerequisites.
+
+Candidate `6ae7b0a` ran in CI `43426626454`. Build/static checks and macOS passed.
+The normal PostgreSQL suite completed in 192.894 seconds with 223 top-level
+passes, one expected helper skip, and two failures in new node-initialization
+and retention-run default assertions. The 21-file Goose migration, partial
+history retry and orphan-refusal integrations passed. The race step did not
+run because the normal suite failed. This is partial qualification only;
+corrections and a complete normal/race rerun are required.
 
 ## Unpublished three-channel correction (2026-11-13)
 
