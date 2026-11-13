@@ -103,6 +103,13 @@ re-queue the older one's live platform jobs.
 | `internal/viewer`, `internal/tui`, `internal/workspaceui`, `internal/cli/ui` | Reducer/follow, operation view, full-screen workspace and guided inline components. |
 | `internal/release`, `internal/upgrade`, `scripts/*.sh`, `.github/workflows/publish-*.yml` | Cosign-verified channel manifests and artifacts; local CLI replacement plus the verified linux/<node arch> binary used by `apply --auto-upgrade-nodes`. |
 
+Before artifact upload, release publication qualifies the configured storage
+target with a unique disposable probe. It requires create-only collision and
+stale-ETag writes to return precondition failures, verifies unchanged content
+and ETags, and checks a matching-ETag replacement succeeds. Only the confirmed
+owned probe key is deleted; qualification or cleanup failure stops publication.
+This production preflight does not write a channel pointer or release artifact.
+
 ## Current command surface
 
 ### Operator and agent quick reference

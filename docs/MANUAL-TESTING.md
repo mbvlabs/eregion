@@ -24,6 +24,11 @@ file access with an empty home and nonexistent workspace store.
 These checks do not qualify server setup or deployment behavior. No unit tests
 were added or run, and no installed-binary replacement occurred.
 
+Candidate `2fad8a3` passed CI `43432621075`: build/static checks, macOS build,
+and normal/race PostgreSQL integrations. Each database run passed 225 top-level
+tests with one expected crash-helper skip; durations were 176.926 and 182.896
+seconds. Release publication still requires the storage/bootstrap gates below.
+
 ## Current test boundary (operator decision, 2026-11-13)
 
 Automated behavioral coverage is integration-only: real PostgreSQL and/or
@@ -78,6 +83,13 @@ replace the pointer. The bootstrap attestation is not set by this work.
 Historical beta.5 may reject later tag-signed edge pointers and may fail closed
 during a moving manifest/bundle race. No compatibility guarantee, new release
 or existing-server upgrade is claimed.
+
+Artifact upload now runs a fail-closed live storage preflight before writing
+any release artifact. Against one unique disposable key it requires create-only
+collision and stale-ETag rejection, unchanged content/ETags, successful matching
+replacement and exact owned-key cleanup. Static review and shell syntax checks
+passed; this is not live qualification until the authorized publisher records
+all checks and successful cleanup.
 
 ## Unpublished separate Goose history (2026-11-13)
 

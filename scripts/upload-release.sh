@@ -138,6 +138,7 @@ if [ "${mode}" != channel ]; then
     for expected in "${files[@]}"; do [ "${name}" != "${expected}" ] || found=true; done
     "${found}" || { echo "unexpected artifact: ${name}" >&2; exit 1; }
   done < <(find "${version_root}" \( -type f -o -type l \) -print0)
+  bash "$(dirname "${BASH_SOURCE[0]}")/check-release-storage.sh" "${bucket}" "${endpoint}"
   verify_file="$(mktemp "${release_root}/.upload-verify.XXXXXXXX")"
   trap 'rm -f "${verify_file}"' EXIT
   for name in "${files[@]}"; do
