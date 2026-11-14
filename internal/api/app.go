@@ -367,25 +367,6 @@ type diagnosisService interface {
 	Diagnose(context.Context, operations.Authority, contract.OperationID, uint64, int, string) (platform.Diagnosis, error)
 }
 
-// diagnosticExecutionService is only called by the authenticated node RPC
-// adapter. It is deliberately not registered as a generic HTTP action.
-type diagnosticExecutionService interface {
-	PreviewDiagnosticExecution(context.Context, contract.Actor, string, contract.OperationID, []string, string) (platform.DiagnosticExecutionPreview, error)
-	SubmitDiagnosticExecution(context.Context, contract.Actor, string, contract.OperationID, []string, string) (operations.SubmissionResult, error)
-}
-
-// DiagnosticExecution previews or admits the dedicated SSH-only operation.
-func (s AppService) DiagnosticExecution(ctx context.Context, actor contract.Actor, key string, original contract.OperationID, argv []string, confirmation string, dryRun bool) (any, error) {
-	service, ok := s.Operations.(diagnosticExecutionService)
-	if !ok {
-		return nil, contract.NewFault(contract.Unavailable, "diagnostic execution is not configured", "Use a node with durable diagnostic execution support.")
-	}
-	if dryRun {
-		return service.PreviewDiagnosticExecution(ctx, actor, key, original, argv, confirmation)
-	}
-	return service.SubmitDiagnosticExecution(ctx, actor, key, original, argv, confirmation)
-}
-
 // Diagnose reads the same durable evidence for every presentation.
 func (s AppService) Diagnose(ctx context.Context, authority operations.Authority, id contract.OperationID, after uint64, limit int, localNode string) (platform.Diagnosis, error) {
 	service, ok := s.Operations.(diagnosisService)

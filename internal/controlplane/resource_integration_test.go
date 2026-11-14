@@ -159,6 +159,10 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 	platformAwait(t, s, platformSubmit(t, s, platform.KindEnvironmentResourceAttach, "env/api/production", "resource-attach", map[string]any{
 		"resource": "db",
 	}), contract.Succeeded)
+	attachedPreview, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/api/production", map[string]any{})
+	if err != nil || !deletionWarningContains(attachedPreview.Warnings, "api/production/db (state: ready)") {
+		t.Fatalf("attached resource preview: %+v, %v", attachedPreview, err)
+	}
 	var resources []string
 	if err := pool.QueryRow(ctx, `SELECT resources FROM eregion_platform_environment_revisions r
         JOIN eregion_platform_environments e ON e.id=r.environment_id
@@ -177,6 +181,10 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 	platformAwait(t, s, platformSubmit(t, s, platform.KindEnvironmentResourceDetach, "env/api/production", "resource-detach", map[string]any{
 		"resource": "db",
 	}), contract.Succeeded)
+	detachedPreview, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/api/production", map[string]any{})
+	if err != nil || !deletionWarningContains(detachedPreview.Warnings, "api/production/db (state: ready)") {
+		t.Fatalf("detached resource preview: %+v, %v", detachedPreview, err)
+	}
 
 	platformAwait(t, s, platformSubmit(t, s, platform.KindResourceDestroy, "resource/api/production/db", "resource-destroy", map[string]any{
 		"confirm": "api/production/db",
@@ -193,6 +201,10 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 		t.Fatalf("named volume identity was lost on destroy: %s", volumesText)
 	}
 	retainedVolumes := volumesText
+	destroyedPreview, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/api/production", map[string]any{})
+	if err != nil || deletionWarningContains(destroyedPreview.Warnings, "Deletion blocked by resource") {
+		t.Fatalf("destroyed resource preview: %+v, %v", destroyedPreview, err)
+	}
 
 	// Re-applying the same identity reactivates the retained volumes instead of
 	// creating a second resource.

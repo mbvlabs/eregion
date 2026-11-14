@@ -521,7 +521,7 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 	// Check again after locking: another effect may have changed state.
 	check, err := step.Check(ctx, Runtime{DryRun: false, Secrets: e.registry(), Scripts: e.Scripts, SecretValues: e.SecretValues, Root: e.StateDir})
 	if err != nil {
-		return e.fail(exec, running, fmt.Errorf("check %s: %w", step.ID(), err))
+		return e.fail(exec, running, fmt.Errorf("check %s: %w", step.ID(), err), nil)
 	}
 	executed := false
 	result := ApplyResult{}
@@ -546,12 +546,12 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		report.emit(Event{Kind: "log", Step: step.ID(), Message: message})
 		result, err = step.Apply(ctx, Runtime{DryRun: false, Secrets: e.registry(), Scripts: e.Scripts, SecretValues: e.SecretValues, Root: e.StateDir}, report)
 		if err != nil {
-			return e.fail(exec, running, err)
+			return e.fail(exec, running, err, result.Result)
 		}
 		executed = true
 	}
 
-	encodedResult, err := json.Marshal(result.Result)
+	encodedResult, err := safeTaskResult(e.registry(), result.Result)
 	if err != nil {
 		// The effect already happened. Do not turn an unserializable diagnostic
 		// result into a failed step that would be re-applied; keep the durable
@@ -582,11 +582,11 @@ func (e *Engine) Run(ctx context.Context, step Step, exec Execution, report Repo
 		Result:         encodedResult,
 	}
 	if err := EnsureDir(filepath.Dir(e.EffectRecordPath(exec))); err != nil {
-		return e.fail(exec, running, err)
+		return e.fail(exec, running, err, nil)
 	}
 	existed, err := SaveEffectRecord(e.EffectRecordPath(exec), record)
 	if err != nil {
-		return e.fail(exec, running, err)
+		return e.fail(exec, running, err, nil)
 	}
 	if existed {
 		// Another writer won the durable record. Never overwrite its history;
@@ -657,8 +657,16 @@ func (e *Engine) completeFromRecord(exec Execution, record EffectRecord) error {
 	return e.saveTask(exec, task)
 }
 
-func (e *Engine) fail(exec Execution, task Task, cause error) (TaskStatus, error) {
+func (e *Engine) fail(exec Execution, task Task, cause error, failureResult any) (TaskStatus, error) {
 	message := e.registry().Redact(cause.Error())
+	var encodedResult json.RawMessage
+	if failureResult != nil {
+		// Leave room for two bounded container snapshots plus stdout/stderr
+		// and JSON escaping within the node's one-megabyte frame.
+		if raw, err := safeTaskResult(e.registry(), failureResult); err == nil && len(raw) <= 4*64*1024 {
+			encodedResult = raw
+		}
+	}
 	errorCode, retryable := failureClassification(cause)
 	task.Status = TaskFailed
 	task.Error = message
@@ -677,13 +685,14 @@ func (e *Engine) fail(exec Execution, task Task, cause error) (TaskStatus, error
 		current.ErrorCode = errorCode
 		current.Retryable = retryable
 		current.CompletedAt = task.CompletedAt
+		current.Result = encodedResult
 		journal.Tasks[exec.EffectKey()] = current
 	}); err != nil {
 		return TaskStatus{}, errors.Join(cause, err)
 	}
 	return TaskStatus{
 		Status: StatusFailed, ExecutionID: exec.ExecutionID(), Attempt: exec.Attempt,
-		InputsHash: task.InputsHash, ErrorCode: errorCode, Retryable: retryable, Detail: message,
+		InputsHash: task.InputsHash, ErrorCode: errorCode, Retryable: retryable, Detail: message, Result: encodedResult,
 	}, cause
 }
 

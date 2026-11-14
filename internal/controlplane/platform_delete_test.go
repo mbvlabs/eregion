@@ -1,9 +1,13 @@
 package controlplane
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -14,6 +18,115 @@ func deletionWarningContains(warnings []string, fragment string) bool {
 		}
 	}
 	return false
+}
+
+func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T) {
+	ctx := context.Background()
+	pool, _ := testPool(t, true)
+	s := testRuntime(t, pool, 0).Service
+	platformSubmit(t, s, platform.KindNodeRegister, "platform", "resource-preview-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+	})
+	platformSubmit(t, s, platform.KindAppCreate, "platform", "resource-preview-app", map[string]any{
+		"name": "previewresources", "environments": []map[string]any{
+			{"name": "production", "node": "local"}, {"name": "staging", "node": "local"},
+		},
+	})
+	for _, resource := range []struct{ env, name string }{
+		{"production", "changing"}, {"production", "degraded"}, {"production", "retained"}, {"staging", "other"},
+	} {
+		platformSubmit(t, s, platform.KindResourceApply, "resource/previewresources/"+resource.env+"/"+resource.name,
+			"resource-preview-"+resource.name, map[string]any{
+				"image": "postgres:17", "health": map[string]any{"type": "exec", "command": []string{"pg_isready"}},
+			})
+	}
+	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources SET state=CASE name
+		WHEN 'changing' THEN 'provisioning' WHEN 'degraded' THEN 'degraded'
+		WHEN 'retained' THEN 'destroyed' ELSE 'ready' END,
+		volumes=CASE WHEN name='retained' THEN '[{"name":"retained-data"}]'::jsonb ELSE volumes END
+		WHERE app_id=(SELECT id FROM eregion_platform_apps WHERE name='previewresources')`); err != nil {
+		t.Fatal(err)
+	}
+	factorCalls := 0
+	s.humanFactor = func(string) error { factorCalls++; return nil }
+	var beforeOps, afterOps int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations`).Scan(&beforeOps); err != nil {
+		t.Fatal(err)
+	}
+	env, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/previewresources/production", map[string]any{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"production/changing (state: provisioning)", "production/degraded (state: degraded)", "Default destroy retains named data volumes", "separate explicit choice"} {
+		if !deletionWarningContains(env.Warnings, fragment) {
+			t.Fatalf("missing %q in %v", fragment, env.Warnings)
+		}
+	}
+	if deletionWarningContains(env.Warnings, "production/retained") || deletionWarningContains(env.Warnings, "staging/other") {
+		t.Fatalf("wrong preview scope: %v", env.Warnings)
+	}
+	app, err := previewSubmission(t, s, platform.KindAppDelete, "app/previewresources", map[string]any{})
+	if err != nil || !deletionWarningContains(app.Warnings, "staging/other (state: ready)") {
+		t.Fatalf("application preview: %+v, %v", app, err)
+	}
+	encoded, err := json.Marshal(env)
+	if err != nil || !strings.Contains(string(encoded), "production/changing (state: provisioning)") {
+		t.Fatalf("JSON preview: %s, %v", encoded, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations`).Scan(&afterOps); err != nil {
+		t.Fatal(err)
+	}
+	if beforeOps != afterOps || factorCalls != 0 {
+		t.Fatalf("preview changed operations or requested factor: %d -> %d, factor calls %d", beforeOps, afterOps, factorCalls)
+	}
+	var retained string
+	if err := pool.QueryRow(ctx, `SELECT volumes::text FROM eregion_platform_resources WHERE name='retained'`).Scan(&retained); err != nil || !strings.Contains(retained, "retained-data") {
+		t.Fatalf("preview changed retained data ledger: %s, %v", retained, err)
+	}
+	submission := platformSubmission(platform.KindEnvironmentDelete, "env/previewresources/production", "resource-preview-refused", map[string]any{"confirm": "previewresources/production"})
+	submission.HumanFactor = "test"
+	if _, err := s.Submit(ctx, submission); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("live resource admission: %v", err)
+	}
+	appSubmission := platformSubmission(platform.KindAppDelete, "app/previewresources", "resource-preview-app-refused", map[string]any{"confirm": "previewresources"})
+	appSubmission.HumanFactor = "test"
+	if _, err := s.Submit(ctx, appSubmission); err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("app resource admission: %v", err)
+	}
+
+	// Preview sees the committed destroyed state while a transaction holds the
+	// app lock and changes it back. Admission waits for that lock and rechecks.
+	if _, err := pool.Exec(ctx, `UPDATE eregion_platform_resources SET state='destroyed' WHERE app_id=(SELECT id FROM eregion_platform_apps WHERE name='previewresources')`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rollback(tx)
+	if _, err := tx.Exec(ctx, `SELECT id FROM eregion_platform_apps WHERE name='previewresources' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_resources SET state='degraded' WHERE name='changing'`); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/previewresources/production", map[string]any{})
+	if err != nil || deletionWarningContains(preview.Warnings, "Deletion blocked by resource") {
+		t.Fatalf("committed snapshot preview: %+v, %v", preview, err)
+	}
+	result := make(chan error, 1)
+	submission = platformSubmission(platform.KindEnvironmentDelete, "env/previewresources/production", "resource-preview-race", map[string]any{"confirm": "previewresources/production"})
+	submission.HumanFactor = "test"
+	go func() { _, err := s.Submit(ctx, submission); result <- err }()
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	waitPointerLockWaiter(t, waitCtx, pool, "FROM eregion_platform_apps WHERE name=$1 FOR UPDATE")
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err == nil || contract.Classify(err).Code != contract.PreconditionFailed {
+		t.Fatalf("admission did not recheck changed resource: %v", err)
+	}
 }
 
 // TestIntegrationDeletionPreviewScopesTargetCountsAndWarnsOnlyForTheLastEnvironment

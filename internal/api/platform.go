@@ -33,9 +33,6 @@ func (s *Server) submitPlatformAction(r *http.Request, raw []byte) (any, int, er
 	if err := decoder.Decode(&request); err != nil || decoder.Decode(new(any)) != io.EOF {
 		return nil, 0, contract.NewFault(contract.ValidationFailed, "invalid operation request", "Provide kind, target, input, and optional dry_run; identity comes from authentication.")
 	}
-	if request.Kind == platform.KindDiagnosticExecution {
-		return nil, 0, contract.NewFault(contract.ValidationFailed, "diagnostic execution is not available over HTTP", "Use the authenticated operator SSH diagnostic execution flow when available.")
-	}
 	normalized, err := NormalizeAction(request.Kind, request.Target, request.Input)
 	if err != nil {
 		return nil, 0, err

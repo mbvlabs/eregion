@@ -5,6 +5,242 @@ Acceptance checks for the v1 alpha/beta line and the record of real-server runs.
 tracks execution. This file says what must work on a real server and what has
 been observed.
 
+## Beta.7 root-cause follow-up (2026-11-14, in progress)
+
+### Operation evidence contract — source implementation (2026-11-14)
+
+The operator requested implementation of
+[operation evidence](../specs/operation-evidence.md), tracked in LABS-369.
+This request does not authorize a live installation or release. The operator
+explicitly authorized an isolated Docker PostgreSQL fixture for database-related
+tests in this session; that exception does not authorize Docker host-qualification
+harnesses or an existing database.
+
+Acceptance distinguishes retained original-execution evidence from current
+observations. Verify replacement, early port failure, release-command cleanup
+and cancellation; actual start/exit state; attempt-separated failure results;
+pinned-secret redaction across rotation and text sanitization; capture loss
+independent of pagination; and read-only diagnosis and terminal failure output.
+Process-metrics acceptance requires real request/attempt counters, distinct
+waiting outcomes, bounded labels and authenticated discovery of node, API and
+worker targets.
+
+Intermediate source checks passed the diagnosis, retry-result, running-API and
+capacity-wait integrations in normal and race modes against the isolated
+PostgreSQL 17.11 fixture. The River metrics integration initially failed because
+its second runtime omitted the required registry endpoint; after correcting that
+fixture setting, its targeted normal and race reruns passed. These checkpoints
+are not qualification of subsequent capture/result changes or a full-suite pass.
+Sanitized logs are retained in `.local/operation-evidence/`.
+
+**Integrated verification:** unpublished, dirty `dev/746c443139df` on Linux/amd64
+passed the normal and race PostgreSQL suites: **301 top-level passes and one
+expected crash-helper skip in each**, plus 196 subtest passes. Package durations
+were 286.227s and 349.295s; no race was reported. The recovery drill and executable
+lifecycle tests were explicitly excluded. The protected untracked CLI
+qualification test was not read or run.
+
+Earlier final-gate failures remain in the evidence directory. One optional
+domain-output snapshot referenced an obsolete column and was corrected to the
+existing ledger state. Three deletion fixtures simulated running work without
+claiming a positive attempt; strict result validation correctly rejected that
+invalid state. They now use the actual claim service, without weakening
+production validation.
+
+After test-only strengthening, all four multi-binding deletion cases passed
+again in normal and race modes. They now assert attempt-2 retry success, retained
+attempt-1 failure evidence, exact `not_found`, and preserved original cancellation.
+Production source was unchanged from the broad passing run. Final code/test
+manifest SHA256:
+`ca4b603aa7e4a29d492c8de9423d6d7ec4bcce5b33382036bab0aedcf6cba4e1`.
+
+The disposable PostgreSQL container and tmpfs data were removed after verifying
+zero leftover test databases. Disposable credential files were removed; sanitized
+evidence remains. Implementation worktrees were integrated and removed. No other
+container, Docker image, installed binary, live database, DNS or release changed.
+
+Linux static build, Darwin arm64 cross-build, scoped vet including production
+CLI files, formatting/diff checks and all 119 command contracts pass. The unsigned
+Linux candidate SHA256 is
+`1884b5039b22aa21433eaaf6924b0117a715b00b2d0ac316b2c4ad64891be25b`.
+Independent source reviews found no remaining blocking findings. These checks
+establish neither an installed-host result nor publication readiness.
+
+Fresh-host Docker rotation, SSH/WireGuard and actual installed-process scraping
+are **not run** by source verification. They require separate host authorization.
+
+**Superseding operator decision:** executable diagnostic containers were rejected.
+Remove that feature and the proposed database transcript extension; diagnostics
+must inspect actual build/deployment/container evidence. Preserve the decision to
+configure fresh-server Docker logging as `local` with bounded rotation, and keep
+the API/worker under systemd. Source removal and fresh-install logging setup are
+in progress; neither is host-qualified by the historical checks below.
+The abandoned transcript patch was archived as qualification evidence and its
+isolated worktree removed without changing the primary worktree.
+
+**Latest checkpoint:** the rootfix dev candidate is installed on TEST and operator
+with matching SHA256
+`95bdda662dbc929da1883a94649da613ae455fa1534a680b27599a99abb82c43`.
+Fresh diagnostic `op_979762fdab2af152d511925283050579` exited0 on attempt1 with
+verified cleanup. After separate approval of the fresh exact-record plan, DNS
+parent `op_5df32b4b31ec2038ab5f82b300b17855` succeeded on attempt1; the same record
+ID is now proxied and exact-owned, generation4 is applied, and a fresh provider
+plan has no changes. All five roots/health paths returned HTTPS200/TLS0 and the
+changed primary returned Cloudflare server/ray headers. No deployment was queued.
+The corrected main DNS selected normal/race runs pass9top-level tests/21subtests
+each; diagnostic logger runs pass2top-level tests/64subtests each.
+
+Doctor passed23/23 after installation, but the final11:20UTC observation returned
+22pass/1fail with drift.pending naming host-readiness-v1. The separate
+intermittent-readiness investigation remains open; public application success is
+not proof that this check passed.
+
+The proposed DB-only diagnostic-output feature is still isolated, unintegrated
+and undeployed. Its selected normal/race runs each have3top-level passes and1
+failure (invalid-UTF8 classification after JSON normalization); review also found
+a daemon-delivery status-marker defect. Implementation/deployment is paused for
+the operator's requested log-store plan review. Scope is diagnostic/operation
+logs, not ongoing application/container logs. The private test PostgreSQL fixture
+was fully stopped and removed. The earlier checkpoints below remain historical.
+
+Fresh read-only TEST status and doctor confirm the same workspace/node,
+schema21/River7, capacity1 and23passing checks; no running operation was present.
+The admin account already has systemd-journal access. A bounded, remotely
+projected Docker-daemon journal read for the latest failed diagnostic's exact
+start interval confirmed the static error
+`compression cannot be enabled when max file count is 1`.
+No raw logs or credentials were exposed. Docker29.1.3 source confirms the
+diagnostic local logger's default compression conflicts with max-file1;
+container creation can succeed before start initializes and rejects the logger.
+The correction disables compression for that one-file logger, not logging or
+sandbox protections. Implementation and fresh execution qualification are pending.
+The old operation retains its unknown outcome and verified cleanup.
+
+The operator approved explicit in-place proxy update and ownership transfer
+instead of delete/create for the previously reviewed DNS conflict. A proxied
+record's Auto TTL must be modeled in the approved transition. Source review and
+new private-PostgreSQL qualification are in progress; no new provider write or
+release has occurred. A fresh concrete plan is required before TEST execution.
+Detailed evidence: `.local/qualification/beta7-root-fixes-20261114/`.
+
+Selected real-PostgreSQL verification now passes all new proxy-transfer tests
+and both diagnostic logger service tests in normal and race modes, with no skips
+or race reports. The selected DNS suite is **not green**: the existing
+`TestIntegrationDefinitionDNSCleanupRecoveryIsReadOnly` deterministically returns
+nil rather than snoozing on attempt2 after an uncertain delete. Its normal,
+race and isolated failures are retained; correction and re-verification are
+pending. No source fix has yet been installed on TEST in this follow-up.
+
+## Beta.7 feedback correction (2026-11-13–14, unpublished source verified)
+
+Baseline source is master `746c443139df196dd9cd92ee06e69218f36d7c41`.
+Installed CLI/node remain beta.7, commit `d4ae67df6753`, on the authorized TEST
+workspace `dklasjdklasjkldas` / `ws_a9cd3df2adf18e34dbec55a4`, node main.
+Registry host identity, schema 21/21, River 7/7 and build capacity 1 match.
+Initial running/queued operation queries were empty.
+
+Fresh readback reports healthy serving Rails production/staging and Go
+production/staging/PR, with all serving replicas running. Independent roots and
+health paths for all five hostnames return HTTPS 200 with normal TLS verification.
+Rails production's managed DNS remains failed while direct DNS and serving work.
+The installed deletion previews still omit live resource blockers.
+
+Local correction work covers bounded diagnostic image decoding, safe numeric
+Cloudflare details, resource-aware deletion previews and narrowly audited
+release-command coordination. These are not yet host-qualified fixes. In
+particular, exact Docker inspection remains blocked by interactive sudo, so the
+diagnostic incident cause is not established. No identity rewrite or pull fallback
+is introduced.
+
+The existing integration recipes ran against an authorized private local
+PostgreSQL 18.6 instance. Normal and race each passed 258 top-level tests with
+one expected crash-helper skip and zero failures; race reported no data race.
+Package durations were 167.239 and 223.133 seconds. The source manifest remained
+unchanged across the runs. Earlier failed runs are retained: one expected-warning
+capitalization mismatch was corrected; two forced-drop cleanup failures required
+`pg_signal_backend` on the private non-superuser test role, not a product change.
+
+Independent stream and integrated reviews found no remaining blocking findings.
+Build, metadata (119 contracts), explicit-file formatting, diff checks, scoped
+control-plane/platform/integration/engine vet and example vet passed. Full
+repository vet/just check and CLI test compilation were skipped to preserve the
+protected untracked CLI qualification test.
+
+Unsigned dev candidate SHA256:
+`803750f8921e9f203fb3c01f59b5d1f1736549d7ca1eb8bb92e0de89cdf8a343`,
+commit `746c443139df`, dirty true. The code/test source aggregate was
+`bedc409219c1529fcc40b08f8ec6f7d6fcab2069ffb7560bd0ce08249c04caf8`.
+The candidate and independently reviewed observation/install scripts were staged
+in a private TEST-node directory and their checksums read back successfully.
+Fresh pre-install status retains the original workspace/host identity, schema,
+capacity and all five serving release/deployment pointers; no queued/running/
+cancelling operations were present.
+
+At the initial W07 handoff, installation was blocked on interactive sudo. The published
+node correctly refuses unsigned automatic uploads; that verification was not
+weakened. At that checkpoint no candidate binary replacement, provider write, live deployment
+overlap qualification, deletion or release publication has occurred. Exact-host
+diagnostic cause, sandbox execution, candidate delete dry-run, actual Cloudflare
+reconciliation and deployment/public regression qualification remain pending.
+
+The first human installer attempt stopped before service/binary changes because
+the qualification helper assumed jq was installed. A checksum-pinned private
+standalone jq1.8.2 was staged instead; no system package change. Read-only host,
+capacity and operation RPC projections, Docker paths, readiness command and
+individual service checks then passed.
+
+### Candidate 803750f8 host qualification (2026-11-14)
+
+The corrected installer succeeded. Independent readback confirmed the candidate
+SHA256 on the node, then the local operator was atomically replaced with identical
+bytes. Original operator/node rollback copies remain. Host convergence applied
+only API/worker revision stamps and readiness (19/22 steps skipped); doctor then
+passed 23/23. Schema, workspace/physical-host identity and capacity 1 were unchanged.
+
+| Stream | Fresh result |
+| --- | --- |
+| Image inspection | Docker29.1.3/API1.52 omitted Volumes/Cmd; the exact old template failed while full-object inspection found the matching local image. This confirms the original lookup mechanism, not a digest-format correction. |
+| Isolated execution | Two explicitly selected Rails/Go image diagnostics reached execution but failed with unknown outcome and verified cleanup. No OOM/timeout or command output. Launch cause and successful sandbox execution remain unqualified. |
+| Delete preview | Rails JSON app/environment and Go plain environment dry-runs name the ready resource blockers with retained-data guidance. No deletion or factor prompt. |
+| Capacity-1 overlap | Go staging and production both succeeded on attempt 1. Staging's release command completed in 2261ms while the other Pack was in Apply. Subsequent container creation retained exclusive waiting; no general contention-free claim. |
+| Rails/Inertia | Explicit feat/inertia-storefront staging deployment succeeded on attempt 1. Rails production and PR serving identities remained unchanged. |
+| Provider result | One explicitly approved exact-record replacement failed once with HTTP400/code81058; safe details reached child and parent. No subsequent old-record delete. A replacement-order/ownership decision is pending, not a blind retry. |
+
+All five environments report healthy, serving replicas run, and all five public
+roots/health paths and linked JS/CSS returned HTTPS200 with normal TLS
+verification. Go staging/production/PR retain the expected SSR heading.
+Fresh Go operations: op_7e391352e9373d4fd12e43d0dc1e5fde and
+op_c769b7add86a4467bd8a795af6e408bc. Rails staging:
+op_d44b8ab126ac6a523a7a38cb377d607a. DNS parent/child:
+op_21071689cfc9997eab26084b230b52d8 / op_09d1b4720ef82985f5f9dec902f810ad.
+
+A narrow durable diagnostic start/wait-evidence follow-up passed normal and race
+with 259 top-level passes and one expected skip each, without race reports.
+Later hint/framing-only deltas received focused normal/race verification; the
+latest selected two diagnostic service tests passed 62 result lines with no
+failures, skips or race reports. The full suite was not rerun after these narrow
+deltas; prior full results retain their exact source checkpoints.
+
+Current installed operator/node SHA256 is
+`65ca1399f4785c9c80b6d6f48ae260aecc41067a6d946dea09a022917095efc2`,
+still dev/746c443139df, dirty. Updates used the existing dev-node checksum
+installation path; published-release verification was not weakened.
+Latest explicit diagnostic op_6c167962f343251dc20a6b04c76d4c48 remains unknown,
+with an unclassified start error and verified cleanup. No cwd, UID, image identity
+or sandbox fallback was changed without cause evidence. Successful isolated
+execution remains blocked; do not replay an ambiguous prior diagnostic.
+
+Final host convergence changed only API/worker revision stamps and readiness;
+doctor passes23/23, capacity remains1, all five serving environments are healthy,
+and no queued/running/cancelling operations remain. The private follow-up test DB
+and temporary node upload/helper directory were removed. Original protected
+rollback binaries and sanitized local evidence remain. DNS replacement strategy
+approval is still pending in Plannotator, and no further provider writes occurred.
+No commit, push, tag or release was made; no blanket RC-readiness claim follows.
+
+Detailed sanitized evidence and transition procedure:
+`.local/planning/beta7-feedback-20261113/evidence/`.
+
 ## Beta.6 findings correction (2026-11-13, unpublished source verification)
 
 Execution started on `master` at
@@ -94,6 +330,12 @@ The normal and race integration recipes require a disposable database DSN.
 CI supplies its isolated PostgreSQL service; an ambient installation DSN is
 never an authorized substitute. Historical unit-test counts and shell-harness
 results below describe earlier candidates, not the current verification gate.
+
+The disposable role needs CREATEDB and permission to terminate fixture backends
+for `DROP DATABASE ... WITH (FORCE)`, including backends created under other test
+roles. The private local fixture uses a non-superuser role with
+`pg_signal_backend`; CI's isolated postgres role already has that authority.
+Grant these rights only inside the disposable test server.
 
 The local integration-only candidate adds database-backed assertions for
 Go-owned defaults, admission atomicity and invalid enum/data rejection across
@@ -187,7 +429,7 @@ this checklist; preserve existing databases, volumes, DNS, credentials and hooks
 | --- | --- |
 | Read-only diagnosis | Inspect an authorized failed and active operation. Verify recorded source/image identities, historical versus current settings, event continuation, and explicit missing evidence. The command must not upgrade a node, pull an image or change deployment state. No raw build environment values or secrets may appear. |
 | Candidate evidence | Observe only the recorded deployment's planned, correctly labelled containers with the exact pinned image. Missing identity or redaction context must withhold logs. Child stderr is observable only when forwarded to container logs. |
-| Isolated diagnostic execution | On a separately authorized disposable fixture, verify exact confirmation, historical image/node pinning, immutable image use without pulling, fixed sandbox limits, and a new operation distinct from the original. Verify cancellation, lost-response recovery and cleanup before terminalization; an ambiguous prior execution must never be rerun automatically. Command output is deliberately withheld. |
+| Read-only deployment diagnosis | Trace the actual operation, source/build, immutable image and deployment evidence. Read bounded redacted build/candidate history and report unavailable observations explicitly. Verify execution flags, RPC admission and temporary diagnostic-container steps are absent; inspection must not submit work or create containers. Preserve generic historical operation readability. |
 | TUI deployment history | Open active and terminal deployments, read their linked operation history, return to row details, open help/discovery overlays, and detach without cancellation. |
 | TOML automation | Export and reapply an enabled environment without rotating its webhook secret or changing other desired state. Verify omitted fields preserve automation, explicit disable retains the reference, and invalid or archived references refuse without mutation. On an authorized fixture, verify actual master push delivery and PR-branch isolation afterward. |
 | Definition boundaries | Inspection snapshots remain non-applicable with safe guidance. Ordinary domain bindings do not claim to reconstruct managed DNS/provider ownership. Bootstrap secrets and resources through their documented separate steps. |
@@ -420,12 +662,11 @@ the existing alpha node/database, or use of an ambient database, is implied.
   and the main app workflow on a separately authorized fresh server and dedicated
   control database. Do not carry alpha state forward as proof of fresh-install
   acceptance, and do not erase the existing alpha server or database.
-- **Before RC:** review replacement-VPS recovery documentation against the same
-  surviving control DB/external services. Inventory protected vault keys,
-  pinned node/transport identity, placement/in-flight work, exact artifacts,
-  routing and external-service prerequisites. State unsupported replacement
-  mechanisms and expendable local-volume policy explicitly. Documentation-only
-  is the agreed gate; no live rehearsal or backup product is implied.
+- **Recovery reference, not an RC gate (operator correction, 2026-11-14):**
+  replacement-VPS recovery guidance describes protected keys/identities,
+  placement/in-flight work, exact artifacts, routing, external-service
+  prerequisites and unsupported mechanisms. It does not establish working
+  recovery or imply a live rehearsal or backup product.
 - **Before final:** actual macOS install/upgrade acceptance remains required.
   A separate fresh-server final rehearsal remains an operator decision.
 

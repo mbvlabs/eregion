@@ -20,6 +20,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/processmetrics"
 )
 
 // ------------------------------------------------------------- acceptance
@@ -532,6 +533,8 @@ func buildSlotKey(nodeName string, slot int) int64 {
 // session advisory lease remains after the short admission transaction.
 func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, onWait func()) (func(), error) {
 	waited := false
+	endWait := func() {}
+	defer func() { endWait() }()
 	deadline := time.Now().Add(buildSlotWait)
 	limit := 0
 	for {
@@ -631,9 +634,12 @@ func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, onWait 
 			}, nil
 		}
 		conn.Release()
-		if !waited && onWait != nil {
+		if !waited {
 			waited = true
-			onWait()
+			endWait = processmetrics.BeginBuildCapacityWait(ctx)
+			if onWait != nil {
+				onWait()
+			}
 		}
 		if time.Now().After(deadline) {
 			return nil, placementViolation(ReasonBuildCapacity, nodeName, fmt.Sprintf("node %q has all %d build slots busy", nodeName, limit),

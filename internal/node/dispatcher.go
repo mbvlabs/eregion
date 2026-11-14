@@ -66,6 +66,9 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 	requestEngine := *d.engine
 	requestEngine.Secrets = registry
 	requestEngine.SecretValues = request.Secrets
+	if requestEngine.SecretValues == nil {
+		requestEngine.SecretValues = map[string]string{}
+	}
 	report := func(event engine.Event) {
 		if onEvent != nil {
 			onEvent(Event{Kind: event.Kind, Step: event.Step, ExecutionID: request.Execution.ExecutionID(), Message: registry.RedactPreservingLength(event.Message)})
@@ -131,6 +134,7 @@ func (d *Dispatcher) Call(ctx context.Context, request Request, onEvent func(Eve
 				InputsMismatch: errors.Is(err, engine.ErrInputsMismatch),
 				ErrorCode:      string(errorCode(err)),
 				Detail:         registry.Redact(err.Error()),
+				Result:         status.Result,
 			}, nil
 		}
 		return ResponseFromStatus(status), nil

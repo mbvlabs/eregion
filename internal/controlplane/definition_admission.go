@@ -146,6 +146,12 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 		if err != nil {
 			return zero, unavailable(err)
 		}
+		if err := tx.Commit(ctx); err != nil {
+			return zero, unavailable(err)
+		}
+		if err := s.populateActionResult(ctx, &op); err != nil {
+			return zero, err
+		}
 		return operations.SubmissionResult{Operation: op, Replay: true}, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {

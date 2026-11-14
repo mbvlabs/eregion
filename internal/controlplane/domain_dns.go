@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -130,7 +131,25 @@ func (s *Service) deleteDomainBindingRowOwned(ctx context.Context, id contract.O
 		if op.State == contract.Cancelling {
 			return errPlatformCancelled
 		}
-		return deleteDomainBindingRowTx(ctx, tx, app, environment, domain)
+		var data json.RawMessage
+		// Keep the original binding identity before the cascade. Failure to
+		// project evidence is isolated from the existing guarded deletion.
+		if nested, err := tx.Begin(ctx); err == nil {
+			if snapshot, err := domainRemovalActionDataTx(ctx, nested, app, environment, domain); err == nil {
+				if nested.Commit(ctx) == nil {
+					data = snapshot
+				}
+			} else {
+				_ = nested.Rollback(ctx)
+			}
+		}
+		if err := deleteDomainBindingRowTx(ctx, tx, app, environment, domain); err != nil {
+			return err
+		}
+		if len(data) != 0 {
+			s.tryDeletionOutputTx(ctx, tx, op, data)
+		}
+		return nil
 	})
 	if err != nil {
 		return err

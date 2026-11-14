@@ -61,8 +61,7 @@ belongs to this host but not to the new client. A conditional update rechecks
 the observed attempt and last `attempted_by` entry, so a job that changed owner
 after the scan is left alone. Jobs with attempts left move back to `available`;
 an exhausted job (`attempt >= max_attempts`) is discarded with `finalized_at`
-set and an error appended, and its operation is failed, except that isolated
-diagnostic execution records cleanup-only intent and requeues the same job. The job change and its
+set and an error appended, and its operation is failed. The job change and its
 operation events commit in one transaction; a recovery failure fails worker
 startup instead of silently dropping history. Jobs last attempted by another
 host are left to River. This recovers accepted work from a SIGKILLed
@@ -249,10 +248,14 @@ artifact admission instead reads the config digest from verified manifest
 metadata. Materialization, containers, retention and diagnostics consume the
 same field, so changing one producer alone is unsafe. Historical rows have no
 identity-format discriminator and must not be silently reinterpreted.
-Source research does not establish the reported diagnostic failure's cause.
-Exact allowlisted host/API/store/image observations are still required before
-the correction gate; no identity fallback, pull-enabled diagnostic or row
-rewrite is introduced by this work. The producer/consumer map and primary-source
+The separate host qualification confirmed a missing-field inspect-template
+failure, not an image-identity-format correction. A later isolated execution
+failure was independently traced to invalid Docker logging options; that
+executable-diagnostic feature has since been removed. Neither finding establishes
+an image-identity correction. Canonical manifest config identity still needs independent
+allowlisted observation before changing these producers/consumers. No identity
+fallback, pull-enabled diagnostic or row rewrite is introduced. The
+producer/consumer map and primary-source
 research are retained in the beta.6 correction evidence under W06.
 
 Repeated `--keep-file` values (TOML `source.buildpacks.keep_files`) map to
@@ -294,6 +297,20 @@ read validation activates no credential and is not repaired by repeated apply.
 An accepted credential proves read validation, not write permission, DNS
 reconciliation, valid TLS or public reachability. Missing workspace access must be fixed
 before entering the token.
+
+Cloudflare error diagnostics retain HTTP status and the existing permanent versus
+retryable category even when the bounded error body cannot be decoded. Only a
+validated numeric provider code and a static reviewed description can be added;
+arbitrary provider messages, echoed inputs and raw bodies are discarded. Definition
+parents accept only the canonical safe detail from failed DNS children. Permanent
+client rejections remain single-attempt failures, not a reason for blind retries.
+
+Application and environment deletion previews use the same non-destroyed resource
+query as submission admission. Attached and detached live resources block; preview
+warnings name each scoped resource and its state and explain the destroy lifecycle
+with volume retention. Destroyed resources follow the existing admission policy,
+including retained volumes. Preview is read-only and needs no human factor;
+submission still rechecks current resource state under its existing locks.
 
 The non-secret, installation-wide definition DNS policy is separate from that
 credential. Read it with `eregion dns status --provider cloudflare --json`. To configure
@@ -373,39 +390,24 @@ bin/eregion help app create --json
 | `metrics rotate --confirm <node>/metrics` | Generates a 256-bit password, saves it owner-only in the resolved workspace credential directory before the RPC, and sends only its bcrypt hash. Under the same node-local telemetry lock used by apply, the node renders and validates the loopback gateway Caddyfile, restarts only `eregion-telemetry.service`, and restores the previous Caddyfile on failure. Public Caddy and the worker's app fragment are never touched. A failed RPC restores the previous local credential. There is no generation compare-and-swap, pending file or recovery journal; a lost successful response can leave the local password stale until the next rotation. No password or hash appears in plain/JSON output, logs, events or journals. |
 | `ui` | Full-screen workspace over the same inventory and node-mode action service. Fleet details show one current node_exporter CPU sample plus current memory, filesystem, load and uptime facts through `metrics.show`; no history or request graph is invented. |
 | `operations list/get/follow/cancel` | Over node RPC the SSH-authenticated operator has server authority: an unfiltered list shows every operation on the node newest first (bounded by `--limit`), and snapshot/follow/cancel may open any operation, including CI tokens, the GitHub webhook and other operators' submissions. `--app`/`--environment` select the platform target and include the environment's `build/<id>` operations. State and limit filters apply. The public HTTP API remains strictly actor- and grant-scoped. |
-| `diagnose <operation-id> [--after CURSOR --limit N]` | Read-only diagnosis by default through the shared service and operator node RPC. It follows operation-owned build/deployment and exact release/build foreign keys, separates pinned historical and current desired revisions, projects typed build settings without raw build environment or Go flags, and pages retained redacted events with a cursor, count and byte bounds. Failed state and explicitly failed step observations are evidence, not an inferred cause. Where historical placement matches the current node, a local immutable-image-ID inspect projects bounded, allowlisted Buildpacks metadata; it never pulls or executes an image. Running candidate reads require exact planned names and ownership labels plus pinned secret redaction context; missing placement, image, or redaction context is explicit. Retained candidate diagnostics are event records; child stderr can appear only if forwarded to Docker. Report retrieval success does not mean the original operation succeeded. Node auto-upgrade is refused. Explicit `--execute --confirm <operation-id> [--dry-run] -- /absolute/executable args...` is a separate durable diagnostic as described below. |
+| `diagnose <operation-id> [--after CURSOR --limit N]` | Read-only diagnosis through the shared service and operator node RPC. It follows operation-owned build/deployment and exact release/build foreign keys, separates pinned historical and current desired revisions, projects typed build settings without raw build environment or Go flags, and pages retained redacted events with a cursor, count and byte bounds. Failed state and explicitly failed step observations are evidence, not an inferred cause. Where historical placement matches the current node, a local immutable-image-ID inspect projects bounded, allowlisted Buildpacks metadata; it never pulls or executes an image. Running candidate reads require exact planned names and ownership labels plus pinned secret redaction context; missing placement, image, or redaction context is explicit. Retained candidate diagnostics are event records; child stderr can appear only if forwarded to Docker. Report retrieval success does not mean the original operation succeeded. Node auto-upgrade is refused. There is no execution flag, diagnostic-container action or arbitrary-command path. |
 | `node serve`, `node worker`, `node migrate`, `node bootstrap …` | Hidden node-mode entry points on the Linux server. They are not part of the operator listing; systemd runs the services, bootstrap/apply converges the host, and `node migrate` applies explicit schema changes. `node rpc` and `node unlock-ssh` remain hidden node paths. The telemetry endpoint is a dedicated Caddy unit, not an eregion node service. |
 | `upgrade` (`--version`, `--channel`, `--dry-run`, `--yes`), `commands`, `help`, `guide agents`, `skill install`, `version` | `upgrade` replaces only the local CLI from a cosign-verified channel; it never touches a node. `guide agents` prints the embedded agent operating guide; `skill install` prompts for harnesses in a terminal or takes `--harness`, then writes the same text as `SKILL.md`. `commands` is discovery. |
 
-Isolated diagnostic execution is an explicit operator-SSH-only action. Exact
-original-operation confirmation is required even for a dry run; `--yes` never
-replaces it. It accepts a direct absolute executable and exact argv after `--`,
-without shell, launcher or resolver. Arguments are ordinary durable operation
-input and must not contain secrets. The original operation is unchanged; accepted
-work gets a new operation ID. JSON and non-terminal invocations return acceptance
-without waiting; an interactive terminal follows it, and `--output ndjson` streams
-the operation. A stable `--idempotency-key` recovers the same accepted operation.
-The read-only dry run neither executes nor checks local image availability.
-Only an original operation with a recorded deployment, immutable local image ID
-and historical revision on this node is supported; remote placement and image
-pull are refused.
+Diagnosis inspects existing evidence only. It never creates a diagnostic
+container, accepts an executable or submits another operation. Actual candidate
+log capture remains part of deployment failure/cleanup, and retained redacted
+events remain readable afterward. Historical operation rows and journals are not
+erased when removing the executable-diagnostic feature. No aliases, compatibility
+execution paths or replacement transcript store remain.
 
-The node primitive withholds all command output because an image may embed
-secrets outside the redaction registry; its bounded evidence is exit status, OOM
-and timeout/unknown state. Its Docker client uses a private, empty per-operation
-configuration directory rather than the host's Docker configuration. The container
-uses a read-only root, no network, an unprivileged UID, dropped capabilities and
-bounded CPU, memory, processes and runtime; no application runtime configuration
-or vault secrets are injected. A dedicated server-side admission method pins an operation's
-exact deployment, release image ID and historical revision node in the same
-transaction as its operation and River job. It refuses other-node placement;
-generic submission and HTTP refuse this kind. Its argv is ordinary operation
-history and must not contain secrets. The internal worker checks node status
-before dispatch, records durable cleanup-only intent on cancellation or an
-uncertain failure, and terminalizes only after owned-container cleanup is proven.
-Orphan and exhausted-job recovery requeue the same operation for cleanup.
-Unavailable cleanup remains nonterminal and retries indefinitely at 30-second
-intervals; this is pending work, not a claim of completion.
+Candidate observations distinguish collection time from Docker start and finish
+timestamps. Running and stopped candidates can be observed; existence or a
+default exit code does not prove execution. Historical capture is attempt-fenced
+and separate from current inspection. Missing pinned redaction context withholds
+affected log text, not safe lifecycle facts. Diagnosis resolves the original
+failure independently of the requested event page, so later capture events and
+pagination do not replace that failure or imply capture loss.
 
 External command event capture is bounded per invocation: up to 2 MiB of
 redacted, sanitized messages, with a live prefix and newest buffered tail. A
@@ -416,6 +418,15 @@ retention. A non-following `build logs` read returns at most 20,000 events;
 `partial` and the string `cursor` identify a continuation with `--after`.
 Pagination is distinct from capture loss. `--after` cannot be combined with
 follow or NDJSON.
+
+Ordinary command output remains live. Values containing control characters or
+line breaks require whole-retained-stream redaction, so those command streams
+are buffered until exit; interrupted persistence is reported as incomplete.
+Overflow that cannot be redacted safely is withheld with a loss notice, not
+published as an unsafe prefix. Docker tails can start inside a multiline secret,
+so affected tail text is withheld while lifecycle observations remain available.
+Private Docker output used to parse IDs and ports is separate from display text;
+redaction never rewrites authority-bearing identities or fixed result keys.
 
 All of MASTER section 5's app, environment, deployment and observation surface
 exists. The `platform` command group is deleted: `app`, `env` (including
@@ -472,7 +483,13 @@ Apply is a resumable sequence, not an atomic external transaction or rollback.
 
 Managed DNS creates missing records, preserves every matching external record
 without adoption, and executes replacements only from the approved record-specific
-plan. Per-change intent precedes provider requests; observed results permit safe
+plan. A unique same-host/type/address foreign proxy conflict can instead propose
+an explicitly approved same-ID update and ownership transfer. Its plan discloses
+future managed-cleanup authority and any required Auto TTL normalization.
+The provider PATCH changes only proxy state, ownership comment and, when
+normalization requires it, TTL; unrelated metadata is preserved. Ambiguous
+candidates are refused and unchanged matching external records stay unowned.
+Per-change intent precedes provider requests; observed results permit safe
 recovery from lost responses. CNAME replacement has an explicitly reported
 resolution gap. Cleanup deletes only approved exact-owned records and preserves
 external records, including when definition DNS policy is disabled. Parent and
@@ -493,9 +510,10 @@ unchanged desired bindings; authority, policy/credential revision and drift
 checks remain. Matching foreign records stay unowned, including alongside
 separately owned records.
 
-Provider failures expose fixed bounded categories and numeric HTTP status,
-never upstream messages/bodies, Cloudflare codes, Ray IDs, credential values,
-URL queries or raw transport errors. Known authorization/client rejection can
+Provider failures expose fixed bounded categories, numeric HTTP status and,
+when safely decoded, validated numeric Cloudflare codes with static descriptions;
+never upstream messages/bodies, Ray IDs, credential values, URL queries or raw
+transport errors. Known authorization/client rejection can
 stop retries; 408/429, provider unavailability and unknown transport outcomes
 retain retry/reconciliation semantics. A later read denial cannot turn an
 unresolved earlier write into a definite failure. Parent diagnosis reports
@@ -554,6 +572,20 @@ operation ID and state. Successful follows exit 0; remote cancellation exits
 130 with wording distinct from viewer detach. Guided create and followed deploys
 share these semantics; accepted-only submissions do not claim completion.
 
+Action-attempt results are append-only payloads in existing operation events,
+not a separate transcript table. Settlement shares the operation transaction
+and attempt fence; mutable step rows continue to serve effect reconciliation.
+Operation snapshots expose the latest retained result while event history keeps
+earlier attempts. Result identity, timing, stage, error, evidence availability
+and history references remain distinct from whether a log page has more data.
+Post-commit action observations feed process metrics without scrape-time queries.
+
+Release-command recovery does not interpret absent or stale node state after
+durable execution intent as permission to run migrations again. Ambiguous or
+retryable outcomes retain the original execution owner and cleanup fence until
+the existing recovery path establishes a terminal observation. Result retrieval
+never grants permission to dispatch a command.
+
 Every command that can follow an accepted operation (`deploy`, `rollback`,
 `restart`, `build stop/retry`, `build logs --follow`, `app create`,
 `env create`, `domain add/remove`, `process scale`, `operations follow`)
@@ -591,6 +623,24 @@ Database/service integration execution and the privileged SSH framing boundary
 remain separate qualification gates.
 
 ## Node-local telemetry
+
+### API and worker process measurements
+
+The long-lived API and River worker expose separate Prometheus registries on
+loopback: API `127.0.0.1:9102`, worker `127.0.0.1:9103`. Ephemeral operator node
+RPC invocations do not start an exporter. Process and Go-runtime collectors,
+bounded-class HTTP request observations, actual River work-function attempts and
+in-memory PostgreSQL pool statistics are producer measurements, not authoritative
+operation status. A returned worker outcome does not replace the durable
+operation result. Scrapes do not query PostgreSQL.
+
+The existing authenticated gateway adds exact `/metrics/api` and
+`/metrics/worker` HTTPS paths, alongside `/metrics/node` and discovery at
+`/metrics/targets.json`. Discovery advertises all three scrape targets on the
+configured public hostname; generated Prometheus and Alloy configurations retain
+authentication and normal TLS verification. Raw process listeners stay private.
+Exporter failure must not prevent API, worker or application work. Installed-host
+scraping and gateway activation require separate manual qualification.
 
 `metrics show` is a node-mode read over the normal operator channel: the CLI
 calls `metrics.show` in `eregion node rpc`, which runs on the node as root and
@@ -660,16 +710,18 @@ that preserves its existing hash. The unit uses isolated
 Caddyfile; public application routes in `/etc/caddy/eregion.d/*.caddy` remain
 worker-owned and are never touched by telemetry. A missing gateway credential,
 a stopped gateway or an absent wg0 cannot stop public ingress or applications:
-only the two exact telemetry paths fail with a bounded gateway error.
+only the exact telemetry paths fail with a bounded gateway error.
 
 The root `/etc/caddy/Caddyfile` is owned by `host-ingress-v3`. It imports the
 worker-owned application fragment and owns only the existing API allowlist plus
-two exact telemetry paths; there is no `/metrics/*` catch-all:
+four exact telemetry paths; there is no `/metrics/*` catch-all:
 
 - `/metrics/node` rewrites to the gateway's fixed `/node` path;
+- `/metrics/api` rewrites to the gateway's fixed `/api` path;
+- `/metrics/worker` rewrites to the gateway's fixed `/worker` path;
 - `/metrics/targets.json` rewrites to the gateway's fixed `/targets.json` path.
 
-Both proxy to `127.0.0.1:9101` with an explicit upstream `Host: 127.0.0.1:9101`
+All proxy to `127.0.0.1:9101` with an explicit upstream `Host: 127.0.0.1:9101`
 (Caddy otherwise preserves the public Host) and forward `Authorization` to the
 gateway. The gateway requires basic authentication, then strips
 `Authorization` and `Cookie` before the raw exporter. The exporter stays
@@ -683,15 +735,17 @@ WireGuard address. `host-telemetry-v2` removes only the exact legacy
 `ufw allow in on wg0 to 10.78.0.1 port 9101 proto tcp` rule when present; it
 creates no 9101 rule and never deletes a foreign rule. If ufw is unavailable,
 Check records the legacy rule as unobserved rather than failing the step. The
-gateway serves exactly two basic-auth paths:
+gateway serves exactly four basic-auth paths:
 
 - `/node` reverse-proxies `http://127.0.0.1:9100/metrics`, rewrites the path to
   `/metrics`, and strips the scraper's `Authorization` and `Cookie` headers
   before the loopback request;
-- `/targets.json` serves the node's HTTP service-discovery document, one target
+- `/api` and `/worker` reverse-proxy the corresponding loopback process
+  exporter's `/metrics`, stripping scraper credentials as for `/node`;
+- `/targets.json` serves the node's HTTP service-discovery document, three targets
   naming the main public hostname on port 443 with
-  `__metrics_path__: /metrics/node`, `__scheme__: https`, `eregion_node`,
-  `eregion_component: node`, `eregion_access: public_https` and
+  `__scheme__: https`, `eregion_node`, the appropriate `__metrics_path__` and
+  `eregion_component`, `eregion_access: public_https` and
   `eregion_public: true`.
 
 The gateway Caddyfile (`root:caddy 0640`) carries only the basic-auth username
@@ -1518,8 +1572,9 @@ readiness, serving HTTPS and secret-match markers. Stop where a required
 replacement/identity/placement mechanism is unsupported. Do not substitute SQL
 edits, forged journals, ad-hoc repair commands or assumed successful operations.
 
-Before RC this inventory, procedure and unsupported-gap disclosure must be
-reviewed. A live replacement-VPS rehearsal is **not required** by the current
+This inventory, procedure and unsupported-gap disclosure are reference guidance,
+not an RC gate (operator correction, 2026-11-14).
+A live replacement-VPS rehearsal is **not required** by the current
 release policy and has not been established by documenting these steps. There
 is no scheduled backup/volume-backup product or recovery-time/data-loss guarantee.
 
@@ -1856,12 +1911,13 @@ shared mode. All unclassified effects retain exclusive host fencing.
 
 | Effect | Host fence | Additional exclusive resources |
 | --- | --- | --- |
-| Exact Pack `platform-pack-02-v1` | Shared for Check/Apply | Validated build/launch cache identities |
+| Exact Pack `platform-pack-02-v1` | Shared for Check/Apply | Output image reference and validated build/launch cache identities |
 | Exact deployment network ensure `platform-network-01-v1` | Shared for Check/Apply | Exact environment network identity |
+| Release command | Shared for Check/Apply | Validated container name, image reference and environment network |
 | Host, route/container, registry removal/GC and retention effects | Exclusive | Existing targeted fences |
 | Existing narrow build-stop/diagnostic opt-outs | Existing independent mode | Existing private/effect fences |
 
-Order is effect lock → host fence → sorted, deduplicated physical resource
+Order is effect lock → host fence → sorted, deduplicated resource
 identities; release unwinds in reverse. Resource lock paths use hashed identities
 beneath engine state. Contention defers before Check/Apply rather than consuming
 a failure attempt. Shared mode never upgrades in place. Different cache writers
@@ -1869,6 +1925,21 @@ may overlap; the same cache or network serializes. Exclusive effects can still
 wait behind builds: this does not promise fairness or lock-free deployment
 completion. Upload/removal/GC host fences remain independent of PostgreSQL
 advisory-session lifetime.
+
+Release commands may progress while an unrelated Pack effect holds its shared
+fence. Container-name fencing is required even across environments: assembled
+names can be truncated to the same Docker name. These resource keys do not
+establish equivalence between different image aliases. Safety relies on immutable
+no-pull release use and ownership-scoped Pack transient cleanup. Per-environment
+target locks and durable deployment/release-command ownership remain unchanged.
+Exclusive preflight, materialization and candidate-container steps can still
+wait; the change is not a general scheduling/fairness guarantee.
+
+The host fence applies to classified engine effects, not every external writer:
+ingress retains its own database/file locks and node binary replacement is outside
+this overlap qualification. Existing release-command timeout removal does not
+prove removal when Docker reports an error; narrowing the fence does not repair
+that pre-existing cleanup uncertainty.
 
 Registry-GC maintenance opportunistically sweeps only exact completed Pack
 attempt networks. With exclusive host fencing it tries the corresponding effect

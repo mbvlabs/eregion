@@ -25,6 +25,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/output"
+	"github.com/mbvlabs/eregion/internal/processmetrics"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/transport"
 	"github.com/spf13/cobra"
@@ -141,7 +142,10 @@ func (a *app) runtimeSpecs() []spec {
 					return result{}, err
 				}
 				raw, err := client.Get(cmd.Context(), contract.OperationID(args[0]))
-				return apiResult(raw), err
+				if err != nil {
+					return result{}, err
+				}
+				return operationResult(raw)
 			}},
 			{use: "cancel <operation_id>", meta: cancelMeta, args: oneID, run: func(cmd *cobra.Command, args []string) (result, error) {
 				client, err := a.client(cmd)
@@ -149,7 +153,10 @@ func (a *app) runtimeSpecs() []spec {
 					return result{}, err
 				}
 				raw, err := client.Cancel(cmd.Context(), contract.OperationID(args[0]))
-				return apiResult(raw), err
+				if err != nil {
+					return result{}, err
+				}
+				return operationResult(raw)
 			}},
 		}},
 	}
@@ -169,6 +176,16 @@ func apiResult(raw json.RawMessage) result {
 	var pretty bytes.Buffer
 	_ = json.Indent(&pretty, raw, "", "  ")
 	return result{data: raw, plain: pretty.String()}
+}
+
+func operationResult(raw json.RawMessage) (result, error) {
+	var op contract.Operation
+	if err := json.Unmarshal(raw, &op); err != nil {
+		return result{}, err
+	}
+	var pretty bytes.Buffer
+	_ = json.Indent(&pretty, raw, "", "  ")
+	return result{data: op, plain: pretty.String()}, nil
 }
 
 func (a *app) client(cmd *cobra.Command) (Backend, error) {
@@ -337,6 +354,7 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime
 	}
 	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
+		Metrics:              processmetrics.New(pool),
 		Vault:                parts.Vault,
 		RegistryEndpoint:     registryEndpoint,
 		RegistryHostIdentity: registryHostIdentity,
@@ -530,6 +548,7 @@ func (a *app) worker(cmd *cobra.Command, _ []string) (result, error) {
 	}
 	defer pool.Close()
 	defer closeTransport()
+	defer run.Metrics.Start(processmetrics.WorkerAddress, a.logger(cmd))()
 	if err := run.Jobs.Start(cmd.Context()); err != nil {
 		return result{}, err
 	}
@@ -577,6 +596,11 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	defer pool.Close()
 	// Deferred before the worker stop below, so it runs after it.
 	defer closeTransport()
+	apiMetrics := processmetrics.New(pool)
+	defer apiMetrics.Start(processmetrics.APIAddress, a.logger(cmd))()
+	if withWorkers {
+		defer run.Metrics.Start(processmetrics.WorkerAddress, a.logger(cmd))()
+	}
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return result{}, contract.NewFault(contract.Unavailable, "could not bind API listener", "Check --listen and whether the port is available.")
@@ -604,7 +628,7 @@ func (a *app) serve(cmd *cobra.Command, _ []string) (res result, serveErr error)
 	if err != nil {
 		return result{}, err
 	}
-	server := &http.Server{Handler: handler, TLSConfig: tlsConfig, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 8192}
+	server := &http.Server{Handler: api.Instrument(handler, apiMetrics), TLSConfig: tlsConfig, ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 8192}
 	logger.Info("API listener bound", "address", listener.Addr().String(), "workers", withWorkers)
 	done := make(chan error, 1)
 	go func() {

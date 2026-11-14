@@ -44,12 +44,19 @@ sketches as the design reference; `docs/workspace.md` describes current views.
   journals or ordinary output. Handoff/export are explicit protected exceptions.
 - A submission is accepted, not completed. A domain binding is desired state,
   not proof of an applied route, valid TLS or a reachable application.
+- Diagnostics are read-only views of real build/deployment/container evidence.
+  Remove executable diagnostic containers; do not add a replacement arbitrary
+  execution mechanism or a transcript store for them.
+- Fresh-server Docker logging defaults to `local`, with bounded rotation
+  (`max-size=20m`, `max-file=5`, compression enabled), not unrotated `json-file`.
+  Keep the API/worker under systemd. No container migration or compatibility
+  work is required before v1.
 - Do not add fleet/HA/backup scope to evade finishing the alpha app workflow.
   Durable application data belongs in external services under the current
   recovery policy; managed local volumes are expendable, never implicitly backed
-  up by the control database. Before RC, document replacement-VPS recovery
-  prerequisites and unsupported gaps. No backup product or live recovery
-  rehearsal is implied by that documentation gate.
+  up by the control database. Replacement-VPS recovery documentation is not an
+  RC gate (operator correction, 2026-11-14). No backup product or live recovery
+  rehearsal is implied.
 - Release model (MASTER D14): `master` is edge, `1.x` is the v1 line, alphas are
   `v1.0.0-alpha.N`. Never cut a branch or push a tag without the user.
 

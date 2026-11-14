@@ -295,7 +295,16 @@ func (w *platformWorker) recoverReleaseCommandRun(ctx context.Context, releaseID
 		if err != nil {
 			return 0, releaseCommandRecoveryDeferredFault(nodeName, err)
 		}
-		outcome = releaseCommandRecoveryOutcome(record, has, response.Status, response.InputsHash)
+		// A failed retryable task is not evidence that the command did not run.
+		// In particular, the node can disappear after removing the command
+		// container but before recording the effect. Keep the original owner.
+		if response.Status == engine.StatusFailed && response.Retryable {
+			outcome = releaseCommandRecoveryDeferred
+		} else if !releaseCommandObservedIdentity(run.OperationID, record, response) {
+			outcome = releaseCommandRecoveryDeferred
+		} else {
+			outcome = releaseCommandRecoveryOutcome(record, has, response.Status, response.InputsHash)
+		}
 	}
 	switch outcome {
 	case releaseCommandRecoverySucceeded:
@@ -326,6 +335,17 @@ func (w *platformWorker) recoverReleaseCommandRun(ctx context.Context, releaseID
 			"the original release command outcome is still unknown",
 			"Keep the release command owned by the original operation and retry after the node is reachable and the command is no longer running.")
 	}
+}
+
+// The execution ID itself binds the operation, attempt and step. If the node
+// additionally reports an attempt, it must agree with that same identity.
+func releaseCommandObservedIdentity(id contract.OperationID, record StepRecord, response node.Response) bool {
+	if record.Attempt == 0 {
+		return false
+	}
+	expected := (engine.Execution{OperationID: id, Attempt: record.Attempt, Step: deploymentCommandStep}).ExecutionID()
+	return !response.InputsMismatch && record.ExecutionID == expected && response.ExecutionID == expected &&
+		(response.Attempt == 0 || response.Attempt == record.Attempt)
 }
 
 func releaseCommandRecoveryDeferredFault(nodeName string, cause error) error {

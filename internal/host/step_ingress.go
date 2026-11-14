@@ -133,12 +133,14 @@ import %s/*.caddy
 	handle @api {
 		reverse_proxy %s
 	}
-%s%s	handle {
+%s%s%s%s	handle {
 		respond 404
 	}
 }
 `, routesDir, s.cfg.Hostname, strings.Join(PublicAPIPaths, " "), s.cfg.APIListen,
 		telemetryProxyBlock(telemetry.MetricsPath, telemetry.GatewayMetricsPath),
+		telemetryProxyBlock(telemetry.APIMetricsPath, telemetry.GatewayAPIMetricsPath),
+		telemetryProxyBlock(telemetry.WorkerMetricsPath, telemetry.GatewayWorkerMetricsPath),
 		telemetryProxyBlock(telemetry.DiscoveryPath, telemetry.GatewayDiscoveryPath)))
 }
 
@@ -377,7 +379,7 @@ func (s *ingressStep) ensureIngressLock() error {
 // /metrics proxy.
 func PublicAPIAndTelemetryPaths() []string {
 	paths := append([]string(nil), PublicAPIPaths...)
-	return append(paths, telemetry.MetricsPath, telemetry.DiscoveryPath)
+	return append(paths, telemetry.MetricsPath, telemetry.APIMetricsPath, telemetry.WorkerMetricsPath, telemetry.DiscoveryPath)
 }
 
 func (s *ingressStep) restoreRootCaddyfile(ctx context.Context, previous []byte, mode os.FileMode, existed bool, report engine.Reporter) error {

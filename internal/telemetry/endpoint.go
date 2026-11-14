@@ -259,17 +259,16 @@ func TargetsJSON(node, hostname string) ([]byte, error) {
 	if _, _, err := net.SplitHostPort(target); err != nil {
 		return nil, fmt.Errorf("invalid telemetry target hostname: %w", err)
 	}
-	out := []discoveryTarget{{
-		Targets: []string{target},
-		Labels: map[string]string{
-			"__metrics_path__":  MetricsPath,
-			"__scheme__":        "https",
-			"eregion_node":      node,
-			"eregion_component": "node",
-			"eregion_access":    "public_https",
-			"eregion_public":    "true",
-		},
-	}}
+	var out []discoveryTarget
+	for _, component := range []struct{ name, path string }{
+		{"node", MetricsPath}, {"api", APIMetricsPath}, {"worker", WorkerMetricsPath},
+	} {
+		out = append(out, discoveryTarget{Targets: []string{target}, Labels: map[string]string{
+			"__metrics_path__": component.path, "__scheme__": "https",
+			"eregion_node": node, "eregion_component": component.name,
+			"eregion_access": "public_https", "eregion_public": "true",
+		}})
+	}
 	raw, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
 		return nil, err

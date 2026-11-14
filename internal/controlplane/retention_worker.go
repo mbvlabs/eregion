@@ -168,6 +168,13 @@ func (s *Service) settleRetentionFailure(ctx context.Context, op contract.Operat
 		code == contract.ValidationFailed || code == contract.PreconditionFailed ||
 		code == contract.NotFound || code == contract.Forbidden || code == contract.Conflict
 	if !permanent && job.Attempt < job.MaxAttempts {
+		message := "retention attempt did not complete"
+		if text := s.cleanupCauseText(cause); text != "" {
+			message += ": " + text
+		}
+		if err := s.recordRetryResult(context.WithoutCancel(ctx), op.ID, attempt, code, message); err != nil {
+			return err
+		}
 		return cause
 	}
 	if code == contract.Internal || code == "" {

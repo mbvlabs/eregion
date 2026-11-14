@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -82,11 +83,6 @@ func (w *platformWorker) Work(ctx context.Context, job *river.Job[platformArgs])
 	}
 	if op.Kind == platform.KindDefinitionApply {
 		return w.runDefinitionApply(ctx, op, attempt)
-	}
-	// Diagnostic execution has its own cleanup-first lifecycle. It must bypass
-	// generic cancellation, settlement and target normalization entirely.
-	if op.Kind == platform.KindDiagnosticExecution {
-		return w.runDiagnosticExecution(ctx, op, raw, attempt)
 	}
 	if op.State == contract.Cancelling {
 		if op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove {
@@ -305,6 +301,9 @@ func (w *platformWorker) settle(ctx context.Context, id contract.OperationID, at
 	}
 	switch fault.Code {
 	case contract.Unavailable:
+		if recordErr := w.service.recordRetryResult(ctx, id, attempt, fault.Code, fault.Message); recordErr != nil {
+			return recordErr
+		}
 		return err
 	case contract.Cancelled:
 		return w.service.cancelPlatform(ctx, id, attempt, fault.Message)
@@ -314,6 +313,9 @@ func (w *platformWorker) settle(ctx context.Context, id contract.OperationID, at
 		}
 		return nil
 	default:
+		if recordErr := w.service.recordRetryResult(ctx, id, attempt, fault.Code, fault.Message); recordErr != nil {
+			return recordErr
+		}
 		return err
 	}
 }
@@ -557,12 +559,9 @@ func (w *platformWorker) runExtension(ctx context.Context, id contract.Operation
 		OperationID: id, Attempt: attempt, Kind: normalized.Kind, Target: normalized.Target.String(),
 		Actor: op.Actor, Input: normalized.Canonical,
 		Report: func(event platform.Event) {
-			message := strings.TrimSpace(event.Message)
+			message := w.service.resultText(strings.TrimSpace(event.Message))
 			if message == "" {
 				return
-			}
-			if len(message) > 4096 {
-				message = message[:4096]
 			}
 			kind := "log"
 			if event.Level == "warning" {
@@ -576,26 +575,57 @@ func (w *platformWorker) runExtension(ctx context.Context, id contract.Operation
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	message := strings.TrimSpace(result.Message)
+	message := w.service.resultText(strings.TrimSpace(result.Message))
 	if message == "" {
 		message = normalized.Summary + " completed."
 	}
-	if len(message) > 4096 {
-		message = message[:4096]
-	}
 	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+		op.PendingResult = &contract.ActionResult{Message: w.service.resultText(message)}
+		if result.Data != nil {
+			raw, marshalErr := json.Marshal(result.Data)
+			switch {
+			case marshalErr != nil:
+				op.PendingResult.DataStatus = "omitted_unserializable"
+			// The existing worker event text cap is 4096 bytes. Extension
+			// payloads use the same bound and report omission explicitly.
+			case len(raw) > 4096:
+				op.PendingResult.DataStatus = "omitted_too_large"
+			default:
+				var decoded any
+				decoder := json.NewDecoder(bytes.NewReader(raw))
+				decoder.UseNumber()
+				if decoder.Decode(&decoded) == nil {
+					preserve := trustedIntegrationFields(*op, normalized, executor, decoded)
+					clean, omitted := w.service.sanitizeResultData(decoded, preserve)
+					if omitted > 0 {
+						if object, ok := clean.(map[string]any); ok {
+							if _, exists := object["redaction_omissions"]; exists {
+								// Reserve the marker rather than trusting a
+								// plugin-supplied count.
+								omitted++
+							}
+							object["redaction_omissions"] = omitted
+						}
+					}
+					redacted, err := json.Marshal(clean)
+					if err == nil && len(redacted) <= 4096 {
+						op.PendingResult.Data = redacted
+						op.PendingResult.DataStatus = "available"
+						if omitted > 0 {
+							op.PendingResult.DataStatus = "partial"
+						}
+					} else {
+						op.PendingResult.DataStatus = "omitted_too_large"
+					}
+				} else {
+					op.PendingResult.DataStatus = "omitted_unserializable"
+				}
+			}
+		}
 		return nil
 	}); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	// finishPlatformOperation appends a generic success event; record the
-	// executor's redacted summary as a separate observation.
-	_, _, _ = w.service.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, current *contract.Operation) error {
-		if current.State.Terminal() {
-			return nil
-		}
-		return appendEvent(ctx, tx, current, contract.Event{Kind: "log", Message: message})
-	})
 	return nil
 }
 
@@ -649,6 +679,9 @@ func (s *Service) finishPlatformOperation(ctx context.Context, id contract.Opera
 		if err := apply(tx, op); err != nil {
 			return err
 		}
+		if err := s.appendActionResultTx(ctx, tx, op, contract.Succeeded, "", "Platform action succeeded.", true); err != nil {
+			return err
+		}
 		return transition(ctx, tx, op, contract.Succeeded, "", "Platform action succeeded; domain state and history are durable.")
 	})
 	if err != nil {
@@ -677,9 +710,7 @@ func (s *Service) failPlatformOperation(ctx context.Context, id contract.Operati
 // already-locked operation. Callers that must commit another change with the
 // failure history, such as worker recovery, run it inside their own transaction.
 func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, code contract.Code, message string) error {
-	if len(message) > 4096 {
-		message = message[:4096]
-	}
+	message = s.resultText(message)
 	if op.State.Terminal() {
 		return nil
 	}
@@ -731,6 +762,9 @@ func (s *Service) failPlatformOperationTx(ctx context.Context, tx pgx.Tx, op *co
 	if err := releaseRestoredDeploymentOwnerTx(ctx, tx, op.ID); err != nil {
 		return err
 	}
+	if err := s.appendActionResultTx(ctx, tx, op, contract.Failed, code, message, true); err != nil {
+		return err
+	}
 	return transition(ctx, tx, op, contract.Failed, code, message)
 }
 
@@ -742,6 +776,7 @@ func servingSuffix(releaseID string) string {
 }
 
 func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, attempt uint32, message string) error {
+	message = s.resultText(message)
 	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
@@ -786,6 +821,9 @@ func (s *Service) cancelPlatform(ctx context.Context, id contract.OperationID, a
 			return err
 		}
 		if err := releaseRestoredDeploymentOwnerTx(ctx, tx, id); err != nil {
+			return err
+		}
+		if err := s.appendActionResultTx(ctx, tx, op, contract.Canceled, contract.Cancelled, message, true); err != nil {
 			return err
 		}
 		return transition(ctx, tx, op, contract.Canceled, "", message)
@@ -1257,8 +1295,7 @@ func (l nodeEffectLoop) wait(ctx context.Context, delay time.Duration) error {
 // must still reach the node. Cancellation stops forward work, never the
 // removal step that makes a failed or cancelled deployment safe.
 func nodeEffectCancellationExempt(stepID string) bool {
-	return stepID == platform.DiagnosticCleanupStep ||
-		strings.HasPrefix(stepID, deploymentCleanupStepPrefix)
+	return strings.HasPrefix(stepID, deploymentCleanupStepPrefix)
 }
 
 // runStep mirrors the diagnostic worker's durable effect protocol for a generic
@@ -1326,6 +1363,22 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 		}
 		return nil
 	}
+	// A release command is not idempotent. Its container may already have
+	// been removed after execution but before the node effect was committed.
+	// No stale, absent-after-intent, or prior retryable failure proves it did
+	// not run, including when cancellation arrives during recovery.
+	releaseOutcomeGuard := func(response node.Response) error {
+		if stepID != deploymentCommandStep {
+			return nil
+		}
+		if response.Status == engine.StatusStale ||
+			(response.Status == engine.StatusAbsent && rowExists) ||
+			(response.Status == engine.StatusFailed && response.Retryable &&
+				(response.Attempt == 0 || response.Attempt < attempt)) {
+			return fmt.Errorf("%w: release command execution cannot be proven absent; inspect the original node journal before any further execution", errNodeEffectOutcomeUnknown)
+		}
+		return nil
+	}
 
 	status := func(ctx context.Context) (node.Response, error) {
 		response, err := tr.Call(ctx, node.Request{Method: node.MethodStatus, RequestID: exec.RequestID, Execution: exec}, nil)
@@ -1346,6 +1399,12 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 		}
 		if stepID == deploymentCommandStep && response.InputsHash == "" && (response.Status == engine.StatusCompleted || response.Status == engine.StatusFailed) {
 			return node.Response{}, contract.NewFault(contract.Unavailable, "release command status has no effect evidence", "Recover the original node effect before rerunning the release command.")
+		}
+		if err := w.service.retainNodeResponse(ctx, exec, response); err != nil {
+			return node.Response{}, err
+		}
+		if err := releaseOutcomeGuard(response); err != nil {
+			return node.Response{}, err
 		}
 		return response, nil
 	}
@@ -1374,6 +1433,12 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 		}
 		if stepID == deploymentCommandStep && response.InputsHash == "" {
 			return node.Response{}, contract.NewFault(contract.Unavailable, "release command response has no effect evidence", "Recover the original node effect before rerunning the release command.")
+		}
+		if err := w.service.retainNodeResponse(ctx, exec, response); err != nil {
+			return node.Response{}, err
+		}
+		if err := releaseOutcomeGuard(response); err != nil {
+			return node.Response{}, err
 		}
 		return response, nil
 	}
@@ -1481,9 +1546,6 @@ func (w *platformWorker) runStepOn(ctx context.Context, tr node.Transport, id co
 func (s *Service) reconcilePlatformOperation(ctx context.Context, op contract.Operation) error {
 	if op.Kind == platform.KindDefinitionApply {
 		return s.requeueDefinitionDrain(ctx, op.ID)
-	}
-	if op.Kind == platform.KindDiagnosticExecution {
-		return s.requeueDiagnosticCleanup(ctx, op.ID)
 	}
 	if op.Kind == platform.KindDomainAdd || op.Kind == platform.KindDomainRemove {
 		if handled, err := s.requeueDefinitionDNSRecovery(ctx, op.ID); handled || err != nil {
@@ -1793,6 +1855,11 @@ func (s *Service) deploymentNodeEffectOutstanding(ctx context.Context, dep platf
 		return true, err
 	}
 	if nodeName == "" {
+		for _, record := range outstanding {
+			if record.Step == deploymentCommandStep {
+				return true, nil
+			}
+		}
 		return false, nil
 	}
 	if s.resolver == nil {
@@ -1818,6 +1885,27 @@ func (s *Service) deploymentNodeEffectOutstanding(ctx context.Context, dep platf
 			return true, contract.NewFault(contract.PreconditionFailed,
 				"node effect has different inputs during cancellation recovery",
 				"Do not discard an effect recorded under other inputs; inspect the node journal.")
+		}
+		if response.Status == engine.StatusFailed {
+			// Evidence collection is best effort and cannot veto safe cleanup.
+			// The helper validates the original execution and current write fence.
+			current := engine.Execution{OperationID: id, Attempt: attempt, Step: record.Step}
+			_ = s.retainNodeResponse(ctx, current, response)
+		}
+		if record.Step == deploymentCommandStep {
+			switch response.Status {
+			case engine.StatusAbsent, engine.StatusStale:
+				// Intent is durable but the command's completion isn't. Its
+				// container may have run and disappeared before acknowledgement.
+				return true, nil
+			case engine.StatusFailed, engine.StatusCompleted:
+				// A terminal task is usable only when it names this exact
+				// execution and inputs. A retryable failure is still unknown.
+				if response.InputsHash == "" || !releaseCommandObservedIdentity(id, record, response) ||
+					(response.Status == engine.StatusFailed && response.Retryable) {
+					return true, nil
+				}
+			}
 		}
 		switch response.Status {
 		case engine.StatusCompleted:
@@ -2051,7 +2139,7 @@ func (s *Service) recoverOwnedDeployment(ctx context.Context, op contract.Operat
 
 	if !evidence && owner.Phase == deploymentOwnerPrepared {
 		if op.State == contract.Cancelling {
-			if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+			if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate", op.Attempt); err != nil {
 				return false, deploymentCleanupIntentFault(err)
 			}
 			if err := s.cancelPlatform(ctx, op.ID, op.Attempt, "Cancellation acknowledged before the traffic switch; the frozen serving route was unchanged and candidates were cleaned where safe."); err != nil {
@@ -2061,7 +2149,7 @@ func (s *Service) recoverOwnedDeployment(ctx context.Context, op contract.Operat
 			return true, nil
 		}
 		if !allowResume {
-			if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+			if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate", op.Attempt); err != nil {
 				return false, deploymentCleanupIntentFault(err)
 			}
 			if err := s.failPlatformOperation(ctx, op.ID, op.Attempt, contract.Unavailable,
@@ -2092,7 +2180,7 @@ func (s *Service) recoverOwnedDeployment(ctx context.Context, op contract.Operat
 			"deployment route state is not safely restored and the operation remains owner",
 			"Keep the candidate containers; retry after the route writer is available.")
 	}
-	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate", op.Attempt); err != nil {
 		return false, deploymentCleanupIntentFault(err)
 	}
 	if err := s.failPlatformOperation(ctx, op.ID, op.Attempt, contract.Unavailable,
@@ -2149,7 +2237,7 @@ func (s *Service) handlePostSwitchRouteFailure(ctx context.Context, op contract.
 			"post-switch route failure could not restore the previous serving route",
 			"Keep the candidate containers and owner; retry after the route writer is available.")
 	}
-	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate", op.Attempt); err != nil {
 		return false, deploymentCleanupIntentFault(err)
 	}
 	if err := s.checkCancelled(ctx, op.ID); err != nil {
@@ -2205,7 +2293,7 @@ func (s *Service) restoreAndCancelOwnedDeployment(ctx context.Context, op contra
 			"deployment route state is not safely restored and the operation remains owner",
 			"Keep the candidate containers; retry after the route writer is available.")
 	}
-	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate"); err != nil {
+	if err := s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate", op.Attempt); err != nil {
 		return false, deploymentCleanupIntentFault(err)
 	}
 	if err := s.cancelPlatform(ctx, op.ID, op.Attempt,

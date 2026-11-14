@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -183,14 +184,15 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 	} else {
 		report.Unavailable = append(report.Unavailable, "live candidate: no deployment recorded")
 	}
-	// A failed terminal state commonly lies beyond the first bounded event page.
-	// Read exactly the snapshot's last event separately; do not pretend a later
-	// candidate-capture event is itself the terminal error.
+	// Capture may append events after terminalization, so the last event is not
+	// necessarily the terminal state. Read the most recent failed state within
+	// the same immutable snapshot and current attempt independently of paging.
 	if op.State == contract.Failed && op.LastSequence > 0 {
-		tail, e := s.Events(ctx, authority, contract.Cursor{OperationID: id, After: op.LastSequence - 1}, 1)
-		if e == nil && len(tail.Events) == 1 && tail.Events[0].Sequence == op.LastSequence && tail.Events[0].Kind == "state" && tail.Events[0].State == contract.Failed {
-			event := tail.Events[0]
-			report.Failure = &platform.DiagnosisFailure{Message: event.Message, Stage: event.Stage}
+		var raw []byte
+		e := s.pool.QueryRow(ctx, `SELECT event FROM eregion_operation_events WHERE operation_id=$1 AND sequence<=$2 AND event->>'kind'='state' AND event->>'state'='failed' AND event->>'attempt'=$3 ORDER BY sequence DESC LIMIT 1`, id, int64(op.LastSequence), fmt.Sprint(op.Attempt)).Scan(&raw)
+		var event contract.Event
+		if e == nil && json.Unmarshal(raw, &event) == nil && event.Validate() == nil && event.OperationID == id && event.Attempt == op.Attempt && event.State == contract.Failed {
+			report.Failure = &platform.DiagnosisFailure{Message: event.Message, Stage: event.Stage, Code: event.ErrorCode}
 			if event.Stage != "" {
 				report.Failure.StageSource = "failed state event"
 			}
@@ -209,11 +211,13 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 				return report, ctx.Err()
 			}
 			report.Partial = true
+			report.HistoryUnavailable = true
 			report.Unavailable = append(report.Unavailable, "events: history unavailable or has a gap")
 			break
 		}
 		if len(page.Events) == 0 || page.Cursor.After <= report.Cursor.After {
 			report.Partial = true
+			report.HistoryUnavailable = true
 			report.Unavailable = append(report.Unavailable, "events: history ended before snapshot cursor")
 			break
 		}
@@ -235,19 +239,25 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 			if event.Stage == platform.CandidateDiagnosticStage && event.CandidateDiagnostic != nil {
 				capturedSeen = true
 			}
-			if event.Kind == "warning" && event.Stage != "" && strings.HasPrefix(event.Message, "Node step failed: ") {
+			if event.Attempt == op.Attempt && event.Kind == "warning" && event.Stage != "" && strings.HasPrefix(event.Message, "Node step failed: ") {
 				if report.Failure == nil {
 					report.Failure = &platform.DiagnosisFailure{}
 				}
-				report.Failure.Stage = event.Stage
-				report.Failure.StageSource = "observed failed node step; not necessarily terminal cause"
+				if report.Failure.Stage == "" || report.Failure.StageSource != "failed state event" {
+					report.Failure.Stage = event.Stage
+					report.Failure.StageSource = "observed failed node step; not necessarily terminal cause"
+				}
 				report.Failure.StepMessage = event.Message
 			}
 			if event.Kind == "state" && event.State == contract.Failed {
+				if event.Attempt != op.Attempt {
+					continue
+				}
 				if report.Failure == nil {
 					report.Failure = &platform.DiagnosisFailure{}
 				}
 				report.Failure.Message = event.Message
+				report.Failure.Code = event.ErrorCode
 				if event.Stage != "" {
 					report.Failure.Stage = event.Stage
 					report.Failure.StageSource = "failed state event"
@@ -260,6 +270,7 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 	}
 	if report.Cursor.After < op.LastSequence {
 		report.Partial = true
+		report.HasMore = true
 	}
 	if op.State == contract.Failed && (report.Failure == nil || report.Failure.Message == "") {
 		report.Unavailable = append(report.Unavailable, "failure detail: failed state event not in this event page")
@@ -299,40 +310,44 @@ func (s *Service) diagnosisCandidate(parent context.Context, dep platform.Deploy
 	}
 	env.Revision = revision
 	names := append([]string(nil), revision.SecretNames...)
-	if revision.Source.CredentialSecretName != "" {
-		names = append(names, revision.Source.CredentialSecretName)
-	}
-	for name := range env.SecretRefs {
-		names = append(names, name)
+	metadataOnly := false
+	if len(dep.SecretRevisions) == 0 && len(env.SecretRefs) > 0 {
+		// Older snapshots without pins cannot prove whether legacy secret refs
+		// were used, even if today's refs differ.
+		metadataOnly = true
 	}
 	for _, name := range names {
 		if _, ok := dep.SecretRevisions[name]; !ok {
-			return nil, "pinned secret revisions unavailable; logs withheld"
+			metadataOnly = true
 		}
 	}
 	worker := &platformWorker{service: s}
-	values, key, credential, _, err := worker.resolveDeploymentSecrets(ctx, env, dep)
-	if err != nil {
-		return nil, "pinned secret redaction context unavailable; logs withheld"
-	}
-	if credential != "" {
-		values[key] = credential
+	values := map[string]string{}
+	if !metadataOnly {
+		// Never resolve today's names when no secret was pinned to the action.
+		// The current environment can have unrelated later secret references.
+		env.SecretRefs = nil
+		var key, credential string
+		values, key, credential, _, err = worker.resolveDeploymentSecrets(ctx, env, dep)
+		if err != nil {
+			metadataOnly = true
+			values = map[string]string{}
+		} else if credential != "" {
+			values[key] = credential
+		}
 	}
 	for name := range dep.SecretRevisions {
 		if values[name] == "" {
-			return nil, "pinned secret redaction context incomplete; logs withheld"
+			metadataOnly = true
 		}
 	}
 	for _, name := range names {
 		if values[name] == "" {
-			return nil, "pinned secret redaction context incomplete; logs withheld"
+			metadataOnly = true
 		}
 	}
 	registry := &secrets.Registry{}
 	for _, value := range values {
-		if strings.ContainsAny(value, "\r\n") {
-			return nil, "multiline secret prevents safe redaction; logs withheld"
-		}
 		registry.Add(value)
 	}
 	plan, err := platform.PlanDeployment(dep.App, dep.Environment, revision.RevisionState, dep.ReleaseID, dep.ID)
@@ -344,20 +359,23 @@ func (s *Service) diagnosisCandidate(parent context.Context, dep platform.Deploy
 		plan = plan[:64]
 	}
 	deadline, _ := ctx.Deadline()
-	payload := platform.CandidateDiagnosticPayload{Step: platform.CandidateDiagnosticStep, App: dep.App, Environment: dep.Environment, ReleaseID: dep.ReleaseID, DeploymentID: dep.ID, Deadline: deadline}
+	payload := platform.CandidateDiagnosticPayload{Step: platform.CandidateDiagnosticStep, App: dep.App, Environment: dep.Environment, ReleaseID: dep.ReleaseID, DeploymentID: dep.ID, Deadline: deadline, MetadataOnly: metadataOnly}
 	for _, p := range plan {
 		payload.Containers = append(payload.Containers, platform.CandidateDiagnosticContainer{Name: p.Name, Process: p.Process.Name, Kind: p.Process.Kind, Replica: p.Replica})
 	}
-	result, err := platform.ObserveRunningCandidateDiagnostics(ctx, payload, imageID, engine.Runtime{Secrets: registry, SecretValues: values})
+	result, err := platform.ObserveCandidateDiagnostics(ctx, payload, imageID, engine.Runtime{Secrets: registry, SecretValues: values})
 	if err != nil {
 		return nil, "candidate observation failed"
 	}
 	result.Truncated = result.Truncated || truncated
+	if metadataOnly {
+		return &result, "pinned secret redaction context unavailable or incomplete; logs withheld"
+	}
 	if result.ImageMismatch {
 		return &result, "candidate image identity missing or differs from the recorded release; affected logs withheld"
 	}
 	if result.Unavailable {
-		return &result, "some planned running candidates were absent, inaccessible, or ownership could not be verified"
+		return &result, "some candidate evidence was unavailable or logs were withheld"
 	}
 	return &result, ""
 }

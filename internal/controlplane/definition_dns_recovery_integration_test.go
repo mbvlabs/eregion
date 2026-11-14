@@ -192,9 +192,22 @@ func TestIntegrationDefinitionDNSCleanupRecoveryIsReadOnly(t *testing.T) {
 	if err := runPlatformAttempt(ctx, s, contract.OperationID(child), 1); contract.Classify(err).Code != contract.Unavailable {
 		t.Fatalf("uncertain delete: %v", err)
 	}
+	provider.mu.Lock()
+	_, exists := provider.records["created"]
+	writesBeforeRecovery := provider.writes
+	provider.mu.Unlock()
+	if !exists {
+		t.Fatal("fixture unexpectedly applied the uncertain delete")
+	}
 	var snooze *river.JobSnoozeError
 	if err := runPlatformAttempt(ctx, s, contract.OperationID(child), 2); !errors.As(err, &snooze) {
 		t.Fatalf("uncertain delete must not be retried: %v", err)
+	}
+	provider.mu.Lock()
+	writesAfterRecovery := provider.writes
+	provider.mu.Unlock()
+	if writesAfterRecovery != writesBeforeRecovery {
+		t.Fatal("unknown cleanup recovery repeated a provider write")
 	}
 	if _, err := s.RequestCancel(ctx, definitionIntegrationActor, parent); err != nil {
 		t.Fatal(err)
@@ -221,5 +234,79 @@ func TestIntegrationDefinitionDNSCleanupRecoveryIsReadOnly(t *testing.T) {
 	defer provider.mu.Unlock()
 	if provider.writes != writes || provider.records["foreign"].Comment != "external-owner" {
 		t.Fatalf("recovery wrote provider state or changed foreign record: writes=%d records=%+v", provider.writes, provider.records)
+	}
+}
+
+// An error response does not prove that the provider rejected the deletion.
+// Readback of the exact absent owned record must settle without another write.
+func TestIntegrationDefinitionDNSCleanupAcceptedErrorReadback(t *testing.T) {
+	pool, s, app, provider := definitionDNSFixture(t, true, 0)
+	ctx := context.Background()
+	first := planAndSubmitDefinitionDNS(t, app, "accepted-cleanup-primary")
+	driveDefinitionDNS(t, s, first)
+	provider.mu.Lock()
+	provider.acceptWrite = true
+	provider.mu.Unlock()
+	add := platformSubmitAs(t, s, definitionIntegrationActor, platform.KindDomainAdd, "env/api/production", "accepted-cleanup-secondary", map[string]any{
+		"domain": "alias.example.com", "dns_mode": "cloudflare", "dns_zone": definitionTestZone,
+		"dns_origins": []string{"8.8.8.8"}, "dns_proxied": false,
+	})
+	if err := runPlatformAttempt(ctx, s, add.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	parent := planAndSubmitDefinitionDNS(t, app, "accepted-cleanup-parent")
+	claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
+	if err != nil || !ok {
+		t.Fatalf("claim=%v err=%v", ok, err)
+	}
+	worker := &platformWorker{service: s}
+	var child contract.OperationID
+	for i := 0; i < 12 && child == ""; i++ {
+		err := worker.runDefinitionApply(ctx, claimed, 1)
+		var snooze *river.JobSnoozeError
+		if err != nil && !errors.As(err, &snooze) {
+			t.Fatal(err)
+		}
+		var id, kind *string
+		if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1), (SELECT s.kind FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&id, &kind); err != nil {
+			t.Fatal(err)
+		}
+		if id != nil && kind != nil {
+			if *kind == platform.KindDomainRemove {
+				child = contract.OperationID(*id)
+			} else if err := runPlatformAttempt(ctx, s, contract.OperationID(*id), 1); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if child == "" {
+		t.Fatal("cleanup child not admitted")
+	}
+	provider.mu.Lock()
+	provider.acceptDelete = true
+	provider.status = http.StatusInternalServerError
+	provider.mu.Unlock()
+	if err := runPlatformAttempt(ctx, s, child, 1); contract.Classify(err).Code != contract.Unavailable {
+		t.Fatalf("uncertain accepted delete: %v", err)
+	}
+	provider.mu.Lock()
+	_, exists := provider.records["created"]
+	writes := provider.writes
+	foreign := provider.records["foreign"]
+	provider.mu.Unlock()
+	if exists || foreign.Comment != "external-owner" {
+		t.Fatalf("fixture did not apply only the owned delete: exists=%v foreign=%+v", exists, foreign)
+	}
+	if err := runPlatformAttempt(ctx, s, child, 2); err != nil {
+		t.Fatalf("observed cleanup did not settle: %v", err)
+	}
+	var state contract.State
+	if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil || state != contract.Failed {
+		t.Fatalf("child state=%s err=%v", state, err)
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	if provider.writes != writes || provider.records["foreign"] != foreign {
+		t.Fatalf("readback repeated a write or changed foreign state: writes=%d records=%+v", provider.writes, provider.records)
 	}
 }

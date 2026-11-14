@@ -13,6 +13,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/access"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/processmetrics"
 	"github.com/mbvlabs/eregion/internal/telemetry"
 )
 
@@ -756,8 +757,8 @@ func managedLeaf(node *managedCaddyNode, want ...string) bool {
 	return managedTokens(node, want...) && len(node.children) == 0
 }
 
-func validateManagedReverseProxy(node *managedCaddyNode) error {
-	if !managedTokens(node, "reverse_proxy", NodeExporterLoopbackAddress) {
+func validateManagedReverseProxy(node *managedCaddyNode, upstream string) error {
+	if !managedTokens(node, "reverse_proxy", upstream) {
 		return fmt.Errorf("managed telemetry configuration has an unsupported metrics upstream")
 	}
 	rewrite, authorization, cookie, transports := 0, 0, 0, 0
@@ -857,7 +858,7 @@ func extractTelemetryHash(raw []byte) (string, error) {
 	bind := false
 	hash := ""
 	basicBlocks := 0
-	discoveryHandlers, metricsHandlers, fallbackHandlers := 0, 0, 0
+	discoveryHandlers, metricsHandlers, apiHandlers, workerHandlers, fallbackHandlers := 0, 0, 0, 0, 0
 	for _, child := range site.children {
 		switch {
 		case len(child.tokens) == 2 && child.tokens[0] == "bind":
@@ -884,7 +885,23 @@ func extractTelemetryHash(raw []byte) (string, error) {
 			if len(child.children) != 1 {
 				return "", fmt.Errorf("managed telemetry configuration has an unsupported metrics handler")
 			}
-			if err := validateManagedReverseProxy(child.children[0]); err != nil {
+			if err := validateManagedReverseProxy(child.children[0], NodeExporterLoopbackAddress); err != nil {
+				return "", err
+			}
+		case managedTokens(child, "handle", telemetry.GatewayAPIMetricsPath):
+			apiHandlers++
+			if len(child.children) != 1 {
+				return "", fmt.Errorf("invalid API metrics handler")
+			}
+			if err := validateManagedReverseProxy(child.children[0], processmetrics.APIAddress); err != nil {
+				return "", err
+			}
+		case managedTokens(child, "handle", telemetry.GatewayWorkerMetricsPath):
+			workerHandlers++
+			if len(child.children) != 1 {
+				return "", fmt.Errorf("invalid worker metrics handler")
+			}
+			if err := validateManagedReverseProxy(child.children[0], processmetrics.WorkerAddress); err != nil {
 				return "", err
 			}
 		case managedTokens(child, "handle"):
@@ -896,7 +913,7 @@ func extractTelemetryHash(raw []byte) (string, error) {
 			return "", fmt.Errorf("managed telemetry configuration has an unsupported site directive")
 		}
 	}
-	if !bind || basicBlocks != 1 || hash == "" || discoveryHandlers != 1 || metricsHandlers != 1 || fallbackHandlers != 1 {
+	if !bind || basicBlocks != 1 || hash == "" || discoveryHandlers != 1 || metricsHandlers != 1 || apiHandlers > 1 || workerHandlers > 1 || fallbackHandlers != 1 {
 		return "", fmt.Errorf("managed telemetry configuration is missing a required contract")
 	}
 	return hash, nil
@@ -934,11 +951,35 @@ http://%s {
 			}
 		}
 	}
+	handle %s {
+		reverse_proxy %s {
+			rewrite /metrics
+			header_up -Authorization
+			header_up -Cookie
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 15s
+				read_timeout 30s
+			}
+		}
+	}
+	handle %s {
+		reverse_proxy %s {
+			rewrite /metrics
+			header_up -Authorization
+			header_up -Cookie
+			transport http {
+				dial_timeout 2s
+				response_header_timeout 15s
+				read_timeout 30s
+			}
+		}
+	}
 	handle {
 		respond 404
 	}
 }
-`, telemetry.GatewayListenAddress, telemetry.GatewayHost, telemetry.Username, hash, telemetry.GatewayDiscoveryPath, TelemetryDir, telemetry.GatewayMetricsPath, NodeExporterLoopbackAddress))
+`, telemetry.GatewayListenAddress, telemetry.GatewayHost, telemetry.Username, hash, telemetry.GatewayDiscoveryPath, TelemetryDir, telemetry.GatewayMetricsPath, NodeExporterLoopbackAddress, telemetry.GatewayAPIMetricsPath, processmetrics.APIAddress, telemetry.GatewayWorkerMetricsPath, processmetrics.WorkerAddress))
 }
 
 // activateTelemetryCaddy writes the rendered gateway config, validates it,

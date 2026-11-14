@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -96,6 +97,17 @@ func (s *ReleaseCommandStep) Describe() string {
 func (s *ReleaseCommandStep) CancelBoundary() engine.Boundary { return engine.BoundaryAfterApply }
 func (s *ReleaseCommandStep) Inputs() ([]byte, error)         { return json.Marshal(s.payload) }
 
+// The command uses a local image, attaches to an environment network and may
+// remove its named container on cancellation. Keep those identities fenced
+// while allowing unrelated Pack effects to share the host fence.
+func (s *ReleaseCommandStep) SharedHostResources() []string {
+	return []string{
+		"docker-container\x00" + s.payload.Name,
+		"docker-image\x00" + s.payload.Image,
+		"docker-network\x00" + s.payload.Network,
+	}
+}
+
 // Check never proves completion: whether the command ran is release-scoped
 // state the control plane records, not something Docker can show afterwards.
 func (s *ReleaseCommandStep) Check(context.Context, engine.Runtime) (engine.CheckResult, error) {
@@ -109,20 +121,43 @@ func (s *ReleaseCommandStep) Apply(ctx context.Context, rt engine.Runtime, repor
 	}
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(s.payload.TimeoutSeconds)*time.Second)
 	defer cancel()
-	stdout, stderr, err := runArgv(runCtx, args, env, rt, s.ID(), report)
+	var createInfo commandOutputInfo
+	created, createStderr, err := runArgvWithEnvGraceCapture(runCtx, args, mergeEnv(os.Environ(), env), rt, s.ID(), report, 0, &createInfo)
+	if err != nil {
+		if runCtx.Err() != nil {
+			return engine.ApplyResult{Result: StepExecutionEvidence{Stage: "release-command-create", OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt), Stderr: truncate(createStderr, 4096), StderrTruncated: createInfo.stderrTruncated || len(createStderr) > 4096}}, runCtx.Err()
+		}
+		return engine.ApplyResult{Result: StepExecutionEvidence{Stage: "release-command-create", OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt), Stderr: truncate(createStderr, 4096), StderrTruncated: createInfo.stderrTruncated || len(createStderr) > 4096}}, fmt.Errorf("%w: release command container could not be created: %s", engine.ErrPermanent, firstLine(createStderr))
+	}
+	id := strings.TrimSpace(created)
+	if !evidenceContainerID.MatchString(id) {
+		// Without the immutable Docker ID there is no authority to remove a
+		// same-name container or to claim that the command ran.
+		return engine.ApplyResult{Result: StepExecutionEvidence{Stage: "release-command-create", OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt)}}, fmt.Errorf("%w: docker did not return a valid release command container ID", engine.ErrPermanent)
+	}
+	// The ID returned by docker create identifies exactly this invocation even
+	// if capture fails or the name is subsequently reused.
+	defer func() {
+		removeCtx, removeCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer removeCancel()
+		_, stderr, removeErr := runArgv(removeCtx, []string{"docker", "rm", "-f", id}, nil, rt, s.ID(), nil)
+		if removeErr != nil && report != nil {
+			report(engine.Event{Kind: "warning", Step: s.ID(), Message: "release command cleanup failed: " + firstLine(stderr)})
+		}
+	}()
+	var info commandOutputInfo
+	_, stderr, err := runArgvWithEnvGraceCapture(runCtx, []string{"docker", "start", "-a", id}, os.Environ(), rt, s.ID(), report, 0, &info)
+	stdout := info.stdoutSafe
+	evidence := captureExecutionEvidence(ctx, id, s.payload.Labels, rt)
+	result := StepExecutionEvidence{Stage: "release-command", OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt), Stdout: truncate(stdout, 8192), Stderr: truncate(stderr, 4096), StdoutTruncated: info.stdoutTruncated || len(stdout) > 8192, StderrTruncated: info.stderrTruncated || len(stderr) > 4096, Container: &evidence}
 	if err == nil {
-		return engine.ApplyResult{Result: map[string]any{"stdout": truncate(stdout, 8192)}}, nil
+		return engine.ApplyResult{Result: result}, nil
 	}
 	if runCtx.Err() != nil {
-		// Killing the docker client leaves the container running. Remove it
-		// so the command cannot continue unobserved or block a later run.
-		removeCtx, removeCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		_, _, _ = runArgv(removeCtx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
-		removeCancel()
 		if ctx.Err() != nil {
-			return engine.ApplyResult{}, ctx.Err()
+			return engine.ApplyResult{Result: result}, ctx.Err()
 		}
-		return engine.ApplyResult{}, fmt.Errorf("%w: release command timed out after %ds; its container was removed", engine.ErrPermanent, s.payload.TimeoutSeconds)
+		return engine.ApplyResult{Result: result}, fmt.Errorf("%w: release command timed out after %ds; cleanup was attempted", engine.ErrPermanent, s.payload.TimeoutSeconds)
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -130,11 +165,11 @@ func (s *ReleaseCommandStep) Apply(ctx context.Context, rt engine.Runtime, repor
 		// command's own status otherwise. Either way this run has ended and
 		// retrying inside the same deployment would only repeat it.
 		if exitErr.ExitCode() == 125 {
-			return engine.ApplyResult{}, fmt.Errorf("%w: release command container did not start: %s", engine.ErrPermanent, firstLine(stderr))
+			return engine.ApplyResult{Result: result}, fmt.Errorf("%w: release command container did not start: %s", engine.ErrPermanent, firstLine(stderr))
 		}
-		return engine.ApplyResult{}, fmt.Errorf("%w: release command failed with exit status %d", engine.ErrPermanent, exitErr.ExitCode())
+		return engine.ApplyResult{Result: result}, fmt.Errorf("%w: release command failed with exit status %d", engine.ErrPermanent, exitErr.ExitCode())
 	}
-	return engine.ApplyResult{}, permanentCommandError(err)
+	return engine.ApplyResult{Result: result}, permanentCommandError(err)
 }
 
 func (s *ReleaseCommandStep) runArgs(ctx context.Context, rt engine.Runtime) ([]string, []string, error) {
@@ -142,7 +177,7 @@ func (s *ReleaseCommandStep) runArgs(ctx context.Context, rt engine.Runtime) ([]
 	if err != nil {
 		return nil, nil, err
 	}
-	args := []string{"docker", "run", "--rm", "--name", s.payload.Name, "--pull", "never", "--network", s.payload.Network}
+	args := []string{"docker", "create", "--name", s.payload.Name, "--pull", "never", "--network", s.payload.Network}
 	for _, key := range sortedEnvKeys(s.payload.Labels) {
 		args = append(args, "--label", key+"="+s.payload.Labels[key])
 	}

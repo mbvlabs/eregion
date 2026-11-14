@@ -386,6 +386,22 @@ func FaultDetails(summary Summary, command string) map[string]any {
 		"operation_id": string(summary.OperationID),
 		"events":       summary.Events,
 		"cursor":       fmt.Sprintf("%d", summary.Cursor),
+		"state":        summary.State,
+	}
+	if summary.ErrorCode != "" {
+		details["error_code"] = summary.ErrorCode
+	}
+	if summary.Operation.ResultReadError != "" {
+		details["result_read_error"] = summary.Operation.ResultReadError
+	}
+	if summary.Operation.Evidence != nil {
+		details["evidence"] = summary.Operation.Evidence
+	}
+	if summary.Operation.EvidenceReadError != "" {
+		details["evidence_read_error"] = summary.Operation.EvidenceReadError
+	}
+	if result := summary.Operation.LatestResult; result != nil {
+		details["result"] = result
 	}
 	if command != "" {
 		details["resume"] = command + " " + string(summary.OperationID)

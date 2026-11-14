@@ -18,7 +18,7 @@ import (
 const CandidateDiagnosticStage = "candidate-diagnostic"
 const CandidateDiagnosticStep = "platform-candidate-diagnostic-01-v1"
 
-var candidateDiagnosticStepPattern = regexp.MustCompile(`^platform-candidate-diagnostic-01-v1$`)
+var candidateDiagnosticStepPattern = regexp.MustCompile(`^platform-candidate-diagnostic-[a-f0-9]+-v1$`)
 
 type CandidateDiagnosticContainer struct {
 	Name    string `json:"name"`
@@ -35,6 +35,7 @@ type CandidateDiagnosticPayload struct {
 	DeploymentID DeploymentID                   `json:"deployment_id"`
 	Deadline     time.Time                      `json:"deadline"`
 	Containers   []CandidateDiagnosticContainer `json:"containers"`
+	MetadataOnly bool                           `json:"metadata_only,omitempty"`
 }
 
 type CandidateDiagnosticLine struct {
@@ -47,15 +48,34 @@ type CandidateDiagnosticLine struct {
 }
 
 type CandidateDiagnosticResult struct {
-	Lines         []CandidateDiagnosticLine `json:"lines"`
-	Truncated     bool                      `json:"truncated"`
-	Unavailable   bool                      `json:"unavailable"`
-	ImageMismatch bool                      `json:"image_mismatch,omitempty"`
+	Lines              []CandidateDiagnosticLine `json:"lines"`
+	Observations       []CandidateObservation    `json:"observations"`
+	LogTimestampSource string                    `json:"log_timestamp_source,omitempty"`
+	RedactionContext   string                    `json:"redaction_context,omitempty"`
+	Truncated          bool                      `json:"truncated"`
+	Unavailable        bool                      `json:"unavailable"`
+	ImageMismatch      bool                      `json:"image_mismatch,omitempty"`
+}
+
+// CandidateObservation is a point-in-time Docker observation, not an inferred
+// cause. StartedAt and FinishedAt establish whether the lifecycle advanced.
+type CandidateObservation struct {
+	Process     string    `json:"process"`
+	Replica     string    `json:"replica"`
+	Container   string    `json:"container"`
+	ContainerID string    `json:"container_id"`
+	ObservedAt  time.Time `json:"observed_at"`
+	State       string    `json:"state"`
+	Running     bool      `json:"running"`
+	StartedAt   time.Time `json:"started_at,omitempty"`
+	FinishedAt  time.Time `json:"finished_at,omitempty"`
+	ExitCode    *int      `json:"exit_code,omitempty"`
+	OOMKilled   bool      `json:"oom_killed"`
+	Health      string    `json:"health,omitempty"`
 }
 
 type candidateDiagnosticStep struct {
 	payload         CandidateDiagnosticPayload
-	runningOnly     bool
 	expectedImageID string
 }
 
@@ -74,7 +94,7 @@ func buildCandidateDiagnosticStep(execution engine.Execution, raw json.RawMessag
 }
 
 func validateCandidateDiagnostic(p CandidateDiagnosticPayload) error {
-	if p.Step != CandidateDiagnosticStep || ValidateName(p.App) != nil || ValidateName(p.Environment) != nil || p.ReleaseID.Validate() != nil || p.DeploymentID.Validate() != nil || p.Deadline.IsZero() || len(p.Containers) > 64 {
+	if !candidateDiagnosticStepPattern.MatchString(p.Step) || ValidateName(p.App) != nil || ValidateName(p.Environment) != nil || p.ReleaseID.Validate() != nil || p.DeploymentID.Validate() != nil || p.Deadline.IsZero() || len(p.Containers) > 64 {
 		return errors.New("invalid candidate diagnostic request")
 	}
 	seen := map[string]bool{}
@@ -87,16 +107,16 @@ func validateCandidateDiagnostic(p CandidateDiagnosticPayload) error {
 	return nil
 }
 
-// ObserveRunningCandidateDiagnostics performs the existing bounded, owned-label
+// ObserveCandidateDiagnostics performs the existing bounded, owned-label
 // diagnostic read directly, without a node task or journal write.
-func ObserveRunningCandidateDiagnostics(ctx context.Context, p CandidateDiagnosticPayload, expectedImageID string, rt engine.Runtime) (CandidateDiagnosticResult, error) {
+func ObserveCandidateDiagnostics(ctx context.Context, p CandidateDiagnosticPayload, expectedImageID string, rt engine.Runtime) (CandidateDiagnosticResult, error) {
 	if err := validateCandidateDiagnostic(p); err != nil {
 		return CandidateDiagnosticResult{}, err
 	}
 	if !diagnosisImageIDPattern.MatchString(expectedImageID) {
 		return CandidateDiagnosticResult{}, errors.New("invalid candidate image identity")
 	}
-	result, err := (&candidateDiagnosticStep{payload: p, runningOnly: true, expectedImageID: expectedImageID}).Apply(ctx, rt, nil)
+	result, err := (&candidateDiagnosticStep{payload: p, expectedImageID: expectedImageID}).Apply(ctx, rt, nil)
 	if err != nil {
 		return CandidateDiagnosticResult{}, err
 	}
@@ -139,18 +159,24 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 	defer cancel()
 	ctx, deadlineCancel := context.WithDeadline(ctx, s.payload.Deadline)
 	defer deadlineCancel()
-	result := CandidateDiagnosticResult{Lines: []CandidateDiagnosticLine{}}
+	result := CandidateDiagnosticResult{Lines: []CandidateDiagnosticLine{}, Observations: []CandidateObservation{}}
+	if len(s.payload.Containers) == 0 {
+		result.Unavailable = true
+		return engine.ApplyResult{Result: result}, nil
+	}
 	if rt.Secrets == nil {
 		result.Unavailable = true
 		return engine.ApplyResult{Result: result}, nil
 	}
-	// Docker timestamps are inserted between lines, preventing exact matching of
-	// a multiline secret. Fail closed instead of persisting a fragment.
-	for _, value := range rt.SecretValues {
-		if strings.ContainsAny(value, "\r\n") {
-			result.Unavailable = true
-			return engine.ApplyResult{Result: result}, nil
-		}
+	logsSafe := !s.payload.MetadataOnly
+	if !logsSafe {
+		result.Unavailable = true
+	}
+	// Docker's tail can begin inside a multiline secret. The missing prefix
+	// makes exact redaction impossible, even without inserted timestamps.
+	if rt.Secrets.RequiresWholeTextRedaction() {
+		logsSafe = false
+		result.Unavailable = true
 	}
 	// Reserve space for the durable claim and summary messages as well.
 	budget := 64*1024 - 512
@@ -163,10 +189,7 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 			result.Truncated = true
 			break
 		}
-		format := "{{json .Id}}\n{{json .Name}}\n{{json .Config.Labels}}"
-		if s.runningOnly {
-			format = "{{json .Id}}\n{{json .Name}}\n{{json .State.Running}}\n{{json .Image}}\n{{json .Config.Labels}}"
-		}
+		format := "{{json .Id}}\n{{json .Name}}\n{{json .Image}}\n{{json .Config.Labels}}\n{{json .State}}"
 		inspect := exec.CommandContext(ctx, "docker", "inspect", "--format", format, c.Name)
 		metadata := &limitedDiagnosticBuffer{limit: 64 * 1024}
 		inspect.Stdout = metadata
@@ -174,21 +197,25 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 			result.Unavailable = true
 			continue
 		}
-		count := 3
-		if s.runningOnly {
-			count = 5
-		}
+		count := 5
 		parts := strings.SplitN(metadata.String(), "\n", count)
-		var id, name string
-		running := true
+		var id, name, imageID string
 		var labels map[string]string
-		if len(parts) != count || json.Unmarshal([]byte(parts[0]), &id) != nil || json.Unmarshal([]byte(parts[1]), &name) != nil || (s.runningOnly && json.Unmarshal([]byte(parts[2]), &running) != nil) || json.Unmarshal([]byte(parts[count-1]), &labels) != nil || strings.TrimPrefix(name, "/") != c.Name || id == "" || !running {
+		var state struct {
+			Status     string
+			Running    bool
+			StartedAt  time.Time
+			FinishedAt time.Time
+			ExitCode   int
+			OOMKilled  bool
+			Health     *struct{ Status string }
+		}
+		if len(parts) != count || json.Unmarshal([]byte(parts[0]), &id) != nil || json.Unmarshal([]byte(parts[1]), &name) != nil || json.Unmarshal([]byte(parts[2]), &imageID) != nil || json.Unmarshal([]byte(parts[3]), &labels) != nil || json.Unmarshal([]byte(parts[4]), &state) != nil || strings.TrimPrefix(name, "/") != c.Name || id == "" {
 			result.Unavailable = true
 			continue
 		}
-		if s.runningOnly {
-			var imageID string
-			if json.Unmarshal([]byte(parts[3]), &imageID) != nil || imageID != s.expectedImageID {
+		if s.expectedImageID != "" {
+			if imageID != s.expectedImageID {
 				result.Unavailable = true
 				result.ImageMismatch = true
 				continue
@@ -206,7 +233,22 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 			result.Unavailable = true
 			continue
 		}
-		command := exec.CommandContext(ctx, "docker", "logs", "--timestamps", "--tail", "200", id)
+		observation := CandidateObservation{Process: c.Process, Replica: c.Replica, Container: c.Name, ContainerID: id, ObservedAt: time.Now().UTC(), State: state.Status, Running: state.Running, StartedAt: state.StartedAt, FinishedAt: state.FinishedAt, OOMKilled: state.OOMKilled}
+		if !state.StartedAt.IsZero() && !state.FinishedAt.IsZero() {
+			observation.ExitCode = &state.ExitCode
+		}
+		if state.Health != nil {
+			observation.Health = state.Health.Status
+		}
+		result.Observations = append(result.Observations, observation)
+		if !logsSafe {
+			continue
+		}
+		// Request one extra line so a bounded tail can be distinguished from
+		// a complete stream of exactly 200 lines.
+		// Do not ask Docker to insert timestamps into the stream: that would
+		// split multiline secret values before they can be redacted.
+		command := exec.CommandContext(ctx, "docker", "logs", "--tail", "201", id)
 		raw := &limitedDiagnosticBuffer{limit: 1024 * 1024}
 		command.Stdout, command.Stderr = raw, raw
 		if err := command.Run(); err != nil || raw.overflow {
@@ -219,8 +261,11 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 		// Redact the complete raw stream before newline normalization, parsing,
 		// safe-text conversion or any truncation.
 		text := rt.Secrets.Redact(raw.String())
+		text = rt.Secrets.Redact(output.SafeText(strings.ReplaceAll(text, "\r\n", "\n")))
+		observedAt := time.Now().UTC()
+		result.LogTimestampSource = "observation_time"
 		containerLines := 0
-		for _, line := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		for _, line := range strings.Split(text, "\n") {
 			if line == "" {
 				continue
 			}
@@ -232,17 +277,7 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 				result.Truncated = true
 				break
 			}
-			stamp, message, ok := strings.Cut(line, " ")
-			if !ok {
-				result.Unavailable = true
-				continue
-			}
-			at, err := time.Parse(time.RFC3339Nano, stamp)
-			if err != nil {
-				result.Unavailable = true
-				continue
-			}
-			message = output.SafeText(message)
+			message := line
 			if len(message) > 32*1024 {
 				message = diagnosticPrefix(message, 32*1024)
 				result.Truncated = true
@@ -251,7 +286,7 @@ func (s *candidateDiagnosticStep) Apply(ctx context.Context, rt engine.Runtime, 
 				message = diagnosticPrefix(message, budget)
 				result.Truncated = true
 			}
-			result.Lines = append(result.Lines, CandidateDiagnosticLine{Process: c.Process, Replica: c.Replica, Container: c.Name, ContainerID: id, Timestamp: at, Message: message})
+			result.Lines = append(result.Lines, CandidateDiagnosticLine{Process: c.Process, Replica: c.Replica, Container: c.Name, ContainerID: id, Timestamp: observedAt, Message: message})
 			containerLines++
 			budget -= len(message)
 			if budget == 0 {

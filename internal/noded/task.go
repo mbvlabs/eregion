@@ -43,6 +43,9 @@ func RunTask(config Config) error {
 		return err
 	}
 	nodeEngine.SecretValues = request.Secrets
+	if nodeEngine.SecretValues == nil {
+		nodeEngine.SecretValues = map[string]string{}
+	}
 	step, err := node.NewStepRegistryWithHost(config.HostSettings()).Build(request.Execution, request.Payload)
 	if err != nil {
 		return err

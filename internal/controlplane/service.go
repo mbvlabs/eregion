@@ -20,8 +20,9 @@ import (
 )
 
 type Service struct {
-	pool    *pgxpool.Pool
-	enqueue func(context.Context, pgx.Tx, contract.OperationID) (int64, error)
+	pool                 *pgxpool.Pool
+	observeActionAttempt func(kind string, outcome string, duration time.Duration)
+	enqueue              func(context.Context, pgx.Tx, contract.OperationID) (int64, error)
 	// enqueuePlatform inserts the one River job for a platform action in the
 	// same transaction as its domain rows.
 	enqueuePlatform func(context.Context, pgx.Tx, contract.Operation) (int64, error)
@@ -32,9 +33,6 @@ type Service struct {
 	transport node.Transport
 	// localNode is the identity of the in-process local transport, if any.
 	localNode string
-	// diagnosticAdmissionNode is the node-mode host identity verified by the
-	// trusted insert-only RPC server against the worker configuration.
-	diagnosticAdmissionNode string
 	// resolver reaches the node a piece of work is placed on: the enrolled
 	// node's own pinned SSH transport, or transport for the node it serves.
 	resolver *NodeResolver
@@ -173,9 +171,6 @@ func (s *Service) SubmitWithReceipt(ctx context.Context, sub operations.Submissi
 	var zero operations.SubmissionResult
 	// This operation may only be admitted by the dedicated trusted boundary;
 	// registering its normalizer later must not make generic submit authorize it.
-	if sub.Kind == platform.KindDiagnosticExecution {
-		return zero, contract.NewFault(contract.ValidationFailed, "diagnostic execution is not available through generic submission", "Use the authenticated operator SSH diagnostic execution flow when available.")
-	}
 	if sub.Kind == platform.KindDefinitionApply {
 		return zero, contract.NewFault(contract.ValidationFailed, "definition apply is not available through generic submission", "Use the trusted operator boundary.")
 	}
@@ -186,7 +181,11 @@ func (s *Service) SubmitWithReceipt(ctx context.Context, sub operations.Submissi
 		return zero, err
 	}
 	if platform.IsKind(sub.Kind) {
-		return s.submitPlatformWithReceipt(ctx, sub)
+		result, err := s.submitPlatformWithReceipt(ctx, sub)
+		if err == nil && result.Replay {
+			err = s.populateActionResult(ctx, &result.Operation)
+		}
+		return result, err
 	}
 	if sub.Kind != operations.TestKind || sub.Target != operations.TestTarget || sub.Confirmation != "" {
 		return zero, contract.NewFault(contract.ValidationFailed, "unsupported operation or target", "Only diagnostic.test on control-plane is implemented; it needs no confirmation.")
@@ -230,6 +229,14 @@ func (s *Service) SubmitWithReceipt(ctx context.Context, sub operations.Submissi
 		op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
 		if err != nil {
 			return zero, unavailable()
+		}
+		// Release the admission connection before the optional history read;
+		// a one-connection pool must still support idempotent replay.
+		if err := tx.Commit(ctx); err != nil {
+			return zero, unavailable()
+		}
+		if err := s.populateActionResult(ctx, &op); err != nil {
+			return zero, err
 		}
 		return operations.SubmissionResult{Operation: op, Replay: true}, nil
 	}
@@ -276,6 +283,9 @@ func (s *Service) Get(ctx context.Context, authority operations.Authority, id co
 			return op, ctx.Err()
 		}
 		return op, unavailable()
+	}
+	if err := s.populateActionResult(ctx, &op); err != nil {
+		return op, err
 	}
 	return op, nil
 }
@@ -355,6 +365,7 @@ func (s *Service) mutate(ctx context.Context, id contract.OperationID, change fu
 	if err := tx.Commit(ctx); err != nil {
 		return op, unavailable()
 	}
+	s.observeCommittedActionResult(op)
 	return op, nil
 }
 
@@ -383,7 +394,22 @@ func (s *Service) mutateOwned(ctx context.Context, id contract.OperationID, atte
 	if err := tx.Commit(ctx); err != nil {
 		return op, false, unavailable()
 	}
+	s.observeCommittedActionResult(op)
 	return op, true, nil
+}
+
+// observeCommittedActionResult must be called only after the transaction
+// which appended op.LatestResult has committed successfully.
+func (s *Service) observeCommittedActionResult(op contract.Operation) {
+	if op.LatestResult == nil || op.LatestResult.Attempt == 0 || s.observeActionAttempt == nil {
+		return
+	}
+	r := op.LatestResult
+	outcome := string(r.Status)
+	if r.Status == contract.Failed && !op.State.Terminal() {
+		outcome = "retrying"
+	}
+	s.observeActionAttempt(op.Kind, outcome, r.CompletedAt.Sub(r.StartedAt))
 }
 
 // transition moves the operation to a new state. A failed transition carries
@@ -404,6 +430,51 @@ func transition(ctx context.Context, tx pgx.Tx, op *contract.Operation, state co
 func appendEvent(ctx context.Context, tx pgx.Tx, op *contract.Operation, event contract.Event) error {
 	event.OperationID, event.Sequence, event.Attempt = op.ID, op.LastSequence+1, op.Attempt
 	event.At = time.Now().UTC()
+	// All terminalization paths use state events, including domain-specific
+	// workers. Preserve a generic result when no richer result was supplied.
+	if event.Kind == "state" && event.State.Terminal() && event.Result == nil && op.LatestResult == nil {
+		event.Result = &contract.ActionResult{
+			OperationID: op.ID, Action: op.Kind, Target: op.Target,
+			Attempt: op.Attempt, Status: event.State, Final: true, StartedAt: op.CreatedAt,
+			CompletedAt: event.At, Code: event.ErrorCode, Evidence: "not_collected",
+			TimingBasis: "operation_created", Stage: "action", History: contract.Cursor{OperationID: op.ID},
+		}
+		if event.Result.StartedAt.After(event.At) {
+			event.Result.StartedAt = event.At
+		}
+		if event.State == contract.Failed {
+			event.Result.Message = event.Message
+			if event.Result.Message == "" {
+				event.Result.Message = "Action failed; inspect retained history."
+			}
+		}
+		if op.PendingResult != nil {
+			event.Result.Data = op.PendingResult.Data
+			event.Result.DataStatus = op.PendingResult.DataStatus
+			if op.PendingResult.Message != "" {
+				event.Result.Message = op.PendingResult.Message
+			}
+		}
+		tryEnrichActionResultTx(ctx, tx, event.Result)
+		tryActionOutputTx(ctx, tx, event.Result)
+		tryActionPayloadTx(ctx, tx, op, event.Result, nil)
+		op.LatestResult = event.Result
+	}
+	if event.Kind == "state" && event.State.Terminal() && event.Result != nil {
+		op.LatestResult = event.Result
+	}
+	if event.Result != nil {
+		result := event.Result
+		if err := result.Validate(); err != nil {
+			return err
+		}
+		if result.OperationID != op.ID || result.Action != op.Kind || result.Target != op.Target || result.Attempt != op.Attempt ||
+			result.History.After > op.LastSequence || (result.ExcerptCursor != nil && result.ExcerptCursor.After > op.LastSequence) ||
+			(result.DataCursor != nil && result.DataCursor.After > op.LastSequence) ||
+			(event.Kind == "state" && (result.Status != event.State || !result.Final)) {
+			return contract.NewFault(contract.ValidationFailed, "action result does not match its operation", "Record an outcome for the fenced operation and attempt.")
+		}
+	}
 	if err := event.Validate(); err != nil {
 		return err
 	}

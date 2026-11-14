@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -42,6 +43,25 @@ func (r *Registry) Add(values ...string) {
 
 func (r *Registry) Redact(text string) string {
 	return r.redact(text, false)
+}
+
+// RequiresWholeTextRedaction reports whether a registered value can be split
+// or reconstructed by line-oriented or control-character normalization. It
+// does not expose registered values to callers.
+func (r *Registry) RequiresWholeTextRedaction() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for value := range r.values {
+		for _, char := range value {
+			if unicode.IsControl(char) || unicode.In(char, unicode.Cf) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // RedactPreservingLength applies the same registered matches without changing

@@ -100,7 +100,8 @@ type CheckResult struct {
 type ApplyResult struct {
 	Notes    []string
 	Warnings []string
-	// Result is stored in the durable effect record. It must not contain secrets.
+	// Result is stored in the effect record on success, or the failed task
+	// journal entry on error. It must not contain secrets.
 	Result any
 }
 

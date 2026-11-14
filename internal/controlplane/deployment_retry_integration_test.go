@@ -2148,7 +2148,7 @@ func TestIntegrationMaintenanceCleanupProtectsOwnerCandidate(t *testing.T) {
 	fixture.deploy(t)
 	env := fixture.environment(t)
 	key := "partial-crash"
-	_, depID, _, _ := fixture.prepareOwnedCandidate(t, key, "registry.example/live:partial-crash", "running")
+	_, depID, _, owner := fixture.prepareOwnedCandidate(t, key, "registry.example/live:partial-crash", "running")
 	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_deployment_owners
         SET phase='prepared',route_target_deployment_id=$2 WHERE environment_id=$1`,
 		env.ID, env.ServingDeploymentID); err != nil {
@@ -2158,7 +2158,7 @@ func TestIntegrationMaintenanceCleanupProtectsOwnerCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.service.persistDeploymentCleanupInstances(fixture.ctx, env, dep, dep.Instances, "candidate"); err != nil {
+	if err := fixture.service.persistDeploymentCleanupInstances(fixture.ctx, env, dep, dep.Instances, "candidate", owner.Attempt); err != nil {
 		t.Fatal(err)
 	}
 	name := key + "-candidate"

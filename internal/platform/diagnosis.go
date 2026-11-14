@@ -5,30 +5,33 @@ import "github.com/mbvlabs/eregion/internal/contract"
 // Diagnosis is a read-only snapshot. Missing evidence is represented by a
 // reason, not by a fabricated conclusion or an empty successful observation.
 type Diagnosis struct {
-	Schema        string                     `json:"schema"`
-	Operation     contract.Operation         `json:"operation"`
-	Build         *DiagnosisBuild            `json:"build,omitempty"`
-	SourceBuild   *DiagnosisBuild            `json:"release_source_build,omitempty"`
-	Release       *DiagnosisRelease          `json:"release,omitempty"`
-	Deployment    *DiagnosisDeployment       `json:"deployment,omitempty"`
-	Historical    *DiagnosisRevision         `json:"historical_revision,omitempty"`
-	BuildRevision *DiagnosisRevision         `json:"build_revision,omitempty"`
-	RecordedBuild *DiagnosisBuildSettings    `json:"recorded_release_build_settings,omitempty"`
-	Current       *DiagnosisRevision         `json:"current_desired_revision,omitempty"`
-	Image         *DiagnosisImage            `json:"image_observation,omitempty"`
-	LiveCandidate *CandidateDiagnosticResult `json:"live_candidate,omitempty"`
-	Failure       *DiagnosisFailure          `json:"failure_observation,omitempty"`
-	Events        []contract.Event           `json:"events"`
-	Cursor        contract.Cursor            `json:"cursor"`
-	Partial       bool                       `json:"partial"`
-	Unavailable   []string                   `json:"unavailable"`
+	Schema             string                     `json:"schema"`
+	Operation          contract.Operation         `json:"operation"`
+	Build              *DiagnosisBuild            `json:"build,omitempty"`
+	SourceBuild        *DiagnosisBuild            `json:"release_source_build,omitempty"`
+	Release            *DiagnosisRelease          `json:"release,omitempty"`
+	Deployment         *DiagnosisDeployment       `json:"deployment,omitempty"`
+	Historical         *DiagnosisRevision         `json:"historical_revision,omitempty"`
+	BuildRevision      *DiagnosisRevision         `json:"build_revision,omitempty"`
+	RecordedBuild      *DiagnosisBuildSettings    `json:"recorded_release_build_settings,omitempty"`
+	Current            *DiagnosisRevision         `json:"current_desired_revision,omitempty"`
+	Image              *DiagnosisImage            `json:"image_observation,omitempty"`
+	LiveCandidate      *CandidateDiagnosticResult `json:"live_candidate,omitempty"`
+	Failure            *DiagnosisFailure          `json:"failure_observation,omitempty"`
+	Events             []contract.Event           `json:"events"`
+	Cursor             contract.Cursor            `json:"cursor"`
+	Partial            bool                       `json:"partial"`
+	HasMore            bool                       `json:"has_more"`
+	HistoryUnavailable bool                       `json:"history_unavailable"`
+	Unavailable        []string                   `json:"unavailable"`
 }
 
 type DiagnosisFailure struct {
-	Message     string `json:"message,omitempty"`
-	Stage       string `json:"stage,omitempty"`
-	StageSource string `json:"stage_source,omitempty"`
-	StepMessage string `json:"step_message,omitempty"`
+	Message     string        `json:"message,omitempty"`
+	Stage       string        `json:"stage,omitempty"`
+	Code        contract.Code `json:"code,omitempty"`
+	StageSource string        `json:"stage_source,omitempty"`
+	StepMessage string        `json:"step_message,omitempty"`
 }
 
 type DiagnosisRevision struct {

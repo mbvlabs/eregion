@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/riverqueue/river"
 )
@@ -21,8 +23,16 @@ const definitionPoll = 2 * time.Second
 var definitionProviderFailure = regexp.MustCompile(`^Cloudflare provider: (authorization|client-rejection|rate-limit|provider-unavailable|network/timeout|invalid-response)( \(HTTP [1-5][0-9][0-9]\))?$`)
 var definitionDefinitiveProviderFailure = regexp.MustCompile(`^Cloudflare provider: (authorization \(HTTP (401|403)\)|client-rejection \(HTTP 4[0-9][0-9]\))$`)
 var definitionCleanupRejectionPrefix = regexp.MustCompile(`^definitive cleanup rejection: [a-f0-9]{64} `)
+var definitionProviderDetail = regexp.MustCompile(`^(.*) (\(code ([1-9][0-9]{0,8}): [^()]*\))$`)
 
 func definitionDefinitiveRejection(message string) bool {
+	if parts := definitionProviderDetail.FindStringSubmatch(message); parts != nil {
+		code, _ := strconv.Atoi(parts[3])
+		if integrations.CloudflareErrorDetail(code) != parts[2] {
+			return false
+		}
+		message = parts[1]
+	}
 	return definitionDefinitiveProviderFailure.MatchString(message) &&
 		!strings.HasSuffix(message, "(HTTP 408)") && !strings.HasSuffix(message, "(HTTP 429)") &&
 		!strings.Contains(message, "client-rejection (HTTP 401)") && !strings.Contains(message, "client-rejection (HTTP 403)")
@@ -31,7 +41,15 @@ func definitionDefinitiveRejection(message string) bool {
 func definitionSafeProviderDiagnostic(message string) string {
 	message = strings.TrimPrefix(message, "definitive write rejection: ")
 	message = definitionCleanupRejectionPrefix.ReplaceAllString(message, "")
-	if definitionProviderFailure.MatchString(message) {
+	base := message
+	if parts := definitionProviderDetail.FindStringSubmatch(message); parts != nil {
+		code, _ := strconv.Atoi(parts[3])
+		if integrations.CloudflareErrorDetail(code) != parts[2] {
+			return ""
+		}
+		base = parts[1]
+	}
+	if definitionProviderFailure.MatchString(base) {
 		return message
 	}
 	return ""
@@ -238,6 +256,7 @@ func (w *platformWorker) runDefinitionApply(ctx context.Context, claimed contrac
 		if err := tx.Commit(ctx); err != nil {
 			return unavailable(err)
 		}
+		w.service.observeCommittedActionResult(op)
 		if active {
 			return river.JobSnooze(definitionPoll)
 		}
@@ -263,6 +282,7 @@ func (w *platformWorker) runDefinitionApply(ctx context.Context, claimed contrac
 		if err := tx.Commit(ctx); err != nil {
 			return unavailable(err)
 		}
+		w.service.observeCommittedActionResult(op)
 		if later || active {
 			return river.JobSnooze(definitionPoll)
 		}

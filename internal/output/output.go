@@ -202,7 +202,7 @@ func redactEnvelope(registry *secrets.Registry, envelope contract.Envelope) (con
 		clean.Next[i] = registry.Redact(next)
 	}
 	if envelope.Data != nil {
-		data, err := registry.JSON(envelope.Data)
+		data, err := redactData(registry, envelope.Data)
 		if err != nil {
 			return contract.Envelope{}, err
 		}
@@ -213,7 +213,7 @@ func redactEnvelope(registry *secrets.Registry, envelope contract.Envelope) (con
 		fault.Message = registry.Redact(fault.Message)
 		fault.Hint = registry.Redact(fault.Hint)
 		if fault.Details != nil {
-			data, err := registry.JSON(fault.Details)
+			data, err := redactFaultDetails(registry, fault.Details, fault.FollowDetails)
 			if err != nil {
 				return contract.Envelope{}, err
 			}

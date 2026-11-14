@@ -71,7 +71,6 @@ func StepFamilies() []Family {
 		{Match: resourceStepPattern.MatchString, Build: buildResourceStep},
 		{Match: resourceVolumeRemoveStepPattern.MatchString, Build: buildResourceVolumeRemoveStep},
 		{Match: candidateDiagnosticStepPattern.MatchString, Build: buildCandidateDiagnosticStep},
-		{Match: diagnosticExecutionPattern.MatchString, Build: buildDiagnosticExecutionStep},
 	}
 }
 
@@ -140,9 +139,17 @@ func buildArgvStep(exec engine.Execution, raw json.RawMessage) (engine.Step, err
 	if err := validateArgv(payload.Argv); err != nil {
 		return nil, err
 	}
+	// Container lifecycle create/start is reserved for the typed release
+	// command step; it is not a generic argv action.
+	if filepath.Base(payload.Argv[0]) == "docker" && len(payload.Argv) > 1 && (payload.Argv[1] == "create" || payload.Argv[1] == "start") {
+		return nil, errors.New("docker create and start are reserved for typed release commands")
+	}
 	if len(payload.CheckArgv) > 0 {
 		if err := validateArgv(payload.CheckArgv); err != nil {
 			return nil, err
+		}
+		if filepath.Base(payload.CheckArgv[0]) == "docker" && len(payload.CheckArgv) > 1 && (payload.CheckArgv[1] == "create" || payload.CheckArgv[1] == "start") {
+			return nil, errors.New("docker create and start are reserved for typed release commands")
 		}
 	}
 	if payload.TimeoutSeconds == 0 {
@@ -236,10 +243,14 @@ func (s *ArgvStep) commandEnv(rt engine.Runtime) ([]string, func(), error) {
 }
 
 func (s *ArgvStep) run(ctx context.Context, argv, env []string, rt engine.Runtime, report engine.Reporter) (string, string, error) {
+	return s.runWithOutputInfo(ctx, argv, env, rt, report, nil)
+}
+
+func (s *ArgvStep) runWithOutputInfo(ctx context.Context, argv, env []string, rt engine.Runtime, report engine.Reporter, info *commandOutputInfo) (string, string, error) {
 	if s.payload.IsolatedDocker {
-		return runArgvClean(ctx, argv, env, rt, s.ID(), report)
+		return runArgvWithEnvGraceCapture(ctx, argv, env, rt, s.ID(), report, 0, info)
 	}
-	return runArgv(ctx, argv, env, rt, s.ID(), report)
+	return runArgvWithEnvGraceCapture(ctx, argv, mergeEnv(os.Environ(), env), rt, s.ID(), report, 0, info)
 }
 
 func (s *ArgvStep) Apply(ctx context.Context, rt engine.Runtime, report engine.Reporter) (engine.ApplyResult, error) {
@@ -251,7 +262,9 @@ func (s *ArgvStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 		return engine.ApplyResult{}, err
 	}
 	defer cleanup()
-	stdout, stderr, err := s.run(runCtx, s.payload.Argv, extraEnv, rt, report)
+	var info commandOutputInfo
+	_, stderr, err := s.runWithOutputInfo(runCtx, s.payload.Argv, extraEnv, rt, report, &info)
+	stdout := info.stdoutSafe
 	if err != nil && s.payload.MissingOK && containerAlreadyGone(stderr) {
 		return engine.ApplyResult{Result: map[string]any{
 			"stdout": truncate(stdout, 8192), "missing": true,
@@ -271,7 +284,7 @@ func (s *ArgvStep) Apply(ctx context.Context, rt engine.Runtime, report engine.R
 			}
 			wrapped = fmt.Errorf("%w: %s", wrapped, detail)
 		}
-		return engine.ApplyResult{}, wrapped
+		return engine.ApplyResult{Result: StepExecutionEvidence{Stage: s.ID(), OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt), Stdout: truncate(stdout, 8192), Stderr: truncate(stderr, 4096), StdoutTruncated: info.stdoutTruncated || len(stdout) > 8192, StderrTruncated: info.stderrTruncated || len(stderr) > 4096}}, wrapped
 	}
 	return engine.ApplyResult{Result: map[string]any{"stdout": truncate(stdout, 8192)}}, nil
 }
@@ -481,40 +494,55 @@ func (s *ContainerStep) Apply(ctx context.Context, rt engine.Runtime, report eng
 	if err != nil {
 		return engine.ApplyResult{}, err
 	}
+	var previous *ExecutionEvidence
+	if _, _, _, exists, _ := s.inspect(ctx); exists {
+		evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+		previous = &evidence
+	}
 	removeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	_, _, _ = runArgv(removeCtx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
 	cancel()
 	runCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	_, stderr, err := runArgv(runCtx, args, env, rt, s.ID(), report)
+	var startInfo commandOutputInfo
+	_, stderr, err := runArgvWithEnvGraceCapture(runCtx, args, mergeEnv(os.Environ(), env), rt, s.ID(), report, 0, &startInfo)
 	cancel()
 	if err != nil {
+		current := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+		failure := engine.ApplyResult{Result: StepExecutionEvidence{Stage: "container-start", OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt), Stderr: truncate(stderr, 4096), StderrTruncated: startInfo.stderrTruncated || len(stderr) > 4096, Previous: previous, Container: &current}}
 		if s.payload.FallbackImage != "" {
 			fallbackArgs, fallbackEnv, fallbackEnvErr := s.runArgs(ctx, s.payload.FallbackImage, rt)
 			if fallbackEnvErr != nil {
-				return engine.ApplyResult{}, fallbackEnvErr
+				return failure, fallbackEnvErr
 			}
 			fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 2*time.Minute)
 			_, _, fallbackErr := runArgv(fallbackCtx, fallbackArgs, fallbackEnv, rt, s.ID(), report)
 			fallbackCancel()
 			if fallbackErr == nil {
-				return engine.ApplyResult{}, fmt.Errorf("%w: starting %s failed (%s); the previous image was restored", engine.ErrPermanent, s.payload.Image, firstLine(stderr))
+				return failure, fmt.Errorf("%w: starting %s failed (%s); the previous image was restored", engine.ErrPermanent, s.payload.Image, firstLine(stderr))
 			}
 		}
-		return engine.ApplyResult{}, fmt.Errorf("%w: docker run failed: %s", engine.ErrPermanent, firstLine(stderr))
+		return failure, fmt.Errorf("%w: docker run failed: %s", engine.ErrPermanent, firstLine(stderr))
 	}
 	hostPort := s.payload.HostPort
 	if s.payload.Publish && hostPort == 0 {
 		portCtx, portCancel := context.WithTimeout(ctx, 20*time.Second)
-		output, portStderr, portErr := runArgv(portCtx, []string{"docker", "port", s.payload.Name, fmt.Sprintf("%d/tcp", s.payload.ContainerPort)}, nil, rt, s.ID(), nil)
+		var portInfo commandOutputInfo
+		output, portStderr, portErr := runArgvWithEnvGraceCapture(portCtx, []string{"docker", "port", s.payload.Name, fmt.Sprintf("%d/tcp", s.payload.ContainerPort)}, os.Environ(), rt, s.ID(), nil, 0, &portInfo)
 		portCancel()
 		if portErr != nil {
-			_, _, _ = runArgv(ctx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
-			return engine.ApplyResult{}, fmt.Errorf("%w: reading the dynamic loopback port failed: %s", engine.ErrPermanent, firstLine(portStderr))
+			evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			_, _, _ = runArgv(cleanupCtx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
+			cleanupCancel()
+			return engine.ApplyResult{Result: StepExecutionEvidence{Stage: "container-port", OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt), Stderr: truncate(portStderr, 4096), StderrTruncated: portInfo.stderrTruncated || len(portStderr) > 4096, Previous: previous, Container: &evidence}}, fmt.Errorf("%w: reading the dynamic loopback port failed: %s", engine.ErrPermanent, firstLine(portStderr))
 		}
 		hostPort, err = ParsePublishedPort(output, s.payload.ContainerPort)
 		if err != nil {
-			_, _, _ = runArgv(ctx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
-			return engine.ApplyResult{}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
+			evidence := captureExecutionEvidence(ctx, s.payload.Name, s.payload.Labels, rt)
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			_, _, _ = runArgv(cleanupCtx, []string{"docker", "rm", "-f", s.payload.Name}, nil, rt, s.ID(), nil)
+			cleanupCancel()
+			return engine.ApplyResult{Result: StepExecutionEvidence{Stage: "container-port", OutputAvailability: "bounded", RedactionContext: originalRedactionContext(rt), Stdout: truncate(portInfo.stdoutSafe, 8192), StdoutTruncated: portInfo.stdoutTruncated || len(portInfo.stdoutSafe) > 8192, Previous: previous, Container: &evidence}}, fmt.Errorf("%w: %s", engine.ErrPermanent, err)
 		}
 	}
 	if report != nil {
@@ -523,6 +551,10 @@ func (s *ContainerStep) Apply(ctx context.Context, rt engine.Runtime, report eng
 	result := map[string]any{
 		"container": s.payload.Name,
 		"image":     s.payload.Image,
+	}
+	if previous != nil {
+		result["previous_container_evidence"] = previous
+		result["redaction_context"] = originalRedactionContext(rt)
 	}
 	if s.payload.Publish {
 		result["host_port"] = hostPort
@@ -2456,7 +2488,7 @@ func validateArgv(argv []string) error {
 			return errors.New("docker command is missing a subcommand")
 		}
 		switch argv[1] {
-		case "version", "pull", "run", "stop", "rm", "inspect", "port", "ps", "network", "restart", "exec", "tag":
+		case "version", "pull", "run", "create", "start", "stop", "rm", "inspect", "port", "ps", "network", "restart", "exec", "tag":
 		case "image":
 			if len(argv) < 3 || (argv[2] != "inspect" && argv[2] != "ls" && argv[2] != "rm") {
 				return errors.New("unsupported docker image command")
@@ -2637,6 +2669,16 @@ func runArgvWithEnv(ctx context.Context, argv []string, env []string, rt engine.
 }
 
 func runArgvWithEnvGrace(ctx context.Context, argv []string, env []string, rt engine.Runtime, step string, report engine.Reporter, grace time.Duration) (string, string, error) {
+	return runArgvWithEnvGraceCapture(ctx, argv, env, rt, step, report, grace, nil)
+}
+
+type commandOutputInfo struct {
+	stdoutTruncated bool
+	stderrTruncated bool
+	stdoutSafe      string
+}
+
+func runArgvWithEnvGraceCapture(ctx context.Context, argv []string, env []string, rt engine.Runtime, step string, report engine.Reporter, grace time.Duration, info *commandOutputInfo) (string, string, error) {
 	if err := validateArgv(argv); err != nil {
 		return "", "", fmt.Errorf("%w: %s", engine.ErrPermanent, err)
 	}
@@ -2674,13 +2716,22 @@ func runArgvWithEnvGrace(ctx context.Context, argv []string, env []string, rt en
 		registry = &secrets.Registry{}
 	}
 	capture := &commandCapture{registry: registry, step: step, report: report}
-	stdout := &lineSink{capture: capture, stream: "stdout"}
-	stderr := &lineSink{capture: capture, stream: "stderr"}
+	streamSafe := rt.Secrets == nil || rt.SecretValues != nil
+	if rt.Secrets.RequiresWholeTextRedaction() {
+		streamSafe = false
+	}
+	stdout := &lineSink{capture: capture, stream: "stdout", streaming: streamSafe}
+	stderr := &lineSink{capture: capture, stream: "stderr", streaming: streamSafe}
 	command.Stdout, command.Stderr = stdout, stderr
 	err := command.Run()
 	stdout.Flush()
 	stderr.Flush()
 	capture.finish()
+	if info != nil {
+		info.stdoutTruncated = stdout.discarded > 0 || len(stdout.clean) > 65536
+		info.stderrTruncated = stderr.discarded > 0 || len(stderr.clean) > 65536
+		info.stdoutSafe = diagnosticPrefix(stdout.clean, 65536)
+	}
 	if ctx.Err() != nil {
 		if command.Process != nil {
 			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
@@ -2773,69 +2824,98 @@ func (c *commandCapture) finish() {
 }
 
 type lineSink struct {
-	capture   *commandCapture
-	stream    string
-	buf       bytes.Buffer
-	pending   []byte
-	discarded uint64
+	capture       *commandCapture
+	stream        string
+	buf           bytes.Buffer
+	discarded     uint64
+	clean         string
+	private       string
+	streaming     bool
+	pending       []byte
+	lineDiscarded uint64
 }
 
 func (s *lineSink) Write(p []byte) (int, error) {
 	s.capture.mu.Lock()
 	defer s.capture.mu.Unlock()
 	n := len(p)
-	if s.buf.Len() < 65536 {
-		room := 65536 - s.buf.Len()
-		if len(p) < room {
-			room = len(p)
-		}
-		_, _ = s.buf.Write(p[:room])
+	room := 2*commandLogHalf - s.buf.Len()
+	if room > len(p) {
+		room = len(p)
 	}
-	if s.capture.report == nil {
-		return n, nil
-	}
-	for len(p) > 0 {
-		index := bytes.IndexByte(p, '\n')
-		segment := p
-		if index >= 0 {
-			segment = p[:index]
+	_, _ = s.buf.Write(p[:room])
+	s.discarded += uint64(len(p) - room)
+	if s.streaming && s.capture.report != nil {
+		for len(p) > 0 {
+			index := bytes.IndexByte(p, '\n')
+			segment := p
+			if index >= 0 {
+				segment = p[:index]
+			}
+			if s.lineDiscarded > 0 || len(s.pending)+len(segment) > 65536 {
+				s.lineDiscarded += uint64(len(s.pending) + len(segment))
+				s.pending = nil
+			} else {
+				s.pending = append(s.pending, segment...)
+			}
+			if index < 0 {
+				break
+			}
+			s.flushStreamingLine()
+			p = p[index+1:]
 		}
-		if s.discarded > 0 || len(s.pending)+len(segment) > 65536 {
-			s.discarded += uint64(len(s.pending)) + uint64(len(segment))
-			s.pending = nil
-		} else {
-			s.pending = append(s.pending, segment...)
-		}
-		if index < 0 {
-			break
-		}
-		if s.discarded > 0 {
-			s.loss()
-		} else {
-			s.emit(strings.TrimRight(string(s.pending), "\r"))
-			s.pending = nil
-		}
-		p = p[index+1:]
 	}
 	return n, nil
+}
+
+func (s *lineSink) flushStreamingLine() {
+	if s.lineDiscarded > 0 {
+		s.capture.record(fmt.Sprintf("%s: oversized line discarded (%d bytes)", s.stream, s.lineDiscarded))
+		s.lineDiscarded = 0
+		s.pending = nil
+		return
+	}
+	text := s.capture.registry.Redact(string(s.pending))
+	text = s.capture.registry.Redact(output.SafeText(text))
+	s.emit(text)
+	s.pending = nil
 }
 
 func (s *lineSink) Flush() {
 	s.capture.mu.Lock()
 	defer s.capture.mu.Unlock()
-	if s.discarded > 0 {
-		s.loss()
-	} else if len(s.pending) > 0 {
-		s.emit(string(s.pending))
-		s.pending = nil
+	raw := s.buf.String()
+	if s.stream == "stdout" {
+		s.private = raw[:min(len(raw), 65536)]
 	}
+	if s.discarded > 0 {
+		// Redaction after sanitization can reconstruct a secret beyond an
+		// arbitrary raw cutoff. Do not publish a buffered partial stream.
+		raw = ""
+	}
+	clean := s.capture.registry.RedactPreservingLength(raw)
+	clean = strings.ReplaceAll(clean, "\r\n", "\n")
+	clean = s.capture.registry.Redact(output.SafeText(clean))
+	s.clean = clean
+	// Chunk the sanitized stream, rather than emitting one database event per
+	// tiny line. Newlines remain in the message and the existing 4 KiB frame
+	// bound and 2 MiB total event budget still apply.
+	if s.streaming {
+		s.flushStreamingLine()
+	} else {
+		s.emit(clean)
+	}
+	if s.discarded > 0 {
+		s.capture.record(fmt.Sprintf("%s: command output truncated; at least %d raw bytes omitted", s.stream, s.discarded))
+	}
+	s.buf.Reset()
 }
 
 func (s *lineSink) emit(line string) {
 	if s.capture.report == nil || strings.TrimSpace(line) == "" {
 		return
 	}
-	message := output.SafeText(s.capture.registry.Redact(line))
+	message := line
 	prefix := s.stream + ": "
 	for len(message) > 0 {
 		end := min(len(message), 4096-len(prefix))
@@ -2847,16 +2927,13 @@ func (s *lineSink) emit(line string) {
 	}
 }
 
-func (s *lineSink) loss() {
-	s.capture.record(fmt.Sprintf("%s: oversized line discarded (%d bytes)", s.stream, s.discarded))
-	s.discarded = 0
-	s.pending = nil
-}
-
 func (s *lineSink) String() string {
 	s.capture.mu.Lock()
 	defer s.capture.mu.Unlock()
-	return s.buf.String()
+	if s.stream == "stdout" {
+		return s.private
+	}
+	return diagnosticPrefix(s.clean, 65536)
 }
 
 func firstLine(value string) string {

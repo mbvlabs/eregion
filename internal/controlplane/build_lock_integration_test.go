@@ -33,17 +33,20 @@ type buildLockEvent struct {
 // remaining effects use the existing scripted deployment transport.
 type buildLockTransport struct {
 	*scriptedPlatformTransport
-	engine  *engine.Engine
-	entered chan buildLockEvent
-	script  string
+	engine      *engine.Engine
+	entered     chan buildLockEvent
+	script      string
+	gateNetwork bool
 }
 
 type buildLockEffect struct {
 	engine.Step
-	execution engine.Execution
-	entered   chan buildLockEvent
-	script    string
-	finished  chan struct{}
+	execution   engine.Execution
+	entered     chan buildLockEvent
+	script      string
+	finished    chan struct{}
+	gateNetwork bool
+	checked     chan struct{}
 }
 
 func (s *buildLockEffect) SharedHostResources() []string {
@@ -51,6 +54,9 @@ func (s *buildLockEffect) SharedHostResources() []string {
 }
 
 func (s *buildLockEffect) Check(context.Context, engine.Runtime) (engine.CheckResult, error) {
+	if s.checked != nil {
+		s.checked <- struct{}{}
+	}
 	return engine.CheckResult{Detail: "controlled external effect"}, nil
 }
 
@@ -59,6 +65,9 @@ func (s *buildLockEffect) Apply(ctx context.Context, _ engine.Runtime, _ engine.
 	if s.execution.Step == deploymentPackStep {
 		event.release = make(chan struct{})
 		event.interrupt = make(chan struct{})
+	}
+	if s.execution.Step == deploymentNetworkStep && s.gateNetwork {
+		event.release = make(chan struct{})
 	}
 	select {
 	case s.entered <- event:
@@ -86,7 +95,7 @@ func (s *buildLockEffect) Apply(ctx context.Context, _ engine.Runtime, _ engine.
 }
 
 func (t *buildLockTransport) Call(ctx context.Context, request node.Request, report func(node.Event)) (node.Response, error) {
-	if request.Execution.Step != deploymentPackStep && request.Execution.Step != deploymentNetworkStep {
+	if request.Execution.Step != deploymentPackStep && request.Execution.Step != deploymentNetworkStep && request.Execution.Step != deploymentCommandStep {
 		return t.scriptedPlatformTransport.Call(ctx, request, report)
 	}
 	var status engine.TaskStatus
@@ -99,7 +108,7 @@ func (t *buildLockTransport) Call(ctx context.Context, request node.Request, rep
 		if err == nil {
 			finished := make(chan struct{})
 			defer close(finished)
-			step = &buildLockEffect{Step: step, execution: request.Execution, entered: t.entered, script: t.script, finished: finished}
+			step = &buildLockEffect{Step: step, execution: request.Execution, entered: t.entered, script: t.script, finished: finished, gateNetwork: t.gateNetwork}
 			status, err = t.engine.Run(ctx, step, request.Execution, nil)
 		}
 	}
@@ -112,6 +121,213 @@ func (t *buildLockTransport) Call(ctx context.Context, request node.Request, rep
 		Executed: status.Executed, Phase: status.Phase, WaitMS: status.WaitMS, Detail: status.Detail,
 		ErrorCode: status.ErrorCode, Retryable: status.Retryable,
 	}, nil
+}
+
+// TestIntegrationReleaseCommandSharesHostFence uses a real worker and engine;
+// only the external Docker/Pack effects are replaced by a test-owned script.
+func TestIntegrationReleaseCommandSharesHostFence(t *testing.T) {
+	pool, _ := testPool(t, true)
+	root := t.TempDir()
+	eng, err := engine.New(root, "local", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng.LockTimeout = 30 * time.Second
+	script := filepath.Join(t.TempDir(), "host-effect")
+	result, err := json.Marshal(map[string]any{
+		"reference": "127.0.0.1:5000/live@sha256:" + strings.Repeat("b", 64),
+		"image_id":  "sha256:" + strings.Repeat("a", 64),
+		"commit":    buildSlotCommit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := "#!/bin/sh\ncase \"$1\" in\n" + deploymentPackStep + ") printf '%s\\n' '" + string(result) + "' ;;\n*) printf '%s\\n' '{}' ;;\nesac\n"
+	if err := os.WriteFile(script, []byte(content), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transport := &buildLockTransport{
+		engine: eng, entered: make(chan buildLockEvent, 16), script: script, gateNetwork: true,
+		scriptedPlatformTransport: &scriptedPlatformTransport{results: map[string]json.RawMessage{
+			deploymentImageStep:      json.RawMessage(`{"stdout":"sha256:` + strings.Repeat("a", 64) + `"}`),
+			deploymentReadyImageStep: json.RawMessage(`{"image":"127.0.0.1:5000/live@sha256:` + strings.Repeat("b", 64) + `","image_id":"sha256:` + strings.Repeat("a", 64) + `"}`),
+		}},
+	}
+	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: 2, TestOnly: true, Transport: transport, RegistryEndpoint: "127.0.0.1:5000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := run.Service
+	service.routeSwitch = func(context.Context, platform.Environment, []string) error { return nil }
+	service.routeSync = func(context.Context) error { return nil }
+	service.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
+	startWorkers(t, run)
+	platformAwait(t, service, platformSubmit(t, service, platform.KindNodeRegister, "platform", "shared-node", map[string]any{
+		"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
+		"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
+	}), contract.Succeeded)
+	for _, app := range []string{"packapp", "commandapp"} {
+		platformAwait(t, service, platformSubmit(t, service, platform.KindAppCreate, "platform", "app-"+app, map[string]any{"name": app}), contract.Succeeded)
+		platformAwait(t, service, platformSubmit(t, service, platform.KindEnvironmentCreate, "app/"+app, "env-"+app, map[string]any{
+			"name": "production", "node": "local", "container_port": 8080,
+			"source": map[string]any{"url": "https://github.com/acme/app.git", "ref": buildSlotCommit, "builder": "paketobuildpacks/builder-jammy-base"},
+			"domain": app + ".example.com", "domain_primary": true,
+		}), contract.Succeeded)
+	}
+	release := seedArtifactRelease(t, service, "commandapp", "production", "registry.example/command:v1",
+		withSeededReleaseImageID("sha256:"+strings.Repeat("a", 64)),
+		withSeededReleaseCommand(platform.CommandSpec{Argv: []string{"/bin/true"}, TimeoutSeconds: 5}))
+	next := func() buildLockEvent {
+		t.Helper()
+		select {
+		case event := <-transport.entered:
+			return event
+		case <-time.After(30 * time.Second):
+			t.Fatal("worker did not reach expected effect")
+			return buildLockEvent{}
+		}
+	}
+	command := platformSubmit(t, service, platform.KindDeploy, "env/commandapp/production", "command", map[string]any{"release_id": release.ID})
+	network := next()
+	if network.execution.OperationID != command.ID || network.execution.Step != deploymentNetworkStep {
+		t.Fatalf("expected command deployment network, got %+v", network.execution)
+	}
+	defer func() {
+		select {
+		case <-network.release:
+		default:
+			close(network.release)
+		}
+	}()
+	build := platformSubmit(t, service, platform.KindDeploy, "env/packapp/production", "build", map[string]any{})
+	pack := next()
+	if pack.execution.OperationID != build.ID || pack.execution.Step != deploymentPackStep {
+		t.Fatalf("expected Pack effect, got %+v", pack.execution)
+	}
+	defer func() {
+		select {
+		case <-pack.release:
+		default:
+			close(pack.release)
+		}
+	}()
+	if unlock, err := engine.Acquire(context.Background(), node.HostLockPath(root), engine.LockExclusive, 0); err == nil {
+		unlock()
+		t.Fatal("active Pack failed to fence an exclusive host mutation")
+	} else if !errors.Is(err, engine.ErrLockHeld) {
+		t.Fatal(err)
+	}
+	close(network.release)
+	event := next()
+	if event.execution.OperationID != command.ID || event.execution.Step != deploymentCommandStep {
+		t.Fatalf("release command did not reach effect while Pack was active: %+v", event.execution)
+	}
+	platformAwait(t, service, command, contract.Succeeded)
+	// Long valid app/environment names can truncate away deployment identity.
+	app := strings.Repeat("a", 40)
+	env1 := platform.Environment{App: app, Name: strings.Repeat("b", 39) + "c"}
+	env2 := platform.Environment{App: app, Name: strings.Repeat("b", 39) + "d"}
+	name := workloadCommandName(env1, platform.DeploymentID("dep_111111111111"))
+	if other := workloadCommandName(env2, platform.DeploymentID("dep_222222222222")); name != other {
+		t.Fatalf("expected truncated container-name collision: %q / %q", name, other)
+	}
+	payload := platform.ReleaseCommandPayload{
+		Step: deploymentCommandStep, Name: name, Image: "sha256:" + strings.Repeat("c", 64),
+		Network: "er-env-one", Command: []string{"/bin/true"}, TimeoutSeconds: 5,
+	}
+	colliding := platform.ReleaseCommandPayload{
+		Step: deploymentCommandStep, Name: workloadCommandName(env2, platform.DeploymentID("dep_222222222222")),
+		Image: "sha256:" + strings.Repeat("d", 64), Network: "er-env-two",
+		Command: []string{"/bin/true"}, TimeoutSeconds: 5,
+	}
+	if payload.Name != colliding.Name || payload.Image == colliding.Image || payload.Network == colliding.Network {
+		t.Fatal("collision fixture must share only the container identity")
+	}
+	for _, resource := range []string{"docker-container\x00" + colliding.Name, "docker-image\x00" + payload.Image, "docker-network\x00" + payload.Network} {
+		t.Run(strings.Split(resource, "\x00")[0], func(t *testing.T) {
+			// Only this key is held in a fresh engine, so a deferred result
+			// proves contention on that exact identity, not a transient wait
+			// on another resource in the sorted acquisition sequence.
+			root := t.TempDir()
+			eng, err := engine.New(root, "local", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			eng.LockTimeout = 100 * time.Millisecond
+			sum := sha256.Sum256([]byte(resource))
+			unlock, err := engine.Acquire(context.Background(), filepath.Join(root, "resource-locks", hex.EncodeToString(sum[:])+".lock"), engine.LockExclusive, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			held := true
+			defer func() {
+				if held {
+					unlock()
+				}
+			}()
+			id, err := contract.NewOperationID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution := engine.Execution{OperationID: id, Attempt: 1, Step: deploymentCommandStep}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			step, err := node.DefaultRegistry().Build(execution, raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checked := make(chan struct{}, 1)
+			entered := make(chan buildLockEvent, 1)
+			effect := &buildLockEffect{Step: step, execution: execution, entered: entered, script: script, checked: checked}
+			status, err := eng.Run(context.Background(), effect, execution, nil)
+			if !errors.Is(err, engine.ErrLockHeld) || status.Status != engine.StatusDeferred ||
+				status.Detail != "exited while waiting for a resource lock before Check/Apply; no effect was attempted" {
+				t.Fatalf("expected resource-lock deferral, got %+v, %v", status, err)
+			}
+			observation, err := eng.Status(context.Background(), execution)
+			if err != nil || observation.Status != engine.StatusDeferred || observation.Detail != status.Detail {
+				t.Fatalf("resource-lock deferral was not durable: %+v, %v", observation, err)
+			}
+			select {
+			case <-checked:
+				t.Fatal("Check ran while resource was locked")
+			default:
+			}
+			select {
+			case got := <-entered:
+				t.Fatalf("Apply ran while resource was locked: %+v", got.execution)
+			default:
+			}
+			unlock()
+			held = false
+			status, err = eng.Run(context.Background(), effect, execution, nil)
+			if err != nil || status.Status != engine.StatusCompleted || !status.Executed {
+				t.Fatalf("same effect did not complete after unlock: %+v, %v", status, err)
+			}
+			select {
+			case <-checked:
+			default:
+				t.Fatal("retry did not run Check")
+			}
+			select {
+			case got := <-entered:
+				if got.execution != execution {
+					t.Fatalf("unexpected effect after unlock: %+v", got.execution)
+				}
+			default:
+				t.Fatal("retry did not run Apply")
+			}
+		})
+	}
+	close(pack.release)
+	event = next()
+	if event.execution.OperationID != build.ID || event.execution.Step != deploymentNetworkStep {
+		t.Fatalf("expected build deployment network, got %+v", event.execution)
+	}
+	close(event.release)
+	platformAwait(t, service, build, contract.Succeeded)
 }
 
 // TestIntegrationBuildLockCompatibility exercises actual service submissions,

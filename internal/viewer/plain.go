@@ -167,6 +167,28 @@ func (p *Plain) Finish(summary Summary, err error, resume string, now time.Time)
 			line += " · " + summary.Cleanup.Detail
 		}
 	}
+	if result := summary.Operation.LatestResult; result != nil {
+		if result.Stage != "" {
+			line += "\nstage: " + result.Stage
+		}
+		if result.Message != "" {
+			line += "\nresult: " + result.Message
+		}
+		excerpt, availability, omitted := result.Excerpt, result.Evidence, result.ExcerptOmitted
+		if evidence := summary.Operation.Evidence; evidence != nil {
+			excerpt, availability, omitted = evidence.Excerpt, evidence.Availability, evidence.ExcerptOmitted
+		}
+		if excerpt != "" {
+			line += "\nexcerpt: " + excerpt
+		} else if omitted != "" {
+			line += "\nexcerpt omitted: " + omitted
+		}
+		line += "\nevidence: " + availability
+		line += "\nhistory: " + string(result.History.OperationID) + " after " + fmt.Sprintf("%d", result.History.After)
+	}
+	if summary.Operation.EvidenceReadError != "" {
+		line += "\nevidence read: " + summary.Operation.EvidenceReadError
+	}
 	return p.line(p.clean()(line))
 }
 

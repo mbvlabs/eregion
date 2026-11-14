@@ -2,10 +2,12 @@ package controlplane
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -96,6 +98,10 @@ func TestIntegrationTestRuntimeRegistryHostBindingAllowsAppDelete(t *testing.T) 
 	if err := runPlatformAttempt(ctx, s, create.ID, 1); err != nil {
 		t.Fatalf("create app: %v", err)
 	}
+	var originalAppID platform.AppID
+	if err := pool.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name='bindingdelete'`).Scan(&originalAppID); err != nil {
+		t.Fatal(err)
+	}
 	s.humanFactor = func(string) error { return nil }
 	deletion := platformSubmission(platform.KindAppDelete, "app/bindingdelete", "runtime-binding-delete", map[string]any{
 		"confirm": "bindingdelete",
@@ -114,6 +120,27 @@ func TestIntegrationTestRuntimeRegistryHostBindingAllowsAppDelete(t *testing.T) 
 	}
 	if apps != 0 {
 		t.Fatalf("app delete left %d application row(s)", apps)
+	}
+	completed, err := s.Get(ctx, op.Actor, op.ID)
+	if err != nil || completed.State != contract.Succeeded || completed.LatestResult == nil {
+		t.Fatalf("delete result: %+v, %v", completed, err)
+	}
+	var result struct {
+		AppID           platform.AppID `json:"app_id"`
+		App             string         `json:"app"`
+		AppDeleted      bool           `json:"app_deleted"`
+		ResourceVolumes string         `json:"resource_volumes"`
+	}
+	if err := json.Unmarshal(completed.LatestResult.Data, &result); err != nil ||
+		result.AppID != originalAppID || result.App != "bindingdelete" || !result.AppDeleted ||
+		result.ResourceVolumes != "unchanged" {
+		t.Fatalf("deleted identity was not retained: %+v, %v", result, err)
+	}
+	replayed, err := s.Submit(ctx, deletion)
+	if err != nil || replayed.ID != completed.ID || replayed.LatestResult == nil ||
+		string(replayed.LatestResult.Data) != string(completed.LatestResult.Data) ||
+		replayed.LastSequence != completed.LastSequence {
+		t.Fatalf("terminal deletion replay changed or omitted its result: %+v, %v", replayed, err)
 	}
 
 	secondRun := testRuntime(t, pool, 0)

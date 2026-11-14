@@ -43,11 +43,18 @@ func KnownCode(code Code) bool { _, ok := exits[code]; return ok }
 
 // Fault is safe to expose after redaction. Causes are never serialized.
 type Fault struct {
-	Code    Code           `json:"code"`
-	Message string         `json:"message"`
-	Hint    string         `json:"hint,omitempty"`
-	Details map[string]any `json:"details,omitempty"`
-	Cause   error          `json:"-"`
+	Code          Code                `json:"code"`
+	Message       string              `json:"message"`
+	Hint          string              `json:"hint,omitempty"`
+	Details       map[string]any      `json:"details,omitempty"`
+	Cause         error               `json:"-"`
+	FollowDetails *FollowFaultDetails `json:"-"`
+}
+
+// FollowFaultDetails identifies the values produced by the follow viewer,
+// independently of any additional, untrusted fault details.
+type FollowFaultDetails struct {
+	Values map[string]any
 }
 
 func (e *Fault) Error() string { return e.Message }

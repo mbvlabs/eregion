@@ -2,7 +2,11 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -18,32 +22,37 @@ import (
 // captureCandidateDiagnostics is best effort and is called while the lifecycle
 // owner is held, before terminal cleanup intent is released to maintenance. A
 // durable claim prevents retries from duplicating output, including after a lost
-// response or partial failure. An interrupted claim is itself an unavailable
-// summary. Nothing in this path can veto the safety tail.
-func (s *Service) captureCandidateDiagnostics(parent context.Context, env platform.Environment, dep platform.Deployment) {
+// response or partial failure. A claim without a completion summary remains
+// unconfirmed. Nothing in this path can veto the safety tail.
+func (s *Service) captureCandidateDiagnostics(parent context.Context, env platform.Environment, dep platform.Deployment, attempt uint32) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
 	defer cancel()
 	op, _, err := s.operationSnapshot(ctx, dep.OperationID)
+	if err != nil || op.Attempt != attempt {
+		return
+	}
+	step, err := s.candidateCaptureStep(ctx, env, dep, op)
 	if err != nil {
 		return
 	}
 	claimed := false
 	err = s.mutateCandidateDiagnostic(ctx, op, func(tx pgx.Tx, current *contract.Operation) error {
 		var allowed, exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_deployment_owners WHERE environment_id=$1 AND operation_id=$2 AND deployment_id=$3)`, env.ID, op.ID, dep.ID).Scan(&allowed); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT true FROM eregion_platform_deployment_owners WHERE environment_id=$1 AND operation_id=$2 AND deployment_id=$3 AND owner_attempt=$4 FOR UPDATE`, env.ID, op.ID, dep.ID, attempt).Scan(&allowed); errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		} else if err != nil {
 			return err
 		}
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'=$2)`, op.ID, platform.CandidateDiagnosticStage).Scan(&exists); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'=$2 AND event->>'attempt'=$3 AND event->>'step'=$4)`, op.ID, platform.CandidateDiagnosticStage, fmt.Sprint(op.Attempt), step).Scan(&exists); err != nil {
 			return err
 		}
 		if exists {
 			return nil
 		}
-		if err := appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Message: "Candidate diagnostic capture started; unavailable if no completion summary follows.", CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Status: "unavailable"}}); err != nil {
+		if err := appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate diagnostic capture started; completion is unconfirmed until a summary follows.", CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Status: "unconfirmed"}}); err != nil {
 			return err
 		}
-		// Capture requires the exact lifecycle owner. An ambiguous or absent
-		// owner leaves only the unavailable marker, never a Docker read.
+		// Only the exact lifecycle owner may claim a Docker read.
 		claimed = allowed
 		return nil
 	})
@@ -51,31 +60,84 @@ func (s *Service) captureCandidateDiagnostics(parent context.Context, env platfo
 		return
 	}
 	result := platform.CandidateDiagnosticResult{Unavailable: true}
-	if captured, ok := s.readCandidateDiagnostics(ctx, env, dep, op); ok {
+	if captured, ok := s.readCandidateDiagnostics(ctx, env, dep, op, step); ok {
 		result = captured
 	}
 	// The claim is already durable; write all output and its summary atomically.
-	// If this fails, the claim remains the honest unavailable summary.
+	// If this fails, the claim remains honestly unconfirmed.
 	_ = s.mutateCandidateDiagnostic(ctx, op, func(tx pgx.Tx, current *contract.Operation) error {
+		var owned bool
+		if err := tx.QueryRow(ctx, `SELECT true FROM eregion_platform_deployment_owners WHERE environment_id=$1 AND operation_id=$2 AND deployment_id=$3 AND owner_attempt=$4 FOR UPDATE`, env.ID, op.ID, dep.ID, attempt).Scan(&owned); errors.Is(err, pgx.ErrNoRows) {
+			return errNotOwned
+		} else if err != nil {
+			return err
+		}
+		if !owned {
+			return errNotOwned
+		}
+		for _, observation := range result.Observations {
+			d := &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Process: observation.Process, Replica: observation.Replica, Container: observation.Container, ContainerID: observation.ContainerID, Timestamp: observation.ObservedAt, Status: "observed", Observation: &contract.CandidateLifecycleObservation{State: observation.State, Running: observation.Running, StartedAt: observation.StartedAt, FinishedAt: observation.FinishedAt, ExitCode: observation.ExitCode, OOMKilled: observation.OOMKilled, Health: observation.Health}}
+			if err := appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate lifecycle observed before cleanup.", CandidateDiagnostic: d}); err != nil {
+				return err
+			}
+		}
 		for _, line := range result.Lines {
-			d := &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Process: line.Process, Replica: line.Replica, Container: line.Container, ContainerID: line.ContainerID, Timestamp: line.Timestamp, Status: "captured"}
-			if err := appendEvent(ctx, tx, current, contract.Event{Kind: "log", Stage: platform.CandidateDiagnosticStage, Message: line.Message, CandidateDiagnostic: d}); err != nil {
+			d := &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Process: line.Process, Replica: line.Replica, Container: line.Container, ContainerID: line.ContainerID, Timestamp: line.Timestamp, Status: "captured", RedactionContext: result.RedactionContext}
+			if err := appendEvent(ctx, tx, current, contract.Event{Kind: "log", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "[log read time; original line time unavailable] " + line.Message, CandidateDiagnostic: d}); err != nil {
 				return err
 			}
 		}
 		status := "complete"
 		if result.Unavailable {
 			status = "unavailable"
+			if len(result.Observations) > 0 || len(result.Lines) > 0 {
+				status = "partial"
+			}
 		}
 		if result.Truncated {
-			if status == "unavailable" {
-				status = "unavailable_truncated"
+			if status == "unavailable" || status == "partial" {
+				status += "_truncated"
 			} else {
 				status = "truncated"
 			}
 		}
-		return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Message: "Candidate diagnostic capture: " + status + ".", CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Status: status}})
+		return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate diagnostic capture: " + status + ".", CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Status: status}})
 	})
+}
+
+// candidateCaptureStep scopes a claim to immutable planned identities and
+// recorded execution IDs, never a wall clock or a mutable diagnostic deadline.
+func (s *Service) candidateCaptureStep(ctx context.Context, env platform.Environment, dep platform.Deployment, op contract.Operation) (string, error) {
+	revision, err := s.revisionByID(ctx, dep.RevisionID)
+	identities := []string{string(op.ID), fmt.Sprint(op.Attempt), string(dep.ID)}
+	if err != nil || revision.App != env.App || revision.Environment != env.Name {
+		identities = append(identities, "plan:unavailable")
+	} else {
+		plan, planErr := platform.PlanDeployment(env.App, env.Name, revision.RevisionState, dep.ReleaseID, dep.ID)
+		if planErr != nil {
+			identities = append(identities, "plan:unavailable")
+		} else {
+			for _, item := range plan {
+				identities = append(identities, "container:"+item.Name)
+			}
+		}
+	}
+	records, err := s.stepRecords(ctx, op.ID)
+	if err != nil {
+		return "", err
+	}
+	for _, record := range records {
+		if record.ExecutionID != "" && (strings.HasPrefix(record.Step, deploymentContainerStepPrefix) || strings.HasPrefix(record.Step, "platform-health-") || strings.HasPrefix(record.Step, "platform-command-") || strings.HasPrefix(record.Step, "platform-port-")) {
+			identities = append(identities, "execution:"+record.ExecutionID)
+		}
+	}
+	sort.Strings(identities)
+	raw, err := json.Marshal(identities)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("platform-candidate-diagnostic-%x-v1", sum[:16]), nil
 }
 
 // Terminal-owner recovery may be the first opportunity to capture. The owner
@@ -100,7 +162,7 @@ func (s *Service) mutateCandidateDiagnostic(ctx context.Context, expected contra
 	return tx.Commit(ctx)
 }
 
-func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Environment, dep platform.Deployment, op contract.Operation) (platform.CandidateDiagnosticResult, bool) {
+func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Environment, dep platform.Deployment, op contract.Operation, step string) (platform.CandidateDiagnosticResult, bool) {
 	var empty platform.CandidateDiagnosticResult
 	// Re-read the deployment after secret snapshot/instance writes; only the
 	// immutable pinned revision and pinned secret revisions can prove redaction.
@@ -112,36 +174,40 @@ func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Env
 		return empty, false
 	}
 	revision, err := s.revisionByID(ctx, dep.RevisionID)
-	if err != nil {
+	if err != nil || revision.App != dep.App || revision.Environment != dep.Environment {
 		return empty, false
 	}
 	env.Revision = &revision
+	metadataOnly := false
 	for _, name := range revision.SecretNames {
 		if _, ok := dep.SecretRevisions[name]; !ok {
-			return empty, false
+			metadataOnly = true
 		}
 	}
-	for name := range env.SecretRefs {
-		if _, ok := dep.SecretRevisions[name]; !ok {
-			return empty, false
-		}
+	if len(dep.SecretRevisions) == 0 && len(env.SecretRefs) > 0 {
+		metadataOnly = true
 	}
+	env.SecretRefs = nil
 	worker := &platformWorker{service: s}
-	values, key, credential, _, err := worker.resolveDeploymentSecrets(ctx, env, dep)
-	if err != nil {
-		return empty, false
+	values := map[string]string{}
+	if !metadataOnly {
+		var key, credential string
+		values, key, credential, _, err = worker.resolveDeploymentSecrets(ctx, env, dep)
+		if err != nil {
+			metadataOnly = true
+			values = map[string]string{}
+		} else if credential != "" {
+			values[key] = credential
+		}
 	}
 	for _, name := range revision.SecretNames {
 		if values[name] == "" {
-			return empty, false
+			metadataOnly = true
 		}
 	}
-	if credential != "" {
-		values[key] = credential
-	}
-	for _, value := range values {
-		if strings.ContainsAny(value, "\r\n") {
-			return empty, false
+	for name := range dep.SecretRevisions {
+		if values[name] == "" {
+			metadataOnly = true
 		}
 	}
 	plan, err := platform.PlanDeployment(env.App, env.Name, revision.RevisionState, dep.ReleaseID, dep.ID)
@@ -152,7 +218,7 @@ func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Env
 	if !ok {
 		return empty, false
 	}
-	payload := platform.CandidateDiagnosticPayload{Step: platform.CandidateDiagnosticStep, App: env.App, Environment: env.Name, ReleaseID: dep.ReleaseID, DeploymentID: dep.ID, Deadline: deadline}
+	payload := platform.CandidateDiagnosticPayload{Step: step, App: env.App, Environment: env.Name, ReleaseID: dep.ReleaseID, DeploymentID: dep.ID, Deadline: deadline, MetadataOnly: metadataOnly}
 	truncated := len(plan) > 64
 	if truncated {
 		plan = plan[:64]
@@ -181,6 +247,21 @@ func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Env
 	if json.Unmarshal(response.Result, &result) != nil {
 		return empty, false
 	}
+	// This marker comes from the caller's verified historical context, never
+	// from the node's response or from current secret revisions.
+	switch {
+	case metadataOnly:
+		result.RedactionContext = "unavailable"
+		result.Lines = nil
+		result.Unavailable = true
+	case len(values) == 0:
+		result.RedactionContext = "not_required"
+	default:
+		result.RedactionContext = "original"
+	}
+	if len(result.Lines) > 0 && result.LogTimestampSource != "observation_time" {
+		return empty, false
+	}
 	if len(result.Lines) > 512 {
 		return empty, false
 	}
@@ -192,21 +273,46 @@ func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Env
 	for _, container := range payload.Containers {
 		expected[container.Name] = container
 	}
+	if len(result.Observations) > len(expected) {
+		return empty, false
+	}
+	seen := make(map[string]bool)
+	for _, observation := range result.Observations {
+		container, ok := expected[observation.Container]
+		if !ok || seen[observation.Container] || observation.Process != container.Process || observation.Replica != container.Replica || observation.ContainerID == "" || observation.ObservedAt.IsZero() {
+			return empty, false
+		}
+		switch observation.State {
+		case "created", "running", "paused", "restarting", "removing", "exited", "dead":
+		default:
+			return empty, false
+		}
+		switch observation.Health {
+		case "", "starting", "healthy", "unhealthy":
+		default:
+			return empty, false
+		}
+		seen[observation.Container] = true
+	}
 	counts := make(map[string]int)
 	bytes := 0
-	for i := range result.Lines {
-		line := &result.Lines[i]
+	lines := make([]platform.CandidateDiagnosticLine, 0, len(result.Lines))
+	for _, line := range result.Lines {
 		container, ok := expected[line.Container]
 		if !ok || line.Process != container.Process || line.Replica != container.Replica || line.ContainerID == "" || line.Timestamp.IsZero() {
-			return empty, false
+			result.Unavailable = true
+			continue
 		}
 		line.Message = registry.Redact(line.Message)
 		counts[line.Container]++
-		bytes += len(line.Message)
-		if counts[line.Container] > 200 || len(line.Message) > 32*1024 || bytes > 64*1024-512 || !utf8.ValidString(line.Message) {
-			return empty, false
+		if counts[line.Container] > 200 || len(line.Message) > 32*1024 || bytes+len(line.Message) > 64*1024-512 || !utf8.ValidString(line.Message) {
+			result.Truncated = true
+			continue
 		}
+		bytes += len(line.Message)
+		lines = append(lines, line)
 	}
+	result.Lines = lines
 	result.Truncated = result.Truncated || truncated
 	return result, true
 }

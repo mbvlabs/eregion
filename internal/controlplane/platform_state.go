@@ -183,6 +183,9 @@ func (s *Service) replaySubmission(ctx context.Context, kind, target string, act
 	if err != nil {
 		return contract.Operation{}, true, unavailable()
 	}
+	if err := s.populateActionResult(ctx, &op); err != nil {
+		return contract.Operation{}, true, err
+	}
 	return op, true, nil
 }
 

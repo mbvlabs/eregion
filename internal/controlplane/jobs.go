@@ -21,10 +21,12 @@ import (
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/processmetrics"
 	"github.com/mbvlabs/eregion/internal/secrets"
 	"github.com/mbvlabs/eregion/internal/vault"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivertype"
 )
 
 const diagnosticQueue = "diagnostic"
@@ -229,23 +231,6 @@ func (s *Service) recoverOrphanedPlatformJob(ctx context.Context, job orphanedPl
 			}
 			return true, false, nil
 		}
-		if op.Kind == platform.KindDiagnosticExecution && !op.State.Terminal() && op.Attempt <= uint32(job.Attempt) {
-			var raw json.RawMessage
-			if err := tx.QueryRow(ctx, "SELECT input FROM eregion_operations WHERE id=$1", op.ID).Scan(&raw); err != nil {
-				return false, false, unavailable(err)
-			}
-			if err := markDiagnosticCleanupTx(ctx, tx, &op, raw); err != nil {
-				return false, false, err
-			}
-			if _, err := tx.Exec(ctx, `UPDATE river_job SET state='scheduled',finalized_at=NULL,
-                max_attempts=GREATEST(max_attempts,attempt+1),scheduled_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, job.ID); err != nil {
-				return false, false, unavailable(err)
-			}
-			if err := tx.Commit(ctx); err != nil {
-				return false, false, unavailable(err)
-			}
-			return true, false, nil
-		}
 		message := fmt.Sprintf("Discarded platform job %d: its final River attempt was left running by an earlier worker process on this host.", job.ID)
 		if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "warning", Stage: "worker", Message: message}); err != nil {
 			return false, false, err
@@ -278,6 +263,7 @@ func (s *Service) recoverOrphanedPlatformJob(ctx context.Context, job orphanedPl
 	if err := tx.Commit(ctx); err != nil {
 		return false, false, unavailable()
 	}
+	s.observeCommittedActionResult(op)
 	return !exhausted, exhausted, nil
 }
 
@@ -334,6 +320,7 @@ func (retentionArgs) Kind() string { return "platform_retention" }
 type Runtime struct {
 	Service *Service
 	Jobs    *river.Client[pgx.Tx]
+	Metrics *processmetrics.Metrics
 	// Nodes resolves the transport of any node for worker dispatch.
 	Nodes NodeTransports
 	// WebhookDeliveries is the durable admission store the API handler uses.
@@ -362,6 +349,7 @@ func (r *Runtime) Close() {
 
 type WorkerConfig struct {
 	Concurrency int
+	Metrics     *processmetrics.Metrics
 	// TestOnly removes River startup jitter. Never enable it in service commands.
 	TestOnly bool
 	// Transport defaults to a local node dispatcher. SSH and userspace WireGuard
@@ -395,9 +383,6 @@ type WorkerConfig struct {
 	// uses EREGION_NODE_NAME. A worker that serves the local transport needs an
 	// explicit name; there is no fallback identity.
 	LocalNodeName string
-	// DiagnosticAdmissionNode is supplied only by trusted node RPC startup
-	// after comparing the host node identity with the worker's configured name.
-	DiagnosticAdmissionNode string
 	// Resolver is an already-built per-node transport resolver. The process
 	// builds one resolver and shares it with extension dispatch, so there is
 	// exactly one cache and one WireGuard key lock per node. Nil builds the
@@ -419,7 +404,10 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	if config.Concurrency < 0 || config.Concurrency > 16 {
 		return nil, contract.NewFault(contract.ValidationFailed, "invalid worker concurrency", "Use 0 for insert-only, or 1–16 workers.")
 	}
-	service := &Service{pool: pool, secrets: config.SecretResolver, vault: config.Vault, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS, diagnosticAdmissionNode: config.DiagnosticAdmissionNode, registryEndpoint: strings.TrimSpace(config.RegistryEndpoint)}
+	service := &Service{pool: pool, secrets: config.SecretResolver, vault: config.Vault, sourceRoots: config.SourceRoots, humanFactor: config.HumanFactor, domainDNS: config.DomainDNS, registryEndpoint: strings.TrimSpace(config.RegistryEndpoint)}
+	if config.Metrics != nil {
+		service.observeActionAttempt = config.Metrics.ObserveActionAttempt
+	}
 	if config.RegistryHostIdentity != nil {
 		identity := *config.RegistryHostIdentity
 		if _, err := VerifyWorkspaceRegistryHost(context.Background(), pool, identity); err != nil {
@@ -473,6 +461,55 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 		Workers: workers, Logger: logger, MaxAttempts: operations.TestMaxAttempts,
 		JobTimeout: jobTimeout, RescueStuckJobsAfter: 2 * time.Minute,
 		SoftStopTimeout: 5 * time.Second, TestOnly: config.TestOnly,
+	}
+	if config.Metrics != nil {
+		riverConfig.Middleware = []rivertype.Middleware{river.WorkerMiddlewareFunc(func(ctx context.Context, job *rivertype.JobRow, inner func(context.Context) error) error {
+			kind := job.Kind
+			switch kind {
+			case "diagnostic_test", "platform_action", "operation_reconcile", "platform_domain_routes", "platform_domain_observe", "platform_container_cleanup", "platform_workload_repair", "platform_retention", "webhook_admission":
+			default:
+				kind = "other"
+			}
+			action := "none"
+			if kind == "platform_action" {
+				var args struct {
+					ActionKind string `json:"action_kind"`
+				}
+				if json.Unmarshal(job.EncodedArgs, &args) == nil && (platform.IsKind(args.ActionKind) || args.ActionKind == platform.KindDefinitionApply) {
+					action = args.ActionKind
+				} else {
+					action = "other"
+				}
+			} else if kind == "platform_retention" && len(job.EncodedArgs) > 0 {
+				var args retentionArgs
+				if json.Unmarshal(job.EncodedArgs, &args) == nil && args.OperationID != "" {
+					action = platform.KindRetentionPrune
+				}
+			}
+			if job.Attempt > 1 {
+				config.Metrics.Retries.WithLabelValues(kind, action).Inc()
+			}
+			started := time.Now()
+			outcome := "panic"
+			defer func() {
+				config.Metrics.Attempts.WithLabelValues(kind, action, outcome).Inc()
+				config.Metrics.AttemptDuration.WithLabelValues(kind, action, outcome).Observe(time.Since(started).Seconds())
+			}()
+			err := inner(processmetrics.WithWorker(ctx, config.Metrics))
+			var snooze *river.JobSnoozeError
+			var cancelled *river.JobCancelError
+			switch {
+			case err == nil:
+				outcome = "success"
+			case errors.As(err, &snooze):
+				outcome = "snoozed"
+			case errors.As(err, &cancelled), errors.Is(err, context.Canceled), errors.Is(err, river.ErrJobCancelledRemotely):
+				outcome = "cancelled"
+			default:
+				outcome = "error"
+			}
+			return err
+		})}
 	}
 	var hostPrefix string
 	if config.Concurrency > 0 {
@@ -571,7 +608,7 @@ func New(pool *pgxpool.Pool, logger *slog.Logger, config WorkerConfig) (*Runtime
 	}
 	webhookDeliveries := NewWebhookDeliveryStore(pool)
 	webhookDeliveries.enqueue = service.enqueueWebhook
-	return &Runtime{Service: service, Jobs: client, Nodes: service.resolver, WebhookDeliveries: webhookDeliveries}, nil
+	return &Runtime{Service: service, Jobs: client, Metrics: config.Metrics, Nodes: service.resolver, WebhookDeliveries: webhookDeliveries}, nil
 }
 
 // registerRuntimeSecrets registers the worker's own secrets so a child process
@@ -686,7 +723,10 @@ func (w *testWorker) injectedFailure(ctx context.Context, id contract.OperationI
 			}
 			return transition(ctx, tx, current, contract.Failed, contract.Unavailable, "Diagnostic retry limit reached.")
 		}
-		return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Message: "Diagnostic requested a retry; work remains durably queued."})
+		if err := appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Message: "Diagnostic requested a retry; work remains durably queued."}); err != nil {
+			return err
+		}
+		return w.service.appendActionResultTx(ctx, tx, current, contract.Failed, contract.Unavailable, "Diagnostic requested a retry; work remains durably queued.", false)
 	})
 	if err != nil {
 		return err
@@ -808,6 +848,9 @@ func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attem
 		// start a second Apply; let River retry and reconcile.
 		return contract.NewFault(contract.Unavailable, "node task is still running", "The operation remains running; reconnecting or retrying will attach to the existing effect, not start another.")
 	case engine.StatusFailed:
+		if err := w.service.retainNodeResponse(ctx, exec, response); err != nil {
+			return err
+		}
 		code := response.ErrorCode
 		if code == "" {
 			code = string(contract.Internal)
@@ -816,6 +859,9 @@ func (w *testWorker) runStep(ctx context.Context, id contract.OperationID, attem
 			return failErr
 		}
 		if response.Retryable {
+			if err := w.service.recordRetryResult(ctx, id, attempt, contract.Code(code), w.service.resultText(response.Detail)); err != nil {
+				return err
+			}
 			return fmt.Errorf("node step %s failed: %s", stepID, response.Detail)
 		}
 		if response.InputsMismatch {
@@ -987,9 +1033,6 @@ func (s *Service) reconcileOperation(ctx context.Context, id contract.OperationI
 	}
 	if op.State.Terminal() {
 		return nil
-	}
-	if op.Kind == platform.KindDiagnosticExecution {
-		return s.requeueDiagnosticCleanup(ctx, id)
 	}
 	if op.Kind == platform.KindDefinitionApply {
 		return s.requeueDefinitionDrain(ctx, id)

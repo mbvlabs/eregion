@@ -983,7 +983,7 @@ func (w *platformWorker) failDeploymentAfterRouteRestore(ctx context.Context, tr
 	// terminal transaction releases ownership, and maintenance needs a durable
 	// row if the immediate removal cannot run yet.
 	if len(candidates) > 0 {
-		if err := w.service.persistDeploymentCleanupInstances(cleanupCtx, env, dep, candidates, "candidate"); err != nil {
+		if err := w.service.persistDeploymentCleanupInstances(cleanupCtx, env, dep, candidates, "candidate", attempt); err != nil {
 			return deploymentCleanupIntentFault(err)
 		}
 	}
@@ -1042,7 +1042,7 @@ func (w *platformWorker) finishDeploymentFailure(ctx context.Context, tr node.Tr
 			return err
 		}
 		cleanupCtx := context.WithoutCancel(ctx)
-		if err := w.service.persistDeploymentCleanupInstances(cleanupCtx, env, dep, candidates, "candidate"); err != nil {
+		if err := w.service.persistDeploymentCleanupInstances(cleanupCtx, env, dep, candidates, "candidate", attempt); err != nil {
 			return deploymentCleanupIntentFault(err)
 		}
 		if err := w.settle(ctx, id, attempt, cause); err != nil {

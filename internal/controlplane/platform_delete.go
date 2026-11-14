@@ -338,7 +338,8 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 	}
 	defer hostRelease()
 	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		if _, err := appByNameForUpdateTx(ctx, tx, env.App); err != nil {
+		lockedApp, err := appByNameForUpdateTx(ctx, tx, env.App)
+		if err != nil {
 			return err
 		}
 		if err := deleteEnvironmentRowsTx(ctx, tx, env); err != nil {
@@ -346,6 +347,13 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 		}
 		if err := deleteEmptyApplicationTx(ctx, tx, env.App); err != nil {
 			return err
+		}
+		var appDeleted bool
+		if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM eregion_platform_apps WHERE id=$1)`, lockedApp.ID).Scan(&appDeleted); err != nil {
+			return err
+		}
+		if data, err := deletionActionData(lockedApp, []platform.Environment{env}, appDeleted); err == nil {
+			w.service.tryDeletionOutputTx(ctx, tx, op, data)
 		}
 		return appendEvent(ctx, tx, op, contract.Event{
 			Kind: "log", Stage: "delete",
@@ -440,6 +448,9 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 		}
 		if err := deleteApplicationRowsTx(ctx, tx, app); err != nil {
 			return err
+		}
+		if data, err := deletionActionData(lockedApp, environments, true); err == nil {
+			w.service.tryDeletionOutputTx(ctx, tx, op, data)
 		}
 		return appendEvent(ctx, tx, op, contract.Event{
 			Kind: "log", Stage: "delete",
@@ -618,12 +629,16 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 	input := normalized.Input
 	preview := platform.Preview{Kind: normalized.Kind, Target: normalized.Target.String(), DryRun: true, Input: input.Preview(), Summary: normalized.Summary}
 	var app, environment string
+	var appID, envID string
 	protected, lastEnvironment := false, false
 	switch value := input.(type) {
 	case *platform.AppDeleteInput:
 		app = value.App
 		if err := s.ensureApplication(ctx, app); err != nil {
 			return preview, err
+		}
+		if err := s.pool.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&appID); err != nil {
+			return preview, unavailable()
 		}
 	case *platform.EnvironmentDeleteInput:
 		app, environment = value.App, value.Environment
@@ -632,6 +647,7 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 			return preview, err
 		}
 		protected = env.Protected
+		envID = string(env.ID)
 		counts, err := s.deletionCounts(ctx, app, environment)
 		if err != nil {
 			return preview, err
@@ -649,8 +665,19 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 	preview.Warnings = append(preview.Warnings,
 		"Containers selected by ownership labels and their Caddy routes are removed before any database row.",
 		"Durable operation and event history is kept; only platform state and secret values are deleted.",
+		"Application and environment deletion never removes resource data volumes, including volumes retained after resource destruction.",
 	)
 	preview.Warnings = append(preview.Warnings, deletionWarnings(counts, environment)...)
+	blockers, err := liveDeletionResources(ctx, s.pool, appID, envID)
+	if err != nil {
+		return preview, err
+	}
+	for _, blocker := range blockers {
+		preview.Warnings = append(preview.Warnings, fmt.Sprintf("Deletion blocked by resource %s/%s/%s (state: %s). Destroy with: eregion resource destroy %s %s %s --confirm %s/%s/%s.", app, blocker.environment, blocker.name, blocker.state, app, blocker.environment, blocker.name, app, blocker.environment, blocker.name))
+	}
+	if len(blockers) > 0 {
+		preview.Warnings = append(preview.Warnings, "Detach each resource from the current revision and ensure the serving revision no longer uses it; wait for dependent deployments before destroying it. Default destroy retains named data volumes. Use --delete-data only as a separate explicit choice to permanently remove owned data.")
+	}
 	switch {
 	case environment == "":
 		preview.Warnings = append(preview.Warnings, "Every application deletion requires the D7 TOTP human factor, regardless of environment protection.")

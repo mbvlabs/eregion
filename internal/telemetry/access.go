@@ -20,12 +20,16 @@ const (
 	GatewayListenAddress = GatewayHost + ":" + Port
 	// MetricsPath is the public HTTPS path the gateway proxies to
 	// node_exporter's /metrics.
-	MetricsPath = "/metrics/node"
+	MetricsPath       = "/metrics/node"
+	APIMetricsPath    = "/metrics/api"
+	WorkerMetricsPath = "/metrics/worker"
 	// DiscoveryPath serves the public HTTPS Prometheus HTTP service-discovery
 	// document.
 	DiscoveryPath = "/metrics/targets.json"
 	// GatewayMetricsPath is the gateway-local upstream path for MetricsPath.
-	GatewayMetricsPath = "/node"
+	GatewayMetricsPath       = "/node"
+	GatewayAPIMetricsPath    = "/api"
+	GatewayWorkerMetricsPath = "/worker"
 	// GatewayDiscoveryPath is the gateway-local path for DiscoveryPath.
 	GatewayDiscoveryPath = "/targets.json"
 	// PublicPort is the HTTPS port advertised by service discovery.

@@ -115,6 +115,18 @@ func definitionPlan(zone DNSZone, req DomainDNSRequest, before []DomainDNSRecord
 		"Cloudflare has no conditional-write API; an external writer can race the final request.",
 		"DNS provider state is not route, TLS or public readiness.",
 	}}
+	for _, want := range desired {
+		count, conflict := 0, false
+		for _, r := range before {
+			if r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
+				count++
+				conflict = conflict || (r.Ownership == "foreign" && r.Proxied != want.Proxied)
+			}
+		}
+		if conflict && count > 1 {
+			return DefinitionDNSPlan{}, contract.NewFault(contract.PreconditionFailed, "ambiguous DNS proxy conflict", "Resolve duplicate records before obtaining a new definition plan.")
+		}
+	}
 	used := make([]bool, len(before))
 	// Every matching foreign record remains external, even when an owned
 	// record or another foreign duplicate already satisfies the same address.
@@ -149,6 +161,35 @@ func definitionPlan(zone DNSZone, req DomainDNSRequest, before []DomainDNSRecord
 				}
 			}
 			if satisfied {
+				continue
+			}
+			// A proxy-mode conflict for the same address cannot be created
+			// alongside the old Cloudflare record. Only a unique candidate may
+			// be transferred, and the concrete before/after requires approval.
+			candidate, count := -1, 0
+			for i, r := range before {
+				if r.Type == want.Type && domainDNSContentEqual(r.Type, r.Content, want.Content) {
+					candidate, count = i, count+1
+				}
+			}
+			if count > 1 {
+				return DefinitionDNSPlan{}, contract.NewFault(contract.PreconditionFailed, "ambiguous DNS proxy conflict", "Resolve duplicate records before obtaining a new definition plan.")
+			}
+			if count == 1 && before[candidate].Ownership == "foreign" && before[candidate].Proxied != want.Proxied {
+				r := before[candidate]
+				a := want
+				a.ID, a.Name, a.Content, a.TTL = r.ID, r.Name, r.Content, r.TTL
+				if a.Proxied {
+					// Cloudflare requires automatic TTL for proxied records.
+					a.TTL = 1
+				}
+				p.Changes = append(p.Changes, DomainDNSChange{Action: "update", Type: want.Type, Before: &r, After: &a})
+				p.RequiresApproval = true
+				p.Warnings = append(p.Warnings, "The proxy-conflicting foreign record will be updated in place and transferred to this binding; managed cleanup may later delete it.")
+				if r.TTL != a.TTL {
+					p.Warnings = append(p.Warnings, "Proxying changes the record TTL to Cloudflare automatic TTL.")
+				}
+				used[candidate] = true
 				continue
 			}
 			a := want
@@ -385,7 +426,12 @@ func (d *DomainDNS) ExecuteApprovedDefinitionDNS(ctx context.Context, actor cont
 		if err = progress.Guard(ctx); err != nil {
 			return i, err
 		}
-		if err = client.apply(ctx, domainDNSChangeToDNSChange(change)); err != nil {
+		if change.Action == "update" && change.Before != nil && change.Before.Ownership == "foreign" {
+			err = client.patchDefinitionProxy(ctx, change)
+		} else {
+			err = client.apply(ctx, domainDNSChangeToDNSChange(change))
+		}
+		if err != nil {
 			_ = d.audit.Record(ctx, AuditEntry{At: d.now().UTC(), Actor: actor.Subject, Action: action, Target: target, Outcome: "failed", Detail: auditDetail(opID, "provider outcome unknown")})
 			var failure *ProviderFailure
 			if errors.As(err, &failure) && (contract.Classify(err).Code == contract.Forbidden || contract.Classify(err).Code == contract.PreconditionFailed) {

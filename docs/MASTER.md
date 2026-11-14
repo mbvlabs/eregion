@@ -87,8 +87,21 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
   an accepted submission is not a completed deployment; a route is not a valid
   certificate or a healthy app. Commands report each separately.
 - **Secrets are generated where possible, shown once, never in operation input,
-  River arguments, events, journals or ordinary output.** Handoff and explicit
-  exports are the protected exceptions.
+   River arguments, events, journals or ordinary output.** Handoff and explicit
+   exports are the protected exceptions.
+- **Diagnostics inspect actual execution evidence (2026-11-14).** Use existing
+  build logs, actual deployment/container logs, exit status, health checks and
+  configuration observations. Diagnosis is read-only: never create a separate
+  diagnostic container or add arbitrary command execution. Remove the previously
+  introduced executable-diagnostic surface, not aliases or compatibility shims.
+  Preserve bounded, redacted operation history and real candidate-log capture.
+  Do not add the proposed diagnostic-container transcript store.
+- **Docker logging is explicitly bounded (2026-11-14).** Fresh installations set
+  the Docker daemon default to `local`, with `max-size=20m`, `max-file=5` and
+  compression enabled. This replaces reliance on the unrotated `json-file`
+  default. Read container logs through Docker, not a separate application log
+  archive. Keep the API and worker under systemd. No existing-container migration,
+  compatibility work or general application-log database ingestion is implied.
 - **Agent-first, human-friendly.** Interactive prompts are a thin layer over
   flags. Guided commands follow `server init`: defaults, clear questions, a plan,
   confirmation, live progress, a result card.
@@ -107,7 +120,7 @@ Multi-tenant hosting and HA; everything listed in section 7 as after v1.
 | D1 | Control model | The CLI talks to a node through SSH over embedded userspace WireGuard, always. Each operator command resolves the selected workspace, opens SSH in WireGuard and runs `eregion node <cmd> --json` there, which calls the same application services the API uses. Local workspace connection data holds a WireGuard identity and an SSH key, not a bearer token. |
 | D2 | Hardening | vaire's: admin user with a sudo password, root login and SSH passwords off, firewall, commit-confirm switchover of SSH to WireGuard with automatic revert, break-glass via the provider console and `eregion node unlock-ssh`. |
 | D3 | Ingress | Caddy on the main node. The main hostname is used exactly as entered. App domains are environment bindings. DNS records, direct or Cloudflare-proxied, and ACME. |
-| D4 | Recovery and backups | Revised 2026-11-10: serious durable application state belongs in external services; managed local-volume data is expendable under the current policy. There is no scheduled backup or volume-backup product. External PostgreSQL holds control-plane state and operation history, but is **not** a backup of Docker volumes, local registry artifacts or host-local vault keys and identities. Before RC, document replacement-VPS recovery with the same surviving control DB/external services, including protected key/identity recovery, artifact availability and unsupported replacement-node gaps. A live recovery rehearsal is not a release gate; documentation is not proof of working recovery. External-provider backup and durability remain the provider/operator's responsibility. |
+| D4 | Recovery and backups | Revised 2026-11-14: serious durable application state belongs in external services; managed local-volume data is expendable under the current policy. There is no scheduled backup or volume-backup product. External PostgreSQL holds control-plane state and operation history, but is **not** a backup of Docker volumes, local registry artifacts or host-local vault keys and identities. Replacement-VPS recovery documentation is not an RC gate. Existing recovery guidance describes prerequisites and unsupported gaps, not proof of working recovery. A live recovery rehearsal is not a release gate. External-provider backup and durability remain the provider/operator's responsibility. |
 | D5 | Telemetry (beta) | Follow vaire's exporter-and-scrape-configuration model. The main node runs loopback-only node_exporter; its existing HTTPS hostname exposes exactly `/metrics/node` and `/metrics/targets.json`, both authenticated through a separate loopback gateway. Discovery advertises reachable HTTPS targets, and generated Prometheus/Alloy configurations authenticate discovery and scraping with normal TLS verification. Raw exporter/gateway ports are not public. `metrics show` provides a bounded current snapshot with checked CPU deltas, freshness and explicit missing values; it does not define or restrict the external collection model. `metrics endpoint` distinguishes desired configuration from observed readiness. `metrics config` uses placeholders in ordinary output and owner-only `--out` files for actual credentials. Rotation retains vaire's simple model: save the generated password locally before sending only its bcrypt hash, restore the local credential on failed RPC, and acknowledge that a lost successful response may require another rotation. Normal apply must preserve the existing credential, serialize with rotation, and restore all managed files/service state on failure with bounded recovery independent of caller cancellation. Telemetry failure must not prevent serving applications. Keep the exporter textfile directory and parent root-owned 0755, nonsymlink and without special mode bits; restrict the systemd collector to eregion, Caddy, Docker, exporter and WireGuard units, and require real producers for self-metrics. Doctor retains fail-closed collector/scrape checks and distinguishes anonymous denial from authenticated success. Operation history remains in PostgreSQL and never depends on telemetry. No managed Prometheus/Grafana/Alloy/Loki deployment or retained metrics/log store is required for beta/v1. Retain the future optional telemetry-node concept described below. |
 
 | D6 | Command tree | [Section 5](#5-command-tree). `platform …`, operator-facing `bootstrap …`, `serve`/`worker`, `platform submit` and bearer-token `context login` are removed from the operator surface; the service, migration and bootstrap entry points live under the hidden Linux-only `node` group. The old resource surface was removed, but alpha.2 adds a new node-mode resource lifecycle under D19. Pre-v1: delete old paths, no aliases or compatibility shims. |
@@ -150,6 +163,18 @@ predecessor; reconciliation without a worker lease fails it. |
 | D35 | App image repository and artifact admission (beta.5) | Each app owns one exact private-workspace image repository path such as `mbvlabs/andurel`, unique in the control database and immutable for beta.5. It never includes a registry host, port, tag, digest, URL or credentials; omission at app create defaults to the app slug. App create may therefore make an image-only app with no Git recipe and no first deploy; an explicit create-and-deploy without Git fails before any transaction commits. Environments retain an optional Git Buildpacks recipe only; `SourceBinding.Image`, `Kind`, TOML `source.image`/`source.kind`, `--image` on app/env create and env update, and the guided Git-versus-image choice are removed without compatibility aliases. Artifact selection is a deploy input: `--image-tag` and `--image-digest` address the app repository, `--image` is a fully qualified public/private reference, and these are distinct from `--ref` and `--release`, mutually exclusive, with no implicit latest. A fully qualified reference to this private registry must name exactly the app repository. Public external references are resolved anonymously with bounded read-only metadata and pulled by canonical digest; no Docker credentials, private external credential feature or automatic mirroring is added. Admission replays the idempotency hash before registry I/O, resolves the tag/index outside any SQL transaction, rechecks app/repository/environment placement facts under the admission lock, and records a pending release pinned to the canonical immutable manifest and expected config digest plus the requested selector as provenance only. A worker never re-resolves a tag; it pulls the pinned artifact, verifies the config digest, then marks the release ready. A missing artifact after admission fails and leaves the previous release serving with no tag fallback, rebuild or mirror. Multi-architecture input selects the target node architecture's immutable child manifest. Preview remains read-only with no registry I/O, shows the app repository/selector and known config blockers, and labels availability unverified. Existing retention/GC policy is unchanged; exact repository parsing protects every environment sharing an app repository, all accepted pending/serving/rollback digests and moved tags, with no heuristic leading-component strip and no external registry delete. Image upload resolves the durable app repository from the app record and verifies the immutable workspace registry-host binding (public SSH host key and canonical state directory) before reading the payload; it holds the app session advisory lock plus the shared node host lock through identity recheck, payload read and every upload helper. Final app/last-environment deletion verifies the same binding before provider/host cleanup and again before the short metadata transaction, takes the same host lock after effects and deletes by durable app ID, so no delete/recreate or second host can retarget an upload. External registry metadata is public-HTTPS-only on every redirect, connection and token realm with no proxy or ambient credentials, redirects are refused, and requested manifest digests are authenticated against raw bytes at top level and selected index child. Artifact pulls use an explicit isolated environment with a private empty Docker config. The canonical artifact reference is bounded against the actual registry endpoint before app creation. `platform.release.create` and its arbitrary destination/pull toggle are removed; internal release constructors and build retry remain. |
 
 ### D5 clarification — vaire telemetry model
+
+**Operation evidence and process metrics (approved 2026-11-14):** the
+contract in [operation evidence](../specs/operation-evidence.md) extends the
+existing authenticated telemetry gateway with fixed API and worker scrape
+targets. Preserve the node_exporter target, normal TLS verification and
+loopback-only process listeners. Instrument actual HTTP requests, River attempts,
+runtime/process activity and in-memory database pool observations; metrics are
+not durable operation status. Every defined action exposes a typed,
+attempt-specific result, with useful bounded failure evidence captured from the
+original execution before cleanup where possible. Capture cannot veto safety
+cleanup. Diagnosis remains read-only, and unavailable evidence must not obscure
+other observed facts or be confused with paginated retained history.
 
 The agreed model is exporters, an authenticated scrape endpoint and generated
 Prometheus/Alloy configuration, as implemented in vaire. Vaire does not install
@@ -347,10 +372,11 @@ eregion dns configure|status|policy --provider cloudflare # configure: human-onl
 eregion config set|unset|list                          # plain variables
 eregion secret set|list|archive|export                 # values write-only
 eregion logs <app> <env> [--process NAME] [--follow]  ·  restart <app> <env>
-eregion metrics show|endpoint|config|rotate            # current snapshot; WireGuard-only authenticated scrape config and rotation
+eregion metrics show|endpoint|config|rotate            # current snapshot; authenticated HTTPS scrape config and rotation
 eregion retention show|set  ·  prune [--dry-run] [--confirm <server>]
 eregion resource apply|attach|detach|list|status|destroy [--delete-data]   # D19
 eregion operations list|get|follow|cancel
+eregion diagnose <operation-id> [--after CURSOR --limit N] # read-only actual execution evidence
 eregion token create|list|revoke  ·  protect init|status
 eregion ssh [node] [--command CMD]  ·  node unlock-ssh # break-glass
 eregion upgrade
@@ -571,6 +597,18 @@ no future mutation or deletion authority. Cleanup remains restricted to exact
 ledger-backed ownership. This revises the matching-record refusal and permits
 explicit conflict replacement for the TOML workflow; the current command
 behavior described above remains unchanged until that work ships.
+
+**Explicit proxy-conflict transfer (operator approval, 2026-11-14).** When one
+unambiguous existing record has the intended hostname, type and address but a
+conflicting proxy setting, TOML plan/apply may propose updating that exact record
+in place and transferring its ownership marker to the current binding. Approval
+must disclose the old and new state and the resulting future managed-cleanup
+authority. Revalidate the concrete snapshot before writing and verify the same
+record ID, intended proxy state and exact new marker afterward. Preserve unrelated
+provider metadata and records. Do not silently adopt unchanged matching records,
+choose among ambiguous candidates, fall back to deletion, or reinterpret an
+already accepted operation. This avoids a deliberate delete/create gap; it does
+not guarantee uninterrupted DNS or close the external-writer race.
 
 ### 6.6 Config and secrets
 
@@ -1305,8 +1343,8 @@ dedicated telemetry unit is checked by `telemetry.endpoint`. Migrations 025 and
 026 remained applied in that historical run (schema 26/26). Cloudflare DNS
 automation was implemented but **not host-qualified at that run**; no token or
 DNS record was read or changed then. Alpha.6's later core provider qualification
-is recorded above. Backups were deferred at that run (D4 now defines the
-documentation-only recovery gate), and external
+is recorded above. Backups were deferred at that run (D4 retains the recovery
+policy without an RC documentation gate), and external
 PostgreSQL is control-plane state, not a backup of managed-resource volumes. A
 future optional separate telemetry node or Grafana is not prohibited long-term;
 it is out of beta/v1 scope and needs its own topology, retention and access

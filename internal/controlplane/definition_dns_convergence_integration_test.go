@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,11 +29,17 @@ type definitionDNSProviderFixture struct {
 	mu             sync.Mutex
 	records        map[string]integrations.DNSRecord
 	status         int
+	errorBody      string
+	echoRequest    bool
 	readStatus     int
 	writes         int
 	acceptWrite    bool
+	acceptDelete   bool
 	disconnect     bool
 	failAfterWrite bool
+	methods        []string
+	patchBody      map[string]any
+	patchMutation  string
 }
 
 func (f *definitionDNSProviderFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -40,6 +47,7 @@ func (f *definitionDNSProviderFixture) ServeHTTP(w http.ResponseWriter, r *http.
 	defer f.mu.Unlock()
 	if r.Method != http.MethodGet {
 		f.writes++
+		f.methods = append(f.methods, r.Method)
 		if f.acceptWrite && r.Method == http.MethodPost {
 			var record integrations.DNSRecord
 			if err := json.NewDecoder(r.Body).Decode(&record); err != nil {
@@ -52,6 +60,43 @@ func (f *definitionDNSProviderFixture) ServeHTTP(w http.ResponseWriter, r *http.
 				f.readStatus = http.StatusForbidden
 			}
 		}
+		if f.acceptWrite && r.Method == http.MethodPatch {
+			var body map[string]any
+			if json.NewDecoder(r.Body).Decode(&body) != nil {
+				http.Error(w, "invalid fixture request", http.StatusBadRequest)
+				return
+			}
+			f.patchBody = body
+			id := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			record, ok := f.records[id]
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			record.Proxied, _ = body["proxied"].(bool)
+			record.Comment, _ = body["comment"].(string)
+			if record.Proxied {
+				record.TTL = 1 // Cloudflare forces automatic TTL when proxied.
+			} else if ttl, ok := body["ttl"].(float64); ok {
+				record.TTL = int(ttl)
+			}
+			switch f.patchMutation {
+			case "id":
+				delete(f.records, id)
+				record.ID = "different"
+			case "proxy":
+				record.Proxied = false
+			case "marker":
+				record.Comment = "other-owner"
+			}
+			f.records[record.ID] = record
+		}
+		// Deletion is independent of create/PATCH acceptance: tests opt in to
+		// an applied delete even when its response reports an error.
+		if f.acceptDelete && r.Method == http.MethodDelete {
+			id := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+			delete(f.records, id)
+		}
 		if f.disconnect {
 			conn, _, err := w.(http.Hijacker).Hijack()
 			if err == nil {
@@ -60,7 +105,20 @@ func (f *definitionDNSProviderFixture) ServeHTTP(w http.ResponseWriter, r *http.
 			return
 		}
 		if f.status != 0 {
-			http.Error(w, "private-provider-body token-and-ray-id", f.status)
+			body := f.errorBody
+			if f.echoRequest {
+				requestBody, _ := io.ReadAll(r.Body)
+				raw, _ := json.Marshal(map[string]any{
+					"errors": []any{map[string]any{"code": 81053, "message": r.Header.Get("Authorization")}},
+					"result": map[string]string{"url": r.URL.String(), "request": string(requestBody)},
+				})
+				body = string(raw)
+			}
+			if body == "" {
+				body = "private-provider-body token-and-ray-id"
+			}
+			w.WriteHeader(f.status)
+			_, _ = w.Write([]byte(body))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "result": map[string]string{"id": "created"}})
@@ -301,24 +359,40 @@ func TestIntegrationDefinitionDNSChildPolicyCredentialDrift(t *testing.T) {
 
 func TestIntegrationDefinitionDNSProviderFailureClassification(t *testing.T) {
 	for _, tc := range []struct {
+		name           string
 		status         int
 		accepted       bool
 		disconnect     bool
 		failAfterWrite bool
+		body           string
+		detail         string
+		echo           bool
 	}{
-		{http.StatusForbidden, false, false, false},
-		{http.StatusTooManyRequests, false, false, false},
-		{http.StatusInternalServerError, false, false, false},
-		{http.StatusInternalServerError, true, false, false},
-		{0, true, true, false},
-		{0, true, false, true},
+		{name: "known", status: 400, body: `{"errors":[{"code":81053,"message":"ledger-token-0123456789 private-provider-body"}],"result":{"secret":"ledger-token-0123456789"}}`, detail: "(code 81053: a DNS record with these details already exists)"},
+		{name: "echo", status: 400, echo: true, detail: "(code 81053: a DNS record with these details already exists)"},
+		{name: "unknown", status: 400, body: `{"errors":[{"code":999123,"message":"private-provider-body"}]}`, detail: "(code 999123: provider error; inspect provider configuration)"},
+		{name: "malformed", status: 400, body: `{"errors":[{"code":81053`, detail: ""},
+		{name: "oversized", status: 400, body: `{"errors":[{"code":81053}],"message":"` + strings.Repeat("x", (8<<20)+1) + `"}`, detail: ""},
+		{name: "string-code", status: 400, body: `{"errors":[{"code":"81053","message":"private-provider-body"}]}`, detail: ""},
+		{name: "fraction-code", status: 400, body: `{"errors":[{"code":81053.0}]}`},
+		{name: "out-of-range-code", status: 400, body: `{"errors":[{"code":1000000000}]}`},
+		{name: "unauthorized", status: http.StatusUnauthorized},
+		{name: "forbidden", status: http.StatusForbidden},
+		{name: "timeout", status: http.StatusRequestTimeout},
+		{name: "rate-limit", status: http.StatusTooManyRequests},
+		{name: "server-error", status: http.StatusInternalServerError},
+		{name: "accepted-server-error", status: http.StatusInternalServerError, accepted: true},
+		{name: "disconnect", accepted: true, disconnect: true},
+		{name: "read-forbidden", accepted: true, failAfterWrite: true},
 	} {
-		t.Run(fmt.Sprintf("%d-accepted-%t-disconnect-%t-read403-%t", tc.status, tc.accepted, tc.disconnect, tc.failAfterWrite), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			status := tc.status
 			pool, s, app, provider := definitionDNSFixture(t, false, status)
 			provider.acceptWrite = tc.accepted
 			provider.disconnect = tc.disconnect
 			provider.failAfterWrite = tc.failAfterWrite
+			provider.errorBody = tc.body
+			provider.echoRequest = tc.echo
 			ctx := context.Background()
 			parent := planAndSubmitDefinitionDNS(t, app, "provider-failure")
 			claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
@@ -363,7 +437,10 @@ func TestIntegrationDefinitionDNSProviderFailureClassification(t *testing.T) {
 			if !strings.Contains(message, expected) || strings.Contains(message, "private-provider-body") {
 				t.Fatalf("unsafe provider diagnostic %q", message)
 			}
-			if status == http.StatusForbidden {
+			if tc.detail != "" && !strings.Contains(message, tc.detail) || tc.detail == "" && strings.Contains(message, "(code ") || strings.Contains(message, "ledger-token-0123456789") {
+				t.Fatalf("unexpected safe detail %q", message)
+			}
+			if status == http.StatusForbidden || status == http.StatusUnauthorized || status == http.StatusBadRequest {
 				if runErr != nil || state != contract.Failed {
 					t.Fatalf("403 state=%s err=%v", state, runErr)
 				}
@@ -379,8 +456,13 @@ func TestIntegrationDefinitionDNSProviderFailureClassification(t *testing.T) {
 				}
 				var diagnosis string
 				if err := pool.QueryRow(ctx, `SELECT failure_message FROM eregion_definition_runs WHERE operation_id=$1`, parent).Scan(&diagnosis); err != nil ||
-					!strings.Contains(diagnosis, "authorization (HTTP 403)") || strings.Contains(diagnosis, "private-provider-body") || !strings.Contains(diagnosis, "serving, route, TLS and public") {
+					!strings.Contains(diagnosis, expected) || tc.detail != "" && !strings.Contains(diagnosis, tc.detail) || strings.Contains(diagnosis, "private-provider-body") || strings.Contains(diagnosis, "ledger-token-0123456789") || !strings.Contains(diagnosis, "serving, route, TLS and public") {
 					t.Fatalf("parent diagnosis=%q err=%v", diagnosis, err)
+				}
+				var events string
+				if err := pool.QueryRow(ctx, `SELECT coalesce(string_agg(event::text, ' '),'') FROM eregion_operation_events WHERE operation_id IN ($1,$2)`, parent, dnsChild).Scan(&events); err != nil ||
+					strings.Contains(events, "private-provider-body") || strings.Contains(events, "ledger-token-0123456789") || tc.detail != "" && !strings.Contains(events, tc.detail) {
+					t.Fatalf("unsafe or missing event detail: %v", err)
 				}
 			} else if runErr == nil || state != contract.Running {
 				t.Fatalf("retryable status %d state=%s err=%v", status, state, runErr)

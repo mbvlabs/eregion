@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -16,24 +17,14 @@ type diagnosisBackend interface {
 	Diagnose(context.Context, contract.OperationID, uint64, int) (json.RawMessage, error)
 }
 
-type diagnosticExecutionBackend interface {
-	DiagnosticExecution(context.Context, contract.OperationID, []string, string, string, bool) (json.RawMessage, error)
-}
-
 func (a *app) diagnoseSpecs() []spec {
-	meta := followingMeta(operationMeta("Inspect an operation or explicitly run an isolated diagnostic", "eregion diagnose <operation_id> --json"))
-	meta.MutatingFlags, meta.DestructiveFlags = []string{"execute"}, []string{"execute"}
-	meta.DryRun, meta.Confirmation = true, "target"
-	meta.ErrorCodes = append(meta.ErrorCodes, contract.ConfirmationRequired)
-	meta.WhenToUse = []string{"Read bounded recorded evidence by default. Node auto-upgrade is never performed.", "Only --execute submits a separate isolated diagnostic against the original deployment's pinned local image. Supply exact --confirm and non-secret argv after --; command output is withheld. Use --dry-run for a read-only plan.", "Use --after with a returned cursor to continue a partial event page. Missing observations are not negative findings."}
-	meta.Examples = append(meta.Examples, "eregion diagnose <operation_id> --after 1000 --limit 1000 --json", "eregion diagnose <operation_id> --execute --confirm <operation_id> --dry-run -- /app/check")
+	meta := operationMeta("Inspect recorded operation evidence", "eregion diagnose <operation_id> --json")
+	meta.WhenToUse = []string{"Read bounded recorded evidence. Node auto-upgrade is never performed.", "Use --after with a returned cursor to continue a partial event page. Missing observations are not negative findings."}
+	meta.Examples = append(meta.Examples, "eregion diagnose <operation_id> --after 1000 --limit 1000 --json")
 	meta.Next = []string{"eregion operations get <operation_id> --json"}
-	return []spec{{use: "diagnose <operation_id> [-- /absolute/executable args...]", meta: meta, args: cobra.ArbitraryArgs, flags: func(cmd *cobra.Command) {
+	return []spec{{use: "diagnose <operation_id>", meta: meta, args: cobra.ArbitraryArgs, flags: func(cmd *cobra.Command) {
 		cmd.Flags().Uint64("after", 0, "Resume after this event cursor")
 		cmd.Flags().Int("limit", 1000, "Maximum events (1–20000; also bounded by bytes)")
-		cmd.Flags().Bool("execute", false, "Submit an isolated diagnostic using the original operation's pinned image")
-		cmd.Flags().String("confirm", "", "Exact original operation ID; required for execution and preview")
-		addDeliveryFlags(cmd)
 	}, run: a.diagnose}}
 }
 
@@ -48,16 +39,8 @@ func (a *app) diagnose(cmd *cobra.Command, args []string) (result, error) {
 	if err := id.Validate(); err != nil {
 		return result{}, err
 	}
-	if boolFlag(cmd, "execute") {
-		return a.diagnoseExecute(cmd, id, args)
-	}
 	if len(args) != 1 || cmd.ArgsLenAtDash() >= 0 {
-		return result{}, contract.NewFault(contract.Usage, "diagnostic command arguments require --execute", "Use --execute --confirm <operation_id> -- /absolute/executable args.")
-	}
-	for _, name := range []string{"confirm", "dry-run", "idempotency-key", "detach", "poll-interval"} {
-		if cmd.Flags().Changed(name) {
-			return result{}, contract.NewFault(contract.Usage, "execution flags require --execute", "Omit execution flags for read-only diagnosis.")
-		}
+		return result{}, contract.NewFault(contract.Usage, "diagnosis accepts only one operation ID", "Use eregion diagnose <operation_id>.")
 	}
 	if streamsNDJSON(cmd) {
 		return result{}, contract.NewFault(contract.Usage, "read-only diagnosis does not stream NDJSON", "Use --json for a bounded diagnosis page.")
@@ -130,6 +113,13 @@ func (a *app) diagnose(cmd *cobra.Command, args []string) (result, error) {
 	}
 	if report.LiveCandidate != nil {
 		fmt.Fprintf(&plain, "Live candidate (truncated=%t unavailable=%t):\n", report.LiveCandidate.Truncated, report.LiveCandidate.Unavailable)
+		for _, observation := range report.LiveCandidate.Observations {
+			fmt.Fprintf(&plain, "  %s/%s state=%s running=%t oom=%t health=%s observed=%s", observation.Process, observation.Replica, observation.State, observation.Running, observation.OOMKilled, observation.Health, observation.ObservedAt.Format(time.RFC3339))
+			if observation.ExitCode != nil {
+				fmt.Fprintf(&plain, " exit=%d", *observation.ExitCode)
+			}
+			fmt.Fprintln(&plain)
+		}
 		for _, line := range report.LiveCandidate.Lines {
 			fmt.Fprintf(&plain, "  %s/%s %s: %s\n", line.Process, line.Replica, line.Timestamp.Format("2006-01-02T15:04:05Z07:00"), line.Message)
 		}
@@ -143,93 +133,14 @@ func (a *app) diagnose(cmd *cobra.Command, args []string) (result, error) {
 			}
 		}
 	}
-	fmt.Fprintf(&plain, "Event cursor: %d; partial: %t\n", report.Cursor.After, report.Partial)
-	if report.Partial {
+	fmt.Fprintf(&plain, "Event cursor: %d; more history: %t; history unavailable: %t\n", report.Cursor.After, report.HasMore, report.HistoryUnavailable)
+	if report.HasMore {
 		fmt.Fprintf(&plain, "Continue: eregion diagnose %s --after %d\n", id, report.Cursor.After)
 	}
 	for _, reason := range report.Unavailable {
 		fmt.Fprintf(&plain, "Unavailable: %s\n", reason)
 	}
 	return result{data: report, plain: plain.String()}, nil
-}
-
-func (a *app) diagnoseExecute(cmd *cobra.Command, id contract.OperationID, args []string) (result, error) {
-	if cmd.ArgsLenAtDash() != 1 || len(args) < 2 {
-		return result{}, contract.NewFault(contract.Usage, "diagnostic execution needs argv after --", "Use diagnose <operation_id> --execute --confirm <operation_id> -- /absolute/executable args.")
-	}
-	if cmd.Flags().Changed("after") || cmd.Flags().Changed("limit") {
-		return result{}, contract.NewFault(contract.Usage, "event paging flags are read-only", "Omit --after and --limit when executing a diagnostic.")
-	}
-	argv := args[1:]
-	if err := platform.ValidateDiagnosticExecutionArgv(argv); err != nil {
-		return result{}, err
-	}
-	confirm := stringFlag(cmd, "confirm")
-	if confirm != string(id) {
-		return result{}, contract.NewFault(contract.ConfirmationRequired, "diagnostic execution requires exact operation confirmation", "Pass --confirm with the original operation ID; --yes does not replace it.")
-	}
-	key := stringFlag(cmd, "idempotency-key")
-	if key == "" {
-		key = "cli:diagnostic:" + randomHex(8)
-	}
-	if err := contract.ValidateIdempotencyKey(key); err != nil {
-		return result{}, err
-	}
-	dryRun := boolFlag(cmd, "dry-run")
-	if dryRun && streamsNDJSON(cmd) {
-		return result{}, contract.NewFault(contract.Usage, "diagnostic preview does not stream NDJSON", "Use --dry-run --json for one read-only plan.")
-	}
-	follow := !dryRun && !boolFlag(cmd, "detach") && (followsByDefault(cmd) || streamsNDJSON(cmd))
-	if err := validateFollowRequest(cmd, follow); err != nil {
-		return result{}, err
-	}
-	client, err := a.client(cmd)
-	if err != nil {
-		return result{}, err
-	}
-	if node, ok := client.(*nodeClient); ok {
-		node.autoUpgrade = false
-	}
-	backend, ok := client.(diagnosticExecutionBackend)
-	if !ok {
-		return result{}, contract.NewFault(contract.Unavailable, "diagnostic execution is not configured", "Use a node with diagnostic execution support.")
-	}
-	raw, err := backend.DiagnosticExecution(cmd.Context(), id, argv, key, confirm, dryRun)
-	if err != nil {
-		return result{}, err
-	}
-	if dryRun {
-		var preview platform.DiagnosticExecutionPreview
-		if json.Unmarshal(raw, &preview) != nil || !preview.DryRun || preview.OriginalOperationID != id {
-			return result{}, invalidNodeData("diagnostic preview")
-		}
-		plain := fmt.Sprintf("Dry run: diagnostic for %s\nnode: %s\nimage ID: %s\narguments: %d\n%s", id, preview.Node, preview.ImageID, preview.ArgCount, preview.Note)
-		for _, constraint := range preview.Sandbox {
-			plain += "\nsandbox: " + constraint
-		}
-		if preview.Replay != nil {
-			plain += fmt.Sprintf("\nreplay operation: %s", preview.Replay.ID)
-		}
-		return result{data: preview, plain: plain}, nil
-	}
-	var receipt struct {
-		Operation contract.Operation `json:"operation"`
-		Replay    bool               `json:"replay"`
-	}
-	if json.Unmarshal(raw, &receipt) != nil || receipt.Operation.Validate() != nil || receipt.Operation.Kind != platform.KindDiagnosticExecution || receipt.Operation.Target != "operation/"+string(id) {
-		return result{}, invalidNodeData("accepted diagnostic operation")
-	}
-	if !follow {
-		return result{data: receipt.Operation, plain: fmt.Sprintf("Accepted diagnostic for %s\noperation: %s\nstate: %s\nCommand output is withheld.\nnext: eregion operations follow %s --output ndjson", id, receipt.Operation.ID, receipt.Operation.State, receipt.Operation.ID), next: []string{"eregion operations get " + string(receipt.Operation.ID) + " --json", "eregion operations follow " + string(receipt.Operation.ID) + " --output ndjson"}}, nil
-	}
-	if plainOutput(cmd) {
-		if _, err := fmt.Fprintf(followConfig(cmd).out, "Accepted diagnostic operation: %s (output withheld)\n", receipt.Operation.ID); err != nil {
-			return result{}, contract.NewFault(contract.Internal, "could not write command output", "Use operations follow with the accepted operation ID.")
-		}
-	}
-	followed, err := a.followAccepted(cmd, client, receipt.Operation)
-	followed.next = []string{"eregion operations get " + string(receipt.Operation.ID) + " --json", "eregion operations follow " + string(receipt.Operation.ID) + " --output ndjson"}
-	return followed, err
 }
 
 func writeDiagnosisRevision(out *strings.Builder, label string, r *platform.DiagnosisRevision) {

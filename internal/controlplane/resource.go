@@ -394,35 +394,54 @@ func ensureNoActiveResourceOperationTx(ctx context.Context, tx pgx.Tx, id contra
 	return nil
 }
 
-// ensureNoLiveResourcesTx refuses an app or environment deletion while a
-// resource container still exists. Data volumes are never removed by this
-// guard, and the operator must destroy each named resource explicitly first.
-func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx pgx.Tx, app, environment string, appID, envID string) error {
-	statement := `SELECT r.name FROM eregion_platform_resources r
+type deletionResourceBlocker struct {
+	environment string
+	name        string
+	state       string
+}
+
+// liveDeletionResources is shared by the read-only preview and locked
+// admission. Destruction state, not attachment or health, defines the guard.
+func liveDeletionResources(ctx context.Context, q resourceStateQueryer, appID, envID string) ([]deletionResourceBlocker, error) {
+	statement := `SELECT e.name,r.name,r.state FROM eregion_platform_resources r
+        JOIN eregion_platform_environments e ON e.id=r.environment_id
         WHERE r.state<>'destroyed' AND `
 	args := []any{}
-	if environment != "" {
-		statement += `r.environment_id=$1 ORDER BY r.name`
+	if envID != "" {
+		statement += `r.environment_id=$1 ORDER BY e.name,r.name`
 		args = append(args, envID)
 	} else {
-		statement += `r.app_id=$1 ORDER BY r.name`
+		statement += `r.app_id=$1 ORDER BY e.name,r.name`
 		args = append(args, appID)
 	}
-	rows, err := tx.Query(ctx, statement, args...)
+	rows, err := q.Query(ctx, statement, args...)
 	if err != nil {
-		return unavailable()
+		return nil, unavailable()
 	}
 	defer rows.Close()
-	names := []string{}
+	var blockers []deletionResourceBlocker
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return unavailable()
+		var blocker deletionResourceBlocker
+		if err := rows.Scan(&blocker.environment, &blocker.name, &blocker.state); err != nil {
+			return nil, unavailable()
 		}
-		names = append(names, name)
+		blockers = append(blockers, blocker)
 	}
 	if err := rows.Err(); err != nil {
-		return unavailable()
+		return nil, unavailable()
+	}
+	return blockers, nil
+}
+
+// ensureNoLiveResourcesTx rechecks the preview predicate under admission locks.
+func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx pgx.Tx, app, environment string, appID, envID string) error {
+	blockers, err := liveDeletionResources(ctx, tx, appID, envID)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(blockers))
+	for _, blocker := range blockers {
+		names = append(names, blocker.name)
 	}
 	if len(names) > 0 {
 		return contract.NewFault(contract.PreconditionFailed,

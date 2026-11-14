@@ -397,7 +397,7 @@ func (s *Service) settleTerminalDeploymentOwner(ctx context.Context, owner deplo
 		// the candidate containers durably before ownership is released. Use
 		// the post-restore target, not the environment snapshot captured before
 		// recordDeploymentRestoreServing changed the live serving pointer.
-		if err := s.recordDeploymentCleanupCandidates(ctx, env, dep); err != nil {
+		if err := s.recordDeploymentCleanupCandidates(ctx, env, dep, owner.Attempt); err != nil {
 			return err
 		}
 	}
@@ -526,9 +526,9 @@ func (s *Service) cleanupInstancesForDeployment(ctx context.Context, env platfor
 	return out, nil
 }
 
-func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env platform.Environment, dep platform.Deployment, instances []platform.DeploymentInstance, reason string) error {
+func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env platform.Environment, dep platform.Deployment, instances []platform.DeploymentInstance, reason string, attempt uint32) error {
 	if reason == "candidate" {
-		s.captureCandidateDiagnostics(ctx, env, dep)
+		s.captureCandidateDiagnostics(ctx, env, dep, attempt)
 	}
 	if len(instances) == 0 {
 		var err error
@@ -560,12 +560,12 @@ func (s *Service) persistDeploymentCleanupInstances(ctx context.Context, env pla
 	return errors.Join(failures...)
 }
 
-func (s *Service) persistDeploymentCleanupIntent(ctx context.Context, env platform.Environment, dep platform.Deployment, reason string) error {
-	return s.persistDeploymentCleanupInstances(ctx, env, dep, dep.Instances, reason)
+func (s *Service) persistDeploymentCleanupIntent(ctx context.Context, env platform.Environment, dep platform.Deployment, reason string, attempt uint32) error {
+	return s.persistDeploymentCleanupInstances(ctx, env, dep, dep.Instances, reason, attempt)
 }
 
-func (s *Service) recordDeploymentCleanupCandidates(ctx context.Context, env platform.Environment, dep platform.Deployment) error {
-	return s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate")
+func (s *Service) recordDeploymentCleanupCandidates(ctx context.Context, env platform.Environment, dep platform.Deployment, attempt uint32) error {
+	return s.persistDeploymentCleanupIntent(ctx, env, dep, "candidate", attempt)
 }
 
 func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner deploymentOwner, env platform.Environment) error {
@@ -620,7 +620,7 @@ func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner dep
 			continue
 		}
 		if dep.ID != owner.RestoreDeploymentID {
-			if err := s.recordDeploymentCleanupCandidates(ctx, env, dep); err != nil {
+			if err := s.recordDeploymentCleanupCandidates(ctx, env, dep, item.attempt); err != nil {
 				recordFailures = append(recordFailures, fmt.Errorf("record cleanup for %s: %w", item.id, err))
 			}
 		}

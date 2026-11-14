@@ -225,20 +225,10 @@ func validateFollowRequest(cmd *cobra.Command, follow bool) error {
 	return validateFollow(cmd)
 }
 
-type followResult struct {
-	Operation    contract.Operation      `json:"operation"`
-	State        contract.State          `json:"state"`
-	Attempt      uint32                  `json:"attempt"`
-	ErrorCode    contract.Code           `json:"error_code,omitempty"`
-	Events       uint64                  `json:"events"`
-	Cursor       uint64                  `json:"cursor,string"`
-	LastSequence uint64                  `json:"last_sequence,string"`
-	Observation  viewer.ObservationState `json:"observation"`
-	Detached     bool                    `json:"detached"`
-}
+type followResult = output.FollowResult
 
-func newFollowResult(summary viewer.Summary) followResult {
-	return followResult{
+func newFollowResult(summary viewer.Summary) output.FollowResult {
+	return output.FollowResult{
 		Operation:    summary.Operation,
 		State:        summary.State,
 		Attempt:      summary.Attempt,
@@ -246,7 +236,7 @@ func newFollowResult(summary viewer.Summary) followResult {
 		Events:       summary.Events,
 		Cursor:       summary.Cursor,
 		LastSequence: summary.LastSequence,
-		Observation:  summary.Observation,
+		Observation:  string(summary.Observation),
 		Detached:     summary.Detached,
 	}
 }
@@ -262,14 +252,18 @@ func (a *app) followCleaner() viewer.Cleaner {
 }
 
 func (a *app) followJSON(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions) (result, error) {
-	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, nil)
+	var snapshot *contract.Operation
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, captureSnapshot(&snapshot, nil))
+	restoreSnapshot(&summary, snapshot)
 	err = followError(summary, err)
 	return result{data: newFollowResult(summary)}, err
 }
 
 func (a *app) followPlain(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (result, error) {
 	presenter := viewer.NewPlain(config.out, config.err, clean)
-	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, presenter.Observe)
+	var snapshot *contract.Operation
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, captureSnapshot(&snapshot, presenter.Observe))
+	restoreSnapshot(&summary, snapshot)
 	observedOK := err == nil
 	err = followError(summary, err)
 	presentationErr := err
@@ -289,6 +283,7 @@ func (a *app) followPlain(cmd *cobra.Command, client Backend, id contract.Operat
 func (a *app) followNDJSONSummary(cmd *cobra.Command, client Backend, id contract.OperationID, opts viewer.FollowOptions, config *followIO, clean viewer.Cleaner) (*output.Stream, viewer.Summary, error) {
 	stream := output.NewStream(config.out, a.secrets)
 	var last uint64
+	var snapshot *contract.Operation
 	emit := func(observation viewer.Observation) error {
 		if observation.Kind != viewer.ObservationEvents {
 			return nil
@@ -297,7 +292,6 @@ func (a *app) followNDJSONSummary(cmd *cobra.Command, client Backend, id contrac
 			if event.Sequence <= last {
 				continue // Defensive: never re-emit a replay or duplicate.
 			}
-			cleanEvent(&event, clean)
 			if err := stream.Event(event); err != nil {
 				return err
 			}
@@ -305,7 +299,8 @@ func (a *app) followNDJSONSummary(cmd *cobra.Command, client Backend, id contrac
 		}
 		return nil
 	}
-	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, emit)
+	summary, err := viewer.Follow(withoutWait(cmd.Context()), client, id, opts, captureSnapshot(&snapshot, emit))
+	restoreSnapshot(&summary, snapshot)
 	return stream, summary, followError(summary, err)
 }
 
@@ -338,7 +333,10 @@ func (a *app) followInteractive(cmd *cobra.Command, client Backend, id contract.
 	}
 	initial := viewer.New(id, viewer.Options{Clean: clean})
 	producer := func(ctx context.Context, emit func(viewer.Observation) error) (viewer.Summary, error) {
-		return viewer.Follow(withoutWait(ctx), client, id, opts, emit)
+		var snapshot *contract.Operation
+		summary, err := viewer.Follow(withoutWait(ctx), client, id, opts, captureSnapshot(&snapshot, emit))
+		restoreSnapshot(&summary, snapshot)
+		return summary, err
 	}
 	summary, err := tui.Run(cmd.Context(), initial, tui.Options{
 		Host:          clean(apiEndpoint(cmd)),
@@ -362,14 +360,22 @@ func (a *app) followInteractive(cmd *cobra.Command, client Backend, id contract.
 	return result{data: newFollowResult(summary), streamed: true}, err
 }
 
-func cleanEvent(event *contract.Event, clean viewer.Cleaner) {
-	event.Message = clean(event.Message)
-	event.Stage = clean(event.Stage)
-	event.ExecutionID = clean(event.ExecutionID)
-	if event.Progress != nil {
-		progress := *event.Progress
-		progress.Unit = clean(progress.Unit)
-		event.Progress = &progress
+func captureSnapshot(snapshot **contract.Operation, next func(viewer.Observation) error) func(viewer.Observation) error {
+	return func(observation viewer.Observation) error {
+		if observation.Snapshot != nil && (*snapshot == nil || observation.Snapshot.LastSequence >= (*snapshot).LastSequence) {
+			copy := *observation.Snapshot
+			*snapshot = &copy
+		}
+		if next != nil {
+			return next(observation)
+		}
+		return nil
+	}
+}
+
+func restoreSnapshot(summary *viewer.Summary, snapshot *contract.Operation) {
+	if snapshot != nil && snapshot.ID == summary.OperationID && snapshot.LastSequence == summary.LastSequence && snapshot.State == summary.State {
+		summary.Operation = *snapshot
 	}
 }
 
@@ -377,17 +383,20 @@ func cleanEvent(event *contract.Event, clean viewer.Cleaner) {
 // faults. A failed operation is not a successful command just because polling
 // succeeded. Leaving the viewer never requests operation cancellation.
 func followError(summary viewer.Summary, err error) error {
+	base := viewer.FaultDetails(summary, resumeCommand)
+	companion := &contract.FollowFaultDetails{Values: base}
 	if summary.Detached || errors.Is(err, context.Canceled) {
 		return &contract.Fault{
-			Code:    contract.Cancelled,
-			Message: "viewer detached; the operation was not cancelled",
-			Hint:    "Resume with " + resumeCommand + " " + string(summary.OperationID) + ".",
-			Details: viewer.FaultDetails(summary, resumeCommand),
-			Cause:   err,
+			Code:          contract.Cancelled,
+			Message:       "viewer detached; the operation was not cancelled",
+			Hint:          "Resume with " + resumeCommand + " " + string(summary.OperationID) + ".",
+			Details:       base,
+			FollowDetails: companion,
+			Cause:         err,
 		}
 	}
 	if err == nil {
-		details := viewer.FaultDetails(summary, resumeCommand)
+		details := base
 		details["state"] = summary.State
 		if summary.ErrorCode != "" {
 			details["error_code"] = summary.ErrorCode
@@ -401,24 +410,28 @@ func followError(summary viewer.Summary, err error) error {
 			return &contract.Fault{
 				Code: code, Message: "operation failed",
 				Hint:    "Inspect operation events before submitting again.",
-				Details: details,
+				Details: details, FollowDetails: companion,
 			}
 		case contract.Canceled:
 			return &contract.Fault{
 				Code: contract.Cancelled, Message: "operation was cancelled",
 				Hint:    "Inspect operation state before submitting again.",
-				Details: details,
+				Details: details, FollowDetails: companion,
 			}
 		default:
 			return nil
 		}
 	}
 	fault := contract.Classify(err)
-	details := viewer.FaultDetails(summary, resumeCommand)
+	details := make(map[string]any, len(base)+len(fault.Details))
+	for key, value := range base {
+		details[key] = value
+	}
 	for key, value := range fault.Details {
 		details[key] = value
 	}
 	fault.Details = details
+	fault.FollowDetails = companion
 	return fault
 }
 

@@ -94,17 +94,8 @@ with `--after <cursor>`; `--limit` bounds each page. Unavailable entries are
 evidence gaps, not findings. Report retrieval success does not mean the original
 operation succeeded. Image metadata describes declarations, not executable
 availability; child stderr appears only when forwarded to Docker.
-`diagnose` is read-only unless explicitly given `--execute`. For an isolated
-diagnostic, use `eregion diagnose <operation-id> --execute --confirm
-<operation-id> -- /absolute/executable args...` (keep the command on one line).
-Add `--dry-run` to preview without execution and supply a stable
-`--idempotency-key` for retries. Every argument is durable ordinary operation
-input: never include a secret. Exact confirmation is required even on dry runs;
-there is no prompt or `--yes` bypass. Only a recorded local deployment image is
-supported; no image is pulled. The new operation is accepted, not complete:
-follow it for exit, OOM, timeout or unknown status and verified cleanup. All
-command output is withheld because image-baked secrets cannot be redacted
-reliably. Do not treat image metadata as proof that a command was run.
+`diagnose` is read-only. Use recorded build logs and actual owned-container
+observations and logs to investigate an operation.
 
 `build logs <build-id> --json` returns at most 20,000 events per read. If
 `partial` is true, resume with `build logs <build-id> --after <cursor>`;

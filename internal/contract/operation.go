@@ -3,6 +3,7 @@ package contract
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -113,7 +114,12 @@ type Operation struct {
 	// FirstDeployOperationID is set on an accepted app or environment create
 	// that queued a first deploy in the same transaction. It is empty when the
 	// create requested no deploy.
-	FirstDeployOperationID OperationID `json:"first_deploy_operation_id,omitempty"`
+	FirstDeployOperationID OperationID         `json:"first_deploy_operation_id,omitempty"`
+	LatestResult           *ActionResult       `json:"latest_result,omitempty"`
+	ResultReadError        string              `json:"result_read_error,omitempty"`
+	Evidence               *ActionEvidenceView `json:"evidence,omitempty"`
+	EvidenceReadError      string              `json:"evidence_read_error,omitempty"`
+	PendingResult          *ActionResult       `json:"-"`
 }
 
 func (o Operation) Validate() error {
@@ -169,13 +175,25 @@ type HealthObservation struct {
 
 // CandidateDiagnostic identifies retained output from a failed candidate only.
 type CandidateDiagnostic struct {
-	DeploymentID string    `json:"deployment_id"`
-	Process      string    `json:"process,omitempty"`
-	Replica      string    `json:"replica,omitempty"`
-	Container    string    `json:"container,omitempty"`
-	ContainerID  string    `json:"container_id,omitempty"`
-	Timestamp    time.Time `json:"timestamp,omitempty"`
-	Status       string    `json:"status,omitempty"`
+	DeploymentID     string                         `json:"deployment_id"`
+	Process          string                         `json:"process,omitempty"`
+	Replica          string                         `json:"replica,omitempty"`
+	Container        string                         `json:"container,omitempty"`
+	ContainerID      string                         `json:"container_id,omitempty"`
+	Timestamp        time.Time                      `json:"timestamp,omitempty"`
+	Status           string                         `json:"status,omitempty"`
+	RedactionContext string                         `json:"redaction_context,omitempty"`
+	Observation      *CandidateLifecycleObservation `json:"observation,omitempty"`
+}
+
+type CandidateLifecycleObservation struct {
+	State      string    `json:"state"`
+	Running    bool      `json:"running"`
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	ExitCode   *int      `json:"exit_code,omitempty"`
+	OOMKilled  bool      `json:"oom_killed"`
+	Health     string    `json:"health,omitempty"`
 }
 
 type Event struct {
@@ -201,8 +219,13 @@ type Event struct {
 	// DurationMS is the measured duration of one completed step.
 	DurationMS *int64 `json:"duration_ms,omitempty"`
 	// Health is a structured probe observation.
-	Health              *HealthObservation   `json:"health,omitempty"`
-	CandidateDiagnostic *CandidateDiagnostic `json:"candidate_diagnostic,omitempty"`
+	Health              *HealthObservation     `json:"health,omitempty"`
+	CandidateDiagnostic *CandidateDiagnostic   `json:"candidate_diagnostic,omitempty"`
+	NodeEvidence        *NodeExecutionEvidence `json:"node_evidence,omitempty"`
+	EvidenceLoss        *NodeEvidenceLoss      `json:"evidence_loss,omitempty"`
+	ActionOutput        json.RawMessage        `json:"action_output,omitempty"`
+	ActionOutputStatus  string                 `json:"action_output_status,omitempty"`
+	Result              *ActionResult          `json:"result,omitempty"`
 	// ErrorCode classifies a failed terminal state. It is only valid on a
 	// state event that reports the failed state.
 	ErrorCode Code      `json:"error_code,omitempty"`
@@ -231,6 +254,16 @@ func (e Event) Validate() error {
 	}
 	if e.Kind == "step" && strings.TrimSpace(e.Stage) == "" {
 		return NewFault(ValidationFailed, "step event requires a stage", "Name the observed execution stage.")
+	}
+	if e.ActionOutputStatus != "" {
+		if e.Kind != "step" || e.Stage != "action-output" ||
+			(e.ActionOutputStatus != "available" && e.ActionOutputStatus != "omitted_too_large" && e.ActionOutputStatus != "omitted_unserializable") ||
+			(e.ActionOutputStatus == "available" && !json.Valid(e.ActionOutput)) ||
+			(e.ActionOutputStatus != "available" && len(e.ActionOutput) != 0) {
+			return NewFault(ValidationFailed, "invalid action output", "Record a bounded JSON effect snapshot or an explicit omission.")
+		}
+	} else if len(e.ActionOutput) != 0 {
+		return NewFault(ValidationFailed, "action output requires availability", "Record its availability with the output.")
 	}
 	if e.ExecutionID != "" && (e.Kind != "step" || !executionIDPattern.MatchString(e.ExecutionID)) {
 		return NewFault(ValidationFailed, "invalid execution identity", "Only step events may carry a durable node execution identity.")

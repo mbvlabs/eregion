@@ -80,5 +80,16 @@ func (s *Service) ListOperations(ctx context.Context, authority operations.Autho
 	if err := rows.Err(); err != nil {
 		return page, unavailable()
 	}
+	rows.Close()
+	// Release the listing connection before optional history hydration. A
+	// failed result read must not hide authoritative operation status.
+	for index := range page.Items {
+		if err := s.latestActionResult(ctx, &page.Items[index]); err != nil {
+			if ctx.Err() != nil {
+				return page, ctx.Err()
+			}
+			page.Items[index].ResultReadError = "operation result history is unavailable"
+		}
+	}
 	return page, nil
 }

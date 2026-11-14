@@ -44,13 +44,7 @@ func (s *Stream) Event(event contract.Event) error {
 	if s.id != "" && (s.id != event.OperationID || event.Sequence <= s.last) {
 		return fmt.Errorf("event stream requires one operation and increasing sequences")
 	}
-	event.Message = s.secrets.Redact(event.Message)
-	event.Stage = s.secrets.Redact(event.Stage)
-	if event.Progress != nil {
-		progress := *event.Progress
-		progress.Unit = s.secrets.Redact(progress.Unit)
-		event.Progress = &progress
-	}
+	event = cleanEvent(s.secrets, event)
 	if err := writeJSON(s.out, Record{Schema: contract.Schema, Type: "event", Event: &event}); err != nil {
 		s.closed = true // A failed write may have emitted a partial record. Never append.
 		return err
