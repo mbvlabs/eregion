@@ -79,6 +79,7 @@ func (f *domainDNSLedgerFixture) ServeHTTP(w http.ResponseWriter, r *http.Reques
 
 func TestIntegrationManagedDNSLedgerPersistsAndCleansUp(t *testing.T) {
 	pool, _ := testPool(t, true)
+	insertTestProviderCredential(t, pool, "0123456789abcdef0123456789abcdef", "example.com")
 	run := testRuntime(t, pool, 0)
 	s := run.Service
 	ctx := context.Background()

@@ -927,7 +927,7 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 			return err
 		})
 	}()
-	awaitLock("SELECT latest_revision, state")
+	awaitLock("FROM eregion_secrets")
 	close(admissionRelease)
 	if err := <-admissionDone; err != nil {
 		t.Fatalf("admission validation: %v", err)
@@ -975,7 +975,7 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 		})
 		submitted <- err
 	}()
-	awaitLock("SELECT name FROM eregion_secrets")
+	awaitLock("FROM eregion_secrets")
 	close(archiveRelease)
 	if err := <-archive; err != nil {
 		t.Fatal(err)

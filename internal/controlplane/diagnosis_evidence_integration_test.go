@@ -21,6 +21,9 @@ func TestIntegrationDiagnosisFindsFailureAfterLaterCaptureAndBeforePage(t *testi
 			return unavailable(err)
 		}
 		op = locked
+		if _, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, 1); err != nil || !found {
+			return unavailable(err)
+		}
 		if err := tx.Operations().SetState(ctx, op.ID, contract.Failed, ""); err != nil {
 			return err
 		}

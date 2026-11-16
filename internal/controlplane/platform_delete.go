@@ -692,7 +692,7 @@ func (s *Service) applicationEnvironments(ctx context.Context, app string) (plat
 		return record, nil, contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
 	}
 	observations, err := s.entities.Platform().Environments().List(ctx, entities.EnvironmentFilter{
-		App: app, Limit: int(^uint(0) >> 1),
+		App: app, Limit: int(^uint32(0) >> 1),
 	})
 	if err != nil {
 		return record, nil, unavailable(err)

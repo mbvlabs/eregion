@@ -145,6 +145,7 @@ func (s *Service) recoverOrphanedPlatformJob(
 		ID: job.ID, Queue: jobargs.PlatformQueue, Attempt: uint32(job.Attempt), LastClient: job.LastClient,
 	}
 	var owned bool
+	var requeuedOutcome, discardedOutcome bool
 	var op contract.Operation
 	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
 		var affected bool
@@ -193,7 +194,7 @@ func (s *Service) recoverOrphanedPlatformJob(
 					if _, err := tx.RiverJobs().Reschedule(ctx, job.ID, 30); err != nil {
 						return unavailable(err)
 					}
-					owned = true
+					owned, requeuedOutcome = true, true
 					return nil
 				}
 			}
@@ -216,7 +217,7 @@ func (s *Service) recoverOrphanedPlatformJob(
 				if _, err := tx.RiverJobs().Reschedule(ctx, job.ID, 2); err != nil {
 					return unavailable(err)
 				}
-				owned = true
+				owned, requeuedOutcome = true, true
 				return nil
 			}
 			message := fmt.Sprintf(
@@ -261,7 +262,7 @@ func (s *Service) recoverOrphanedPlatformJob(
 					}
 				}
 			}
-			owned = true
+			owned, discardedOutcome = true, true
 			return nil
 		}
 		message := fmt.Sprintf(
@@ -276,7 +277,7 @@ func (s *Service) recoverOrphanedPlatformJob(
 		); err != nil {
 			return err
 		}
-		owned = true
+		owned, requeuedOutcome = true, true
 		return nil
 	})
 	if err != nil {
@@ -289,7 +290,7 @@ func (s *Service) recoverOrphanedPlatformJob(
 		return false, false, nil
 	}
 	s.observeCommittedActionResult(op)
-	return !exhausted, exhausted, nil
+	return requeuedOutcome, discardedOutcome, nil
 }
 
 // jobTimeout is the deadline one River job gets. It is the effective bound

@@ -1001,3 +1001,23 @@ func TestIntegrationShutdownMidStepRecoversOnce(t *testing.T) {
 		t.Fatalf("shutdown duplicated or lost progress: %d", got)
 	}
 }
+
+// insertTestProviderCredential seeds the secret-free provider metadata a typed
+// admission transaction resolves zones from. Provider HTTP remains the test's
+// configured transport; no plaintext credential is stored here.
+func insertTestProviderCredential(t *testing.T, pool *pgxpool.Pool, zoneID, zoneName string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credentials
+		(provider,zone_id,zone_name,latest_revision,created_by_kind,created_by_subject,updated_by_kind,updated_by_subject,created_at,updated_at)
+		VALUES('cloudflare',$1,$2,1,'operator','test','operator','test',clock_timestamp(),clock_timestamp())
+		ON CONFLICT (provider,zone_id) DO NOTHING`, zoneID, zoneName); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credential_revisions
+		(provider,zone_id,revision,key_id,ciphertext,ciphertext_sha256,revision_hash,created_by_kind,created_by_subject,created_at)
+		VALUES('cloudflare',$1,1,'test-key','\x00',repeat('0',64),repeat('0',64),'operator','test',clock_timestamp())
+		ON CONFLICT (provider,zone_id,revision) DO NOTHING`, zoneID); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -157,11 +157,7 @@ func definitionDNSFixture(t *testing.T, foreign bool, status int) (*pgxpool.Pool
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credentials
-		(provider,zone_id,zone_name,latest_revision,created_by_kind,created_by_subject,updated_by_kind,updated_by_subject,created_at,updated_at)
-		VALUES('cloudflare',$1,'example.com',1,'operator','test','operator','test',clock_timestamp(),clock_timestamp())`, definitionTestZone); err != nil {
-		t.Fatal(err)
-	}
+	insertTestProviderCredential(t, pool, definitionTestZone, "example.com")
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_dns_policy(singleton,revision,enabled,provider,zone_id,origins,proxy_mode,updated_at)
 		VALUES(true,1,true,'cloudflare',$1,ARRAY['8.8.8.8'],'dns-only',clock_timestamp())
 		ON CONFLICT(singleton) DO UPDATE SET revision=1,enabled=true,provider='cloudflare',zone_id=$1,origins=ARRAY['8.8.8.8'],proxy_mode='dns-only'`, definitionTestZone); err != nil {

@@ -601,6 +601,52 @@ func TestIntegrationRetentionDailySubmissionIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestIntegrationPlatformSubmissionRoutesRetentionToMaintenanceQueue checks the
+// committed River job, not an in-memory decision: retention pruning must reach
+// the maintenance queue as platform_retention, while every other platform
+// action stays on the platform queue as platform_action.
+func TestIntegrationPlatformSubmissionRoutesRetentionToMaintenanceQueue(t *testing.T) {
+	pool, _ := testPool(t, true)
+	s := testRuntime(t, pool, 0).Service
+	ctx := context.Background()
+	submissions := []struct {
+		name, kind, queue string
+		op                contract.Operation
+	}{
+		{
+			name: "retention", kind: jobargs.Retention{}.Kind(), queue: jobargs.MaintenanceQueue,
+			op: platformSubmit(t, s, platform.KindRetentionPrune, "node/local", "queue-route-retention", map[string]any{}),
+		},
+		{
+			name: "platform action", kind: jobargs.PlatformAction{}.Kind(), queue: jobargs.PlatformQueue,
+			op: platformSubmit(t, s, platform.KindAppCreate, "platform", "queue-route-app", map[string]any{"name": "queued"}),
+		},
+	}
+	for _, submission := range submissions {
+		t.Run(submission.name, func(t *testing.T) {
+			var kind, queue, operationID string
+			if err := pool.QueryRow(ctx, `SELECT j.kind,j.queue,j.args->>'operation_id'
+                FROM river_job j JOIN eregion_operations o ON o.job_id=j.id WHERE o.id=$1`, submission.op.ID).
+				Scan(&kind, &queue, &operationID); err != nil {
+				t.Fatal(err)
+			}
+			if kind != submission.kind || queue != submission.queue || operationID != string(submission.op.ID) {
+				t.Fatalf("job kind=%q queue=%q operation=%q, want %q on %q for %s",
+					kind, queue, operationID, submission.kind, submission.queue, submission.op.ID)
+			}
+			var jobs, misplaced int
+			if err := pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE kind<>$2 OR queue<>$3)
+                FROM river_job WHERE args->>'operation_id'=$1`, submission.op.ID, submission.kind, submission.queue).
+				Scan(&jobs, &misplaced); err != nil {
+				t.Fatal(err)
+			}
+			if jobs != 1 || misplaced != 0 {
+				t.Fatalf("operation %s has %d job(s), %d outside %s/%s", submission.op.ID, jobs, misplaced, submission.kind, submission.queue)
+			}
+		})
+	}
+}
+
 // TestIntegrationRetentionDailySubmissionHonoursTheDayState proves the daily
 // submitter never duplicates a successful or in-progress run, and gives a
 // failed or cancelled day exactly one new numbered attempt after its backoff.

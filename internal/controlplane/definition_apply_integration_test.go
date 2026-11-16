@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/jobargs"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/riverqueue/river"
 )
@@ -86,6 +87,118 @@ func TestIntegrationDefinitionSnapshotIgnoresUnrelatedOperation(t *testing.T) {
 	})
 	if err != nil || result.Replay || result.Operation.State != contract.Queued {
 		t.Fatalf("apply=%+v err=%v", result, err)
+	}
+}
+
+// TestIntegrationExhaustedDefinitionOrphanReschedulesDrain proves the exhausted
+// definition branch reports the committed outcome: the drained parent reports a
+// requeue, not a discard, and the same transaction leaves the River job
+// scheduled for the drain while the linked child is cancelling.
+func TestIntegrationExhaustedDefinitionOrphanReschedulesDrain(t *testing.T) {
+	pool, _ := testPool(t, true)
+	run := testRuntime(t, pool, 0)
+	s := run.Service
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, action := range []struct {
+		kind, target, key string
+		input             map[string]any
+	}{
+		{platform.KindNodeRegister, "platform", "drain-node", map[string]any{
+			"name": "local", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker},
+		}},
+		{platform.KindAppCreate, "platform", "drain-app", map[string]any{"name": "api"}},
+		{platform.KindEnvironmentCreate, "app/api", "drain-env", map[string]any{
+			"name": "production", "node": "local", "config": map[string]string{"OLD": "value"},
+		}},
+	} {
+		op := platformSubmitAs(t, s, definitionIntegrationActor, action.kind, action.target, action.key, action.input)
+		if err := runPlatformAttempt(ctx, s, op.ID, 1); err != nil {
+			t.Fatalf("setup %s: %v", action.kind, err)
+		}
+		var state contract.State
+		if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state); err != nil || state != contract.Succeeded {
+			t.Fatalf("setup %s state=%s err=%v", action.kind, state, err)
+		}
+	}
+
+	app := api.AppService{DefinitionPlanner: s}
+	input := api.DefinitionPlanInput{App: "api", Environment: "production", Definition: integrationDefinition}
+	plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
+	if err != nil || !plan.CanApply {
+		t.Fatalf("plan=%+v err=%v", plan, err)
+	}
+	input.PlanNonce = plan.PlanNonce
+	result, err := app.ApplyDefinition(ctx, definitionIntegrationActor, api.DefinitionApplyInput{
+		Plan: input, ApprovedDigest: plan.Digest, IdempotencyKey: "drain-orphan", Confirm: "api/production",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := result.Operation.ID
+	claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
+	if err != nil || !ok {
+		t.Fatalf("claim=%v err=%v", ok, err)
+	}
+	err = (&platformWorker{service: s}).runDefinitionApply(ctx, claimed, 1)
+	var snooze *river.JobSnoozeError
+	if !errors.As(err, &snooze) {
+		t.Fatalf("first definition step did not wait for its child: %v", err)
+	}
+	var child contract.OperationID
+	if err := pool.QueryRow(ctx, `SELECT child_operation_id FROM eregion_definition_steps
+        WHERE parent_operation_id=$1 AND child_operation_id IS NOT NULL ORDER BY ordinal LIMIT 1`, parent).Scan(&child); err != nil {
+		t.Fatal(err)
+	}
+	var childState contract.State
+	if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&childState); err != nil || childState != contract.Queued {
+		t.Fatalf("child state=%s err=%v, want queued", childState, err)
+	}
+
+	var jobID int64
+	if err := pool.QueryRow(ctx, `UPDATE river_job
+        SET state='running',attempt=$2,max_attempts=$2,attempted_by=ARRAY['old-worker'],attempted_at=clock_timestamp()
+        WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1) RETURNING id`, parent, jobargs.PlatformMaxAttempts).Scan(&jobID); err != nil {
+		t.Fatal(err)
+	}
+	requeued, discarded, err := s.recoverOrphanedPlatformJob(ctx, orphanedPlatformJob{
+		ID: jobID, OperationID: parent,
+		Attempt: jobargs.PlatformMaxAttempts, MaxAttempts: jobargs.PlatformMaxAttempts,
+		LastClient: "old-worker",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !requeued || discarded {
+		t.Fatalf("definition drain requeued=%t discarded=%t, want requeued only", requeued, discarded)
+	}
+
+	var parentState, drainedChildState contract.State
+	var failureCode, failureMessage string
+	var finished bool
+	if err := pool.QueryRow(ctx, `SELECT o.state,r.failure_code,r.failure_message,r.finished_at IS NOT NULL
+        FROM eregion_operations o JOIN eregion_definition_runs r ON r.operation_id=o.id
+        WHERE o.id=$1`, parent).Scan(&parentState, &failureCode, &failureMessage, &finished); err != nil {
+		t.Fatal(err)
+	}
+	if parentState != contract.Cancelling || finished || failureCode != string(contract.Unavailable) ||
+		!strings.Contains(failureMessage, "attempts were exhausted") {
+		t.Fatalf("parent state=%s finished=%t code=%q message=%q", parentState, finished, failureCode, failureMessage)
+	}
+	if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&drainedChildState); err != nil ||
+		drainedChildState != contract.Cancelling {
+		t.Fatalf("drained child state=%s err=%v, want cancelling", drainedChildState, err)
+	}
+	var jobState string
+	var maxAttempts int
+	var finalized, inDrainWindow bool
+	if err := pool.QueryRow(ctx, `SELECT state,max_attempts,finalized_at IS NOT NULL,
+        (scheduled_at-clock_timestamp()) > interval '1 second' AND (scheduled_at-clock_timestamp()) < interval '4 seconds'
+        FROM river_job WHERE id=$1`, jobID).Scan(&jobState, &maxAttempts, &finalized, &inDrainWindow); err != nil {
+		t.Fatal(err)
+	}
+	if jobState != "scheduled" || finalized || maxAttempts != jobargs.PlatformMaxAttempts+1 || !inDrainWindow {
+		t.Fatalf("river job state=%s finalized=%t max_attempts=%d scheduled_window=%t", jobState, finalized, maxAttempts, inDrainWindow)
 	}
 }
 

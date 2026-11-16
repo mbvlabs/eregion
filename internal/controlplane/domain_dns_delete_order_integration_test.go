@@ -42,6 +42,7 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pool, _ := testPool(t, true)
+			insertTestProviderCredential(t, pool, "0123456789abcdef0123456789abcdef", "example.com")
 			transport := &scriptedPlatformTransport{}
 			identity := ensureTestRegistryHost(t, pool, t.TempDir())
 			run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
@@ -151,6 +152,7 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 func setupMultiBindingDelete(t *testing.T, app string) (*pgxpool.Pool, *Service, *scriptedPlatformTransport, *domainDNSLedgerFixture, context.Context, contract.Operation) {
 	t.Helper()
 	pool, _ := testPool(t, true)
+	insertTestProviderCredential(t, pool, "0123456789abcdef0123456789abcdef", "example.com")
 	transport := &scriptedPlatformTransport{}
 	identity := ensureTestRegistryHost(t, pool, t.TempDir())
 	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{

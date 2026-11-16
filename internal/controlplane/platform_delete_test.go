@@ -120,7 +120,7 @@ func TestIntegrationDeletionPreviewResourceAdmissionAndStateChange(t *testing.T)
 	go func() { _, err := s.Submit(ctx, submission); result <- err }()
 	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	waitPointerLockWaiter(t, waitCtx, pool, "FROM eregion_platform_apps WHERE name=$1 FOR UPDATE")
+	waitPointerLockWaiter(t, waitCtx, pool, "FROM eregion_platform_apps")
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}

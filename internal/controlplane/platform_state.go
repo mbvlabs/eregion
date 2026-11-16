@@ -178,7 +178,7 @@ func (s *Service) recordPlatformSubmissionTx(
 		Target: normalized.Target.String(),
 		Actor:  actor,
 	}
-	jobID, err := tx.Jobs().EnqueuePlatform(ctx, op)
+	jobID, err := enqueuePlatformTx(ctx, tx, op)
 	if err != nil {
 		return zero, unavailable(err)
 	}
@@ -210,6 +210,17 @@ func (s *Service) recordPlatformSubmissionTx(
 		}
 	}
 	return operations.SubmissionResult{Operation: op, WebhookSecretActivated: activated}, nil
+}
+
+// enqueuePlatformTx is the one admission-side routing decision for platform
+// jobs: retention runs on the maintenance queue, every other platform action on
+// the platform queue. Both go through the Store's one River client and the
+// caller's transaction.
+func enqueuePlatformTx(ctx context.Context, tx *entities.StoreTx, op contract.Operation) (int64, error) {
+	if op.Kind == platform.KindRetentionPrune {
+		return tx.Jobs().EnqueueRetention(ctx, op.ID)
+	}
+	return tx.Jobs().EnqueuePlatform(ctx, op)
 }
 
 func hashInput(canonical json.RawMessage) string {
