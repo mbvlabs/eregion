@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -31,11 +31,11 @@ func TestIntegrationPlatformWebhookAdmissionReplayAndRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	secrets, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -200,11 +200,11 @@ func TestIntegrationPlatformWebhookConcurrentAdmissionLoser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	secrets, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -303,11 +303,11 @@ func TestIntegrationPlatformWebhookAdmissionRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	secrets, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -327,12 +327,8 @@ func TestIntegrationPlatformWebhookAdmissionRollback(t *testing.T) {
 			"source": map[string]any{"url": "https://github.com/acme/api", "ref": "main"},
 		}},
 	})
-	originalEnqueue := s.enqueuePlatform
-	s.enqueuePlatform = func(ctx context.Context, tx pgx.Tx, op contract.Operation) (int64, error) {
-		if _, err := originalEnqueue(ctx, tx, op); err != nil {
-			return 0, err
-		}
-		return 0, errors.New("injected failure after webhook secret activation")
+	s.beforeSubmissionCommit = func() error {
+		return errors.New("injected failure after webhook secret activation")
 	}
 	submission := operations.Submission{
 		Kind: platform.KindEnvironmentUpdate, Target: "env/rollback/production", Actor: testActor,
@@ -343,7 +339,7 @@ func TestIntegrationPlatformWebhookAdmissionRollback(t *testing.T) {
 	if _, err := s.SubmitWithReceipt(ctx, submission); err == nil {
 		t.Fatal("rollback injection did not fail admission")
 	}
-	s.enqueuePlatform = originalEnqueue
+	s.beforeSubmissionCommit = nil
 	var operationsCount, revisionsCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE idempotency_key=$1`, submission.IdempotencyKey).Scan(&operationsCount); err != nil {
 		t.Fatal(err)
@@ -371,11 +367,11 @@ func TestIntegrationPlatformWebhookAdmissionAndDeletionLockOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	secrets, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, LocalNodeName: "local", NodeStateDir: t.TempDir(), Vault: secrets,
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -735,11 +731,11 @@ func newWebhookIntegrationRuntime(t *testing.T, concurrency int) (*pgxpool.Pool,
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	secrets, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: concurrency, TestOnly: true, LocalNodeName: "local",
 		NodeStateDir: t.TempDir(), Vault: secrets, RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -768,21 +764,18 @@ func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := secrets.Store().Set(ctx, tx, ns, []byte("test-secret-value"), 0, testActor); err != nil {
-			rollback(tx)
-			t.Fatal(err)
-		}
-		if name == "ARCHIVED" {
-			if _, err := secrets.Store().Archive(ctx, tx, ns, 1, testActor); err != nil {
-				rollback(tx)
-				t.Fatal(err)
+		err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			if _, err := secrets.Store().Set(ctx, tx.Secrets(), ns, []byte("test-secret-value"), 0, testActor); err != nil {
+				return err
 			}
-		}
-		if err := tx.Commit(ctx); err != nil {
+			if name == "ARCHIVED" {
+				if _, err := secrets.Store().Archive(ctx, tx.Secrets(), ns, 1, testActor); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -832,15 +825,11 @@ func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
 	// idempotent replay must be returned before validating current vault state.
 	ns, _ := vault.NewNamespace("nametest", "production", "ACTIVE")
 	other, _ := vault.NewNamespace("nametest", "production", "OTHER")
-	tx, err := pool.Begin(ctx)
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := secrets.Store().Set(ctx, tx.Secrets(), other, []byte("other-secret-value"), 0, testActor)
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := secrets.Store().Set(ctx, tx, other, []byte("other-secret-value"), 0, testActor); err != nil {
-		rollback(tx)
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	replay := request("name-only-replay", `{"webhook_secret_name":"OTHER"}`)
@@ -848,15 +837,11 @@ func TestIntegrationWebhookNameOnlyAdmissionAndReplay(t *testing.T) {
 	if err != nil || first.Replay {
 		t.Fatalf("first name update=%+v err=%v", first, err)
 	}
-	tx, err = pool.Begin(ctx)
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := secrets.Store().Archive(ctx, tx.Secrets(), other, 1, testActor)
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := secrets.Store().Archive(ctx, tx, other, 1, testActor); err != nil {
-		rollback(tx)
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	before := readCounts()
@@ -892,15 +877,11 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := pool.Begin(ctx)
+	err = run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := secrets.Store().Set(ctx, tx.Secrets(), ns, []byte("secret-value"), 0, testActor)
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := secrets.Store().Set(ctx, tx, ns, []byte("secret-value"), 0, testActor); err != nil {
-		rollback(tx)
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	awaitLock := func(fragment string) {
@@ -922,58 +903,61 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 		}
 	}
 	// Admission's namespace lock remains held until its caller commits.
-	admission, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(admission)
-	name := "HOOK"
-	input := &platform.EnvironmentUpdateInput{App: "archivetest", Environment: "production", WebhookSecretName: &name}
-	state := platform.RevisionState{WebhookSecretName: name}
-	if activated, err := run.Service.activateWebhookSecretTx(ctx, admission, testActor, input, state, nil); err != nil || activated {
-		t.Fatalf("admission validation: activated=%t err=%v", activated, err)
-	}
+	admissionLocked := make(chan struct{})
+	admissionRelease := make(chan struct{})
+	admissionDone := make(chan error, 1)
+	go func() {
+		admissionDone <- run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			name := "HOOK"
+			input := &platform.EnvironmentUpdateInput{App: "archivetest", Environment: "production", WebhookSecretName: &name}
+			state := platform.RevisionState{WebhookSecretName: name}
+			if activated, err := run.Service.activateWebhookSecretTx(ctx, tx, testActor, input, state, nil); err != nil || activated {
+				return errors.New("admission validation failed")
+			}
+			close(admissionLocked)
+			<-admissionRelease
+			return nil
+		})
+	}()
+	<-admissionLocked
 	archiveDone := make(chan error, 1)
 	go func() {
-		tx, err := pool.Begin(ctx)
-		if err != nil {
-			archiveDone <- err
-			return
-		}
-		defer rollback(tx)
-		if _, err = secrets.Store().Archive(ctx, tx, ns, 1, testActor); err == nil {
-			err = tx.Commit(ctx)
-		}
-		archiveDone <- err
+		archiveDone <- run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			_, err := secrets.Store().Archive(ctx, tx.Secrets(), ns, 1, testActor)
+			return err
+		})
 	}()
 	awaitLock("SELECT latest_revision, state")
-	if err := admission.Commit(ctx); err != nil {
-		t.Fatal(err)
+	close(admissionRelease)
+	if err := <-admissionDone; err != nil {
+		t.Fatalf("admission validation: %v", err)
 	}
 	if err := <-archiveDone; err != nil {
 		t.Fatalf("archive after admission commit: %v", err)
 	}
 	// Restore, then archive first inside an uncommitted transaction. The real
 	// submission must wait, observe archived state, and roll back completely.
-	tx, err = pool.Begin(ctx)
+	err = run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := secrets.Store().Set(ctx, tx.Secrets(), ns, []byte("secret-value-2"), 1, testActor)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := secrets.Store().Set(ctx, tx, ns, []byte("secret-value-2"), 1, testActor); err != nil {
-		rollback(tx)
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	archive, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(archive)
-	if _, err := secrets.Store().Archive(ctx, archive, ns, 2, testActor); err != nil {
-		t.Fatal(err)
-	}
+	archiveLocked := make(chan struct{})
+	archiveRelease := make(chan struct{})
+	archive := make(chan error, 1)
+	go func() {
+		archive <- run.Service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			if _, err := secrets.Store().Archive(ctx, tx.Secrets(), ns, 2, testActor); err != nil {
+				return err
+			}
+			close(archiveLocked)
+			<-archiveRelease
+			return nil
+		})
+	}()
+	<-archiveLocked
 	var beforeRevision string
 	var beforeRevisions, beforeOps, beforeJobs int
 	if err := pool.QueryRow(ctx, `SELECT e.current_revision_id,
@@ -992,7 +976,8 @@ func TestIntegrationWebhookAdmissionSerializesArchive(t *testing.T) {
 		submitted <- err
 	}()
 	awaitLock("SELECT name FROM eregion_secrets")
-	if err := archive.Commit(ctx); err != nil {
+	close(archiveRelease)
+	if err := <-archive; err != nil {
 		t.Fatal(err)
 	}
 	if err := <-submitted; err == nil || contract.Classify(err).Code != contract.PreconditionFailed {

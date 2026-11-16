@@ -13,6 +13,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -386,7 +387,8 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	v, err := vault.NewService(pool, ring)
+	store := newTestEntities(t, pool)
+	v, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,15 +396,10 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(tx)
-	if _, err := v.Store().Set(ctx, tx, ns, []byte("integration-secret-value"), 0, testActor); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := v.Store().Set(ctx, tx.Secrets(), ns, []byte("integration-secret-value"), 0, testActor)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT s.latest_revision=1 AND s.state='active' AND s.archived_at IS NULL
@@ -420,16 +417,11 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	providerTx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(providerTx)
-	if _, err := v.Store().SetProviderCredential(ctx, providerTx, scope, "example.com",
-		[]byte("integration-provider-value"), 0, testActor); err != nil {
-		t.Fatal(err)
-	}
-	if err := providerTx.Commit(ctx); err != nil {
+	if err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := v.Store().SetProviderCredential(ctx, tx.Providers(), scope, "example.com",
+			[]byte("integration-provider-value"), 0, testActor)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT p.latest_revision=1 AND p.zone_name='example.com'
@@ -441,10 +433,7 @@ func TestIntegrationDatabasePolicyGitDeploymentAndStoredSecretIntegrity(t *testi
 		WHERE p.provider='cloudflare' AND p.zone_id=$3`, testActor.Kind, testActor.Subject, scope.ZoneID).Scan(&ok); err != nil || !ok {
 		t.Fatalf("provider credential metadata: ok=%v err=%v", ok, err)
 	}
-	audit, err := integrations.NewPostgresAudit(pool)
-	if err != nil {
-		t.Fatal(err)
-	}
+	audit := newTestEntities(t, pool).Audit()
 	for _, action := range []string{"policy.first", "policy.second"} {
 		if err := audit.Record(ctx, integrations.AuditEntry{At: time.Now().UTC(), Actor: testActor.Subject,
 			Action: action, Target: "deploypolicy/production", Outcome: "succeeded"}); err != nil {

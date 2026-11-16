@@ -2,16 +2,15 @@ package controlplane
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
@@ -107,14 +106,15 @@ var _ integrations.DNSCredentialSource = (*CloudflareCredentialStore)(nil)
 // River.
 type CloudflareSetup struct {
 	vault     *vault.Service
+	entities  *entities.Store
 	baseURL   string
 	client    *http.Client
 	now       func() time.Time
 	auditKind string
 }
 
-func NewCloudflareSetup(service *vault.Service, baseURL string, client *http.Client) *CloudflareSetup {
-	return &CloudflareSetup{vault: service, baseURL: baseURL, client: client, now: time.Now, auditKind: "cloudflare.configure"}
+func NewCloudflareSetup(service *vault.Service, store *entities.Store, baseURL string, client *http.Client) *CloudflareSetup {
+	return &CloudflareSetup{vault: service, entities: store, baseURL: baseURL, client: client, now: time.Now, auditKind: "cloudflare.configure"}
 }
 
 // Preview validates the token and returns the exact current revision the
@@ -158,6 +158,9 @@ func (s *CloudflareSetup) ConfigureCloudflareCredential(ctx context.Context, act
 	if err := requireCloudflareOperator(actor); err != nil {
 		return vault.ProviderMetadata{}, err
 	}
+	if s == nil || s.entities == nil {
+		return vault.ProviderMetadata{}, contract.NewFault(contract.Unavailable, "provider credential storage is unavailable", "Construct the control plane with typed entities persistence.")
+	}
 	scope, zone, trimmed, err := s.prepare(zoneID, zoneName, token)
 	if err != nil {
 		return vault.ProviderMetadata{}, err
@@ -165,27 +168,45 @@ func (s *CloudflareSetup) ConfigureCloudflareCredential(ctx context.Context, act
 	if err := s.validateToken(ctx, zone, trimmed); err != nil {
 		return vault.ProviderMetadata{}, err
 	}
-	tx, err := s.vault.Store().Pool().Begin(ctx)
+	var metadata vault.ProviderMetadata
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		metadata, err = s.vault.Store().SetProviderCredential(ctx, tx.Providers(), scope, zone.ZoneName, []byte(trimmed), expectedRevision, actor)
+		if err != nil {
+			return err
+		}
+		entry := integrations.AuditEntry{
+			At: s.now().UTC(), Actor: actor.Subject, Action: s.auditKind,
+			Target: scope.Provider + "/" + scope.ZoneID, Outcome: "succeeded",
+			Detail: fmt.Sprintf("zone=%s revision=%d read_validated=true", zone.ZoneName, metadata.LatestRevision),
+		}
+		if err := tx.Audit().Record(ctx, entry); err != nil {
+			return providerAuditFault(err)
+		}
+		return nil
+	})
 	if err != nil {
-		return vault.ProviderMetadata{}, contract.NewFault(contract.Unavailable, "provider credential storage is unavailable", "Check PostgreSQL connectivity and retry; the existing credential was not changed.")
-	}
-	defer func() { _ = tx.Rollback(context.Background()) }()
-	metadata, err := s.vault.Store().SetProviderCredential(ctx, tx, scope, zone.ZoneName, []byte(trimmed), expectedRevision, actor)
-	if err != nil {
-		return vault.ProviderMetadata{}, err
-	}
-	entry := integrations.AuditEntry{
-		At: s.now().UTC(), Actor: actor.Subject, Action: s.auditKind,
-		Target: scope.Provider + "/" + scope.ZoneID, Outcome: "succeeded",
-		Detail: fmt.Sprintf("zone=%s revision=%d read_validated=true", zone.ZoneName, metadata.LatestRevision),
-	}
-	if err := recordAuditTx(ctx, tx, entry); err != nil {
-		return vault.ProviderMetadata{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return vault.ProviderMetadata{}, providerCommitFault(err)
+		switch {
+		case entities.IsBeginFailure(err):
+			return vault.ProviderMetadata{}, contract.NewFault(contract.Unavailable, "provider credential storage is unavailable", "Check PostgreSQL connectivity and retry; the existing credential was not changed.")
+		case entities.IsCommitFailure(err):
+			return vault.ProviderMetadata{}, providerCommitFault(err)
+		default:
+			return vault.ProviderMetadata{}, err
+		}
 	}
 	return metadata, nil
+}
+
+// providerAuditFault preserves the provider activation fault text. An encoding
+// failure remains Internal; every audit persistence failure is Unavailable and
+// means the credential was not activated.
+func providerAuditFault(err error) error {
+	var fault *contract.Fault
+	if errors.As(err, &fault) && fault.Code == contract.Internal {
+		return fault
+	}
+	return contract.NewFault(contract.Unavailable, "durable integration audit is unavailable", "The provider credential was not activated; repair database connectivity and retry.")
 }
 
 // providerCommitFault keeps an ambiguous PostgreSQL commit failure safe. A
@@ -194,7 +215,7 @@ func (s *CloudflareSetup) ConfigureCloudflareCredential(ctx context.Context, act
 // before retrying. The cause is never attached, avoiding DB error details and
 // any credential material reaching the CLI.
 func providerCommitFault(err error) *contract.Fault {
-	if errors.Is(err, pgx.ErrTxCommitRollback) {
+	if entities.IsDefiniteRollback(err) {
 		return contract.NewFault(contract.Unavailable,
 			"provider credential commit was rolled back",
 			"The existing credential was not changed. Run eregion dns status --provider cloudflare to read the observed revision, then retry with that revision.")
@@ -278,17 +299,6 @@ func requireCloudflareOperator(actor contract.Actor) error {
 	}
 	if actor.Kind != "operator" {
 		return contract.NewFault(contract.Forbidden, "Cloudflare setup uses the trusted SSH operator boundary", "CI, webhook and system actors cannot configure provider credentials.")
-	}
-	return nil
-}
-
-func recordAuditTx(ctx context.Context, tx pgx.Tx, entry integrations.AuditEntry) error {
-	raw, err := json.Marshal(entry)
-	if err != nil {
-		return contract.NewFault(contract.Internal, "could not encode the provider audit entry", "Do not activate the credential; report the binary version.")
-	}
-	if err := integrations.InsertAuditTx(ctx, tx, raw); err != nil {
-		return contract.NewFault(contract.Unavailable, "durable integration audit is unavailable", "The provider credential was not activated; repair database connectivity and retry.")
 	}
 	return nil
 }

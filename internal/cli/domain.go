@@ -207,12 +207,16 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 		}
 	}
 	if dryRun {
-		preview, err := submitDomain(cmd, client, kind, target.String(), rawInput, "", true)
+		preview, _, err := submitDomain(cmd, client, kind, target.String(), rawInput, "", true)
 		if err != nil {
 			return result{}, err
 		}
 		if kind == platform.KindDomainRemove {
-			preview.data, preview.plain = platformWithConfirmation(preview.data.(json.RawMessage), input.Domain)
+			raw, ok := preview.data.(json.RawMessage)
+			if !ok {
+				return result{}, invalidNodeData("domain preview")
+			}
+			preview.data, preview.plain = platformWithConfirmation(raw, input.Domain)
 		} else {
 			records := domainRecords(input.Domain, input.Addresses)
 			raw, ok := preview.data.(json.RawMessage)
@@ -243,13 +247,9 @@ func (a *app) domainChange(cmd *cobra.Command, kind string, input platform.Domai
 	if err := contract.ValidateIdempotencyKey(key); err != nil {
 		return result{}, err
 	}
-	submission, err := submitDomain(cmd, client, kind, target.String(), rawInput, key, false)
+	_, op, err := submitDomain(cmd, client, kind, target.String(), rawInput, key, false)
 	if err != nil {
 		return result{}, err
-	}
-	var op contract.Operation
-	if err := json.Unmarshal(submission.data.(json.RawMessage), &op); err != nil || op.ID == "" {
-		return result{}, contract.NewFault(contract.Internal, "unexpected operation answer", "Check binary compatibility before assuming the change was rejected.")
 	}
 
 	detach, _ := cmd.Flags().GetBool("detach")
@@ -365,12 +365,26 @@ func previewManagedData(value any) any {
 	return data["dns_managed"]
 }
 
-func submitDomain(cmd *cobra.Command, client Backend, kind, target string, input json.RawMessage, key string, dryRun bool) (result, error) {
+func submitDomain(cmd *cobra.Command, client Backend, kind, target string, input json.RawMessage, key string, dryRun bool) (result, contract.Operation, error) {
 	raw, err := client.SubmitAction(cmd.Context(), kind, target, input, key, "", dryRun)
 	if err != nil {
-		return result{}, err
+		return result{}, contract.Operation{}, err
 	}
-	return platformOperationResult(raw, dryRun), nil
+	submission := platformOperationResult(raw, dryRun)
+	if dryRun {
+		return submission, contract.Operation{}, nil
+	}
+	// Accepted submissions carry the typed contract operation. A checked
+	// assertion keeps an incompatible or unexpected answer a structured fault
+	// instead of a panic, and never implies that a possibly accepted mutation
+	// was rejected.
+	op, ok := submission.data.(contract.Operation)
+	if !ok || op.Validate() != nil {
+		return result{}, contract.Operation{}, contract.NewFault(contract.Unavailable,
+			"the node returned an unexpected operation answer",
+			"Check binary compatibility before assuming the change was rejected.")
+	}
+	return submission, op, nil
 }
 
 type domainRecord struct {

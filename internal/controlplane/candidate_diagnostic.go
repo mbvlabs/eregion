@@ -4,16 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -35,26 +34,17 @@ func (s *Service) captureCandidateDiagnostics(parent context.Context, env platfo
 	if err != nil {
 		return
 	}
+	fence := entities.CandidateCaptureFence{
+		OperationID:   op.ID,
+		Attempt:       attempt,
+		EnvironmentID: env.ID,
+		DeploymentID:  dep.ID,
+	}
 	claimed := false
-	err = s.mutateCandidateDiagnostic(ctx, op, func(tx pgx.Tx, current *contract.Operation) error {
-		var allowed, exists bool
-		if err := tx.QueryRow(ctx, `SELECT true FROM eregion_platform_deployment_owners WHERE environment_id=$1 AND operation_id=$2 AND deployment_id=$3 AND owner_attempt=$4 FOR UPDATE`, env.ID, op.ID, dep.ID, attempt).Scan(&allowed); errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		} else if err != nil {
-			return err
-		}
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'=$2 AND event->>'attempt'=$3 AND event->>'step'=$4)`, op.ID, platform.CandidateDiagnosticStage, fmt.Sprint(op.Attempt), step).Scan(&exists); err != nil {
-			return err
-		}
-		if exists {
-			return nil
-		}
-		if err := appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate diagnostic capture started; completion is unconfirmed until a summary follows.", CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Status: "unconfirmed"}}); err != nil {
-			return err
-		}
-		// Only the exact lifecycle owner may claim a Docker read.
-		claimed = allowed
-		return nil
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var claimErr error
+		claimed, claimErr = tx.CandidateCapture(fence).Claim(step)
+		return claimErr
 	})
 	if err != nil || !claimed {
 		return
@@ -63,46 +53,49 @@ func (s *Service) captureCandidateDiagnostics(parent context.Context, env platfo
 	if captured, ok := s.readCandidateDiagnostics(ctx, env, dep, op, step); ok {
 		result = captured
 	}
-	// The claim is already durable; write all output and its summary atomically.
-	// If this fails, the claim remains honestly unconfirmed.
-	_ = s.mutateCandidateDiagnostic(ctx, op, func(tx pgx.Tx, current *contract.Operation) error {
-		var owned bool
-		if err := tx.QueryRow(ctx, `SELECT true FROM eregion_platform_deployment_owners WHERE environment_id=$1 AND operation_id=$2 AND deployment_id=$3 AND owner_attempt=$4 FOR UPDATE`, env.ID, op.ID, dep.ID, attempt).Scan(&owned); errors.Is(err, pgx.ErrNoRows) {
-			return errNotOwned
-		} else if err != nil {
-			return err
+	// The claim is already durable; write all output and its summary atomically
+	// with a fresh, cancellation-detached completion budget. The setup/read
+	// context may already be exhausted by a slow node read, which must not
+	// prevent an otherwise available completion. Persistence failure leaves the
+	// claim honestly unconfirmed.
+	completionCtx, cancelCompletion := context.WithTimeout(context.WithoutCancel(parent), 2*time.Second)
+	defer cancelCompletion()
+	events := make(
+		[]contract.Event,
+		0,
+		len(result.Observations)+len(result.Lines)+1,
+	)
+	for _, observation := range result.Observations {
+		d := &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Process: observation.Process, Replica: observation.Replica, Container: observation.Container, ContainerID: observation.ContainerID, Timestamp: observation.ObservedAt, Status: "observed", Observation: &contract.CandidateLifecycleObservation{State: observation.State, Running: observation.Running, StartedAt: observation.StartedAt, FinishedAt: observation.FinishedAt, ExitCode: observation.ExitCode, OOMKilled: observation.OOMKilled, Health: observation.Health}}
+		events = append(events, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate lifecycle observed before cleanup.", CandidateDiagnostic: d})
+	}
+	for _, line := range result.Lines {
+		d := &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Process: line.Process, Replica: line.Replica, Container: line.Container, ContainerID: line.ContainerID, Timestamp: line.Timestamp, Status: "captured", RedactionContext: result.RedactionContext}
+		events = append(events, contract.Event{Kind: "log", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "[log read time; original line time unavailable] " + line.Message, CandidateDiagnostic: d})
+	}
+	status := "complete"
+	if result.Unavailable {
+		status = "unavailable"
+		if len(result.Observations) > 0 || len(result.Lines) > 0 {
+			status = "partial"
 		}
-		if !owned {
-			return errNotOwned
+	}
+	if result.Truncated {
+		if status == "unavailable" || status == "partial" {
+			status += "_truncated"
+		} else {
+			status = "truncated"
 		}
-		for _, observation := range result.Observations {
-			d := &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Process: observation.Process, Replica: observation.Replica, Container: observation.Container, ContainerID: observation.ContainerID, Timestamp: observation.ObservedAt, Status: "observed", Observation: &contract.CandidateLifecycleObservation{State: observation.State, Running: observation.Running, StartedAt: observation.StartedAt, FinishedAt: observation.FinishedAt, ExitCode: observation.ExitCode, OOMKilled: observation.OOMKilled, Health: observation.Health}}
-			if err := appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate lifecycle observed before cleanup.", CandidateDiagnostic: d}); err != nil {
-				return err
-			}
-		}
-		for _, line := range result.Lines {
-			d := &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Process: line.Process, Replica: line.Replica, Container: line.Container, ContainerID: line.ContainerID, Timestamp: line.Timestamp, Status: "captured", RedactionContext: result.RedactionContext}
-			if err := appendEvent(ctx, tx, current, contract.Event{Kind: "log", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "[log read time; original line time unavailable] " + line.Message, CandidateDiagnostic: d}); err != nil {
-				return err
-			}
-		}
-		status := "complete"
-		if result.Unavailable {
-			status = "unavailable"
-			if len(result.Observations) > 0 || len(result.Lines) > 0 {
-				status = "partial"
-			}
-		}
-		if result.Truncated {
-			if status == "unavailable" || status == "partial" {
-				status += "_truncated"
-			} else {
-				status = "truncated"
-			}
-		}
-		return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate diagnostic capture: " + status + ".", CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Status: status}})
+	}
+	events = append(events, contract.Event{Kind: "warning", Stage: platform.CandidateDiagnosticStage, Step: step, Message: "Candidate diagnostic capture: " + status + ".", CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: string(dep.ID), Status: status}})
+	completionErr := s.entities.WithinTx(completionCtx, func(tx *entities.StoreTx) error {
+		return tx.CandidateCapture(fence).Complete(step, events)
 	})
+	if completionErr != nil && s.logger != nil {
+		// Bounded static category only: never a Docker, SQL, provider or
+		// secret-bearing error string.
+		s.logger.Warn("candidate_capture_completion_unconfirmed", "reason", "persistence")
+	}
 }
 
 // candidateCaptureStep scopes a claim to immutable planned identities and
@@ -138,28 +131,6 @@ func (s *Service) candidateCaptureStep(ctx context.Context, env platform.Environ
 	}
 	sum := sha256.Sum256(raw)
 	return fmt.Sprintf("platform-candidate-diagnostic-%x-v1", sum[:16]), nil
-}
-
-// Terminal-owner recovery may be the first opportunity to capture. The owner
-// lock still serializes the lifecycle even after terminalization, so diagnostic
-// history may be appended without changing terminal state or ownership.
-func (s *Service) mutateCandidateDiagnostic(ctx context.Context, expected contract.Operation, change func(pgx.Tx, *contract.Operation) error) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 FOR UPDATE", expected.ID))
-	if err != nil {
-		return err
-	}
-	if op.Attempt != expected.Attempt {
-		return errNotOwned
-	}
-	if err := change(tx, &op); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
 }
 
 func (s *Service) readCandidateDiagnostics(ctx context.Context, env platform.Environment, dep platform.Deployment, op contract.Operation, step string) (platform.CandidateDiagnosticResult, bool) {

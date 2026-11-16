@@ -13,6 +13,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -103,23 +104,15 @@ func (s *Service) recordContainerCleanup(ctx context.Context, containerName stri
 	if cause != nil {
 		detail = s.cleanupCauseText(cause)
 	}
-	var attempts int
-	if err := s.pool.QueryRow(ctx, `INSERT INTO eregion_platform_container_cleanup
-        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,next_attempt_at,created_at)
-        VALUES($1,$2,$3,$4,$5,1,$6,clock_timestamp(),clock_timestamp())
-        ON CONFLICT (container_name) DO UPDATE
-        SET environment_id=EXCLUDED.environment_id,node=EXCLUDED.node,
-            deployment_id=EXCLUDED.deployment_id,reason=EXCLUDED.reason,
-            attempts=eregion_platform_container_cleanup.attempts+1,
-            last_error=EXCLUDED.last_error,next_attempt_at=clock_timestamp()
-        RETURNING attempts`,
-		containerName, environmentID, nodeName, nullableDeploymentID(deploymentID), reason, detail).Scan(&attempts); err != nil {
-		return unavailable()
+	attempts, err := s.entities.Platform().Cleanup().RecordFailure(ctx, entities.CleanupRecord{
+		ContainerName: containerName, EnvironmentID: environmentID, Node: nodeName,
+		DeploymentID: deploymentID, Reason: reason, LastError: detail,
+	})
+	if err != nil {
+		return unavailable(err)
 	}
-	next := fmt.Sprintf("%d seconds", int(containerCleanupBackoff(attempts).Seconds()))
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_container_cleanup
-        SET next_attempt_at=clock_timestamp()+$2::interval WHERE container_name=$1`, containerName, next); err != nil {
-		return unavailable()
+	if _, err := s.entities.Platform().Cleanup().Reschedule(ctx, containerName, containerCleanupBackoff(int(attempts))); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -132,14 +125,10 @@ func (s *Service) ensureContainerCleanup(ctx context.Context, containerName stri
 	if cause != nil {
 		detail = s.cleanupCauseText(cause)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_platform_container_cleanup
-        (container_name,environment_id,node,deployment_id,reason,attempts,last_error,next_attempt_at,created_at)
-        VALUES($1,$2,$3,$4,$5,1,$6,clock_timestamp(),clock_timestamp())
-        ON CONFLICT (container_name) DO UPDATE
-        SET environment_id=EXCLUDED.environment_id,node=EXCLUDED.node,
-            deployment_id=EXCLUDED.deployment_id,reason=EXCLUDED.reason,
-            last_error=EXCLUDED.last_error`, containerName, environmentID, nodeName,
-		nullableDeploymentID(deploymentID), reason, detail); err != nil {
+	if _, err := s.entities.Platform().Cleanup().Ensure(ctx, entities.CleanupRecord{
+		ContainerName: containerName, EnvironmentID: environmentID, Node: nodeName,
+		DeploymentID: deploymentID, Reason: reason, LastError: detail,
+	}); err != nil {
 		return unavailable(err)
 	}
 	return nil
@@ -148,41 +137,24 @@ func (s *Service) ensureContainerCleanup(ctx context.Context, containerName stri
 // retryDueContainerCleanups removes due leaked containers. A success deletes
 // the row; any failure is recorded again with the next backoff.
 func (s *Service) retryDueContainerCleanups(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT c.container_name,c.environment_id,a.name,e.name,c.node,
-            coalesce(c.deployment_id,''),c.reason,c.attempts,c.created_at
-        FROM eregion_platform_container_cleanup c
-        JOIN eregion_platform_environments e ON e.id=c.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE c.next_attempt_at <= clock_timestamp()
-        ORDER BY c.next_attempt_at,c.container_name LIMIT $1`, containerCleanupPageSize)
+	rows, err := s.entities.Platform().Cleanup().Due(ctx, containerCleanupPageSize)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
-	var due []containerCleanupRow
-	for rows.Next() {
-		var row containerCleanupRow
-		var deploymentID string
-		if err := rows.Scan(&row.ContainerName, &row.EnvironmentID, &row.App, &row.Environment, &row.Node, &deploymentID,
-			&row.Reason, &row.Attempts, &row.CreatedAt); err != nil {
-			rows.Close()
-			return unavailable()
-		}
-		row.DeploymentID = platform.DeploymentID(deploymentID)
-		due = append(due, row)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
+	due := make([]containerCleanupRow, 0, len(rows))
+	for _, row := range rows {
+		due = append(due, containerCleanupRow{
+			ContainerName: row.ContainerName, EnvironmentID: row.EnvironmentID,
+			App: row.App, Environment: row.Environment, Node: row.Node,
+			DeploymentID: row.DeploymentID, Reason: row.Reason,
+			Attempts: int(row.Attempts), CreatedAt: row.CreatedAt,
+		})
 	}
 	var failures []error
 	for _, row := range due {
 		if err := s.retryContainerCleanup(ctx, row); err != nil {
 			if errors.Is(err, errCleanupDeferred) {
-				if _, deferErr := s.pool.Exec(ctx, `UPDATE eregion_platform_container_cleanup
-                    SET next_attempt_at=clock_timestamp()+$2::interval
-                    WHERE container_name=$1`, row.ContainerName,
-					fmt.Sprintf("%d seconds", int(containerCleanupDeferInterval.Seconds()))); deferErr != nil {
+				if _, deferErr := s.entities.Platform().Cleanup().Reschedule(ctx, row.ContainerName, containerCleanupDeferInterval); deferErr != nil {
 					failures = append(failures, unavailable(deferErr))
 				}
 				continue
@@ -193,8 +165,8 @@ func (s *Service) retryDueContainerCleanups(ctx context.Context) error {
 			failures = append(failures, fmt.Errorf("cleanup %s: %w", row.ContainerName, err))
 			continue
 		}
-		if _, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_container_cleanup WHERE container_name=$1`, row.ContainerName); err != nil {
-			failures = append(failures, unavailable())
+		if _, err := s.entities.Platform().Cleanup().Delete(ctx, row.ContainerName); err != nil {
+			failures = append(failures, unavailable(err))
 		}
 	}
 	return errors.Join(failures...)
@@ -271,39 +243,25 @@ func (s *Service) removeDeploymentCleanupRowsNow(ctx context.Context, env platfo
 	if err != nil || protected {
 		return
 	}
-	rows, err := s.pool.Query(ctx, `SELECT c.container_name,c.environment_id,a.name,e.name,c.node,
-            coalesce(c.deployment_id,''),c.reason,c.attempts,c.created_at
-        FROM eregion_platform_container_cleanup c
-        JOIN eregion_platform_environments e ON e.id=c.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE c.environment_id=$1 AND c.deployment_id=$2
-        ORDER BY c.container_name`, env.ID, deploymentID)
+	rows, err := s.entities.Platform().Cleanup().ForDeployment(ctx, env.ID, deploymentID, "")
 	if err != nil {
 		return
 	}
-	var due []containerCleanupRow
-	for rows.Next() {
-		var row containerCleanupRow
-		var storedDeployment string
-		if err := rows.Scan(&row.ContainerName, &row.EnvironmentID, &row.App, &row.Environment, &row.Node,
-			&storedDeployment, &row.Reason, &row.Attempts, &row.CreatedAt); err != nil {
-			rows.Close()
-			return
-		}
-		row.DeploymentID = platform.DeploymentID(storedDeployment)
-		due = append(due, row)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return
+	due := make([]containerCleanupRow, 0, len(rows))
+	for _, row := range rows {
+		due = append(due, containerCleanupRow{
+			ContainerName: row.ContainerName, EnvironmentID: row.EnvironmentID,
+			App: row.App, Environment: row.Environment, Node: row.Node,
+			DeploymentID: row.DeploymentID, Reason: row.Reason,
+			Attempts: int(row.Attempts), CreatedAt: row.CreatedAt,
+		})
 	}
 	for _, row := range due {
 		if err := s.removeContainerCleanupRow(ctx, row); err != nil {
 			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
 			continue
 		}
-		if _, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_container_cleanup WHERE container_name=$1`, row.ContainerName); err != nil {
+		if _, err := s.entities.Platform().Cleanup().Delete(ctx, row.ContainerName); err != nil {
 			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
 		}
 	}
@@ -317,39 +275,25 @@ func (s *Service) removePreviousDeploymentCleanupNow(ctx context.Context, env pl
 	if err != nil || protected {
 		return
 	}
-	rows, err := s.pool.Query(ctx, `SELECT c.container_name,c.environment_id,a.name,e.name,c.node,
-            coalesce(c.deployment_id,''),c.reason,c.attempts,c.created_at
-        FROM eregion_platform_container_cleanup c
-        JOIN eregion_platform_environments e ON e.id=c.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE c.environment_id=$1 AND c.deployment_id=$2 AND c.reason='previous'
-        ORDER BY c.container_name`, env.ID, deploymentID)
+	rows, err := s.entities.Platform().Cleanup().ForDeployment(ctx, env.ID, deploymentID, "previous")
 	if err != nil {
 		return
 	}
 	var due []containerCleanupRow
-	for rows.Next() {
-		var row containerCleanupRow
-		var storedDeployment string
-		if err := rows.Scan(&row.ContainerName, &row.EnvironmentID, &row.App, &row.Environment, &row.Node,
-			&storedDeployment, &row.Reason, &row.Attempts, &row.CreatedAt); err != nil {
-			rows.Close()
-			return
-		}
-		row.DeploymentID = platform.DeploymentID(storedDeployment)
-		due = append(due, row)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return
+	for _, row := range rows {
+		due = append(due, containerCleanupRow{
+			ContainerName: row.ContainerName, EnvironmentID: row.EnvironmentID,
+			App: row.App, Environment: row.Environment, Node: row.Node,
+			DeploymentID: row.DeploymentID, Reason: row.Reason,
+			Attempts: int(row.Attempts), CreatedAt: row.CreatedAt,
+		})
 	}
 	for _, row := range due {
 		if err := s.removeContainerCleanupRow(ctx, row); err != nil {
 			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
 			continue
 		}
-		if _, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_container_cleanup WHERE container_name=$1`, row.ContainerName); err != nil {
+		if _, err := s.entities.Platform().Cleanup().Delete(ctx, row.ContainerName); err != nil {
 			_ = s.recordContainerCleanup(ctx, row.ContainerName, row.EnvironmentID, row.Node, row.DeploymentID, row.Reason, err)
 		}
 	}

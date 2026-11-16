@@ -3,12 +3,12 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
+	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -27,7 +27,12 @@ type promotionPlan struct {
 // production's current revision. No build row is created. The new release
 // deliberately has no command of its own: the deployment resolves production's
 // current revision release command, so a staging command is never copied.
-func (s *Service) preparePromotionTx(ctx context.Context, tx pgx.Tx, operationID contract.OperationID, input *platform.PromoteInput) error {
+func (s *Service) preparePromotionTx(
+	ctx context.Context,
+	tx *entities.StoreTx,
+	operationID contract.OperationID,
+	input *platform.PromoteInput,
+) error {
 	plan, err := s.promotionPlanTx(ctx, tx, input)
 	if err != nil {
 		return err
@@ -41,13 +46,19 @@ func (s *Service) preparePromotionTx(ctx context.Context, tx pgx.Tx, operationID
 	}
 	sourceJSON, err := json.Marshal(plan.SourceRelease.Source)
 	if err != nil {
-		return contract.NewFault(contract.Internal, "could not encode the promoted artifact source", "Report the command and binary version.")
+		return contract.NewFault(
+			contract.Internal,
+			"could not encode the promoted artifact source",
+			"Report the command and binary version.",
+		)
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_releases
-        (id,operation_id,app_id,environment_id,image,image_id,source,status,commit_sha,completed_at,error_code,error,created_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,'ready',$8,clock_timestamp(),'','',clock_timestamp())`,
-		releaseID, operationID, envAppID(ctx, tx, plan.TargetEnvironment.App), plan.TargetEnvironment.ID,
-		plan.SourceRelease.Image, plan.SourceRelease.ImageID, sourceJSON, plan.SourceRelease.CommitSHA); err != nil {
+	completedAt := time.Now().UTC()
+	if _, err := tx.Platform().Releases().Insert(ctx, entities.ReleaseInsert{
+		ID: releaseID, OperationID: operationID, AppID: envAppID(ctx, tx, plan.TargetEnvironment.App),
+		EnvironmentID: plan.TargetEnvironment.ID, Image: plan.SourceRelease.Image,
+		ImageID: plan.SourceRelease.ImageID, Source: sourceJSON, Status: platform.ReleaseReady,
+		CommitSHA: plan.SourceRelease.CommitSHA, CompletedAt: &completedAt,
+	}); err != nil {
 		return platformWriteError(err, "promoted release could not be recorded")
 	}
 	if err := s.prepareDeploymentTx(ctx, tx, operationID, plan.TargetEnvironment, releaseID,
@@ -63,7 +74,11 @@ func (s *Service) preparePromotionTx(ctx context.Context, tx pgx.Tx, operationID
 // serving release cannot advance between validation and the release insert.
 // The target row lock serializes this promotion with any other submission that
 // would change production's serving state.
-func (s *Service) promotionPlanTx(ctx context.Context, tx pgx.Tx, input *platform.PromoteInput) (promotionPlan, error) {
+func (s *Service) promotionPlanTx(
+	ctx context.Context,
+	tx *entities.StoreTx,
+	input *platform.PromoteInput,
+) (promotionPlan, error) {
 	source, err := environmentByNameTx(ctx, tx, input.App, input.SourceEnvironment)
 	if err != nil {
 		return promotionPlan{}, err
@@ -85,19 +100,33 @@ func (s *Service) promotionPlanTx(ctx context.Context, tx pgx.Tx, input *platfor
 	if err := s.checkDeployabilityTx(ctx, tx, target, true); err != nil {
 		return promotionPlan{}, err
 	}
-	if err := s.checkPlacementByTx(ctx, tx, target.Node, platform.RoleApplication, platform.CapabilityDocker); err != nil {
+	if err := s.checkPlacementByTx(
+		ctx,
+		tx,
+		target.Node,
+		platform.RoleApplication,
+		platform.CapabilityDocker,
+	); err != nil {
 		return promotionPlan{}, err
 	}
-	if err := promotionDeploymentConflict(ctx, tx, target, release); err != nil {
+	if err := promotionDeploymentConflict(ctx, tx.Platform().Releases(), tx.Platform().Deployments(), target, release); err != nil {
 		return promotionPlan{}, err
 	}
-	return promotionPlan{SourceEnvironment: source, SourceRelease: release, TargetEnvironment: target}, nil
+	return promotionPlan{
+		SourceEnvironment: source,
+		SourceRelease:     release,
+		TargetEnvironment: target,
+	}, nil
 }
 
 // previewPromotion resolves the same facts without mutation. A preview is
 // advisory and takes no row lock; the submission repeats every check inside its
 // transaction.
-func (s *Service) previewPromotion(ctx context.Context, normalized platform.Normalized, input *platform.PromoteInput) (platform.Preview, error) {
+func (s *Service) previewPromotion(
+	ctx context.Context,
+	normalized platform.Normalized,
+	input *platform.PromoteInput,
+) (platform.Preview, error) {
 	preview := platform.Preview{
 		Kind: platform.KindPromote, Target: normalized.Target.String(), DryRun: true,
 		Input: input.Preview(), Summary: normalized.Summary,
@@ -126,18 +155,29 @@ func (s *Service) previewPromotion(ctx context.Context, normalized platform.Norm
 	if err := s.checkPreviewPlacement(ctx, target.Node, ""); err != nil {
 		return preview, err
 	}
-	if err := promotionDeploymentConflict(ctx, s.pool, target, release); err != nil {
+	if err := promotionDeploymentConflict(ctx, s.entities.Platform().Releases(), s.entities.Platform().Deployments(), target, release); err != nil {
 		return preview, err
 	}
 	preview.Steps = promotionSteps()
-	preview.Summary = fmt.Sprintf("Promote %s/%s serving release %s to %s/%s without rebuilding; production's current revision, config, secrets, domains and release command apply.",
-		input.App, input.SourceEnvironment, release.ID, input.App, platform.PromotionTargetEnvironment)
+	preview.Summary = fmt.Sprintf(
+		"Promote %s/%s serving release %s to %s/%s without rebuilding; production's current revision, config, secrets, domains and release command apply.",
+		input.App,
+		input.SourceEnvironment,
+		release.ID,
+		input.App,
+		platform.PromotionTargetEnvironment,
+	)
 	if target.ServingRelease != "" {
-		preview.Warnings = append(preview.Warnings, "Production's serving release stays until the candidate passes health and its primary-domain public check.")
+		preview.Warnings = append(
+			preview.Warnings,
+			"Production's serving release stays until the candidate passes health and its primary-domain public check.",
+		)
 	}
-	preview.Warnings = append(preview.Warnings,
+	preview.Warnings = append(
+		preview.Warnings,
 		"Nothing is copied from "+input.App+"/"+input.SourceEnvironment+": production keeps its own domain bindings, plain config, secret names and release command.",
-		"The exact image digest is pinned as a new production release; no build is requested.")
+		"The exact image digest is pinned as a new production release; no build is requested.",
+	)
 	preview.Data = map[string]any{
 		"source_environment":        input.SourceEnvironment,
 		"source_release_id":         string(release.ID),
@@ -153,7 +193,11 @@ func (s *Service) previewPromotion(ctx context.Context, normalized platform.Norm
 
 func (s *Service) promotionDeployability(ctx context.Context, env platform.Environment) error {
 	report := platform.EvaluateDeployability(env.Revision, platform.DeployabilityState{
-		ArtifactReady: true, ExplicitRelease: true, PrimaryDomain: env.PrimaryDomain, DNS: env.Deployability.DNS,
+		ArtifactReady:   true,
+		ExplicitRelease: true,
+		BuilderRequired: false,
+		PrimaryDomain:   env.PrimaryDomain,
+		DNS:             env.Deployability.DNS,
 	})
 	missing, err := s.resourceDeployability(ctx, env)
 	if err != nil {
@@ -175,36 +219,72 @@ func (s *Service) promotionDeployability(ctx context.Context, env platform.Envir
 // preview and submission. It proves the source artifact is a ready, unpruned
 // release that is currently serving its own environment, and that the public
 // target can be verified on the same node without cross-node artifact transfer.
-func validatePromotionState(input *platform.PromoteInput, source, target platform.Environment, release platform.Release) error {
+func validatePromotionState(
+	input *platform.PromoteInput,
+	source, target platform.Environment,
+	release platform.Release,
+) error {
 	if input.App != target.App || input.App != source.App {
-		return contract.NewFault(contract.ValidationFailed, "promotion must stay inside one application", "Use environments from the same app; promotion never crosses app ownership.")
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"promotion must stay inside one application",
+			"Use environments from the same app; promotion never crosses app ownership.",
+		)
 	}
 	if target.Name != platform.PromotionTargetEnvironment {
-		return contract.NewFault(contract.ValidationFailed, "promotion target must be production", "Use env promote; the production target is fixed.")
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"promotion target must be production",
+			"Use env promote; the production target is fixed.",
+		)
 	}
 	if source.Name == target.Name {
-		return contract.NewFault(contract.ValidationFailed, "an environment cannot be promoted to itself", "Name a different source environment.")
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"an environment cannot be promoted to itself",
+			"Name a different source environment.",
+		)
 	}
 	if source.ServingRelease == "" {
 		return promotionSourceServingFault(input)
 	}
 	if source.ServingRelease != release.ID {
-		return contract.NewFault(contract.Conflict, "the source serving release changed during promotion", "Read the source environment again and retry; no production release was recorded.")
+		return contract.NewFault(
+			contract.Conflict,
+			"the source serving release changed during promotion",
+			"Read the source environment again and retry; no production release was recorded.",
+		)
 	}
 	if release.App != source.App || release.Environment != source.Name {
-		return contract.NewFault(contract.Conflict, "the source release does not belong to the source environment", "Use the serving release of the named environment.")
+		return contract.NewFault(
+			contract.Conflict,
+			"the source release does not belong to the source environment",
+			"Use the serving release of the named environment.",
+		)
 	}
 	if err := refusePrunedRelease(release); err != nil {
 		return err
 	}
 	if release.Status != platform.ReleaseReady {
-		return contract.NewFault(contract.PreconditionFailed, "the source serving release is not ready", "Wait for the source release to become ready before promoting it.")
+		return contract.NewFault(
+			contract.PreconditionFailed,
+			"the source serving release is not ready",
+			"Wait for the source release to become ready before promoting it.",
+		)
 	}
 	if release.ImageID == "" {
-		return contract.NewFault(contract.PreconditionFailed, "the source serving release has no immutable image", "Deploy a ready release with a verified image digest before promoting it.")
+		return contract.NewFault(
+			contract.PreconditionFailed,
+			"the source serving release has no immutable image",
+			"Deploy a ready release with a verified image digest before promoting it.",
+		)
 	}
 	if source.Node != target.Node {
-		return contract.NewFault(contract.PreconditionFailed, "the source and production environments are on different nodes", "Promotion reuses the exact image on the production node; cross-node artifact transfer is not implemented. Use the same node, or deploy from production's own source.")
+		return contract.NewFault(
+			contract.PreconditionFailed,
+			"the source and production environments are on different nodes",
+			"Promotion reuses the exact image on the production node; cross-node artifact transfer is not implemented. Use the same node, or deploy from production's own source.",
+		)
 	}
 	return nil
 }
@@ -232,38 +312,41 @@ func promotionTargetFault(err error) error {
 // deploys may still be queued after a promotion; the execution-time rebind in
 // deploymentPlan keeps whichever one runs next pointed at the actual previous
 // serving deployment.
-func promotionDeploymentConflict(ctx context.Context, q rowQueryer, target platform.Environment, release platform.Release) error {
+func promotionDeploymentConflict(
+	ctx context.Context,
+	releases *entities.ReleaseStore,
+	deployments *entities.DeploymentStore,
+	target platform.Environment,
+	release platform.Release,
+) error {
 	if release.ImageID == "" {
 		return nil
 	}
 	if target.ServingRelease != "" {
-		serving, err := scanReleaseRow(q.QueryRow(ctx, releaseSelect+" WHERE r.id=$1", target.ServingRelease))
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return unavailable()
+		serving, found, err := releases.GetByID(ctx, target.ServingRelease)
+		if err != nil {
+			return unavailable(err)
 		}
-		if err == nil && serving.ImageID == release.ImageID {
-			return contract.NewFault(contract.Conflict,
+		if found && serving.ImageID == release.ImageID {
+			return contract.NewFault(
+				contract.Conflict,
 				"production already serves the exact source artifact "+release.ImageID,
-				"Use a new source release for a new promotion; apply a revision change with restart.")
+				"Use a new source release for a new promotion; apply a revision change with restart.",
+			)
 		}
 	}
-	var activeReleaseID string
-	err := q.QueryRow(ctx, `SELECT d.release_id
-        FROM eregion_platform_deployments d
-        JOIN eregion_operations o ON o.id=d.operation_id
-        WHERE d.environment_id=$1
-          AND d.state IN ('pending','running')
-          AND o.state IN ('queued','running','cancelling')
-        ORDER BY d.created_at, d.id LIMIT 1`, target.ID).Scan(&activeReleaseID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	activeReleaseID, found, err := deployments.ActiveReleaseForEnvironment(ctx, target.ID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if !found {
 		return nil
 	}
-	if err != nil {
-		return unavailable()
-	}
-	return contract.NewFault(contract.Conflict,
-		"production has an active deployment ("+activeReleaseID+"); promotion cannot be admitted until it finishes",
-		"Follow or wait for the active operation, then retry the promotion; a later promotion never rewrites that deployment's previous-release cleanup history.")
+	return contract.NewFault(
+		contract.Conflict,
+		"production has an active deployment ("+string(activeReleaseID)+"); promotion cannot be admitted until it finishes",
+		"Follow or wait for the active operation, then retry the promotion; a later promotion never rewrites that deployment's previous-release cleanup history.",
+	)
 }
 
 func promotionSteps() []string {

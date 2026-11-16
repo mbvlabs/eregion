@@ -156,7 +156,7 @@ func TestIntegrationDeletionPreviewScopesTargetCountsAndWarnsOnlyForTheLastEnvir
 		"domain": "deletepreview-staging.example.com",
 	})
 	for _, environment := range []string{"production", "staging"} {
-		seedArtifactRelease(t, s, "deletepreview", environment, "ghcr.io/acme/deletepreview:"+environment)
+		seedArtifactRelease(t, pool, s, "deletepreview", environment, "ghcr.io/acme/deletepreview:"+environment)
 	}
 
 	staging, err := previewSubmission(t, s, platform.KindEnvironmentDelete, "env/deletepreview/staging", map[string]any{})

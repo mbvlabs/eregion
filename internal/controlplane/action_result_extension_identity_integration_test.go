@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -36,14 +36,8 @@ func TestIntegrationRegisteredExtensionIdentityAndCollisionResult(t *testing.T) 
 	ctx := context.Background()
 	run.Service.redaction = &secrets.Registry{}
 	run.Service.redaction.Add("a", "stdout", "rawsecret")
-	audit, err := integrations.NewPostgresAudit(pool)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := integrations.NewPostgresGrantStore(pool)
-	if err != nil {
-		t.Fatal(err)
-	}
+	audit := newTestEntities(t, pool).Audit()
+	store := run.Service.entities.Grants()
 	access, err := integrations.NewAccessController(integrations.AccessConfig{
 		AdminSubjects: []string{testActor.Subject}, Audit: audit, Store: store,
 	})
@@ -95,7 +89,7 @@ func TestIntegrationRegisteredExtensionIdentityAndCollisionResult(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, owned, err := run.Service.mutateOwned(ctx, id, 1, func(tx pgx.Tx, op *contract.Operation) error {
+		_, owned, err := run.Service.mutateOwned(ctx, id, 1, func(tx *entities.StoreTx, op *contract.Operation) error {
 			return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: "integration", Message: "Integration attempt started."})
 		})
 		if err != nil || !owned {

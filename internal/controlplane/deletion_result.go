@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -17,26 +17,22 @@ type deletedEnvironmentResult struct {
 
 // An optional evidence write must not veto the existing deletion transaction.
 // Work on a copy so a rolled-back savepoint cannot advance the event cursor.
-func (s *Service) tryDeletionOutputTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, data json.RawMessage) {
-	nested, err := tx.Begin(ctx)
-	if err != nil {
+func (s *Service) tryDeletionOutputTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, data json.RawMessage) {
+	if tx == nil {
 		op.PendingResult = &contract.ActionResult{DataStatus: "unavailable"}
 		return
 	}
 	copy := *op
-	if err := s.appendActionOutputTx(ctx, nested, &copy, data); err != nil {
-		_ = nested.Rollback(ctx)
-		op.PendingResult = &contract.ActionResult{DataStatus: "unavailable"}
-		return
-	}
-	if err := nested.Commit(ctx); err != nil {
+	if err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		return s.appendActionOutputTx(ctx, nested, &copy, data)
+	}); err != nil {
 		op.PendingResult = &contract.ActionResult{DataStatus: "unavailable"}
 		return
 	}
 	*op = copy
 }
 
-func domainRemovalActionDataTx(ctx context.Context, tx pgx.Tx, app, environment, domain string) (json.RawMessage, error) {
+func domainRemovalActionDataTx(ctx context.Context, tx *entities.StoreTx, app, environment, domain string) (json.RawMessage, error) {
 	var result struct {
 		DomainID              platform.DomainID      `json:"domain_id"`
 		EnvironmentID         platform.EnvironmentID `json:"environment_id"`
@@ -50,17 +46,15 @@ func domainRemovalActionDataTx(ctx context.Context, tx pgx.Tx, app, environment,
 		RouteSync             string                 `json:"route_sync"`
 		ObservedAt            time.Time              `json:"observed_at"`
 	}
-	err := tx.QueryRow(ctx, `SELECT d.id,e.id,d.name,d.is_primary,
-		EXISTS(SELECT 1 FROM eregion_platform_domain_dns x WHERE x.domain_id=d.id),
-		coalesce((SELECT state FROM eregion_platform_domain_dns x WHERE x.domain_id=d.id),'not_required')
-		FROM eregion_platform_domains d JOIN eregion_platform_environments e ON e.id=d.environment_id
-		JOIN eregion_platform_apps a ON a.id=e.app_id
-		WHERE a.name=$1 AND e.name=$2 AND d.name=$3 FOR UPDATE OF d`,
-		app, environment, domain).Scan(&result.DomainID, &result.EnvironmentID, &result.Domain,
-		&result.WasPrimary, &result.ManagedDNS, &result.ProviderCleanup)
+	facts, found, err := tx.Platform().Domains().RemovalData(ctx, app, environment, domain)
 	if err != nil {
 		return nil, err
 	}
+	if !found {
+		return nil, contract.NewFault(contract.NotFound, "domain binding was not found", "Reload the binding before recording removal evidence.")
+	}
+	result.DomainID, result.EnvironmentID, result.Domain = facts.DomainID, facts.EnvironmentID, facts.Domain
+	result.WasPrimary, result.ManagedDNS, result.ProviderCleanup = facts.Primary, facts.ManagedDNS, facts.DNSState
 	result.App, result.Environment = app, environment
 	result.DesiredBindingRemoved, result.RouteSync, result.ObservedAt = true, "not_observed", time.Now().UTC()
 	return json.Marshal(result)

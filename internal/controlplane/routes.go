@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -58,7 +58,7 @@ func (w *platformWorker) runDomain(ctx context.Context, id contract.OperationID,
 	if err := w.service.syncRoutes(ctx); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
-	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		kind, summary := "domain.added", "Saved the binding for "+input.Domain+" on "+input.App+"/"+input.Environment+"; route and observations are reported separately."
 		if normalized.Kind == platform.KindDomainRemove {
 			kind, summary = "domain.removed", "Removed the binding and route for "+input.Domain
@@ -111,145 +111,112 @@ func (s *Service) writeRoutesForDeployment(ctx context.Context, env platform.Env
 }
 
 func (s *Service) writeRoutes(ctx context.Context, overrideEnvironment platform.EnvironmentID, overrideUpstreams []string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return unavailable()
-	}
-	defer rollback(tx)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, caddyRoutesLockKey); err != nil {
-		return unavailable()
-	}
-	if overrideEnvironment != "" {
-		// A deployment switch changes this environment's desired upstreams, so
-		// its domains get a new route revision before the write is attempted.
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains SET desired_revision=desired_revision+1 WHERE environment_id=$1`, overrideEnvironment); err != nil {
-			return unavailable()
+	var routeErr error
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if err := tx.Platform().Domains().LockRouteWrite(ctx, caddyRoutesLockKey); err != nil {
+			return unavailable(err)
 		}
-	}
-	rows, err := tx.Query(ctx, desiredRoutesQuery)
-	if err != nil {
-		return unavailable()
-	}
-	var routes []platform.Route
-	var routed, unrouted []string
-	for rows.Next() {
-		var route platform.Route
-		var environmentID platform.EnvironmentID
-		var rawInstances []byte
-		if err := rows.Scan(&route.Domain, &environmentID, &route.Primary, &rawInstances); err != nil {
-			rows.Close()
-			return unavailable()
-		}
-		if environmentID == overrideEnvironment {
-			route.Upstreams = append([]string(nil), overrideUpstreams...)
-		} else if len(rawInstances) > 0 {
-			var instances []platform.DeploymentInstance
-			if err := json.Unmarshal(rawInstances, &instances); err != nil {
-				rows.Close()
-				return unavailable()
+		if overrideEnvironment != "" {
+			// A deployment switch changes this environment's desired upstreams, so
+			// its domains get a new route revision before the write is attempted.
+			if _, err := tx.Platform().Domains().BumpDesiredRevision(ctx, overrideEnvironment); err != nil {
+				return unavailable(err)
 			}
-			route.Upstreams = platform.WebUpstreams(instances)
 		}
-		if len(route.Upstreams) == 0 {
-			unrouted = append(unrouted, route.Domain)
-		} else {
-			routed = append(routed, route.Domain)
+		targets, err := tx.Platform().Domains().RouteTargets(ctx)
+		if err != nil {
+			return unavailable(err)
 		}
-		routes = append(routes, route)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return unavailable()
-	}
-	content := platform.RenderRoutes(routes)
-	now := time.Now().UTC()
-	// Keep the worker's PostgreSQL desired-route lock first, then serialize the
-	// fragment publish and activation with the host's root publish/activation.
-	// The host never takes a database lock, so this order cannot deadlock.
-	releaseIngress, err := engine.AcquireFile(ctx, platform.CaddyIngressLockPath, engine.LockExclusive, 30*time.Second)
-	if err != nil {
-		fault := contract.NewFault(contract.Unavailable,
-			"the local ingress is busy with another publish or activation",
-			"Wait for the other ingress operation to finish, then retry.")
-		return s.finishRouteWrite(ctx, tx, routed, unrouted, fault, now)
-	}
-	defer releaseIngress()
-	previous, err := os.ReadFile(platform.CaddyRoutesPath)
-	if err != nil {
-		fault := contract.NewFault(contract.PreconditionFailed, "Caddy is not set up on the main node ("+err.Error()+")", "Run eregion server init with a public hostname.")
-		return s.finishRouteWrite(ctx, tx, routed, unrouted, fault, now)
-	}
-	if len(routed) > 0 {
-		if err := validateCaddyRoutes(ctx, content); err != nil {
-			return s.finishRouteWrite(ctx, tx, routed, unrouted, err, now)
-		}
-	}
-	if !bytes.Equal(previous, content) {
-		if err := platform.WriteFileAtomic(platform.CaddyRoutesPath, content, 0o644); err != nil {
-			fault := contract.NewFault(contract.PreconditionFailed, "could not write the Caddy routes", err.Error())
-			return s.finishRouteWrite(ctx, tx, routed, unrouted, fault, now)
-		}
-		if err := loadCaddyfile(ctx); err != nil {
-			restoreErr := platform.WriteFileAtomic(platform.CaddyRoutesPath, previous, 0o644)
-			_ = loadCaddyfile(context.WithoutCancel(ctx))
-			if restoreErr != nil {
-				err = errors.Join(err, fmt.Errorf("restore previous routes: %w", restoreErr))
+		routes := make([]platform.Route, 0, len(targets))
+		var routed, unrouted []string
+		for _, target := range targets {
+			route := platform.Route{Domain: target.Domain, Primary: target.Primary}
+			if target.EnvironmentID == overrideEnvironment {
+				route.Upstreams = append([]string(nil), overrideUpstreams...)
+			} else if len(target.Instances) > 0 {
+				var instances []platform.DeploymentInstance
+				if err := json.Unmarshal(target.Instances, &instances); err != nil {
+					return unavailable(err)
+				}
+				route.Upstreams = platform.WebUpstreams(instances)
 			}
-			return s.finishRouteWrite(ctx, tx, routed, unrouted, err, now)
+			if len(route.Upstreams) == 0 {
+				unrouted = append(unrouted, route.Domain)
+			} else {
+				routed = append(routed, route.Domain)
+			}
+			routes = append(routes, route)
 		}
+		content := platform.RenderRoutes(routes)
+		now := time.Now().UTC()
+		// Keep the worker's PostgreSQL desired-route lock first, then serialize the
+		// fragment publish and activation with the host's root publish/activation.
+		// The host never takes a database lock, so this order cannot deadlock.
+		releaseIngress, err := engine.AcquireFile(ctx, platform.CaddyIngressLockPath, engine.LockExclusive, 30*time.Second)
+		if err != nil {
+			routeErr = contract.NewFault(contract.Unavailable,
+				"the local ingress is busy with another publish or activation",
+				"Wait for the other ingress operation to finish, then retry.")
+			return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
+		}
+		defer releaseIngress()
+		previous, err := os.ReadFile(platform.CaddyRoutesPath)
+		if err != nil {
+			routeErr = contract.NewFault(contract.PreconditionFailed, "Caddy is not set up on the main node ("+err.Error()+")", "Run eregion server init with a public hostname.")
+			return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
+		}
+		if len(routed) > 0 {
+			if err := validateCaddyRoutes(ctx, content); err != nil {
+				routeErr = err
+				return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
+			}
+		}
+		if !bytes.Equal(previous, content) {
+			if err := platform.WriteFileAtomic(platform.CaddyRoutesPath, content, 0o644); err != nil {
+				routeErr = contract.NewFault(contract.PreconditionFailed, "could not write the Caddy routes", err.Error())
+				return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
+			}
+			if err := loadCaddyfile(ctx); err != nil {
+				restoreErr := platform.WriteFileAtomic(platform.CaddyRoutesPath, previous, 0o644)
+				_ = loadCaddyfile(context.WithoutCancel(ctx))
+				if restoreErr != nil {
+					err = errors.Join(err, fmt.Errorf("restore previous routes: %w", restoreErr))
+				}
+				routeErr = err
+				return s.finishRouteWriteTx(ctx, tx, routed, unrouted, routeErr, now)
+			}
+		}
+		routeErr = nil
+		return s.finishRouteWriteTx(ctx, tx, routed, unrouted, nil, now)
+	})
+	if err != nil {
+		if routeErr != nil {
+			return errors.Join(routeErr, err)
+		}
+		return err
 	}
-	return s.finishRouteWrite(ctx, tx, routed, unrouted, nil, now)
+	return routeErr
 }
 
-// desiredRoutesQuery is shared by every route writer. The owner row is the
-// exclusive source of route intent; without an owner the recorded serving
-// deployment is used. There is deliberately no scan of running deployments,
-// no creation-time election and no inference that a running step proves an
-// applied route. A route step can be running before its apply; the owner's
-// explicit intent is what concurrent writers honor.
-const desiredRoutesQuery = `SELECT d.name,e.id,d.is_primary,
-        coalesce(target.instances,'[]'::jsonb)
-    FROM eregion_platform_domains d
-    JOIN eregion_platform_environments e ON e.id=d.environment_id
-    LEFT JOIN eregion_platform_deployment_owners o ON o.environment_id=e.id
-    LEFT JOIN eregion_platform_deployments target
-        ON target.id=CASE
-            WHEN o.environment_id IS NOT NULL THEN o.route_target_deployment_id
-            ELSE e.serving_deployment_id
-        END
-    ORDER BY d.name`
-
-// finishRouteWrite records the applied or failed route attempt and commits the
-// lock transaction. The file and the rows never claim more than the reload did.
-func (s *Service) finishRouteWrite(ctx context.Context, tx pgx.Tx, routed, unrouted []string, routeErr error, now time.Time) error {
+// finishRouteWriteTx records the applied or failed route attempt in the
+// caller's transaction. The file and the rows never claim more than the reload
+// did; the caller commits the route lock with the durable state.
+func (s *Service) finishRouteWriteTx(ctx context.Context, tx *entities.StoreTx, routed, unrouted []string, routeErr error, now time.Time) error {
 	if len(routed) > 0 {
 		if routeErr == nil {
-			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains
-                SET route_state='applied',route_error='',applied_revision=desired_revision,
-                    route_applied_at=coalesce(route_applied_at,$2),route_observed_at=$2,observed_at=$2
-                WHERE name=ANY($1)`, routed, now.UTC()); err != nil {
-				return unavailable()
+			if _, err := tx.Platform().Domains().MarkRoutesApplied(ctx, routed, now.UTC()); err != nil {
+				return unavailable(err)
 			}
-		} else if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains
-            SET route_state='failed',route_error=$2,route_observed_at=$3,observed_at=$3
-            WHERE name=ANY($1)`, routed, boundedRouteError(routeErr.Error()), now.UTC()); err != nil {
-			return unavailable()
+		} else if _, err := tx.Platform().Domains().MarkRoutesFailed(ctx, routed, boundedRouteError(routeErr.Error()), now.UTC()); err != nil {
+			return unavailable(err)
 		}
 	}
 	if len(unrouted) > 0 {
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domains
-            SET route_state='pending',route_error=$2,route_observed_at=$3,observed_at=$3
-            WHERE name=ANY($1)`, unrouted, "no serving web upstream yet", now.UTC()); err != nil {
-			return unavailable()
+		if _, err := tx.Platform().Domains().MarkRoutesPending(ctx, unrouted, "no serving web upstream yet", now.UTC()); err != nil {
+			return unavailable(err)
 		}
 	}
-	if commitErr := tx.Commit(ctx); commitErr != nil {
-		if routeErr != nil {
-			return errors.Join(routeErr, commitErr)
-		}
-		return commitErr
-	}
-	return routeErr
+	return nil
 }
 
 func boundedRouteError(message string) string {
@@ -315,11 +282,7 @@ func loadCaddyfile(ctx context.Context) error {
 // worker already loaded the pinned revision into env; never read the current
 // revision here, which may be newer than the deployment being verified.
 func (s *Service) primaryCheckPath(ctx context.Context, env platform.Environment) string {
-	var explicit string
-	err := s.pool.QueryRow(ctx, `SELECT coalesce(d.check_path,'')
-        FROM eregion_platform_domains d
-        WHERE d.environment_id=$1 AND d.name=$2 AND d.is_primary
-        LIMIT 1`, env.ID, env.PrimaryDomain).Scan(&explicit)
+	explicit, _, err := s.entities.Platform().Domains().PrimaryCheckPath(ctx, env.ID, env.PrimaryDomain)
 	if err != nil {
 		explicit = ""
 	}

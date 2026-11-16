@@ -6,17 +6,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -107,127 +106,94 @@ func definitionSnapshotChange(a, b definitionSnapshot) string {
 func (s *Service) readDefinitionSnapshot(ctx context.Context, r *appdef.Resolved) (definitionSnapshot, platform.Environment, error) {
 	var snap definitionSnapshot
 	var env platform.Environment
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	err := s.entities.WithinReadTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		snap, env, err = readDefinitionSnapshotTx(ctx, tx, r)
+		return err
+	})
 	if err != nil {
-		return snap, env, unavailable()
-	}
-	defer rollback(tx)
-	snap, env, err = readDefinitionSnapshotTx(ctx, tx, r)
-	if err != nil {
-		return snap, env, err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return snap, env, unavailable()
+		return snap, env, unavailable(err)
 	}
 	return snap, env, nil
 }
 
 // readDefinitionSnapshotTx also permits admission to reread the exact same
 // material under its own transaction and locks.
-func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, r *appdef.Resolved) (definitionSnapshot, platform.Environment, error) {
+func readDefinitionSnapshotTx(ctx context.Context, tx *entities.StoreTx, r *appdef.Resolved) (definitionSnapshot, platform.Environment, error) {
 	var snap definitionSnapshot
 	var env platform.Environment
-	var err error
 	app, environment := r.App, r.Environment
-	if snap.Workspace, err = readWorkspace(ctx, tx); err != nil {
-		return snap, env, unavailable()
+	var err error
+	if snap.Workspace, err = readWorkspaceSchema(ctx, tx.Workspace()); err != nil {
+		return snap, env, unavailable(err)
 	}
 	if !snap.Workspace.Configured {
 		return snap, env, contract.NewFault(contract.PreconditionFailed, "workspace is not configured", "Initialize the workspace before planning a definition.")
 	}
-	err = tx.QueryRow(ctx, `SELECT id,image_repository FROM eregion_platform_apps WHERE name=$1`, app).Scan(&snap.AppID, &snap.ImageRepository)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return snap, env, unavailable()
+	repository, found, err := tx.Platform().Apps().Repository(ctx, app)
+	if err != nil {
+		return snap, env, unavailable(err)
 	}
-	if snap.AppID != "" {
-		env, err = scanEnvironmentRow(tx.QueryRow(ctx, environmentSelect+` WHERE a.name=$1 AND e.name=$2`, app, environment))
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return snap, env, unavailable()
+	if found {
+		snap.AppID, snap.ImageRepository = repository.ID, repository.ImageRepository
+		observation, found, err := tx.Platform().Environments().GetByName(ctx, app, environment)
+		if err != nil {
+			return snap, env, unavailable(err)
 		}
-		if err == nil {
+		if found {
+			env = observation.Environment
 			snap.EnvironmentID, snap.RevisionID, snap.Protected = env.ID, env.RevisionID, env.Protected
 		}
 	}
-	rows, err := tx.Query(ctx, `SELECT d.id,d.name,d.is_primary,coalesce(d.check_path,''),d.desired_revision,coalesce(x.zone_id,''),coalesce(x.generation,0),coalesce(x.provider,''),coalesce(x.zone_name,''),coalesce(x.ownership_marker,''),coalesce(x.desired_origins,'{}'),coalesce(x.desired_proxied,false),coalesce(x.state,''),coalesce(x.applied_generation,0),coalesce(x.last_operation_id,'') FROM eregion_platform_domains d LEFT JOIN eregion_platform_domain_dns x ON x.domain_id=d.id WHERE d.environment_id=$1 ORDER BY d.name`, snap.EnvironmentID)
+	bindings, err := tx.Platform().Domains().DefinitionSnapshot(ctx, snap.EnvironmentID)
 	if err != nil {
-		return snap, env, unavailable()
+		return snap, env, unavailable(err)
 	}
-	for rows.Next() {
-		var b definitionBinding
-		if err = rows.Scan(&b.ID, &b.Name, &b.Primary, &b.CheckPath, &b.Revision, &b.ZoneID, &b.Generation, &b.Provider, &b.ZoneName, &b.Ownership, &b.Origins, &b.Proxied, &b.State, &b.AppliedGeneration, &b.LastOperationID); err != nil {
-			break
-		}
-		snap.Bindings = append(snap.Bindings, b)
+	for _, binding := range bindings {
+		snap.Bindings = append(snap.Bindings, definitionBinding{
+			ID: binding.ID, Name: binding.Domain, Primary: binding.Primary,
+			CheckPath: binding.CheckPath, Revision: binding.DesiredRevision,
+			ZoneID: binding.ZoneID, Generation: binding.Generation, Provider: binding.Provider,
+			ZoneName: binding.ZoneName, Ownership: binding.OwnershipMarker, Origins: binding.DesiredOrigins,
+			Proxied: binding.DesiredProxied, State: binding.State,
+			AppliedGeneration: binding.AppliedGeneration, LastOperationID: string(binding.LastOperationID),
+		})
 	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
+	resources, err := tx.Resources().DefinitionSnapshot(ctx, snap.EnvironmentID)
 	if err != nil {
-		return snap, env, unavailable()
+		return snap, env, unavailable(err)
 	}
-	rows, err = tx.Query(ctx, `SELECT id,name,node_name,spec,state,coalesce(operation_id,'') FROM eregion_platform_resources WHERE environment_id=$1 ORDER BY name`, snap.EnvironmentID)
+	for _, resource := range resources {
+		snap.Resources = append(snap.Resources, definitionResource{
+			ID: string(resource.ID), Name: resource.Name, Node: resource.Node,
+			Spec: resource.Spec, State: string(resource.State), OperationID: string(resource.OperationID),
+		})
+	}
+	secrets, err := tx.Secrets().DefinitionSnapshot(ctx, app, environment)
 	if err != nil {
-		return snap, env, unavailable()
+		return snap, env, unavailable(err)
 	}
-	for rows.Next() {
-		var r definitionResource
-		if err = rows.Scan(&r.ID, &r.Name, &r.Node, &r.Spec, &r.State, &r.OperationID); err != nil {
-			break
-		}
-		snap.Resources = append(snap.Resources, r)
+	for _, secret := range secrets {
+		snap.Secrets = append(snap.Secrets, definitionSecret{
+			Name: secret.Name, Revision: int64(secret.Revision), State: secret.State,
+		})
 	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return snap, env, unavailable()
-	}
-	rows, err = tx.Query(ctx, `SELECT name,latest_revision,state FROM eregion_secrets WHERE app=$1 AND environment=$2 ORDER BY name`, app, environment)
-	if err != nil {
-		return snap, env, unavailable()
-	}
-	for rows.Next() {
-		var v definitionSecret
-		if err = rows.Scan(&v.Name, &v.Revision, &v.State); err != nil {
-			break
-		}
-		snap.Secrets = append(snap.Secrets, v)
-	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return snap, env, unavailable()
-	}
-	if snap.Policy, err = scanDefinitionDNSPolicy(tx.QueryRow(ctx, definitionDNSPolicySelect)); err != nil {
+	if snap.Policy, err = readDefinitionDNSPolicy(ctx, tx); err != nil {
 		return snap, env, err
 	}
 	if snap.Policy.Enabled {
-		err = tx.QueryRow(ctx, `SELECT latest_revision FROM eregion_provider_credentials WHERE provider='cloudflare' AND zone_id=$1`, snap.Policy.ZoneID).Scan(&snap.ProviderRevision)
-		if err != nil {
-			return snap, env, unavailable()
+		revision, found, err := tx.Providers().RevisionForZone(ctx, "cloudflare", snap.Policy.ZoneID)
+		if err != nil || !found {
+			return snap, env, unavailable(err)
 		}
+		snap.ProviderRevision = int64(revision)
 	}
-	rows, err = tx.Query(ctx, `SELECT zone_id,latest_revision FROM eregion_provider_credentials WHERE provider='cloudflare' AND (zone_id=$1 OR zone_id IN (SELECT x.zone_id FROM eregion_platform_domain_dns x JOIN eregion_platform_domains d ON d.id=x.domain_id WHERE d.environment_id=$2)) ORDER BY zone_id`, snap.Policy.ZoneID, snap.EnvironmentID)
+	credentials, err := tx.Providers().ZoneRevisionsForDefinition(ctx, "cloudflare", snap.Policy.ZoneID, string(snap.EnvironmentID))
 	if err != nil {
-		return snap, env, unavailable()
+		return snap, env, unavailable(err)
 	}
-	for rows.Next() {
-		var c definitionCredential
-		if err = rows.Scan(&c.ZoneID, &c.Revision); err != nil {
-			break
-		}
-		snap.Credentials = append(snap.Credentials, c)
-	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return snap, env, unavailable()
+	for _, credential := range credentials {
+		snap.Credentials = append(snap.Credentials, definitionCredential{ZoneID: credential.ZoneID, Revision: int64(credential.Revision)})
 	}
 	// Updates select nodes by exact name, not by discovery over the node table.
 	// Resources run on the current environment node before the revision update
@@ -249,50 +215,31 @@ func readDefinitionSnapshotTx(ctx context.Context, tx pgx.Tx, r *appdef.Resolved
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	rows, err = tx.Query(ctx, `SELECT name,roles,capabilities,status,enrollment_state,transport,last_check_state FROM eregion_platform_nodes WHERE name=ANY($1::text[]) ORDER BY name`, names)
+	nodes, err := tx.Nodes().DefinitionSnapshot(ctx, names)
 	if err != nil {
-		return snap, env, unavailable()
+		return snap, env, unavailable(err)
 	}
-	for rows.Next() {
-		var n definitionNode
-		if err = rows.Scan(&n.Name, &n.Roles, &n.Capabilities, &n.Status, &n.EnrollmentState, &n.Transport, &n.LastCheckState); err != nil {
-			break
-		}
-		sort.Strings(n.Roles)
-		sort.Strings(n.Capabilities)
-		snap.Nodes = append(snap.Nodes, n)
-	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return snap, env, unavailable()
+	for _, node := range nodes {
+		sort.Strings(node.Roles)
+		sort.Strings(node.Capabilities)
+		snap.Nodes = append(snap.Nodes, definitionNode{
+			Name: node.Name, Roles: node.Roles, Capabilities: node.Capabilities,
+			Status: string(node.Status), EnrollmentState: string(node.Enrollment),
+			Transport: node.Transport, LastCheckState: node.LastCheckState,
+		})
 	}
 	// Unrelated work cannot affect this application's definition. Keep all
 	// same-app environment/resource work and builds, including other environments,
 	// since admission fences the whole application.
-	rows, err = tx.Query(ctx, `SELECT o.id,o.kind,o.target,o.state FROM eregion_operations o
-		WHERE o.state IN ('queued','running','cancelling') AND (
-			o.target=$1 OR left(o.target,length($2))=$2 OR left(o.target,length($3))=$3
-			OR EXISTS (SELECT 1 FROM eregion_platform_builds b WHERE o.target='build/'||b.id AND b.app_id=$4)
-		) ORDER BY o.id`, "app/"+app, "env/"+app+"/", "resource/"+app+"/", snap.AppID)
+	activeOperations, err := tx.Operations().DefinitionActiveOperations(ctx, platform.AppID(snap.AppID),
+		"app/"+app, "env/"+app+"/", "resource/"+app+"/")
 	if err != nil {
-		return snap, env, unavailable()
+		return snap, env, unavailable(err)
 	}
-	for rows.Next() {
-		var o definitionOperation
-		if err = rows.Scan(&o.ID, &o.Kind, &o.Target, &o.State); err != nil {
-			break
-		}
-		snap.ActiveOperations = append(snap.ActiveOperations, o)
-	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return snap, env, unavailable()
+	for _, operation := range activeOperations {
+		snap.ActiveOperations = append(snap.ActiveOperations, definitionOperation{
+			ID: string(operation.ID), Kind: operation.Kind, Target: operation.Target, State: string(operation.State),
+		})
 	}
 	return snap, env, nil
 }
@@ -329,7 +276,7 @@ func (s *Service) planDefinition(ctx context.Context, actor contract.Actor, inpu
 	if err != nil {
 		return p, contract.NewFault(contract.ValidationFailed, "invalid app definition", err.Error())
 	}
-	if s == nil || s.pool == nil {
+	if s == nil || s.entities == nil {
 		return p, unavailable()
 	}
 	snap, env, err := s.readDefinitionSnapshot(ctx, r)

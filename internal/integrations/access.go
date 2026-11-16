@@ -55,8 +55,8 @@ type AccessDecision struct {
 type AccessConfig struct {
 	AdminSubjects []string
 	Audit         AuditSink
-	// Store persists grants across process restarts. Use FileGrantStore in a
-	// control plane and MemoryGrantStore only in tests.
+	// Store persists grants across process restarts. Production injects the
+	// control plane's typed entities-backed GrantStore.
 	Store            GrantStore
 	Now              func() time.Time
 	MaxGrantDuration time.Duration
@@ -81,7 +81,7 @@ func NewAccessController(cfg AccessConfig) (*AccessController, error) {
 		return nil, contract.NewFault(contract.ValidationFailed, "access decisions require an audit sink", "Configure durable auditing; access fails closed.")
 	}
 	if cfg.Store == nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "access grants require a persistent store", "Use NewFileGrantStore in production; MemoryGrantStore is test-only.")
+		return nil, contract.NewFault(contract.ValidationFailed, "access grants require a persistent store", "Inject the control plane's typed entities grant store in production.")
 	}
 	if len(cfg.AdminSubjects) == 0 {
 		return nil, contract.NewFault(contract.ValidationFailed, "access controller needs at least one admin subject", "Configure an explicit admin allowlist; access fails closed.")
@@ -371,6 +371,29 @@ func sameGrantRequest(existing, requested DeviceGrant, defaultedExpiry bool) boo
 	return sameRoutes(existing.Routes, requested.Routes)
 }
 
+// GrantReplayMatches reports whether a durable grant already binds the same
+// creation request as a retried store Put. A direct store Put cannot know
+// whether the caller defaulted the expiry, so it always applies the
+// defaulted-expiry tolerance: a replay keeps the original ExpiresAt and never
+// replaces it, even when the retry carries a different explicit expiry. An
+// AccessController creation request, by contrast, knows whether the caller
+// defaulted the expiry and still rejects a different explicit expiry as a
+// conflict before reaching Put. The comparison itself stays here so every
+// GrantStore implementation applies one replay policy.
+func GrantReplayMatches(existing, requested DeviceGrant) bool {
+	return sameGrantRequest(existing, requested, true)
+}
+
+// ValidateGrantID reports whether id is a canonical deterministic grant
+// identity. Persistence implementations call it before a write so a malformed
+// identity fails as a validation fault instead of a database round trip.
+func ValidateGrantID(id string) error {
+	if !grantIDPattern.MatchString(id) {
+		return contract.NewFault(contract.ValidationFailed, "invalid access grant ID", "Use the grant identity derived from the operation.")
+	}
+	return nil
+}
+
 func sameRoutes(left, right []string) bool {
 	if len(left) != len(right) {
 		return false
@@ -388,6 +411,13 @@ func storeUnavailable(err error) error {
 		return fault
 	}
 	return contract.NewFault(contract.Unavailable, "access grant store is unavailable", "Do not treat this as an access decision; repair the store and retry the same operation.")
+}
+
+// GrantStoreUnavailable normalizes a grant-store failure for the GrantStore
+// port. A *contract.Fault passes through unchanged, so a validation or conflict
+// decision is never reclassified as unavailability.
+func GrantStoreUnavailable(err error) error {
+	return storeUnavailable(err)
 }
 
 func validateRoutes(grant *DeviceGrant, routes []string) error {

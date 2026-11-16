@@ -158,7 +158,7 @@ func TestIntegrationReleaseCommandRecovery(t *testing.T) {
 				statusHash = inputsHash
 			}
 			fake := &releaseRecoveryTransport{status: test.status, inputsHash: statusHash, statusErr: test.statusErr, queryFault: test.queryFault}
-			service := &Service{pool: pool, resolver: NewNodeResolver(pool, ResolverConfig{}, func() node.Transport { return fake })}
+			service := &Service{entities: newTestEntities(t, pool), resolver: NewNodeResolver(newTestEntities(t, pool).Nodes(), ResolverConfig{}, func() node.Transport { return fake })}
 			worker := &platformWorker{service: service}
 			decision, err := worker.recoverReleaseCommandRun(ctx, releaseID, digest, run, current)
 			if test.wantError {

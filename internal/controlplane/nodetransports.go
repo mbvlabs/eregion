@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/transport"
@@ -101,7 +101,7 @@ type cachedTransport struct {
 
 // NodeResolver is the PostgreSQL-backed NodeTransports.
 type NodeResolver struct {
-	pool     *pgxpool.Pool
+	nodes    *entities.NodeStore
 	config   ResolverConfig
 	fallback func() node.Transport
 
@@ -114,8 +114,8 @@ var _ NodeTransports = (*NodeResolver)(nil)
 // NewNodeResolver builds a resolver. fallback returns the worker's own
 // configured transport (nil when the process has none); it is read lazily so
 // a transport installed after construction is honoured.
-func NewNodeResolver(pool *pgxpool.Pool, config ResolverConfig, fallback func() node.Transport) *NodeResolver {
-	return &NodeResolver{pool: pool, config: config, fallback: fallback, cache: map[string]*cachedTransport{}}
+func NewNodeResolver(nodes *entities.NodeStore, config ResolverConfig, fallback func() node.Transport) *NodeResolver {
+	return &NodeResolver{nodes: nodes, config: config, fallback: fallback, cache: map[string]*cachedTransport{}}
 }
 
 // Close releases every cached tunnel.
@@ -130,7 +130,7 @@ func (r *NodeResolver) Close() {
 
 // TransportFor implements NodeTransports.
 func (r *NodeResolver) TransportFor(ctx context.Context, nodeName string) (node.Transport, error) {
-	rec, err := loadNodeConn(ctx, r.pool, nodeName)
+	rec, err := loadNodeConn(ctx, r.nodes, nodeName)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +149,7 @@ func (r *NodeResolver) TransportFor(ctx context.Context, nodeName string) (node.
 // Direct returns an uncached transport over the node's direct SSH address,
 // ignoring any tunnel. Enrollment and tunnel repair use it, so a broken tunnel
 // cannot lock the control plane out of the node. The caller closes it.
-func (r *NodeResolver) Direct(rec nodeConn) (node.Transport, func(), error) {
+func (r *NodeResolver) Direct(rec entities.NodeConnection) (node.Transport, func(), error) {
 	return r.build(rec, true)
 }
 
@@ -180,7 +180,7 @@ func (r *NodeResolver) fallbackFor(name string) (node.Transport, error) {
 
 // cached returns the shared transport of an enrolled node, rebuilding it when
 // the node record's connection facts changed.
-func (r *NodeResolver) cached(rec nodeConn, direct bool) (node.Transport, error) {
+func (r *NodeResolver) cached(rec entities.NodeConnection, direct bool) (node.Transport, error) {
 	key := connectionKey(rec, r.usesTunnel(rec, direct))
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -199,19 +199,19 @@ func (r *NodeResolver) cached(rec nodeConn, direct bool) (node.Transport, error)
 	return built, nil
 }
 
-func connectionKey(rec nodeConn, tunnel bool) string {
+func connectionKey(rec entities.NodeConnection, tunnel bool) string {
 	sum := sha256.Sum256([]byte(strings.Join([]string{rec.SSHAddress, rec.SSHUser, rec.HostKey, rec.WGAddress, rec.WGEndpoint, strconv.Itoa(rec.WGSSHPort), rec.WGPublicKey, rec.ControlWGPublicKey, fmt.Sprint(tunnel)}, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
 
 // usesTunnel reports whether SSH should run inside the node's WireGuard
 // tunnel: only once the node's peers were applied and a key directory exists.
-func (r *NodeResolver) usesTunnel(rec nodeConn, direct bool) bool {
+func (r *NodeResolver) usesTunnel(rec entities.NodeConnection, direct bool) bool {
 	return !direct && rec.WGEnabled && rec.WGState == platform.WireGuardApplied &&
 		r.config.WireGuardKeyDir != "" && rec.WGAddress != "" && rec.WGPublicKey != "" && rec.WGEndpoint != ""
 }
 
-func (r *NodeResolver) build(rec nodeConn, direct bool) (node.Transport, func(), error) {
+func (r *NodeResolver) build(rec entities.NodeConnection, direct bool) (node.Transport, func(), error) {
 	noop := func() {}
 	if r.config.SSHIdentityFile == "" {
 		return nil, noop, contract.NewFault(contract.PreconditionFailed, "the control plane has no SSH identity for enrolled nodes", "Set EREGION_NODE_SSH_IDENTITY to the control plane's SSH key, which is authorized on every node.")
@@ -261,7 +261,7 @@ func (r *NodeResolver) build(rec nodeConn, direct bool) (node.Transport, func(),
 
 // tunnel builds the userspace WireGuard dialer for one node with the control
 // plane's per-node key.
-func (r *NodeResolver) tunnel(rec nodeConn) (*transport.WireGuardDialer, error) {
+func (r *NodeResolver) tunnel(rec entities.NodeConnection) (*transport.WireGuardDialer, error) {
 	key, err := transport.ReadWireGuardKey(r.controlKeyPath(rec.Name))
 	if err != nil {
 		return nil, contract.NewFault(contract.PreconditionFailed, "the control plane WireGuard key for the node is unreadable", err.Error())

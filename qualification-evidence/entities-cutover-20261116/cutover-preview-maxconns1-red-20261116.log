@@ -1,0 +1,6 @@
+=== RUN   TestIntegrationCutoverPreviewExplicitArtifactMaxConnsOne
+    entities_cutover_integration_test.go:132: explicit-artifact preview with maxConns=1: control-plane database is unavailable
+--- FAIL: TestIntegrationCutoverPreviewExplicitArtifactMaxConnsOne (5.21s)
+FAIL
+FAIL	github.com/mbvlabs/eregion/internal/controlplane	5.226s
+FAIL

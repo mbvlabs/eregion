@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/operations"
@@ -43,7 +44,7 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 			pool, _ := testPool(t, true)
 			transport := &scriptedPlatformTransport{}
 			identity := ensureTestRegistryHost(t, pool, t.TempDir())
-			run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+			run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 				Concurrency: 0, TestOnly: true, Transport: transport,
 				NodeStateDir: identity.StateDir, RegistryHostIdentity: &identity,
 				RegistryEndpoint: "127.0.0.1:5000",
@@ -147,12 +148,12 @@ func TestIntegrationDeleteOrderKeepsServingWorkloadsWhenCloudflareCleanupFails(t
 	}
 }
 
-func setupMultiBindingDelete(t *testing.T, app string) (*Service, *scriptedPlatformTransport, *domainDNSLedgerFixture, context.Context, contract.Operation) {
+func setupMultiBindingDelete(t *testing.T, app string) (*pgxpool.Pool, *Service, *scriptedPlatformTransport, *domainDNSLedgerFixture, context.Context, contract.Operation) {
 	t.Helper()
 	pool, _ := testPool(t, true)
 	transport := &scriptedPlatformTransport{}
 	identity := ensureTestRegistryHost(t, pool, t.TempDir())
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: transport,
 		NodeStateDir: identity.StateDir, RegistryHostIdentity: &identity,
 		RegistryEndpoint: "127.0.0.1:5000",
@@ -216,10 +217,10 @@ func setupMultiBindingDelete(t *testing.T, app string) (*Service, *scriptedPlatf
 		t.Fatalf("claim deletion attempt: claimed=%v, %v", claimed, err)
 	}
 	deleteOp = claimedOp
-	return s, transport, fixture, ctx, deleteOp
+	return pool, s, transport, fixture, ctx, deleteOp
 }
 
-func assertDeletionResult(t *testing.T, s *Service, op contract.Operation, attempt uint32, app string, priorFailure bool) {
+func assertDeletionResult(t *testing.T, pool *pgxpool.Pool, s *Service, op contract.Operation, attempt uint32, app string, priorFailure bool) {
 	t.Helper()
 	current, err := s.Get(context.Background(), op.Actor, op.ID)
 	if err != nil || current.State != contract.Succeeded || current.LatestResult == nil ||
@@ -233,7 +234,7 @@ func assertDeletionResult(t *testing.T, s *Service, op contract.Operation, attem
 	}
 	if priorFailure {
 		var retained bool
-		if err := s.pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM eregion_operation_events
+		if err := pool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM eregion_operation_events
 			WHERE operation_id=$1 AND event->'result'->>'attempt'='1'
 			AND event->'result'->>'status'='failed' AND event->'result'->>'final'='false')`, op.ID).Scan(&retained); err != nil || !retained {
 			t.Fatalf("earlier failed attempt was not retained: %v", err)
@@ -267,7 +268,7 @@ func operationEventText(t *testing.T, s *Service, id contract.OperationID) strin
 }
 
 func TestIntegrationMultiBindingDNSCleanupPreflightsAll(t *testing.T) {
-	s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-preflight")
+	_, s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-preflight")
 	fixture.mu.Lock()
 	fixture.records["foreign-b"] = integrations.DNSRecord{ID: "foreign-b", Name: "b.example.com", Type: "CNAME", Content: "other.example.net", TTL: 1, Comment: "manual"}
 	// External records are preserved, not a cleanup refusal. A failed read of
@@ -299,7 +300,7 @@ func TestIntegrationMultiBindingDNSCleanupPreflightsAll(t *testing.T) {
 }
 
 func TestIntegrationMultiBindingDNSLaterFailureRetainsLedgerAndWorkloads(t *testing.T) {
-	s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-later")
+	pool, s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-later")
 	fixture.mu.Lock()
 	fixture.failDeleteHost = "b.example.com"
 	fixture.mu.Unlock()
@@ -346,11 +347,11 @@ func TestIntegrationMultiBindingDNSLaterFailureRetainsLedgerAndWorkloads(t *test
 	if providerRecordPresent(fixture, "a.example.com") || providerRecordPresent(fixture, "b.example.com") {
 		t.Fatal("retry left provider records")
 	}
-	assertDeletionResult(t, s, deleteOp, 2, "multi-later", true)
+	assertDeletionResult(t, pool, s, deleteOp, 2, "multi-later", true)
 }
 
 func TestIntegrationMultiBindingDNSPostDeleteReadFailureRetainsLedger(t *testing.T) {
-	s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-read")
+	pool, s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-read")
 	fixture.mu.Lock()
 	fixture.failReadAfterDeleteHost = "b.example.com"
 	fixture.mu.Unlock()
@@ -391,14 +392,14 @@ func TestIntegrationMultiBindingDNSPostDeleteReadFailureRetainsLedger(t *testing
 	if _, err := s.environment(ctx, "multi-read", "test"); err == nil {
 		t.Fatal("retry did not delete the environment")
 	}
-	assertDeletionResult(t, s, deleteOp, 2, "multi-read", true)
+	assertDeletionResult(t, pool, s, deleteOp, 2, "multi-read", true)
 }
 
 func TestIntegrationMultiBindingDNSCancelRetainsLedgerAndRetries(t *testing.T) {
-	s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-cancel")
+	pool, s, transport, fixture, ctx, deleteOp := setupMultiBindingDelete(t, "multi-cancel")
 	fixture.mu.Lock()
 	fixture.afterDelete = func() {
-		_, _ = s.pool.Exec(context.Background(), `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, deleteOp.ID)
+		_, _ = pool.Exec(context.Background(), `UPDATE eregion_operations SET state='cancelling' WHERE id=$1`, deleteOp.ID)
 	}
 	fixture.mu.Unlock()
 	w := &platformWorker{service: s}
@@ -439,7 +440,7 @@ func TestIntegrationMultiBindingDNSCancelRetainsLedgerAndRetries(t *testing.T) {
 	if _, err := s.environment(ctx, "multi-cancel", "test"); err == nil {
 		t.Fatal("retry after cancellation did not delete the environment")
 	}
-	assertDeletionResult(t, s, retryOp, 1, "multi-cancel", false)
+	assertDeletionResult(t, pool, s, retryOp, 1, "multi-cancel", false)
 	original, err := s.Get(ctx, deleteOp.Actor, deleteOp.ID)
 	if err != nil || original.State != contract.Canceled {
 		t.Fatalf("replacement operation rewrote the original cancellation: %+v, %v", original, err)

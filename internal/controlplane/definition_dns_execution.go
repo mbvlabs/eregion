@@ -5,16 +5,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"net"
 	"reflect"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/riverqueue/river"
@@ -72,7 +71,7 @@ func definitionCleanupDefinitiveRejection(message string, plan integrations.Doma
 	return false
 }
 
-func lockDefinitionDNSCredentialTx(ctx context.Context, tx pgx.Tx, snapshot definitionSnapshot, zoneID string) error {
+func lockDefinitionDNSCredentialTx(ctx context.Context, tx *entities.StoreTx, snapshot definitionSnapshot, zoneID string) error {
 	var expected int64
 	for _, credential := range snapshot.Credentials {
 		if credential.ZoneID == zoneID {
@@ -80,13 +79,12 @@ func lockDefinitionDNSCredentialTx(ctx context.Context, tx pgx.Tx, snapshot defi
 			break
 		}
 	}
-	var current int64
-	err := tx.QueryRow(ctx, `SELECT latest_revision FROM eregion_provider_credentials WHERE provider='cloudflare' AND zone_id=$1 FOR SHARE`, zoneID).Scan(&current)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && (expected == 0 || current != expected)) {
-		return definitionDNSConflict()
-	}
+	current, found, err := tx.Providers().LockRevisionForZoneShare(ctx, "cloudflare", zoneID)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
+	}
+	if !found || expected == 0 || int64(current) != expected {
+		return definitionDNSConflict()
 	}
 	return nil
 }
@@ -94,87 +92,87 @@ func lockDefinitionDNSCredentialTx(ctx context.Context, tx pgx.Tx, snapshot defi
 // loadDefinitionDNSChildTx distinguishes an ordinary unlinked operation from
 // a broken link. It locks journal and operation rows for the caller's short
 // transaction. No parent attempt is pinned: a parent retry retains its child.
-func loadDefinitionDNSChildTx(ctx context.Context, tx pgx.Tx, child contract.OperationID) (*definitionDNSChild, error) {
+func loadDefinitionDNSChildTx(ctx context.Context, tx *entities.StoreTx, child contract.OperationID) (*definitionDNSChild, error) {
 	return loadDefinitionDNSChildTxMode(ctx, tx, child, false)
 }
 
-func loadDefinitionDNSChildTxMode(ctx context.Context, tx pgx.Tx, child contract.OperationID, recovery bool) (*definitionDNSChild, error) {
+func loadDefinitionDNSChildTxMode(ctx context.Context, tx *entities.StoreTx, child contract.OperationID, recovery bool) (*definitionDNSChild, error) {
 	// The unlocked lookup only chooses which target to lock; the locked journal
 	// and approved input below revalidate it. Never lock a child before its
 	// app/environment: the parent sequencer and admission take those first.
-	var app, environment string
-	var environmentID platform.EnvironmentID
-	var parentID contract.OperationID
-	var ordinal int
-	err := tx.QueryRow(ctx, `SELECT a.name,e.name,e.id,s.parent_operation_id,s.ordinal FROM eregion_definition_steps s
-        JOIN eregion_definition_runs r ON r.operation_id=s.parent_operation_id
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE s.child_operation_id=$1`, child).Scan(&app, &environment, &environmentID, &parentID, &ordinal)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_definition_steps WHERE child_operation_id=$1)`, child).Scan(&exists); err != nil {
-			return nil, unavailable()
+	targetInfo, found, err := tx.DefinitionDNS().ChildTarget(ctx, child)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	if !found {
+		exists, err := tx.DefinitionSteps().ChildExists(ctx, child)
+		if err != nil {
+			return nil, unavailable(err)
 		}
 		if exists {
 			return nil, definitionDNSConflict()
 		}
 		return nil, nil
 	}
-	if err != nil {
-		return nil, unavailable()
-	}
+	app, environment := targetInfo.App, targetInfo.Environment
+	environmentID, parentID, ordinal := targetInfo.EnvironmentID, targetInfo.ParentID, targetInfo.Ordinal
 	if err := lockDefinitionTargetTx(ctx, tx, app, environment); err != nil {
 		return nil, err
 	}
 	// Parent polling takes parent, run, then step. Explicit single-row locks
 	// preserve that order regardless of the planner's join order; the child is
 	// last. Re-read all relationships below after the locks are held.
-	lock := func(row pgx.Row) error {
-		var id string
-		if err := row.Scan(&id); errors.Is(err, pgx.ErrNoRows) {
-			return definitionDNSConflict()
-		} else if err != nil {
-			return unavailable()
-		}
-		return nil
+	if _, found, err := tx.Operations().Lock(ctx, parentID); err != nil {
+		return nil, unavailable(err)
+	} else if !found {
+		return nil, definitionDNSConflict()
 	}
-	if err := lock(tx.QueryRow(ctx, `SELECT id FROM eregion_operations WHERE id=$1 FOR UPDATE`, parentID)); err != nil {
-		return nil, err
+	if _, found, err := tx.DefinitionRuns().Lock(ctx, parentID); err != nil {
+		return nil, unavailable(err)
+	} else if !found {
+		return nil, definitionDNSConflict()
 	}
-	if err := lock(tx.QueryRow(ctx, `SELECT operation_id FROM eregion_definition_runs WHERE operation_id=$1 FOR UPDATE`, parentID)); err != nil {
-		return nil, err
+	if _, found, err := tx.DefinitionSteps().Lock(ctx, parentID, ordinal); err != nil {
+		return nil, unavailable(err)
+	} else if !found {
+		return nil, definitionDNSConflict()
 	}
-	if err := lock(tx.QueryRow(ctx, `SELECT parent_operation_id FROM eregion_definition_steps WHERE parent_operation_id=$1 AND ordinal=$2 FOR UPDATE`, parentID, ordinal)); err != nil {
-		return nil, err
+	if _, found, err := tx.Operations().Lock(ctx, child); err != nil {
+		return nil, unavailable(err)
+	} else if !found {
+		return nil, definitionDNSConflict()
 	}
-	if err := lock(tx.QueryRow(ctx, `SELECT id FROM eregion_operations WHERE id=$1 FOR UPDATE`, child)); err != nil {
-		return nil, err
+	journal, found, err := tx.DefinitionDNS().LoadJournal(ctx, parentID, ordinal, child)
+	if err != nil {
+		return nil, unavailable(err)
 	}
-	var d definitionDNSChild
-	var approved, input, opInput, plan, cleanup, progress []byte
+	if !found {
+		return nil, definitionDNSConflict()
+	}
+	d := definitionDNSChild{
+		ParentID: journal.ParentID, Ordinal: journal.Ordinal,
+		EnvironmentID: journal.EnvironmentID, DomainID: journal.DomainID,
+		AllocatedID: journal.AllocatedDomainID, Progress: nil, progressJSON: journal.DNSProgress,
+	}
+	var approved, input, opInput, plan, cleanup []byte
+	var progress []byte
 	var kind, target, opKind, opTarget, inputHash, parentKind, parentTarget string
 	var parentState, childState contract.State
 	var parentActor, childActor contract.Actor
-	var attempt uint32
 	var finished bool
-	err = tx.QueryRow(ctx, `SELECT r.operation_id,s.ordinal,r.environment_id,
-        coalesce(s.domain_id,''),coalesce(s.allocated_domain_id,''),r.approved,s.kind,s.target,s.input,
-        s.dns_plan,s.dns_cleanup,s.dns_progress,p.kind,p.target,p.actor_kind,p.actor_subject,p.state,
-        c.kind,c.target,c.actor_kind,c.actor_subject,c.state,c.attempt,c.input_hash,c.input,r.finished_at IS NOT NULL
-        FROM eregion_definition_steps s
-        JOIN eregion_definition_runs r ON r.operation_id=s.parent_operation_id
-        JOIN eregion_operations p ON p.id=r.operation_id
-        JOIN eregion_operations c ON c.id=s.child_operation_id
-        WHERE s.parent_operation_id=$1 AND s.ordinal=$2 AND s.child_operation_id=$3`, parentID, ordinal, child).Scan(
-		&d.ParentID, &d.Ordinal, &d.EnvironmentID, &d.DomainID, &d.AllocatedID, &approved, &kind, &target, &input,
-		&plan, &cleanup, &progress, &parentKind, &parentTarget, &parentActor.Kind, &parentActor.Subject, &parentState,
-		&opKind, &opTarget, &childActor.Kind, &childActor.Subject, &childState, &attempt, &inputHash, &opInput, &finished)
-	if errors.Is(err, pgx.ErrNoRows) {
+	approved = journal.Approved
+	kind, target, input = journal.StepKind, journal.StepTarget, journal.StepInput
+	plan, cleanup, progress = journal.DNSPlan, journal.DNSCleanup, journal.DNSProgress
+	parentKind, parentTarget = journal.ParentKind, journal.ParentTarget
+	parentActor, parentState = journal.ParentActor, journal.ParentState
+	opKind, opTarget = journal.ChildKind, journal.ChildTarget
+	childActor, childState = journal.ChildActor, journal.ChildState
+	inputHash, opInput, finished = journal.ChildInputHash, journal.ChildInput, journal.Finished
+	d.ParentState = parentState
+	d.Kind, d.Target, d.Actor, d.InputHash = kind, target, childActor, inputHash
+	d.Approved = definitionApprovedRun{}
+	if json.Unmarshal(approved, &d.Approved) != nil {
 		return nil, definitionDNSConflict()
-	}
-	if err != nil {
-		return nil, unavailable()
 	}
 	parentAllowed := parentState == contract.Running || parentState == contract.Queued || (recovery && parentState == contract.Cancelling)
 	childAllowed := childState == contract.Running || childState == contract.Queued || (recovery && childState == contract.Cancelling)
@@ -202,7 +200,7 @@ func loadDefinitionDNSChildTxMode(ctx context.Context, tx pgx.Tx, child contract
 	d.Input = *in
 	d.Kind, d.Target, d.Actor, d.InputHash = kind, target, childActor, inputHash
 	d.ParentState = parentState
-	if d.ParentID != parentID || d.Ordinal != ordinal || d.EnvironmentID != environmentID || in.App != app || in.Environment != environment || json.Unmarshal(approved, &d.Approved) != nil || d.Approved.Snapshot.EnvironmentID != d.EnvironmentID || d.Approved.Plan.App != in.App || d.Approved.Plan.Environment != in.Environment {
+	if d.ParentID != parentID || d.Ordinal != ordinal || d.EnvironmentID != environmentID || in.App != app || in.Environment != environment || d.Approved.Snapshot.EnvironmentID != d.EnvironmentID || d.Approved.Plan.App != in.App || d.Approved.Plan.Environment != in.Environment {
 		return nil, definitionDNSConflict()
 	}
 	if len(plan) != 0 && string(plan) != "null" {
@@ -253,17 +251,17 @@ func (s *Service) definitionDNSChild(ctx context.Context, child contract.Operati
 }
 
 func (s *Service) definitionDNSChildMode(ctx context.Context, child contract.OperationID, recovery bool) (*definitionDNSChild, error) {
-	tx, err := s.pool.Begin(ctx)
+	var step *definitionDNSChild
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		step, err = loadDefinitionDNSChildTxMode(ctx, tx, child, recovery)
+		return err
+	})
 	if err != nil {
-		return nil, unavailable()
-	}
-	defer rollback(tx)
-	step, err := loadDefinitionDNSChildTxMode(ctx, tx, child, recovery)
-	if err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return nil, unavailable(err)
+		}
 		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, unavailable()
 	}
 	return step, nil
 }
@@ -275,9 +273,9 @@ func (w *platformWorker) stopDefinitionDNSChild(ctx context.Context, op contract
 	wait := func() (bool, error) {
 		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
-		_, _, _ = w.service.mutateOwned(recordCtx, op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
-			var recorded bool
-			if err := tx.QueryRow(recordCtx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'='dns_outcome_unknown')`, op.ID).Scan(&recorded); err != nil {
+		_, _, _ = w.service.mutateOwned(recordCtx, op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
+			recorded, err := tx.Operations().EventStageExists(recordCtx, op.ID, "dns_outcome_unknown")
+			if err != nil {
 				return err
 			}
 			if !recorded && !current.State.Terminal() {
@@ -307,11 +305,10 @@ func (w *platformWorker) stopDefinitionDNSChild(ctx context.Context, op contract
 		return false, nil
 	}
 	finish := func() (bool, error) {
-		var exhausted bool
-		if err := w.service.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'='dns_recovery_exhausted')`, op.ID).Scan(&exhausted); err != nil {
+		exhausted, err := w.service.entities.Operations().EventStageExists(ctx, op.ID, "dns_recovery_exhausted")
+		if err != nil {
 			return wait()
 		}
-		var err error
 		if exhausted {
 			err = w.service.failPlatformOperation(ctx, op.ID, attempt, contract.Unavailable, "Definition DNS worker stopped; read-only recovery resolved its pending provider effect.")
 		} else {
@@ -381,84 +378,82 @@ func (w *platformWorker) stopDefinitionDNSChild(ctx context.Context, op contract
 }
 
 func (s *Service) recordDefinitionDNSCleanupResolution(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, expected *definitionDNSChild, observed integrations.DomainDNSPlan) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return unavailable(err)
-	}
-	defer rollback(tx)
-	step, err := loadDefinitionDNSChildTxMode(ctx, tx, op.ID, true)
-	if err != nil {
-		return err
-	}
-	if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || !reflect.DeepEqual(step.Cleanup, expected.Cleanup) || len(observed.Changes) != 0 || validateDefinitionDNSCleanup(*step.Cleanup, observed) != nil {
-		return definitionDNSConflict()
-	}
-	var state contract.State
-	var currentAttempt uint32
-	if err := tx.QueryRow(ctx, `SELECT state,attempt FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state, &currentAttempt); err != nil {
-		return unavailable(err)
-	}
-	if state != contract.Cancelling || currentAttempt != attempt {
-		return definitionDNSConflict()
-	}
-	current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
-	if err != nil {
-		return err
-	}
-	if current.LastOperationID != op.ID || current.Generation != ledger.Generation || current.Domain != ledger.Domain || current.ZoneID != ledger.ZoneID || current.ZoneName != ledger.ZoneName || current.Ownership != ledger.Ownership || current.Provider != "cloudflare" {
-		return definitionDNSConflict()
-	}
-	policy, err := scanDefinitionDNSPolicy(tx.QueryRow(ctx, definitionDNSPolicySelect+` FOR SHARE OF p`))
-	if err != nil {
-		return err
-	}
-	if policy.Revision != step.Approved.Snapshot.Policy.Revision {
-		return definitionDNSConflict()
-	}
-	if err := lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID); err != nil {
-		return err
-	}
-	if diagnostic := definitionSafeProviderDiagnostic(current.CleanupError); diagnostic != "" {
-		var recorded bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'='dns_prior_provider_failure')`, op.ID).Scan(&recorded); err != nil {
+	return s.recordDefinitionDNSCleanupResolutionTx(ctx, op, attempt, ledger, expected, observed)
+}
+func (s *Service) recordDefinitionDNSCleanupResolutionTx(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, expected *definitionDNSChild, observed integrations.DomainDNSPlan) error {
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		step, err := loadDefinitionDNSChildTxMode(ctx, tx, op.ID, true)
+		if err != nil {
+			return err
+		}
+		if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || !reflect.DeepEqual(step.Cleanup, expected.Cleanup) || len(observed.Changes) != 0 || validateDefinitionDNSCleanup(*step.Cleanup, observed) != nil {
+			return definitionDNSConflict()
+		}
+		currentOp, found, err := tx.Operations().Get(ctx, op.ID)
+		if err != nil || !found {
 			return unavailable(err)
 		}
-		if !recorded {
-			child, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", op.ID))
+		if currentOp.State != contract.Cancelling || currentOp.Attempt != attempt {
+			return definitionDNSConflict()
+		}
+		current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
+		if err != nil {
+			return err
+		}
+		if current.LastOperationID != op.ID || current.Generation != ledger.Generation || current.Domain != ledger.Domain || current.ZoneID != ledger.ZoneID || current.ZoneName != ledger.ZoneName || current.Ownership != ledger.Ownership || current.Provider != "cloudflare" {
+			return definitionDNSConflict()
+		}
+		policy, err := lockedDefinitionDNSPolicy(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if policy.Revision != step.Approved.Snapshot.Policy.Revision {
+			return definitionDNSConflict()
+		}
+		if err := lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID); err != nil {
+			return err
+		}
+		if diagnostic := definitionSafeProviderDiagnostic(current.CleanupError); diagnostic != "" {
+			recorded, err := tx.Operations().EventStageExists(ctx, op.ID, "dns_prior_provider_failure")
 			if err != nil {
 				return unavailable(err)
 			}
-			if err := appendEvent(ctx, tx, &child, contract.Event{Kind: "warning", Stage: "dns_prior_provider_failure", Message: diagnostic}); err != nil {
-				return err
+			if !recorded {
+				if err := appendEvent(ctx, tx, &currentOp, contract.Event{Kind: "warning", Stage: "dns_prior_provider_failure", Message: diagnostic}); err != nil {
+					return err
+				}
 			}
 		}
-	}
-	tag, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns SET state='cleanup_verified',cleanup_verified_at=clock_timestamp(),cleanup_error='',updated_at=clock_timestamp()
-		WHERE domain_id=$1 AND last_operation_id=$2 AND generation=$3 AND state IN ('cleanup_pending','cleanup_failed','cleanup_verified')`, ledger.DomainID, op.ID, ledger.Generation)
+		rows, err := tx.Platform().DomainDNS().MarkCleanupVerifiedForGeneration(ctx, ledger.DomainID, op.ID, ledger.Generation)
+		if err != nil {
+			return unavailable(err)
+		}
+		if rows != 1 {
+			return definitionDNSConflict()
+		}
+		return nil
+	})
 	if err != nil {
-		return unavailable(err)
-	}
-	if tag.RowsAffected() != 1 {
-		return definitionDNSConflict()
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return unavailable(err)
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return unavailable(err)
+		}
+		return err
 	}
 	return nil
 }
 
 // prepareDefinitionDNSRecoveryTx is called with the child operation locked.
 // It records exhaustion once and leaves the child nonterminal.
-func prepareDefinitionDNSRecoveryTx(ctx context.Context, tx pgx.Tx, op *contract.Operation) (bool, error) {
-	var linked bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_definition_steps s JOIN eregion_definition_runs r ON r.operation_id=s.parent_operation_id WHERE s.child_operation_id=$1 AND r.finished_at IS NULL AND (s.dns_plan IS NOT NULL OR s.dns_cleanup IS NOT NULL))`, op.ID).Scan(&linked); err != nil {
+func prepareDefinitionDNSRecoveryTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (bool, error) {
+	linked, err := tx.DefinitionDNS().LinkedCleanupPending(ctx, op.ID)
+	if err != nil {
 		return false, unavailable(err)
 	}
 	if !linked || op.State.Terminal() {
 		return false, nil
 	}
-	var recorded bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'='dns_recovery_exhausted')`, op.ID).Scan(&recorded); err != nil {
+	recorded, err := tx.Operations().EventStageExists(ctx, op.ID, "dns_recovery_exhausted")
+	if err != nil {
 		return false, unavailable(err)
 	}
 	if !recorded {
@@ -475,108 +470,111 @@ func prepareDefinitionDNSRecoveryTx(ctx context.Context, tx pgx.Tx, op *contract
 }
 
 func (s *Service) latchDefinitionDNSRecovery(ctx context.Context, id contract.OperationID) error {
-	tx, err := s.pool.Begin(ctx)
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		op, found, err := tx.Operations().Lock(ctx, id)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		handled, err := prepareDefinitionDNSRecoveryTx(ctx, tx, &op)
+		if err != nil {
+			return err
+		}
+		if !handled {
+			return definitionDNSConflict()
+		}
+		return nil
+	})
 	if err != nil {
-		return unavailable(err)
-	}
-	defer rollback(tx)
-	op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 FOR UPDATE", id))
-	if err != nil {
-		return unavailable(err)
-	}
-	handled, err := prepareDefinitionDNSRecoveryTx(ctx, tx, &op)
-	if err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return unavailable(err)
+		}
 		return err
-	}
-	if !handled {
-		return definitionDNSConflict()
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return unavailable(err)
 	}
 	return nil
 }
 
 func (s *Service) requeueDefinitionDNSRecovery(ctx context.Context, id contract.OperationID) (bool, error) {
-	var jobID *int64
-	if err := s.pool.QueryRow(ctx, `SELECT job_id FROM eregion_operations WHERE id=$1`, id).Scan(&jobID); err != nil {
-		return false, unavailable(err)
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return false, unavailable(err)
-	}
-	defer rollback(tx)
-	if jobID != nil {
-		var state string
-		err = tx.QueryRow(ctx, `SELECT state FROM river_job WHERE id=$1 FOR UPDATE`, *jobID).Scan(&state)
-		if errors.Is(err, pgx.ErrNoRows) {
-			jobID = nil
-		} else if err != nil {
-			return false, unavailable(err)
-		} else if state != "discarded" && state != "completed" && state != "cancelled" {
-			var linked bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_definition_steps s JOIN eregion_definition_runs r ON r.operation_id=s.parent_operation_id WHERE s.child_operation_id=$1 AND r.finished_at IS NULL AND (s.dns_plan IS NOT NULL OR s.dns_cleanup IS NOT NULL))`, id).Scan(&linked); err != nil {
-				return false, unavailable(err)
-			}
-			return linked, nil
+	handled := false
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		jobID, hasJob, err := tx.Operations().JobID(ctx, id)
+		if err != nil {
+			return unavailable(err)
 		}
-	}
-	op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 FOR UPDATE", id))
+		if hasJob {
+			state, found, err := tx.RiverJobs().GetForUpdate(ctx, jobID)
+			if err != nil {
+				return unavailable(err)
+			}
+			if !found {
+				hasJob = false
+			} else if state != "discarded" && state != "completed" && state != "cancelled" {
+				linked, err := tx.DefinitionDNS().LinkedCleanupPending(ctx, id)
+				if err != nil {
+					return unavailable(err)
+				}
+				handled = linked
+				return nil
+			}
+		}
+		op, found, err := tx.Operations().Lock(ctx, id)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		handled, err = prepareDefinitionDNSRecoveryTx(ctx, tx, &op)
+		if err != nil || !handled {
+			return err
+		}
+		if !hasJob {
+			created, err := tx.Jobs().EnqueuePlatform(ctx, op)
+			if err != nil {
+				return unavailable(err)
+			}
+			jobID, hasJob = created, true
+			if err := tx.Operations().SetJob(ctx, id, created); err != nil {
+				return unavailable(err)
+			}
+		}
+		if hasJob {
+			if _, err := tx.RiverJobs().Snooze(ctx, jobID, op.Attempt, 30); err != nil {
+				return unavailable(err)
+			}
+		}
+		return nil
+	})
 	if err != nil {
-		return false, unavailable(err)
-	}
-	handled, err := prepareDefinitionDNSRecoveryTx(ctx, tx, &op)
-	if err != nil || !handled {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return false, unavailable(err)
+		}
 		return handled, err
 	}
-	if jobID == nil {
-		if s.enqueuePlatform == nil {
-			return true, unavailable()
-		}
-		created, err := s.enqueuePlatform(ctx, tx, op)
-		if err != nil {
-			return true, unavailable(err)
-		}
-		jobID = &created
-		if _, err := tx.Exec(ctx, `UPDATE eregion_operations SET job_id=$2 WHERE id=$1`, id, created); err != nil {
-			return true, unavailable(err)
-		}
-	}
-	if _, err := tx.Exec(ctx, `UPDATE river_job SET state='scheduled',finalized_at=NULL,attempt=GREATEST(attempt,$2),max_attempts=GREATEST(max_attempts,attempt+1,$2+1),scheduled_at=clock_timestamp()+interval '30 seconds' WHERE id=$1`, *jobID, op.Attempt); err != nil {
-		return true, unavailable(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return true, unavailable(err)
-	}
-	return true, nil
+	return handled, nil
 }
 
 // guardDefinitionDNSTerminalTx runs while the operation row is locked. An
 // intent writer locks that same row before persisting intent, so terminal
 // settlement cannot race a new request past this check.
-func guardDefinitionDNSTerminalTx(ctx context.Context, tx pgx.Tx, op *contract.Operation) error {
+func guardDefinitionDNSTerminalTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) error {
 	if op.Kind != platform.KindDomainAdd && op.Kind != platform.KindDomainRemove {
 		return nil
 	}
-	var progress, plan, cleanup, input, approvedRun []byte
-	var domainID, ledgerState, ledgerError, cleanupError, ledgerOwner string
-	err := tx.QueryRow(ctx, `SELECT s.dns_progress,s.dns_plan,s.dns_cleanup,s.input,r.approved,coalesce(s.domain_id,''),coalesce(x.state,''),coalesce(x.last_error,''),coalesce(x.cleanup_error,''),coalesce(x.last_operation_id,'')
-		FROM eregion_definition_steps s JOIN eregion_definition_runs r ON r.operation_id=s.parent_operation_id LEFT JOIN eregion_platform_domain_dns x ON x.domain_id=s.domain_id
-		WHERE s.child_operation_id=$1`, op.ID).Scan(&progress, &plan, &cleanup, &input, &approvedRun, &domainID, &ledgerState, &ledgerError, &cleanupError, &ledgerOwner)
-	if errors.Is(err, pgx.ErrNoRows) {
-		var definitionKey, dnsEvidence bool
-		if err := tx.QueryRow(ctx, `SELECT left(idempotency_key,11)='definition:', coalesce(input->>'dns_mode','')='cloudflare' OR EXISTS(SELECT 1 FROM eregion_platform_domain_dns WHERE last_operation_id=$1) FROM eregion_operations WHERE id=$1`, op.ID).Scan(&definitionKey, &dnsEvidence); err != nil {
+	cleanupState, found, err := tx.Platform().Outcomes().DomainDNSDefinitionCleanupState(ctx, op.ID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if !found {
+		marker, found, err := tx.DefinitionDNS().TerminalMarker(ctx, op.ID)
+		if err != nil {
 			return unavailable(err)
 		}
-		if definitionKey && dnsEvidence {
+		if found && marker.DefinitionKey && marker.DNSEvidence {
 			return definitionDNSConflict()
 		}
 		return nil
 	}
-	if err != nil {
-		return unavailable(err)
-	}
+	progress, plan, cleanup, input, approvedRun := cleanupState.DNSProgress, cleanupState.DNSPlan, cleanupState.DNSCleanup, cleanupState.Input, cleanupState.Approved
+	domainID, ledgerState := string(cleanupState.DomainID), cleanupState.State
+	ledgerError, cleanupError := cleanupState.LastError, cleanupState.CleanupError
+	ledgerOwner := string(cleanupState.LastOperationID)
 	hasPlan := len(plan) > 0 && string(plan) != "null"
 	hasCleanup := len(cleanup) > 0 && string(cleanup) != "null"
 	if (hasPlan && hasCleanup) || (hasPlan && op.Kind != platform.KindDomainAdd) || (hasCleanup && op.Kind != platform.KindDomainRemove) {
@@ -612,8 +610,8 @@ func guardDefinitionDNSTerminalTx(ctx context.Context, tx pgx.Tx, op *contract.O
 		if !found {
 			return definitionDNSConflict()
 		}
-		var verified bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events WHERE operation_id=$1 AND event->>'stage'='dns' AND event->>'message' LIKE 'Verified Cloudflare cleanup for %') AND NOT EXISTS(SELECT 1 FROM eregion_definition_steps s JOIN eregion_platform_domains d ON d.id=s.domain_id WHERE s.child_operation_id=$1)`, op.ID).Scan(&verified); err != nil {
+		verified, err := tx.DefinitionDNS().CleanupVerifiedWithoutLink(ctx, op.ID)
+		if err != nil {
 			return unavailable(err)
 		}
 		if verified {
@@ -734,108 +732,99 @@ func definitionDNSPlanMatchesLedger(plan integrations.DefinitionDNSPlan, ledger 
 
 // Lock the ledger before the binding, matching domain cleanup. The
 // app/environment and parent/run/step/child locks are already held.
-func lockDefinitionDNSLedgerTx(ctx context.Context, tx pgx.Tx, domainID platform.DomainID, environmentID platform.EnvironmentID) (domainDNSLedger, error) {
-	var id platform.DomainID
-	err := tx.QueryRow(ctx, `SELECT domain_id FROM eregion_platform_domain_dns WHERE domain_id=$1 FOR UPDATE`, domainID).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
+func lockDefinitionDNSLedgerTx(ctx context.Context, tx *entities.StoreTx, domainID platform.DomainID, environmentID platform.EnvironmentID) (domainDNSLedger, error) {
+	if _, found, err := tx.Platform().DomainDNS().LockLedger(ctx, domainID); err != nil {
+		return domainDNSLedger{}, unavailable(err)
+	} else if !found {
 		return domainDNSLedger{}, definitionDNSConflict()
 	}
-	if err != nil {
-		return domainDNSLedger{}, unavailable()
-	}
-	err = tx.QueryRow(ctx, `SELECT id FROM eregion_platform_domains WHERE id=$1 AND environment_id=$2 FOR UPDATE`, domainID, environmentID).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if locked, err := tx.Platform().Domains().LockByIDAndEnvironment(ctx, domainID, environmentID); err != nil {
+		return domainDNSLedger{}, unavailable(err)
+	} else if !locked {
 		return domainDNSLedger{}, definitionDNSConflict()
 	}
+	ledger, found, err := tx.Platform().DomainDNS().GetByDomainID(ctx, domainID)
 	if err != nil {
-		return domainDNSLedger{}, unavailable()
+		return domainDNSLedger{}, unavailable(err)
 	}
-	ledger, err := scanDomainDNSLedger(tx.QueryRow(ctx, domainDNSLedgerSelect+` WHERE x.domain_id=$1`, domainID))
-	if errors.Is(err, pgx.ErrNoRows) {
+	if !found {
 		return domainDNSLedger{}, definitionDNSConflict()
 	}
-	if err != nil {
-		return domainDNSLedger{}, unavailable()
-	}
-	return ledger, nil
+	return domainDNSLedgerFromEntities(ledger), nil
 }
 
 // withLocked rechecks authority and the approved ledger before any progress
 // access. The policy row is locked only until this transaction commits.
-func (p *definitionDNSProgressStore) withLocked(ctx context.Context, fn func(pgx.Tx, *definitionDNSChild) error) error {
-	if p == nil || p.service == nil || p.service.pool == nil || p.service.domainDNS == nil {
+func (p *definitionDNSProgressStore) withLocked(ctx context.Context, fn func(*entities.StoreTx, *definitionDNSChild) error) error {
+	if p == nil || p.service == nil || p.service.entities == nil || p.service.domainDNS == nil {
 		return unavailable()
 	}
 	if err := p.service.domainDNS.AuthorizeWrite(ctx, p.child.Actor); err != nil {
 		return err
 	}
-	tx, err := p.service.pool.Begin(ctx)
+	err := p.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		d, err := loadDefinitionDNSChildTxMode(ctx, tx, p.child.ID, p.recovery)
+		if err != nil {
+			return err
+		}
+		if d == nil || d.ParentID != p.parentID || d.Ordinal != p.ordinal || d.Plan == nil || d.DomainID != p.ledger.DomainID {
+			return definitionDNSConflict()
+		}
+		currentOp, found, err := tx.Operations().Get(ctx, p.child.ID)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		state, attempt, actor := currentOp.State, currentOp.Attempt, currentOp.Actor
+		if actor != p.child.Actor || (state != contract.Running && !(p.recovery && state == contract.Cancelling)) || (!p.recovery && d.ParentState == contract.Cancelling) || attempt != p.attempt {
+			return definitionDNSConflict()
+		}
+		ledger, err := lockDefinitionDNSLedgerTx(ctx, tx, d.DomainID, d.EnvironmentID)
+		if err != nil {
+			return err
+		}
+		environmentID, found, err := tx.Platform().Domains().EnvironmentIDByID(ctx, d.DomainID)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		if environmentID != d.EnvironmentID {
+			return definitionDNSConflict()
+		}
+		if ledger.Generation != p.ledger.Generation || ledger.LastOperationID != p.child.ID || ledger.App != d.Input.App || ledger.Environment != d.Input.Environment || ledger.Domain != d.Input.Domain || ledger.ZoneID != d.Plan.ZoneID || ledger.ZoneName != d.Plan.Zone || ledger.Ownership != d.Plan.Ownership || ledger.Ownership != integrations.DomainDNSOwnership(string(d.DomainID), ledger.ZoneID) || ledger.Provider != "cloudflare" || !definitionDNSPlanMatchesLedger(*d.Plan, ledger) {
+			return definitionDNSConflict()
+		}
+		policy, err := lockedDefinitionDNSPolicy(ctx, tx)
+		if err != nil {
+			return err
+		}
+		approvedPolicy := d.Approved.Snapshot.Policy
+		if !reflect.DeepEqual(policy, approvedPolicy) || !policy.Enabled || (policy.ProxyMode != "proxied" && policy.ProxyMode != "dns-only") || policy.ZoneID != ledger.ZoneID || policy.ZoneName != ledger.ZoneName || !reflect.DeepEqual(policy.Origins, ledger.DesiredOrigins) || (policy.ProxyMode == "proxied") != ledger.DesiredProxied || d.Input.DNSMode != "cloudflare" || d.Input.DNSZone != ledger.ZoneID || d.Input.DNSProxied == nil || *d.Input.DNSProxied != ledger.DesiredProxied || !reflect.DeepEqual(d.Input.DNSOrigins, ledger.DesiredOrigins) {
+			return definitionDNSConflict()
+		}
+		if err := lockDefinitionDNSCredentialTx(ctx, tx, d.Approved.Snapshot, ledger.ZoneID); err != nil {
+			return err
+		}
+		if err := validateDefinitionDNSProgress(*d.Plan, d.Progress); err != nil {
+			return err
+		}
+		return fn(tx, d)
+	})
 	if err != nil {
-		return unavailable()
-	}
-	defer rollback(tx)
-	d, err := loadDefinitionDNSChildTxMode(ctx, tx, p.child.ID, p.recovery)
-	if err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return unavailable(err)
+		}
 		return err
-	}
-	if d == nil || d.ParentID != p.parentID || d.Ordinal != p.ordinal || d.Plan == nil || d.DomainID != p.ledger.DomainID {
-		return definitionDNSConflict()
-	}
-	var state contract.State
-	var attempt uint32
-	var actor contract.Actor
-	if err := tx.QueryRow(ctx, `SELECT state,attempt,actor_kind,actor_subject FROM eregion_operations WHERE id=$1`, p.child.ID).Scan(&state, &attempt, &actor.Kind, &actor.Subject); err != nil {
-		return unavailable()
-	}
-	if actor != p.child.Actor || (state != contract.Running && !(p.recovery && state == contract.Cancelling)) || (!p.recovery && d.ParentState == contract.Cancelling) || attempt != p.attempt {
-		return definitionDNSConflict()
-	}
-	var ledger domainDNSLedger
-	ledger, err = lockDefinitionDNSLedgerTx(ctx, tx, d.DomainID, d.EnvironmentID)
-	if err != nil {
-		return err
-	}
-	var environmentID platform.EnvironmentID
-	if err := tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE id=$1`, d.DomainID).Scan(&environmentID); err != nil {
-		return unavailable()
-	}
-	if environmentID != d.EnvironmentID {
-		return definitionDNSConflict()
-	}
-	if ledger.Generation != p.ledger.Generation || ledger.LastOperationID != p.child.ID || ledger.App != d.Input.App || ledger.Environment != d.Input.Environment || ledger.Domain != d.Input.Domain || ledger.ZoneID != d.Plan.ZoneID || ledger.ZoneName != d.Plan.Zone || ledger.Ownership != d.Plan.Ownership || ledger.Ownership != integrations.DomainDNSOwnership(string(d.DomainID), ledger.ZoneID) || ledger.Provider != "cloudflare" || !definitionDNSPlanMatchesLedger(*d.Plan, ledger) {
-		return definitionDNSConflict()
-	}
-	policy, err := scanDefinitionDNSPolicy(tx.QueryRow(ctx, definitionDNSPolicySelect+` FOR SHARE OF p`))
-	if err != nil {
-		return err
-	}
-	approvedPolicy := d.Approved.Snapshot.Policy
-	if !reflect.DeepEqual(policy, approvedPolicy) || !policy.Enabled || (policy.ProxyMode != "proxied" && policy.ProxyMode != "dns-only") || policy.ZoneID != ledger.ZoneID || policy.ZoneName != ledger.ZoneName || !reflect.DeepEqual(policy.Origins, ledger.DesiredOrigins) || (policy.ProxyMode == "proxied") != ledger.DesiredProxied || d.Input.DNSMode != "cloudflare" || d.Input.DNSZone != ledger.ZoneID || d.Input.DNSProxied == nil || *d.Input.DNSProxied != ledger.DesiredProxied || !reflect.DeepEqual(d.Input.DNSOrigins, ledger.DesiredOrigins) {
-		return definitionDNSConflict()
-	}
-	if err := lockDefinitionDNSCredentialTx(ctx, tx, d.Approved.Snapshot, ledger.ZoneID); err != nil {
-		return err
-	}
-	if err := validateDefinitionDNSProgress(*d.Plan, d.Progress); err != nil {
-		return err
-	}
-	if err := fn(tx, d); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return unavailable()
 	}
 	return nil
 }
 
 func (p *definitionDNSProgressStore) Load(ctx context.Context) ([]integrations.DefinitionDNSProgress, error) {
 	var entries []integrations.DefinitionDNSProgress
-	err := p.withLocked(ctx, func(_ pgx.Tx, d *definitionDNSChild) error { entries = d.Progress; return nil })
+	err := p.withLocked(ctx, func(_ *entities.StoreTx, d *definitionDNSChild) error { entries = d.Progress; return nil })
 	return entries, err
 }
 
 func (p *definitionDNSProgressStore) Guard(ctx context.Context) error {
-	return p.withLocked(ctx, func(pgx.Tx, *definitionDNSChild) error { return nil })
+	return p.withLocked(ctx, func(*entities.StoreTx, *definitionDNSChild) error { return nil })
 }
 
 // validateDefinitionDNSCleanup permits missing approved records on retry, but
@@ -908,58 +897,58 @@ func (s *Service) guardDefinitionDNSCleanup(ctx context.Context, op contract.Ope
 }
 
 func (s *Service) checkDefinitionDNSCleanupAuthority(ctx context.Context, op contract.Operation, attempt uint32, ledger domainDNSLedger, expected *definitionDNSChild, recovery bool) (*definitionDNSChild, error) {
-	tx, err := s.pool.Begin(ctx)
+	var step *definitionDNSChild
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		step, err = loadDefinitionDNSChildTxMode(ctx, tx, op.ID, recovery)
+		if err != nil {
+			return err
+		}
+		if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || step.DomainID != ledger.DomainID || step.Cleanup.ZoneID != ledger.ZoneID || step.Cleanup.Zone != ledger.ZoneName || step.Cleanup.Host != ledger.Domain || step.Cleanup.Ownership != ledger.Ownership || ledger.Ownership != integrations.DomainDNSOwnership(string(ledger.DomainID), ledger.ZoneID) {
+			return definitionDNSConflict()
+		}
+		currentOp, found, err := tx.Operations().Get(ctx, op.ID)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		state, currentAttempt := currentOp.State, currentOp.Attempt
+		if (state != contract.Running && !(recovery && state == contract.Cancelling)) || currentAttempt != attempt {
+			return definitionDNSConflict()
+		}
+		if state == contract.Running && step.ParentState == contract.Cancelling {
+			return definitionDNSConflict()
+		}
+		current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
+		if err != nil {
+			return err
+		}
+		environmentID, found, err := tx.Platform().Domains().EnvironmentIDByID(ctx, ledger.DomainID)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		if environmentID != step.EnvironmentID || current.LastOperationID != op.ID || current.Generation != ledger.Generation || current.App != step.Input.App || current.Environment != step.Input.Environment || current.Domain != ledger.Domain || current.ZoneID != ledger.ZoneID || current.ZoneName != ledger.ZoneName || current.Ownership != ledger.Ownership || current.Provider != "cloudflare" {
+			return definitionDNSConflict()
+		}
+		policy, err := lockedDefinitionDNSPolicy(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if policy.Revision != step.Approved.Snapshot.Policy.Revision {
+			return definitionDNSConflict()
+		}
+		return lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID)
+	})
 	if err != nil {
-		return nil, unavailable()
-	}
-	defer rollback(tx)
-	step, err := loadDefinitionDNSChildTxMode(ctx, tx, op.ID, recovery)
-	if err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return nil, unavailable(err)
+		}
 		return nil, err
-	}
-	if step == nil || step.ParentID != expected.ParentID || step.Ordinal != expected.Ordinal || step.Actor != op.Actor || step.Cleanup == nil || step.DomainID != ledger.DomainID || step.Cleanup.ZoneID != ledger.ZoneID || step.Cleanup.Zone != ledger.ZoneName || step.Cleanup.Host != ledger.Domain || step.Cleanup.Ownership != ledger.Ownership || ledger.Ownership != integrations.DomainDNSOwnership(string(ledger.DomainID), ledger.ZoneID) {
-		return nil, definitionDNSConflict()
-	}
-	var state contract.State
-	var currentAttempt uint32
-	if err := tx.QueryRow(ctx, `SELECT state,attempt FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state, &currentAttempt); err != nil {
-		return nil, unavailable()
-	}
-	if (state != contract.Running && !(recovery && state == contract.Cancelling)) || currentAttempt != attempt {
-		return nil, definitionDNSConflict()
-	}
-	if state == contract.Running && step.ParentState == contract.Cancelling {
-		return nil, definitionDNSConflict()
-	}
-	current, err := lockDefinitionDNSLedgerTx(ctx, tx, ledger.DomainID, step.EnvironmentID)
-	if err != nil {
-		return nil, err
-	}
-	var environmentID platform.EnvironmentID
-	if err := tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE id=$1`, ledger.DomainID).Scan(&environmentID); err != nil {
-		return nil, unavailable()
-	}
-	if environmentID != step.EnvironmentID || current.LastOperationID != op.ID || current.Generation != ledger.Generation || current.App != step.Input.App || current.Environment != step.Input.Environment || current.Domain != ledger.Domain || current.ZoneID != ledger.ZoneID || current.ZoneName != ledger.ZoneName || current.Ownership != ledger.Ownership || current.Provider != "cloudflare" {
-		return nil, definitionDNSConflict()
-	}
-	policy, err := scanDefinitionDNSPolicy(tx.QueryRow(ctx, definitionDNSPolicySelect+` FOR SHARE OF p`))
-	if err != nil {
-		return nil, err
-	}
-	if policy.Revision != step.Approved.Snapshot.Policy.Revision {
-		return nil, definitionDNSConflict()
-	}
-	if err := lockDefinitionDNSCredentialTx(ctx, tx, step.Approved.Snapshot, ledger.ZoneID); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, unavailable()
 	}
 	return step, nil
 }
 
 func (p *definitionDNSProgressStore) Intent(ctx context.Context, entry integrations.DefinitionDNSProgress) error {
-	return p.withLocked(ctx, func(tx pgx.Tx, d *definitionDNSChild) error {
+	return p.withLocked(ctx, func(tx *entities.StoreTx, d *definitionDNSChild) error {
 		if entry.Result != nil || entry.Index < 0 || entry.Index >= len(d.Plan.Changes) {
 			return definitionDNSConflict()
 		}
@@ -981,7 +970,7 @@ func (p *definitionDNSProgressStore) Intent(ctx context.Context, entry integrati
 }
 
 func (p *definitionDNSProgressStore) Observed(ctx context.Context, entry integrations.DefinitionDNSProgress) error {
-	return p.withLocked(ctx, func(tx pgx.Tx, d *definitionDNSChild) error {
+	return p.withLocked(ctx, func(tx *entities.StoreTx, d *definitionDNSChild) error {
 		if entry.Result == nil || entry.Index < 0 || entry.Index != len(d.Progress)-1 {
 			return definitionDNSConflict()
 		}
@@ -1000,16 +989,16 @@ func (p *definitionDNSProgressStore) Observed(ctx context.Context, entry integra
 	})
 }
 
-func saveDefinitionDNSProgress(ctx context.Context, tx pgx.Tx, d *definitionDNSChild) error {
+func saveDefinitionDNSProgress(ctx context.Context, tx *entities.StoreTx, d *definitionDNSChild) error {
 	raw, err := json.Marshal(d.Progress)
 	if err != nil || len(raw) > maxDefinitionDNSProgressBytes {
 		return definitionDNSConflict()
 	}
-	tag, err := tx.Exec(ctx, `UPDATE eregion_definition_steps SET dns_progress=$3 WHERE parent_operation_id=$1 AND ordinal=$2 AND dns_progress=$4::jsonb AND child_operation_id=$5`, d.ParentID, d.Ordinal, raw, d.progressJSON, d.childID)
+	saved, err := tx.DefinitionSteps().SaveDNSProgress(ctx, d.ParentID, d.Ordinal, raw, d.progressJSON, d.childID)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
-	if tag.RowsAffected() != 1 {
+	if !saved {
 		return definitionDNSConflict()
 	}
 	return nil

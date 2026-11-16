@@ -4,14 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 )
 
@@ -80,12 +79,9 @@ func (s *Service) retainNodeResponse(parent context.Context, current engine.Exec
 	evidence.Previous = normalizeNodeContainerEvidence(evidence.Previous)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
 	defer cancel()
-	_, _, storeErr := s.mutateOwned(ctx, current.OperationID, current.Attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		var exists bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events
-			WHERE operation_id=$1 AND event->'node_evidence'->>'execution_id'=$2
-			AND event->'node_evidence'->>'outcome'=$3)`,
-			op.ID, evidence.ExecutionID, evidence.Outcome).Scan(&exists); err != nil {
+	_, _, storeErr := s.mutateOwned(ctx, current.OperationID, current.Attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		exists, err := tx.Operations().NodeEvidenceExists(ctx, op.ID, evidence.ExecutionID, evidence.Outcome)
+		if err != nil {
 			return err
 		}
 		if exists {
@@ -100,7 +96,7 @@ func (s *Service) retainNodeResponse(parent context.Context, current engine.Exec
 	if storeErr != nil && ctx.Err() == nil {
 		// A lost capture must not veto cleanup. If the database recovered,
 		// retain the loss separately; never imply that output was complete.
-		_, _, _ = s.mutateOwned(ctx, current.OperationID, current.Attempt, func(tx pgx.Tx, op *contract.Operation) error {
+		_, _, _ = s.mutateOwned(ctx, current.OperationID, current.Attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 			return appendEvent(ctx, tx, op, contract.Event{Kind: "warning", Stage: "evidence",
 				Message:      "Node execution evidence could not be retained.",
 				EvidenceLoss: &contract.NodeEvidenceLoss{ExecutionID: evidence.ExecutionID, Attempt: evidence.Attempt}})
@@ -137,25 +133,14 @@ func normalizeNodeContainerEvidence(value *contract.NodeContainerEvidence) *cont
 	return value
 }
 
-func nodeResultEvidence(ctx context.Context, tx pgx.Tx, result *contract.ActionResult, through uint64) error {
-	rows, err := tx.Query(ctx, `SELECT sequence,event->'node_evidence' FROM eregion_operation_events
-		WHERE operation_id=$1 AND event->'node_evidence'->>'attempt'=$2
-		AND event->'node_evidence'->>'outcome'='failed' AND sequence<=$3
-		AND ($4='action' OR event->>'step'=$4) ORDER BY sequence LIMIT 1`,
-		result.OperationID, strconv.FormatUint(uint64(result.Attempt), 10), through, result.Stage)
+func nodeResultEvidence(ctx context.Context, tx *entities.StoreTx, result *contract.ActionResult, through uint64) error {
+	sequence, raw, found, err := tx.Operations().FailedNodeEvidence(ctx, result.OperationID, through, result.Attempt, result.Stage)
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var sequence uint64
-		var raw []byte
-		if err := rows.Scan(&sequence, &raw); err != nil {
-			rows.Close()
-			return err
-		}
+	if found {
 		var evidence contract.NodeExecutionEvidence
 		if err := json.Unmarshal(raw, &evidence); err != nil {
-			rows.Close()
 			return err
 		}
 		if evidence.Stage != "" {
@@ -198,19 +183,8 @@ func nodeResultEvidence(ctx context.Context, tx pgx.Tx, result *contract.ActionR
 			result.ExcerptCursor = &contract.Cursor{OperationID: result.OperationID, After: sequence - 1}
 		}
 	}
-	err = rows.Err()
-	rows.Close()
+	lost, err := tx.Operations().EvidenceLost(ctx, result.OperationID, through, result.Attempt)
 	if err != nil {
-		return err
-	}
-	var lost bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events lost
-		WHERE lost.operation_id=$1 AND lost.event->'evidence_loss'->>'attempt'=$2 AND lost.sequence<=$3 AND lost.event->>'stage'='evidence'
-		AND lost.event->>'message'='Node execution evidence could not be retained.'
-		AND NOT EXISTS(SELECT 1 FROM eregion_operation_events recovered
-			WHERE recovered.operation_id=lost.operation_id AND recovered.sequence<=$3
-			AND recovered.event->'node_evidence'->>'execution_id'=lost.event->'evidence_loss'->>'execution_id'))`,
-		result.OperationID, strconv.FormatUint(uint64(result.Attempt), 10), through).Scan(&lost); err != nil {
 		return err
 	}
 	if lost {

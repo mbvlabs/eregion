@@ -1,0 +1,309 @@
+cmd: go test ./internal/controlplane -count=1 -v -timeout 600s -run '<combined 73-prefix + exact15>'
+EREGION_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:36002/postgres?sslmode=disable
+manifest=42db565456af06c5bc9041e4e98207c4f1f05390945c16a72b5b7f7adbe3aaec
+head=35cb3b4bfce8
+start: 2026-11-16T14:58:21Z
+run: ^(TestIntegration(Entities|Cutover|Goose|Migration|RiverPartial|RiverGeneration|ReadinessRound).*|TestIntegrationConcurrentWorkspaceAssignmentAgrees|TestIntegrationConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner|TestIntegrationDatabasePolicyAdmissionDefaults|TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic|TestIntegrationDatabasePolicyRetentionSettings|TestIntegrationExtensionGrantRetryConflictAndNonRevival|TestIntegrationOperationFollowSessionConsumerReplayAndContradiction|TestIntegrationOperationFollowSessionReadBudgetAndMissingTail|TestIntegrationOperationFollowSessionReadsSnapshotAndEvents|TestIntegrationOperationFollowSessionTerminalRaceAndDetach|TestIntegrationOperationFollowWireEvidence|TestIntegrationRetentionPolicyRepository|TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable|TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize|TestIntegrationWorkspaceRegistryHostBindingIsExactAndNeverBackfilled)$
+---
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/node
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/app
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/domain
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/resource
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/production
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/staging
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/preview
+=== RUN   TestIntegrationDatabasePolicyAdmissionDefaults/review
+--- PASS: TestIntegrationDatabasePolicyAdmissionDefaults (0.28s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/node (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/app (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/domain (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/resource (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/production (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/staging (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/preview (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyAdmissionDefaults/review (0.00s)
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/node-role
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/health-type
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/process-kind
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/bind-format
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/port-bounds
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/resource-spec
+=== RUN   TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/domain-proxy-type
+--- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic (0.18s)
+    --- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/node-role (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/health-type (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/process-kind (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/bind-format (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/port-bounds (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/resource-spec (0.00s)
+    --- PASS: TestIntegrationDatabasePolicyInvalidAdmissionIsAtomic/domain-proxy-type (0.00s)
+=== RUN   TestIntegrationDatabasePolicyRetentionSettings
+--- PASS: TestIntegrationDatabasePolicyRetentionSettings (0.20s)
+=== RUN   TestIntegrationEntitiesWithinTxOwnsRollback
+--- PASS: TestIntegrationEntitiesWithinTxOwnsRollback (0.27s)
+=== RUN   TestIntegrationCutoverRegisterExtensionsComposition
+--- PASS: TestIntegrationCutoverRegisterExtensionsComposition (0.19s)
+=== RUN   TestIntegrationCutoverPreviewExplicitArtifactMaxConnsOne
+--- PASS: TestIntegrationCutoverPreviewExplicitArtifactMaxConnsOne (0.23s)
+=== RUN   TestIntegrationCutoverBuildAdmissionMaxConnsOne
+--- PASS: TestIntegrationCutoverBuildAdmissionMaxConnsOne (0.39s)
+=== RUN   TestIntegrationCutoverManagedDomainAdmissionMaxConnsOne
+--- PASS: TestIntegrationCutoverManagedDomainAdmissionMaxConnsOne (0.54s)
+=== RUN   TestIntegrationCutoverProductionSubmissionAtomicity
+--- PASS: TestIntegrationCutoverProductionSubmissionAtomicity (0.47s)
+=== RUN   TestIntegrationCutoverWebhookSecretRollback
+--- PASS: TestIntegrationCutoverWebhookSecretRollback (0.27s)
+=== RUN   TestIntegrationEntitiesDefinitionDNSJournal
+--- PASS: TestIntegrationEntitiesDefinitionDNSJournal (0.17s)
+=== RUN   TestIntegrationEntitiesDefinitionFoundation
+=== RUN   TestIntegrationEntitiesDefinitionFoundation/workspace_identity
+=== RUN   TestIntegrationEntitiesDefinitionFoundation/run_journal
+=== RUN   TestIntegrationEntitiesDefinitionFoundation/step_journal
+=== RUN   TestIntegrationEntitiesDefinitionFoundation/narrow_operation_adapters
+=== RUN   TestIntegrationEntitiesDefinitionFoundation/planning_reads_and_locks
+=== RUN   TestIntegrationEntitiesDefinitionFoundation/run_uniqueness_and_terminal_reconcile
+--- PASS: TestIntegrationEntitiesDefinitionFoundation (0.24s)
+    --- PASS: TestIntegrationEntitiesDefinitionFoundation/workspace_identity (0.00s)
+    --- PASS: TestIntegrationEntitiesDefinitionFoundation/run_journal (0.00s)
+    --- PASS: TestIntegrationEntitiesDefinitionFoundation/step_journal (0.01s)
+    --- PASS: TestIntegrationEntitiesDefinitionFoundation/narrow_operation_adapters (0.00s)
+    --- PASS: TestIntegrationEntitiesDefinitionFoundation/planning_reads_and_locks (0.02s)
+    --- PASS: TestIntegrationEntitiesDefinitionFoundation/run_uniqueness_and_terminal_reconcile (0.00s)
+=== RUN   TestIntegrationEntitiesDefinitionLockOrderConflict
+--- PASS: TestIntegrationEntitiesDefinitionLockOrderConflict (0.44s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesPushWebhookBinding
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesPushWebhookBinding (0.23s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesOperationTxProjections
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesOperationTxProjections (0.18s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesOperationSavepointProjection
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesOperationSavepointProjection (0.20s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesDefinitionJournal
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesDefinitionJournal (0.22s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesDefinitionActiveOperations
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesDefinitionActiveOperations (0.20s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesNodeShareLock
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesNodeShareLock (0.46s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesDomainAndEnvironmentFacts
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesDomainAndEnvironmentFacts (0.22s)
+=== RUN   TestIntegrationEntitiesDomainPrerequisitesWorkspaceCatalogAndLock
+--- PASS: TestIntegrationEntitiesDomainPrerequisitesWorkspaceCatalogAndLock (0.50s)
+=== RUN   TestIntegrationEntitiesGrantStoreContract
+--- PASS: TestIntegrationEntitiesGrantStoreContract (0.20s)
+=== RUN   TestIntegrationEntitiesGrantStoreConcurrentWriters
+--- PASS: TestIntegrationEntitiesGrantStoreConcurrentWriters (0.32s)
+=== RUN   TestIntegrationExtensionGrantRetryConflictAndNonRevival
+--- PASS: TestIntegrationExtensionGrantRetryConflictAndNonRevival (0.24s)
+=== RUN   TestIntegrationEntitiesInfrastructureInstallationSchemaPrivileges
+--- PASS: TestIntegrationEntitiesInfrastructureInstallationSchemaPrivileges (0.06s)
+=== RUN   TestIntegrationEntitiesInfrastructureFactsAndSession
+--- PASS: TestIntegrationEntitiesInfrastructureFactsAndSession (0.04s)
+=== RUN   TestIntegrationEntitiesInfrastructureMigrationSnapshot
+--- PASS: TestIntegrationEntitiesInfrastructureMigrationSnapshot (0.05s)
+=== RUN   TestIntegrationEntitiesAtomicOperationSecretRiverRollback
+--- PASS: TestIntegrationEntitiesAtomicOperationSecretRiverRollback (0.23s)
+=== RUN   TestIntegrationEntitiesSavepointDedup
+--- PASS: TestIntegrationEntitiesSavepointDedup (0.23s)
+=== RUN   TestIntegrationEntitiesJobRuntimeTypedEnqueues
+--- PASS: TestIntegrationEntitiesJobRuntimeTypedEnqueues (0.19s)
+=== RUN   TestIntegrationEntitiesJobRuntimeLifecycle
+--- PASS: TestIntegrationEntitiesJobRuntimeLifecycle (0.21s)
+=== RUN   TestIntegrationEntitiesOperationGuardsAndReuse
+--- PASS: TestIntegrationEntitiesOperationGuardsAndReuse (0.21s)
+=== RUN   TestIntegrationEntitiesOperationEventStepFoundation
+--- PASS: TestIntegrationEntitiesOperationEventStepFoundation (0.36s)
+=== RUN   TestIntegrationEntitiesOperationHistoryParity
+=== RUN   TestIntegrationEntitiesOperationHistoryParity/actor-only
+=== RUN   TestIntegrationEntitiesOperationHistoryParity/all-actors
+=== RUN   TestIntegrationEntitiesOperationHistoryParity/app-only
+=== RUN   TestIntegrationEntitiesOperationHistoryParity/app-environment
+=== RUN   TestIntegrationEntitiesOperationHistoryParity/app-environment-running
+--- PASS: TestIntegrationEntitiesOperationHistoryParity (0.19s)
+    --- PASS: TestIntegrationEntitiesOperationHistoryParity/actor-only (0.00s)
+    --- PASS: TestIntegrationEntitiesOperationHistoryParity/all-actors (0.00s)
+    --- PASS: TestIntegrationEntitiesOperationHistoryParity/app-only (0.00s)
+    --- PASS: TestIntegrationEntitiesOperationHistoryParity/app-environment (0.00s)
+    --- PASS: TestIntegrationEntitiesOperationHistoryParity/app-environment-running (0.00s)
+=== RUN   TestIntegrationEntitiesTypedInputAndIdentityPattern
+--- PASS: TestIntegrationEntitiesTypedInputAndIdentityPattern (0.17s)
+=== RUN   TestIntegrationEntitiesTransactionIdentityForShareLocks
+--- PASS: TestIntegrationEntitiesTransactionIdentityForShareLocks (0.43s)
+=== RUN   TestIntegrationEntitiesPlatformBuildReleasePointerAndKeyShare
+--- PASS: TestIntegrationEntitiesPlatformBuildReleasePointerAndKeyShare (0.52s)
+=== RUN   TestIntegrationEntitiesPlatformOwnerRouteCAS
+--- PASS: TestIntegrationEntitiesPlatformOwnerRouteCAS (0.21s)
+=== RUN   TestIntegrationEntitiesPlatformResourceFencesAndValidation
+--- PASS: TestIntegrationEntitiesPlatformResourceFencesAndValidation (0.22s)
+=== RUN   TestIntegrationEntitiesPlatformDeployabilityRawFacts
+--- PASS: TestIntegrationEntitiesPlatformDeployabilityRawFacts (0.18s)
+=== RUN   TestIntegrationEntitiesPlatformEnvironmentDNSObservation
+--- PASS: TestIntegrationEntitiesPlatformEnvironmentDNSObservation (0.21s)
+=== RUN   TestIntegrationEntitiesPlatformCorruptSentinels
+--- PASS: TestIntegrationEntitiesPlatformCorruptSentinels (0.24s)
+=== RUN   TestIntegrationEntitiesPlatformSessionLeaseUncertainty
+--- PASS: TestIntegrationEntitiesPlatformSessionLeaseUncertainty (0.23s)
+=== RUN   TestIntegrationEntitiesPlatformBuildSlotsAndTargetContention
+--- PASS: TestIntegrationEntitiesPlatformBuildSlotsAndTargetContention (0.26s)
+=== RUN   TestIntegrationEntitiesPlatformCrossDomainDecoys
+--- PASS: TestIntegrationEntitiesPlatformCrossDomainDecoys (0.21s)
+=== RUN   TestIntegrationEntitiesPlatformDomainDNSAndLeases
+--- PASS: TestIntegrationEntitiesPlatformDomainDNSAndLeases (0.24s)
+=== RUN   TestIntegrationEntitiesPlatformStateParity
+--- PASS: TestIntegrationEntitiesPlatformStateParity (0.23s)
+=== RUN   TestIntegrationEntitiesPlatformReleaseDeploymentParity
+--- PASS: TestIntegrationEntitiesPlatformReleaseDeploymentParity (0.20s)
+=== RUN   TestIntegrationEntitiesPlatformResourceNodeFoundation
+--- PASS: TestIntegrationEntitiesPlatformResourceNodeFoundation (0.18s)
+=== RUN   TestIntegrationEntitiesPlatformAtomicRollback
+--- PASS: TestIntegrationEntitiesPlatformAtomicRollback (0.22s)
+=== RUN   TestIntegrationEntitiesRetentionAndResults
+--- PASS: TestIntegrationEntitiesRetentionAndResults (0.21s)
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_queue
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_attempt
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_owner
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_state
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/empty_owner
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/exact_owner
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_queue
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_attempt
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_owner
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_state
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/empty_owner
+=== RUN   TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/exact_owner
+--- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix (0.26s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_queue (0.01s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_attempt (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_owner (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/wrong_state (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/empty_owner (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/discard/exact_owner (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_queue (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_attempt (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_owner (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/wrong_state (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/empty_owner (0.00s)
+    --- PASS: TestIntegrationEntitiesRiverOwnerFenceMatrix/requeue/exact_owner (0.00s)
+=== RUN   TestIntegrationEntitiesRiverMetadata
+--- PASS: TestIntegrationEntitiesRiverMetadata (0.23s)
+=== RUN   TestIntegrationRiverGenerationSchemaMatchesMigrated
+--- PASS: TestIntegrationRiverGenerationSchemaMatchesMigrated (0.27s)
+=== RUN   TestIntegrationEntitiesSavepointPoisonRejectsCommit
+--- PASS: TestIntegrationEntitiesSavepointPoisonRejectsCommit (0.19s)
+=== RUN   TestIntegrationEntitiesSavepointCallbackIdentityAndPanicWrite
+--- PASS: TestIntegrationEntitiesSavepointCallbackIdentityAndPanicWrite (0.19s)
+=== RUN   TestIntegrationEntitiesSavepointAtomicSecretOperationRiverRollback
+--- PASS: TestIntegrationEntitiesSavepointAtomicSecretOperationRiverRollback (0.19s)
+=== RUN   TestIntegrationEntitiesSavepointNilCallbackPoison
+--- PASS: TestIntegrationEntitiesSavepointNilCallbackPoison (0.19s)
+=== RUN   TestIntegrationEntitiesSecretPortCiphertextMetadata
+--- PASS: TestIntegrationEntitiesSecretPortCiphertextMetadata (0.21s)
+=== RUN   TestIntegrationEntitiesBeginCallbackAndCancellationClassification
+--- PASS: TestIntegrationEntitiesBeginCallbackAndCancellationClassification (0.19s)
+=== RUN   TestIntegrationEntitiesCommitFailureClassification
+=== RUN   TestIntegrationEntitiesCommitFailureClassification/definite_rollback_from_aborted_transaction
+=== RUN   TestIntegrationEntitiesCommitFailureClassification/deferred_trigger_at_commit_is_conservative_unknown
+--- PASS: TestIntegrationEntitiesCommitFailureClassification (0.17s)
+    --- PASS: TestIntegrationEntitiesCommitFailureClassification/definite_rollback_from_aborted_transaction (0.00s)
+    --- PASS: TestIntegrationEntitiesCommitFailureClassification/deferred_trigger_at_commit_is_conservative_unknown (0.00s)
+=== RUN   TestIntegrationEntitiesTxProjectionVisibility
+--- PASS: TestIntegrationEntitiesTxProjectionVisibility (0.18s)
+=== RUN   TestIntegrationEntitiesWebhookReceipts
+--- PASS: TestIntegrationEntitiesWebhookReceipts (0.20s)
+=== RUN   TestIntegrationMigrations
+--- PASS: TestIntegrationMigrations (0.32s)
+=== RUN   TestIntegrationReadinessRoundTripsPreserveInspection
+--- PASS: TestIntegrationReadinessRoundTripsPreserveInspection (0.27s)
+=== RUN   TestIntegrationGooseFreshPlanReadOnly
+--- PASS: TestIntegrationGooseFreshPlanReadOnly (0.20s)
+=== RUN   TestIntegrationGooseRefusesExistingMetadata
+=== RUN   TestIntegrationGooseRefusesExistingMetadata/legacy
+=== RUN   TestIntegrationGooseRefusesExistingMetadata/vault
+=== RUN   TestIntegrationGooseRefusesExistingMetadata/river-empty
+=== RUN   TestIntegrationGooseRefusesExistingMetadata/river-populated
+=== RUN   TestIntegrationGooseRefusesExistingMetadata/river-job
+--- PASS: TestIntegrationGooseRefusesExistingMetadata (0.31s)
+    --- PASS: TestIntegrationGooseRefusesExistingMetadata/legacy (0.06s)
+    --- PASS: TestIntegrationGooseRefusesExistingMetadata/vault (0.06s)
+    --- PASS: TestIntegrationGooseRefusesExistingMetadata/river-empty (0.07s)
+    --- PASS: TestIntegrationGooseRefusesExistingMetadata/river-populated (0.07s)
+    --- PASS: TestIntegrationGooseRefusesExistingMetadata/river-job (0.06s)
+=== RUN   TestIntegrationGooseRejectsMalformedHistory
+=== RUN   TestIntegrationGooseRejectsMalformedHistory/empty
+=== RUN   TestIntegrationGooseRejectsMalformedHistory/missing-zero
+=== RUN   TestIntegrationGooseRejectsMalformedHistory/duplicate
+=== RUN   TestIntegrationGooseRejectsMalformedHistory/down
+=== RUN   TestIntegrationGooseRejectsMalformedHistory/unknown
+=== RUN   TestIntegrationGooseRejectsMalformedHistory/gap
+=== RUN   TestIntegrationGooseRejectsMalformedHistory/out-of-order
+--- PASS: TestIntegrationGooseRejectsMalformedHistory (0.36s)
+    --- PASS: TestIntegrationGooseRejectsMalformedHistory/empty (0.04s)
+    --- PASS: TestIntegrationGooseRejectsMalformedHistory/missing-zero (0.05s)
+    --- PASS: TestIntegrationGooseRejectsMalformedHistory/duplicate (0.05s)
+    --- PASS: TestIntegrationGooseRejectsMalformedHistory/down (0.06s)
+    --- PASS: TestIntegrationGooseRejectsMalformedHistory/unknown (0.06s)
+    --- PASS: TestIntegrationGooseRejectsMalformedHistory/gap (0.05s)
+    --- PASS: TestIntegrationGooseRejectsMalformedHistory/out-of-order (0.05s)
+=== RUN   TestIntegrationGooseZeroHistoryRefusesExistingRiver
+--- PASS: TestIntegrationGooseZeroHistoryRefusesExistingRiver (0.06s)
+=== RUN   TestIntegrationGooseZeroHistoryRefusesOrphan
+--- PASS: TestIntegrationGooseZeroHistoryRefusesOrphan (0.06s)
+=== RUN   TestIntegrationGooseTransactionalFailureAndRetry
+--- PASS: TestIntegrationGooseTransactionalFailureAndRetry (0.21s)
+=== RUN   TestIntegrationGooseMidChainFailureAndRetry
+--- PASS: TestIntegrationGooseMidChainFailureAndRetry (0.23s)
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans/table
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans/future-table
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans/function
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans/index
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans/trigger
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans/river-empty
+=== RUN   TestIntegrationGoosePartialPrefixRefusesOrphans/river-populated
+--- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans (0.80s)
+    --- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans/table (0.11s)
+    --- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans/future-table (0.12s)
+    --- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans/function (0.10s)
+    --- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans/index (0.11s)
+    --- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans/trigger (0.10s)
+    --- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans/river-empty (0.11s)
+    --- PASS: TestIntegrationGoosePartialPrefixRefusesOrphans/river-populated (0.13s)
+=== RUN   TestIntegrationGooseCompleteHistoryRefusesOrphanFunction
+--- PASS: TestIntegrationGooseCompleteHistoryRefusesOrphanFunction (0.22s)
+=== RUN   TestIntegrationRiverPartialFailureRetry
+--- PASS: TestIntegrationRiverPartialFailureRetry (0.26s)
+=== RUN   TestIntegrationMigrationSingleSchemaSearchPath
+--- PASS: TestIntegrationMigrationSingleSchemaSearchPath (0.23s)
+=== RUN   TestIntegrationMigrationTwoConnectionsConcurrencyAndCancellation
+=== RUN   TestIntegrationMigrationTwoConnectionsConcurrencyAndCancellation/shared
+=== RUN   TestIntegrationMigrationTwoConnectionsConcurrencyAndCancellation/separate
+--- PASS: TestIntegrationMigrationTwoConnectionsConcurrencyAndCancellation (1.16s)
+    --- PASS: TestIntegrationMigrationTwoConnectionsConcurrencyAndCancellation/shared (0.59s)
+    --- PASS: TestIntegrationMigrationTwoConnectionsConcurrencyAndCancellation/separate (0.57s)
+=== RUN   TestIntegrationOperationFollowSessionReadsSnapshotAndEvents
+--- PASS: TestIntegrationOperationFollowSessionReadsSnapshotAndEvents (0.28s)
+=== RUN   TestIntegrationOperationFollowSessionTerminalRaceAndDetach
+--- PASS: TestIntegrationOperationFollowSessionTerminalRaceAndDetach (0.21s)
+=== RUN   TestIntegrationOperationFollowSessionReadBudgetAndMissingTail
+--- PASS: TestIntegrationOperationFollowSessionReadBudgetAndMissingTail (10.20s)
+=== RUN   TestIntegrationOperationFollowSessionConsumerReplayAndContradiction
+--- PASS: TestIntegrationOperationFollowSessionConsumerReplayAndContradiction (0.22s)
+=== RUN   TestIntegrationOperationFollowWireEvidence
+--- PASS: TestIntegrationOperationFollowWireEvidence (0.25s)
+=== RUN   TestIntegrationRetentionPolicyRepository
+--- PASS: TestIntegrationRetentionPolicyRepository (0.26s)
+=== RUN   TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable
+--- PASS: TestIntegrationWorkspaceAssignmentIsSingletonIdempotentAndImmutable (0.18s)
+=== RUN   TestIntegrationWorkspaceRegistryHostBindingIsExactAndNeverBackfilled
+--- PASS: TestIntegrationWorkspaceRegistryHostBindingIsExactAndNeverBackfilled (0.40s)
+=== RUN   TestIntegrationConcurrentWorkspaceAssignmentAgrees
+--- PASS: TestIntegrationConcurrentWorkspaceAssignmentAgrees (0.19s)
+=== RUN   TestIntegrationConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner
+--- PASS: TestIntegrationConcurrentWorkspaceAssignmentWithDifferentNamesHasOneWinner (0.18s)
+=== RUN   TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize
+--- PASS: TestIntegrationWorkspaceReadBeforeMigrationDoesNotInitialize (0.03s)
+PASS
+ok  	github.com/mbvlabs/eregion/internal/controlplane	32.387s
+end: 2026-11-16T14:58:58Z
+EXIT_STATUS=0

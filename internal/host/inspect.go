@@ -200,7 +200,11 @@ func ReadWorkspaceStatus(ctx context.Context, dsn string) (controlplane.Workspac
 		return controlplane.WorkspaceIdentity{}, err
 	}
 	defer pool.Close()
-	return controlplane.ReadWorkspace(ctx, pool)
+	store, err := mustStore(pool)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, err
+	}
+	return controlplane.ReadWorkspace(ctx, store)
 }
 
 // DiskStatus is one filesystem's observation.

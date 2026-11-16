@@ -26,6 +26,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
 	"github.com/mbvlabs/eregion/internal/doctor"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -1575,7 +1576,11 @@ func readWorkspaceFromDSN(ctx context.Context, dsn string) (controlplane.Workspa
 		return controlplane.WorkspaceIdentity{}, err
 	}
 	defer pool.Close()
-	return controlplane.ReadWorkspace(ctx, pool)
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, err
+	}
+	return controlplane.ReadWorkspace(ctx, store)
 }
 
 func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Registry, buildConcurrency bool) (api.AppService, func(), error) {
@@ -1606,8 +1611,13 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		pool.Close()
 		return api.AppService{}, nil, err
 	}
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		pool.Close()
+		return api.AppService{}, nil, err
+	}
 	a := &app{secrets: registry}
-	parts, resolver, err := a.startExtensions(pool)
+	parts, resolver, err := a.startExtensions(store)
 	if err != nil {
 		pool.Close()
 		return api.AppService{}, nil, err
@@ -1626,7 +1636,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		}
 		registryHostIdentity = &identity
 	}
-	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
+	run, err := controlplane.New(store, logger, controlplane.WorkerConfig{
 		Concurrency: 0, SecretResolver: resolver, LocalNodeName: os.Getenv("EREGION_NODE_NAME"),
 		Redaction: registry, Vault: parts.Vault,
 		RegistryEndpoint:     registryEndpoint,
@@ -1647,7 +1657,7 @@ func openNodeApp(ctx context.Context, logger *slog.Logger, registry *secrets.Reg
 		)
 	})
 	appService.Retention = run.Service
-	appService.DefinitionDNS = controlplane.NewDefinitionDNSPolicyStore(pool)
+	appService.DefinitionDNS = controlplane.NewDefinitionDNSPolicyStore(parts.Entities)
 	appService.DefinitionPlanner = run.Service
 	if parts.Cloudflare != nil {
 		appService.Cloudflare = parts.Cloudflare

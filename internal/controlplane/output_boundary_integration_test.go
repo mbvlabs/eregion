@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -25,7 +25,7 @@ func TestIntegrationOutputBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = run.Service.mutate(ctx, op.ID, func(tx pgx.Tx, current *contract.Operation) error {
+	_, err = run.Service.mutate(ctx, op.ID, func(tx *entities.StoreTx, current *contract.Operation) error {
 		return appendEvent(ctx, tx, current, contract.Event{Kind: "log", Stage: "status", Message: "stdout secret"})
 	})
 	if err != nil {

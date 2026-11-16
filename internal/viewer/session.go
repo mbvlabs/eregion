@@ -1,7 +1,10 @@
 package viewer
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"reflect"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -23,12 +26,32 @@ type SessionResult struct {
 // SessionClient opens one read session; implementations close it before
 // returning on callback failure or cancellation.
 type SessionClient interface {
-	FollowSession(context.Context, contract.Cursor, int, time.Duration, func(SessionObservation) error) (SessionResult, error)
+	FollowSession(
+		context.Context,
+		contract.Cursor,
+		int,
+		time.Duration,
+		func(SessionObservation) error,
+	) (SessionResult, error)
 }
 
-func followSession(ctx context.Context, client SessionClient, id contract.OperationID, opts FollowOptions, emit func(Observation) error) (Summary, error) {
+func followSession(
+	ctx context.Context,
+	client SessionClient,
+	id contract.OperationID,
+	opts FollowOptions,
+	emit func(Observation) error,
+) (Summary, error) {
 	opts = opts.normalized()
-	model := New(id, Options{EventLimit: opts.EventLimit, StaleAfter: opts.StaleAfter, StalePolls: opts.StalePolls, Clean: opts.Clean})
+	model := New(
+		id,
+		Options{
+			EventLimit: opts.EventLimit,
+			StaleAfter: opts.StaleAfter,
+			StalePolls: opts.StalePolls,
+			Clean:      opts.Clean,
+		},
+	)
 	model.Cursor = opts.After
 	send := func(o Observation) error {
 		if emit == nil {
@@ -45,69 +68,88 @@ func followSession(ctx context.Context, client SessionClient, id contract.Operat
 		}
 		var callbackErr error
 		var snapshot *contract.Operation
-		result, err := client.FollowSession(ctx, contract.Cursor{OperationID: id, After: model.Cursor}, opts.PageLimit, opts.PollInterval, func(observation SessionObservation) error {
-			now := opts.Now()
-			fail := func(err error) error { callbackErr = err; return err }
-			if observation.Cursor.OperationID != id {
-				return fail(followProtocolError())
-			}
-			if observation.Snapshot != nil {
-				op := *observation.Snapshot
-				if op.Validate() != nil || op.ID != id || observation.Cursor.After != model.Cursor || observation.Events != nil || op.LastSequence < model.Cursor {
+		result, err := client.FollowSession(
+			ctx,
+			contract.Cursor{OperationID: id, After: model.Cursor},
+			opts.PageLimit,
+			opts.PollInterval,
+			func(observation SessionObservation) error {
+				now := opts.Now()
+				fail := func(err error) error { callbackErr = err; return err }
+				if observation.Cursor.OperationID != id {
 					return fail(followProtocolError())
 				}
-				snapshot = &op
-				model.Snapshot(op, now)
+				if observation.Snapshot != nil {
+					op := *observation.Snapshot
+					if op.Validate() != nil || op.ID != id ||
+						observation.Cursor.After != model.Cursor ||
+						observation.Events != nil ||
+						op.LastSequence < model.Cursor {
+						return fail(followProtocolError())
+					}
+					snapshot = &op
+					model.Snapshot(op, now)
+					model.PollSucceeded(now)
+					backoff = opts.PollInterval
+					if err := send(
+						Observation{Kind: ObservationSnapshot, At: now, Snapshot: &op},
+					); err != nil {
+						return fail(err)
+					}
+					return nil
+				}
+				if snapshot == nil || len(observation.Events) == 0 ||
+					len(observation.Events) > opts.PageLimit {
+					return fail(followProtocolError())
+				}
+				next := model.Cursor
+				var previous uint64
+				var fresh []contract.Event
+				for _, event := range observation.Events {
+					if event.Validate() != nil || event.OperationID != id ||
+						(previous != 0 && event.Sequence <= previous) {
+						return fail(followProtocolError())
+					}
+					previous = event.Sequence
+					if event.Sequence <= model.Cursor {
+						continue
+					}
+					if event.Sequence != next+1 {
+						return fail(followProtocolError())
+					}
+					next = event.Sequence
+					fresh = append(fresh, event)
+				}
+				if observation.Cursor.After != previous {
+					return fail(followProtocolError())
+				}
+				if len(fresh) == 0 {
+					return nil
+				}
+				if err := model.Page(fresh, now); err != nil {
+					return fail(followProtocolError())
+				}
 				model.PollSucceeded(now)
-				backoff = opts.PollInterval
-				if err := send(Observation{Kind: ObservationSnapshot, At: now, Snapshot: &op}); err != nil {
+				if err := send(
+					Observation{Kind: ObservationEvents, At: now, Events: fresh},
+				); err != nil {
 					return fail(err)
 				}
 				return nil
-			}
-			if snapshot == nil || len(observation.Events) == 0 || len(observation.Events) > opts.PageLimit {
-				return fail(followProtocolError())
-			}
-			next := model.Cursor
-			var previous uint64
-			var fresh []contract.Event
-			for _, event := range observation.Events {
-				if event.Validate() != nil || event.OperationID != id || (previous != 0 && event.Sequence <= previous) {
-					return fail(followProtocolError())
-				}
-				previous = event.Sequence
-				if event.Sequence <= model.Cursor {
-					continue
-				}
-				if event.Sequence != next+1 {
-					return fail(followProtocolError())
-				}
-				next = event.Sequence
-				fresh = append(fresh, event)
-			}
-			if observation.Cursor.After != previous {
-				return fail(followProtocolError())
-			}
-			if len(fresh) == 0 {
-				return nil
-			}
-			if err := model.Page(fresh, now); err != nil {
-				return fail(followProtocolError())
-			}
-			model.PollSucceeded(now)
-			if err := send(Observation{Kind: ObservationEvents, At: now, Events: fresh}); err != nil {
-				return fail(err)
-			}
-			return nil
-		})
+			},
+		)
 		if callbackErr != nil {
 			return modelSummary(model), callbackErr
 		}
 		if err == nil {
-			if snapshot == nil || result.Operation.Validate() != nil || result.Operation.ID != id ||
+			if snapshot == nil {
+				return modelSummary(model), followProtocolError()
+			}
+			sameOperation, compareErr := sameOperationWire(*snapshot, result.Operation)
+			if result.Operation.Validate() != nil || result.Operation.ID != id ||
 				result.Cursor.OperationID != id || result.Cursor.After != model.Cursor ||
 				!result.Operation.State.Terminal() || result.Operation.LastSequence != model.Cursor ||
-				*snapshot != result.Operation || model.State != result.Operation.State ||
+				compareErr != nil || !sameOperation || model.State != result.Operation.State ||
 				model.Attempt != result.Operation.Attempt || model.ErrorCode != result.Operation.ErrorCode {
 				return modelSummary(model), followProtocolError()
 			}
@@ -135,5 +177,45 @@ func followSession(ctx context.Context, client SessionClient, id contract.Operat
 }
 
 func followProtocolError() error {
-	return contract.NewFault(contract.ValidationFailed, "invalid operation follow stream", "Check operator and node compatibility; do not assume the operation stopped.")
+	return contract.NewFault(
+		contract.ValidationFailed,
+		"invalid operation follow stream",
+		"Check operator and node compatibility; do not assume the operation stopped.",
+	)
+}
+
+// sameOperationWire compares the serialized Operation contract by value. The
+// final observation and the session result arrive through independent wire
+// decoders, so their nested result/evidence pointers are always distinct even
+// when the values are identical. Internal PendingResult is excluded (json:"-").
+// Numbers decode as json.Number so no precision is lost; object key order and
+// insignificant JSON formatting are not semantic differences. A marshal or
+// decode failure is a protocol rejection, not equality.
+func sameOperationWire(left, right contract.Operation) (bool, error) {
+	leftValue, err := operationWireValue(left)
+	if err != nil {
+		return false, err
+	}
+	rightValue, err := operationWireValue(right)
+	if err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(leftValue, rightValue), nil
+}
+
+func operationWireValue(op contract.Operation) (any, error) {
+	// PendingResult is an internal, unexported wire-invisible hand-off. It is
+	// never part of the operation equality contract.
+	op.PendingResult = nil
+	encoded, err := json.Marshal(op)
+	if err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	return value, nil
 }

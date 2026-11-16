@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -47,27 +47,24 @@ type deploymentOwnerRow struct {
 	Environment string
 }
 
-const deploymentOwnerColumns = `coalesce(o.operation_id,''),coalesce(o.deployment_id,''),
-    coalesce(o.owner_attempt,0),o.phase,coalesce(o.route_target_deployment_id,''),
-    coalesce(o.restore_release_id,''),coalesce(o.restore_deployment_id,'')`
-
-func scanDeploymentOwner(row pgx.Row, environmentID platform.EnvironmentID) (deploymentOwner, error) {
-	owner := deploymentOwner{EnvironmentID: environmentID}
-	err := row.Scan(&owner.OperationID, &owner.DeploymentID, &owner.Attempt, &owner.Phase,
-		&owner.RouteTarget, &owner.RestoreReleaseID, &owner.RestoreDeploymentID)
-	return owner, err
+func deploymentOwnerFromEntities(owner entities.Owner) deploymentOwner {
+	return deploymentOwner{
+		EnvironmentID: owner.EnvironmentID, OperationID: owner.OperationID,
+		DeploymentID: owner.DeploymentID, Attempt: owner.Attempt, Phase: deploymentOwnerPhase(owner.Phase),
+		RouteTarget: owner.RouteTarget, RestoreReleaseID: owner.RestoreRelease,
+		RestoreDeploymentID: owner.RestoreDeployment,
+	}
 }
 
-func (s *Service) deploymentOwnerByEnvironment(ctx context.Context, q rowQuerier, environmentID platform.EnvironmentID) (deploymentOwner, bool, error) {
-	owner, err := scanDeploymentOwner(q.QueryRow(ctx, `SELECT `+deploymentOwnerColumns+`
-        FROM eregion_platform_deployment_owners o WHERE o.environment_id=$1`, environmentID), environmentID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return owner, false, nil
-	}
+func (s *Service) deploymentOwnerByEnvironment(ctx context.Context, owners *entities.DeploymentOwnerStore, environmentID platform.EnvironmentID) (deploymentOwner, bool, error) {
+	owner, found, err := owners.Get(ctx, environmentID)
 	if err != nil {
-		return owner, false, unavailable()
+		return deploymentOwner{}, false, unavailable(err)
 	}
-	return owner, true, nil
+	if !found {
+		return deploymentOwner{}, false, nil
+	}
+	return deploymentOwnerFromEntities(owner), true, nil
 }
 
 // deploymentLifecycleKind is the operation set that can change traffic or the
@@ -86,7 +83,7 @@ func deploymentLifecycleKind(kind string) bool {
 // run while holding env/<app>/<env>. A different live owner returns false; the
 // caller must snooze without consuming a River attempt.
 func (s *Service) acquireDeploymentOwner(ctx context.Context, dep platform.Deployment, env platform.Environment, attempt uint32) (deploymentOwner, bool, error) {
-	owner, has, err := s.deploymentOwnerByEnvironment(ctx, s.pool, env.ID)
+	owner, has, err := s.deploymentOwnerByEnvironment(ctx, s.entities.Platform().Owners(), env.ID)
 	if err != nil {
 		return owner, false, err
 	}
@@ -123,23 +120,35 @@ func (s *Service) acquireDeploymentOwner(ctx context.Context, dep platform.Deplo
 		phase = deploymentOwnerRestoring
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return deploymentOwner{}, false, unavailable()
+	owner = deploymentOwner{
+		EnvironmentID: env.ID, OperationID: dep.OperationID, DeploymentID: dep.ID,
+		Attempt: attempt, Phase: phase, RouteTarget: target,
+		RestoreReleaseID: restoreRelease, RestoreDeploymentID: restoreDeployment,
 	}
-	defer rollback(tx)
-	tag, err := tx.Exec(ctx, `INSERT INTO eregion_platform_deployment_owners
-        (environment_id,operation_id,deployment_id,owner_attempt,phase,route_target_deployment_id,restore_release_id,restore_deployment_id,created_at,updated_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,clock_timestamp(),clock_timestamp())
-        ON CONFLICT (environment_id) DO NOTHING`,
-		env.ID, dep.OperationID, dep.ID, attempt, string(phase),
-		nullableDeploymentID(target), nullableReleaseID(restoreRelease), nullableDeploymentID(restoreDeployment))
+	var raced bool
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		inserted, err := tx.Platform().Owners().Insert(ctx, entities.OwnerInsert{
+			EnvironmentID: env.ID, OperationID: dep.OperationID, DeploymentID: dep.ID,
+			Attempt: attempt, Phase: string(phase), RouteTarget: target,
+			RestoreRelease: restoreRelease, RestoreDeployment: restoreDeployment,
+		})
+		if err != nil {
+			return unavailable(err)
+		}
+		if !inserted {
+			raced = true
+			return nil
+		}
+		return bindDeploymentPredecessor(ctx, tx, dep, owner)
+	})
 	if err != nil {
-		return deploymentOwner{}, false, unavailable()
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return deploymentOwner{}, false, unavailable(err)
+		}
+		return deploymentOwner{}, false, err
 	}
-	if tag.RowsAffected() == 0 {
-		_ = tx.Rollback(ctx)
-		owner, has, err = s.deploymentOwnerByEnvironment(ctx, s.pool, env.ID)
+	if raced {
+		owner, has, err = s.deploymentOwnerByEnvironment(ctx, s.entities.Platform().Owners(), env.ID)
 		if err != nil {
 			return owner, false, err
 		}
@@ -148,25 +157,12 @@ func (s *Service) acquireDeploymentOwner(ctx context.Context, dep platform.Deplo
 		}
 		return s.renewDeploymentOwner(ctx, owner, dep, attempt)
 	}
-	owner = deploymentOwner{
-		EnvironmentID: env.ID, OperationID: dep.OperationID, DeploymentID: dep.ID,
-		Attempt: attempt, Phase: phase, RouteTarget: target,
-		RestoreReleaseID: restoreRelease, RestoreDeploymentID: restoreDeployment,
-	}
-	if err := bindDeploymentPredecessor(ctx, tx, dep, owner); err != nil {
-		return deploymentOwner{}, false, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return deploymentOwner{}, false, unavailable()
-	}
 	return owner, true, nil
 }
 
-func bindDeploymentPredecessor(ctx context.Context, tx pgx.Tx, dep platform.Deployment, owner deploymentOwner) error {
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_deployments
-        SET previous_release_id=$2,previous_deployment_id=$3,updated_at=updated_at
-        WHERE id=$1`, dep.ID, nullableReleaseID(owner.RestoreReleaseID), nullableDeploymentID(owner.RestoreDeploymentID)); err != nil {
-		return unavailable()
+func bindDeploymentPredecessor(ctx context.Context, tx *entities.StoreTx, dep platform.Deployment, owner deploymentOwner) error {
+	if _, err := tx.Platform().Deployments().BindPredecessor(ctx, dep.ID, owner.RestoreReleaseID, owner.RestoreDeploymentID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -178,32 +174,30 @@ func (s *Service) renewDeploymentOwner(ctx context.Context, owner deploymentOwne
 	if owner.Attempt > attempt {
 		return owner, false, errNotOwned
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return owner, false, unavailable()
-	}
-	defer rollback(tx)
-	if owner.Attempt < attempt {
-		tag, err := tx.Exec(ctx, `UPDATE eregion_platform_deployment_owners
-            SET owner_attempt=$3,updated_at=clock_timestamp()
-            WHERE environment_id=$1 AND operation_id=$2 AND owner_attempt <= $3`,
-			owner.EnvironmentID, owner.OperationID, attempt)
-		if err != nil {
-			return owner, false, unavailable()
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if owner.Attempt < attempt {
+			renewed, err := tx.Platform().Owners().Renew(ctx, owner.EnvironmentID, owner.OperationID, attempt)
+			if err != nil {
+				return unavailable(err)
+			}
+			if !renewed {
+				return errNotOwned
+			}
+			owner.Attempt = attempt
 		}
-		if tag.RowsAffected() == 0 {
+		// Repair or reassert the deployment's frozen predecessor from the owner
+		// before any effects. A crash between owner creation and the old separate
+		// binding left stale previous pointers; renewal closes that gap atomically.
+		return bindDeploymentPredecessor(ctx, tx, dep, owner)
+	})
+	if err != nil {
+		if errors.Is(err, errNotOwned) {
 			return owner, false, errNotOwned
 		}
-		owner.Attempt = attempt
-	}
-	// Repair or reassert the deployment's frozen predecessor from the owner
-	// before any effects. A crash between owner creation and the old separate
-	// binding left stale previous pointers; renewal closes that gap atomically.
-	if err := bindDeploymentPredecessor(ctx, tx, dep, owner); err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return owner, false, unavailable(err)
+		}
 		return owner, false, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return owner, false, unavailable()
 	}
 	return owner, true, nil
 }
@@ -227,76 +221,55 @@ func frozenPredecessor(dep platform.Deployment, env platform.Environment, routeC
 // setDeploymentOwnerRoute changes the exclusive route intent. A stale attempt
 // gets errNotOwned and must not touch the route or candidates.
 func (s *Service) setDeploymentOwnerRoute(ctx context.Context, owner deploymentOwner, target platform.DeploymentID, phase deploymentOwnerPhase, attempt uint32) (deploymentOwner, error) {
-	updated, err := scanDeploymentOwner(s.pool.QueryRow(ctx, `UPDATE eregion_platform_deployment_owners o
-        SET route_target_deployment_id=$3,phase=$4,owner_attempt=$5,updated_at=clock_timestamp()
-        WHERE o.environment_id=$1 AND o.operation_id=$2 AND o.deployment_id=$6 AND o.owner_attempt <= $5
-        RETURNING `+deploymentOwnerColumns,
-		owner.EnvironmentID, owner.OperationID, nullableDeploymentID(target), string(phase), attempt, owner.DeploymentID),
-		owner.EnvironmentID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	updated, found, err := s.entities.Platform().Owners().SetRoute(ctx,
+		owner.EnvironmentID, owner.OperationID, owner.DeploymentID, target, string(phase), attempt)
+	if err != nil {
+		return owner, unavailable(err)
+	}
+	if !found {
 		return owner, errNotOwned
 	}
-	if err != nil {
-		return owner, unavailable()
-	}
-	return updated, nil
+	return deploymentOwnerFromEntities(updated), nil
 }
 
 // releaseRestoredDeploymentOwnerTx removes an owner after the exact frozen
 // restore target is durable. It must never release a serving-phase owner: only
 // the success finalizer may do that.
-func releaseRestoredDeploymentOwnerTx(ctx context.Context, tx pgx.Tx, operationID contract.OperationID) error {
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_deployment_owners o
-        USING eregion_platform_environments e
-        WHERE o.operation_id=$1 AND o.environment_id=e.id
-          AND o.phase IN ('prepared','restored')
-          AND o.route_target_deployment_id IS NOT DISTINCT FROM o.restore_deployment_id
-          AND e.serving_deployment_id IS NOT DISTINCT FROM o.restore_deployment_id`, operationID); err != nil {
-		return unavailable()
+func releaseRestoredDeploymentOwnerTx(ctx context.Context, tx *entities.StoreTx, operationID contract.OperationID) error {
+	if _, err := tx.Platform().Owners().DeleteRestoredByOperation(ctx, operationID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
 // releaseServedDeploymentOwnerTx is called only by the successful deployment
 // finalizer after the serving pointer and history commit.
-func releaseServedDeploymentOwnerTx(ctx context.Context, tx pgx.Tx, operationID contract.OperationID) error {
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_deployment_owners o
-        USING eregion_platform_environments e
-        WHERE o.operation_id=$1 AND o.environment_id=e.id
-          AND o.phase='serving'
-          AND o.route_target_deployment_id=o.deployment_id
-          AND e.serving_deployment_id=o.deployment_id`, operationID); err != nil {
-		return unavailable()
+func releaseServedDeploymentOwnerTx(ctx context.Context, tx *entities.StoreTx, operationID contract.OperationID) error {
+	if _, err := tx.Platform().Owners().DeleteServedByOperation(ctx, operationID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
+func ownerEntity(owner deploymentOwner) entities.Owner {
+	return entities.Owner{
+		EnvironmentID: owner.EnvironmentID, OperationID: owner.OperationID,
+		DeploymentID: owner.DeploymentID, Attempt: owner.Attempt, Phase: string(owner.Phase),
+		RouteTarget: owner.RouteTarget, RestoreRelease: owner.RestoreReleaseID,
+		RestoreDeployment: owner.RestoreDeploymentID,
+	}
+}
+
 func (s *Service) releaseRestoredDeploymentOwner(ctx context.Context, owner deploymentOwner) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_deployment_owners o
-        USING eregion_platform_environments e
-        WHERE o.environment_id=$1 AND o.operation_id=$2 AND o.owner_attempt=$3
-          AND o.environment_id=e.id
-          AND o.phase IN ('prepared','restored')
-          AND o.route_target_deployment_id IS NOT DISTINCT FROM o.restore_deployment_id
-          AND e.serving_deployment_id IS NOT DISTINCT FROM o.restore_deployment_id`,
-		owner.EnvironmentID, owner.OperationID, owner.Attempt)
-	if err != nil {
-		return unavailable()
+	if _, err := s.entities.Platform().Owners().DeleteRestored(ctx, ownerEntity(owner)); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
 func (s *Service) releaseServedDeploymentOwner(ctx context.Context, owner deploymentOwner) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_deployment_owners o
-        USING eregion_platform_environments e
-        WHERE o.environment_id=$1 AND o.operation_id=$2 AND o.owner_attempt=$3
-          AND o.environment_id=e.id
-          AND o.phase='serving'
-          AND o.route_target_deployment_id=o.deployment_id
-          AND e.serving_deployment_id=o.deployment_id`,
-		owner.EnvironmentID, owner.OperationID, owner.Attempt)
-	if err != nil {
-		return unavailable()
+	if _, err := s.entities.Platform().Owners().DeleteServed(ctx, ownerEntity(owner)); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -304,29 +277,16 @@ func (s *Service) releaseServedDeploymentOwner(ctx context.Context, owner deploy
 // deploymentOwnerRowsToSettle returns owner rows that cannot progress on their
 // own: ambiguous legacy rows and rows whose operation is already terminal.
 func (s *Service) deploymentOwnerRowsToSettle(ctx context.Context) ([]deploymentOwnerRow, error) {
-	rows, err := s.pool.Query(ctx, `SELECT o.environment_id,`+deploymentOwnerColumns+`,a.name,e.name
-        FROM eregion_platform_deployment_owners o
-        JOIN eregion_platform_environments e ON e.id=o.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        LEFT JOIN eregion_operations op ON op.id=o.operation_id
-        WHERE o.phase='ambiguous' OR op.id IS NULL OR op.state NOT IN ('queued','running','cancelling')
-        ORDER BY o.environment_id
-        LIMIT 100`)
+	rows, err := s.entities.Platform().Owners().ListSettleable(ctx)
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	var out []deploymentOwnerRow
-	for rows.Next() {
-		var row deploymentOwnerRow
-		if err := rows.Scan(&row.EnvironmentID, &row.OperationID, &row.DeploymentID, &row.Attempt,
-			&row.Phase, &row.RouteTarget, &row.RestoreReleaseID, &row.RestoreDeploymentID,
-			&row.App, &row.Environment); err != nil {
-			return nil, unavailable()
-		}
-		out = append(out, row)
+	out := make([]deploymentOwnerRow, 0, len(rows))
+	for _, row := range rows {
+		owner := deploymentOwnerFromEntities(row)
+		out = append(out, deploymentOwnerRow{deploymentOwner: owner, App: row.App, Environment: row.Environment})
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // recoverStaleDeploymentOwner is called while the caller already holds the
@@ -336,12 +296,12 @@ func (s *Service) recoverStaleDeploymentOwner(ctx context.Context, owner deploym
 	if owner.Phase == deploymentOwnerAmbiguous || owner.OperationID == "" {
 		return true, s.resolveAmbiguousDeploymentOwner(ctx, owner, env)
 	}
-	op, err := scanOperation(s.pool.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", owner.OperationID))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return true, s.settleTerminalDeploymentOwner(ctx, owner, env, nil)
-	}
+	op, found, err := s.entities.Operations().Get(ctx, owner.OperationID)
 	if err != nil {
-		return false, unavailable()
+		return false, unavailable(err)
+	}
+	if !found {
+		return true, s.settleTerminalDeploymentOwner(ctx, owner, env, nil)
 	}
 	if !op.State.Terminal() {
 		return false, nil
@@ -423,23 +383,26 @@ func isNotFound(err error) bool {
 // owner's instances. Maintenance removes them only after ownership is released
 // and the guards prove they are neither serving nor the current route target.
 func (s *Service) recordDeploymentRestoreServing(ctx context.Context, env platform.Environment, release platform.ReleaseID, deployment platform.DeploymentID) error {
-	tx, err := s.pool.Begin(ctx)
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if err := lockServingPointersTx(ctx, tx, env.ID, release, deployment); err != nil {
+			return err
+		}
+		_, err := tx.Platform().Environments().SetServing(ctx, entities.EnvironmentServing{
+			ID: env.ID, ReleaseID: release, DeploymentID: deployment,
+			HealthState:  platform.HealthUnknown,
+			HealthDetail: "the recorded serving route was restored; restore health was not observed",
+			CheckedAt:    time.Now().UTC(),
+		})
+		if err != nil {
+			return unavailable(fmt.Errorf("record restored serving state: %w", err))
+		}
+		return nil
+	})
 	if err != nil {
-		return unavailable(err)
-	}
-	defer rollback(tx)
-	if err := lockServingPointersTx(ctx, tx, env.ID, release, deployment); err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return unavailable(err)
+		}
 		return err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-        SET serving_release_id=$2,serving_deployment_id=$3,applied_release_id=$2,
-            health_state='unknown',health_detail='the recorded serving route was restored; restore health was not observed',
-            health_checked_at=clock_timestamp(),updated_at=clock_timestamp()
-        WHERE id=$1`, env.ID, nullableReleaseID(release), nullableDeploymentID(deployment)); err != nil {
-		return unavailable(fmt.Errorf("record restored serving state: %w", err))
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return unavailable(err)
 	}
 	return nil
 }
@@ -449,22 +412,19 @@ func (s *Service) recordDeploymentRestoreServing(ctx context.Context, env platfo
 // It reads the authoritative rows under the caller's environment lock instead
 // of trusting an environment snapshot captured before a switch or restore.
 func (s *Service) deploymentCleanupProtected(ctx context.Context, env platform.Environment, deploymentID platform.DeploymentID) (bool, error) {
-	var serving platform.DeploymentID
-	var phase deploymentOwnerPhase
-	var ownerDeployment, routeTarget, restoreTarget platform.DeploymentID
-	var hasOwner bool
-	err := s.pool.QueryRow(ctx, `SELECT coalesce(e.serving_deployment_id,''),
-            coalesce(o.phase,''),coalesce(o.deployment_id,''),coalesce(o.route_target_deployment_id,''),
-            coalesce(o.restore_deployment_id,''),o.environment_id IS NOT NULL
-        FROM eregion_platform_environments e
-        LEFT JOIN eregion_platform_deployment_owners o ON o.environment_id=e.id
-        WHERE e.id=$1`, env.ID).Scan(&serving, &phase, &ownerDeployment, &routeTarget, &restoreTarget, &hasOwner)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, contract.NewFault(contract.NotFound, "environment is missing", "Inspect the environment before retrying cleanup.")
-	}
+	facts, found, err := s.entities.Platform().Owners().CleanupProtected(ctx, env.ID)
 	if err != nil {
 		return false, unavailable(err)
 	}
+	if !found {
+		return false, contract.NewFault(contract.NotFound, "environment is missing", "Inspect the environment before retrying cleanup.")
+	}
+	serving := facts.ServingDeployment
+	phase := deploymentOwnerPhase(facts.OwnerPhase)
+	ownerDeployment := facts.OwnerDeployment
+	routeTarget := facts.RouteTarget
+	restoreTarget := facts.RestoreDeployment
+	hasOwner := facts.HasOwner
 	if deploymentID != "" && deploymentID == serving {
 		return true, nil
 	}
@@ -569,10 +529,7 @@ func (s *Service) recordDeploymentCleanupCandidates(ctx context.Context, env pla
 }
 
 func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner deploymentOwner, env platform.Environment) error {
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_deployment_owners
-        SET route_target_deployment_id=$2,updated_at=clock_timestamp()
-        WHERE environment_id=$1 AND operation_id IS NULL`,
-		env.ID, nullableDeploymentID(owner.RestoreDeploymentID)); err != nil {
+	if _, err := s.entities.Platform().Owners().ResolveAmbiguous(ctx, env.ID, owner.RestoreDeploymentID); err != nil {
 		return unavailable(fmt.Errorf("set ambiguous owner restore target: %w", err))
 	}
 	if err := s.writeRoutesForDeployment(ctx, env, owner.RestoreDeploymentID); err != nil {
@@ -582,13 +539,7 @@ func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner dep
 		return err
 	}
 
-	rows, err := s.pool.Query(ctx, `SELECT o.id,o.attempt,o.state,d.id
-        FROM eregion_operations o
-        JOIN eregion_platform_deployments d ON d.operation_id=o.id
-        WHERE d.environment_id=$1
-          AND o.state IN ('queued','running','cancelling')
-          AND o.kind IN ('platform.deploy','platform.rollback','platform.restart','platform.promote')
-        ORDER BY o.id`, env.ID)
+	rows, err := s.entities.Operations().ListActiveDeploymentsForEnvironment(ctx, env.ID)
 	if err != nil {
 		return unavailable(fmt.Errorf("list ambiguous active deployments: %w", err))
 	}
@@ -598,19 +549,11 @@ func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner dep
 		state      contract.State
 		deployment platform.DeploymentID
 	}
-	var active []activeDeployment
-	for rows.Next() {
-		var item activeDeployment
-		if err := rows.Scan(&item.id, &item.attempt, &item.state, &item.deployment); err != nil {
-			rows.Close()
-			return unavailable(fmt.Errorf("scan ambiguous active deployment: %w", err))
-		}
-		active = append(active, item)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
+	active := make([]activeDeployment, 0, len(rows))
+	for _, item := range rows {
+		active = append(active, activeDeployment{
+			id: item.ID, attempt: item.Attempt, state: item.State, deployment: item.DeploymentID,
+		})
 	}
 	var recordFailures, lookupFailures []error
 	for _, item := range active {
@@ -644,20 +587,15 @@ func (s *Service) resolveAmbiguousDeploymentOwner(ctx context.Context, owner dep
 		}
 	}
 	if len(active) > 0 {
-		var remaining int
-		if err := s.pool.QueryRow(ctx, `SELECT count(*)
-            FROM eregion_operations o JOIN eregion_platform_deployments d ON d.operation_id=o.id
-            WHERE d.environment_id=$1 AND o.state IN ('queued','running','cancelling')
-              AND o.kind IN ('platform.deploy','platform.rollback','platform.restart','platform.promote')`,
-			env.ID).Scan(&remaining); err != nil {
+		remaining, err := s.entities.Operations().CountActiveDeploymentsForEnvironment(ctx, env.ID)
+		if err != nil {
 			return unavailable(fmt.Errorf("count remaining ambiguous deployments: %w", err))
 		}
 		if remaining > 0 {
 			return nil
 		}
 	}
-	if _, err := s.pool.Exec(ctx, `DELETE FROM eregion_platform_deployment_owners
-        WHERE environment_id=$1 AND operation_id IS NULL`, env.ID); err != nil {
+	if _, err := s.entities.Platform().Owners().ClearAmbiguous(ctx, env.ID); err != nil {
 		return unavailable(fmt.Errorf("delete ambiguous owner: %w", err))
 	}
 	return nil
@@ -677,7 +615,7 @@ func (s *Service) reconcileDeploymentOwners(ctx context.Context) error {
 		}
 		env, envErr := s.environment(ctx, row.App, row.Environment)
 		if envErr == nil {
-			owner, has, ownerErr := s.deploymentOwnerByEnvironment(ctx, s.pool, env.ID)
+			owner, has, ownerErr := s.deploymentOwnerByEnvironment(ctx, s.entities.Platform().Owners(), env.ID)
 			if ownerErr != nil {
 				envErr = ownerErr
 			} else if has {

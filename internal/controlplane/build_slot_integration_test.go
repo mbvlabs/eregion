@@ -34,7 +34,11 @@ type scriptedPlatformTransport struct {
 func (*scriptedPlatformTransport) Name() string         { return "scripted" }
 func (*scriptedPlatformTransport) NodeIdentity() string { return "local" }
 
-func (s *scriptedPlatformTransport) Call(_ context.Context, request node.Request, _ func(node.Event)) (node.Response, error) {
+func (s *scriptedPlatformTransport) Call(
+	_ context.Context,
+	request node.Request,
+	_ func(node.Event),
+) (node.Response, error) {
 	key := string(request.Execution.OperationID) + "|" + request.Execution.Step
 	if request.Method == node.MethodStatus {
 		s.mu.Lock()
@@ -42,7 +46,10 @@ func (s *scriptedPlatformTransport) Call(_ context.Context, request node.Request
 		hash := s.hashes[key]
 		s.mu.Unlock()
 		if !done {
-			return node.Response{Status: engine.StatusAbsent, ExecutionID: request.Execution.ExecutionID()}, nil
+			return node.Response{
+				Status:      engine.StatusAbsent,
+				ExecutionID: request.Execution.ExecutionID(),
+			}, nil
 		}
 		return node.Response{
 			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
@@ -94,6 +101,12 @@ func (s *scriptedPlatformTransport) runCount(step string) int {
 	return count
 }
 
+func (s *scriptedPlatformTransport) totalRuns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.runs)
+}
+
 func TestIntegrationEnvironmentBuildNodeIsValidatedAndGated(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
@@ -110,11 +123,22 @@ func TestIntegrationEnvironmentBuildNodeIsValidatedAndGated(t *testing.T) {
 		{"name": "build-1", "roles": []string{platform.RoleBuilder}, "capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks}},
 		{"name": "app-2", "roles": []string{platform.RoleApplication}, "capabilities": []string{platform.CapabilityDocker}},
 	} {
-		if _, err := submit("node-"+node["name"].(string), platform.KindNodeRegister, "platform", node); err != nil {
+		name, _ := node["name"].(string)
+		if _, err := submit(
+			"node-"+name,
+			platform.KindNodeRegister,
+			"platform",
+			node,
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := submit("app", platform.KindAppCreate, "platform", map[string]any{"name": "live"}); err != nil {
+	if _, err := submit(
+		"app",
+		platform.KindAppCreate,
+		"platform",
+		map[string]any{"name": "live"},
+	); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := submit("bad-env", platform.KindEnvironmentCreate, "app/live", map[string]any{
@@ -150,11 +174,41 @@ func TestIntegrationEnvironmentBuildNodeIsValidatedAndGated(t *testing.T) {
 func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	pool, _ := testPool(t, true)
 	transport := &scriptedPlatformTransport{results: map[string]json.RawMessage{
-		deploymentPackStep:       json.RawMessage(`{"reference":"127.0.0.1:5000/live@sha256:` + strings.Repeat("b", 64) + `","image_id":"sha256:` + strings.Repeat("a", 64) + `","commit":"` + buildSlotCommit + `"}`),
-		deploymentImageStep:      json.RawMessage(`{"stdout":"sha256:` + strings.Repeat("a", 64) + `"}`),
-		deploymentReadyImageStep: json.RawMessage(`{"image":"127.0.0.1:5000/live@sha256:` + strings.Repeat("b", 64) + `","image_id":"sha256:` + strings.Repeat("a", 64) + `"}`),
+		deploymentPackStep: json.RawMessage(
+			`{"reference":"127.0.0.1:5000/live@sha256:` + strings.Repeat(
+				"b",
+				64,
+			) + `","image_id":"sha256:` + strings.Repeat(
+				"a",
+				64,
+			) + `","runtime_id":"sha256:` + strings.Repeat(
+				"a",
+				64,
+			) + `","commit":"` + buildSlotCommit + `"}`,
+		),
+		deploymentImageStep: json.RawMessage(
+			`{"stdout":"sha256:` + strings.Repeat("a", 64) + `"}`,
+		),
+		deploymentReadyImageStep: json.RawMessage(
+			`{"image":"127.0.0.1:5000/live@sha256:` + strings.Repeat(
+				"b",
+				64,
+			) + `","image_id":"sha256:` + strings.Repeat(
+				"a",
+				64,
+			) + `"}`,
+		),
 	}}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{Concurrency: 2, TestOnly: true, Transport: transport, RegistryEndpoint: "127.0.0.1:5000"})
+	run, err := New(
+		newTestEntities(t, pool),
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WorkerConfig{
+			Concurrency:      2,
+			TestOnly:         true,
+			Transport:        transport,
+			RegistryEndpoint: "127.0.0.1:5000",
+		},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,19 +220,48 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	s.publicVerify = func(context.Context, platform.Environment, string) error { return nil }
 	startWorkers(t, run)
 	ctx := context.Background()
-	platformAwait(t, s, platformSubmit(t, s, platform.KindNodeRegister, "platform", "build-agent", map[string]any{
-		"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
-		"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
-	}), contract.Succeeded)
-	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "build-app", map[string]any{"name": "live"}), contract.Succeeded)
-	platformAwait(t, s, platformSubmit(t, s, platform.KindEnvironmentCreate, "app/live", "build-env", map[string]any{
-		"name": "production", "node": "local", "container_port": 8080,
-		"source": map[string]any{
-			"url": "https://github.com/acme/app.git", "ref": buildSlotCommit,
-			"builder": "paketobuildpacks/builder-jammy-base",
-		},
-		"domain": "live.example.com", "domain_primary": true,
-	}), contract.Succeeded)
+	platformAwait(
+		t,
+		s,
+		platformSubmit(t, s, platform.KindNodeRegister, "platform", "build-agent", map[string]any{
+			"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder},
+			"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
+		}),
+		contract.Succeeded,
+	)
+	platformAwait(
+		t,
+		s,
+		platformSubmit(
+			t,
+			s,
+			platform.KindAppCreate,
+			"platform",
+			"build-app",
+			map[string]any{"name": "live"},
+		),
+		contract.Succeeded,
+	)
+	platformAwait(
+		t,
+		s,
+		platformSubmit(
+			t,
+			s,
+			platform.KindEnvironmentCreate,
+			"app/live",
+			"build-env",
+			map[string]any{
+				"name": "production", "node": "local", "container_port": 8080,
+				"source": map[string]any{
+					"url": "https://github.com/acme/app.git", "ref": buildSlotCommit,
+					"builder": "paketobuildpacks/builder-jammy-base",
+				},
+				"domain": "live.example.com", "domain_primary": true,
+			},
+		),
+		contract.Succeeded,
+	)
 
 	previousWait, previousPoll := buildSlotWait, buildSlotPoll
 	buildSlotWait, buildSlotPoll = 250*time.Millisecond, 25*time.Millisecond
@@ -198,7 +281,14 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	}
 	// Cleanup runs before the pool is closed, even after a fatal assertion.
 	t.Cleanup(releaseHeld)
-	blocked := platformSubmit(t, s, platform.KindDeploy, "env/live/production", "build-blocked", map[string]any{})
+	blocked := platformSubmit(
+		t,
+		s,
+		platform.KindDeploy,
+		"env/live/production",
+		"build-blocked",
+		map[string]any{},
+	)
 	blocked = platformAwait(t, s, blocked, contract.Failed)
 	if blocked.ErrorCode != contract.PreconditionFailed {
 		t.Fatalf("capacity failure code=%s", blocked.ErrorCode)
@@ -221,13 +311,22 @@ func TestIntegrationReleaseBuildSlotQueuesAndRuns(t *testing.T) {
 	}
 	releaseHeld()
 
-	ready := platformSubmit(t, s, platform.KindDeploy, "env/live/production", "build-ready", map[string]any{})
+	ready := platformSubmit(
+		t,
+		s,
+		platform.KindDeploy,
+		"env/live/production",
+		"build-ready",
+		map[string]any{},
+	)
 	ready = platformAwait(t, s, ready, contract.Succeeded)
 	release, err := s.releaseForOperation(ctx, ready.ID)
-	if err != nil || release.Status != platform.ReleaseReady || !strings.HasPrefix(release.ImageID, "sha256:") {
+	if err != nil || release.Status != platform.ReleaseReady ||
+		!strings.HasPrefix(release.ImageID, "sha256:") {
 		t.Fatalf("release=%+v err=%v", release, err)
 	}
-	if !platform.IsImageDigestReference(release.Image) || !strings.HasPrefix(release.Image, "127.0.0.1:5000/live@sha256:") {
+	if !platform.IsImageDigestReference(release.Image) ||
+		!strings.HasPrefix(release.Image, "127.0.0.1:5000/live@sha256:") {
 		t.Fatalf("release image = %q, want the canonical registry digest reference", release.Image)
 	}
 	if got := transport.runCount(deploymentPackStep); got != 1 {

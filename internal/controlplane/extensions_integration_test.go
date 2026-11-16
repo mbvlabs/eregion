@@ -51,14 +51,15 @@ func startControlPlane(t *testing.T, dsn, keyFile, nodeDir string, workers int) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RegisterExtensions(ExtensionConfig{Pool: pool}); err != nil {
+	store := newTestEntities(t, pool)
+	if _, err := RegisterExtensions(ExtensionConfig{Entities: store}); err != nil {
 		t.Fatal(err)
 	}
-	vaultService, err := NewVaultService(pool, keyFile)
+	vaultService, err := NewVaultService(store, keyFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: workers, TestOnly: true, NodeStateDir: nodeDir, LocalNodeName: "local",
 		SecretResolver: vault.NewEnvironmentResolver(vaultService), RegistryEndpoint: "127.0.0.1:5000",
 	})

@@ -41,27 +41,15 @@ const domainObservationPageSize = 100
 func (s *Service) observeDomains(ctx context.Context) error {
 	return walkDomainObservationPages(ctx, domainObservationPageSize,
 		func(ctx context.Context, after string, limit int) ([]domainObservation, error) {
-			rows, err := s.pool.Query(ctx, `SELECT d.name,d.expected_addresses,
-                coalesce(NULLIF(d.check_path,''), NULLIF(r.runtime->>'health_path',''), e.health_path, '/')
-                FROM eregion_platform_domains d
-                JOIN eregion_platform_environments e ON e.id=d.environment_id
-                LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id
-                WHERE d.name > $1
-                ORDER BY d.name LIMIT $2`, after, limit)
+			rows, err := s.entities.Platform().Domains().ObservationTargets(ctx, after, limit)
 			if err != nil {
-				return nil, unavailable()
+				return nil, unavailable(err)
 			}
-			defer rows.Close()
-			var domains []domainObservation
-			for rows.Next() {
-				var domain domainObservation
-				if err := rows.Scan(&domain.name, &domain.expected, &domain.healthPath); err != nil {
-					return nil, unavailable()
-				}
-				domains = append(domains, domain)
-			}
-			if err := rows.Err(); err != nil {
-				return nil, unavailable()
+			domains := make([]domainObservation, 0, len(rows))
+			for _, row := range rows {
+				domains = append(domains, domainObservation{
+					name: row.Domain, expected: row.ExpectedAddresses, healthPath: row.CheckPath,
+				})
 			}
 			return domains, nil
 		},
@@ -156,20 +144,15 @@ func (s *Service) observeDomain(ctx context.Context, domain domainObservation) e
 	if err := validateDomainObservationWrite(dnsState, certificateState, publicState, publicStatus); err != nil {
 		return err
 	}
-	var statusArg any
-	if publicStatus != 0 {
-		statusArg = publicStatus
-	}
-	_, err := s.pool.Exec(ctx, `UPDATE eregion_platform_domains
-        SET dns_state=$2,dns_addresses=$3,dns_error=$4,dns_observed_at=$5,
-            certificate_state=$6,certificate_not_after=$7,certificate_error=$8,certificate_observed_at=$9,
-            public_state=$10,public_status=$11,public_error=$12,public_observed_at=$13,
-            observed_at=$14
-        WHERE name=$1`, domain.name, dnsState, dnsAddresses, boundedRouteError(dnsError), now,
-		certificateState, certificateNotAfter, boundedRouteError(certificateError), certificateObservedAt,
-		publicState, statusArg, boundedRouteError(publicError), publicObservedAt, now)
+	_, err := s.entities.Platform().Domains().RecordObservation(ctx, domain.name, platform.DomainBinding{
+		DNSState: dnsState, DNSAddresses: dnsAddresses, DNSError: boundedRouteError(dnsError), DNSObservedAt: &now,
+		CertificateState: certificateState, CertificateNotAfter: certificateNotAfter,
+		CertificateError: boundedRouteError(certificateError), CertificateObservedAt: certificateObservedAt,
+		PublicState: publicState, PublicStatus: publicStatus, PublicError: boundedRouteError(publicError),
+		PublicObservedAt: publicObservedAt, ObservedAt: &now,
+	})
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
 	return nil
 }

@@ -62,14 +62,15 @@ func (i RegistryHostIdentity) Equal(other RegistryHostIdentity) bool {
 		i.StateDir == other.StateDir
 }
 
-// VerifyWorkspaceRegistryHost reads the singleton binding and requires the
-// observed local public identity to match it exactly. Missing bindings and
-// mismatches fail closed; there is no name-only or role/default fallback.
-func VerifyWorkspaceRegistryHost(ctx context.Context, pool workspaceQuerier, observed RegistryHostIdentity) (RegistryHostIdentity, error) {
+// VerifyWorkspaceRegistryHost reads the singleton binding through the typed
+// workspace view and requires the observed local public identity to match it
+// exactly. Missing bindings and mismatches fail closed; there is no name-only or
+// role/default fallback.
+func VerifyWorkspaceRegistryHost(ctx context.Context, reader workspaceReader, observed RegistryHostIdentity) (RegistryHostIdentity, error) {
 	if err := observed.Validate(); err != nil {
 		return RegistryHostIdentity{}, err
 	}
-	identity, err := readWorkspaceSchema(ctx, pool)
+	identity, err := readWorkspaceSchema(ctx, reader)
 	if err != nil {
 		return RegistryHostIdentity{}, err
 	}

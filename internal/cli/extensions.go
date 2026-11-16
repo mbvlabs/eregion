@@ -8,10 +8,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -34,6 +34,7 @@ var serveExtensionEnvironment = []string{
 
 // extensionRuntime is what the shared startup built for the extensions.
 type extensionRuntime struct {
+	Entities   *entities.Store
 	Vault      *vault.Service
 	Extensions *controlplane.Extensions
 	DomainDNS  *integrations.DomainDNS
@@ -48,16 +49,17 @@ type extensionRuntime struct {
 // with an instruction instead of silently deploying without them. A process
 // without workers (executes false) registers the actions for validation but never
 // touches Docker, so an API-only host needs no container runtime.
-func (a *app) startExtensions(pool *pgxpool.Pool) (extensionRuntime, *vault.EnvironmentResolver, error) {
+func (a *app) startExtensions(store *entities.Store) (extensionRuntime, *vault.EnvironmentResolver, error) {
 	var parts extensionRuntime
+	parts.Entities = store
 	if path := os.Getenv("EREGION_VAULT_KEY_FILE"); path != "" {
-		service, err := controlplane.NewVaultService(pool, path)
+		service, err := controlplane.NewVaultService(store, path)
 		if err != nil {
 			return parts, nil, err
 		}
 		parts.Vault = service
 	}
-	config := controlplane.ExtensionConfig{Pool: pool}
+	config := controlplane.ExtensionConfig{Entities: store}
 	config.AccessAdmins = splitList(os.Getenv("EREGION_ACCESS_ADMINS"))
 	config.DNSAdmins = splitList(os.Getenv("EREGION_DNS_ADMINS"))
 	var credentials *controlplane.CloudflareCredentialStore
@@ -73,9 +75,9 @@ func (a *app) startExtensions(pool *pgxpool.Pool) (extensionRuntime, *vault.Envi
 	parts.Extensions = extensions
 	parts.DomainDNS = extensions.DomainDNS
 	if parts.Vault != nil {
-		parts.Cloudflare = controlplane.NewCloudflareSetup(parts.Vault, config.CloudflareBaseURL, config.CloudflareClient)
+		parts.Cloudflare = controlplane.NewCloudflareSetup(parts.Vault, store, config.CloudflareBaseURL, config.CloudflareClient)
 	}
-	parts.Webhooks = controlplane.NewPushWebhookResolver(pool, parts.Vault)
+	parts.Webhooks = controlplane.NewPushWebhookResolver(store, parts.Vault)
 	return parts, vault.NewEnvironmentResolver(parts.Vault), nil
 }
 

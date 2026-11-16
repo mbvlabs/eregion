@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -19,7 +20,7 @@ import (
 // serving pointer, or remove a first deploy's site, during that interval.
 func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *testing.T) {
 	pool, _ := testPool(t, true)
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 2, TestOnly: true, Transport: newScriptedDeployTransport(), NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -41,7 +42,7 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 		if err != nil {
 			return err
 		}
-		selected, err := routeInstancesForTest(ctx, s, "route.example.com")
+		selected, err := routeInstancesForTest(ctx, newTestEntities(t, pool), "route.example.com")
 		if err != nil {
 			return err
 		}
@@ -82,9 +83,9 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 		"name": "production", "node": "local", "container_port": 80, "health": map[string]any{"timeout_seconds": 2},
 		"domain": "route.example.com", "domain_primary": true,
 	}), contract.Succeeded)
-	release := seedArtifactRelease(t, s, "route", "production", "registry.example/route:v1").ID
+	release := seedArtifactRelease(t, pool, s, "route", "production", "registry.example/route:v1").ID
 	platformAwait(t, s, platformSubmit(t, s, platform.KindDeploy, "env/route/production", "route-first", map[string]any{"release_id": release}), contract.Succeeded)
-	previous, err := routeInstancesForTest(ctx, s, "route.example.com")
+	previous, err := routeInstancesForTest(ctx, newTestEntities(t, pool), "route.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,7 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 	}
 	failPublic.Store(true)
 	platformAwait(t, s, platformSubmit(t, s, platform.KindDeploy, "env/route/production", "route-failed", map[string]any{"release_id": release}), contract.Failed)
-	restored, err := routeInstancesForTest(ctx, s, "route.example.com")
+	restored, err := routeInstancesForTest(ctx, newTestEntities(t, pool), "route.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,24 +106,17 @@ func TestIntegrationRouteWritersPreserveCandidateUntilPublicVerification(t *test
 	}
 }
 
-func routeInstancesForTest(ctx context.Context, s *Service, domain string) ([]platform.DeploymentInstance, error) {
-	rows, err := s.pool.Query(ctx, desiredRoutesQuery)
+func routeInstancesForTest(ctx context.Context, store *entities.Store, domain string) ([]platform.DeploymentInstance, error) {
+	targets, err := store.Platform().Domains().RouteTargets(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var name, environment string
-		var primary bool
-		var raw []byte
-		if err := rows.Scan(&name, &environment, &primary, &raw); err != nil {
-			return nil, err
-		}
-		if name == domain {
+	for _, target := range targets {
+		if target.Domain == domain {
 			var instances []platform.DeploymentInstance
-			err := json.Unmarshal(raw, &instances)
+			err := json.Unmarshal(target.Instances, &instances)
 			return instances, err
 		}
 	}
-	return nil, rows.Err()
+	return nil, nil
 }

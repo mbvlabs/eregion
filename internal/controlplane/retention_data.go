@@ -3,12 +3,10 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
@@ -91,19 +89,14 @@ func retentionEnvironmentSources(override retention.Override) map[string]string 
 }
 
 func (s *Service) environmentRetentionOverride(ctx context.Context, app, environment string) (retention.Override, error) {
-	var raw []byte
-	err := s.pool.QueryRow(ctx, `SELECT coalesce(r.retention,'{}'::jsonb)
-        FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id
-        WHERE a.name=$1 AND e.name=$2`, app, environment).Scan(&raw)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return retention.Override{}, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
-	}
+	override := retention.Override{}
+	raw, found, err := s.entities.Platform().Environments().RetentionOverride(ctx, app, environment)
 	if err != nil {
 		return retention.Override{}, unavailable(err)
 	}
-	override := retention.Override{}
+	if !found {
+		return retention.Override{}, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
+	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &override); err != nil {
 			return retention.Override{}, unavailable(err)
@@ -229,26 +222,18 @@ func (s *Service) retentionEnvironmentRows(ctx context.Context, nodeName string)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.pool.Query(ctx, `SELECT e.id,a.name,e.name,e.node_name,
-        coalesce(e.serving_release_id,''),coalesce(e.serving_deployment_id,''),coalesce(r.retention,'{}'::jsonb)
-        FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id
-        WHERE $1='' OR e.node_name=$1
-        ORDER BY a.name,e.name`, nodeName)
+	rows, err := s.entities.Platform().Environments().RetentionRows(ctx, nodeName)
 	if err != nil {
 		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	var environments []retentionEnvironmentRow
-	for rows.Next() {
-		var item retentionEnvironmentRow
-		var raw []byte
-		if err := rows.Scan(&item.ID, &item.App, &item.Name, &item.Node, &item.ServingRelease, &item.ServingDeploy, &raw); err != nil {
-			return nil, unavailable(err)
+	environments := make([]retentionEnvironmentRow, 0, len(rows))
+	for _, row := range rows {
+		item := retentionEnvironmentRow{
+			ID: row.ID, App: row.App, Name: row.Name, Node: row.Node,
+			ServingRelease: string(row.ServingRelease), ServingDeploy: string(row.ServingDeploy),
 		}
-		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &item.Override); err != nil {
+		if len(row.Retention) > 0 {
+			if err := json.Unmarshal(row.Retention, &item.Override); err != nil {
 				return nil, unavailable(err)
 			}
 		}
@@ -259,7 +244,7 @@ func (s *Service) retentionEnvironmentRows(ctx context.Context, nodeName string)
 		item.Policy = policy
 		environments = append(environments, item)
 	}
-	return environments, rows.Err()
+	return environments, nil
 }
 
 // loadRetentionInput reads the platform rows and the node inventory, then maps
@@ -295,43 +280,26 @@ func (s *Service) retentionPlatformState(ctx context.Context, nodeName string, e
 		})
 	}
 
-	releases, err := s.pool.Query(ctx, `SELECT r.id,a.name,e.name,r.image,coalesce(r.image_id,''),r.status,r.created_at,r.pruned_at
-        FROM eregion_platform_releases r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE $1='' OR e.node_name=$1
-        ORDER BY r.created_at,r.id`, nodeName)
+	releaseRows, err := s.entities.Platform().Releases().RetentionRows(ctx, nodeName)
 	if err != nil {
 		return state, unavailable(err)
 	}
-	for releases.Next() {
-		var item retention.Release
-		if err := releases.Scan(&item.ID, &item.App, &item.Environment, &item.Image, &item.ImageID, &item.Status, &item.CreatedAt, &item.PrunedAt); err != nil {
-			releases.Close()
-			return state, unavailable(err)
-		}
-		state.Releases = append(state.Releases, item)
-	}
-	err = releases.Err()
-	releases.Close()
-	if err != nil {
-		return state, err
+	for _, row := range releaseRows {
+		state.Releases = append(state.Releases, retention.Release{
+			ID: string(row.ID), App: row.App, Environment: row.Environment, Image: row.Image,
+			ImageID: row.ImageID, Status: string(row.Status), CreatedAt: row.CreatedAt, PrunedAt: row.PrunedAt,
+		})
 	}
 
-	deployments, err := s.pool.Query(ctx, `SELECT d.id,a.name,e.name,coalesce(d.release_id,''),coalesce(d.previous_release_id,''),d.state,d.created_at,d.completed_at
-        FROM eregion_platform_deployments d
-        JOIN eregion_platform_apps a ON a.id=d.app_id
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        WHERE ($1='' OR e.node_name=$1) AND d.state IN ('succeeded','pending','running')
-        ORDER BY d.created_at,d.id`, nodeName)
+	deploymentRows, err := s.entities.Platform().Deployments().RetentionRows(ctx, nodeName)
 	if err != nil {
 		return state, unavailable(err)
 	}
-	for deployments.Next() {
-		var item retention.Deployment
-		if err := deployments.Scan(&item.ID, &item.App, &item.Environment, &item.Release, &item.PreviousRelease, &item.State, &item.CreatedAt, &item.CompletedAt); err != nil {
-			deployments.Close()
-			return state, unavailable(err)
+	for _, row := range deploymentRows {
+		item := retention.Deployment{
+			ID: string(row.ID), App: row.App, Environment: row.Environment, Release: string(row.ReleaseID),
+			PreviousRelease: string(row.PreviousReleaseID), State: string(row.State),
+			CreatedAt: row.CreatedAt, CompletedAt: row.CompletedAt,
 		}
 		state.Deployments = append(state.Deployments, item)
 		if item.State == "pending" || item.State == "running" {
@@ -344,33 +312,16 @@ func (s *Service) retentionPlatformState(ctx context.Context, nodeName string, e
 			}
 		}
 	}
-	err = deployments.Err()
-	deployments.Close()
-	if err != nil {
-		return state, err
-	}
 
-	active, err := s.pool.Query(ctx, `SELECT r.id
-        FROM eregion_platform_releases r
-        JOIN eregion_operations o ON o.id=r.operation_id
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE ($1='' OR e.node_name=$1) AND o.state IN ('queued','running','cancelling')`, nodeName)
+	active, err := s.entities.Platform().Releases().ActiveForNode(ctx, nodeName)
 	if err != nil {
 		return state, unavailable(err)
 	}
-	for active.Next() {
-		var releaseID string
-		if err := active.Scan(&releaseID); err != nil {
-			active.Close()
-			return state, unavailable(err)
-		}
-		state.InFlight.Releases = append(state.InFlight.Releases, releaseID)
+	for _, releaseID := range active {
+		state.InFlight.Releases = append(state.InFlight.Releases, string(releaseID))
 	}
-	err = active.Err()
-	active.Close()
-	return state, err
+	return state, nil
 }
-
 func (s *Service) retentionInventory(ctx context.Context, nodeName string) (retention.Inventory, error) {
 	if s.resolver == nil {
 		return retention.Inventory{}, contract.NewFault(contract.Unavailable, "the worker has no node resolver", "Run retention in a worker configured with node transports.")

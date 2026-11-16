@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -71,7 +72,7 @@ func (t *unknownStatusTransport) callCount() int {
 // placement lookup and node-name resolution still run.
 func newTestNodeResolver(t *testing.T, pool *pgxpool.Pool, transports map[string]node.Transport) *NodeResolver {
 	t.Helper()
-	resolver := &NodeResolver{pool: pool, cache: map[string]*cachedTransport{}}
+	resolver := &NodeResolver{nodes: newTestEntities(t, pool).Nodes(), cache: map[string]*cachedTransport{}}
 	for name, transport := range transports {
 		if err := insertFixtureNode(context.Background(), pool, name, []string{"application"}, []string{"docker"}, ""); err != nil {
 			t.Fatal(err)
@@ -81,7 +82,7 @@ func newTestNodeResolver(t *testing.T, pool *pgxpool.Pool, transports map[string
             WHERE name=$1`, name); err != nil {
 			t.Fatal(err)
 		}
-		rec, err := loadNodeConn(context.Background(), pool, name)
+		rec, err := loadNodeConn(context.Background(), newTestEntities(t, pool).Nodes(), name)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,17 +108,14 @@ func appendEnvironmentNodeRevision(t *testing.T, fixture *deploymentRetryFixture
 	}
 	state := platform.CloneRevisionState(env.Revision.RevisionState)
 	state.Runtime.Node = node
-	tx, err := fixture.pool.Begin(fixture.ctx)
+	var revisionID platform.RevisionID
+	err = fixture.service.entities.WithinTx(fixture.ctx, func(tx *entities.StoreTx) error {
+		var err error
+		revisionID, err = publishEnvironmentRevisionTx(fixture.ctx, tx, env, "", testActor,
+			"environment.updated", "move environment to "+node, state, nil)
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(tx)
-	revisionID, err := publishEnvironmentRevisionTx(fixture.ctx, tx, env, "", testActor,
-		"environment.updated", "move environment to "+node, state, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(fixture.ctx); err != nil {
 		t.Fatal(err)
 	}
 	return revisionID
@@ -423,7 +421,7 @@ func (t *cancelLostPackTransport) Call(ctx context.Context, request node.Request
 func newBuildCancellationFixture(t *testing.T, transport node.Transport) (*Service, *pgxpool.Pool, contract.Operation) {
 	t.Helper()
 	pool, _ := testPool(t, true)
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: transport, NodeStateDir: t.TempDir(), LocalNodeName: "local",
 		RegistryEndpoint: "127.0.0.1:5000",
 	})

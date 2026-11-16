@@ -8,51 +8,12 @@ import (
 	"errors"
 	"sort"
 	"strings"
-	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
-
-const resourceColumns = `r.id,a.name,e.name,r.name,r.node_name,r.spec,r.state,r.image,r.image_id,r.image_digest,
-    r.container_name,r.network_name,r.volumes,r.health_state,r.health_detail,r.health_checked_at,
-    coalesce(r.operation_id,''),r.error_code,r.error,r.created_at,r.updated_at,r.destroyed_at`
-
-func scanResourceRow(row pgx.Row) (platform.Resource, error) {
-	var resource platform.Resource
-	var rawSpec, rawVolumes []byte
-	var state, health string
-	var operationID, errorCode string
-	var destroyedAt *time.Time
-	err := row.Scan(&resource.ID, &resource.App, &resource.Environment, &resource.Name, &resource.Node,
-		&rawSpec, &state, &resource.Image, &resource.ImageID, &resource.ImageDigest, &resource.ContainerName,
-		&resource.NetworkName, &rawVolumes, &health, &resource.HealthDetail, &resource.HealthChecked,
-		&operationID, &errorCode, &resource.Error, &resource.CreatedAt, &resource.UpdatedAt, &destroyedAt)
-	if err != nil {
-		return resource, err
-	}
-	resource.State = platform.ResourceState(state)
-	resource.HealthState = platform.HealthState(health)
-	resource.OperationID = contract.OperationID(operationID)
-	resource.ErrorCode = contract.Code(errorCode)
-	resource.DestroyedAt = destroyedAt
-	if len(rawSpec) > 0 {
-		if err := json.Unmarshal(rawSpec, &resource.Spec); err != nil {
-			return resource, err
-		}
-	}
-	if len(rawVolumes) > 0 {
-		if err := json.Unmarshal(rawVolumes, &resource.Volumes); err != nil {
-			return resource, err
-		}
-	}
-	if err := validateStoredResource(resource); err != nil {
-		return resource, err
-	}
-	return resource, nil
-}
 
 func validateStoredResource(resource platform.Resource) error {
 	if !resource.State.Valid() || (resource.HealthState != platform.HealthUnknown && resource.HealthState != platform.HealthHealthy && resource.HealthState != platform.HealthUnhealthy) || resource.ID.Validate() != nil || resource.Volumes == nil {
@@ -78,41 +39,35 @@ func validateStoredResource(resource platform.Resource) error {
 	return nil
 }
 
-func resourceByNameTx(ctx context.Context, tx pgx.Tx, app, environment, name string, lock bool) (platform.Resource, error) {
-	statement := `SELECT ` + resourceColumns + `
-        FROM eregion_platform_resources r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE a.name=$1 AND e.name=$2 AND r.name=$3`
-	if lock {
-		statement += ` FOR UPDATE OF r`
+func resourceByNameTx(ctx context.Context, tx *entities.StoreTx, app, environment, name string, lock bool) (platform.Resource, error) {
+	resource, found, err := tx.Resources().GetByName(ctx, app, environment, name, lock)
+	if err != nil {
+		return resource, unavailable(err)
 	}
-	resource, err := scanResourceRow(tx.QueryRow(ctx, statement, app, environment, name))
-	if errors.Is(err, pgx.ErrNoRows) {
+	if !found {
 		return resource, contract.NewFault(contract.NotFound, "resource not found", "Apply the resource declaration first; inventory lists resource identities.")
 	}
-	if err != nil {
-		return resource, unavailable()
+	if err := validateStoredResource(resource); err != nil {
+		return resource, err
 	}
 	return resource, nil
 }
 
 func (s *Service) resourceByName(ctx context.Context, app, environment, name string) (platform.Resource, error) {
-	resource, err := scanResourceRow(s.pool.QueryRow(ctx, `SELECT `+resourceColumns+`
-        FROM eregion_platform_resources r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE a.name=$1 AND e.name=$2 AND r.name=$3`, app, environment, name))
-	if errors.Is(err, pgx.ErrNoRows) {
+	resource, found, err := s.entities.Resources().GetByName(ctx, app, environment, name, false)
+	if err != nil {
+		return resource, unavailable(err)
+	}
+	if !found {
 		return resource, contract.NewFault(contract.NotFound, "resource not found", "Apply the resource declaration first; inventory lists resource identities.")
 	}
-	if err != nil {
-		return resource, unavailable()
+	if err := validateStoredResource(resource); err != nil {
+		return resource, err
 	}
 	return resource, nil
 }
 
-func (s *Service) prepareResourceApply(ctx context.Context, tx pgx.Tx, id contract.OperationID, input *platform.ResourceApplyInput) error {
+func (s *Service) prepareResourceApply(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, input *platform.ResourceApplyInput) error {
 	env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 	if err != nil {
 		return err
@@ -146,7 +101,7 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx pgx.Tx, id contra
 			if err != nil {
 				return err
 			}
-			metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx, namespace)
+			metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx.Secrets(), namespace)
 			if err != nil {
 				if contract.Classify(err).Code == contract.NotFound {
 					missing = append(missing, name)
@@ -168,10 +123,6 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx pgx.Tx, id contra
 	if err != nil {
 		return err
 	}
-	raw, err := json.Marshal(input.ResourceSpec)
-	if err != nil {
-		return unavailable()
-	}
 	if found {
 		if existing.Node != env.Node {
 			return contract.NewFault(contract.PreconditionFailed, "resource is bound to node "+existing.Node, "A resource with persistent volumes is never moved implicitly. Destroy it on "+existing.Node+" first; data volumes stay there, and a new resource identity must be declared for another node.")
@@ -179,12 +130,10 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx pgx.Tx, id contra
 		if existing.State == platform.ResourceProvisioning || existing.State == platform.ResourceDestroying {
 			return contract.NewFault(contract.Conflict, "resource is already changing", "Wait for the active resource operation to finish or cancel it explicitly.")
 		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
-            SET node_name=$2, spec=$3, image=$4, state='pending', operation_id=$5,
-                health_state='unknown', health_detail='', health_checked_at=NULL,
-                error_code='', error='', destroyed_at=NULL, updated_at=clock_timestamp()
-            WHERE id=$1`, existing.ID, env.Node, raw, input.Image, id); err != nil {
-			return unavailable()
+		if _, err := tx.Resources().ResetForApply(ctx, entities.ResourceReset{
+			ID: existing.ID, Node: env.Node, Spec: input.ResourceSpec, Image: input.Image, OperationID: id,
+		}); err != nil {
+			return unavailable(err)
 		}
 		return nil
 	}
@@ -192,16 +141,16 @@ func (s *Service) prepareResourceApply(ctx context.Context, tx pgx.Tx, id contra
 	if err != nil {
 		return unavailable()
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_resources
-        (id,app_id,environment_id,name,node_name,spec,state,image,operation_id,image_id,image_digest,container_name,network_name,volumes,health_state,health_detail,error_code,error,created_at,updated_at)
-        VALUES($1,$2,$3,$4,$5,$6,'pending',$7,$8,'','','','','[]'::jsonb,'unknown','','','',clock_timestamp(),clock_timestamp())`,
-		resourceID, envAppID(ctx, tx, input.App), env.ID, input.Name, env.Node, raw, input.Image, id); err != nil {
+	if _, err := tx.Resources().Insert(ctx, entities.ResourceInsert{
+		ID: resourceID, AppID: envAppID(ctx, tx, input.App), EnvironmentID: env.ID,
+		Name: input.Name, Node: env.Node, Spec: input.ResourceSpec, Image: input.Image, OperationID: id,
+	}); err != nil {
 		return platformWriteError(err, "resource name already exists in this environment")
 	}
 	return nil
 }
 
-func (s *Service) prepareResourceDestroy(ctx context.Context, tx pgx.Tx, id contract.OperationID, input *platform.ResourceDestroyInput) error {
+func (s *Service) prepareResourceDestroy(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, input *platform.ResourceDestroyInput) error {
 	env, err := environmentByNameTx(ctx, tx, input.App, input.Environment)
 	if err != nil {
 		return err
@@ -219,7 +168,7 @@ func (s *Service) prepareResourceDestroy(ctx context.Context, tx pgx.Tx, id cont
 	if resource.State == platform.ResourceProvisioning {
 		return contract.NewFault(contract.Conflict, "resource is still provisioning", "Wait for the apply to finish before destroying the resource.")
 	}
-	if err := resourceDestroyBlocked(ctx, tx, env, input.Name); err != nil {
+	if err := resourceDestroyBlocked(ctx, tx.Platform().Environments(), tx.Platform().Revisions(), tx.Platform().Deployments(), env, input.Name); err != nil {
 		return err
 	}
 	if err := ensureNoActiveParentDeleteTx(ctx, tx, id, input.App, input.Environment); err != nil {
@@ -228,17 +177,15 @@ func (s *Service) prepareResourceDestroy(ctx context.Context, tx pgx.Tx, id cont
 	if err := ensureNoActiveResourceOperationTx(ctx, tx, id, input.Target().String()); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
-        SET state='destroying', operation_id=$2, error_code='', error='', updated_at=clock_timestamp()
-        WHERE id=$1`, resource.ID, id); err != nil {
-		return unavailable()
+	if _, err := tx.Resources().MarkDestroying(ctx, resource.ID, id); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
 // resourceByNameTxOptional distinguishes an absent declaration from a database
 // failure during apply, where the first declaration has no row yet.
-func resourceByNameTxOptional(ctx context.Context, tx pgx.Tx, app, environment, name string) (platform.Resource, bool, error) {
+func resourceByNameTxOptional(ctx context.Context, tx *entities.StoreTx, app, environment, name string) (platform.Resource, bool, error) {
 	resource, err := resourceByNameTx(ctx, tx, app, environment, name, true)
 	if err == nil {
 		return resource, true, nil
@@ -249,41 +196,29 @@ func resourceByNameTxOptional(ctx context.Context, tx pgx.Tx, app, environment, 
 	return platform.Resource{}, false, err
 }
 
-// resourceStateQueryer is the read surface shared by a submission transaction
-// and the worker's pooled checks.
-type resourceStateQueryer interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-	QueryRow(context.Context, string, ...any) pgx.Row
-}
-
 // resourceInUse reports whether the current revision or the serving deployment
 // still attaches the named resource. The caller must hold the environment row
 // lock (submission) or the environment target lock (worker), so a revision or
 // serving switch cannot pass between this read and the action it guards.
-func resourceInUse(ctx context.Context, q resourceStateQueryer, app, environment, name string) (bool, string, error) {
-	var currentRevision, servingRevision string
-	err := q.QueryRow(ctx, `SELECT coalesce(e.current_revision_id,''), coalesce(d.revision_id,'')
-        FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        LEFT JOIN eregion_platform_deployments d ON d.id=e.serving_deployment_id
-        WHERE a.name=$1 AND e.name=$2`, app, environment).Scan(&currentRevision, &servingRevision)
-	if errors.Is(err, pgx.ErrNoRows) {
+func resourceInUse(ctx context.Context, environments *entities.EnvironmentStore, revisions *entities.RevisionStore, app, environment, name string) (bool, string, error) {
+	pointers, found, err := environments.RevisionPointers(ctx, app, environment)
+	if err != nil {
+		return false, "", unavailable(err)
+	}
+	if !found {
 		return false, "", contract.NewFault(contract.NotFound, "environment not found", "The resource's environment no longer exists.")
 	}
-	if err != nil {
-		return false, "", unavailable()
-	}
-	for _, revision := range []string{currentRevision, servingRevision} {
+	for _, revision := range []platform.RevisionID{pointers.Current, pointers.Serving} {
 		if revision == "" {
 			continue
 		}
-		var attached bool
-		if err := q.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_platform_environment_revisions WHERE id=$1 AND $2=ANY(resources))`, revision, name).Scan(&attached); err != nil {
-			return false, "", unavailable()
+		attached, err := revisions.UsesResource(ctx, revision, name)
+		if err != nil {
+			return false, "", unavailable(err)
 		}
 		if attached {
 			detail := "Detach the resource from the current environment revision and deploy the detached revision, or stop the environment, before destroying it; its container and volumes are not touched by detach."
-			if revision != currentRevision {
+			if revision != pointers.Current {
 				detail = "The serving deployment still uses a revision that references this resource. Deploy a revision without it (or stop the environment) before destroying the resource."
 			}
 			return true, detail, nil
@@ -323,29 +258,19 @@ func (d resourceDeploymentDependency) UsesResource(name string) bool {
 // start, use or switch away from the named resource. It includes the previous
 // deployment's revision because D17 keeps the old release serving until the
 // switch completes; destroying a dependency during that window is a race.
-func resourceDeploymentInUse(ctx context.Context, q resourceStateQueryer, environmentID platform.EnvironmentID, name string) (bool, error) {
-	rows, err := q.Query(ctx, `SELECT coalesce(r.id,''),
-            coalesce(r.resources,'{}'::text[]), coalesce(pr.resources,'{}'::text[])
-        FROM eregion_platform_deployments d
-        LEFT JOIN eregion_platform_environment_revisions r ON r.id=d.revision_id
-        LEFT JOIN eregion_platform_deployments p ON p.id=d.previous_deployment_id
-        LEFT JOIN eregion_platform_environment_revisions pr ON pr.id=p.revision_id
-        WHERE d.environment_id=$1 AND d.state IN ('pending','running')`, environmentID)
+func resourceDeploymentInUse(ctx context.Context, deployments *entities.DeploymentStore, environmentID platform.EnvironmentID, name string) (bool, error) {
+	dependencies, err := deployments.ResourceDependencies(ctx, environmentID)
 	if err != nil {
-		return false, unavailable()
+		return false, unavailable(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var dependency resourceDeploymentDependency
-		if err := rows.Scan(&dependency.RevisionID, &dependency.Resources, &dependency.PreviousResources); err != nil {
-			return false, unavailable()
+	for _, dependency := range dependencies {
+		mapped := resourceDeploymentDependency{
+			RevisionID: string(dependency.RevisionID), Resources: dependency.Resources,
+			PreviousResources: dependency.PreviousResources,
 		}
-		if dependency.UsesResource(name) {
+		if mapped.UsesResource(name) {
 			return true, nil
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, unavailable()
 	}
 	return false, nil
 }
@@ -355,13 +280,13 @@ func resourceDeploymentInUse(ctx context.Context, q resourceStateQueryer, enviro
 // environment target lock. Together with the resource lifecycle lock this
 // prevents a destroy from racing a deployment switch or removing a dependency
 // that a queued/running deployment still expects.
-func resourceDestroyBlocked(ctx context.Context, q resourceStateQueryer, env platform.Environment, name string) error {
-	if inUse, detail, err := resourceInUse(ctx, q, env.App, env.Name, name); err != nil {
+func resourceDestroyBlocked(ctx context.Context, environments *entities.EnvironmentStore, revisions *entities.RevisionStore, deployments *entities.DeploymentStore, env platform.Environment, name string) error {
+	if inUse, detail, err := resourceInUse(ctx, environments, revisions, env.App, env.Name, name); err != nil {
 		return err
 	} else if inUse {
 		return contract.NewFault(contract.PreconditionFailed, "resource is still referenced by an environment revision", detail)
 	}
-	if inUse, err := resourceDeploymentInUse(ctx, q, env.ID, name); err != nil {
+	if inUse, err := resourceDeploymentInUse(ctx, deployments, env.ID, name); err != nil {
 		return err
 	} else if inUse {
 		return contract.NewFault(contract.Conflict, "a deployment that uses this resource is queued or running", "Wait for the deployment to finish or cancel it explicitly, then destroy the resource.")
@@ -369,12 +294,13 @@ func resourceDestroyBlocked(ctx context.Context, q resourceStateQueryer, env pla
 	return nil
 }
 
-func ensureNoActiveParentDeleteTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, app, environment string) error {
-	var active int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_operations
-        WHERE id<>$1 AND state IN ('queued','running','cancelling')
-          AND ((kind=$4 AND target=$2) OR (kind=$5 AND target=$3))`, id, "app/"+app, "env/"+app+"/"+environment, platform.KindAppDelete, platform.KindEnvironmentDelete).Scan(&active); err != nil {
-		return unavailable()
+func ensureNoActiveParentDeleteTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, app, environment string) error {
+	active, err := tx.Operations().CountActiveParentDeletes(ctx, entities.ParentDeleteGuard{
+		ExcludeID: id, AppTarget: "app/" + app, EnvironmentTarget: "env/" + app + "/" + environment,
+		AppDeleteKind: platform.KindAppDelete, EnvironmentDeleteKind: platform.KindEnvironmentDelete,
+	})
+	if err != nil {
+		return unavailable(err)
 	}
 	if active > 0 {
 		return contract.NewFault(contract.Conflict, "an application or environment deletion is already active", "Wait for it to finish before changing a managed resource.")
@@ -382,11 +308,10 @@ func ensureNoActiveParentDeleteTx(ctx context.Context, tx pgx.Tx, id contract.Op
 	return nil
 }
 
-func ensureNoActiveResourceOperationTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, target string) error {
-	var active int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_operations
-        WHERE id<>$1 AND target=$2 AND state IN ('queued','running','cancelling')`, id, target).Scan(&active); err != nil {
-		return unavailable()
+func ensureNoActiveResourceOperationTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, target string) error {
+	active, err := tx.Operations().CountActiveResourceOperations(ctx, id, target)
+	if err != nil {
+		return unavailable(err)
 	}
 	if active > 0 {
 		return contract.NewFault(contract.Conflict, "another operation is active for this resource", "Wait for it to finish or cancel it explicitly.")
@@ -402,40 +327,31 @@ type deletionResourceBlocker struct {
 
 // liveDeletionResources is shared by the read-only preview and locked
 // admission. Destruction state, not attachment or health, defines the guard.
-func liveDeletionResources(ctx context.Context, q resourceStateQueryer, appID, envID string) ([]deletionResourceBlocker, error) {
-	statement := `SELECT e.name,r.name,r.state FROM eregion_platform_resources r
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE r.state<>'destroyed' AND `
-	args := []any{}
+func liveDeletionResources(ctx context.Context, resources *entities.ResourceStore, appID platform.AppID, envID platform.EnvironmentID) ([]deletionResourceBlocker, error) {
+	var (
+		records []entities.ResourceBlocker
+		err     error
+	)
 	if envID != "" {
-		statement += `r.environment_id=$1 ORDER BY e.name,r.name`
-		args = append(args, envID)
+		records, err = resources.LiveForEnvironment(ctx, envID)
 	} else {
-		statement += `r.app_id=$1 ORDER BY e.name,r.name`
-		args = append(args, appID)
+		records, err = resources.LiveForApp(ctx, appID)
 	}
-	rows, err := q.Query(ctx, statement, args...)
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	var blockers []deletionResourceBlocker
-	for rows.Next() {
-		var blocker deletionResourceBlocker
-		if err := rows.Scan(&blocker.environment, &blocker.name, &blocker.state); err != nil {
-			return nil, unavailable()
-		}
-		blockers = append(blockers, blocker)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, unavailable()
+	blockers := make([]deletionResourceBlocker, 0, len(records))
+	for _, record := range records {
+		blockers = append(blockers, deletionResourceBlocker{
+			environment: record.Environment, name: record.Name, state: record.State,
+		})
 	}
 	return blockers, nil
 }
 
 // ensureNoLiveResourcesTx rechecks the preview predicate under admission locks.
-func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx pgx.Tx, app, environment string, appID, envID string) error {
-	blockers, err := liveDeletionResources(ctx, tx, appID, envID)
+func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx *entities.StoreTx, app, environment string, appID string, envID string) error {
+	blockers, err := liveDeletionResources(ctx, tx.Resources(), platform.AppID(appID), platform.EnvironmentID(envID))
 	if err != nil {
 		return err
 	}
@@ -452,31 +368,14 @@ func (s *Service) ensureNoLiveResourcesTx(ctx context.Context, tx pgx.Tx, app, e
 }
 
 func (s *Service) resourceTargets(ctx context.Context, app, environment string) ([]string, error) {
-	statement := `SELECT 'resource/'||a.name||'/'||e.name||'/'||r.name
-        FROM eregion_platform_resources r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE a.name=$1`
-	args := []any{app}
-	if environment != "" {
-		statement += ` AND e.name=$2`
-		args = append(args, environment)
-	}
-	statement += ` ORDER BY r.name`
-	rows, err := s.pool.Query(ctx, statement, args...)
+	targets, err := s.entities.Resources().Targets(ctx, app, environment)
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	targets := []string{}
-	for rows.Next() {
-		var target string
-		if err := rows.Scan(&target); err != nil {
-			return nil, unavailable()
-		}
-		targets = append(targets, target)
+	if targets == nil {
+		targets = []string{}
 	}
-	return targets, rows.Err()
+	return targets, nil
 }
 
 func (w *platformWorker) runResourceApply(ctx context.Context, id contract.OperationID, attempt uint32, input *platform.ResourceApplyInput) error {
@@ -618,25 +517,19 @@ func (w *platformWorker) applyResource(ctx context.Context, id contract.Operatio
 		return err
 	}
 
-	rawVolumes, err := json.Marshal(ownedVolumes)
-	if err != nil {
-		return unavailable()
-	}
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}
-	return w.service.finishResourceOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		tag, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
-            SET state='ready', image=$2, image_id=$3, image_digest=$4, container_name=$5, network_name=$6,
-                volumes=$7, health_state='healthy', health_detail='',
-                health_checked_at=clock_timestamp(), operation_id=$8, error_code='', error='',
-                destroyed_at=NULL, updated_at=clock_timestamp()
-            WHERE id=$1 AND operation_id=$8`, resource.ID, plan.Spec.Image, imageID, imageDigest, plan.Container,
-			plan.Network, rawVolumes, id)
+	return w.service.finishResourceOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		rows, err := tx.Resources().MarkReady(ctx, entities.ResourceReady{
+			ID: resource.ID, OperationID: id, Image: plan.Spec.Image, ImageID: imageID,
+			ImageDigest: imageDigest, ContainerName: plan.Container, NetworkName: plan.Network,
+			Volumes: ownedVolumes,
+		})
 		if err != nil {
-			return unavailable()
+			return unavailable(err)
 		}
-		if tag.RowsAffected() == 0 {
+		if rows == 0 {
 			return contract.NewFault(contract.PreconditionFailed, "resource changed while it was being provisioned", "Refresh resource inventory and submit a new explicit apply if the declaration is still desired.")
 		}
 		return appendEvent(ctx, tx, op, contract.Event{
@@ -669,7 +562,7 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 	if err != nil {
 		return err
 	}
-	if err := resourceDestroyBlocked(ctx, w.service.pool, env, resource.Name); err != nil {
+	if err := resourceDestroyBlocked(ctx, w.service.entities.Platform().Environments(), w.service.entities.Platform().Revisions(), w.service.entities.Platform().Deployments(), env, resource.Name); err != nil {
 		return err
 	}
 	plan, err := platform.PlanResource(env.ID, resource.Node, resource.ID, env.App, env.Name, resource.Name, resource.Spec)
@@ -716,31 +609,24 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 	if err := w.service.checkCancelled(ctx, id); err != nil {
 		return err
 	}
-	return w.service.finishResourceOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		volumes := []byte("[]")
+	return w.service.finishResourceOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		detail := "Container removed; named volumes were retained."
+		destroyVolumes := ownedVolumes
 		if input.DeleteData {
+			destroyVolumes = []platform.ResourceVolumeStatus{}
 			if len(deleteVolumes) == 0 {
 				detail = "Container removed; no owned named volumes were recorded to delete."
 			} else {
 				detail = "Container and named volumes removed; resource data was deleted."
 			}
-		} else {
-			raw, err := json.Marshal(ownedVolumes)
-			if err != nil {
-				return unavailable()
-			}
-			volumes = raw
 		}
-		tag, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
-            SET state='destroyed', container_name='', volumes=$3, health_state='unknown',
-                health_detail=$4, health_checked_at=clock_timestamp(), operation_id=$2,
-                error_code='', error='', destroyed_at=clock_timestamp(), updated_at=clock_timestamp()
-            WHERE id=$1 AND operation_id=$2`, resource.ID, id, volumes, detail)
+		rows, err := tx.Resources().MarkDestroyed(ctx, entities.ResourceDestroyed{
+			ID: resource.ID, OperationID: id, Volumes: destroyVolumes, Detail: detail,
+		})
 		if err != nil {
-			return unavailable()
+			return unavailable(err)
 		}
-		if tag.RowsAffected() == 0 {
+		if rows == 0 {
 			return contract.NewFault(contract.PreconditionFailed, "resource changed while it was being destroyed", "Refresh resource inventory before retrying.")
 		}
 		return appendEvent(ctx, tx, op, contract.Event{
@@ -755,11 +641,11 @@ func (w *platformWorker) destroyResource(ctx context.Context, id contract.Operat
 // cancellation error so the resource settles to degraded through the normal
 // cancellation path. This is deliberately scoped to resources; other operation
 // completion policy is unchanged.
-func (s *Service) finishResourceOperation(ctx context.Context, id contract.OperationID, attempt uint32, finalize func(pgx.Tx, *contract.Operation) error) error {
+func (s *Service) finishResourceOperation(ctx context.Context, id contract.OperationID, attempt uint32, finalize func(*entities.StoreTx, *contract.Operation) error) error {
 	if s.beforeResourceFinalize != nil {
 		s.beforeResourceFinalize()
 	}
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
 		}
@@ -781,14 +667,8 @@ func (s *Service) finishResourceOperation(ctx context.Context, id contract.Opera
 }
 
 func (s *Service) markResourceState(ctx context.Context, id contract.OperationID, target string, state platform.ResourceState) error {
-	_, err := s.pool.Exec(ctx, `UPDATE eregion_platform_resources r
-        SET state=$3, updated_at=clock_timestamp()
-        FROM eregion_platform_apps a, eregion_platform_environments e
-        WHERE r.app_id=a.id AND r.environment_id=e.id
-          AND 'resource/'||a.name||'/'||e.name||'/'||r.name=$2 AND r.operation_id=$1`,
-		id, target, string(state))
-	if err != nil {
-		return unavailable()
+	if _, err := s.entities.Resources().SetStateForTarget(ctx, id, target, state); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -802,14 +682,10 @@ func (s *Service) recordResourceFailure(ctx context.Context, id contract.Operati
 	if message == "" {
 		message = "resource operation failed"
 	}
-	_, _ = s.pool.Exec(ctx, `UPDATE eregion_platform_resources r
-        SET state='degraded', health_state='unhealthy', health_detail=$4,
-            health_checked_at=clock_timestamp(), error_code=$5, error=$4,
-            updated_at=clock_timestamp()
-        FROM eregion_platform_apps a, eregion_platform_environments e
-        WHERE r.app_id=a.id AND r.environment_id=e.id
-          AND a.name=$1 AND e.name=$2 AND r.name=$3 AND r.operation_id=$6`,
-		app, environment, name, message, string(fault.Code), id)
+	_, _ = s.entities.Resources().RecordFailure(ctx, entities.ResourceFailure{
+		App: app, Environment: environment, Name: name, OperationID: id,
+		Code: fault.Code, Message: message,
+	})
 }
 
 // settleResourceForTerminalOperationTx moves a resource out of a transient
@@ -818,7 +694,7 @@ func (s *Service) recordResourceFailure(ctx context.Context, id contract.Operati
 // never clobbered. The container identity, image and cumulative volume ledger
 // are intentionally preserved: a later apply reuses them, while a later
 // destroy can still find every owned volume and the possibly existing container.
-func settleResourceForTerminalOperationTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, kind string, code contract.Code) error {
+func settleResourceForTerminalOperationTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, kind string, code contract.Code) error {
 	if kind != platform.KindResourceApply && kind != platform.KindResourceDestroy {
 		return nil
 	}
@@ -830,13 +706,8 @@ func settleResourceForTerminalOperationTx(ctx context.Context, tx pgx.Tx, id con
 	if errorCode == "" {
 		errorCode = contract.Unavailable
 	}
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
-        SET state='degraded', health_state='unknown', health_detail=$2,
-            health_checked_at=clock_timestamp(), error_code=$3, error=$2,
-            updated_at=clock_timestamp()
-        WHERE operation_id=$1 AND state IN ('provisioning','destroying')`,
-		id, detail, string(errorCode)); err != nil {
-		return unavailable()
+	if _, err := tx.Resources().SettleTerminal(ctx, id, errorCode, detail); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -847,23 +718,8 @@ func settleResourceForTerminalOperationTx(ctx context.Context, tx pgx.Tx, id con
 // operation from an earlier crash converges without a repair command or a manual
 // database edit. The operation_id predicate is the concurrency fence.
 func (s *Service) reconcileTerminalResourceStates(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, `UPDATE eregion_platform_resources r
-        SET state='degraded', health_state='unknown',
-            health_detail=CASE r.state
-                WHEN 'destroying' THEN 'Resource destroy was interrupted before a durable destroyed state; re-apply or re-destroy the resource explicitly.'
-                ELSE 'Resource apply was interrupted before a durable ready state; re-apply or destroy the resource explicitly.'
-            END,
-            health_checked_at=clock_timestamp(),
-            error_code=CASE WHEN o.error_code<>'' THEN o.error_code ELSE 'cancelled' END,
-            error=CASE r.state
-                WHEN 'destroying' THEN 'Resource destroy was interrupted before a durable destroyed state; re-apply or re-destroy the resource explicitly.'
-                ELSE 'Resource apply was interrupted before a durable ready state; re-apply or destroy the resource explicitly.'
-            END,
-            updated_at=clock_timestamp()
-        FROM eregion_operations o
-        WHERE r.operation_id=o.id AND o.state IN ('cancelled','failed')
-          AND r.state IN ('provisioning','destroying')`); err != nil {
-		return unavailable()
+	if _, err := s.entities.Resources().ReconcileTerminal(ctx); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -872,53 +728,47 @@ func (s *Service) reconcileTerminalResourceStates(ctx context.Context) error {
 // row's cumulative ledger before any Docker volume is created. The operation ID
 // fence rejects a worker that was superseded while preparing the effect.
 func (s *Service) persistOwnedResourceVolumes(ctx context.Context, id contract.OperationID, resourceID platform.ResourceID, planned []platform.ResourceVolumeStatus) ([]platform.ResourceVolumeStatus, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, unavailable()
-	}
-	defer rollback(tx)
-	var raw []byte
-	if err := tx.QueryRow(ctx, `SELECT volumes FROM eregion_platform_resources
-        WHERE id=$1 AND operation_id=$2 FOR UPDATE`, resourceID, id).Scan(&raw); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, contract.NewFault(contract.PreconditionFailed, "resource operation was superseded", "Refresh resource inventory and retry from its current operation.")
+	var volumes []platform.ResourceVolumeStatus
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		raw, found, err := tx.Resources().LockVolumes(ctx, resourceID, id)
+		if err != nil {
+			return unavailable(err)
 		}
-		return nil, unavailable()
-	}
-	existing := []platform.ResourceVolumeStatus{}
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &existing); err != nil {
-			return nil, unavailable()
+		if !found {
+			return contract.NewFault(contract.PreconditionFailed, "resource operation was superseded", "Refresh resource inventory and retry from its current operation.")
 		}
-	}
-	volumes := platform.MergeResourceVolumes(existing, planned)
-	encoded, err := json.Marshal(volumes)
+		existing := []platform.ResourceVolumeStatus{}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &existing); err != nil {
+				return unavailable(err)
+			}
+		}
+		volumes = platform.MergeResourceVolumes(existing, planned)
+		encoded, err := json.Marshal(volumes)
+		if err != nil {
+			return unavailable(err)
+		}
+		if _, err := tx.Resources().SetVolumes(ctx, resourceID, id, encoded); err != nil {
+			return unavailable(err)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, unavailable()
-	}
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_resources
-        SET volumes=$3, updated_at=clock_timestamp()
-        WHERE id=$1 AND operation_id=$2`, resourceID, id, encoded); err != nil {
-		return nil, unavailable()
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, unavailable()
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return nil, unavailable(err)
+		}
+		return nil, err
 	}
 	return volumes, nil
 }
 
 func (s *Service) recordResourceContainer(ctx context.Context, id contract.OperationID, resourceID platform.ResourceID, plan platform.ResourcePlan, imageID, imageDigest string, volumes []platform.ResourceVolumeStatus) error {
-	rawVolumes, err := json.Marshal(volumes)
-	if err != nil {
-		return unavailable()
-	}
-	_, err = s.pool.Exec(ctx, `UPDATE eregion_platform_resources
-        SET image=$2, image_id=$3, image_digest=$4, container_name=$5, network_name=$6, volumes=$7,
-            updated_at=clock_timestamp()
-        WHERE id=$1 AND operation_id=$8`, resourceID, plan.Spec.Image, imageID, imageDigest, plan.Container,
-		plan.Network, rawVolumes, id)
-	if err != nil {
-		return unavailable()
+	if _, err := s.entities.Resources().RecordContainer(ctx, entities.ResourceContainer{
+		ID: resourceID, OperationID: id, Image: plan.Spec.Image, ImageID: imageID,
+		ImageDigest: imageDigest, ContainerName: plan.Container, NetworkName: plan.Network,
+		Volumes: volumes,
+	}); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -929,38 +779,28 @@ func (s *Service) resourceDeployability(ctx context.Context, env platform.Enviro
 	}
 	missing := []string{}
 	for _, name := range env.Revision.Resources {
-		var state, health string
-		err := s.pool.QueryRow(ctx, `SELECT state, health_state FROM eregion_platform_resources WHERE environment_id=$1 AND name=$2`, env.ID, name).Scan(&state, &health)
-		if errors.Is(err, pgx.ErrNoRows) {
-			missing = append(missing, "resource:"+name)
-			continue
-		}
+		state, found, err := s.entities.Resources().State(ctx, env.ID, name)
 		if err != nil {
-			return nil, unavailable()
+			return nil, unavailable(err)
 		}
-		if state != string(platform.ResourceReady) || health != string(platform.HealthHealthy) {
+		if !found || state.State != platform.ResourceReady || state.Health != platform.HealthHealthy {
 			missing = append(missing, "resource:"+name)
 		}
 	}
 	return missing, nil
 }
 
-func (s *Service) resourceDeployabilityTx(ctx context.Context, tx pgx.Tx, env platform.Environment) ([]string, error) {
+func (s *Service) resourceDeployabilityTx(ctx context.Context, tx *entities.StoreTx, env platform.Environment) ([]string, error) {
 	if env.Revision == nil || len(env.Revision.Resources) == 0 {
 		return nil, nil
 	}
 	missing := []string{}
 	for _, name := range env.Revision.Resources {
-		var state, health string
-		err := tx.QueryRow(ctx, `SELECT state, health_state FROM eregion_platform_resources WHERE environment_id=$1 AND name=$2`, env.ID, name).Scan(&state, &health)
-		if errors.Is(err, pgx.ErrNoRows) {
-			missing = append(missing, "resource:"+name)
-			continue
-		}
+		state, found, err := tx.Resources().State(ctx, env.ID, name)
 		if err != nil {
-			return nil, unavailable()
+			return nil, unavailable(err)
 		}
-		if state != string(platform.ResourceReady) || health != string(platform.HealthHealthy) {
+		if !found || state.State != platform.ResourceReady || state.Health != platform.HealthHealthy {
 			missing = append(missing, "resource:"+name)
 		}
 	}
@@ -968,27 +808,22 @@ func (s *Service) resourceDeployabilityTx(ctx context.Context, tx pgx.Tx, env pl
 }
 
 func (s *Service) inventoryResources(ctx context.Context, query platform.InventoryQuery) ([]platform.Resource, error) {
-	statement := `SELECT ` + resourceColumns + `
-        FROM eregion_platform_resources r
-        JOIN eregion_platform_apps a ON a.id=r.app_id
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE ($1='' OR a.name=$1) AND ($2='' OR e.name=$2)
-          AND ($3='' OR r.state=$3) AND ($4='' OR r.node_name=$4)
-        ORDER BY a.name,e.name,r.name LIMIT $5`
-	rows, err := s.pool.Query(ctx, statement, query.App, query.Environment, query.State, query.Node, query.Limit)
+	items, err := s.entities.Resources().List(ctx, entities.ResourceFilter{
+		App: query.App, Environment: query.Environment, State: query.State,
+		Node: query.Node, Limit: query.Limit,
+	})
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	items := []platform.Resource{}
-	for rows.Next() {
-		resource, err := scanResourceRow(rows)
-		if err != nil {
-			return nil, unavailable()
+	for _, resource := range items {
+		if err := validateStoredResource(resource); err != nil {
+			return nil, err
 		}
-		items = append(items, resource)
 	}
-	return items, rows.Err()
+	if items == nil {
+		items = []platform.Resource{}
+	}
+	return items, nil
 }
 
 func (s *Service) resolveResourceSecrets(ctx context.Context, env platform.Environment, spec platform.ResourceSpec) (map[string]string, string, error) {

@@ -1,0 +1,35 @@
+version: "2"
+sql:
+  - engine: postgresql
+    schema:
+      - internal/dbschema/migrations
+      - internal/entities/infrastructure/schema.sql
+    queries: internal/entities/queries
+    gen:
+      go:
+        package: query
+        out: internal/entities/internal/query
+        sql_package: pgx/v5
+        overrides:
+          - db_type: jsonb
+            go_type:
+              import: encoding/json
+              type: RawMessage
+          - db_type: jsonb
+            nullable: true
+            go_type:
+              import: encoding/json
+              type: RawMessage
+              pointer: true
+          - db_type: pg_catalog.int4
+            go_type: int64
+          - db_type: pg_catalog.int4
+            nullable: true
+            go_type:
+              type: int64
+              pointer: true
+          - db_type: pg_catalog.int8
+            nullable: true
+            go_type:
+              type: int64
+              pointer: true

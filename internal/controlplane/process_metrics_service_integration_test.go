@@ -132,7 +132,7 @@ func TestIntegrationProcessMetricsRiverPostgres(t *testing.T) {
 	}
 
 	m := processmetrics.New(pool)
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: newScriptedDeployTransport(),
 		NodeStateDir: t.TempDir(), LocalNodeName: "local", Metrics: m,
 		RegistryEndpoint: "127.0.0.1:5000",

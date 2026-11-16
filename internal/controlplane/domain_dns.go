@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -30,11 +30,9 @@ func (s *Service) previewDomainDNS(ctx context.Context, actor contract.Actor, in
 	}
 	var ledger *domainDNSLedger
 	var err error
-	if s.pool != nil {
-		ledger, err = s.loadDomainDNSLedger(ctx, input.App, input.Environment, input.Domain)
-		if err != nil {
-			return integrations.DomainDNSPlan{}, err
-		}
+	ledger, err = s.loadDomainDNSLedger(ctx, input.App, input.Environment, input.Domain)
+	if err != nil {
+		return integrations.DomainDNSPlan{}, err
 	}
 	var zone integrations.DNSZone
 	var domainID platform.DomainID
@@ -127,21 +125,22 @@ func (s *Service) applyDomainDNSEffect(ctx context.Context, op contract.Operatio
 // verified cleanup) or has neither, and a cancellation accepted before this
 // boundary prevents the delete.
 func (s *Service) deleteDomainBindingRowOwned(ctx context.Context, id contract.OperationID, attempt uint32, app, environment, domain string) error {
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State == contract.Cancelling {
 			return errPlatformCancelled
 		}
 		var data json.RawMessage
 		// Keep the original binding identity before the cascade. Failure to
 		// project evidence is isolated from the existing guarded deletion.
-		if nested, err := tx.Begin(ctx); err == nil {
-			if snapshot, err := domainRemovalActionDataTx(ctx, nested, app, environment, domain); err == nil {
-				if nested.Commit(ctx) == nil {
-					data = snapshot
-				}
-			} else {
-				_ = nested.Rollback(ctx)
+		if scopeErr := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+			snapshot, err := domainRemovalActionDataTx(ctx, nested, app, environment, domain)
+			if err != nil {
+				return err
 			}
+			data = snapshot
+			return nil
+		}); scopeErr != nil {
+			data = nil
 		}
 		if err := deleteDomainBindingRowTx(ctx, tx, app, environment, domain); err != nil {
 			return err
@@ -160,33 +159,29 @@ func (s *Service) deleteDomainBindingRowOwned(ctx context.Context, id contract.O
 	return nil
 }
 
-func deleteDomainBindingRowTx(ctx context.Context, tx pgx.Tx, app, environment, domain string) error {
+func deleteDomainBindingRowTx(ctx context.Context, tx *entities.StoreTx, app, environment, domain string) error {
 	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domain_dns x
-        USING eregion_platform_domains d, eregion_platform_environments e, eregion_platform_apps a
-        WHERE x.domain_id=d.id AND d.environment_id=e.id AND e.app_id=a.id
-          AND d.name=$1 AND a.name=$2 AND e.name=$3`, domain, app, environment); err != nil {
-		return unavailable()
+	_, environmentID, found, err := tx.Platform().Domains().GetByName(ctx, domain)
+	if err != nil {
+		return unavailable(err)
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domains d
-        USING eregion_platform_environments e, eregion_platform_apps a
-        WHERE d.environment_id=e.id AND e.app_id=a.id
-          AND d.name=$1 AND a.name=$2 AND e.name=$3`, domain, app, environment); err != nil {
-		return unavailable()
+	if !found {
+		return nil
+	}
+	if _, err := tx.Platform().DomainDNS().DeleteForBinding(ctx, domain, environmentID); err != nil {
+		return unavailable(err)
+	}
+	if _, err := tx.Platform().Domains().DeleteBinding(ctx, domain, app, environment); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
 func (s *Service) domainBindingExists(ctx context.Context, app, environment, domain string) (bool, error) {
-	var exists bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS(
-        SELECT 1 FROM eregion_platform_domains d
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE d.name=$1 AND a.name=$2 AND e.name=$3)`,
-		strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")), app, environment).Scan(&exists)
+	exists, err := s.entities.Platform().Domains().BindingExists(ctx,
+		strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), ".")), app, environment)
 	if err != nil {
-		return false, unavailable()
+		return false, unavailable(err)
 	}
 	return exists, nil
 }

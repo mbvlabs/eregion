@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 )
 
@@ -29,7 +29,7 @@ func TestIntegrationCandidateCaptureClaimsStayIndependent(t *testing.T) {
 			if _, _, claimed, err := run.Service.claimAttempt(ctx, op.ID, 1, "test"); err != nil || !claimed {
 				t.Fatalf("claim: %v %v", claimed, err)
 			}
-			_, owned, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx pgx.Tx, current *contract.Operation) error {
+			_, owned, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx *entities.StoreTx, current *contract.Operation) error {
 				claim := func(step string) error {
 					return appendEvent(ctx, tx, current, contract.Event{
 						Kind: "warning", Stage: "candidate", Step: step,
@@ -91,7 +91,7 @@ func TestIntegrationCandidateCaptureClaimsStayIndependent(t *testing.T) {
 			check("settlement")
 			// A later history event forces a fresh projection without changing
 			// the immutable settled result or completing the first claim.
-			_, err = run.Service.mutate(ctx, op.ID, func(tx pgx.Tx, current *contract.Operation) error {
+			_, err = run.Service.mutate(ctx, op.ID, func(tx *entities.StoreTx, current *contract.Operation) error {
 				return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Message: "Later read-only evidence observation."})
 			})
 			if err != nil {

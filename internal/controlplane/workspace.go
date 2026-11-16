@@ -8,10 +8,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 )
 
 // Workspace identity is installation metadata, not a tenant boundary. The
@@ -70,80 +68,68 @@ func NewWorkspaceID() (string, error) {
 	return "ws_" + hex.EncodeToString(raw[:]), nil
 }
 
-type workspaceQuerier interface {
-	QueryRow(context.Context, string, ...any) pgx.Row
-}
-
-func workspaceTableExists(ctx context.Context, pool workspaceQuerier) (bool, error) {
-	var exists bool
-	if err := pool.QueryRow(ctx, "SELECT to_regclass('eregion_workspace') IS NOT NULL").Scan(&exists); err != nil {
-		return false, err
-	}
-	return exists, nil
+// workspaceReader is the typed read surface shared by the Store and StoreTx
+// workspace views. It exposes no query or driver handle.
+type workspaceReader interface {
+	Get(context.Context) (entities.WorkspaceRecord, bool, error)
+	SchemaExists(context.Context) (bool, error)
 }
 
 // ReadWorkspace reads the authoritative identity without inserting a row.
 // A missing table is distinct from a migrated but empty table.
-func ReadWorkspace(ctx context.Context, pool *pgxpool.Pool) (WorkspaceIdentity, error) {
-	return readWorkspaceSchema(ctx, pool)
+func ReadWorkspace(ctx context.Context, store *entities.Store) (WorkspaceIdentity, error) {
+	if store == nil {
+		return WorkspaceIdentity{}, contract.NewFault(contract.Internal, "workspace identity needs typed persistence", "Construct the entities store before reading the workspace.")
+	}
+	return readWorkspaceSchema(ctx, store.Workspace())
 }
 
-func readWorkspaceSchema(ctx context.Context, pool workspaceQuerier) (WorkspaceIdentity, error) {
-	exists, err := workspaceTableExists(ctx, pool)
+func readWorkspaceSchema(ctx context.Context, reader workspaceReader) (WorkspaceIdentity, error) {
+	exists, err := reader.SchemaExists(ctx)
 	if err != nil {
 		return WorkspaceIdentity{}, err
 	}
 	if !exists {
 		return WorkspaceIdentity{}, ErrWorkspaceSchemaMissing
 	}
-	return readWorkspace(ctx, pool)
-}
-
-func readWorkspace(ctx context.Context, q workspaceQuerier) (WorkspaceIdentity, error) {
-	var identity WorkspaceIdentity
-	var nodeName, keyType, fingerprint, stateDir pgtype.Text
-	err := q.QueryRow(ctx, `SELECT workspace_id, name, registry_host_node, registry_host_key_type,
-        registry_host_key_fingerprint, registry_host_state_dir FROM eregion_workspace WHERE singleton`).
-		Scan(&identity.ID, &identity.Name, &nodeName, &keyType, &fingerprint, &stateDir)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return WorkspaceIdentity{}, nil
-	}
+	record, found, err := reader.Get(ctx)
 	if err != nil {
 		return WorkspaceIdentity{}, err
 	}
-	if err := ValidateWorkspaceID(identity.ID); err != nil {
+	if !found {
+		return WorkspaceIdentity{}, nil
+	}
+	return workspaceIdentity(record)
+}
+
+func workspaceIdentity(record entities.WorkspaceRecord) (WorkspaceIdentity, error) {
+	if err := ValidateWorkspaceID(record.ID); err != nil {
 		return WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed,
 			"the control database has an invalid workspace ID", "Inspect the workspace row; never rewrite applied migrations.")
 	}
-	if err := ValidateWorkspaceName(identity.Name); err != nil {
+	if err := ValidateWorkspaceName(record.Name); err != nil {
 		return WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed,
 			"the control database has an invalid workspace name", "Inspect the workspace row; never rewrite applied migrations.")
 	}
-	values := []pgtype.Text{nodeName, keyType, fingerprint, stateDir}
-	present := 0
-	for _, value := range values {
-		if value.Valid {
-			present++
-		}
-	}
-	if present != 0 && present != len(values) {
-		return WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed,
-			"the workspace registry host binding is incomplete",
-			"Inspect the workspace row; missing bindings are unverified and are never inferred.")
-	}
-	if present == len(values) {
-		binding := RegistryHostIdentity{
-			NodeName: strings.TrimSpace(nodeName.String), HostKeyType: strings.TrimSpace(keyType.String),
-			HostKeyFingerprint: strings.TrimSpace(fingerprint.String), StateDir: strings.TrimSpace(stateDir.String),
-		}
-		if err := binding.Validate(); err != nil {
+	if !record.WorkspaceRegistryHost() {
+		if record.WorkspaceRegistryHostPartial() {
 			return WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed,
-				"the control database has an invalid workspace registry host binding", err.Error())
+				"the workspace registry host binding is incomplete",
+				"Inspect the workspace row; missing bindings are unverified and are never inferred.")
 		}
-		identity.RegistryHost = &binding
+		return WorkspaceIdentity{Configured: true, ID: record.ID, Name: record.Name}, nil
 	}
-	identity.Configured = true
-	return identity, nil
+	binding := RegistryHostIdentity{
+		NodeName:           strings.TrimSpace(*record.RegistryHostNode),
+		HostKeyType:        strings.TrimSpace(*record.RegistryHostKeyType),
+		HostKeyFingerprint: strings.TrimSpace(*record.RegistryHostKeyFingerprint),
+		StateDir:           strings.TrimSpace(*record.RegistryHostStateDir),
+	}
+	if err := binding.Validate(); err != nil {
+		return WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed,
+			"the control database has an invalid workspace registry host binding", err.Error())
+	}
+	return WorkspaceIdentity{Configured: true, ID: record.ID, Name: record.Name, RegistryHost: &binding}, nil
 }
 
 // AssignWorkspace implements the one-time compare-and-set assignment:
@@ -154,62 +140,63 @@ func readWorkspace(ctx context.Context, q workspaceQuerier) (WorkspaceIdentity, 
 //
 // The advisory transaction lock serialises assignment. INSERT ... ON CONFLICT
 // is the compare-and-set that also handles a writer that did not take the lock.
-func AssignWorkspace(ctx context.Context, pool *pgxpool.Pool, name string, registryHost RegistryHostIdentity) (WorkspaceIdentity, error) {
+func AssignWorkspace(ctx context.Context, store *entities.Store, name string, registryHost RegistryHostIdentity) (WorkspaceIdentity, error) {
+	if store == nil {
+		return WorkspaceIdentity{}, contract.NewFault(contract.Internal, "workspace identity needs typed persistence", "Construct the entities store before assigning the workspace.")
+	}
 	if err := ValidateWorkspaceName(name); err != nil {
 		return WorkspaceIdentity{}, err
 	}
 	if err := registryHost.Validate(); err != nil {
 		return WorkspaceIdentity{}, err
 	}
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return WorkspaceIdentity{}, err
-	}
-	defer rollback(tx)
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", workspaceAssignmentLock); err != nil {
-		return WorkspaceIdentity{}, err
-	}
-	id, err := NewWorkspaceID()
-	if err != nil {
-		return WorkspaceIdentity{}, err
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO eregion_workspace
-            (singleton, workspace_id, name, registry_host_node, registry_host_key_type,
-             registry_host_key_fingerprint, registry_host_state_dir, created_at)
-         VALUES (true, $1, $2, $3, $4, $5, $6, clock_timestamp())
-         ON CONFLICT (singleton) DO NOTHING`,
-		id, name, registryHost.NodeName, registryHost.HostKeyType,
-		registryHost.HostKeyFingerprint, registryHost.StateDir); err != nil {
-		return WorkspaceIdentity{}, err
-	}
-	identity, err := readWorkspace(ctx, tx)
-	if err != nil {
-		return WorkspaceIdentity{}, err
-	}
-	if !identity.Configured {
-		return WorkspaceIdentity{}, contract.NewFault(contract.Internal,
-			"the workspace identity was not recorded", "Inspect the control database and retry the apply.")
-	}
-	if identity.Name != name {
-		return WorkspaceIdentity{}, workspaceNameConflict(identity.Name, name)
-	}
-	if identity.RegistryHost == nil {
-		return WorkspaceIdentity{}, contract.NewFault(contract.PreconditionFailed,
-			"the existing workspace has no verified registry host binding",
-			"The workspace remains unverified and is never backfilled. Use a fresh installation; do not edit the workspace row.")
-	}
-	if !identity.RegistryHost.Equal(registryHost) {
-		fault := contract.NewFault(contract.Conflict,
-			"the workspace registry host binding is already configured for another physical host",
-			"The bound node, public SSH host key and canonical node state directory are immutable. Use the original host or a fresh installation.")
-		fault.Details = map[string]any{
-			"bound_node":  identity.RegistryHost.NodeName,
-			"actual_node": registryHost.NodeName,
+	var identity WorkspaceIdentity
+	err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		if err := tx.Workspace().LockAssignment(ctx, workspaceAssignmentLock); err != nil {
+			return err
 		}
-		return WorkspaceIdentity{}, fault
-	}
-	if err := tx.Commit(ctx); err != nil {
+		id, err := NewWorkspaceID()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Workspace().Insert(ctx, entities.WorkspaceInsert{
+			ID: id, Name: name,
+			RegistryHostNode:           registryHost.NodeName,
+			RegistryHostKeyType:        registryHost.HostKeyType,
+			RegistryHostKeyFingerprint: registryHost.HostKeyFingerprint,
+			RegistryHostStateDir:       registryHost.StateDir,
+		}); err != nil {
+			return err
+		}
+		identity, err = readWorkspaceSchema(ctx, tx.Workspace())
+		if err != nil {
+			return err
+		}
+		if !identity.Configured {
+			return contract.NewFault(contract.Internal,
+				"the workspace identity was not recorded", "Inspect the control database and retry the apply.")
+		}
+		if identity.Name != name {
+			return workspaceNameConflict(identity.Name, name)
+		}
+		if identity.RegistryHost == nil {
+			return contract.NewFault(contract.PreconditionFailed,
+				"the existing workspace has no verified registry host binding",
+				"The workspace remains unverified and is never backfilled. Use a fresh installation; do not edit the workspace row.")
+		}
+		if !identity.RegistryHost.Equal(registryHost) {
+			fault := contract.NewFault(contract.Conflict,
+				"the workspace registry host binding is already configured for another physical host",
+				"The bound node, public SSH host key and canonical node state directory are immutable. Use the original host or a fresh installation.")
+			fault.Details = map[string]any{
+				"bound_node":  identity.RegistryHost.NodeName,
+				"actual_node": registryHost.NodeName,
+			}
+			return fault
+		}
+		return nil
+	})
+	if err != nil {
 		return WorkspaceIdentity{}, err
 	}
 	return identity, nil

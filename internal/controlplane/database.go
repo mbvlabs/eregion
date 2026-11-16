@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/dbschema"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/database"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
@@ -66,8 +67,13 @@ func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, ControlDatabaseFault(dsn, err)
 	}
-	var version int
-	if err := pool.QueryRow(ctx, "SELECT current_setting('server_version_num')::integer").Scan(&version); err != nil {
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		pool.Close()
+		return nil, ControlDatabaseFault(dsn, err)
+	}
+	version, err := store.DatabaseVersion(ctx)
+	if err != nil {
 		pool.Close()
 		return nil, ControlDatabaseFault(dsn, err)
 	}
@@ -100,8 +106,6 @@ func schemaFault(message string) error {
 
 type migrationIdentity struct{ schema, role string }
 
-const identityQuery = `SELECT cardinality(current_schemas(false)), current_schema(), current_user`
-
 func checkedIdentity(count int, schema, role string) (migrationIdentity, error) {
 	if count != 1 || schema == "" || role == "" {
 		return migrationIdentity{}, contract.NewFault(contract.PreconditionFailed, "unsupported database search_path", "Configure exactly one existing installation schema in search_path for every pool connection.")
@@ -125,12 +129,10 @@ func (c migrationConnector) Connect(ctx context.Context) (driver.Conn, error) {
 		conn.Close()
 		return nil, fmt.Errorf("unexpected PostgreSQL connector")
 	}
-	var count int
-	var schema, role string
-	err = pgxConn.Conn().QueryRow(ctx, identityQuery).Scan(&count, &schema, &role)
+	facts, err := entities.NewSessionStore(pgxConn.Conn()).DatabaseIdentity(ctx)
 	if err == nil {
 		var got migrationIdentity
-		got, err = checkedIdentity(count, schema, role)
+		got, err = checkedIdentity(facts.SchemaCount, facts.Schema, facts.Role)
 		if err == nil && got != c.want {
 			err = contract.NewFault(contract.PreconditionFailed, "inconsistent database pool schema or role", "Use the same single-schema search_path and role on every pool connection.")
 		}
@@ -198,26 +200,21 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 		return plan, identity, unavailable(err)
 	}
 	defer tx.Rollback()
-	var count int
-	var schema, role sql.NullString
-	var old, exists bool
+	snapshot := entities.NewMigrationSnapshot(tx)
 	// Match Goose's PostgreSQL TableExists predicate, including its restriction
 	// to tables in current_schema. Neither ledger is read before presence is known.
-	if err := tx.QueryRowContext(ctx, `SELECT cardinality(current_schemas(false)), current_schema(), current_user,
-		to_regclass('eregion_schema_migrations') IS NOT NULL,
-		EXISTS (SELECT 1 FROM pg_catalog.pg_tables WHERE
-			(current_schema() IS NULL OR schemaname = current_schema()) AND tablename = 'goose_db_version')`).
-		Scan(&count, &schema, &role, &old, &exists); err != nil {
+	catalog, err := snapshot.Catalog(ctx)
+	if err != nil {
 		return plan, identity, unavailable(err)
 	}
-	identity, err = checkedIdentity(count, schema.String, role.String)
+	identity, err = checkedIdentity(catalog.Identity.SchemaCount, catalog.Identity.Schema, catalog.Identity.Role)
 	if err != nil {
 		return plan, identity, err
 	}
-	if old {
+	if catalog.LegacyLedger {
 		return plan, identity, schemaFault("legacy application migration ledger exists")
 	}
-	if exists {
+	if catalog.LedgerExists {
 		history, err := store.ListMigrations(ctx, tx)
 		if err != nil {
 			return plan, identity, unavailable(err)
@@ -232,48 +229,7 @@ func inspectApplicationMigrations(ctx context.Context, pool *pgxpool.Pool) (plan
 		if err != nil {
 			return plan, identity, schemaFault("invalid application migration inventory")
 		}
-		var orphan bool
-		err = tx.QueryRowContext(ctx, `SELECT EXISTS (
-			SELECT 1 FROM pg_catalog.pg_class c
-			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-			WHERE n.nspname = ANY(current_schemas(false))
-			AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S', 'i', 'I')
-			AND (($3 AND c.relname LIKE 'river\_%' ESCAPE '\') OR
-			  (c.relname LIKE 'eregion\_%' ESCAPE '\' AND NOT (
-			    (c.relkind IN ('r', 'p') AND c.relname = ANY($1::text[]))
-			    OR (c.relkind IN ('i', 'I') AND EXISTS (
-			      SELECT 1 FROM pg_catalog.pg_index i
-			      JOIN pg_catalog.pg_class owner ON owner.oid = i.indrelid
-			      WHERE i.indexrelid = c.oid AND owner.relname = ANY($1::text[])
-			      AND (c.relname || ':' || owner.relname = ANY($2::text[]) OR EXISTS (
-			        SELECT 1 FROM pg_catalog.pg_constraint con
-			        WHERE con.conindid = c.oid AND con.conrelid = owner.oid AND con.contype IN ('p', 'u')
-			      ))
-			    ))
-			  )))
-			UNION ALL
-			SELECT 1 FROM pg_catalog.pg_type t
-			JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-			WHERE n.nspname = ANY(current_schemas(false))
-			AND (($3 AND t.typname LIKE 'river\_%' ESCAPE '\') OR
-			  (t.typname LIKE 'eregion\_%' ESCAPE '\' AND NOT (
-			    t.typtype = 'c' AND t.typname = ANY($1::text[]) AND EXISTS (
-			      SELECT 1 FROM pg_catalog.pg_class owner
-			      WHERE owner.oid = t.typrelid AND owner.relkind IN ('r', 'p') AND owner.relname = t.typname
-			    )
-			  )))
-			UNION ALL
-			SELECT 1 FROM pg_catalog.pg_proc p
-			JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-			WHERE n.nspname = ANY(current_schemas(false))
-			AND (p.proname LIKE 'eregion\_%' ESCAPE '\' OR ($3 AND p.proname LIKE 'river\_%' ESCAPE '\'))
-			UNION ALL
-			SELECT 1 FROM pg_catalog.pg_trigger tr
-			JOIN pg_catalog.pg_class owner ON owner.oid = tr.tgrelid
-			JOIN pg_catalog.pg_namespace n ON n.oid = owner.relnamespace
-			WHERE n.nspname = ANY(current_schemas(false)) AND NOT tr.tgisinternal
-			AND (tr.tgname LIKE 'eregion\_%' ESCAPE '\' OR owner.relname = ANY($1::text[]))
-		)`, tables, indexes, plan.Current < plan.Required).Scan(&orphan)
+		orphan, err := snapshot.UnexpectedObjects(ctx, tables, indexes, plan.Current < plan.Required)
 		if err != nil {
 			return plan, identity, unavailable(err)
 		}
@@ -302,12 +258,11 @@ func readRiverMigrations(ctx context.Context, pool *pgxpool.Pool, m *rivermigrat
 		return unavailable(err)
 	}
 	defer rollback(tx)
-	var count int
-	var schema, role string
-	if err := tx.QueryRow(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+	facts, err := entities.NewSessionStore(conn.Conn()).DatabaseIdentity(ctx)
+	if err != nil {
 		return unavailable(err)
 	}
-	got, err := checkedIdentity(count, schema, role)
+	got, err := checkedIdentity(facts.SchemaCount, facts.Schema, facts.Role)
 	if err != nil {
 		return err
 	}
@@ -347,8 +302,8 @@ func acquireMigrationLock(ctx context.Context, pool *pgxpool.Pool) (*pgxpool.Con
 		if err != nil {
 			return nil, unavailable(err)
 		}
-		var locked bool
-		if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", migrationLock).Scan(&locked); err != nil {
+		locked, err := entities.NewSessionStore(conn.Conn()).TrySessionLock(ctx, migrationLock)
+		if err != nil {
 			// A lost response can leave the session locked; discard it.
 			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = conn.Conn().Close(closeCtx)
@@ -393,7 +348,7 @@ func migrateWithFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS, af
 	defer func() {
 		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if _, err := conn.Exec(unlockCtx, "SELECT pg_advisory_unlock($1)", migrationLock); err != nil {
+		if _, err := entities.NewSessionStore(conn.Conn()).UnlockSession(unlockCtx, migrationLock); err != nil {
 			_ = conn.Conn().Close(unlockCtx)
 		}
 	}()
@@ -401,12 +356,11 @@ func migrateWithFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS, af
 	if err != nil {
 		return plan, err
 	}
-	var count int
-	var schema, role string
-	if err := conn.QueryRow(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+	facts, err := entities.NewSessionStore(conn.Conn()).DatabaseIdentity(ctx)
+	if err != nil {
 		return plan, unavailable(err)
 	}
-	lockIdentity, err := checkedIdentity(count, schema, role)
+	lockIdentity, err := checkedIdentity(facts.SchemaCount, facts.Schema, facts.Role)
 	if err != nil {
 		return plan, err
 	}
@@ -446,10 +400,11 @@ func migrateWithFS(ctx context.Context, pool *pgxpool.Pool, migrations fs.FS, af
 		return plan, unavailable(err)
 	}
 	defer riverConn.Release()
-	if err := riverConn.QueryRow(ctx, identityQuery).Scan(&count, &schema, &role); err != nil {
+	riverFacts, err := entities.NewSessionStore(riverConn.Conn()).DatabaseIdentity(ctx)
+	if err != nil {
 		return plan, unavailable(err)
 	}
-	riverIdentity, err := checkedIdentity(count, schema, role)
+	riverIdentity, err := checkedIdentity(riverFacts.SchemaCount, riverFacts.Schema, riverFacts.Role)
 	if err != nil {
 		return plan, err
 	}

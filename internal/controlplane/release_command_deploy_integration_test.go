@@ -18,7 +18,7 @@ import (
 func TestIntegrationReleaseCommandLostResponseStaysRunning(t *testing.T) {
 	pool, _ := testPool(t, true)
 	fake := newScriptedDeployTransport()
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 2, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -41,7 +41,7 @@ func TestIntegrationReleaseCommandLostResponseStaysRunning(t *testing.T) {
 		"domain": "live.example.com", "domain_primary": true,
 	}), contract.Succeeded)
 
-	releaseID := seedArtifactRelease(t, s, "live", "production", "registry.example/live:v1",
+	releaseID := seedArtifactRelease(t, pool, s, "live", "production", "registry.example/live:v1",
 		withSeededReleaseCommand(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})).ID
 	digest := platform.ReleaseCommandDigest(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})
 
@@ -92,7 +92,7 @@ func TestIntegrationReleaseCommandLostResponseStaysRunning(t *testing.T) {
 func TestIntegrationReleaseCommandTerminalOwnerRecovery(t *testing.T) {
 	pool, _ := testPool(t, true)
 	fake := newScriptedDeployTransport()
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 2, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -114,7 +114,7 @@ func TestIntegrationReleaseCommandTerminalOwnerRecovery(t *testing.T) {
 		"name": "production", "node": "local", "container_port": 80, "health": map[string]any{"timeout_seconds": 2},
 		"domain": "live.example.com", "domain_primary": true,
 	}), contract.Succeeded)
-	releaseID := seedArtifactRelease(t, s, "live", "production", "registry.example/live:v1",
+	releaseID := seedArtifactRelease(t, pool, s, "live", "production", "registry.example/live:v1",
 		withSeededReleaseCommand(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})).ID
 	digest := platform.ReleaseCommandDigest(platform.CommandSpec{Argv: []string{"/bin/migrate"}, TimeoutSeconds: 120})
 

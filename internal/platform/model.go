@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"strings"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/buildpacks"
@@ -24,7 +25,14 @@ const (
 	CapabilityHTTPIngress = "http-ingress"
 )
 
-var knownRoles = []string{RoleApplication, RoleBuilder, RoleEdge, RoleRegistry, RoleTelemetry, RoleControlPlane}
+var knownRoles = []string{
+	RoleApplication,
+	RoleBuilder,
+	RoleEdge,
+	RoleRegistry,
+	RoleTelemetry,
+	RoleControlPlane,
+}
 
 type NodeStatus string
 
@@ -175,6 +183,10 @@ type DeployabilityState struct {
 	// release supplies the artifact, so the revision's source binding is not
 	// required.
 	ExplicitRelease bool
+	// BuilderRequired is true when this evaluation is for a Git build path
+	// (or environment status of a Git recipe). A missing builder is then an
+	// actionable blocker: there is no built-in default.
+	BuilderRequired bool
 	PrimaryDomain   string
 	DNS             string
 }
@@ -198,6 +210,9 @@ func EvaluateDeployability(revision *EnvironmentRevision, state DeployabilitySta
 	// artifact-selection guidance instead of inventing a source or latest tag.
 	if !state.ArtifactReady && !state.ArtifactPlanned {
 		missing = append(missing, "artifact")
+	}
+	if state.BuilderRequired && (revision == nil || strings.TrimSpace(revision.Source.Builder) == "") {
+		missing = append(missing, "builder")
 	}
 	if revision == nil || !runtimeReady(revision.Runtime) {
 		missing = append(missing, "runtime")

@@ -119,38 +119,80 @@ func humanInteractive(cmd *cobra.Command) bool {
 	outputMode, _ := cmd.Flags().GetString("output")
 	plain := outputMode == "" || outputMode == "plain"
 	return !jsonMode && plain &&
-		term.IsTerminal(int(os.Stdin.Fd())) && ui.Enabled(os.Stderr) //nolint:gosec // G115: file descriptors fit in int.
+		term.IsTerminal(
+			int(os.Stdin.Fd()),
+		) && ui.Enabled(os.Stderr) //nolint:gosec // G115: file descriptors fit in int.
 }
 
 // addSetupFlags adds the source, runtime, process, configuration, secret and
 // domain inputs shared by app create and env create.
 func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 	f := cmd.Flags()
-	f.String("node", defaultNodeName, "Application node with the application role and docker capability")
+	f.String(
+		"node",
+		defaultNodeName,
+		"Application node with the application role and docker capability",
+	)
 	f.String("build-node", "", "Optional builder node (builder + buildpacks); defaults to --node")
 	f.String("git-url", "", "HTTPS git repository URL without credentials")
 	f.String("git-ref", "", "Branch or tag to build; empty uses the repository default")
 	f.String("git-credential-file", "", "Protected 0600 file containing the repository read token")
-	f.String("git-credential-name", "", "Vault secret name for the read token (default GIT_READ_TOKEN)")
-	f.Bool("github-auth", false, "Use the local authenticated gh token as the github.com read credential (opt-in; broader scopes may apply)")
-	f.String("builder", "", "Buildpacks builder image; empty uses the build node's platform default")
+	f.String(
+		"git-credential-name",
+		"",
+		"Vault secret name for the read token (default GIT_READ_TOKEN)",
+	)
+	f.Bool(
+		"github-auth",
+		false,
+		"Use the local authenticated gh token as the github.com read credential (opt-in; broader scopes may apply)",
+	)
+	f.String(
+		"builder",
+		"",
+		"Buildpacks builder image; required for Git builds, which have no built-in default",
+	)
 	f.String("context-path", "", "Build context path inside the repository")
-	f.StringArray("build-env", nil, "Buildpacks environment KEY=VALUE (repeatable; update with '' clears all)")
+	f.StringArray(
+		"build-env",
+		nil,
+		"Buildpacks environment KEY=VALUE (repeatable; update with '' clears all)",
+	)
 	addBuildpackFlags(cmd)
 	f.Int("container-port", platform.DefaultContainerPort, "Web process container port")
 	f.String("health-type", "http", "Health check type: http or tcp")
 	f.String("health-path", platform.DefaultHealthPath, "Loopback health path")
 	f.Int("health-timeout", platform.DefaultHealthTimeout, "Health timeout in seconds (1–300)")
-	f.String("release-command", "", "Release-scoped command run once per release before deployment, e.g. migrate")
-	f.StringArray("process", nil, "Complete process entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces default web). A worker has no port: queue=worker::1:queue; quotes preserve argv, no shell")
+	f.String(
+		"release-command",
+		"",
+		"Release-scoped command run once per release before deployment, e.g. migrate",
+	)
+	f.StringArray(
+		"process",
+		nil,
+		"Complete process entry NAME=KIND:PORT:REPLICAS:COMMAND ARGS (repeatable; replaces default web). A worker has no port: queue=worker::1:queue; quotes preserve argv, no shell",
+	)
 	f.StringArray("config", nil, "Plain configuration KEY=VALUE (repeatable)")
-	f.StringArray("secret", nil, "Vault secret NAME=PATH with a protected 0600 value file (repeatable)")
-	f.String("from", "", "Read an eregion.toml app definition; config is plain, secrets are names only; revision flags cannot be combined")
+	f.StringArray(
+		"secret",
+		nil,
+		"Vault secret NAME=PATH with a protected 0600 value file (repeatable)",
+	)
+	f.String(
+		"from",
+		"",
+		"Read an eregion.toml app definition; config is plain, secrets are names only; revision flags cannot be combined",
+	)
 	f.String("idempotency-key", "", "Stable submission key; one is generated when empty")
 	f.Bool("dry-run", false, "Validate and show the plan without accepting work or writing secrets")
 	if withDomain {
 		f.String("domain", "", "Public hostname for the environment; empty adds no binding")
-		f.String("domain-check-path", "", "HTTP path to observe on the first domain; empty uses the web health path")
+		f.String(
+			"domain-check-path",
+			"",
+			"HTTP path to observe on the first domain; empty uses the web health path",
+		)
 	}
 }
 
@@ -158,15 +200,21 @@ func addSetupFlags(cmd *cobra.Command, withDomain bool) {
 // by app create and env create. Omitting both uses the name default:
 // production and staging protected, every other name unprotected.
 func addProtectionFlags(cmd *cobra.Command) {
-	cmd.Flags().Bool("protected", false, "Create the environment protected (the default for production and staging)")
-	cmd.Flags().Bool("unprotected", false, "Create the environment unprotected; explicit opt-out from the name default")
+	cmd.Flags().
+		Bool("protected", false, "Create the environment protected (the default for production and staging)")
+	cmd.Flags().
+		Bool("unprotected", false, "Create the environment unprotected; explicit opt-out from the name default")
 }
 
 func setupProtectionFlag(cmd *cobra.Command) (*bool, error) {
 	protected := flagChanged(cmd, "protected")
 	unprotected := flagChanged(cmd, "unprotected")
 	if protected && unprotected {
-		return nil, contract.NewFault(contract.ValidationFailed, "choose one protection state", "Pass --protected or --unprotected, not both.")
+		return nil, contract.NewFault(
+			contract.ValidationFailed,
+			"choose one protection state",
+			"Pass --protected or --unprotected, not both.",
+		)
 	}
 	switch {
 	case unprotected:
@@ -192,7 +240,11 @@ func (a *app) registerSecretValue(value []byte) {
 // confirmation, so a cancelled prompt leaves no operation behind.
 func setupPromptError(command string, err error) error {
 	if errors.Is(err, ui.ErrAborted) {
-		return contract.NewFault(contract.Cancelled, command+" cancelled", "No operation was submitted and no secret value was written.")
+		return contract.NewFault(
+			contract.Cancelled,
+			command+" cancelled",
+			"No operation was submitted and no secret value was written.",
+		)
 	}
 	return err
 }
@@ -217,15 +269,45 @@ func flagChanged(cmd *cobra.Command, name string) bool {
 	return cmd != nil && cmd.Flags().Lookup(name) != nil && cmd.Flags().Changed(name)
 }
 
-var buildpackFlagNames = []string{"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version"}
+var buildpackFlagNames = []string{
+	"buildpack",
+	"keep-file",
+	"frontend-directory",
+	"frontend-script",
+	"frontend-start-script",
+	"target",
+	"go-version",
+	"go-build-flags",
+	"node-version",
+}
 
 func addBuildpackFlags(cmd *cobra.Command) {
 	f := cmd.Flags()
-	f.StringArray("buildpack", nil, "Ordered buildpack OCI reference or builder URN (repeatable; empty clears order)")
-	f.StringArray("keep-file", nil, "Repository-relative keep-file glob (repeatable; empty clears list)")
-	f.String("frontend-directory", "", "Node project directory relative to the build context; empty clears override")
-	f.StringArray("frontend-script", nil, "Node package script in order (repeatable; empty clears override)")
-	f.String("frontend-start-script", "", "Existing npm package script for launch (empty clears override)")
+	f.StringArray(
+		"buildpack",
+		nil,
+		"Ordered buildpack OCI reference or builder URN (repeatable; empty clears order)",
+	)
+	f.StringArray(
+		"keep-file",
+		nil,
+		"Repository-relative keep-file glob (repeatable; empty clears list)",
+	)
+	f.String(
+		"frontend-directory",
+		"",
+		"Node project directory relative to the build context; empty clears override",
+	)
+	f.StringArray(
+		"frontend-script",
+		nil,
+		"Node package script in order (repeatable; empty clears override)",
+	)
+	f.String(
+		"frontend-start-script",
+		"",
+		"Existing npm package script for launch (empty clears override)",
+	)
 	f.StringArray("target", nil, "Go target PROCESS=./PACKAGE (repeatable; empty clears targets)")
 	f.String("go-version", "", "Go buildpack version")
 	f.String("go-build-flags", "", "Go build flags")
@@ -250,7 +332,11 @@ func parseGoTargets(values []string) ([]buildpacks.GoTarget, error) {
 		}
 		process, target, ok := strings.Cut(value, "=")
 		if !ok {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid --target", "Use PROCESS=./PACKAGE; an empty value clears targets.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid --target",
+				"Use PROCESS=./PACKAGE; an empty value clears targets.",
+			)
 		}
 		targets = append(targets, buildpacks.GoTarget{Process: process, Target: target})
 	}
@@ -262,7 +348,8 @@ func parseGoTargets(values []string) ([]buildpacks.GoTarget, error) {
 }
 
 func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) error {
-	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script") || flagChanged(cmd, "frontend-start-script")
+	frontend := flagChanged(cmd, "frontend-directory") || flagChanged(cmd, "frontend-script") ||
+		flagChanged(cmd, "frontend-start-script")
 	if flagChanged(cmd, "target") {
 		targets, err := parseGoTargets(flagArray(cmd, "target"))
 		if err != nil {
@@ -270,7 +357,8 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 		}
 		source.GoTargets = targets
 	}
-	advanced := flagChanged(cmd, "go-version") || flagChanged(cmd, "go-build-flags") || flagChanged(cmd, "node-version")
+	advanced := flagChanged(cmd, "go-version") || flagChanged(cmd, "go-build-flags") ||
+		flagChanged(cmd, "node-version")
 	if frontend || advanced || flagChanged(cmd, "buildpack") || flagChanged(cmd, "keep-file") {
 		if source.Buildpacks == nil {
 			source.Buildpacks = &buildpacks.Settings{}
@@ -321,7 +409,11 @@ func applyBuildpackFlags(cmd *cobra.Command, source *platform.SourceBinding) err
 		}
 		settings, err := buildpacks.NormalizeSettings(source.Buildpacks)
 		if err != nil {
-			return contract.NewFault(contract.ValidationFailed, "invalid Buildpacks settings", err.Error())
+			return contract.NewFault(
+				contract.ValidationFailed,
+				"invalid Buildpacks settings",
+				err.Error(),
+			)
 		}
 		source.Buildpacks = settings
 	}
@@ -334,7 +426,11 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 	for _, target := range source.GoTargets {
 		values = append(values, target.Process+"="+target.Target)
 	}
-	text, err := ui.Input("Go targets", "Comma-separated PROCESS=./PACKAGE entries; empty for defaults", strings.Join(values, ","))
+	text, err := ui.Input(
+		"Go targets",
+		"Comma-separated PROCESS=./PACKAGE entries; empty for defaults",
+		strings.Join(values, ","),
+	)
 	if err != nil {
 		return err
 	}
@@ -347,7 +443,11 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 	if settings != nil {
 		order = settings.Order
 	}
-	text, err = ui.Input("Buildpack order", "Comma-separated fully qualified references; empty uses builder detection", strings.Join(order, ","))
+	text, err = ui.Input(
+		"Buildpack order",
+		"Comma-separated fully qualified references; empty uses builder detection",
+		strings.Join(order, ","),
+	)
 	if err != nil {
 		return err
 	}
@@ -364,7 +464,11 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 	if settings != nil {
 		keepFiles = settings.KeepFiles
 	}
-	text, err = ui.Input("Keep files", "Comma-separated repository-relative globs; empty clears the list", strings.Join(keepFiles, ","))
+	text, err = ui.Input(
+		"Keep files",
+		"Comma-separated repository-relative globs; empty clears the list",
+		strings.Join(keepFiles, ","),
+	)
 	if err != nil {
 		return err
 	}
@@ -378,7 +482,11 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 		}
 	}
 	enabled := settings != nil && settings.Frontend != nil
-	enabled, err = ui.YesNoDefault("Configure Node build inputs?", "Optional inputs for a selected Node buildpack", enabled)
+	enabled, err = ui.YesNoDefault(
+		"Configure Node build inputs?",
+		"Optional inputs for a selected Node buildpack",
+		enabled,
+	)
 	if err != nil {
 		return err
 	}
@@ -390,16 +498,28 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 			settings.Frontend = &buildpacks.Frontend{}
 		}
 		f := settings.Frontend
-		f.Directory, err = ui.Input("Frontend directory", "Relative to the build context; empty uses buildpack default", f.Directory)
+		f.Directory, err = ui.Input(
+			"Frontend directory",
+			"Relative to the build context; empty uses buildpack default",
+			f.Directory,
+		)
 		if err != nil {
 			return err
 		}
-		text, err = ui.Input("Frontend scripts", "Comma-separated package script names; empty uses buildpack default", strings.Join(f.Scripts, ","))
+		text, err = ui.Input(
+			"Frontend scripts",
+			"Comma-separated package script names; empty uses buildpack default",
+			strings.Join(f.Scripts, ","),
+		)
 		if err != nil {
 			return err
 		}
 		f.Scripts = strings.Split(text, ",")
-		f.StartScript, err = ui.Input("Frontend start script", "Existing npm package script for launch; empty uses buildpack default", f.StartScript)
+		f.StartScript, err = ui.Input(
+			"Frontend start script",
+			"Existing npm package script for launch; empty uses buildpack default",
+			f.StartScript,
+		)
 		if err != nil {
 			return err
 		}
@@ -410,15 +530,27 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 	if settings != nil && settings.Advanced != nil {
 		advanced = *settings.Advanced
 	}
-	advanced.GoVersion, err = ui.Input("Go version", "Empty uses the buildpack default", advanced.GoVersion)
+	advanced.GoVersion, err = ui.Input(
+		"Go version",
+		"Empty uses the buildpack default",
+		advanced.GoVersion,
+	)
 	if err != nil {
 		return err
 	}
-	advanced.GoBuildFlags, err = ui.Input("Go build flags", "Empty uses the buildpack default", advanced.GoBuildFlags)
+	advanced.GoBuildFlags, err = ui.Input(
+		"Go build flags",
+		"Empty uses the buildpack default",
+		advanced.GoBuildFlags,
+	)
 	if err != nil {
 		return err
 	}
-	advanced.NodeVersion, err = ui.Input("Node version", "Empty uses the buildpack default", advanced.NodeVersion)
+	advanced.NodeVersion, err = ui.Input(
+		"Node version",
+		"Empty uses the buildpack default",
+		advanced.NodeVersion,
+	)
 	if err != nil {
 		return err
 	}
@@ -432,7 +564,11 @@ func guidedBuildpacks(source *platform.SourceBinding) error {
 	}
 	settings, err = buildpacks.NormalizeSettings(settings)
 	if err != nil {
-		return contract.NewFault(contract.ValidationFailed, "invalid Buildpacks settings", err.Error())
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid Buildpacks settings",
+			err.Error(),
+		)
 	}
 	source.Buildpacks = settings
 	return nil
@@ -489,7 +625,10 @@ func askReplicas(title, def string) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if replicas, convErr := strconv.Atoi(value); convErr == nil && replicas >= 1 && replicas <= 32 {
+		if replicas, convErr := strconv.Atoi(
+			value,
+		); convErr == nil && replicas >= 1 &&
+			replicas <= 32 {
 			return replicas, nil
 		}
 		fmt.Fprintln(os.Stderr, ui.Warn("Use between 1 and 32 replicas."))
@@ -504,7 +643,10 @@ func askIntRange(title, description, def string, min, max int) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if number, convErr := strconv.Atoi(value); convErr == nil && number >= min && number <= max {
+		if number, convErr := strconv.Atoi(
+			value,
+		); convErr == nil && number >= min &&
+			number <= max {
 			return number, nil
 		}
 		fmt.Fprintln(os.Stderr, ui.Warn(fmt.Sprintf("Use a number from %d to %d.", min, max)))
@@ -515,17 +657,49 @@ func askIntRange(title, description, def string, min, max int) (int, error) {
 // definitionRevisionFlags are the explicit flag inputs that a definition file
 // owns. Combining one with --from would make the requested state ambiguous.
 var definitionRevisionFlags = []string{
-	"node", "build-node", "git-url", "git-ref", "git-credential-file",
-	"git-credential-name", "image", "builder", "context-path", "build-env",
-	"buildpack", "keep-file", "frontend-directory", "frontend-script", "frontend-start-script", "target", "go-version", "go-build-flags", "node-version",
-	"container-port", "health-type", "health-path", "health-timeout",
-	"release-command", "process", "config", "secret", "domain", "domain-check-path",
+	"node",
+	"build-node",
+	"git-url",
+	"git-ref",
+	"git-credential-file",
+	"git-credential-name",
+	"image",
+	"builder",
+	"context-path",
+	"build-env",
+	"buildpack",
+	"keep-file",
+	"frontend-directory",
+	"frontend-script",
+	"frontend-start-script",
+	"target",
+	"go-version",
+	"go-build-flags",
+	"node-version",
+	"container-port",
+	"health-type",
+	"health-path",
+	"health-timeout",
+	"release-command",
+	"process",
+	"config",
+	"secret",
+	"domain",
+	"domain-check-path",
 }
 
-func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string) (*setupAnswers, error) {
+func (a *app) readSetupFromFile(
+	cmd *cobra.Command,
+	mode setupMode,
+	path string,
+) (*setupAnswers, error) {
 	for _, name := range definitionRevisionFlags {
 		if flagChanged(cmd, name) {
-			return nil, contract.NewFault(contract.ValidationFailed, "definition file and revision flags conflict", "Use --from alone for revision fields; keep only identity, deploy, output and idempotency flags.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"definition file and revision flags conflict",
+				"Use --from alone for revision fields; keep only identity, deploy, output and idempotency flags.",
+			)
 		}
 	}
 	definition, err := readDefinitionFile(path)
@@ -543,7 +717,11 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 		if flagChanged(cmd, "name") {
 			flagName := flagString(cmd, "name")
 			if appName != "" && flagName != appName {
-				return nil, contract.NewFault(contract.ValidationFailed, "definition app disagrees with --name", "Use the file's app name, or edit the definition.")
+				return nil, contract.NewFault(
+					contract.ValidationFailed,
+					"definition app disagrees with --name",
+					"Use the file's app name, or edit the definition.",
+				)
 			}
 			appName = flagName
 		}
@@ -551,13 +729,21 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 		if flagChanged(cmd, "app") {
 			flagApp := flagString(cmd, "app")
 			if appName != "" && flagApp != appName {
-				return nil, contract.NewFault(contract.ValidationFailed, "definition app disagrees with --app", "Use the file's app name, or edit the definition.")
+				return nil, contract.NewFault(
+					contract.ValidationFailed,
+					"definition app disagrees with --app",
+					"Use the file's app name, or edit the definition.",
+				)
 			}
 			appName = flagApp
 		}
 	}
 	if err := platform.ValidateName(appName); err != nil {
-		return nil, contract.NewFault(contract.ValidationFailed, "definition app is missing or invalid", "Set app in the definition or pass the command's app flag.")
+		return nil, contract.NewFault(
+			contract.ValidationFailed,
+			"definition app is missing or invalid",
+			"Set app in the definition or pass the command's app flag.",
+		)
 	}
 	resolvedImageRepository := ""
 	if definition.ImageRepository != nil {
@@ -568,12 +754,18 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 		resolvedImageRepository = normalized
 	}
 	if flagChanged(cmd, "image-repository") {
-		flagRepository, err := platform.NormalizeImageRepository(flagString(cmd, "image-repository"))
+		flagRepository, err := platform.NormalizeImageRepository(
+			flagString(cmd, "image-repository"),
+		)
 		if err != nil {
 			return nil, err
 		}
 		if resolvedImageRepository != "" && resolvedImageRepository != flagRepository {
-			return nil, contract.NewFault(contract.ValidationFailed, "definition image_repository disagrees with --image-repository", "Use the file's repository, or edit the definition.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"definition image_repository disagrees with --image-repository",
+				"Use the file's repository, or edit the definition.",
+			)
 		}
 		resolvedImageRepository = flagRepository
 	}
@@ -623,10 +815,18 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 	case setupEnvironment:
 		selected := flagString(cmd, "name")
 		if selected == "" {
-			return nil, contract.NewFault(contract.InputRequired, "an environment is required", "Pass --name; the shared recipe applies to any environment without adding it to the definition.")
+			return nil, contract.NewFault(
+				contract.InputRequired,
+				"an environment is required",
+				"Pass --name; the shared recipe applies to any environment without adding it to the definition.",
+			)
 		}
 		if err := platform.ValidateName(selected); err != nil {
-			return nil, contract.NewFault(contract.ValidationFailed, "definition environment is invalid", err.Error())
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"definition environment is invalid",
+				err.Error(),
+			)
 		}
 		_, spec, resourceSpecs, err := resolve(selected)
 		if err != nil {
@@ -638,18 +838,33 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 
 	primary := specs[0]
 	ans := &setupAnswers{
-		App: appName, Environment: primary.Name, ImageRepository: resolvedImageRepository, Node: primary.Node, BuildNode: primary.BuildNode,
-		GitURL: primary.Source.URL, GitRef: primary.Source.Ref,
-		CredentialName: primary.Source.CredentialSecretName,
-		Builder:        primary.Source.Builder, ContextPath: primary.Source.ContextPath,
-		GoTargets: primary.Source.GoTargets, Buildpacks: primary.Source.Buildpacks,
-		ContainerPort: primary.ContainerPort, HealthType: primary.Runtime.HealthType,
-		HealthPath: primary.Runtime.HealthPath, HealthTimeout: primary.Runtime.HealthTimeoutSeconds,
-		Processes: primary.Processes, Config: cloneStringMap(primary.Config),
-		SecretValues: map[string][]byte{}, SecretNames: append([]string(nil), primary.SecretNames...),
-		Domains: append([]platform.DomainDeclaration(nil), primary.Domains...), From: path,
-		ResourceSpecs: resourceByEnvironment[primary.Name], ResourceNames: append([]string(nil), primary.Resources...),
-		Protection: protection, PrebuiltSpecs: specs, AdditionalResourceSpecs: resourceByEnvironment,
+		App:                     appName,
+		Environment:             primary.Name,
+		ImageRepository:         resolvedImageRepository,
+		Node:                    primary.Node,
+		BuildNode:               primary.BuildNode,
+		GitURL:                  primary.Source.URL,
+		GitRef:                  primary.Source.Ref,
+		CredentialName:          primary.Source.CredentialSecretName,
+		Builder:                 primary.Source.Builder,
+		ContextPath:             primary.Source.ContextPath,
+		GoTargets:               primary.Source.GoTargets,
+		Buildpacks:              primary.Source.Buildpacks,
+		ContainerPort:           primary.ContainerPort,
+		HealthType:              primary.Runtime.HealthType,
+		HealthPath:              primary.Runtime.HealthPath,
+		HealthTimeout:           primary.Runtime.HealthTimeoutSeconds,
+		Processes:               primary.Processes,
+		Config:                  cloneStringMap(primary.Config),
+		SecretValues:            map[string][]byte{},
+		SecretNames:             append([]string(nil), primary.SecretNames...),
+		Domains:                 append([]platform.DomainDeclaration(nil), primary.Domains...),
+		From:                    path,
+		ResourceSpecs:           resourceByEnvironment[primary.Name],
+		ResourceNames:           append([]string(nil), primary.Resources...),
+		Protection:              protection,
+		PrebuiltSpecs:           specs,
+		AdditionalResourceSpecs: resourceByEnvironment,
 	}
 	for _, domain := range primary.Domains {
 		if domain.Primary {
@@ -675,7 +890,11 @@ func (a *app) readSetupFromFile(cmd *cobra.Command, mode setupMode, path string)
 			ans.Deploy = false
 			break
 		}
-		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from production's new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
+		deploy, err := ui.YesNoDefault(
+			"Request the first deploy?",
+			"The submission queues it from production's new revision; --no-deploy skips it. A first deploy needs a domain.",
+			ans.Domain != "",
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -701,9 +920,11 @@ func validateUniqueEnvironmentDomains(specs []platform.EnvironmentSpec) error {
 	for _, spec := range specs {
 		for _, domain := range environmentSpecDomains(spec) {
 			if other, exists := seen[domain]; exists {
-				return contract.NewFault(contract.ValidationFailed,
+				return contract.NewFault(
+					contract.ValidationFailed,
 					"domain "+domain+" is declared for both "+other+" and "+spec.Name,
-					"Each hostname can route to one environment; put distinct domains in [environments.<name>] overrides.")
+					"Each hostname can route to one environment; put distinct domains in [environments.<name>] overrides.",
+				)
 			}
 			seen[domain] = spec.Name
 		}
@@ -726,17 +947,35 @@ func readDefinitionFile(path string) (appdef.Definition, error) {
 	const maxDefinitionBytes = 1 << 20
 	info, err := os.Stat(path)
 	if err != nil {
-		return appdef.Definition{}, contract.NewFault(contract.InputRequired, "cannot read the app definition", "Pass --from with a readable regular file.")
+		return appdef.Definition{}, contract.NewFault(
+			contract.InputRequired,
+			"cannot read the app definition",
+			"Pass --from with a readable regular file.",
+		)
 	}
 	if !info.Mode().IsRegular() {
-		return appdef.Definition{}, contract.NewFault(contract.InputRequired, "the app definition is not a regular file", "Pass --from with a readable regular file.")
+		return appdef.Definition{}, contract.NewFault(
+			contract.InputRequired,
+			"the app definition is not a regular file",
+			"Pass --from with a readable regular file.",
+		)
 	}
 	if info.Size() > maxDefinitionBytes {
-		return appdef.Definition{}, contract.NewFault(contract.ValidationFailed, "the app definition is too large", "Keep the definition under 1 MiB.")
+		return appdef.Definition{}, contract.NewFault(
+			contract.ValidationFailed,
+			"the app definition is too large",
+			"Keep the definition under 1 MiB.",
+		)
 	}
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: the operator explicitly selected the definition input.
+	raw, err := os.ReadFile(
+		path,
+	) //nolint:gosec // G304: the operator explicitly selected the definition input.
 	if err != nil {
-		return appdef.Definition{}, contract.NewFault(contract.InputRequired, "cannot read the app definition", "Pass --from with a readable regular file.")
+		return appdef.Definition{}, contract.NewFault(
+			contract.InputRequired,
+			"cannot read the app definition",
+			"Pass --from with a readable regular file.",
+		)
 	}
 	definition, err := appdef.Parse(raw)
 	if err != nil {
@@ -828,9 +1067,18 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			if mode == setupEnvironment {
 				flag = "--app"
 			}
-			return nil, contract.NewFault(contract.InputRequired, flag+" is required without a terminal", "Pass "+flag+" with the app name.")
+			return nil, contract.NewFault(
+				contract.InputRequired,
+				flag+" is required without a terminal",
+				"Pass "+flag+" with the app name.",
+			)
 		}
-		value, err := askValidated("App name", "Lowercase letters, digits and inner hyphens", "", platform.ValidateName)
+		value, err := askValidated(
+			"App name",
+			"Lowercase letters, digits and inner hyphens",
+			"",
+			platform.ValidateName,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -838,26 +1086,56 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 	}
 	if ans.Environment == "" {
 		if !interactive {
-			return nil, contract.NewFault(contract.InputRequired, "--name is required without a terminal", "Pass --name with the environment name.")
+			return nil, contract.NewFault(
+				contract.InputRequired,
+				"--name is required without a terminal",
+				"Pass --name with the environment name.",
+			)
 		}
-		value, err := askValidated("Environment name", "For example production or staging", "", platform.ValidateName)
+		value, err := askValidated(
+			"Environment name",
+			"For example production or staging",
+			"",
+			platform.ValidateName,
+		)
 		if err != nil {
 			return nil, err
 		}
 		ans.Environment = value
 	}
 	if interactive && mode == setupApp {
-		fmt.Fprintln(os.Stderr, ui.Note("app create will also create staging from this recipe; both start protected."))
+		fmt.Fprintln(
+			os.Stderr,
+			ui.Note("app create will also create staging from this recipe; both start protected."),
+		)
 	}
 	if interactive && !flagChanged(cmd, "node") {
-		value, err := a.askNode(cmd, "Application node", "Runs the containers", ans.Node, platform.RoleApplication, platform.CapabilityDocker, "", "")
+		value, err := a.askNode(
+			cmd,
+			"Application node",
+			"Runs the containers",
+			ans.Node,
+			platform.RoleApplication,
+			platform.CapabilityDocker,
+			"",
+			"",
+		)
 		if err != nil {
 			return nil, err
 		}
 		ans.Node = value
 	}
 	if interactive && !flagChanged(cmd, "build-node") {
-		value, err := a.askNode(cmd, "Builder node", "Runs the Buildpacks builds", ans.BuildNode, platform.RoleBuilder, platform.CapabilityBuildpacks, "The application node", ans.Node)
+		value, err := a.askNode(
+			cmd,
+			"Builder node",
+			"Runs the Buildpacks builds",
+			ans.BuildNode,
+			platform.RoleBuilder,
+			platform.CapabilityBuildpacks,
+			"The application node",
+			ans.Node,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -869,7 +1147,11 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		// A Git URL is the only source recipe. Absent means image-only app
 		// creation; the artifact is selected explicitly at deploy time.
 	case interactive:
-		value, err := ui.Input("HTTPS git repository (optional)", "Leave empty to deploy explicit artifacts later; no source is required", "")
+		value, err := ui.Input(
+			"HTTPS git repository (optional)",
+			"Leave empty to deploy explicit artifacts later; no source is required",
+			"",
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -881,7 +1163,11 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			return nil, err
 		}
 		if interactive && !flagChanged(cmd, "git-ref") {
-			value, err := ui.Input("Branch or tag", "Empty uses the repository's default branch", ans.GitRef)
+			value, err := ui.Input(
+				"Branch or tag",
+				"Empty uses the repository's default branch",
+				ans.GitRef,
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -891,19 +1177,28 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			return nil, err
 		}
 		if interactive && !flagChanged(cmd, "builder") {
-			value, err := askValidated("Buildpacks builder", "Empty uses the build node's platform default", ans.Builder, func(value string) error {
-				if value == "" {
-					return nil
-				}
-				return platform.ValidateImage(value)
-			})
+			value, err := askValidated(
+				"Buildpacks builder",
+				"Required for Git builds; there is no built-in default",
+				ans.Builder,
+				func(value string) error {
+					if value == "" {
+						return fmt.Errorf("git builds require an explicit builder; there is no built-in default")
+					}
+					return platform.ValidateImage(value)
+				},
+			)
 			if err != nil {
 				return nil, err
 			}
 			ans.Builder = value
 		}
 		if interactive && !flagChanged(cmd, "context-path") {
-			value, err := ui.Input("Build context path", "Empty builds the repository root", ans.ContextPath)
+			value, err := ui.Input(
+				"Build context path",
+				"Empty builds the repository root",
+				ans.ContextPath,
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -925,20 +1220,34 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 		ans.GoTargets, ans.Buildpacks = source.GoTargets, source.Buildpacks
 	} else {
-		if flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") || flagChanged(cmd, "build-env") || buildpackFlagsChanged(cmd) {
-			return nil, contract.NewFault(contract.ValidationFailed, "build settings need a Git source", "Pass --git-url, or omit --builder, --context-path and --build-env for an image-only app.")
+		if flagChanged(cmd, "builder") || flagChanged(cmd, "context-path") ||
+			flagChanged(cmd, "build-env") ||
+			buildpackFlagsChanged(cmd) {
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"build settings need a Git source",
+				"Pass --git-url, or omit --builder, --context-path and --build-env for an image-only app.",
+			)
 		}
 	}
 
 	if interactive && !flagChanged(cmd, "container-port") && len(flagArray(cmd, "process")) == 0 {
-		port, err := askPort("Web container port", "The port the web process listens on inside the container", fmt.Sprint(ans.ContainerPort))
+		port, err := askPort(
+			"Web container port",
+			"The port the web process listens on inside the container",
+			fmt.Sprint(ans.ContainerPort),
+		)
 		if err != nil {
 			return nil, err
 		}
 		ans.ContainerPort = port
 	}
 	if interactive && !flagChanged(cmd, "health-path") {
-		value, err := ui.Input("Health path", "Loopback HTTP path used by the deploy health check", ans.HealthPath)
+		value, err := ui.Input(
+			"Health path",
+			"Loopback HTTP path used by the deploy health check",
+			ans.HealthPath,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -977,7 +1286,11 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 		}
 		for name, path := range valuesByPath {
 			if ans.CredentialName != "" && name == ans.CredentialName {
-				return nil, contract.NewFault(contract.ValidationFailed, "secret name conflicts with the git read credential", "The read credential is not injected into the app; choose another secret name.")
+				return nil, contract.NewFault(
+					contract.ValidationFailed,
+					"secret name conflicts with the git read credential",
+					"The read credential is not injected into the app; choose another secret name.",
+				)
 			}
 			value, err := readProtectedSecretFile(path)
 			if err != nil {
@@ -993,7 +1306,11 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 	}
 
 	if interactive && !flagChanged(cmd, "domain") {
-		value, err := ui.Input("Public domain", "For example api.example.com; empty adds it later", ans.Domain)
+		value, err := ui.Input(
+			"Public domain",
+			"For example api.example.com; empty adds it later",
+			ans.Domain,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -1014,7 +1331,11 @@ func (a *app) readSetup(cmd *cobra.Command, mode setupMode) (*setupAnswers, erro
 			ans.Deploy = false
 			break
 		}
-		deploy, err := ui.YesNoDefault("Request the first deploy?", "The submission queues it from the new revision; --no-deploy skips it. A first deploy needs a domain.", ans.Domain != "")
+		deploy, err := ui.YesNoDefault(
+			"Request the first deploy?",
+			"The submission queues it from the new revision; --no-deploy skips it. A first deploy needs a domain.",
+			ans.Domain != "",
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -1054,19 +1375,32 @@ func (a *app) readSetupCredential(cmd *cobra.Command, ans *setupAnswers, interac
 		return nil
 	}
 	if name != "" {
-		return contract.NewFault(contract.InputRequired, "--git-credential-name needs a value", "Pass --git-credential-file with a protected 0600 file, or omit both flags.")
+		return contract.NewFault(
+			contract.InputRequired,
+			"--git-credential-name needs a value",
+			"Pass --git-credential-file with a protected 0600 file, or omit both flags.",
+		)
 	}
 	if !interactive {
 		return nil
 	}
-	private, err := ui.YesNoDefault("Private repository?", "Store a read credential in this environment's vault; only its name enters the revision", false)
+	private, err := ui.YesNoDefault(
+		"Private repository?",
+		"Store a read credential in this environment's vault; only its name enters the revision",
+		false,
+	)
 	if err != nil {
 		return err
 	}
 	if !private {
 		return nil
 	}
-	name, err = askValidated("Credential secret name", "The vault name for the repository read token", "GIT_READ_TOKEN", vault.ValidateName)
+	name, err = askValidated(
+		"Credential secret name",
+		"The vault name for the repository read token",
+		"GIT_READ_TOKEN",
+		vault.ValidateName,
+	)
 	if err != nil {
 		return err
 	}
@@ -1075,7 +1409,11 @@ func (a *app) readSetupCredential(cmd *cobra.Command, ans *setupAnswers, interac
 		return err
 	}
 	if token == "" {
-		return contract.NewFault(contract.InputRequired, "the read token is empty", "Enter a token, or answer No to the private-repository question.")
+		return contract.NewFault(
+			contract.InputRequired,
+			"the read token is empty",
+			"Enter a token, or answer No to the private-repository question.",
+		)
 	}
 	value := []byte(token)
 	a.registerSecretValue(value)
@@ -1109,17 +1447,26 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 			return extras, nil
 		}
 		if !setupProcessNamePattern.MatchString(name) {
-			fmt.Fprintln(os.Stderr, ui.Warn("Use a lowercase process name of 1–63 letters, digits, underscores, or hyphens."))
+			fmt.Fprintln(
+				os.Stderr,
+				ui.Warn(
+					"Use a lowercase process name of 1–63 letters, digits, underscores, or hyphens.",
+				),
+			)
 			continue
 		}
 		if seen[name] {
 			fmt.Fprintln(os.Stderr, ui.Warn("Use each process name once."))
 			continue
 		}
-		kind, err := ui.Choose("Process kind", "A worker has no port; a service has a private container port", [][2]string{
-			{"Worker (no port)", "worker"},
-			{"Service (private port only)", "service"},
-		})
+		kind, err := ui.Choose(
+			"Process kind",
+			"A worker has no port; a service has a private container port",
+			[][2]string{
+				{"Worker (no port)", "worker"},
+				{"Service (private port only)", "service"},
+			},
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -1148,7 +1495,12 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 			continue
 		}
 		extras = append(extras, platform.ProcessSpec{
-			Name: name, Kind: kind, Command: command, Args: args, Replicas: replicas, ContainerPort: port,
+			Name:          name,
+			Kind:          kind,
+			Command:       command,
+			Args:          args,
+			Replicas:      replicas,
+			ContainerPort: port,
 		})
 		seen[name] = true
 	}
@@ -1157,7 +1509,11 @@ func readAdditionalProcesses(existing []platform.ProcessSpec) ([]platform.Proces
 func readConfigPairs(ans *setupAnswers) error {
 	text := ""
 	for {
-		value, err := ui.Lines("Config", "One KEY=VALUE per line; paste a .env block. Blank lines and # comments are skipped. Ctrl+J for a new line, Enter to finish", text)
+		value, err := ui.Lines(
+			"Config",
+			"One KEY=VALUE per line; paste a .env block. Blank lines and # comments are skipped. Ctrl+J for a new line, Enter to finish",
+			text,
+		)
 		if err != nil {
 			return err
 		}
@@ -1185,7 +1541,8 @@ func envLines(text string) []string {
 		}
 		line = strings.TrimPrefix(line, "export ")
 		if key, value, ok := strings.Cut(line, "="); ok && len(value) >= 2 {
-			if (value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'') {
+			if (value[0] == '"' && value[len(value)-1] == '"') ||
+				(value[0] == '\'' && value[len(value)-1] == '\'') {
 				line = key + "=" + value[1:len(value)-1]
 			}
 		}
@@ -1200,7 +1557,11 @@ func (a *app) readSetupSecrets(ans *setupAnswers) error {
 		if n := len(ans.SecretValues); n > 0 {
 			title = fmt.Sprintf("Another secret name (%d added)", n)
 		}
-		name, err := ui.Input(title, "Environment-variable form, e.g. DATABASE_URL; empty to finish", "")
+		name, err := ui.Input(
+			title,
+			"Environment-variable form, e.g. DATABASE_URL; empty to finish",
+			"",
+		)
 		if err != nil {
 			return err
 		}
@@ -1216,7 +1577,10 @@ func (a *app) readSetupSecrets(ans *setupAnswers) error {
 			continue
 		}
 		if ans.CredentialName != "" && name == ans.CredentialName {
-			fmt.Fprintln(os.Stderr, ui.Warn("The git read credential is not injected; choose another secret name."))
+			fmt.Fprintln(
+				os.Stderr,
+				ui.Warn("The git read credential is not injected; choose another secret name."),
+			)
 			continue
 		}
 		value, err := ui.Secret("Secret value for " + name)
@@ -1283,7 +1647,11 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 	}
 
 	if ans.HealthType != "http" && ans.HealthType != "tcp" {
-		return platform.EnvironmentSpec{}, contract.NewFault(contract.ValidationFailed, "invalid health type", "Use http or tcp.")
+		return platform.EnvironmentSpec{}, contract.NewFault(
+			contract.ValidationFailed,
+			"invalid health type",
+			"Use http or tcp.",
+		)
 	}
 	if ans.HealthPath == "" {
 		ans.HealthPath = platform.DefaultHealthPath
@@ -1353,10 +1721,17 @@ func (ans *setupAnswers) environmentSpec(cmd *cobra.Command) (platform.Environme
 		}
 	}
 	spec := platform.EnvironmentSpec{
-		Name: ans.Environment, Node: ans.Node, BuildNode: ans.BuildNode,
+		Name:          ans.Environment,
+		Node:          ans.Node,
+		BuildNode:     ans.BuildNode,
 		Protected:     ans.Protection,
-		ContainerPort: containerPort, Bind: platform.DefaultBind,
-		Health: platform.HealthInput{Type: ans.HealthType, Path: ans.HealthPath, TimeoutSeconds: ans.HealthTimeout},
+		ContainerPort: containerPort,
+		Bind:          platform.DefaultBind,
+		Health: platform.HealthInput{
+			Type:           ans.HealthType,
+			Path:           ans.HealthPath,
+			TimeoutSeconds: ans.HealthTimeout,
+		},
 		Source: source,
 		Runtime: platform.RuntimeSpec{
 			Node: ans.Node, HealthType: ans.HealthType, HealthPath: ans.HealthPath,
@@ -1383,29 +1758,56 @@ func defaultSetupWebProcess(port int) platform.ProcessSpec {
 	if port == 0 {
 		port = platform.DefaultContainerPort
 	}
-	return platform.ProcessSpec{Name: "web", Kind: "web", Args: []string{}, Replicas: 1, ContainerPort: port}
+	return platform.ProcessSpec{
+		Name:          "web",
+		Kind:          "web",
+		Args:          []string{},
+		Replicas:      1,
+		ContainerPort: port,
+	}
 }
 
 // parseAssignments parses repeated KEY=VALUE inputs. Values are plain, not
 // secrets, and cannot carry NUL or line breaks.
 func parseAssignments(values []string, label string) (map[string]string, error) {
 	if len(values) > 64 {
-		return nil, contract.NewFault(contract.ValidationFailed, "too many "+label+" entries", "Use at most 64 entries.")
+		return nil, contract.NewFault(
+			contract.ValidationFailed,
+			"too many "+label+" entries",
+			"Use at most 64 entries.",
+		)
 	}
 	out := make(map[string]string, len(values))
 	for _, value := range values {
 		key, item, ok := strings.Cut(value, "=")
-		if !ok || key == "" || strings.TrimSpace(key) != key || strings.ContainsAny(key, " \t\r\n") {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid "+label+" value", "Use KEY=VALUE with a nonempty key without whitespace.")
+		if !ok || key == "" || strings.TrimSpace(key) != key ||
+			strings.ContainsAny(key, " \t\r\n") {
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid "+label+" value",
+				"Use KEY=VALUE with a nonempty key without whitespace.",
+			)
 		}
 		if !assignmentKeyPattern.MatchString(key) {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid "+label+" key", "Use 1–128 ASCII letters, digits, and underscores; do not start with a digit.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid "+label+" key",
+				"Use 1–128 ASCII letters, digits, and underscores; do not start with a digit.",
+			)
 		}
 		if _, exists := out[key]; exists {
-			return nil, contract.NewFault(contract.ValidationFailed, "duplicate "+label+" key", "Set each key once.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"duplicate "+label+" key",
+				"Set each key once.",
+			)
 		}
 		if strings.ContainsAny(item, "\x00\r\n") {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid "+label+" value", "Values cannot contain NUL or line breaks.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid "+label+" value",
+				"Values cannot contain NUL or line breaks.",
+			)
 		}
 		out[key] = item
 	}
@@ -1414,19 +1816,31 @@ func parseAssignments(values []string, label string) (map[string]string, error) 
 
 func parseSecretFlags(values []string) (map[string]string, error) {
 	if len(values) > 64 {
-		return nil, contract.NewFault(contract.ValidationFailed, "too many --secret entries", "Use at most 64 secret values.")
+		return nil, contract.NewFault(
+			contract.ValidationFailed,
+			"too many --secret entries",
+			"Use at most 64 secret values.",
+		)
 	}
 	out := make(map[string]string, len(values))
 	for _, value := range values {
 		name, path, ok := strings.Cut(value, "=")
 		if !ok || name == "" || path == "" {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid --secret value", "Use NAME=PATH with a vault secret name and a protected 0600 file.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid --secret value",
+				"Use NAME=PATH with a vault secret name and a protected 0600 file.",
+			)
 		}
 		if err := vault.ValidateName(name); err != nil {
 			return nil, err
 		}
 		if _, exists := out[name]; exists {
-			return nil, contract.NewFault(contract.ValidationFailed, "duplicate --secret name", "Set each secret name once.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"duplicate --secret name",
+				"Set each secret name once.",
+			)
 		}
 		out[name] = path
 	}
@@ -1437,26 +1851,46 @@ func parseSecretFlags(values []string) (map[string]string, error) {
 // replicas and command are optional; the command line never runs through a shell.
 func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 	if len(values) > 32 {
-		return nil, contract.NewFault(contract.ValidationFailed, "too many processes", "Use at most 32 processes.")
+		return nil, contract.NewFault(
+			contract.ValidationFailed,
+			"too many processes",
+			"Use at most 32 processes.",
+		)
 	}
 	out := make([]platform.ProcessSpec, 0, len(values))
 	seen := map[string]bool{}
 	for _, value := range values {
 		name, rest, ok := strings.Cut(value, "=")
 		if !ok || name == "" || strings.TrimSpace(name) != name {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid --process value", "Use NAME=KIND:PORT:REPLICAS:COMMAND ARGS.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid --process value",
+				"Use NAME=KIND:PORT:REPLICAS:COMMAND ARGS.",
+			)
 		}
 		if !setupProcessNamePattern.MatchString(name) {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid process name", "Use a lowercase name of 1–63 letters, digits, underscores, or hyphens.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid process name",
+				"Use a lowercase name of 1–63 letters, digits, underscores, or hyphens.",
+			)
 		}
 		if seen[name] {
-			return nil, contract.NewFault(contract.ValidationFailed, "duplicate process name", "Use each process name once.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"duplicate process name",
+				"Use each process name once.",
+			)
 		}
 		seen[name] = true
 		parts := strings.SplitN(rest, ":", 4)
 		kind := strings.ToLower(strings.TrimSpace(parts[0]))
 		if kind != "web" && kind != "worker" && kind != "service" {
-			return nil, contract.NewFault(contract.ValidationFailed, "invalid process kind", "Use web, worker, or service.")
+			return nil, contract.NewFault(
+				contract.ValidationFailed,
+				"invalid process kind",
+				"Use web, worker, or service.",
+			)
 		}
 		port := 0
 		if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
@@ -1464,9 +1898,16 @@ func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 			if err != nil || value < 1 || value > 65535 {
 				hint := "Use a container port from 1 to 65535."
 				if kind == "worker" {
-					hint = "A worker has no port; leave it empty: " + name + "=worker::" + strings.Join(parts[2:], ":")
+					hint = "A worker has no port; leave it empty: " + name + "=worker::" + strings.Join(
+						parts[2:],
+						":",
+					)
 				}
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid process port", hint)
+				return nil, contract.NewFault(
+					contract.ValidationFailed,
+					"invalid process port",
+					hint,
+				)
 			}
 			port = value
 		}
@@ -1474,7 +1915,11 @@ func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 		if len(parts) > 2 && strings.TrimSpace(parts[2]) != "" {
 			value, err := strconv.Atoi(strings.TrimSpace(parts[2]))
 			if err != nil || value < 1 || value > 32 {
-				return nil, contract.NewFault(contract.ValidationFailed, "invalid process replicas", "Use between 1 and 32 replicas.")
+				return nil, contract.NewFault(
+					contract.ValidationFailed,
+					"invalid process replicas",
+					"Use between 1 and 32 replicas.",
+				)
 			}
 			replicas = value
 		}
@@ -1486,7 +1931,17 @@ func parseProcessSpecs(values []string) ([]platform.ProcessSpec, error) {
 				return nil, err
 			}
 		}
-		out = append(out, platform.ProcessSpec{Name: name, Kind: kind, Command: command, Args: args, Replicas: replicas, ContainerPort: port})
+		out = append(
+			out,
+			platform.ProcessSpec{
+				Name:          name,
+				Kind:          kind,
+				Command:       command,
+				Args:          args,
+				Replicas:      replicas,
+				ContainerPort: port,
+			},
+		)
 	}
 	return out, nil
 }
@@ -1564,7 +2019,11 @@ func parseCommandArgv(line string) ([]string, error) {
 		started = true
 	}
 	if escaped || quote != 0 {
-		return nil, contract.NewFault(contract.ValidationFailed, "invalid command quoting", "Close all quotes and escape sequences; commands are argv, not shell expressions.")
+		return nil, contract.NewFault(
+			contract.ValidationFailed,
+			"invalid command quoting",
+			"Close all quotes and escape sequences; commands are argv, not shell expressions.",
+		)
 	}
 	if started {
 		fields = append(fields, word.String())
@@ -1584,19 +2043,37 @@ func formatCommandArgv(argv []string) string {
 // the node's EREGION_GIT_ALLOWED_HOSTS. The node still applies its allowlist.
 func validateGitURLShape(raw string) error {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return contract.NewFault(contract.ValidationFailed, "invalid git source URL", "Use an https:// repository URL without credentials, query, or fragment.")
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid git source URL",
+			"Use an https:// repository URL without credentials, query, or fragment.",
+		)
 	}
 	if port := parsed.Port(); port != "" && port != "443" {
-		return contract.NewFault(contract.ValidationFailed, "invalid git source URL", "Git build sources must use the default HTTPS port.")
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid git source URL",
+			"Git build sources must use the default HTTPS port.",
+		)
 	}
 	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 	if host == "" || net.ParseIP(host) != nil {
-		return contract.NewFault(contract.ValidationFailed, "invalid git source URL", "Use a repository hostname, not an IP address.")
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid git source URL",
+			"Use a repository hostname, not an IP address.",
+		)
 	}
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") ||
 		strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
-		return contract.NewFault(contract.ValidationFailed, "invalid git source URL", "Git build sources cannot target a loopback or internal name.")
+		return contract.NewFault(
+			contract.ValidationFailed,
+			"invalid git source URL",
+			"Git build sources cannot target a loopback or internal name.",
+		)
 	}
 	return nil
 }
@@ -1635,7 +2112,12 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 		}
 		fmt.Fprintf(&out, "environments: %s\n", strings.Join(labels, ", "))
 	} else {
-		fmt.Fprintf(&out, "environment: %s (%s)\n", ans.Environment, protectionLabel(ans.Protection, ans.Environment))
+		fmt.Fprintf(
+			&out,
+			"environment: %s (%s)\n",
+			ans.Environment,
+			protectionLabel(ans.Protection, ans.Environment),
+		)
 	}
 	fmt.Fprintf(&out, "node: %s\n", ans.Node)
 	if ans.BuildNode != "" {
@@ -1657,7 +2139,11 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 			fmt.Fprintf(&out, "context path: %s\n", ans.ContextPath)
 		}
 		if len(ans.BuildEnv) > 0 {
-			fmt.Fprintf(&out, "build environment: %s\n", strings.Join(sortedKeys(ans.BuildEnv), ", "))
+			fmt.Fprintf(
+				&out,
+				"build environment: %s\n",
+				strings.Join(sortedKeys(ans.BuildEnv), ", "),
+			)
 		}
 	} else {
 		fmt.Fprintln(&out, "source: none (deploy explicit artifacts)")
@@ -1665,7 +2151,13 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 	for _, process := range planProcesses(ans) {
 		fmt.Fprintf(&out, "process: %s\n", process)
 	}
-	fmt.Fprintf(&out, "health: %s %s (%ds timeout)\n", strings.ToUpper(ans.HealthType), ans.HealthPath, ans.HealthTimeout)
+	fmt.Fprintf(
+		&out,
+		"health: %s %s (%ds timeout)\n",
+		strings.ToUpper(ans.HealthType),
+		ans.HealthPath,
+		ans.HealthTimeout,
+	)
 	if ans.ReleaseCommand != "" {
 		fmt.Fprintf(&out, "release command: %s\n", ans.ReleaseCommand)
 	}
@@ -1690,7 +2182,11 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 			if record, ok := domainDNSRecord(domain.Domain, cmd); ok {
 				fmt.Fprintf(&out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
 			} else {
-				fmt.Fprintf(&out, "DNS record: point %s at the main node's public IPv4 address\n", domain.Domain)
+				fmt.Fprintf(
+					&out,
+					"DNS record: point %s at the main node's public IPv4 address\n",
+					domain.Domain,
+				)
 			}
 		}
 		fmt.Fprintln(&out, "Create them at the DNS provider; a Cloudflare proxy in front is fine.")
@@ -1702,7 +2198,11 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 		if record, ok := domainDNSRecord(ans.Domain, cmd); ok {
 			fmt.Fprintf(&out, "DNS record: %s %s %s\n", record.Type, record.Name, record.Value)
 		} else {
-			fmt.Fprintf(&out, "DNS record: point %s at the main node's public IPv4 address\n", ans.Domain)
+			fmt.Fprintf(
+				&out,
+				"DNS record: point %s at the main node's public IPv4 address\n",
+				ans.Domain,
+			)
 		}
 		fmt.Fprintln(&out, "Create it at the DNS provider; a Cloudflare proxy in front is fine.")
 	} else {
@@ -1738,7 +2238,10 @@ func setupPlan(ans *setupAnswers, preview platform.Preview, cmd *cobra.Command) 
 	if ans.Deploy {
 		fmt.Fprintln(&out, "first deploy: queued from the revision")
 		if ans.Domain == "" {
-			fmt.Fprintln(&out, "warning: the first deploy has no domain; the deployability gate refuses it until a primary domain is bound")
+			fmt.Fprintln(
+				&out,
+				"warning: the first deploy has no domain; the deployability gate refuses it until a primary domain is bound",
+			)
 		}
 	} else if len(ans.ResourceSpecs) > 0 {
 		fmt.Fprintln(&out, "first deploy: deferred until declared resources report healthy")
@@ -1792,10 +2295,18 @@ func sortedKeysBytes(values map[string][]byte) []string {
 // previewAction validates one canonical action on the node without accepting
 // work. It runs before any vault write so a rejected declaration cannot leave
 // orphan secret values.
-func (a *app) previewAction(cmd *cobra.Command, kind, target string, input any) (platform.Preview, error) {
+func (a *app) previewAction(
+	cmd *cobra.Command,
+	kind, target string,
+	input any,
+) (platform.Preview, error) {
 	raw, err := json.Marshal(input)
 	if err != nil {
-		return platform.Preview{}, contract.NewFault(contract.Internal, "could not encode platform input", "Report the command and binary version.")
+		return platform.Preview{}, contract.NewFault(
+			contract.Internal,
+			"could not encode platform input",
+			"Report the command and binary version.",
+		)
 	}
 	client, err := a.client(cmd)
 	if err != nil {
@@ -1807,7 +2318,8 @@ func (a *app) previewAction(cmd *cobra.Command, kind, target string, input any) 
 		return platform.Preview{}, err
 	}
 	var preview platform.Preview
-	if json.Unmarshal(data, &preview) != nil || !preview.DryRun || preview.Kind != kind || preview.Target != target {
+	if json.Unmarshal(data, &preview) != nil || !preview.DryRun || preview.Kind != kind ||
+		preview.Target != target {
 		return platform.Preview{}, invalidNodeData("action preview")
 	}
 	if preview.Replay && (preview.Operation == nil || preview.Operation.ID == "") {
@@ -1819,16 +2331,31 @@ func (a *app) previewAction(cmd *cobra.Command, kind, target string, input any) 
 // submitAccepted submits one action with a D12 target confirmation when the
 // action requires one, returning the durable operation it was accepted as. The
 // idempotency key is stable when the operator supplied one.
-func (a *app) submitAccepted(cmd *cobra.Command, kind, target string, input any, confirm string) (contract.Operation, error) {
+func (a *app) submitAccepted(
+	cmd *cobra.Command,
+	kind, target string,
+	input any,
+	confirm string,
+) (contract.Operation, error) {
 	return a.submitAcceptedWithSecrets(cmd, kind, target, input, confirm, nil)
 }
 
 // submitAcceptedWithSecrets is submitAccepted for a D7 factor-gated action:
 // the code travels in the same node request that performs it.
-func (a *app) submitAcceptedWithSecrets(cmd *cobra.Command, kind, target string, input any, confirm string, secretValues map[string]string) (contract.Operation, error) {
+func (a *app) submitAcceptedWithSecrets(
+	cmd *cobra.Command,
+	kind, target string,
+	input any,
+	confirm string,
+	secretValues map[string]string,
+) (contract.Operation, error) {
 	raw, err := json.Marshal(input)
 	if err != nil {
-		return contract.Operation{}, contract.NewFault(contract.Internal, "could not encode platform input", "Report the command and binary version.")
+		return contract.Operation{}, contract.NewFault(
+			contract.Internal,
+			"could not encode platform input",
+			"Report the command and binary version.",
+		)
 	}
 	key, _ := cmd.Flags().GetString("idempotency-key")
 	if key == "" {
@@ -1841,12 +2368,22 @@ func (a *app) submitAcceptedWithSecrets(cmd *cobra.Command, kind, target string,
 	if err != nil {
 		return contract.Operation{}, err
 	}
-	data, err := client.SubmitActionWithSecrets(cmd.Context(), kind, target, raw, key, confirm, false, secretValues)
+	data, err := client.SubmitActionWithSecrets(
+		cmd.Context(),
+		kind,
+		target,
+		raw,
+		key,
+		confirm,
+		false,
+		secretValues,
+	)
 	if err != nil {
 		return contract.Operation{}, err
 	}
 	var op contract.Operation
-	if json.Unmarshal(data, &op) != nil || op.Validate() != nil || op.Kind != kind || op.Target != target {
+	if json.Unmarshal(data, &op) != nil || op.Validate() != nil || op.Kind != kind ||
+		op.Target != target {
 		return contract.Operation{}, invalidNodeData("accepted operation")
 	}
 	return op, nil
@@ -1855,7 +2392,11 @@ func (a *app) submitAcceptedWithSecrets(cmd *cobra.Command, kind, target string,
 // putSecret writes one secret value, replacing an existing value when a prior
 // attempt already created the namespace. It is only for values the operator did
 // not request with an explicit revision CAS guard.
-func (a *app) putSecret(cmd *cobra.Command, namespace vault.Namespace, value []byte) (vault.Metadata, error) {
+func (a *app) putSecret(
+	cmd *cobra.Command,
+	namespace vault.Namespace,
+	value []byte,
+) (vault.Metadata, error) {
 	client, err := a.client(cmd)
 	if err != nil {
 		return vault.Metadata{}, err
@@ -1894,7 +2435,11 @@ func setupSecretNames(ans *setupAnswers) []string {
 
 // writeSetupSecrets stores the read credential and the environment secrets for
 // one environment before its submission. Only names enter the operation input.
-func (a *app) writeSetupSecrets(cmd *cobra.Command, ans *setupAnswers, spec platform.EnvironmentSpec) ([]string, error) {
+func (a *app) writeSetupSecrets(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	spec platform.EnvironmentSpec,
+) ([]string, error) {
 	return a.writeSetupSecretsForEnvironments(cmd, ans, []platform.EnvironmentSpec{spec})
 }
 
@@ -1903,11 +2448,16 @@ func (a *app) writeSetupSecrets(cmd *cobra.Command, ans *setupAnswers, spec plat
 // writes the same value to production and staging, while an environment-specific
 // name never leaks into another namespace. The Git read credential follows the
 // same rule and is written only when the spec's source names that credential.
-func (a *app) writeSetupSecretsForEnvironments(cmd *cobra.Command, ans *setupAnswers, specs []platform.EnvironmentSpec) ([]string, error) {
+func (a *app) writeSetupSecretsForEnvironments(
+	cmd *cobra.Command,
+	ans *setupAnswers,
+	specs []platform.EnvironmentSpec,
+) ([]string, error) {
 	written := make([]string, 0, len(ans.SecretValues)+1)
 	seen := map[string]bool{}
 	for _, spec := range specs {
-		if ans.CredentialName != "" && len(ans.CredentialValue) > 0 && spec.Source.CredentialSecretName == ans.CredentialName {
+		if ans.CredentialName != "" && len(ans.CredentialValue) > 0 &&
+			spec.Source.CredentialSecretName == ans.CredentialName {
 			namespace, err := vault.NewNamespace(ans.App, spec.Name, ans.CredentialName)
 			if err != nil {
 				return nil, err
@@ -1957,7 +2507,11 @@ func (a *app) appExists(cmd *cobra.Command, name string) (bool, error) {
 }
 
 func (a *app) environmentExists(cmd *cobra.Command, app, environment string) (bool, error) {
-	raw, err := a.platformReadInventoryWith(cmd, "environments", urlValues("app", app, "environment", environment, "limit", "1"))
+	raw, err := a.platformReadInventoryWith(
+		cmd,
+		"environments",
+		urlValues("app", app, "environment", environment, "limit", "1"),
+	)
 	if err != nil {
 		return false, err
 	}
@@ -1992,7 +2546,10 @@ func urlValues(pairs ...string) map[string][]string {
 }
 
 // readEnvironment reads one environment's current revision and deployability.
-func (a *app) readEnvironment(cmd *cobra.Command, app, environment string) (platform.Environment, json.RawMessage, error) {
+func (a *app) readEnvironment(
+	cmd *cobra.Command,
+	app, environment string,
+) (platform.Environment, json.RawMessage, error) {
 	if err := platform.ValidateName(app); err != nil {
 		return platform.Environment{}, nil, err
 	}
@@ -2038,7 +2595,10 @@ func writeProcessTable(processes []platform.ProcessSpec) string {
 		if command == "" {
 			command = "-"
 		}
-		rows = append(rows, []string{process.Name, process.Kind, fmt.Sprint(process.Replicas), port, command})
+		rows = append(
+			rows,
+			[]string{process.Name, process.Kind, fmt.Sprint(process.Replicas), port, command},
+		)
 	}
 	return writeTable([]string{"NAME", "KIND", "REPLICAS", "PORT", "COMMAND"}, rows)
 }
@@ -2155,18 +2715,27 @@ type deferredDefinitionResource struct {
 }
 
 func (r deferredDefinitionResource) warning() string {
-	return "Resource " + r.App + "/" + r.Environment + "/" + r.Resource + " requires deferral: missing or archived secrets " + strings.Join(r.SecretNames, ", ") + ". Create with --no-deploy, use `eregion secret set --app " + r.App + " --environment " + r.Environment + " --name <NAME> --file /absolute/protected/path` for each secret (use --expected-revision for archived names), then plan with `eregion env update " + r.App + " " + r.Environment + " --from <file> --dry-run --json` and follow its exact nonce/digest approval command with a stable idempotency key."
+	return "Resource " + r.App + "/" + r.Environment + "/" + r.Resource + " requires deferral: missing or archived secrets " + strings.Join(
+		r.SecretNames,
+		", ",
+	) + ". Create with --no-deploy, use `eregion secret set --app " + r.App + " --environment " + r.Environment + " --name <NAME> --file /absolute/protected/path` for each secret (use --expected-revision for archived names), then plan with `eregion env update " + r.App + " " + r.Environment + " --from <file> --dry-run --json` and follow its exact nonce/digest approval command with a stable idempotency key."
 }
 
 func resourceAfterAcceptedFault(err error, operation contract.OperationID) error {
 	fault := contract.Classify(err)
-	fault.Message = "Environment creation was accepted as " + string(operation) + ", but resource provisioning failed: " + fault.Message
+	fault.Message = "Environment creation was accepted as " + string(
+		operation,
+	) + ", but resource provisioning failed: " + fault.Message
 	return fault
 }
 
 // bootstrapDefinitionResources checks only secret metadata; the admission
 // transaction repeats this check under namespace locks before creating work.
-func (a *app) bootstrapDefinitionResources(cmd *cobra.Command, specs []platform.ResourceApplyInput, preview bool) ([]contract.OperationID, []deferredDefinitionResource, error) {
+func (a *app) bootstrapDefinitionResources(
+	cmd *cobra.Command,
+	specs []platform.ResourceApplyInput,
+	preview bool,
+) ([]contract.OperationID, []deferredDefinitionResource, error) {
 	var ids []contract.OperationID
 	var deferred []deferredDefinitionResource
 	for _, spec := range specs {
@@ -2186,7 +2755,10 @@ func (a *app) bootstrapDefinitionResources(cmd *cobra.Command, specs []platform.
 				return ids, deferred, err
 			}
 			for _, name := range names {
-				metadata, err := client.GetSecretMetadata(cmd.Context(), vault.Namespace{App: spec.App, Environment: spec.Environment, Name: name})
+				metadata, err := client.GetSecretMetadata(
+					cmd.Context(),
+					vault.Namespace{App: spec.App, Environment: spec.Environment, Name: name},
+				)
 				if err != nil {
 					if contract.Classify(err).Code == contract.NotFound {
 						missing = append(missing, name)
@@ -2207,7 +2779,8 @@ func (a *app) bootstrapDefinitionResources(cmd *cobra.Command, specs []platform.
 			op, err := a.submitAccepted(cmd, platform.KindResourceApply, target.String(), spec, "")
 			if err != nil {
 				fault := contract.Classify(err)
-				if fault.Code != contract.PreconditionFailed || fault.Details["reason"] != "missing_secret_values" {
+				if fault.Code != contract.PreconditionFailed ||
+					fault.Details["reason"] != "missing_secret_values" {
 					return ids, deferred, err
 				}
 				// RPC decoding may turn a string slice into a generic JSON array.
@@ -2229,7 +2802,15 @@ func (a *app) bootstrapDefinitionResources(cmd *cobra.Command, specs []platform.
 			}
 		}
 		if len(missing) > 0 {
-			deferred = append(deferred, deferredDefinitionResource{App: spec.App, Environment: spec.Environment, Resource: spec.Name, SecretNames: missing})
+			deferred = append(
+				deferred,
+				deferredDefinitionResource{
+					App:         spec.App,
+					Environment: spec.Environment,
+					Resource:    spec.Name,
+					SecretNames: missing,
+				},
+			)
 		}
 	}
 	return ids, deferred, nil
@@ -2248,9 +2829,19 @@ func (r setupResult) plainText() string {
 					}
 					labels = append(labels, environment.Name+" ("+state+")")
 				}
-				fmt.Fprintf(&out, "Dry run: create app %s with environments %s\n", r.App, strings.Join(labels, ", "))
+				fmt.Fprintf(
+					&out,
+					"Dry run: create app %s with environments %s\n",
+					r.App,
+					strings.Join(labels, ", "),
+				)
 			} else {
-				fmt.Fprintf(&out, "Dry run: create app %s with environment %s\n", r.App, r.Environment)
+				fmt.Fprintf(
+					&out,
+					"Dry run: create app %s with environment %s\n",
+					r.App,
+					r.Environment,
+				)
 			}
 		} else {
 			fmt.Fprintf(&out, "Dry run: create environment %s/%s\n", r.App, r.Environment)
@@ -2272,16 +2863,35 @@ func (r setupResult) plainText() string {
 				}
 				labels = append(labels, environment.Name+" ("+state+")")
 			}
-			fmt.Fprintf(&out, "Created app %s with environments %s on %s.\n", r.App, strings.Join(labels, ", "), r.Node)
+			fmt.Fprintf(
+				&out,
+				"Created app %s with environments %s on %s.\n",
+				r.App,
+				strings.Join(labels, ", "),
+				r.Node,
+			)
 		} else {
-			fmt.Fprintf(&out, "Created app %s with environment %s on %s.\n", r.App, r.Environment, r.Node)
+			fmt.Fprintf(
+				&out,
+				"Created app %s with environment %s on %s.\n",
+				r.App,
+				r.Environment,
+				r.Node,
+			)
 		}
 	} else {
 		state := "unprotected"
 		if r.Protected {
 			state = "protected"
 		}
-		fmt.Fprintf(&out, "Created environment %s/%s on %s (%s).\n", r.App, r.Environment, r.Node, state)
+		fmt.Fprintf(
+			&out,
+			"Created environment %s/%s on %s (%s).\n",
+			r.App,
+			r.Environment,
+			r.Node,
+			state,
+		)
 	}
 	fmt.Fprintf(&out, "operation: %s\n", r.OperationID)
 	if r.FirstDeployOperationID != "" {
@@ -2299,9 +2909,19 @@ func (r setupResult) plainText() string {
 			fmt.Fprintf(&out, "domain check path: %s\n", r.DomainCheckPath)
 		}
 		if r.DNSRecord != nil {
-			fmt.Fprintf(&out, "DNS record:\n  %s  %s  %s\n", r.DNSRecord.Type, r.DNSRecord.Name, r.DNSRecord.Value)
+			fmt.Fprintf(
+				&out,
+				"DNS record:\n  %s  %s  %s\n",
+				r.DNSRecord.Type,
+				r.DNSRecord.Name,
+				r.DNSRecord.Value,
+			)
 		} else {
-			fmt.Fprintf(&out, "DNS record: point %s at the main node's public IPv4 address\n", r.Domain)
+			fmt.Fprintf(
+				&out,
+				"DNS record: point %s at the main node's public IPv4 address\n",
+				r.Domain,
+			)
 		}
 	}
 	for _, warning := range r.Warnings {
@@ -2318,7 +2938,10 @@ func (r setupResult) plainText() string {
 // declaration after the app/environment exists. It never waits for readiness
 // and never writes secret values; existing resource identities are reapplied
 // with their durable volume ownership preserved.
-func (a *app) provisionDefinitionResources(cmd *cobra.Command, specs []platform.ResourceApplyInput) ([]contract.OperationID, error) {
+func (a *app) provisionDefinitionResources(
+	cmd *cobra.Command,
+	specs []platform.ResourceApplyInput,
+) ([]contract.OperationID, error) {
 	if dryRun(cmd) || len(specs) == 0 {
 		return nil, nil
 	}

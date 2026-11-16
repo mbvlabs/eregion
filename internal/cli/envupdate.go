@@ -2,13 +2,14 @@ package cli
 
 import (
 	"fmt"
-	"github.com/spf13/cobra"
 	"maps"
 	"os"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/spf13/cobra"
 
 	"github.com/mbvlabs/eregion/internal/cli/ui"
 	"github.com/mbvlabs/eregion/internal/contract"
@@ -42,7 +43,10 @@ type guidedUpdateAnswers struct {
 // envUpdateGuided asks for the current revision's editable fields, prefilled.
 // It never submits or writes a vault value; the caller previews the patch and
 // confirms before doing either.
-func (a *app) envUpdateGuided(cmd *cobra.Command, current platform.Environment) (*guidedEnvironmentUpdate, error) {
+func (a *app) envUpdateGuided(
+	cmd *cobra.Command,
+	current platform.Environment,
+) (*guidedEnvironmentUpdate, error) {
 	base := revisionStateOf(current)
 	var credential []byte
 	keep := false
@@ -52,11 +56,29 @@ func (a *app) envUpdateGuided(cmd *cobra.Command, current platform.Environment) 
 		}
 	}()
 
-	node, err := a.askNode(cmd, "Application node", "Runs the containers", current.Node, platform.RoleApplication, platform.CapabilityDocker, "", "")
+	node, err := a.askNode(
+		cmd,
+		"Application node",
+		"Runs the containers",
+		current.Node,
+		platform.RoleApplication,
+		platform.CapabilityDocker,
+		"",
+		"",
+	)
 	if err != nil {
 		return nil, err
 	}
-	buildNode, err := a.askNode(cmd, "Builder node", "Runs the Buildpacks builds", current.BuildNode, platform.RoleBuilder, platform.CapabilityBuildpacks, "The application node", node)
+	buildNode, err := a.askNode(
+		cmd,
+		"Builder node",
+		"Runs the Buildpacks builds",
+		current.BuildNode,
+		platform.RoleBuilder,
+		platform.CapabilityBuildpacks,
+		"The application node",
+		node,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -86,9 +108,15 @@ func (a *app) envUpdateGuided(cmd *cobra.Command, current platform.Environment) 
 
 // buildGuidedUpdate maps prefilled answers to a partial environment patch and
 // the human-readable diff shown before confirmation.
-func buildGuidedUpdate(current platform.Environment, answers guidedUpdateAnswers) *guidedEnvironmentUpdate {
+func buildGuidedUpdate(
+	current platform.Environment,
+	answers guidedUpdateAnswers,
+) *guidedEnvironmentUpdate {
 	base := revisionStateOf(current)
-	edit := &guidedEnvironmentUpdate{Credential: answers.Credential, CredentialName: answers.CredentialName}
+	edit := &guidedEnvironmentUpdate{
+		Credential:     answers.Credential,
+		CredentialName: answers.CredentialName,
+	}
 	patch := platform.EnvironmentUpdateInput{App: current.App, Environment: current.Name}
 	changed := make([]string, 0, 5)
 	diff := make([]string, 0, 8)
@@ -102,7 +130,10 @@ func buildGuidedUpdate(current platform.Environment, answers guidedUpdateAnswers
 		buildNode := answers.BuildNode
 		patch.BuildNode = &buildNode
 		changed = append(changed, "build_node")
-		diff = append(diff, "build node: "+displayValue(current.BuildNode)+" → "+displayValue(answers.BuildNode))
+		diff = append(
+			diff,
+			"build node: "+displayValue(current.BuildNode)+" → "+displayValue(answers.BuildNode),
+		)
 	}
 	if !sourceEqual(base.Source, answers.Source) {
 		source := answers.Source
@@ -150,7 +181,9 @@ func revisionStateOf(current platform.Environment) platform.RevisionState {
 	}
 }
 
-func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceBinding, credential []byte, credentialName string, err error) {
+func (a *app) guidedSource(
+	base platform.SourceBinding,
+) (source platform.SourceBinding, credential []byte, credentialName string, err error) {
 	keep := false
 	defer func() {
 		if !keep {
@@ -163,14 +196,22 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 		{"No Git source (deploy explicit artifacts)", "none"},
 	}
 	if base.URL == "" {
-		options = [][2]string{{"No Git source (deploy explicit artifacts)", "none"}, {"Set a Git build recipe", "git"}}
-	}
-	kind, err := ui.ChooseDefault("Git build source", "Artifacts are selected explicitly at deploy time; there is no persistent image mode", options, func() string {
-		if base.URL == "" {
-			return "none"
+		options = [][2]string{
+			{"No Git source (deploy explicit artifacts)", "none"},
+			{"Set a Git build recipe", "git"},
 		}
-		return "git"
-	}())
+	}
+	kind, err := ui.ChooseDefault(
+		"Git build source",
+		"Artifacts are selected explicitly at deploy time; there is no persistent image mode",
+		options,
+		func() string {
+			if base.URL == "" {
+				return "none"
+			}
+			return "git"
+		}(),
+	)
 	if err != nil {
 		return platform.SourceBinding{}, nil, "", err
 	}
@@ -179,21 +220,39 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 		keep = true
 		return platform.SourceBinding{}, nil, "", nil
 	case "git":
-		url, err := askValidated("HTTPS git repository", "No credentials in the URL; the node checks its allowed hosts", base.URL, validateGitURLShape)
+		url, err := askValidated(
+			"HTTPS git repository",
+			"No credentials in the URL; the node checks its allowed hosts",
+			base.URL,
+			validateGitURLShape,
+		)
 		if err != nil {
 			return platform.SourceBinding{}, nil, "", err
 		}
-		ref, err := ui.Input("Branch or tag", "Empty uses the repository's default branch", base.Ref)
+		ref, err := ui.Input(
+			"Branch or tag",
+			"Empty uses the repository's default branch",
+			base.Ref,
+		)
 		if err != nil {
 			return platform.SourceBinding{}, nil, "", err
 		}
-		name, err := askValidated("Credential secret name", "Empty for a public repository", base.CredentialSecretName, validateOptionalSecretName)
+		name, err := askValidated(
+			"Credential secret name",
+			"Empty for a public repository",
+			base.CredentialSecretName,
+			validateOptionalSecretName,
+		)
 		if err != nil {
 			return platform.SourceBinding{}, nil, "", err
 		}
 		if name != "" {
 			replaceDefault := name != base.CredentialSecretName
-			replace, err := ui.YesNoDefault("Replace the stored read token?", "The value is written only after the preview and confirmation; only the name enters the revision.", replaceDefault)
+			replace, err := ui.YesNoDefault(
+				"Replace the stored read token?",
+				"The value is written only after the preview and confirmation; only the name enters the revision.",
+				replaceDefault,
+			)
 			if err != nil {
 				return platform.SourceBinding{}, nil, "", err
 			}
@@ -203,18 +262,31 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 					return platform.SourceBinding{}, nil, "", err
 				}
 				if token == "" {
-					return platform.SourceBinding{}, nil, "", contract.NewFault(contract.InputRequired, "the repository read token is empty", "Enter a token, or answer No to replacing the stored read token.")
+					return platform.SourceBinding{}, nil, "", contract.NewFault(
+						contract.InputRequired,
+						"the repository read token is empty",
+						"Enter a token, or answer No to replacing the stored read token.",
+					)
 				}
 				credential = []byte(token)
 				a.registerSecretValue(credential)
 			}
 		}
 		builderDefault := base.Builder
-		builder, err := askValidated("Buildpacks builder", "Empty uses the build node's platform default", builderDefault, validateOptionalImage)
+		builder, err := askValidated(
+			"Buildpacks builder",
+			"Required for Git builds; there is no built-in default",
+			builderDefault,
+			validateOptionalImage,
+		)
 		if err != nil {
 			return platform.SourceBinding{}, nil, "", err
 		}
-		contextPath, err := ui.Input("Build context path", "Empty builds the repository root", base.ContextPath)
+		contextPath, err := ui.Input(
+			"Build context path",
+			"Empty builds the repository root",
+			base.ContextPath,
+		)
 		if err != nil {
 			return platform.SourceBinding{}, nil, "", err
 		}
@@ -230,7 +302,11 @@ func (a *app) guidedSource(base platform.SourceBinding) (source platform.SourceB
 		keep = true
 		return source, credential, name, nil
 	default:
-		return platform.SourceBinding{}, nil, "", contract.NewFault(contract.Internal, "unsupported guided source kind", "Report the command and binary version.")
+		return platform.SourceBinding{}, nil, "", contract.NewFault(
+			contract.Internal,
+			"unsupported guided source kind",
+			"Report the command and binary version.",
+		)
 	}
 }
 
@@ -250,7 +326,11 @@ func guidedRuntime(base platform.RuntimeSpec, node string) (platform.RuntimeSpec
 	if healthPath == "" {
 		healthPath = platform.DefaultHealthPath
 	}
-	healthPath, err = ui.Input("Health path", "Loopback path used by the deploy health check", healthPath)
+	healthPath, err = ui.Input(
+		"Health path",
+		"Loopback path used by the deploy health check",
+		healthPath,
+	)
 	if err != nil {
 		return platform.RuntimeSpec{}, err
 	}
@@ -266,7 +346,11 @@ func guidedRuntime(base platform.RuntimeSpec, node string) (platform.RuntimeSpec
 	if base.ReleaseCommand != nil {
 		releaseLine = formatCommandArgv(base.ReleaseCommand.Argv)
 	}
-	releaseLine, err = ui.Input("Release command", "Executable and quoted arguments; empty for none; no shell", releaseLine)
+	releaseLine, err = ui.Input(
+		"Release command",
+		"Executable and quoted arguments; empty for none; no shell",
+		releaseLine,
+	)
 	if err != nil {
 		return platform.RuntimeSpec{}, err
 	}
@@ -298,7 +382,11 @@ func guidedProcesses(base []platform.ProcessSpec) ([]platform.ProcessSpec, error
 	for index := range processes {
 		process := &processes[index]
 		if process.Kind == "web" || process.Kind == "service" {
-			port, err := askPort("Container port for "+process.Name, "The port inside the container", strconv.Itoa(process.ContainerPort))
+			port, err := askPort(
+				"Container port for "+process.Name,
+				"The port inside the container",
+				strconv.Itoa(process.ContainerPort),
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -309,7 +397,11 @@ func guidedProcesses(base []platform.ProcessSpec) ([]platform.ProcessSpec, error
 			line = formatCommandArgv(append([]string{process.Command}, process.Args...))
 		}
 		for {
-			input, inputErr := ui.Input("Command for "+process.Name, "Executable and quoted arguments; empty for a web process", line)
+			input, inputErr := ui.Input(
+				"Command for "+process.Name,
+				"Executable and quoted arguments; empty for a web process",
+				line,
+			)
 			if inputErr != nil {
 				return nil, inputErr
 			}
@@ -326,7 +418,10 @@ func guidedProcesses(base []platform.ProcessSpec) ([]platform.ProcessSpec, error
 			process.Command, process.Args = command, args
 			break
 		}
-		replicas, err := askReplicas("Replicas for "+processLabel(*process), strconv.Itoa(process.Replicas))
+		replicas, err := askReplicas(
+			"Replicas for "+processLabel(*process),
+			strconv.Itoa(process.Replicas),
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -342,14 +437,21 @@ func guidedProcesses(base []platform.ProcessSpec) ([]platform.ProcessSpec, error
 
 func removeProcesses(processes []platform.ProcessSpec) ([]platform.ProcessSpec, error) {
 	for {
-		name, err := ui.Input("Remove a process", "Existing process name; empty keeps the formation", "")
+		name, err := ui.Input(
+			"Remove a process",
+			"Existing process name; empty keeps the formation",
+			"",
+		)
 		if err != nil {
 			return nil, err
 		}
 		if name == "" {
 			return processes, nil
 		}
-		index := slices.IndexFunc(processes, func(process platform.ProcessSpec) bool { return process.Name == name })
+		index := slices.IndexFunc(
+			processes,
+			func(process platform.ProcessSpec) bool { return process.Name == name },
+		)
 		if index < 0 {
 			fmt.Fprintln(os.Stderr, ui.Warn("No process is named "+name+"."))
 			continue
@@ -441,7 +543,10 @@ func sourceDiff(old, new platform.SourceBinding) []string {
 	out := []string{}
 	field := func(name, oldValue, newValue string) {
 		if oldValue != newValue {
-			out = append(out, "source."+name+": "+displayValue(oldValue)+" → "+displayValue(newValue))
+			out = append(
+				out,
+				"source."+name+": "+displayValue(oldValue)+" → "+displayValue(newValue),
+			)
 		}
 	}
 	field("url", old.URL, new.URL)
@@ -465,12 +570,19 @@ func runtimeDiff(old, new platform.RuntimeSpec) []string {
 	out := []string{}
 	field := func(name, oldValue, newValue string) {
 		if oldValue != newValue {
-			out = append(out, "runtime."+name+": "+displayValue(oldValue)+" → "+displayValue(newValue))
+			out = append(
+				out,
+				"runtime."+name+": "+displayValue(oldValue)+" → "+displayValue(newValue),
+			)
 		}
 	}
 	field("health_type", old.HealthType, new.HealthType)
 	field("health_path", old.HealthPath, new.HealthPath)
-	field("health_timeout_seconds", strconv.Itoa(old.HealthTimeoutSeconds), strconv.Itoa(new.HealthTimeoutSeconds))
+	field(
+		"health_timeout_seconds",
+		strconv.Itoa(old.HealthTimeoutSeconds),
+		strconv.Itoa(new.HealthTimeoutSeconds),
+	)
 	oldRelease, newRelease := "", ""
 	if old.ReleaseCommand != nil {
 		oldRelease = formatCommandArgv(old.ReleaseCommand.Argv)
@@ -494,7 +606,10 @@ func processSpecsDiff(old, new []platform.ProcessSpec) []string {
 	}
 	for _, process := range old {
 		if _, exists := newByName[process.Name]; !exists {
-			out = append(out, "process "+process.Name+": removed ("+describeProcessSpec(process)+")")
+			out = append(
+				out,
+				"process "+process.Name+": removed ("+describeProcessSpec(process)+")",
+			)
 		}
 	}
 	for _, process := range new {
@@ -504,11 +619,29 @@ func processSpecsDiff(old, new []platform.ProcessSpec) []string {
 			continue
 		}
 		if previous.Replicas != process.Replicas {
-			out = append(out, fmt.Sprintf("process %s.replicas: %d → %d", process.Name, previous.Replicas, process.Replicas))
+			out = append(
+				out,
+				fmt.Sprintf(
+					"process %s.replicas: %d → %d",
+					process.Name,
+					previous.Replicas,
+					process.Replicas,
+				),
+			)
 		}
 		if previous.Kind != process.Kind || previous.Command != process.Command ||
-			!slices.Equal(previous.Args, process.Args) || previous.ContainerPort != process.ContainerPort {
-			out = append(out, "process "+process.Name+": "+describeProcessSpec(previous)+" → "+describeProcessSpec(process))
+			!slices.Equal(
+				previous.Args,
+				process.Args,
+			) || previous.ContainerPort != process.ContainerPort {
+			out = append(
+				out,
+				"process "+process.Name+": "+describeProcessSpec(
+					previous,
+				)+" → "+describeProcessSpec(
+					process,
+				),
+			)
 		}
 	}
 	return out

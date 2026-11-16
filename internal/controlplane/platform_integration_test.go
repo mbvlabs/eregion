@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -72,13 +71,8 @@ func TestIntegrationPlatformAtomicAndTargetLock(t *testing.T) {
 	pool, dsn := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	original := run.Service.enqueuePlatform
-	run.Service.enqueuePlatform = func(ctx context.Context, tx pgx.Tx, op contract.Operation) (int64, error) {
-		_, err := original(ctx, tx, op)
-		if err != nil {
-			return 0, err
-		}
-		return 0, errors.New("injected failure after job insertion")
+	run.Service.beforeSubmissionCommit = func() error {
+		return errors.New("injected failure after job insertion")
 	}
 	_, err := run.Service.Submit(ctx, platformSubmission(platform.KindAppCreate, "platform", "atomic", map[string]any{"name": "atomic"}))
 	if err == nil {
@@ -90,12 +84,13 @@ func TestIntegrationPlatformAtomicAndTargetLock(t *testing.T) {
 			t.Fatalf("partial %s count=%d err=%v", table, count, err)
 		}
 	}
+	run.Service.beforeSubmissionCommit = nil
 	otherPool, err := Open(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer otherPool.Close()
-	other := &Service{pool: otherPool}
+	other := &Service{entities: newTestEntities(t, otherPool)}
 	for _, target := range []string{"env/live/production", "node/local", "platform"} {
 		release, err := run.Service.lockTarget(ctx, target)
 		if err != nil {

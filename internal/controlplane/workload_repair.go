@@ -10,9 +10,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -35,46 +35,29 @@ type servingWorkload struct {
 // the node kept running. A missing set queues one restart; the idempotency key
 // makes concurrent workers and repeated starts collapse to the same operation.
 func (s *Service) repairServingWorkloads(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT a.name,e.name,coalesce(e.serving_deployment_id,''),
-        coalesce(dep.instances,'[]'::jsonb),
-        coalesce(NULLIF(r.runtime->>'node',''),e.node_name)
-        FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        JOIN eregion_platform_deployments dep ON dep.id=e.serving_deployment_id AND dep.state='succeeded'
-        LEFT JOIN eregion_platform_environment_revisions r ON r.id=dep.revision_id
-        WHERE e.serving_deployment_id IS NOT NULL
-        ORDER BY a.name,e.name`)
+	rows, err := s.entities.Platform().Deployments().RepairTargets(ctx)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
 	var workloads []servingWorkload
-	for rows.Next() {
-		var workload servingWorkload
-		var rawInstances []byte
-		if err := rows.Scan(&workload.App, &workload.Environment, &workload.Deployment,
-			&rawInstances, &workload.Node); err != nil {
-			rows.Close()
-			return unavailable()
+	for _, row := range rows {
+		workload := servingWorkload{
+			App: row.App, Environment: row.Environment,
+			Deployment: row.ServingDeployment, Node: row.Node,
 		}
-		if len(rawInstances) > 0 {
-			if err := json.Unmarshal(rawInstances, &workload.Instances); err != nil {
-				rows.Close()
-				return unavailable()
+		if len(row.Instances) > 0 {
+			if err := json.Unmarshal(row.Instances, &workload.Instances); err != nil {
+				return unavailable(err)
 			}
 		}
 		workloads = append(workloads, workload)
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	var failures []error
 	for _, workload := range workloads {
 		if len(workload.Instances) == 0 {
 			continue
 		}
-		active, err := s.environmentHasActiveOperation(ctx, s.pool, workload.App, workload.Environment, "")
+		active, err := s.environmentHasActiveOperation(ctx, s.entities.Operations(), workload.App, workload.Environment, "")
 		if err != nil {
 			failures = append(failures, err)
 			continue
@@ -117,40 +100,31 @@ func (s *Service) repairServingWorkloads(ctx context.Context) error {
 	return errors.Join(failures...)
 }
 
-// operationQueryer is the subset of pgxpool.Pool and pgx.Tx used by the repair
-// guard, so submission and maintenance can share one query.
-type operationQueryer interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}
-
 type activeOperation struct {
 	Kind  string
 	State contract.State
 }
 
-func activeEnvironmentOperations(ctx context.Context, q operationQueryer, app, environment string, exclude contract.OperationID) ([]activeOperation, error) {
-	rows, err := q.Query(ctx, `SELECT kind,state FROM eregion_operations
-        WHERE id <> $3 AND target IN ($1,$2) AND state IN ('queued','running','cancelling')`,
-		"env/"+app+"/"+environment, "app/"+app, exclude)
-	if err != nil {
-		return nil, unavailable()
-	}
-	defer rows.Close()
-	var active []activeOperation
-	for rows.Next() {
-		var operation activeOperation
-		var state string
-		if err := rows.Scan(&operation.Kind, &state); err != nil {
-			return nil, unavailable()
-		}
-		operation.State = contract.State(state)
-		active = append(active, operation)
-	}
-	return active, rows.Err()
+// environmentOperationLister is the typed store/tx surface shared by the
+// submission guard and the maintenance guard.
+type environmentOperationLister interface {
+	ListActiveAppEnvironmentOperations(ctx context.Context, exclude contract.OperationID, environmentTarget, appTarget string) ([]entities.ActiveAppEnvironmentOperation, error)
 }
 
-func (s *Service) environmentHasActiveOperation(ctx context.Context, q operationQueryer, app, environment string, exclude contract.OperationID) (bool, error) {
-	active, err := activeEnvironmentOperations(ctx, q, app, environment, exclude)
+func activeEnvironmentOperations(ctx context.Context, operations environmentOperationLister, app, environment string, exclude contract.OperationID) ([]activeOperation, error) {
+	rows, err := operations.ListActiveAppEnvironmentOperations(ctx, exclude, "env/"+app+"/"+environment, "app/"+app)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	active := make([]activeOperation, 0, len(rows))
+	for _, row := range rows {
+		active = append(active, activeOperation{Kind: row.Kind, State: row.State})
+	}
+	return active, nil
+}
+
+func (s *Service) environmentHasActiveOperation(ctx context.Context, operations environmentOperationLister, app, environment string, exclude contract.OperationID) (bool, error) {
+	active, err := activeEnvironmentOperations(ctx, operations, app, environment, exclude)
 	if err != nil {
 		return false, err
 	}

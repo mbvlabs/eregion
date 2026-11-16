@@ -2,18 +2,16 @@ package controlplane
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
 // insertEnvironmentRevisionTx appends one immutable revision. The environment
 // row lock held by the caller (or the just-inserted row in this transaction)
 // serializes the per-environment number.
-func insertEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, envID platform.EnvironmentID, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState) (platform.RevisionID, int, error) {
+func insertEnvironmentRevisionTx(ctx context.Context, tx *entities.StoreTx, envID platform.EnvironmentID, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState) (platform.RevisionID, int, error) {
 	if err := actor.Validate(); err != nil {
 		return "", 0, err
 	}
@@ -28,21 +26,13 @@ func insertEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, envID platform.
 		return "", 0, unavailable()
 	}
 	var number int
-	if err := tx.QueryRow(ctx, `SELECT coalesce(max(number),0)+1 FROM eregion_platform_environment_revisions WHERE environment_id=$1`, envID).Scan(&number); err != nil {
-		return "", 0, unavailable()
+	if number, err = tx.Platform().Revisions().NextNumber(ctx, envID); err != nil {
+		return "", 0, unavailable(err)
 	}
-	source, _ := json.Marshal(state.Source)
-	runtime, _ := json.Marshal(state.Runtime)
-	processes, _ := json.Marshal(state.Processes)
-	config, _ := json.Marshal(state.Config)
-	retentionOverride, _ := json.Marshal(state.Retention)
-	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
-        (id,environment_id,number,operation_id,actor_kind,actor_subject,operation,summary,
-         source,auto_deploy,webhook_secret_name,runtime,processes,config,secret_names,resources,deploy_intent,retention,created_at)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,clock_timestamp())`,
-		revisionID, envID, number, nullableOperationID(opID), actor.Kind, actor.Subject, operation, summary,
-		source, state.AutoDeploy, state.WebhookSecretName, runtime, processes, config, state.SecretNames, state.Resources, state.DeployIntent,
-		retentionOverride); err != nil {
+	if _, err := tx.Platform().Revisions().Insert(ctx, entities.RevisionInsert{
+		ID: revisionID, EnvironmentID: envID, Number: number, OperationID: opID,
+		Actor: actor, Operation: operation, Summary: summary, State: state,
+	}); err != nil {
 		return "", 0, platformWriteError(err, "environment revision could not be recorded")
 	}
 	return revisionID, number, nil
@@ -57,7 +47,7 @@ func nullableOperationID(id contract.OperationID) any {
 
 // insertEnvironmentTx writes the environment row, its first revision and the
 // current-revision pointer in one transaction.
-func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platform.App, spec *platform.EnvironmentSpec, opID contract.OperationID, actor contract.Actor, operation, summary string, deployIntent bool) (platform.EnvironmentID, error) {
+func (s *Service) insertEnvironmentTx(ctx context.Context, tx *entities.StoreTx, app platform.App, spec *platform.EnvironmentSpec, opID contract.OperationID, actor contract.Actor, operation, summary string, deployIntent bool) (platform.EnvironmentID, error) {
 	node, err := nodeByNameTx(ctx, tx, spec.Node)
 	if err != nil {
 		return "", err
@@ -71,7 +61,7 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if err != nil {
 		return "", err
 	}
-	var buildNode any
+	buildNode := ""
 	if spec.BuildNode != "" {
 		builder, err := nodeByNameTx(ctx, tx, spec.BuildNode)
 		if err != nil {
@@ -90,7 +80,6 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if err != nil {
 		return "", unavailable()
 	}
-	config, _ := json.Marshal(state.Config)
 	secretRefs := spec.SecretRefs
 	if secretRefs == nil {
 		secretRefs = map[string]string{}
@@ -98,7 +87,6 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if len(state.SecretNames) > 0 {
 		secretRefs = map[string]string{}
 	}
-	refs, _ := json.Marshal(secretRefs)
 	containerPort := spec.ContainerPort
 	for _, process := range state.Processes {
 		if process.Kind == "web" && process.ContainerPort > 0 {
@@ -110,11 +98,13 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if spec.Protected != nil {
 		protected = *spec.Protected
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_environments
-        (id,app_id,name,node_name,build_node,host_port,candidate_port,container_port,bind_address,health_type,health_path,health_timeout_seconds,env,secret_refs,protected,secret_revision,health_state,health_detail,created_at,updated_at)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,0,'unknown','',clock_timestamp(),clock_timestamp())`,
-		envID, app.ID, spec.Name, node.Name, buildNode, hostPort, candidatePort, containerPort, spec.Bind,
-		state.Runtime.HealthType, state.Runtime.HealthPath, state.Runtime.HealthTimeoutSeconds, config, refs, protected); err != nil {
+	if _, err := tx.Platform().Environments().Insert(ctx, entities.EnvironmentInsert{
+		ID: envID, AppID: app.ID, Name: spec.Name, Node: node.Name, BuildNode: buildNode,
+		HostPort: hostPort, CandidatePort: candidatePort, ContainerPort: containerPort,
+		Bind: spec.Bind, HealthType: state.Runtime.HealthType, HealthPath: state.Runtime.HealthPath,
+		HealthTimeoutSeconds: state.Runtime.HealthTimeoutSeconds, Env: state.Config,
+		SecretRefs: secretRefs, Protected: protected,
+	}); err != nil {
 		return "", platformWriteError(err, "environment name or port already exists")
 	}
 	revisionID, _, err := insertEnvironmentRevisionTx(ctx, tx, envID, opID, actor, operation, summary, state)
@@ -127,8 +117,8 @@ func (s *Service) insertEnvironmentTx(ctx context.Context, tx pgx.Tx, app platfo
 	if err := lockRevisionPointerTx(ctx, tx, envID, revisionID); err != nil {
 		return "", err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments SET current_revision_id=$2,updated_at=clock_timestamp() WHERE id=$1`, envID, revisionID); err != nil {
-		return "", unavailable()
+	if _, err := tx.Platform().Environments().SetCurrentRevision(ctx, envID, revisionID); err != nil {
+		return "", unavailable(err)
 	}
 	// The optional first domain bindings commit before the caller queues a
 	// first deploy, so the deploy's deployability gate sees the primary binding.
@@ -186,7 +176,7 @@ func revisionStateFromSpec(spec platform.EnvironmentSpec, node string, deployInt
 // publishEnvironmentRevisionTx appends a revision and mirrors the legacy
 // columns the current deploy worker still reads. The mirror goes away with the
 // per-process container work in work list row 5.
-func publishEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, env platform.Environment, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState, buildNode *string) (platform.RevisionID, error) {
+func publishEnvironmentRevisionTx(ctx context.Context, tx *entities.StoreTx, env platform.Environment, opID contract.OperationID, actor contract.Actor, operation, summary string, state platform.RevisionState, buildNode *string) (platform.RevisionID, error) {
 	if _, err := lockPointerEnvironmentTx(ctx, tx, env.ID); err != nil {
 		return "", err
 	}
@@ -211,22 +201,21 @@ func publishEnvironmentRevisionTx(ctx context.Context, tx pgx.Tx, env platform.E
 			break
 		}
 	}
-	config, _ := json.Marshal(state.Config)
 	refs := env.SecretRefs
 	if len(state.SecretNames) > 0 {
 		refs = map[string]string{}
 	}
-	refsJSON, _ := json.Marshal(refs)
-	buildNodeValue := nullableString(env.BuildNode)
+	buildNodeValue := env.BuildNode
 	if buildNode != nil {
-		buildNodeValue = nullableString(*buildNode)
+		buildNodeValue = *buildNode
 	}
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-        SET node_name=$2,build_node=$3,container_port=$4,health_type=$5,health_path=$6,
-            health_timeout_seconds=$7,env=$8,secret_refs=$9,current_revision_id=$10,updated_at=clock_timestamp()
-        WHERE id=$1`, env.ID, node, buildNodeValue, containerPort,
-		state.Runtime.HealthType, state.Runtime.HealthPath, state.Runtime.HealthTimeoutSeconds,
-		config, refsJSON, revisionID); err != nil {
+	config := state.Config
+	if _, err := tx.Platform().Environments().PublishMirror(ctx, entities.EnvironmentMirror{
+		ID: env.ID, Node: node, BuildNode: buildNodeValue, ContainerPort: containerPort,
+		HealthType: state.Runtime.HealthType, HealthPath: state.Runtime.HealthPath,
+		HealthTimeoutSeconds: state.Runtime.HealthTimeoutSeconds, Env: config,
+		SecretRefs: refs, RevisionID: revisionID,
+	}); err != nil {
 		return "", platformWriteError(err, "environment revision could not be applied")
 	}
 	return revisionID, nil
@@ -239,7 +228,7 @@ func nullableString(value string) any {
 	return value
 }
 
-func currentRevisionStateTx(ctx context.Context, tx pgx.Tx, env platform.Environment) (platform.RevisionState, error) {
+func currentRevisionStateTx(ctx context.Context, tx *entities.StoreTx, env platform.Environment) (platform.RevisionState, error) {
 	if env.Revision != nil && env.RevisionID != "" && env.Revision.ID == env.RevisionID {
 		return platform.CloneRevisionState(env.Revision.RevisionState), nil
 	}
@@ -248,100 +237,28 @@ func currentRevisionStateTx(ctx context.Context, tx pgx.Tx, env platform.Environ
 
 // ---------------------------------------------------------------- inventory
 
-const revisionSelect = `SELECT r.id,a.name,e.name,r.number,coalesce(r.operation_id,''),
-    r.actor_kind,r.actor_subject,r.operation,r.summary,r.source,r.auto_deploy,r.webhook_secret_name,
-    r.runtime,r.processes,r.config,r.secret_names,r.resources,r.retention,r.deploy_intent,r.created_at
-    FROM eregion_platform_environment_revisions r
-    JOIN eregion_platform_environments e ON e.id=r.environment_id
-    JOIN eregion_platform_apps a ON a.id=e.app_id`
-
-func scanRevisionRow(row pgx.Row) (platform.EnvironmentRevision, error) {
-	var revision platform.EnvironmentRevision
-	var source, runtime, processes, config, retentionOverride []byte
-	err := row.Scan(&revision.ID, &revision.App, &revision.Environment, &revision.Number,
-		&revision.OperationID, &revision.Actor.Kind, &revision.Actor.Subject, &revision.Operation,
-		&revision.Summary, &source, &revision.AutoDeploy, &revision.WebhookSecretName,
-		&runtime, &processes, &config, &revision.SecretNames, &revision.Resources, &retentionOverride, &revision.DeployIntent, &revision.CreatedAt)
-	if err != nil {
-		return revision, err
-	}
-	if len(retentionOverride) > 0 {
-		if err := json.Unmarshal(retentionOverride, &revision.Retention); err != nil {
-			return revision, err
-		}
-	}
-	if len(source) > 0 {
-		if err := json.Unmarshal(source, &revision.Source); err != nil {
-			return revision, err
-		}
-	}
-	if len(runtime) > 0 {
-		if err := json.Unmarshal(runtime, &revision.Runtime); err != nil {
-			return revision, err
-		}
-	}
-	if len(processes) > 0 {
-		if err := json.Unmarshal(processes, &revision.Processes); err != nil {
-			return revision, err
-		}
-	}
-	revision.Config = map[string]string{}
-	if len(config) > 0 {
-		if err := json.Unmarshal(config, &revision.Config); err != nil {
-			return revision, err
-		}
-	}
-	if revision.Processes == nil {
-		revision.Processes = []platform.ProcessSpec{}
-	}
-	if revision.SecretNames == nil {
-		revision.SecretNames = []string{}
-	}
-	if revision.Resources == nil {
-		revision.Resources = []string{}
-	}
-	return revision, nil
-}
-
 func (s *Service) revisionByID(ctx context.Context, id platform.RevisionID) (platform.EnvironmentRevision, error) {
-	revision, err := scanRevisionRow(s.pool.QueryRow(ctx, revisionSelect+" WHERE r.id=$1", id))
+	revision, found, err := s.entities.Platform().Revisions().GetByID(ctx, id)
 	if err != nil {
 		return revision, unavailable(err)
+	}
+	if !found {
+		return revision, contract.NewFault(contract.NotFound, "environment revision not found", "Use a revision ID from inventory.")
 	}
 	return revision, nil
 }
 
 func (s *Service) inventoryRevisions(ctx context.Context, query platform.InventoryQuery) ([]platform.EnvironmentRevision, error) {
-	items := []platform.EnvironmentRevision{}
-	statement := revisionSelect + " WHERE 1=1"
-	args := []any{}
-	if query.App != "" {
-		args = append(args, query.App)
-		statement += fmt.Sprintf(" AND a.name=$%d", len(args))
-	}
-	if query.Environment != "" {
-		args = append(args, query.Environment)
-		statement += fmt.Sprintf(" AND e.name=$%d", len(args))
-	}
-	if query.State != "" {
-		args = append(args, query.State)
-		statement += fmt.Sprintf(" AND r.operation=$%d", len(args))
-	}
-	args = append(args, query.Limit)
-	statement += fmt.Sprintf(" ORDER BY r.created_at DESC LIMIT $%d", len(args))
-	rows, err := s.pool.Query(ctx, statement, args...)
+	items, err := s.entities.Platform().Revisions().List(ctx, entities.RevisionFilter{
+		App: query.App, Environment: query.Environment, State: query.State, Limit: query.Limit,
+	})
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		revision, err := scanRevisionRow(rows)
-		if err != nil {
-			return nil, unavailable()
-		}
-		items = append(items, revision)
+	if items == nil {
+		items = []platform.EnvironmentRevision{}
 	}
-	return items, rows.Err()
+	return items, nil
 }
 
 func (s *Service) inventoryDeployability(ctx context.Context, query platform.InventoryQuery) ([]platform.EnvironmentDeployabilityReport, error) {

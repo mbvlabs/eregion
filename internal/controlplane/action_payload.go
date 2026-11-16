@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -297,7 +297,7 @@ type diagnosticPayloadResult struct {
 // actionPayloadTx projects durable, operation-linked facts while settlement
 // holds the operation lock. Absence is represented explicitly; it is not
 // inferred from the action's requested input or from unrelated current rows.
-func (s *Service) actionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, status contract.State) (json.RawMessage, error) {
+func (s *Service) actionPayloadTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, status contract.State) (json.RawMessage, error) {
 	var payload any
 	switch op.Kind {
 	case platform.KindAppDelete, platform.KindEnvironmentDelete:
@@ -348,54 +348,35 @@ func (s *Service) actionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.O
 				return nil, err
 			}
 			result.AppName = in.Name
-			var app appObservation
-			err := tx.QueryRow(ctx, `SELECT id,clock_timestamp(),updated_at FROM eregion_platform_apps WHERE name=$1`, in.Name).
-				Scan(&app.ID, &app.ObservedAt, &app.UpdatedAt)
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			app, found, err := tx.Platform().Apps().ActionTimestamps(ctx, in.Name)
+			if err != nil {
 				return nil, err
 			}
-			if err == nil {
-				result.CurrentApp = &app
+			if found {
+				result.CurrentApp = &appObservation{ID: string(app.ID), ObservedAt: app.Now, UpdatedAt: app.UpdatedAt}
 			}
 			result.Availability = "partial"
 		}
-		rows, err := tx.Query(ctx, `SELECT r.id,r.environment_id,e.name,a.id,a.name,r.number,r.deploy_intent,
-			coalesce((SELECT o.id FROM eregion_operations o
-				JOIN eregion_platform_deployments first_dep ON first_dep.operation_id=o.id
-				WHERE r.deploy_intent AND o.kind='platform.deploy'
-				AND o.idempotency_key='first-deploy:' || r.id
-				AND o.actor_kind=source_op.actor_kind AND o.actor_subject=source_op.actor_subject
-				AND o.target='env/' || a.name || '/' || e.name
-				AND first_dep.revision_id=r.id AND first_dep.environment_id=r.environment_id),''),
-			r.processes,r.config,coalesce(p.config,'{}'::jsonb),(r.number=1 OR p.id IS NOT NULL),r.secret_names,r.resources
-			FROM eregion_platform_environment_revisions r
-			JOIN eregion_operations source_op ON source_op.id=r.operation_id
-			JOIN eregion_platform_environments e ON e.id=r.environment_id
-			JOIN eregion_platform_apps a ON a.id=e.app_id
-			LEFT JOIN LATERAL (SELECT id,config FROM eregion_platform_environment_revisions prev
-				WHERE prev.environment_id=r.environment_id AND prev.number=r.number-1) p ON true
-			WHERE r.operation_id=$1 ORDER BY a.name,e.name,r.number`, op.ID)
+		rows, err := tx.Platform().Revisions().FirstDeployActionRows(ctx, op.ID)
 		if err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var revision actionRevision
-			var processes, config, previous []byte
-			if err := rows.Scan(&revision.ID, &revision.EnvironmentID, &revision.Environment, &revision.AppID, &revision.App, &revision.Number, &revision.DeployIntent, &revision.FirstDeployOperationID, &processes, &config, &previous, &revision.ChangedConfigAvailable, &revision.SecretNames, &revision.Resources); err != nil {
-				rows.Close()
+		for _, row := range rows {
+			revision := actionRevision{
+				ID: string(row.RevisionID), EnvironmentID: string(row.EnvironmentID), Environment: row.Environment,
+				AppID: string(row.AppID), App: row.App, Number: row.Number, DeployIntent: row.DeployIntent,
+				FirstDeployOperationID: string(row.DeployOpID), ChangedConfigAvailable: row.HasPrevious,
+				SecretNames: row.SecretNames, Resources: row.Resources,
+			}
+			for _, process := range row.Processes {
+				revision.Processes = append(revision.Processes, actionProcess{Name: process.Name, Kind: process.Kind, Replicas: process.Replicas})
+			}
+			currentConfig, err := rawConfig(row.Config)
+			if err != nil {
 				return nil, err
 			}
-			if err := json.Unmarshal(processes, &revision.Processes); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			var currentConfig, previousConfig map[string]json.RawMessage
-			if err := json.Unmarshal(config, &currentConfig); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			if err := json.Unmarshal(previous, &previousConfig); err != nil {
-				rows.Close()
+			previousConfig, err := rawConfig(row.PreviousConfig)
+			if err != nil {
 				return nil, err
 			}
 			if revision.ChangedConfigAvailable {
@@ -413,11 +394,6 @@ func (s *Service) actionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.O
 			sort.Strings(revision.ChangedConfigKeys)
 			result.Revisions = append(result.Revisions, revision)
 		}
-		err = rows.Err()
-		rows.Close()
-		if err != nil {
-			return nil, err
-		}
 		if len(result.Revisions) > 0 {
 			result.Availability = "available"
 			result.Reason = ""
@@ -425,18 +401,20 @@ func (s *Service) actionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.O
 		payload = result
 	case platform.KindReleaseCreate, platform.KindBuildRetry, platform.KindDeploy, platform.KindRollback, platform.KindRestart, platform.KindPromote:
 		result := executionPayload{Availability: "unavailable", Reason: "No build, release or deployment linked to this operation remains available."}
-		err := tx.QueryRow(ctx, `SELECT coalesce(b.id,''),coalesce(b.state,''),coalesce(b.commit_sha,''),
-			coalesce(d.id,''),coalesce(d.state,''),coalesce(d.revision_id,b.revision_id,''),
-			coalesce(d.release_id,b.release_id,r.id,''),coalesce(r.image,''),coalesce(r.image_id,'')
-			FROM (SELECT $1::text AS operation_id) o
-			LEFT JOIN eregion_platform_builds b ON b.operation_id=o.operation_id
-			LEFT JOIN eregion_platform_deployments d ON d.operation_id=o.operation_id
-			LEFT JOIN eregion_platform_releases r ON r.id=coalesce(d.release_id,b.release_id)
-				OR (d.id IS NULL AND b.id IS NULL AND r.operation_id=o.operation_id)
-			LIMIT 1`, op.ID).Scan(&result.BuildID, &result.BuildState, &result.CommitSHA,
-			&result.DeploymentID, &result.DeployState, &result.RevisionID, &result.ReleaseID, &result.Image, &result.ImageID)
+		facts, found, err := tx.Platform().Deployments().BuildDeploymentFacts(ctx, op.ID)
 		if err != nil {
 			return nil, err
+		}
+		if found {
+			result.BuildID = string(facts.BuildID)
+			result.BuildState = string(facts.BuildState)
+			result.CommitSHA = facts.CommitSHA
+			result.DeploymentID = string(facts.DeploymentID)
+			result.DeployState = string(facts.DeployState)
+			result.RevisionID = string(facts.RevisionID)
+			result.ReleaseID = string(facts.ReleaseID)
+			result.Image = facts.Image
+			result.ImageID = facts.ImageID
 		}
 		if result.BuildID != "" || result.DeploymentID != "" || result.ReleaseID != "" {
 			result.Availability = "partial"
@@ -450,32 +428,24 @@ func (s *Service) actionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.O
 		payload = result
 	case platform.KindDefinitionApply:
 		result := definitionPayload{Availability: "unavailable", Reason: "No definition run linked to this operation remains available."}
-		err := tx.QueryRow(ctx, `SELECT environment_id,finished_at FROM eregion_definition_runs WHERE operation_id=$1`, op.ID).
-			Scan(&result.EnvironmentID, &result.FinishedAt)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		run, found, err := tx.DefinitionRuns().Get(ctx, op.ID)
+		if err != nil {
 			return nil, err
 		}
-		if err == nil {
+		if found {
 			result.Availability = "available"
 			result.Reason = ""
-			rows, err := tx.Query(ctx, `SELECT s.ordinal,s.kind,s.target,coalesce(s.child_operation_id,''),coalesce(o.state,'')
-				FROM eregion_definition_steps s LEFT JOIN eregion_operations o ON o.id=s.child_operation_id
-				WHERE s.parent_operation_id=$1 ORDER BY s.ordinal`, op.ID)
+			result.EnvironmentID = run.EnvironmentID
+			result.FinishedAt = run.FinishedAt
+			rows, err := tx.DefinitionSteps().ListChildJournal(ctx, op.ID)
 			if err != nil {
 				return nil, err
 			}
-			for rows.Next() {
-				var child definitionChild
-				if err := rows.Scan(&child.Ordinal, &child.Kind, &child.Target, &child.OperationID, &child.Status); err != nil {
-					rows.Close()
-					return nil, err
-				}
-				result.Children = append(result.Children, child)
-			}
-			err = rows.Err()
-			rows.Close()
-			if err != nil {
-				return nil, err
+			for _, row := range rows {
+				result.Children = append(result.Children, definitionChild{
+					Ordinal: row.Ordinal, Kind: row.Kind, Target: row.Target,
+					OperationID: string(row.ChildID), Status: row.ChildState,
+				})
 			}
 		}
 		payload = result
@@ -495,15 +465,30 @@ func (s *Service) actionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.O
 	return json.Marshal(payload)
 }
 
-func actionInputTx(ctx context.Context, tx pgx.Tx, id contract.OperationID, dst any) error {
-	var raw []byte
-	if err := tx.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, id).Scan(&raw); err != nil {
+func rawConfig(values map[string]string) (map[string]json.RawMessage, error) {
+	result := make(map[string]json.RawMessage, len(values))
+	for key, value := range values {
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		result[key] = raw
+	}
+	return result, nil
+}
+
+func actionInputTx(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, dst any) error {
+	raw, found, err := tx.Operations().Input(ctx, id)
+	if err != nil {
 		return err
+	}
+	if !found {
+		return contract.NewFault(contract.NotFound, "operation input not found", "Read the operation before projecting its input.")
 	}
 	return json.Unmarshal(raw, dst)
 }
 
-func protectionActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (protectionPayload, error) {
+func protectionActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (protectionPayload, error) {
 	result := protectionPayload{Availability: "partial"}
 	target, err := platform.ParseTarget(op.Target)
 	if err != nil || target.Kind != platform.TargetEnvironment {
@@ -514,87 +499,79 @@ func protectionActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operat
 		return result, err
 	}
 	result.App, result.Environment, result.DesiredProtected = target.App, target.Environment, in.Protected
-	var observation protectionObservation
-	err = tx.QueryRow(ctx, `SELECT clock_timestamp(),e.updated_at,e.id,e.protected
-		FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
-		WHERE a.name=$1 AND e.name=$2`, target.App, target.Environment).
-		Scan(&observation.ObservedAt, &observation.UpdatedAt, &observation.EnvironmentID, &observation.Protected)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	facts, found, err := tx.Platform().Outcomes().ProtectionFacts(ctx, target.App, target.Environment)
+	if err != nil {
 		return result, err
 	}
-	if err == nil {
-		result.CurrentObservation = &observation
+	if found {
+		result.CurrentObservation = &protectionObservation{
+			ObservedAt: facts.Now, UpdatedAt: facts.UpdatedAt, EnvironmentID: string(facts.ID), Protected: facts.Protected,
+		}
 	} else {
 		result.Reason = "The environment no longer exists; its current protection cannot be observed."
 	}
 	return result, nil
 }
 
-func executionDeploymentFacts(ctx context.Context, tx pgx.Tx, op *contract.Operation, result *executionPayload) error {
-	var observation deploymentObservation
-	err := tx.QueryRow(ctx, `SELECT coalesce(d.previous_release_id,''),coalesce(d.previous_deployment_id,''),
-		clock_timestamp(),e.updated_at,coalesce(e.serving_deployment_id,''),coalesce(e.serving_release_id,''),
-		coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,''),e.health_state,e.health_checked_at,
-		coalesce(o.operation_id,''),coalesce(o.deployment_id,''),coalesce(o.phase,''),coalesce(o.route_target_deployment_id,''),
-		(SELECT count(*) FROM eregion_platform_container_cleanup c WHERE c.deployment_id=d.id),
-		(SELECT count(*) FROM eregion_platform_container_cleanup c WHERE c.deployment_id=d.previous_deployment_id)
-		FROM eregion_platform_deployments d JOIN eregion_platform_environments e ON e.id=d.environment_id
-		LEFT JOIN eregion_platform_deployment_owners o ON o.environment_id=e.id
-		WHERE d.id=$1 AND d.operation_id=$2`, result.DeploymentID, op.ID).
-		Scan(&result.PreviousReleaseID, &result.PreviousDeploymentID, &observation.ObservedAt, &observation.EnvironmentUpdatedAt,
-			&observation.ServingDeploymentID, &observation.ServingReleaseID, &observation.DesiredReleaseID,
-			&observation.AppliedReleaseID, &observation.HealthState, &observation.HealthCheckedAt,
-			&observation.OwnerOperationID, &observation.OwnerDeploymentID, &observation.OwnerPhase,
-			&observation.RouteTargetDeploymentID, &observation.CandidateCleanupPending, &observation.PreviousCleanupPending)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+func executionDeploymentFacts(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, result *executionPayload) error {
+	facts, found, err := tx.Platform().Deployments().ExecutionFacts(ctx, platform.DeploymentID(result.DeploymentID), op.ID)
+	if err != nil {
 		return err
 	}
-	if err == nil {
-		observation.ActionDeploymentServing = observation.ServingDeploymentID == result.DeploymentID
+	if found {
+		result.PreviousReleaseID = string(facts.PreviousReleaseID)
+		result.PreviousDeploymentID = string(facts.PreviousDeploymentID)
+		observation := deploymentObservation{
+			ObservedAt: facts.Now, EnvironmentUpdatedAt: facts.EnvironmentUpdatedAt,
+			ServingDeploymentID: string(facts.ServingDeploymentID), ServingReleaseID: string(facts.ServingReleaseID),
+			DesiredReleaseID: string(facts.DesiredReleaseID), AppliedReleaseID: string(facts.AppliedReleaseID),
+			HealthState: string(facts.HealthState), HealthCheckedAt: facts.HealthCheckedAt,
+			OwnerOperationID: string(facts.OwnerOperationID), OwnerDeploymentID: string(facts.OwnerDeploymentID),
+			OwnerPhase: facts.OwnerPhase, RouteTargetDeploymentID: string(facts.RouteTarget),
+			CandidateCleanupPending: int(facts.CleanupCount), PreviousCleanupPending: int(facts.PreviousCleanupCount),
+			ActionDeploymentServing: string(facts.ServingDeploymentID) == result.DeploymentID,
+		}
 		result.CurrentObservation = &observation
 	}
-	rows, err := tx.Query(ctx, `SELECT step,state,attempt,execution_id,started_at,completed_at
-		FROM eregion_operation_steps WHERE operation_id=$1 AND
-		(step LIKE 'platform-health-%' OR step LIKE 'platform-cleanup-%' OR step IN ($2,$3,$4))
-		ORDER BY step`, op.ID, deploymentRouteStep, deploymentPublicStep, deploymentRestoreRouteStep)
+	records, err := tx.Steps().ListByPattern(ctx, op.ID,
+		[]string{"platform-health-%", "platform-cleanup-%"},
+		[]string{deploymentRouteStep, deploymentPublicStep, deploymentRestoreRouteStep},
+	)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var step diagnosticStep
-		if err := rows.Scan(&step.Step, &step.State, &step.Attempt, &step.ExecutionID, &step.StartedAt, &step.CompletedAt); err != nil {
-			return err
-		}
-		result.Steps = append(result.Steps, step)
+	for _, record := range records {
+		result.Steps = append(result.Steps, diagnosticStep{
+			Step: record.Step, State: record.State, Attempt: record.Attempt,
+			ExecutionID: record.ExecutionID, StartedAt: record.StartedAt, CompletedAt: record.CompletedAt,
+		})
 	}
-	return rows.Err()
+	return nil
 }
 
-func (s *Service) retentionActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (retentionPayload, error) {
+func (s *Service) retentionActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (retentionPayload, error) {
 	result := retentionPayload{Availability: "unavailable", Reason: "No retention run linked to this operation remains available."}
-	var planned, removed, runErrors []byte
-	err := tx.QueryRow(ctx, `SELECT id,status,planned_bytes,reclaimed_bytes,started_at,finished_at,
-		planned_items,removed_items,errors,cache_bytes,cache_measured_at,cache_measurement_error,gc_generation
-		FROM eregion_retention_runs WHERE operation_id=$1 ORDER BY started_at DESC LIMIT 1`, op.ID).
-		Scan(&result.RunID, &result.Status, &result.PlannedBytes, &result.ReclaimedBytes, &result.StartedAt,
-			&result.FinishedAt, &planned, &removed, &runErrors, &result.CacheBytes, &result.CacheMeasuredAt,
-			&result.CacheError, &result.GCGeneration)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return result, nil
-	}
+	run, found, err := tx.Retention().LatestRunForOperation(ctx, op.ID)
 	if err != nil {
 		return result, err
 	}
+	if !found {
+		return result, nil
+	}
+	result.RunID, result.Status = run.ID, run.Status
+	result.PlannedBytes, result.ReclaimedBytes = run.PlannedBytes, run.ReclaimedBytes
+	result.StartedAt, result.FinishedAt = &run.StartedAt, run.FinishedAt
+	result.CacheBytes, result.CacheMeasuredAt = run.CacheBytes, run.CacheMeasuredAt
+	result.CacheError, result.GCGeneration = run.CacheMeasurementError, run.GCGeneration
 	var plan, removals []retention.Item
 	var errs []retention.RunError
-	if err := json.Unmarshal(planned, &plan); err != nil {
+	if err := json.Unmarshal(run.PlannedItems, &plan); err != nil {
 		return result, err
 	}
-	if err := json.Unmarshal(removed, &removals); err != nil {
+	if err := json.Unmarshal(run.RemovedItems, &removals); err != nil {
 		return result, err
 	}
-	if err := json.Unmarshal(runErrors, &errs); err != nil {
+	if err := json.Unmarshal(run.Errors, &errs); err != nil {
 		return result, err
 	}
 	project := func(item retention.Item) retentionPayloadItem {
@@ -635,7 +612,7 @@ func (s *Service) retentionActionPayload(ctx context.Context, tx pgx.Tx, op *con
 	return result, nil
 }
 
-func nodeActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (nodePayload, error) {
+func nodeActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (nodePayload, error) {
 	result := nodePayload{Availability: "partial", Reason: "The selected node has no current record; registration is not authentication."}
 	if op.Kind == platform.KindNodeRegister {
 		var in platform.NodeRegisterInput
@@ -660,24 +637,25 @@ func nodeActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (
 			result.DeclaredRoles = in.Roles
 		}
 	}
-	var observation nodeObservation
-	err := tx.QueryRow(ctx, `SELECT clock_timestamp(),updated_at,roles,capabilities,status,enrollment_state,
-		coalesce(enroll_operation_id,''),enrolled_at,identity_fingerprint,last_check_state,last_check_at,wg_state
-		FROM eregion_platform_nodes WHERE name=$1`, result.Name).
-		Scan(&observation.ObservedAt, &observation.UpdatedAt, &observation.Roles, &observation.Capabilities,
-			&observation.Status, &observation.EnrollmentState, &observation.EnrollmentOperation, &observation.EnrolledAt,
-			&observation.IdentityFingerprint, &observation.LastCheckState, &observation.LastCheckAt, &observation.WireGuardState)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	facts, found, err := tx.Nodes().ActionFacts(ctx, result.Name)
+	if err != nil {
 		return result, err
 	}
-	if err == nil {
-		result.CurrentObservation = &observation
+	if found {
+		result.CurrentObservation = &nodeObservation{
+			ObservedAt: facts.Now, UpdatedAt: facts.UpdatedAt, Roles: facts.Roles,
+			Capabilities: facts.Capabilities, Status: string(facts.Status),
+			EnrollmentState: string(facts.Enrollment), EnrollmentOperation: string(facts.EnrollmentOperation),
+			EnrolledAt: facts.EnrolledAt, IdentityFingerprint: facts.IdentityFingerprint,
+			LastCheckState: facts.LastCheckState, LastCheckAt: facts.LastCheckAt,
+			WireGuardState: string(facts.WGState),
+		}
 		result.Reason = "Current node facts may have changed since this operation; registration alone is not verification."
 	}
 	return result, nil
 }
 
-func domainActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (domainPayload, error) {
+func domainActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (domainPayload, error) {
 	result := domainPayload{Availability: "partial", Reason: "The selected binding is absent; a removed binding's identity and cleanup outcome require a pre-delete snapshot."}
 	target, err := platform.ParseTarget(op.Target)
 	if err != nil || target.Kind != platform.TargetEnvironment {
@@ -688,37 +666,36 @@ func domainActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation)
 		return result, err
 	}
 	result.App, result.Environment, result.Name = target.App, target.Environment, in.Domain
-	var observation actionDomainObservation
-	err = tx.QueryRow(ctx, `SELECT clock_timestamp(),d.id,d.environment_id,d.is_primary,d.desired_revision,d.applied_revision,
-		d.route_state,d.route_observed_at,d.route_applied_at,d.dns_state,d.dns_observed_at,
-		d.certificate_state,d.certificate_observed_at,d.public_state,d.public_observed_at,
-		coalesce(x.provider,''),coalesce(x.zone_name,''),coalesce(x.ownership_marker,''),x.generation,x.applied_generation,
-		x.desired_origins,x.desired_proxied,coalesce(x.state,''),coalesce(x.last_operation_id,''),x.updated_at,
-		x.cleanup_requested_at,x.cleanup_verified_at
-		FROM eregion_platform_domains d
-		JOIN eregion_platform_environments e ON e.id=d.environment_id
-		JOIN eregion_platform_apps a ON a.id=e.app_id
-		LEFT JOIN eregion_platform_domain_dns x ON x.domain_id=d.id
-		WHERE a.name=$1 AND e.name=$2 AND d.name=$3`, result.App, result.Environment, result.Name).
-		Scan(&observation.ObservedAt, &observation.ID, &observation.EnvironmentID, &observation.Primary,
-			&observation.DesiredRevision, &observation.AppliedRevision, &observation.RouteState, &observation.RouteObservedAt,
-			&observation.RouteAppliedAt, &observation.DNSState, &observation.DNSObservedAt, &observation.CertificateState,
-			&observation.CertificateObservedAt, &observation.PublicState, &observation.PublicObservedAt,
-			&observation.Provider, &observation.ZoneName, &observation.OwnershipMarker, &observation.Generation,
-			&observation.AppliedGeneration, &observation.DesiredOrigins, &observation.DesiredProxied,
-			&observation.ProviderState, &observation.LastOperationID, &observation.LedgerUpdatedAt,
-			&observation.CleanupRequestedAt, &observation.CleanupVerifiedAt)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	facts, found, err := tx.Platform().Domains().ActionFacts(ctx, result.App, result.Environment, result.Name)
+	if err != nil {
 		return result, err
 	}
-	if err == nil {
+	if found {
+		observation := actionDomainObservation{
+			ObservedAt: facts.Now, ID: string(facts.ID), EnvironmentID: string(facts.EnvironmentID),
+			Primary: facts.Primary, DesiredRevision: facts.DesiredRevision, AppliedRevision: facts.AppliedRevision,
+			RouteState: string(facts.RouteState), RouteObservedAt: facts.RouteObservedAt,
+			RouteAppliedAt: facts.RouteAppliedAt, DNSState: string(facts.DNSState),
+			DNSObservedAt: facts.DNSObservedAt, CertificateState: string(facts.CertificateState),
+			CertificateObservedAt: facts.CertificateObservedAt, PublicState: string(facts.PublicState),
+			PublicObservedAt: facts.PublicObservedAt, Provider: facts.Provider, ZoneName: facts.ZoneName,
+			OwnershipMarker: facts.OwnershipMarker, DesiredOrigins: facts.DesiredOrigins,
+			ProviderState: facts.LedgerState, LastOperationID: string(facts.LastOperationID),
+			LedgerUpdatedAt: facts.LedgerUpdatedAt, CleanupRequestedAt: facts.CleanupRequestedAt,
+			CleanupVerifiedAt: facts.CleanupVerifiedAt,
+		}
+		if facts.LedgerState != "" {
+			generation, applied := facts.Generation, facts.AppliedGeneration
+			proxied := facts.DesiredProxied
+			observation.Generation, observation.AppliedGeneration, observation.DesiredProxied = &generation, &applied, &proxied
+		}
 		result.CurrentObservation = &observation
 		result.Reason = "The binding and DNS ledger are current observations and may have changed since this operation."
 	}
 	return result, nil
 }
 
-func resourceActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (resourcePayload, error) {
+func resourceActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (resourcePayload, error) {
 	result := resourcePayload{Availability: "partial", Reason: "The selected resource has no current record; its historical state is unavailable."}
 	target, err := platform.ParseTarget(op.Target)
 	if err != nil || target.Kind != platform.TargetResource {
@@ -733,24 +710,20 @@ func resourceActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operatio
 		result.DeleteDataRequested = &in.DeleteData
 		result.DataOutcome = "unavailable"
 	}
-	var observation resourceObservation
-	var volumes []byte
-	err = tx.QueryRow(ctx, `SELECT clock_timestamp(),r.updated_at,r.id,r.environment_id,r.node_name,r.state,
-		r.image,r.image_id,r.container_name,r.network_name,r.volumes,r.health_state,r.health_checked_at,
-		coalesce(r.operation_id,''),r.destroyed_at
-		FROM eregion_platform_resources r JOIN eregion_platform_environments e ON e.id=r.environment_id
-		JOIN eregion_platform_apps a ON a.id=r.app_id
-		WHERE a.name=$1 AND e.name=$2 AND r.name=$3`, result.App, result.Environment, result.Name).
-		Scan(&observation.ObservedAt, &observation.UpdatedAt, &observation.ID, &observation.EnvironmentID,
-			&observation.Node, &observation.State, &observation.Image, &observation.ImageID,
-			&observation.ContainerName, &observation.NetworkName, &volumes, &observation.HealthState,
-			&observation.HealthCheckedAt, &observation.LastOperationID, &observation.DestroyedAt)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	facts, found, err := tx.Resources().ActionFacts(ctx, result.App, result.Environment, result.Name)
+	if err != nil {
 		return result, err
 	}
-	if err == nil {
+	if found {
+		observation := resourceObservation{
+			ObservedAt: facts.Now, ID: string(facts.ID), EnvironmentID: string(facts.EnvironmentID),
+			Node: facts.Node, State: string(facts.State), Image: facts.Image, ImageID: facts.ImageID,
+			ContainerName: facts.ContainerName, NetworkName: facts.NetworkName,
+			HealthState: string(facts.HealthState), HealthCheckedAt: facts.HealthCheckedAt,
+			LastOperationID: string(facts.OperationID), DestroyedAt: facts.DestroyedAt,
+		}
 		var owned []platform.ResourceVolumeStatus
-		if err := json.Unmarshal(volumes, &owned); err != nil {
+		if err := json.Unmarshal(facts.Volumes, &owned); err != nil {
 			return result, err
 		}
 		for _, volume := range owned {
@@ -771,50 +744,48 @@ func resourceActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operatio
 	return result, nil
 }
 
-func buildStopActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (buildStopPayload, error) {
+func buildStopActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (buildStopPayload, error) {
 	result := buildStopPayload{Availability: "partial", Reason: "The target build record is no longer available."}
 	target, err := platform.ParseTarget(op.Target)
 	if err != nil || target.Kind != platform.TargetBuild {
 		return result, errors.New("invalid build stop target")
 	}
 	result.TargetBuildID = string(target.Build)
-	var observation buildObservation
-	err = tx.QueryRow(ctx, `SELECT clock_timestamp(),id,operation_id,state,commit_sha,coalesce(revision_id,''),
-		coalesce(release_id,''),completed_at FROM eregion_platform_builds WHERE id=$1`, result.TargetBuildID).
-		Scan(&observation.ObservedAt, &observation.ID, &observation.OperationID, &observation.State,
-			&observation.CommitSHA, &observation.RevisionID, &observation.ReleaseID, &observation.CompletedAt)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	facts, found, err := tx.Platform().Builds().ActionFacts(ctx, platform.BuildID(result.TargetBuildID))
+	if err != nil {
 		return result, err
 	}
-	if err == nil {
-		result.CurrentObservation = &observation
+	if found {
+		result.CurrentObservation = &buildObservation{
+			ObservedAt: facts.Now, ID: string(facts.ID), OperationID: string(facts.OperationID),
+			State: string(facts.State), CommitSHA: facts.CommitSHA, RevisionID: string(facts.RevisionID),
+			ReleaseID: string(facts.ReleaseID), CompletedAt: facts.CompletedAt,
+		}
 		result.Reason = "Build state is a current observation, not proof of the stop action's historical outcome."
 	}
 	return result, nil
 }
 
-func diagnosticActionPayload(ctx context.Context, tx pgx.Tx, op *contract.Operation) (diagnosticPayloadResult, error) {
+func diagnosticActionPayload(ctx context.Context, tx *entities.StoreTx, op *contract.Operation) (diagnosticPayloadResult, error) {
 	result := diagnosticPayloadResult{Availability: "available"}
 	var in operations.TestInput
 	if err := actionInputTx(ctx, tx, op.ID, &in); err != nil {
 		return result, err
 	}
 	result.RequestedSteps = in.Steps
-	rows, err := tx.Query(ctx, `SELECT step,state,attempt,execution_id,started_at,completed_at
-		FROM eregion_operation_steps WHERE operation_id=$1 ORDER BY step`, op.ID)
+	rows, err := tx.Steps().List(ctx, op.ID)
 	if err != nil {
 		return result, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var step diagnosticStep
-		if err := rows.Scan(&step.Step, &step.State, &step.Attempt, &step.ExecutionID, &step.StartedAt, &step.CompletedAt); err != nil {
-			return result, err
+	for _, record := range rows {
+		step := diagnosticStep{
+			Step: record.Step, State: record.State, Attempt: record.Attempt,
+			ExecutionID: record.ExecutionID, StartedAt: record.StartedAt, CompletedAt: record.CompletedAt,
 		}
 		if step.State == "completed" {
 			result.AcknowledgedSteps++
 		}
 		result.Steps = append(result.Steps, step)
 	}
-	return result, rows.Err()
+	return result, nil
 }

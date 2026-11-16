@@ -8,21 +8,20 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
-	"github.com/mbvlabs/eregion/internal/node"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
-	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
 func readActionPayload(t *testing.T, pool *pgxpool.Pool, s *Service, op contract.Operation, dst any) string {
 	t.Helper()
 	ctx := context.Background()
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(tx)
-	raw, err := s.actionPayloadTx(ctx, tx, &op, contract.Succeeded)
+	var raw json.RawMessage
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		raw, err = s.actionPayloadTx(ctx, tx, &op, contract.Succeeded)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,12 +44,18 @@ func TestIntegrationActionPayloadRevisionAndUnavailable(t *testing.T) {
 		},
 	})
 	ctx := context.Background()
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(tx)
-	raw, err := s.actionPayloadTx(ctx, tx, &op, contract.Succeeded)
+	var raw json.RawMessage
+	var missingRaw json.RawMessage
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		raw, err = s.actionPayloadTx(ctx, tx, &op, contract.Succeeded)
+		if err != nil {
+			return err
+		}
+		missing := contract.Operation{ID: op.ID, Kind: platform.KindRetentionPrune}
+		missingRaw, err = s.actionPayloadTx(ctx, tx, &missing, contract.Failed)
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,20 +80,20 @@ func TestIntegrationActionPayloadRevisionAndUnavailable(t *testing.T) {
 		emptyResult.CurrentApp.ObservedAt.IsZero() || len(emptyResult.Revisions) != 0 {
 		t.Fatalf("app without environments: %+v", emptyResult)
 	}
-	missing := contract.Operation{ID: op.ID, Kind: platform.KindRetentionPrune}
-	raw, err = s.actionPayloadTx(ctx, tx, &missing, contract.Failed)
-	if err != nil || !strings.Contains(string(raw), `"availability":"unavailable"`) {
-		t.Fatalf("missing retention payload %s: %v", raw, err)
+	if !strings.Contains(string(missingRaw), `"availability":"unavailable"`) {
+		t.Fatalf("missing retention payload %s", missingRaw)
 	}
-	missing.Kind = platform.KindDeploy
-	raw, err = s.actionPayloadTx(ctx, tx, &missing, contract.Failed)
-	if err != nil || !strings.Contains(string(raw), `"availability":"unavailable"`) {
-		t.Fatalf("missing deployment payload %s: %v", raw, err)
-	}
-	missing.Kind = platform.KindDefinitionApply
-	raw, err = s.actionPayloadTx(ctx, tx, &missing, contract.Failed)
-	if err != nil || !strings.Contains(string(raw), `"availability":"unavailable"`) {
-		t.Fatalf("missing definition payload %s: %v", raw, err)
+	for _, kind := range []string{platform.KindDeploy, platform.KindDefinitionApply} {
+		var out json.RawMessage
+		missing := contract.Operation{ID: op.ID, Kind: kind}
+		err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			var err error
+			out, err = s.actionPayloadTx(ctx, tx, &missing, contract.Failed)
+			return err
+		})
+		if err != nil || !strings.Contains(string(out), `"availability":"unavailable"`) {
+			t.Fatalf("missing %s payload %s: %v", kind, out, err)
+		}
 	}
 }
 
@@ -240,13 +245,8 @@ func TestIntegrationActionPayloadBuildStopTarget(t *testing.T) {
 
 func TestIntegrationActionPayloadDiagnosticAcknowledgements(t *testing.T) {
 	pool, _ := testPool(t, true)
-	dir := t.TempDir()
-	run := testRuntime(t, pool, 0, dir)
-	local, err := node.NewLocal(dir, "local", &secrets.Registry{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	run.Service.transport = local
+	run := testRuntime(t, pool, 0)
+	run.Service.transport = &scriptedPlatformTransport{}
 	ctx := context.Background()
 	op, err := run.Service.Submit(ctx, submission("payload-diagnostic", `{"steps":2,"step_delay_ms":0}`))
 	if err != nil {

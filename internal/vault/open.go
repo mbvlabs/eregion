@@ -38,18 +38,13 @@ func OpenRevision(ring *KeyRing, row EncryptedRevision) ([]byte, RevisionRef, er
 	if row.Revision == 0 || row.KeyID == "" || len(row.Ciphertext) == 0 {
 		return nil, RevisionRef{}, contract.NewFault(contract.PreconditionFailed, "the environment webhook secret is unusable", "Rotate it with eregion env update.")
 	}
-	encrypted := encryptedRow{
-		Name:           row.Namespace.Name,
-		State:          row.State,
-		Ref:            RevisionRef{Revision: row.Revision, KeyID: row.KeyID, CreatedAt: row.CreatedAt},
-		KeyID:          row.KeyID,
-		Ciphertext:     row.Ciphertext,
-		CiphertextHash: row.CiphertextSHA256,
-		RevisionHash:   row.RevisionHash,
-	}
-	plaintext, err := decryptRow(ring, row.Namespace, &encrypted)
+	plaintext, ref, err := decryptStored(ring, StoredCiphertext{
+		Namespace: row.Namespace, State: row.State, Revision: row.Revision,
+		KeyID: row.KeyID, Ciphertext: row.Ciphertext, CiphertextSHA256: row.CiphertextSHA256,
+		RevisionHash: row.RevisionHash, CreatedAt: row.CreatedAt,
+	})
 	if err != nil {
 		return nil, RevisionRef{}, err
 	}
-	return plaintext, encrypted.Ref, nil
+	return plaintext, ref, nil
 }

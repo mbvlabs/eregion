@@ -155,7 +155,7 @@ func TestIntegrationReleaseCommandRecoveryAndCleanupFences(t *testing.T) {
 				if tc.name == "confirmed-failed" {
 					tr.result = json.RawMessage(`{"stage":"release-command","output_availability":"bounded","redaction_context":"not_required","container":{"availability":"partial","started_at":"2026-11-14T10:00:00Z","finished_at":"2026-11-14T10:00:01Z","exit_code":1}}`)
 				}
-				s := &Service{pool: pool, resolver: NewNodeResolver(pool, ResolverConfig{}, func() node.Transport { return tr })}
+				s := &Service{entities: newTestEntities(t, pool), resolver: NewNodeResolver(newTestEntities(t, pool).Nodes(), ResolverConfig{}, func() node.Transport { return tr })}
 				current, err := contract.NewOperationID()
 				if err != nil {
 					t.Fatal(err)
@@ -211,7 +211,7 @@ func TestIntegrationReleaseCommandRecoveryAndCleanupFences(t *testing.T) {
 				if tc.name == "confirmed-failed" {
 					tr.result = json.RawMessage(`{"stage":"release-command","output_availability":"bounded","redaction_context":"not_required","container":{"availability":"partial","started_at":"2026-11-14T10:00:00Z","finished_at":"2026-11-14T10:00:01Z","exit_code":1}}`)
 				}
-				run.Service.resolver = NewNodeResolver(pool, ResolverConfig{}, func() node.Transport { return tr })
+				run.Service.resolver = NewNodeResolver(newTestEntities(t, pool).Nodes(), ResolverConfig{}, func() node.Transport { return tr })
 				outstanding, err := run.Service.deploymentNodeEffectOutstanding(ctx, dep, env, op.ID, 1)
 				if err != nil || outstanding != tc.wantOutstanding || tr.runs != 0 {
 					t.Fatalf("outstanding=%v want=%v runs=%d err=%v", outstanding, tc.wantOutstanding, tr.runs, err)

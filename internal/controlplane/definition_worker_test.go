@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 )
 
 // This integration test requires an explicitly isolated test database. It is
@@ -35,23 +36,24 @@ func TestIntegrationDefinitionDrainReservesUntilChildSettles(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_definition_steps(parent_operation_id,ordinal,kind,target,input,child_operation_id,dns_progress) VALUES ($1,0,'platform.environment.update','env/app/prod',$3::jsonb,$2,'[]')`, parent, child, childInput); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := pool.Begin(ctx)
+	s := &Service{entities: newTestEntities(t, pool)}
+	var op contract.Operation
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		locked, found, err := tx.Operations().Lock(ctx, parent)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		op = locked
+		active, err := definitionDrainTx(ctx, tx, &op)
+		if err != nil || !active {
+			t.Fatalf("drain active=%t err=%v", active, err)
+		}
+		if err := definitionFinishTx(ctx, tx, &op, contract.Canceled, "", "cancelled"); err == nil {
+			t.Fatal("finished parent while child was active")
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(tx)
-	op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 FOR UPDATE", parent))
-	if err != nil {
-		t.Fatal(err)
-	}
-	active, err := definitionDrainTx(ctx, tx, &op)
-	if err != nil || !active {
-		t.Fatalf("drain active=%t err=%v", active, err)
-	}
-	if err := definitionFinishTx(ctx, tx, &op, contract.Canceled, "", "cancelled"); err == nil {
-		t.Fatal("finished parent while child was active")
-	}
-	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 	var state contract.State
@@ -64,7 +66,6 @@ func TestIntegrationDefinitionDrainReservesUntilChildSettles(t *testing.T) {
 	}
 	// Drive the cancelling child through the ordinary worker and then let the
 	// parent drain finish; the synthetic journal above tests only this lifecycle.
-	s := &Service{pool: pool}
 	if err := runPlatformAttempt(ctx, s, child, 1); err != nil {
 		t.Fatalf("settle cancelling child: %v", err)
 	}

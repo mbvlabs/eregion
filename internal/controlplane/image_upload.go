@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -23,7 +24,7 @@ type ImageUploadLease struct {
 	App             string
 	ImageRepository string
 
-	conn        *pgx.Conn
+	session     *entities.SessionStore
 	advisoryKey int64
 	hostRelease engine.Release
 	released    bool
@@ -54,11 +55,12 @@ func acquireImageUploadLease(ctx context.Context, config *pgx.ConnConfig, observ
 	if err != nil {
 		return nil, contract.NewFault(contract.Unavailable, "the control database is unavailable", "Retry the upload after the node's control database is reachable.")
 	}
+	session := entities.NewSessionStore(conn)
 	closeWithError := func(cause error) (*ImageUploadLease, error) {
-		_ = conn.Close(context.Background())
+		_ = session.Close(context.Background())
 		return nil, cause
 	}
-	binding, err := VerifyWorkspaceRegistryHost(ctx, conn, observed)
+	binding, err := VerifyWorkspaceRegistryHost(ctx, session.Workspace(), observed)
 	if err != nil {
 		return closeWithError(err)
 	}
@@ -66,7 +68,7 @@ func acquireImageUploadLease(ctx context.Context, config *pgx.ConnConfig, observ
 	if strings.TrimSpace(hostLockPath) == "" {
 		return closeWithError(contract.NewFault(contract.PreconditionFailed, "the verified registry host lock path is empty", "Restore the bound node state directory before uploading."))
 	}
-	initial, err := readImageUploadIdentity(ctx, conn, appName)
+	initial, err := readImageUploadIdentity(ctx, session, appName)
 	if err != nil {
 		return closeWithError(err)
 	}
@@ -77,14 +79,14 @@ func acquireImageUploadLease(ctx context.Context, config *pgx.ConnConfig, observ
 	}
 	key := targetLockKey("app/" + appName)
 	var advisory bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&advisory); err != nil {
+	if advisory, err = session.TrySessionLock(ctx, key); err != nil {
 		return closeWithError(contract.NewFault(contract.Unavailable, "the application upload lock is unavailable", "Retry after the control database is reachable."))
 	}
 	if !advisory {
 		return closeWithError(contract.NewFault(contract.Conflict, "the application is being deleted or changed", "Wait for the current application mutation to finish, then retry the upload."))
 	}
 	releaseAdvisory := func() {
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, key)
+		_, _ = session.UnlockSession(context.Background(), key)
 	}
 	hostRelease, err := engine.Acquire(ctx, hostLockPath, engine.LockExclusive, 0)
 	if err != nil {
@@ -98,7 +100,7 @@ func acquireImageUploadLease(ctx context.Context, config *pgx.ConnConfig, observ
 		hostRelease()
 		releaseAdvisory()
 	}
-	after, err := readImageUploadIdentity(ctx, conn, appName)
+	after, err := readImageUploadIdentity(ctx, session, appName)
 	if err != nil {
 		releaseBoth()
 		return closeWithError(err)
@@ -117,7 +119,7 @@ func acquireImageUploadLease(ctx context.Context, config *pgx.ConnConfig, observ
 	}
 	return &ImageUploadLease{
 		AppID: after.AppID, App: after.App, ImageRepository: after.ImageRepository,
-		conn: conn, advisoryKey: key, hostRelease: hostRelease,
+		session: session, advisoryKey: key, hostRelease: hostRelease,
 	}, nil
 }
 
@@ -134,15 +136,15 @@ func (l *ImageUploadLease) Release() {
 		l.hostRelease()
 		l.hostRelease = nil
 	}
-	if l.conn != nil {
+	if l.session != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		var unlocked bool
-		_ = l.conn.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, l.advisoryKey).Scan(&unlocked)
+
+		_, _ = l.session.UnlockSession(ctx, l.advisoryKey)
 		cancel()
 		// The connection is dedicated to this lease. Close/discard it in every
 		// case; an uncertain unlock is never returned to a pool.
-		_ = l.conn.Close(context.Background())
-		l.conn = nil
+		_ = l.session.Close(context.Background())
+		l.session = nil
 	}
 }
 
@@ -152,16 +154,16 @@ type imageUploadIdentity struct {
 	ImageRepository string
 }
 
-func readImageUploadIdentity(ctx context.Context, conn *pgx.Conn, appName string) (imageUploadIdentity, error) {
+func readImageUploadIdentity(ctx context.Context, session *entities.SessionStore, appName string) (imageUploadIdentity, error) {
 	var identity imageUploadIdentity
-	err := conn.QueryRow(ctx, `SELECT id,name,image_repository FROM eregion_platform_apps WHERE name=$1`, appName).
-		Scan(&identity.AppID, &identity.App, &identity.ImageRepository)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return identity, contract.NewFault(contract.NotFound, "application not found", "Create the application before uploading an image.")
-	}
+	upload, found, err := session.Apps().UploadIdentity(ctx, appName)
 	if err != nil {
 		return identity, contract.NewFault(contract.Unavailable, "the application identity is unavailable", "Retry after the control database is reachable.")
 	}
+	if !found {
+		return identity, contract.NewFault(contract.NotFound, "application not found", "Create the application before uploading an image.")
+	}
+	identity.AppID, identity.App, identity.ImageRepository = upload.ID, upload.Name, upload.ImageRepository
 	return identity, nil
 }
 
@@ -169,7 +171,7 @@ func readImageUploadIdentity(ctx context.Context, conn *pgx.Conn, appName string
 // against the immutable workspace binding. Direct service callers cannot bypass
 // this by constructing a Service or by holding only a local name.
 func (s *Service) verifyLocalRegistryHost(ctx context.Context) (RegistryHostIdentity, error) {
-	if s == nil || s.pool == nil {
+	if s == nil || s.entities == nil {
 		return RegistryHostIdentity{}, contract.NewFault(contract.PreconditionFailed, "the control database is unavailable", "Registry mutation requires the control-plane database.")
 	}
 	if s.registryHostIdentity == nil {
@@ -177,7 +179,7 @@ func (s *Service) verifyLocalRegistryHost(ctx context.Context) (RegistryHostIden
 			"this process has no verified local registry host identity",
 			"Start the node through its managed composition so the public host key and state directory can be verified.")
 	}
-	return VerifyWorkspaceRegistryHost(ctx, s.pool, *s.registryHostIdentity)
+	return VerifyWorkspaceRegistryHost(ctx, s.entities.Workspace(), *s.registryHostIdentity)
 }
 
 // acquireRegistryHostLock takes the actual shared node host lock and waits for

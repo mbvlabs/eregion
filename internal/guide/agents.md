@@ -274,15 +274,18 @@ image-only app, then select its artifact explicitly at deploy time. Each app has
 one immutable private image repository (for example `mbvlabs/andurel`), set at
 `app create` with `--image-repository` and defaulting to the app slug. Builds
 and `eregion image push --app <app>` publish into that exact repository;
-environment create/update cannot change it. Repeat
-`--buildpack` in the desired order, or omit it for builder detection. An empty
-builder uses the build node's platform default; an explicit builder selects an
-image. Configure optional targets with `--target web=./cmd/web`, Node inputs with
+environment create/update cannot change it. A Git build requires an explicit
+builder (`--builder` / `source.builder`); there is no built-in default builder or
+run-image pin. Repeat `--buildpack` in the desired order, or omit it for builder
+detection. `--builder ''` clears the builder and leaves the recipe incomplete;
+a Git deploy then fails with an actionable error before any operation/build,
+while explicit image/artifact/release deploys remain builder-independent.
+Configure optional targets with `--target web=./cmd/web`, Node inputs with
 `--frontend-directory` and repeated `--frontend-script`, and advanced inputs
 with `--go-version`, `--go-build-flags` and `--node-version`. Supplied typed
 values override corresponding raw build environment keys; clearing one removes
 the override. `env update --build-env ''`, `--target ''`, and
-`--buildpack ''` clear their lists; `--builder ''` resets the builder. TOML
+`--buildpack ''` clear their lists; `--builder ''` clears the builder. TOML
 definitions use `[source.buildpacks] order = [...]` via `--from`.
 Definitions use `version = 1`. `[source]` is an optional Git build recipe with
 builder, buildpack order, targets and keep-file settings. Image selectors belong

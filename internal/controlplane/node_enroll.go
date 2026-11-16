@@ -9,15 +9,13 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/processmetrics"
@@ -46,8 +44,8 @@ func (s *Service) resolverConfig() ResolverConfig {
 // roles, the SSH address, and the pinned public host key. Identity, probed
 // capabilities, and the enrolled state are written by the worker after the
 // node proved itself.
-func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.OperationID, in *platform.NodeEnrollInput) error {
-	existing, err := loadNodeConn(ctx, tx, in.Node)
+func (s *Service) prepareNodeEnroll(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, in *platform.NodeEnrollInput) error {
+	existing, err := loadNodeConn(ctx, tx.Nodes(), in.Node)
 	found := err == nil
 	if err != nil {
 		if fault := contract.Classify(err); fault.Code != contract.NotFound {
@@ -61,9 +59,7 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.
 		if existing.Transport != "ssh" {
 			return contract.NewFault(contract.PreconditionFailed, "node was not submitted for enrollment", "Enroll the node with its address and pinned host key.")
 		}
-		_, err := tx.Exec(ctx, `UPDATE eregion_platform_nodes
-            SET enrollment_state=CASE WHEN enrollment_state='enrolled' THEN 'enrolled' ELSE 'pending' END,
-                enrollment_error='', enroll_operation_id=$2, updated_at=clock_timestamp() WHERE name=$1`, in.Node, string(id))
+		_, err := tx.Nodes().ResetEnrollment(ctx, in.Node, id)
 		if err != nil {
 			return unavailable(err)
 		}
@@ -103,22 +99,13 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.
 			}
 		}
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO eregion_platform_nodes
-        (name,roles,capabilities,address,status,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key,
-         ssh_host_key_fingerprint,expected_identity_fingerprint,build_concurrency,build_user,wg_enabled,wg_address,wg_endpoint,wg_ssh_port,enroll_operation_id,
-         created_at,updated_at,enrollment_error,identity_public_key,identity_fingerprint,os_id,os_version,arch,wg_public_key,control_wg_public_key,wg_state,last_check_state,last_check_detail)
-        VALUES($1,$2,$3,$4,'registered',$5,'ssh',$4,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
-         clock_timestamp(),clock_timestamp(),'','','','','','','','','none','unknown','')
-        ON CONFLICT (name) DO UPDATE SET roles=EXCLUDED.roles, address=EXCLUDED.address, enrollment_state=EXCLUDED.enrollment_state,
-            enrollment_error='', transport='ssh', ssh_address=EXCLUDED.ssh_address, ssh_user=EXCLUDED.ssh_user,
-            ssh_host_key=EXCLUDED.ssh_host_key, ssh_host_key_fingerprint=EXCLUDED.ssh_host_key_fingerprint,
-            expected_identity_fingerprint=CASE WHEN EXCLUDED.expected_identity_fingerprint<>'' THEN EXCLUDED.expected_identity_fingerprint ELSE eregion_platform_nodes.expected_identity_fingerprint END,
-            build_concurrency=EXCLUDED.build_concurrency, build_user=EXCLUDED.build_user, wg_enabled=EXCLUDED.wg_enabled,
-            wg_address=EXCLUDED.wg_address, wg_endpoint=EXCLUDED.wg_endpoint, wg_ssh_port=EXCLUDED.wg_ssh_port, enroll_operation_id=EXCLUDED.enroll_operation_id,
-            updated_at=clock_timestamp()`,
-		in.Node, in.Roles, capabilities, in.Address, string(state), in.User, in.HostKey, in.HostKeyFingerprint,
-		in.IdentityFingerprint, in.BuildConcurrency, in.BuildUser, in.PrivateNetwork != nil, wgAddress, wgEndpoint, wgSSHPort, string(id))
-	if err != nil {
+	if _, err := tx.Nodes().UpsertEnrollment(ctx, entities.NodeEnrollment{
+		Name: in.Node, Roles: in.Roles, Capabilities: capabilities, Address: in.Address,
+		State: state, User: in.User, HostKey: in.HostKey, HostKeyFingerprint: in.HostKeyFingerprint,
+		IdentityFingerprint: in.IdentityFingerprint, BuildConcurrency: in.BuildConcurrency,
+		BuildUser: in.BuildUser, WGEnabled: in.PrivateNetwork != nil, WGAddress: wgAddress,
+		WGEndpoint: wgEndpoint, WGSSHPort: wgSSHPort, OperationID: id,
+	}); err != nil {
 		return platformWriteError(err, "node enrollment conflicts with another node")
 	}
 	return nil
@@ -126,7 +113,7 @@ func (s *Service) prepareNodeEnroll(ctx context.Context, tx pgx.Tx, id contract.
 
 // allocateWireGuardAddress returns the lowest free host address of the private
 // subnet, skipping the control plane's own address.
-func (s *Service) allocateWireGuardAddress(ctx context.Context, tx pgx.Tx) (string, error) {
+func (s *Service) allocateWireGuardAddress(ctx context.Context, tx *entities.StoreTx) (string, error) {
 	config := s.resolverConfig()
 	prefix, err := netip.ParsePrefix(config.subnet())
 	if err != nil || !prefix.Addr().Is4() {
@@ -136,25 +123,16 @@ func (s *Service) allocateWireGuardAddress(ctx context.Context, tx pgx.Tx) (stri
 	if err != nil {
 		return "", contract.NewFault(contract.ValidationFailed, "the control plane WireGuard address is invalid", "Set EREGION_NODE_WG_ADDRESS.")
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, wgAllocationLock); err != nil {
+	if err := tx.Nodes().LockWireGuardAllocation(ctx, wgAllocationLock); err != nil {
 		return "", unavailable(err)
 	}
-	rows, err := tx.Query(ctx, `SELECT wg_address FROM eregion_platform_nodes WHERE wg_address<>''`)
+	addresses, err := tx.Nodes().WireGuardAddresses(ctx)
 	if err != nil {
 		return "", unavailable(err)
 	}
 	used := map[string]bool{control.String(): true}
-	for rows.Next() {
-		var address string
-		if err := rows.Scan(&address); err != nil {
-			rows.Close()
-			return "", unavailable(err)
-		}
+	for _, address := range addresses {
 		used[address] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return "", unavailable(err)
 	}
 	prefix = prefix.Masked()
 	for candidate := prefix.Addr().Next(); prefix.Contains(candidate); candidate = candidate.Next() {
@@ -195,7 +173,7 @@ func (w *platformWorker) stepJSON(ctx context.Context, tr node.Transport, id con
 // verifyNode runs the identity challenge and the capability probe against a
 // node and checks them against the pinned record. It is shared by enrollment
 // and by node checks, so both apply exactly the same rules.
-func (w *platformWorker) verifyNode(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, rec nodeConn) (attestedHost, error) {
+func (w *platformWorker) verifyNode(ctx context.Context, tr node.Transport, id contract.OperationID, attempt uint32, rec entities.NodeConnection) (attestedHost, error) {
 	var host attestedHost
 	nonce := node.IdentityNonce(string(id), rec.Name)
 	if err := w.stepJSON(ctx, tr, id, attempt, "node-identity-01-v1", node.IdentityPayload{Step: "node-identity-01-v1", Node: rec.Name, Nonce: nonce}, &host.attestation); err != nil {
@@ -232,7 +210,7 @@ func (w *platformWorker) verifyNode(ctx context.Context, tr node.Transport, id c
 
 func (w *platformWorker) runNodeEnroll(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
 	input := normalized.Input.(*platform.NodeEnrollInput)
-	rec, err := loadNodeConn(ctx, w.service.pool, input.Node)
+	rec, err := loadNodeConn(ctx, w.service.entities.Nodes(), input.Node)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
@@ -262,14 +240,13 @@ func (w *platformWorker) runNodeEnroll(ctx context.Context, id contract.Operatio
 	}
 	probeJSON, _ := json.Marshal(host.probe)
 	detail := fmt.Sprintf("enrolled: %s %s %s; capabilities %s", host.probe.OS.ID, host.probe.OS.VersionID, host.probe.Arch, strings.Join(capabilities, ","))
-	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_nodes SET
-            enrollment_state='enrolled', enrollment_error='', enrolled_at=coalesce(enrolled_at,clock_timestamp()),
-            identity_public_key=$2, identity_fingerprint=$3, capabilities=$4, os_id=$5, os_version=$6, arch=$7, probe=$8,
-            status='ready', last_seen_at=clock_timestamp(), last_check_at=clock_timestamp(), last_check_state='ok', last_check_detail=$9,
-            updated_at=clock_timestamp()
-            WHERE name=$1`, rec.Name, host.attestation.PublicKey, host.fingerprint, capabilities,
-			host.probe.OS.ID, host.probe.OS.VersionID, host.probe.Arch, probeJSON, detail); err != nil {
+	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		if _, err := tx.Nodes().RecordEnrolled(ctx, entities.NodeEnrollmentResult{
+			Name: rec.Name, IdentityPublicKey: host.attestation.PublicKey,
+			IdentityFingerprint: host.fingerprint, Capabilities: capabilities,
+			OSID: host.probe.OS.ID, OSVersion: host.probe.OS.VersionID, Arch: host.probe.Arch,
+			Probe: probeJSON, Detail: detail,
+		}); err != nil {
 			return err
 		}
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "log", Stage: "enrolled", Message: fmt.Sprintf("Node %s enrolled; identity %s, host key %s pinned.", rec.Name, host.fingerprint, hostKeyFingerprintOf(rec.HostKey))})
@@ -292,7 +269,7 @@ func hostKeyFingerprintOf(hostKey string) string {
 	return fingerprint
 }
 
-func buildConcurrencyFor(rec nodeConn) int {
+func buildConcurrencyFor(rec entities.NodeConnection) int {
 	if !contains(rec.Roles, platform.RoleBuilder) {
 		return 0
 	}
@@ -319,11 +296,9 @@ func (w *platformWorker) settleEnroll(ctx context.Context, id contract.Operation
 		terminal = true
 	}
 	message := truncateText(fault.Message, 1024)
-	_, _ = w.service.pool.Exec(context.WithoutCancel(ctx), `UPDATE eregion_platform_nodes
-        SET enrollment_state=CASE WHEN $3 AND enrollment_state='pending' THEN 'failed' ELSE enrollment_state END,
-            enrollment_error=CASE WHEN enrollment_state='enrolled' THEN enrollment_error ELSE $2 END,
-            last_check_at=clock_timestamp(), last_check_state=$4, last_check_detail=$2, updated_at=clock_timestamp()
-        WHERE name=$1`, nodeName, message, terminal, checkStateFor(err))
+	_, _ = w.service.entities.Nodes().RecordEnrollmentFailure(
+		context.WithoutCancel(ctx), nodeName, message, checkStateFor(err), terminal,
+	)
 	return w.settle(ctx, id, attempt, err)
 }
 
@@ -350,7 +325,7 @@ func truncateText(text string, limit int) string {
 // must still be the pinned one, the host must still be supported, and the
 // declared roles must still be backed by probed capabilities. The result and
 // its time are recorded either way, so the CLI can show freshness honestly.
-func (w *platformWorker) runEnrolledCheck(ctx context.Context, id contract.OperationID, attempt uint32, rec nodeConn) error {
+func (w *platformWorker) runEnrolledCheck(ctx context.Context, id contract.OperationID, attempt uint32, rec entities.NodeConnection) error {
 	tr, err := w.service.resolver.TransportFor(ctx, rec.Name)
 	if err != nil {
 		w.service.recordNodeCheck(ctx, rec.Name, checkStateFor(err), contract.Classify(err).Message, false)
@@ -367,13 +342,15 @@ func (w *platformWorker) runEnrolledCheck(ctx context.Context, id contract.Opera
 		capabilities = []string{"none"}
 	}
 	probeJSON, _ := json.Marshal(host.probe)
-	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		_, err := tx.Exec(ctx, `UPDATE eregion_platform_nodes SET capabilities=$2, os_id=$3, os_version=$4, arch=$5, probe=$6,
-            status='ready', last_seen_at=clock_timestamp(), last_check_at=clock_timestamp(), last_check_state='ok',
-            last_check_detail=$7, updated_at=clock_timestamp() WHERE name=$1`,
-			rec.Name, capabilities, host.probe.OS.ID, host.probe.OS.VersionID, host.probe.Arch, probeJSON,
-			"identity "+host.fingerprint+" verified; capabilities "+strings.Join(capabilities, ","))
-		return err
+	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		if _, err := tx.Nodes().RecordCheckSuccess(ctx, entities.NodeCheckResult{
+			Name: rec.Name, Capabilities: capabilities, OSID: host.probe.OS.ID,
+			OSVersion: host.probe.OS.VersionID, Arch: host.probe.Arch, Probe: probeJSON,
+			Detail: "identity " + host.fingerprint + " verified; capabilities " + strings.Join(capabilities, ","),
+		}); err != nil {
+			return err
+		}
+		return nil
 	}); err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
@@ -386,9 +363,8 @@ func (s *Service) recordNodeCheck(ctx context.Context, name, state, detail strin
 	if ready {
 		status = "ready"
 	}
-	_, _ = s.pool.Exec(context.WithoutCancel(ctx), `UPDATE eregion_platform_nodes
-        SET status=CASE WHEN status='disabled' THEN status ELSE $2 END, last_check_at=clock_timestamp(), last_check_state=$3,
-            last_check_detail=$4, updated_at=clock_timestamp() WHERE name=$1`, name, status, state, truncateText(detail, 1024))
+	_, _ = s.entities.Nodes().RecordCheckStatus(context.WithoutCancel(ctx),
+		name, status, state, truncateText(detail, 1024))
 }
 
 // -------------------------------------------------------------- reconcile
@@ -398,7 +374,7 @@ func (s *Service) recordNodeCheck(ctx context.Context, name, state, detail strin
 // changes nothing when the node already matches.
 func (w *platformWorker) runNodeReconcile(ctx context.Context, id contract.OperationID, attempt uint32, normalized platform.Normalized) error {
 	input := normalized.Input.(*platform.NodeReconcileInput)
-	rec, err := loadNodeConn(ctx, w.service.pool, input.Node)
+	rec, err := loadNodeConn(ctx, w.service.entities.Nodes(), input.Node)
 	if err != nil {
 		return w.settle(ctx, id, attempt, err)
 	}
@@ -438,9 +414,7 @@ func (w *platformWorker) runNodeReconcile(ctx context.Context, id contract.Opera
 	// Persist the public keys first. They are public values; the node's private
 	// key stays in its private state directory and the control plane's stays in
 	// its protected key file.
-	if _, err := w.service.pool.Exec(ctx, `UPDATE eregion_platform_nodes SET wg_public_key=$2, control_wg_public_key=$3,
-        wg_state=CASE WHEN wg_state IN ('none','failed') THEN 'keyed' ELSE wg_state END, updated_at=clock_timestamp() WHERE name=$1`,
-		rec.Name, key.PublicKey, controlPublic); err != nil {
+	if _, err := w.service.entities.Nodes().SetWireGuardKeys(ctx, rec.Name, key.PublicKey, controlPublic); err != nil {
 		return w.settle(ctx, id, attempt, unavailable(err))
 	}
 	peers, err := w.service.wireGuardPeers(ctx, rec, controlPublic)
@@ -456,7 +430,7 @@ func (w *platformWorker) runNodeReconcile(ctx context.Context, id contract.Opera
 	}
 	var applied node.WireGuardResult
 	if err := w.stepJSON(ctx, tr, id, attempt, "node-wireguard-02-v1", payload, &applied); err != nil {
-		_, _ = w.service.pool.Exec(context.WithoutCancel(ctx), `UPDATE eregion_platform_nodes SET wg_state='failed', updated_at=clock_timestamp() WHERE name=$1 AND wg_state<>'applied'`, rec.Name)
+		_, _ = w.service.entities.Nodes().SetWireGuardFailed(context.WithoutCancel(ctx), rec.Name)
 		return w.settle(ctx, id, attempt, err)
 	}
 	state := platform.WireGuardRender
@@ -478,9 +452,9 @@ func shortHash(hash string) string {
 }
 
 func (w *platformWorker) finishReconcile(ctx context.Context, id contract.OperationID, attempt uint32, nodeName, message string, state *platform.WireGuardState) error {
-	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.finishPlatformOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if state != nil {
-			if _, err := tx.Exec(ctx, `UPDATE eregion_platform_nodes SET wg_state=$2, wg_reconciled_at=clock_timestamp(), updated_at=clock_timestamp() WHERE name=$1`, nodeName, string(*state)); err != nil {
+			if _, err := tx.Nodes().SetWireGuardState(ctx, nodeName, *state); err != nil {
 				return err
 			}
 		}
@@ -495,38 +469,27 @@ func (w *platformWorker) finishReconcile(ctx context.Context, id contract.Operat
 // dials in, so it needs no endpoint) and every other enrolled node that has a
 // key and a public endpoint (a full mesh among nodes). Sorted by key, so the
 // rendered configuration is deterministic.
-func (s *Service) wireGuardPeers(ctx context.Context, rec nodeConn, controlPublic string) ([]node.WireGuardPeer, error) {
+func (s *Service) wireGuardPeers(ctx context.Context, rec entities.NodeConnection, controlPublic string) ([]node.WireGuardPeer, error) {
 	control, err := netip.ParseAddr(s.resolverConfig().controlAddress())
 	if err != nil {
 		return nil, contract.NewFault(contract.ValidationFailed, "the control plane WireGuard address is invalid", "Set EREGION_NODE_WG_ADDRESS.")
 	}
 	peers := []node.WireGuardPeer{{PublicKey: controlPublic, AllowedIPs: []string{control.String() + "/32"}}}
-	rows, err := s.pool.Query(ctx, `SELECT wg_public_key,wg_address,wg_endpoint FROM eregion_platform_nodes
-        WHERE name<>$1 AND enrollment_state='enrolled' AND wg_enabled AND wg_public_key<>'' AND wg_address<>'' AND wg_endpoint<>'' ORDER BY name`, rec.Name)
+	records, err := s.entities.Nodes().WireGuardPeers(ctx, rec.Name)
 	if err != nil {
 		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var key, address, endpoint string
-		if err := rows.Scan(&key, &address, &endpoint); err != nil {
-			return nil, unavailable(err)
-		}
-		peers = append(peers, node.WireGuardPeer{PublicKey: key, AllowedIPs: []string{address + "/32"}, Endpoint: endpoint, Keepalive: 25})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, unavailable(err)
+	for _, peer := range records {
+		peers = append(peers, node.WireGuardPeer{
+			PublicKey: peer.PublicKey, AllowedIPs: []string{peer.Address + "/32"},
+			Endpoint: peer.Endpoint, Keepalive: 25,
+		})
 	}
 	sort.Slice(peers, func(i, j int) bool { return peers[i].PublicKey < peers[j].PublicKey })
 	return peers, nil
 }
 
 // ----------------------------------------------------------- build slots
-
-// buildSlotKey is the advisory-lock key of one build slot of a node.
-func buildSlotKey(nodeName string, slot int) int64 {
-	return advisoryKey("eregion-build-slot\x00" + nodeName + "\x00" + strconv.Itoa(slot))
-}
 
 // acquireBuildSlot serializes each admission with capacity changes on the node
 // row and counts occupied locks across the entire supported keyspace. Only a
@@ -538,102 +501,32 @@ func (s *Service) acquireBuildSlot(ctx context.Context, nodeName string, onWait 
 	deadline := time.Now().Add(buildSlotWait)
 	limit := 0
 	for {
-		conn, err := s.pool.Acquire(ctx)
+		probe, err := s.entities.Nodes().ProbeBuildSlots(ctx, nodeName, platform.MaxBuildConcurrency)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, unavailable(err)
-		}
-		// A session with an uncertain advisory-lock result must never return
-		// to the pool. Closing it also rolls back an uncertain transaction.
-		discard := func(conn *pgxpool.Conn) {
-			raw := conn.Hijack()
-			closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_ = raw.Close(closeCtx)
-		}
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			discard(conn)
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, unavailable(err)
-		}
-		err = tx.QueryRow(ctx, `SELECT build_concurrency FROM eregion_platform_nodes WHERE name=$1 FOR UPDATE`, nodeName).Scan(&limit)
-		if err != nil {
-			discard(conn)
-			if errors.Is(err, pgx.ErrNoRows) {
+			if errors.Is(err, entities.ErrPlatformPointerIntegrity) {
 				return nil, contract.NewFault(contract.PreconditionFailed, "build node is no longer registered", "Register the node before building.")
 			}
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, unavailable(err)
-		}
-		if limit < 1 || limit > platform.MaxBuildConcurrency {
-			discard(conn)
-			return nil, contract.NewFault(contract.PreconditionFailed, "build node concurrency is invalid", "Correct the node's build concurrency before building.")
-		}
-		var held []int64
-		busy := 0
-		for slot := range platform.MaxBuildConcurrency {
-			var got bool
-			key := buildSlotKey(nodeName, slot)
-			if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&got); err != nil {
-				discard(conn)
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
-				return nil, unavailable(err)
-			}
-			if got {
-				held = append(held, key)
-			} else {
-				busy++
-			}
-		}
-		var chosen int64
-		admitted := busy < limit && len(held) > 0
-		if admitted {
-			chosen = held[0]
-			held = held[1:]
-		}
-		for _, key := range held {
-			var unlocked bool
-			if err := tx.QueryRow(ctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&unlocked); err != nil || !unlocked {
-				discard(conn)
-				if ctx.Err() != nil {
-					return nil, ctx.Err()
-				}
+			if errors.Is(err, entities.ErrPlatformLeaseUncertain) {
 				return nil, contract.NewFault(contract.Unavailable, "build slot probe cleanup is uncertain", "Retry when the control database is available.")
 			}
-		}
-		if err := tx.Commit(ctx); err != nil {
-			discard(conn)
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
 			return nil, unavailable(err)
 		}
-		if admitted {
+		limit = probe.Limit
+		if limit < 1 || limit > platform.MaxBuildConcurrency {
+			return nil, contract.NewFault(contract.PreconditionFailed, "build node concurrency is invalid", "Correct the node's build concurrency before building.")
+		}
+		if probe.Lease != nil {
+			release := probe.Lease
 			var once sync.Once
 			return func() {
 				once.Do(func() {
-					releaseCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-					defer cancel()
-					var unlocked bool
-					err := conn.QueryRow(releaseCtx, `SELECT pg_advisory_unlock($1)`, chosen).Scan(&unlocked)
-					if err != nil || !unlocked {
-						discard(conn)
-						return
-					}
-					conn.Release()
+					_ = release.Release()
 				})
 			}, nil
 		}
-		conn.Release()
 		if !waited {
 			waited = true
 			endWait = processmetrics.BeginBuildCapacityWait(ctx)

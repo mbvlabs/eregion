@@ -89,7 +89,7 @@ func TestIntegrationExecutableLifecycle(t *testing.T) {
 	if err := os.WriteFile(nodeConfigPath, nodeConfig, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := AssignWorkspace(ctx, pool, "test", identity); err != nil {
+	if _, err := AssignWorkspace(ctx, newTestEntities(t, pool), "test", identity); err != nil {
 		t.Fatal(err)
 	}
 

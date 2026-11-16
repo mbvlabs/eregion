@@ -83,9 +83,9 @@ type Release struct {
 	// Image is the registry reference recorded on the release, usually
 	// repository:tag. A digest after "@" is treated as an artifact reference.
 	Image string
-	// ImageID is the local Docker image identity: the image config digest.
-	// It is not a manifest digest. It matches RegistryArtifact.ConfigDigest,
-	// images on the node, and LocalImageRef RepoDigests.
+	// ImageID is the release's authenticated image config digest. It is not a
+	// manifest digest and is not treated as Docker's local runtime image ID,
+	// which is a separate observation matched through RepoDigests.
 	ImageID string
 	// Status is the platform release status. A release that never reached
 	// ready has no promise that it produced an image; a failed release that
@@ -232,8 +232,9 @@ type Image struct {
 // config ID, repository tags and RepoDigests are enough to map Release.ImageID
 // to a manifest and to show which tags an image removal will untag.
 type LocalImageRef struct {
-	// ID is Docker's local image ID, which is the image config digest
-	// (sha256:…), matching Release.ImageID.
+	// ID is Docker's local runtime image ID (sha256:…). It is matched to a
+	// release through RepoDigests, never by assuming it equals the recorded
+	// config digest.
 	ID string
 	// RepoTags are the repository:tag references Docker still points at the
 	// image. They are operator-visible dry-run detail; removal re-reads them.
@@ -354,7 +355,12 @@ func Plan(in Input) []Item {
 		seenEnvironments[key] = true
 
 		policy := normalizedPolicy(environment.Policy)
-		rollbackTarget := RollbackTarget(environment.App, environment.Name, environment.ServingRelease, in.Deployments)
+		rollbackTarget := RollbackTarget(
+			environment.App,
+			environment.Name,
+			environment.ServingRelease,
+			in.Deployments,
+		)
 		if environment.ServingRelease != "" {
 			protectedReleaseIDs[environment.ServingRelease] = true
 		}
@@ -393,8 +399,11 @@ func Plan(in Input) []Item {
 				App:         release.App,
 				Environment: release.Environment,
 				Reference:   release.ID,
-				Reason: fmt.Sprintf("outside the newest %d releases and older than the %d-day keep window",
-					policy.KeepReleases, policy.KeepNewerThanDays),
+				Reason: fmt.Sprintf(
+					"outside the newest %d releases and older than the %d-day keep window",
+					policy.KeepReleases,
+					policy.KeepNewerThanDays,
+				),
 			})
 		}
 	}
@@ -417,7 +426,12 @@ func Plan(in Input) []Item {
 	protectedImageDigests := map[string]bool{}
 	retainedReleaseIDs := map[string]bool{}
 	for _, release := range releases {
-		if !registryReleaseRetained(release, plannedReleaseIDs, protectedReleaseIDs, environmentByKey) {
+		if !registryReleaseRetained(
+			release,
+			plannedReleaseIDs,
+			protectedReleaseIDs,
+			environmentByKey,
+		) {
 			continue
 		}
 		retainedReleaseIDs[release.ID] = true
@@ -425,17 +439,55 @@ func Plan(in Input) []Item {
 		for _, digest := range releaseImageDigests(release) {
 			protectedImageDigests[digest] = true
 		}
+		// Docker's local runtime ID is a separate observation resolved through
+		// RepoDigests, never the recorded config digest. Keep every plausible
+		// mapping so an ambiguous retained release protects all of them.
+		runtimeIDs, _ := releaseRuntimeImageIDs(release, localImages)
+		for _, runtimeID := range runtimeIDs {
+			protectedImageDigests[runtimeID] = true
+		}
 	}
 
 	registryIndex := indexRegistryArtifacts(in.Registry)
-	skipReasons, skipAll := registrySkipReasons(releases, plannedReleaseIDs, protectedReleaseIDs, environmentByKey, registryIndex, localImages)
+	skipReasons, skipAll := registrySkipReasons(
+		releases,
+		plannedReleaseIDs,
+		protectedReleaseIDs,
+		environmentByKey,
+		registryIndex,
+		localImages,
+	)
 	if in.RegistryUnsafeReason != "" {
 		skipReasons, skipAll = map[string]string{"*": in.RegistryUnsafeReason}, true
 	}
-	items = append(items, planRegistryArtifacts(registryIndex, protection, artifactMetadata, skipReasons, skipAll, now)...)
+	items = append(
+		items,
+		planRegistryArtifacts(
+			registryIndex,
+			protection,
+			artifactMetadata,
+			skipReasons,
+			skipAll,
+			now,
+		)...)
 	items = append(items, planBuildpackCache(serverPolicy, in.Cache)...)
-	items = append(items, planContainers(environmentByKey, in.Containers, inFlightReleases, inFlightDeployments, inFlightContainers)...)
-	imageItems := planReleaseImages(releases, plannedReleaseIDs, protectedReleaseIDs, in.Containers, in.LocalImages, in.Images)
+	items = append(
+		items,
+		planContainers(
+			environmentByKey,
+			in.Containers,
+			inFlightReleases,
+			inFlightDeployments,
+			inFlightContainers,
+		)...)
+	imageItems := planReleaseImages(
+		releases,
+		plannedReleaseIDs,
+		protectedReleaseIDs,
+		in.Containers,
+		in.LocalImages,
+		in.Images,
+	)
 	plannedImageIDs := map[string]bool{}
 	for _, item := range imageItems {
 		if item.Kind == ItemImage {
@@ -443,7 +495,15 @@ func Plan(in Input) []Item {
 		}
 	}
 	items = append(items, imageItems...)
-	items = append(items, planDanglingImages(in.Images, protectedImageDigests, retainedReleaseIDs, plannedImageIDs, in.Containers)...)
+	items = append(
+		items,
+		planDanglingImages(
+			in.Images,
+			protectedImageDigests,
+			retainedReleaseIDs,
+			plannedImageIDs,
+			in.Containers,
+		)...)
 	return items
 }
 
@@ -583,10 +643,13 @@ func deploymentNewer(a, b Deployment) bool {
 
 func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
 	if cache.Unknown {
-		return []Item{{
-			Kind: ItemCacheSkipped, Reference: "*",
-			Reason: "the Buildpacks cache could not be measured completely; no cache entry is removed",
-		}}
+		return []Item{
+			{
+				Kind:      ItemCacheSkipped,
+				Reference: "*",
+				Reason:    "the Buildpacks cache could not be measured completely; no cache entry is removed",
+			},
+		}
 	}
 	entries := make([]CacheEntry, 0, len(cache.Entries))
 	var entryBytes int64
@@ -636,8 +699,11 @@ func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
 			Kind:      ItemBuildpackCache,
 			Reference: entry.Path,
 			Bytes:     entry.Bytes,
-			Reason: fmt.Sprintf("Buildpacks cache exceeds the %s cap or %d%% disk use; least recently used entry",
-				humanBytes(policy.BuildpackCacheMaxBytes), policy.BuildpackCacheMaxPercent),
+			Reason: fmt.Sprintf(
+				"Buildpacks cache exceeds the %s cap or %d%% disk use; least recently used entry",
+				humanBytes(policy.BuildpackCacheMaxBytes),
+				policy.BuildpackCacheMaxPercent,
+			),
 		})
 		cacheBytes -= entry.Bytes
 		if cacheBytes < 0 {
@@ -649,7 +715,13 @@ func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
 		}
 		cacheWithinLimit := cacheBytes <= policy.BuildpackCacheMaxBytes
 		diskWithinLimit := cache.DiskTotalBytes <= 0 ||
-			float64(usedBytes) <= float64(cache.DiskTotalBytes)*float64(policy.BuildpackCacheMaxPercent)/100
+			float64(
+				usedBytes,
+			) <= float64(
+				cache.DiskTotalBytes,
+			)*float64(
+				policy.BuildpackCacheMaxPercent,
+			)/100
 		if cacheWithinLimit && (diskWithinLimit || cacheBytes == 0 || index == len(entries)-1) {
 			break
 		}
@@ -657,7 +729,11 @@ func planBuildpackCache(policy Policy, cache CacheInventory) []Item {
 	return items
 }
 
-func planContainers(environmentByKey map[environmentKey]Environment, containers []Container, inFlightReleases, inFlightDeployments, inFlightContainers map[string]bool) []Item {
+func planContainers(
+	environmentByKey map[environmentKey]Environment,
+	containers []Container,
+	inFlightReleases, inFlightDeployments, inFlightContainers map[string]bool,
+) []Item {
 	sorted := append([]Container(nil), containers...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		if sorted[i].App != sorted[j].App {
@@ -694,7 +770,8 @@ func planContainers(environmentByKey map[environmentKey]Environment, containers 
 			if environment.ServingRelease != "" && container.Release == environment.ServingRelease {
 				continue
 			}
-			if environment.ServingDeployment != "" && container.Deployment == environment.ServingDeployment {
+			if environment.ServingDeployment != "" &&
+				container.Deployment == environment.ServingDeployment {
 				continue
 			}
 		}
@@ -734,7 +811,49 @@ func humanBytes(bytes int64) string {
 // image is still present. It never removes by a tag: a release without an
 // ImageID keeps its row only. An image shared with a retained release or any
 // existing container (running or stopped) is kept and reported as a diagnostic.
-func planReleaseImages(releases []Release, planned, protected map[string]bool, containers []Container, localImages []LocalImageRef, dangling []Image) []Item {
+// releaseRuntimeImageIDs maps a release's canonical manifest reference to every
+// local Docker runtime image ID whose RepoDigests contain that manifest. The
+// recorded config digest is never treated as a Docker inventory ID, and a
+// legacy/tag-only row never supplies a removal selector. Multiple IDs are
+// plausible mappings, not a reason to forget them: callers protect all of them
+// and refuse to delete any single ambiguous candidate.
+func releaseRuntimeImageIDs(release Release, localImages localImageIndex) ([]string, string) {
+	reference, parsed := parseImageReference(release.Image)
+	if !parsed || reference.digest == "" {
+		return nil, "release has no canonical manifest reference; the historical row is preserved without an image removal selector"
+	}
+	seen := map[string]bool{}
+	ids := make([]string, 0, 1)
+	for imageID, references := range localImages {
+		for _, local := range references {
+			if local.digest != reference.digest || seen[imageID] {
+				continue
+			}
+			seen[imageID] = true
+			ids = append(ids, imageID)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		return nil, "no local image carries the canonical manifest " + reference.digest
+	}
+	return ids, ""
+}
+
+// planReleaseImages plans the immutable local-image removal for releases that
+// are being pruned, and for releases an earlier run already marked pruned whose
+// image is still present. It never removes by a tag or by the recorded config
+// digest: the canonical manifest reference is resolved to exactly one proven
+// local runtime image ID. An absent or ambiguous mapping is skipped
+// conservatively, and a retained release protects every plausible mapping.
+func planReleaseImages(
+	releases []Release,
+	planned, protected map[string]bool,
+	containers []Container,
+	localImages []LocalImageRef,
+	dangling []Image,
+) []Item {
+	localIndex := indexLocalImages(localImages)
 	retainedImages := map[string]string{}
 	for _, release := range releases {
 		if planned[release.ID] {
@@ -743,12 +862,11 @@ func planReleaseImages(releases []Release, planned, protected map[string]bool, c
 		if release.PrunedAt != nil && !protected[release.ID] {
 			continue
 		}
-		imageID := normalizeDigest(release.ImageID)
-		if !validDigest(imageID) {
-			continue
-		}
-		if _, exists := retainedImages[imageID]; !exists {
-			retainedImages[imageID] = release.ID
+		imageIDs, _ := releaseRuntimeImageIDs(release, localIndex)
+		for _, imageID := range imageIDs {
+			if _, exists := retainedImages[imageID]; !exists {
+				retainedImages[imageID] = release.ID
+			}
 		}
 	}
 	containerImages := containerImageOwners(containers)
@@ -773,17 +891,34 @@ func planReleaseImages(releases []Release, planned, protected map[string]bool, c
 		if !isPlanned && !isPruned {
 			continue
 		}
-		imageID := normalizeDigest(release.ImageID)
-		if !validDigest(imageID) {
+		imageIDs, mappingReason := releaseRuntimeImageIDs(release, localIndex)
+		if len(imageIDs) == 0 {
 			if isPlanned {
 				items = append(items, Item{
-					Kind: ItemImageSkipped, App: release.App, Environment: release.Environment,
-					Release: release.ID, Reference: release.ID,
-					Reason: "release has no immutable image ID; the release row is marked pruned but no image is removed by a mutable tag",
+					Kind:        ItemImageSkipped,
+					App:         release.App,
+					Environment: release.Environment,
+					Release:     release.ID,
+					Reference:   release.ID,
+					Reason:      mappingReason + "; no image is removed without a proven runtime mapping",
 				})
 			}
 			continue
 		}
+		if len(imageIDs) > 1 {
+			if isPlanned {
+				items = append(items, Item{
+					Kind:        ItemImageSkipped,
+					App:         release.App,
+					Environment: release.Environment,
+					Release:     release.ID,
+					Reference:   release.ID,
+					Reason:      "multiple local images carry the canonical manifest; removal is ambiguous and every plausible runtime image is protected",
+				})
+			}
+			continue
+		}
+		imageID := imageIDs[0]
 		if owner, shared := retainedImages[imageID]; shared {
 			if isPlanned {
 				items = append(items, Item{
@@ -873,7 +1008,11 @@ func localImageRepoTags(localImages []LocalImageRef) map[string][]string {
 	return tags
 }
 
-func planDanglingImages(images []Image, protectedArtifacts, retainedReleaseIDs, plannedImageIDs map[string]bool, containers []Container) []Item {
+func planDanglingImages(
+	images []Image,
+	protectedArtifacts, retainedReleaseIDs, plannedImageIDs map[string]bool,
+	containers []Container,
+) []Item {
 	sorted := append([]Image(nil), images...)
 	sort.SliceStable(sorted, func(i, j int) bool {
 		return imageReference(sorted[i]) < imageReference(sorted[j])

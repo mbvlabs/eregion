@@ -3,14 +3,11 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/buildpacks"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
@@ -48,12 +45,12 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 	} else {
 		report.Unavailable = append(report.Unavailable, "build: no build is recorded for this operation")
 	}
-	dep, err := scanDeploymentRow(s.pool.QueryRow(ctx, deploymentSelect+" WHERE d.operation_id=$1", id))
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return report, unavailable()
+	dep, depFound, err := s.entities.Platform().Deployments().GetByOperation(ctx, id)
+	if err != nil {
+		return report, unavailable(err)
 	}
 	var releaseID platform.ReleaseID
-	if err == nil {
+	if depFound {
 		report.Deployment = &platform.DiagnosisDeployment{ID: dep.ID, ReleaseID: dep.ReleaseID, RevisionID: dep.RevisionID, State: dep.State}
 		releaseID = dep.ReleaseID
 	} else {
@@ -66,24 +63,30 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 		releaseID = build.ReleaseID
 	}
 	if releaseID == "" {
-		release, e := scanReleaseRow(s.pool.QueryRow(ctx, releaseSelect+" WHERE r.operation_id=$1", id))
-		if e == nil {
+		release, ok, e := s.entities.Platform().Releases().GetByOperation(ctx, id)
+		if e != nil {
+			return report, unavailable(e)
+		}
+		if ok {
 			releaseID = release.ID
-		} else if !errors.Is(e, pgx.ErrNoRows) {
-			return report, unavailable()
 		}
 	}
+	var observedImage, runtimeID string
 	if releaseID != "" {
 		release, e := s.releaseByID(ctx, releaseID)
 		if e != nil {
 			return report, e
 		}
+		observedImage = release.Image
 		r := &platform.DiagnosisRelease{ID: release.ID, BuildID: release.BuildID, CommitSHA: release.CommitSHA, Status: release.Status, Pruned: release.PrunedAt != nil}
 		if diagnosticImageID.MatchString(release.ImageID) {
+			// The recorded image_id is the authenticated immutable config
+			// identity. The local Docker runtime ID is observed separately
+			// below and must never replace this field.
 			r.ImageID = release.ImageID
 		}
-		if diagnosticDigest.MatchString(release.ImageID) {
-			r.ImageDigest = release.ImageID
+		if parsed, parseErr := platform.ParseFullyQualifiedImage(release.Image); parseErr == nil && parsed.Digest != "" {
+			r.ImageDigest = parsed.Digest
 		} else if diagnosticDigest.MatchString(release.Image) {
 			r.ImageDigest = release.Image
 		} else {
@@ -158,25 +161,37 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 			report.Unavailable = append(report.Unavailable, "current desired revision: environment or revision unavailable")
 		}
 	}
-	if report.Release == nil || report.Release.ImageID == "" {
-		report.Unavailable = append(report.Unavailable, "image observation: immutable local image ID not recorded")
+	if report.Release == nil || report.Release.ImageDigest == "" {
+		report.Unavailable = append(report.Unavailable, "image observation: canonical image reference not recorded")
 	} else if report.Deployment == nil || historical == nil || historical.Runtime.Node == "" || localNode == "" {
 		report.Unavailable = append(report.Unavailable, "image observation: historical node placement is unknown")
 	} else if historical.Runtime.Node != localNode {
 		report.Unavailable = append(report.Unavailable, "image observation: historical placement is another node; remote observation unsupported")
 	} else {
-		image, reason := platform.ObserveDiagnosisImage(ctx, report.Release.ImageID)
-		report.Image = image
+		// Resolve the canonical manifest to the Docker runtime image ID before
+		// observing labels or comparing candidate container .Image values.
+		resolveRuntimeID := platform.ResolveDiagnosisImageID
+		if s.diagnosisImageResolver != nil {
+			resolveRuntimeID = s.diagnosisImageResolver
+		}
+		observeImage := platform.ObserveDiagnosisImage
+		if s.diagnosisImageObserver != nil {
+			observeImage = s.diagnosisImageObserver
+		}
+		resolvedID, reason := resolveRuntimeID(ctx, observedImage)
+		runtimeID = resolvedID
 		if reason != "" {
 			report.Unavailable = append(report.Unavailable, "image observation: "+reason)
+		} else {
+			image, reason := observeImage(ctx, runtimeID)
+			report.Image = image
+			if reason != "" {
+				report.Unavailable = append(report.Unavailable, "image observation: "+reason)
+			}
 		}
 	}
 	if report.Deployment != nil {
-		imageID := ""
-		if report.Release != nil {
-			imageID = report.Release.ImageID
-		}
-		live, reason := s.diagnosisCandidate(ctx, dep, historical, localNode, imageID)
+		live, reason := s.diagnosisCandidate(ctx, dep, historical, localNode, runtimeID)
 		report.LiveCandidate = live
 		if reason != "" {
 			report.Unavailable = append(report.Unavailable, "live candidate: "+reason)
@@ -188,10 +203,11 @@ func (s *Service) Diagnose(ctx context.Context, authority operations.Authority, 
 	// necessarily the terminal state. Read the most recent failed state within
 	// the same immutable snapshot and current attempt independently of paging.
 	if op.State == contract.Failed && op.LastSequence > 0 {
-		var raw []byte
-		e := s.pool.QueryRow(ctx, `SELECT event FROM eregion_operation_events WHERE operation_id=$1 AND sequence<=$2 AND event->>'kind'='state' AND event->>'state'='failed' AND event->>'attempt'=$3 ORDER BY sequence DESC LIMIT 1`, id, int64(op.LastSequence), fmt.Sprint(op.Attempt)).Scan(&raw)
-		var event contract.Event
-		if e == nil && json.Unmarshal(raw, &event) == nil && event.Validate() == nil && event.OperationID == id && event.Attempt == op.Attempt && event.State == contract.Failed {
+		event, found, e := s.entities.Operations().FailedStateEvent(ctx, id, op.LastSequence, op.Attempt)
+		if e != nil {
+			return report, unavailable(e)
+		}
+		if found && event.Validate() == nil && event.OperationID == id && event.Attempt == op.Attempt && event.State == contract.Failed {
 			report.Failure = &platform.DiagnosisFailure{Message: event.Message, Stage: event.Stage, Code: event.ErrorCode}
 			if event.Stage != "" {
 				report.Failure.StageSource = "failed state event"

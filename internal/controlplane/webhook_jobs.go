@@ -7,30 +7,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
+	"github.com/mbvlabs/eregion/internal/jobargs"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/riverqueue/river"
 )
 
-const webhookQueue = "webhook"
-
-// webhookArgs carries the environment identity and delivery hash. The body, signature,
-// secret, sender and raw delivery ID never enter River arguments or logs.
-type webhookArgs struct {
-	EnvironmentID  string `json:"environment_id"`
-	DeliveryIDHash string `json:"delivery_id_hash"`
-}
-
-func (webhookArgs) Kind() string { return "webhook_admission" }
-
+// webhookWorker drains one admitted delivery into a submitted platform deploy.
 type webhookWorker struct {
-	river.WorkerDefaults[webhookArgs]
+	river.WorkerDefaults[jobargs.WebhookAdmission]
 	service *Service
 }
 
-func (*webhookWorker) NextRetry(job *river.Job[webhookArgs]) time.Time {
+func (*webhookWorker) NextRetry(job *river.Job[jobargs.WebhookAdmission]) time.Time {
 	delay := time.Duration(job.Attempt) * 2 * time.Second
 	if delay > 30*time.Second {
 		delay = 30 * time.Second
@@ -38,9 +29,11 @@ func (*webhookWorker) NextRetry(job *river.Job[webhookArgs]) time.Time {
 	return time.Now().Add(delay)
 }
 
-func (w *webhookWorker) Work(ctx context.Context, job *river.Job[webhookArgs]) error {
+func (w *webhookWorker) Work(ctx context.Context, job *river.Job[jobargs.WebhookAdmission]) error {
 	return w.service.submitWebhookAdmission(ctx, job.Args.EnvironmentID, job.Args.DeliveryIDHash)
 }
+
+var errWebhookTerminalFailure = errors.New("webhook admission failed terminally")
 
 // submitWebhookAdmission submits the ordinary platform.deploy operation for one
 // admitted push. The receipt row is locked, the operation/domain rows/River
@@ -52,100 +45,110 @@ func (s *Service) submitWebhookAdmission(ctx context.Context, environmentID, del
 	if environmentID == "" || !validHash(deliveryIDHash) {
 		return contract.NewFault(contract.ValidationFailed, "webhook admission job has a malformed delivery hash", "Inspect the River job; do not retry it with a different identity.")
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return unavailable(err)
-	}
-	defer rollback(tx)
-	record, err := loadWebhookAdmissionTx(ctx, tx, environmentID, deliveryIDHash, true)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return unavailable(err)
-	}
-	switch record.State {
-	case api.WebhookDeliverySubmitted, api.WebhookDeliveryFailed:
-		return nil
-	case api.WebhookDeliveryAdmitted:
-	default:
-		// Legacy pending rows have no recorded commit and are reconciled only
-		// by an authenticated redelivery, never by this worker.
-		return nil
-	}
-	target, err := platform.ParseTarget(record.Target)
-	if err != nil || target.Kind != platform.TargetEnvironment {
-		return s.failWebhookAdmission(ctx, tx, record, contract.ValidationFailed, "the admitted target is not an environment deploy")
-	}
-	// Shared platform admission takes application before environment locks.
-	// The delivery row remains locked so receipt/idempotency behavior is unchanged.
-	if _, err := appByNameForUpdateTx(ctx, tx, target.App); err != nil {
-		if contract.Classify(err).Code == contract.NotFound {
-			return s.failWebhookAdmission(ctx, tx, record, contract.PreconditionFailed, "the application was deleted after the push was admitted")
-		}
-		return err
-	}
-	env, err := environmentByIDTx(ctx, tx, platform.EnvironmentID(record.EnvironmentID))
-	if err != nil {
-		if contract.Classify(err).Code == contract.NotFound {
-			return s.failWebhookAdmission(ctx, tx, record, contract.PreconditionFailed, "the environment was deleted after the push was admitted")
-		}
-		return err
-	}
-	if env.App != target.App || env.Name != target.Environment {
-		return s.failWebhookAdmission(ctx, tx, record, contract.PreconditionFailed, "the environment was recreated after the push was admitted")
-	}
-	if err := webhookSourceBindingCurrent(env, record); err != nil {
-		fault := contract.Classify(err)
-		return s.failWebhookAdmission(ctx, tx, record, fault.Code, fault.Message)
-	}
-	raw, err := json.Marshal(platform.DeployInput{App: target.App, Environment: target.Environment, Ref: record.Commit})
-	if err != nil {
-		return s.failWebhookAdmission(ctx, tx, record, contract.Internal, "the admitted deploy input could not be encoded")
-	}
-	normalized, err := platform.Default().Normalize(platform.KindDeploy, record.Target, raw)
-	if err != nil {
-		code, detail, retry := webhookAdmissionFailure(err)
-		if retry {
+	var terminalCode contract.Code
+	var terminalDetail string
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		record, found, err := tx.Webhooks().Lock(ctx, environmentID, deliveryIDHash)
+		if err != nil {
 			return err
 		}
-		return s.failWebhookAdmission(ctx, tx, record, code, detail)
-	}
-	// The webhook carries an exact commit, so no remote read is needed. The
-	// transaction helper still checks this URL and ref against the revision it
-	// reads, exactly as an ordinary deploy does.
-	resolved := &resolvedGitRef{
-		URL: env.Revision.Source.URL,
-		Ref: record.Commit, SHA: record.Commit,
-	}
-	id, err := contract.NewOperationID()
-	if err != nil {
-		return err
-	}
-	result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, record.Actor, "ghdelivery-"+record.EnvironmentID+"-"+record.DeliveryIDHash, resolved, nil, "", nil)
-	if err != nil {
-		code, detail, retry := webhookAdmissionFailure(err)
-		if retry {
+		if !found {
+			return nil
+		}
+		admission := webhookAdmissionFromReceipt(record)
+		switch admission.State {
+		case api.WebhookDeliverySubmitted, api.WebhookDeliveryFailed:
+			return nil
+		case api.WebhookDeliveryAdmitted:
+		default:
+			// Legacy pending rows have no recorded commit and are reconciled only
+			// by an authenticated redelivery, never by this worker.
+			return nil
+		}
+		target, err := platform.ParseTarget(admission.Target)
+		if err != nil || target.Kind != platform.TargetEnvironment {
+			code, detail, retry := webhookAdmissionFailure(contract.NewFault(contract.ValidationFailed, "the admitted target is not an environment deploy", "Admit only an environment deploy target."))
+			if retry {
+				return contract.NewFault(contract.Unavailable, "webhook admission is not retryable", "Inspect the delivery record.")
+			}
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, code, detail)
+		}
+		// Shared platform admission takes application before environment locks.
+		// The delivery row remains locked so receipt/idempotency behavior is unchanged.
+		if _, found, err := tx.Platform().Apps().GetByNameForUpdate(ctx, target.App); err != nil {
+			return err
+		} else if !found {
+			code, detail := contract.PreconditionFailed, "the application was deleted after the push was admitted"
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, code, detail)
+		}
+		env, found, err := tx.Platform().Environments().GetByID(ctx, platform.EnvironmentID(admission.EnvironmentID))
+		if err != nil {
 			return err
 		}
-		// The helper may have inserted the operation before rejecting the
-		// submission. Roll the whole attempt back before recording a terminal
-		// receipt, so a failed admission can never leave a partial operation
-		// or platform job behind.
-		rollback(tx)
-		return s.markWebhookAdmissionFailed(ctx, record.EnvironmentID, record.DeliveryIDHash, code, detail)
-	}
-	op := result.Operation
-	tag, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
-        SET state='submitted', operation_id=$3, submitted_at=clock_timestamp()
-        WHERE environment_id=$1 AND delivery_id_hash=$2 AND state='admitted'`, record.EnvironmentID, record.DeliveryIDHash, op.ID)
+		if !found {
+			code, detail := contract.PreconditionFailed, "the environment was deleted after the push was admitted"
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, code, detail)
+		}
+		if env.Environment.App != target.App || env.Environment.Name != target.Environment {
+			code, detail := contract.PreconditionFailed, "the environment was recreated after the push was admitted"
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, code, detail)
+		}
+		if env.Environment.Revision == nil {
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, contract.PreconditionFailed, "the environment has no current revision")
+		}
+		if err := webhookSourceBindingCurrent(env.Environment, admission); err != nil {
+			fault := contract.Classify(err)
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, fault.Code, fault.Message)
+		}
+		raw, err := json.Marshal(platform.DeployInput{App: target.App, Environment: target.Environment, Ref: admission.Commit})
+		if err != nil {
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, contract.Internal, "the admitted deploy input could not be encoded")
+		}
+		normalized, err := platform.Default().Normalize(platform.KindDeploy, admission.Target, raw)
+		if err != nil {
+			code, detail, retry := webhookAdmissionFailure(err)
+			if retry {
+				return err
+			}
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, code, detail)
+		}
+		// The webhook carries an exact commit, so no remote read is needed. The
+		// transaction helper still checks this URL and ref against the revision it
+		// reads, exactly as an ordinary deploy does.
+		resolved := &resolvedGitRef{
+			URL: env.Environment.Revision.Source.URL,
+			Ref: admission.Commit, SHA: admission.Commit,
+		}
+		id, err := contract.NewOperationID()
+		if err != nil {
+			return err
+		}
+		result, err := s.recordPlatformSubmissionTx(ctx, tx, id, normalized, admission.Actor, "ghdelivery-"+admission.EnvironmentID+"-"+admission.DeliveryIDHash, resolved, nil, "", nil)
+		if err != nil {
+			code, detail, retry := webhookAdmissionFailure(err)
+			if retry {
+				return err
+			}
+			terminalCode, terminalDetail = code, detail
+			return errWebhookTerminalFailure
+		}
+		submitted, err := tx.Webhooks().Submit(ctx, admission.EnvironmentID, admission.DeliveryIDHash, result.Operation.ID, string(api.WebhookDeliveryAdmitted))
+		if err != nil {
+			return err
+		}
+		if !submitted {
+			return contract.NewFault(contract.Unavailable, "webhook admission changed while its operation was submitted", "Retry the delivery; do not submit a second operation.")
+		}
+		return nil
+	})
 	if err != nil {
-		return unavailable(err)
-	}
-	if tag.RowsAffected() != 1 {
-		return contract.NewFault(contract.Unavailable, "webhook admission changed while its operation was submitted", "Retry the delivery; do not submit a second operation.")
-	}
-	if err := tx.Commit(ctx); err != nil {
+		if errors.Is(err, errWebhookTerminalFailure) {
+			return s.markWebhookAdmissionFailed(ctx, environmentID, deliveryIDHash, terminalCode, terminalDetail)
+		}
+		var fault *contract.Fault
+		if errors.As(err, &fault) {
+			return err
+		}
 		return unavailable(err)
 	}
 	return nil
@@ -174,36 +177,40 @@ func webhookSourceBindingCurrent(env platform.Environment, record api.WebhookAdm
 // The worker uses it after rolling back a failed submission attempt so no
 // partial operation can commit with the receipt.
 func (s *Service) markWebhookAdmissionFailed(ctx context.Context, environmentID, deliveryIDHash string, code contract.Code, detail string) error {
-	tx, err := s.pool.Begin(ctx)
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		record, found, err := tx.Webhooks().Lock(ctx, environmentID, deliveryIDHash)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return nil
+		}
+		admission := webhookAdmissionFromReceipt(record)
+		if admission.State != api.WebhookDeliveryAdmitted {
+			return nil
+		}
+		return s.failWebhookAdmissionInTx(ctx, tx, admission, code, detail)
+	})
 	if err != nil {
+		var fault *contract.Fault
+		if errors.As(err, &fault) {
+			return err
+		}
 		return unavailable(err)
 	}
-	defer rollback(tx)
-	record, err := loadWebhookAdmissionTx(ctx, tx, environmentID, deliveryIDHash, true)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return unavailable(err)
-	}
-	if record.State != api.WebhookDeliveryAdmitted {
-		return nil
-	}
-	return s.failWebhookAdmission(ctx, tx, record, code, detail)
+	return nil
 }
 
-// failWebhookAdmission commits one sanitized terminal admission failure. The
-// operation and platform job were never committed, so the receipt becomes
-// terminal instead of staying pending forever.
-func (s *Service) failWebhookAdmission(ctx context.Context, tx pgx.Tx, record api.WebhookAdmission, code contract.Code, detail string) error {
-	if _, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
-        SET state='failed', failed_at=clock_timestamp(), error_code=$3, error_detail=$4
-        WHERE environment_id=$1 AND delivery_id_hash=$2 AND state='admitted'`,
-		record.EnvironmentID, record.DeliveryIDHash, string(code), sanitizeWebhookFailure(detail)); err != nil {
-		return unavailable(err)
+// failWebhookAdmissionInTx records one sanitized terminal admission failure in
+// the caller's transaction. The operation and platform job were never
+// committed, so the receipt becomes terminal instead of staying pending.
+func (s *Service) failWebhookAdmissionInTx(ctx context.Context, tx *entities.StoreTx, record api.WebhookAdmission, code contract.Code, detail string) error {
+	failed, err := tx.Webhooks().Fail(ctx, record.EnvironmentID, record.DeliveryIDHash, code, sanitizeWebhookFailure(detail))
+	if err != nil {
+		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return unavailable(err)
+	if !failed {
+		return contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation changed", "Retry the delivery; do not submit a second operation.")
 	}
 	return nil
 }
@@ -270,34 +277,14 @@ func webhookAdmissionDispositionFor(jobState string) webhookAdmissionDisposition
 // runs on every worker and now also repairs admitted receipts whose River job
 // vanished or reached a terminal state.
 //
-// The SQL filters to actionable River states before LIMIT, so a large healthy
-// backlog cannot hide later broken receipts. Each candidate is re-read under
-// its receipt row lock; a concurrent maintenance pass may already have replaced
-// the job, so the current job identity and state decide the action.
+// The typed query filters to actionable River states before the limit, so a
+// large healthy backlog cannot hide later broken receipts. Each candidate is
+// re-read under its receipt row lock; a concurrent maintenance pass may already
+// have replaced the job, so the current job identity and state decide the action.
 func (s *Service) reconcileWebhookAdmissions(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx, `SELECT d.environment_id, d.delivery_id_hash
-        FROM eregion_webhook_deliveries d
-        LEFT JOIN river_job j ON j.id=d.job_id
-        WHERE d.state='admitted'
-          AND (d.job_id IS NULL OR j.id IS NULL OR j.state IN ('completed','discarded','cancelled'))
-        ORDER BY d.first_seen_at
-        LIMIT 100`)
+	identities, err := s.entities.Webhooks().ListNeedingRiver(ctx, 100)
 	if err != nil {
 		return unavailable(err)
-	}
-	var identities []webhookArgs
-	for rows.Next() {
-		var identity webhookArgs
-		if err := rows.Scan(&identity.EnvironmentID, &identity.DeliveryIDHash); err != nil {
-			rows.Close()
-			return err
-		}
-		identities = append(identities, identity)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
 	}
 	var failures []error
 	for _, identity := range identities {
@@ -313,62 +300,52 @@ func (s *Service) reconcileWebhookAdmissions(ctx context.Context) error {
 // maintenance requeue cannot make this pass fail a valid replacement job or
 // enqueue the same receipt twice.
 func (s *Service) reconcileWebhookAdmission(ctx context.Context, environmentID, deliveryIDHash string) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return unavailable(err)
-	}
-	defer rollback(tx)
-	record, err := loadWebhookAdmissionTx(ctx, tx, environmentID, deliveryIDHash, true)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return unavailable(err)
-	}
-	if record.State != api.WebhookDeliveryAdmitted {
-		return nil
-	}
-	jobState, err := webhookJobStateTx(ctx, tx, record.JobID)
-	if err != nil {
-		return unavailable(err)
-	}
-	switch webhookAdmissionDispositionFor(jobState) {
-	case webhookAdmissionFail:
-		return s.failWebhookAdmission(ctx, tx, record, contract.Unavailable, "the durable admission job was "+jobState+" before submitting the deploy")
-	case webhookAdmissionRequeue:
-		if record.AdmissionAttempts >= platformMaxAttempts {
-			return s.failWebhookAdmission(ctx, tx, record, contract.Unavailable, "the admission job disappeared after its final attempt")
-		}
-		if s.enqueueWebhook == nil {
-			return unavailable()
-		}
-		jobID, err := s.enqueueWebhook(ctx, tx, environmentID, deliveryIDHash)
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		record, found, err := tx.Webhooks().Lock(ctx, environmentID, deliveryIDHash)
 		if err != nil {
-			return unavailable(err)
+			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_webhook_deliveries
-            SET job_id=$3, admission_attempts=admission_attempts+1
-            WHERE environment_id=$1 AND delivery_id_hash=$2 AND state='admitted'`, environmentID, deliveryIDHash, jobID); err != nil {
-			return unavailable(err)
+		if !found {
+			return nil
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return unavailable(err)
+		admission := webhookAdmissionFromReceipt(record)
+		if admission.State != api.WebhookDeliveryAdmitted {
+			return nil
 		}
+		jobState, found, err := tx.RiverJobs().GetState(ctx, admission.JobID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			jobState = ""
+		}
+		switch webhookAdmissionDispositionFor(jobState) {
+		case webhookAdmissionFail:
+			return s.failWebhookAdmissionInTx(ctx, tx, admission, contract.Unavailable, "the durable admission job was "+jobState+" before submitting the deploy")
+		case webhookAdmissionRequeue:
+			if admission.AdmissionAttempts >= jobargs.PlatformMaxAttempts {
+				return s.failWebhookAdmissionInTx(ctx, tx, admission, contract.Unavailable, "the admission job disappeared after its final attempt")
+			}
+			jobID, err := tx.Jobs().EnqueueWebhook(ctx, environmentID, deliveryIDHash)
+			if err != nil {
+				return err
+			}
+			reassigned, err := tx.Webhooks().ReassignJob(ctx, environmentID, deliveryIDHash, jobID)
+			if err != nil {
+				return err
+			}
+			if !reassigned {
+				return contract.NewFault(contract.PreconditionFailed, "webhook delivery reservation changed", "Retry the delivery; do not submit a second operation.")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		var fault *contract.Fault
+		if errors.As(err, &fault) {
+			return err
+		}
+		return unavailable(err)
 	}
 	return nil
-}
-
-func webhookJobStateTx(ctx context.Context, q rowQueryer, jobID int64) (string, error) {
-	if jobID == 0 {
-		return "", nil
-	}
-	var state string
-	err := q.QueryRow(ctx, `SELECT state FROM river_job WHERE id=$1`, jobID).Scan(&state)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return state, nil
 }

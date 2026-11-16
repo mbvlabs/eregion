@@ -22,6 +22,7 @@ import (
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/host"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/output"
@@ -320,12 +321,18 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime
 			nodeTransport = local
 		}
 	}
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		closeTransport()
+		pool.Close()
+		return nil, nil, extensionRuntime{}, nil, err
+	}
 	// One resolver serves extension dispatch and the worker. Sharing it keeps
 	// one transport cache and one WireGuard key lock per node.
-	nodes := controlplane.NewNodeResolver(pool, a.fleetResolverConfig(logger), func() node.Transport { return nodeTransport })
+	nodes := controlplane.NewNodeResolver(store.Nodes(), a.fleetResolverConfig(logger), func() node.Transport { return nodeTransport })
 	// Extensions register before New so the registry is complete before any
 	// action can be normalized, submitted, or executed.
-	parts, secretResolver, err := a.startExtensions(pool)
+	parts, secretResolver, err := a.startExtensions(store)
 	if err != nil {
 		closeTransport()
 		pool.Close()
@@ -352,7 +359,7 @@ func (a *app) startRuntime(cmd *cobra.Command, concurrency int, readinessRuntime
 		}
 		registryHostIdentity = &identity
 	}
-	run, err := controlplane.New(pool, logger, controlplane.WorkerConfig{
+	run, err := controlplane.New(store, logger, controlplane.WorkerConfig{
 		Concurrency: concurrency, Transport: nodeTransport, SecretResolver: secretResolver,
 		Metrics:              processmetrics.New(pool),
 		Vault:                parts.Vault,

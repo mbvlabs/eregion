@@ -8,11 +8,11 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/appdef"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -72,7 +72,7 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 	if err != nil || len(input.Plan.Definition) > appdef.MaxDefinitionBytes {
 		return zero, contract.NewFault(contract.ValidationFailed, "definition input is too large", "Use a bounded definition without secret values.")
 	}
-	if s == nil || s.pool == nil {
+	if s == nil || s.entities == nil {
 		return zero, unavailable()
 	}
 	resolved, err := appdef.ResolveSelection([]byte(input.Plan.Definition), input.Plan.App, input.Plan.Environment)
@@ -121,200 +121,182 @@ func (s *Service) ApplyDefinition(ctx context.Context, actor contract.Actor, inp
 		}
 	}
 
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	defer rollback(tx)
-	// The policy guard precedes app/environment locks, matching policy writes.
-	if err = lockDefinitionPolicyTx(ctx, tx); err != nil {
-		return zero, unavailable(err)
-	}
-	if err = lockDefinitionTargetTx(ctx, tx, plan.App, plan.Environment); err != nil {
-		return zero, err
-	}
-	// Serialize same-target submissions and replay a concurrent winner before
-	// comparing its newly changed snapshot to our original plan.
-	var existingID contract.OperationID
-	var existingHash string
-	err = tx.QueryRow(ctx, `SELECT id,input_hash FROM eregion_operations WHERE actor_kind=$1 AND actor_subject=$2 AND kind=$3 AND target=$4 AND idempotency_key=$5`, actor.Kind, actor.Subject, platform.KindDefinitionApply, target, input.IdempotencyKey).Scan(&existingID, &existingHash)
-	if err == nil {
-		if existingHash != requestHash {
-			return zero, idempotencyInputConflict()
+	var submitted operations.SubmissionResult
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		// The policy guard precedes app/environment locks, matching policy writes.
+		if err := lockDefinitionPolicyTx(ctx, tx); err != nil {
+			return unavailable(err)
 		}
-		op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", existingID))
+		if err := lockDefinitionTargetTx(ctx, tx, plan.App, plan.Environment); err != nil {
+			return err
+		}
+		// Serialize same-target submissions and replay a concurrent winner before
+		// comparing its newly changed snapshot to our original plan.
+		identity, found, err := tx.Operations().Identity(ctx, entities.OperationKey{
+			Kind: platform.KindDefinitionApply, Target: target, Actor: actor, IdempotencyKey: input.IdempotencyKey,
+		})
 		if err != nil {
+			return unavailable(err)
+		}
+		if found {
+			if identity.InputHash != requestHash {
+				return idempotencyInputConflict()
+			}
+			op, found, err := tx.Operations().Get(ctx, identity.ID)
+			if err != nil || !found {
+				return unavailable(err)
+			}
+			submitted = operations.SubmissionResult{Operation: op, Replay: true}
+			return nil
+		}
+		// Absence is the typed revision-zero disabled policy, not a storage error.
+		// The advisory lock above also serializes creation of the singleton.
+		policy, err := lockedDefinitionDNSPolicy(ctx, tx)
+		if err != nil {
+			return err
+		}
+		// Lock existing secret and provider metadata rows in deterministic order.
+		if _, err := tx.Secrets().LockDefinitionSecretNames(ctx, plan.App, plan.Environment); err != nil {
+			return unavailable(err)
+		}
+		if _, err := tx.Providers().LockZoneRevisionsForDefinition(ctx, "cloudflare", policy.ZoneID, string(material.Snapshot.EnvironmentID)); err != nil {
+			return unavailable(err)
+		}
+		// Pin existing selected placement rows until admission commits. Registration
+		// of a missing planned node cannot make an otherwise blocked plan applicable.
+		var nodeNames []string
+		for _, node := range material.Snapshot.Nodes {
+			nodeNames = append(nodeNames, node.Name)
+		}
+		if _, err := tx.Nodes().LockExistingNames(ctx, nodeNames); err != nil {
+			return unavailable(err)
+		}
+		current, _, err := readDefinitionSnapshotTx(ctx, tx, material.Resolved)
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(current, material.Snapshot) {
+			return contract.NewFault(contract.Conflict, definitionSnapshotChange(current, material.Snapshot), "Review and approve a new plan.")
+		}
+		// Hostnames are installation-wide, not environment-local. Recheck existing
+		// bindings even though unrelated application inventory is not fingerprinted.
+		// The domain table's global uniqueness constraint remains the final fence
+		// against a concurrent insertion after this read.
+		for _, domain := range plan.Domains {
+			if domain.Action == "remove" {
+				continue
+			}
+			owner, found, err := tx.Platform().Domains().EnvironmentIDByName(ctx, domain.Name)
+			if err != nil {
+				return unavailable(err)
+			}
+			if found && owner != current.EnvironmentID {
+				return contract.NewFault(contract.Conflict, "hostname belongs to another environment", "Remove the existing binding or review a plan using another hostname.")
+			}
+		}
+		for _, active := range current.ActiveOperations {
+			if active.Target == "app/"+plan.App || active.Target == target || strings.HasPrefix(active.Target, "resource/"+plan.App+"/") || strings.HasPrefix(active.Target, "env/"+plan.App+"/") {
+				return contract.NewFault(contract.Conflict, "application has active operations", "Wait for existing work and plan again.")
+			}
+		}
+		activeBuild, err := tx.Platform().Builds().ActiveOperationForApp(ctx, current.AppID)
+		if err != nil {
+			return unavailable(err)
+		}
+		if activeBuild {
+			return contract.NewFault(contract.Conflict, "application has active build operations", "Wait for existing work and plan again.")
+		}
+		id, err := contract.NewOperationID()
+		if err != nil {
+			return err
+		}
+		inserted, err := tx.Operations().Insert(ctx, entities.OperationInsert{
+			ID: id,
+			Key: entities.OperationKey{
+				Kind: platform.KindDefinitionApply, Target: target, Actor: actor, IdempotencyKey: input.IdempotencyKey,
+			},
+			InputHash: requestHash, Input: canonical,
+		})
+		if err != nil {
+			return unavailable(err)
+		}
+		if !inserted {
+			return idempotencyInputConflict()
+		}
+		approved, err := json.Marshal(definitionApproved{Input: input, Snapshot: material.Snapshot, Plan: plan, Actor: actor})
+		if err != nil {
+			return err
+		}
+		if err := tx.DefinitionRuns().Insert(ctx, entities.DefinitionRunInsert{
+			OperationID: id, PlanNonce: input.Plan.PlanNonce, EnvironmentID: string(current.EnvironmentID),
+			Approved: approved,
+		}); err != nil {
+			if isUniqueConstraint(err) {
+				return contract.NewFault(contract.Conflict, "definition nonce or environment already reserved", "Review and approve a new plan after active work finishes.")
+			}
+			return unavailable(err)
+		}
+		for ordinal, step := range material.Steps {
+			insert := entities.DefinitionStepInsert{
+				ParentOperationID: id, Ordinal: ordinal, Kind: step.Kind, Target: step.Target,
+				Input: step.Input, DomainID: step.DomainID, AllocatedDomainID: step.AllocatedDomainID,
+			}
+			if step.DNSPlan != nil {
+				insert.DNSPlan, err = json.Marshal(step.DNSPlan)
+				if err != nil {
+					return err
+				}
+			}
+			if step.DNSCleanup != nil {
+				insert.DNSCleanup, err = json.Marshal(step.DNSCleanup)
+				if err != nil {
+					return err
+				}
+			}
+			if err := tx.DefinitionSteps().Insert(ctx, insert); err != nil {
+				if isUniqueConstraint(err) {
+					return contract.NewFault(contract.Conflict, "definition domain identity already reserved", "Review and approve a new plan.")
+				}
+				return unavailable(err)
+			}
+		}
+		op := contract.Operation{ID: id, Kind: platform.KindDefinitionApply, Target: target, Actor: actor}
+		job, err := tx.Jobs().EnqueuePlatform(ctx, op)
+		if err != nil {
+			return unavailable(err)
+		}
+		if err := tx.Operations().SetJob(ctx, id, job); err != nil {
+			return unavailable(err)
+		}
+		op, found, err = tx.Operations().Get(ctx, id)
+		if err != nil || !found {
+			return unavailable(err)
+		}
+		if err := appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: "Definition apply accepted durably."}); err != nil {
+			return err
+		}
+		submitted = operations.SubmissionResult{Operation: op}
+		return nil
+	})
+	if err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
 			return zero, unavailable(err)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return zero, unavailable(err)
-		}
-		if err := s.populateActionResult(ctx, &op); err != nil {
+		var fault *contract.Fault
+		if errors.As(err, &fault) {
 			return zero, err
 		}
-		return operations.SubmissionResult{Operation: op, Replay: true}, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
 		return zero, unavailable(err)
 	}
-	// Absence is the typed revision-zero disabled policy, not a storage error.
-	// The advisory lock above also serializes creation of the singleton.
-	if _, err = scanDefinitionDNSPolicy(tx.QueryRow(ctx, definitionDNSPolicySelect+` FOR SHARE OF p`)); err != nil {
-		return zero, err
-	}
-	// Lock existing secret and provider metadata rows in deterministic order.
-	for _, query := range []string{
-		`SELECT name FROM eregion_secrets WHERE app=$1 AND environment=$2 ORDER BY name FOR SHARE`,
-		`SELECT zone_id FROM eregion_provider_credentials WHERE provider='cloudflare' AND (zone_id=(SELECT zone_id FROM eregion_definition_dns_policy WHERE singleton=true) OR zone_id IN (SELECT x.zone_id FROM eregion_platform_domain_dns x JOIN eregion_platform_domains d ON d.id=x.domain_id WHERE d.environment_id=$1)) ORDER BY zone_id FOR SHARE`,
-	} {
-		var rows pgx.Rows
-		if strings.Contains(query, "eregion_provider_credentials") {
-			rows, err = tx.Query(ctx, query, material.Snapshot.EnvironmentID)
-		} else {
-			rows, err = tx.Query(ctx, query, plan.App, plan.Environment)
-		}
-		if err != nil {
-			return zero, unavailable(err)
-		}
-		for rows.Next() {
-			var ignored string
-			if err = rows.Scan(&ignored); err != nil {
-				break
-			}
-		}
-		if err == nil {
-			err = rows.Err()
-		}
-		rows.Close()
-		if err != nil {
-			return zero, unavailable(err)
+	if submitted.Replay {
+		if err := s.populateActionResult(ctx, &submitted.Operation); err != nil {
+			return zero, err
 		}
 	}
-	// Pin existing selected placement rows until admission commits. Registration
-	// of a missing planned node cannot make an otherwise blocked plan applicable.
-	var nodeNames []string
-	for _, node := range material.Snapshot.Nodes {
-		nodeNames = append(nodeNames, node.Name)
-	}
-	rows, err := tx.Query(ctx, `SELECT name FROM eregion_platform_nodes WHERE name=ANY($1::text[]) ORDER BY name FOR SHARE`, nodeNames)
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	for rows.Next() {
-		var name string
-		if err = rows.Scan(&name); err != nil {
-			break
-		}
-	}
-	if err == nil {
-		err = rows.Err()
-	}
-	rows.Close()
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	current, _, err := readDefinitionSnapshotTx(ctx, tx, material.Resolved)
-	if err != nil {
-		return zero, err
-	}
-	if !reflect.DeepEqual(current, material.Snapshot) {
-		return zero, contract.NewFault(contract.Conflict, definitionSnapshotChange(current, material.Snapshot), "Review and approve a new plan.")
-	}
-	// Hostnames are installation-wide, not environment-local. Recheck existing
-	// bindings even though unrelated application inventory is not fingerprinted.
-	// The domain table's global uniqueness constraint remains the final fence
-	// against a concurrent insertion after this read.
-	for _, domain := range plan.Domains {
-		if domain.Action == "remove" {
-			continue
-		}
-		var owner platform.EnvironmentID
-		err = tx.QueryRow(ctx, `SELECT environment_id FROM eregion_platform_domains WHERE name=$1`, domain.Name).Scan(&owner)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return zero, unavailable(err)
-		}
-		if err == nil && owner != current.EnvironmentID {
-			return zero, contract.NewFault(contract.Conflict, "hostname belongs to another environment", "Remove the existing binding or review a plan using another hostname.")
-		}
-	}
-	for _, active := range current.ActiveOperations {
-		if active.Target == "app/"+plan.App || active.Target == target || strings.HasPrefix(active.Target, "resource/"+plan.App+"/") || strings.HasPrefix(active.Target, "env/"+plan.App+"/") {
-			return zero, contract.NewFault(contract.Conflict, "application has active operations", "Wait for existing work and plan again.")
-		}
-	}
-	var activeBuild bool
-	if err = tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM eregion_operations o JOIN eregion_platform_builds b ON o.target='build/'||b.id WHERE b.app_id=$1 AND o.state IN ('queued','running','cancelling'))`, current.AppID).Scan(&activeBuild); err != nil {
-		return zero, unavailable(err)
-	}
-	if activeBuild {
-		return zero, contract.NewFault(contract.Conflict, "application has active build operations", "Wait for existing work and plan again.")
-	}
-	id, err := contract.NewOperationID()
-	if err != nil {
-		return zero, err
-	}
-	inserted, err := tx.Exec(ctx, `INSERT INTO eregion_operations (id,kind,target,actor_kind,actor_subject,idempotency_key,input_hash,input,state,attempt,completed_steps,last_sequence,error_code,created_at,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'queued',0,0,0,'',clock_timestamp(),clock_timestamp()) ON CONFLICT (actor_kind,actor_subject,kind,target,idempotency_key) DO NOTHING`, id, platform.KindDefinitionApply, target, actor.Kind, actor.Subject, input.IdempotencyKey, requestHash, canonical)
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	if inserted.RowsAffected() != 1 {
-		return zero, idempotencyInputConflict()
-	}
-	approved, err := json.Marshal(definitionApproved{Input: input, Snapshot: material.Snapshot, Plan: plan, Actor: actor})
-	if err != nil {
-		return zero, err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO eregion_definition_runs (operation_id,plan_nonce,environment_id,approved,next_step,failure_code,failure_message) VALUES ($1,$2,$3,$4,0,'','')`, id, input.Plan.PlanNonce, current.EnvironmentID, approved)
-	if err != nil {
-		var pgerr *pgconn.PgError
-		if errors.As(err, &pgerr) && pgerr.Code == "23505" {
-			return zero, contract.NewFault(contract.Conflict, "definition nonce or environment already reserved", "Review and approve a new plan after active work finishes.")
-		}
-		return zero, unavailable(err)
-	}
-	for i, step := range material.Steps {
-		var dns, cleanup any
-		if step.DNSPlan != nil {
-			dns, err = json.Marshal(step.DNSPlan)
-			if err != nil {
-				return zero, err
-			}
-		}
-		if step.DNSCleanup != nil {
-			cleanup, err = json.Marshal(step.DNSCleanup)
-			if err != nil {
-				return zero, err
-			}
-		}
-		_, err = tx.Exec(ctx, `INSERT INTO eregion_definition_steps (parent_operation_id,ordinal,kind,target,input,domain_id,allocated_domain_id,dns_plan,dns_cleanup,dns_progress) VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$8,$9,'[]'::jsonb)`, id, i, step.Kind, step.Target, step.Input, string(step.DomainID), string(step.AllocatedDomainID), dns, cleanup)
-		if err != nil {
-			var pgerr *pgconn.PgError
-			if errors.As(err, &pgerr) && pgerr.Code == "23505" {
-				return zero, contract.NewFault(contract.Conflict, "definition domain identity already reserved", "Review and approve a new plan.")
-			}
-			return zero, unavailable(err)
-		}
-	}
-	if s.enqueuePlatform == nil {
-		return zero, unavailable()
-	}
-	op := contract.Operation{ID: id, Kind: platform.KindDefinitionApply, Target: target, Actor: actor}
-	job, err := s.enqueuePlatform(ctx, tx, op)
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	if _, err = tx.Exec(ctx, `UPDATE eregion_operations SET job_id=$2 WHERE id=$1`, id, job); err != nil {
-		return zero, unavailable(err)
-	}
-	op, err = scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1", id))
-	if err != nil {
-		return zero, unavailable(err)
-	}
-	if err = appendEvent(ctx, tx, &op, contract.Event{Kind: "state", State: contract.Queued, Message: "Definition apply accepted durably."}); err != nil {
-		return zero, unavailable(err)
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return zero, unavailable(err)
-	}
-	return operations.SubmissionResult{Operation: op}, nil
+	return submitted, nil
+}
+
+func isUniqueConstraint(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

@@ -15,7 +15,7 @@ import (
 // checked at the desired revision's path.
 func TestIntegrationPrimaryCheckPathUsesPinnedRevision(t *testing.T) {
 	pool, _ := testPool(t, true)
-	service := &Service{pool: pool}
+	service := &Service{entities: newTestEntities(t, pool)}
 	ctx := context.Background()
 
 	appID, err := platform.NewAppID()

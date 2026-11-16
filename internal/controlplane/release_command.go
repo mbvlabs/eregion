@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -110,20 +110,14 @@ func releaseCommandErrorIsTerminal(err error) bool {
 }
 
 func (s *Service) releaseCommandRun(ctx context.Context, releaseID platform.ReleaseID, digest string) (releaseCommandRun, error) {
-	var row releaseCommandRun
-	err := s.pool.QueryRow(ctx, `SELECT r.state,coalesce(r.operation_id,''),
-        EXISTS(SELECT 1 FROM eregion_operations o
-               WHERE o.id=r.operation_id AND o.state IN ('queued','running','cancelling'))
-        FROM eregion_platform_release_command_runs r
-        WHERE r.release_id=$1 AND r.command_digest=$2`, releaseID, digest).
-		Scan(&row.State, &row.OperationID, &row.Live)
-	if errors.Is(err, pgx.ErrNoRows) {
+	record, found, err := s.entities.Platform().ReleaseCommands().Get(ctx, releaseID, digest)
+	if err != nil {
+		return releaseCommandRun{}, unavailable(err)
+	}
+	if !found {
 		return releaseCommandRun{}, nil
 	}
-	if err != nil {
-		return releaseCommandRun{}, unavailable()
-	}
-	return row, nil
+	return releaseCommandRun{State: record.State, OperationID: record.OperationID, Live: record.Active}, nil
 }
 
 // startReleaseCommandRun records the one running command for this release and
@@ -132,19 +126,11 @@ func (s *Service) releaseCommandRun(ctx context.Context, releaseID platform.Rele
 // another operation and a succeeded row are never overwritten, even if the
 // caller's pre-read raced another writer.
 func (s *Service) startReleaseCommandRun(ctx context.Context, releaseID platform.ReleaseID, digest string, operationID contract.OperationID) error {
-	tag, err := s.pool.Exec(ctx, `INSERT INTO eregion_platform_release_command_runs
-        (release_id,command_digest,operation_id,state,started_at,error_code,error)
-        VALUES($1,$2,$3,'running',clock_timestamp(),'','')
-        ON CONFLICT (release_id,command_digest) DO UPDATE
-        SET operation_id=$3,state='running',error_code='',error='',
-            started_at=clock_timestamp(),completed_at=NULL
-        WHERE eregion_platform_release_command_runs.operation_id=EXCLUDED.operation_id
-           OR eregion_platform_release_command_runs.state='failed'`,
-		releaseID, digest, operationID)
+	rows, err := s.entities.Platform().ReleaseCommands().Start(ctx, releaseID, digest, operationID)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
-	if tag.RowsAffected() == 0 {
+	if rows == 0 {
 		return contract.NewFault(contract.Unavailable,
 			"the release command run is owned by another operation",
 			"Retry the deployment; an unresolved release command is never overwritten.")
@@ -156,38 +142,31 @@ func (s *Service) startReleaseCommandRun(ctx context.Context, releaseID platform
 // row is still running under the original owner. A racing recovery or claim
 // leaves the row untouched.
 func (s *Service) finishRecoveredReleaseCommandRun(ctx context.Context, releaseID platform.ReleaseID, digest string, owner contract.OperationID, state string, code contract.Code, message string) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE eregion_platform_release_command_runs
-        SET state=$4,error_code=$5,error=$6,completed_at=clock_timestamp()
-        WHERE release_id=$1 AND command_digest=$2 AND state='running' AND operation_id=$3`,
-		releaseID, digest, owner, state, string(code), boundedRouteError(message))
+	rows, err := s.entities.Platform().ReleaseCommands().FinishRecovered(ctx, releaseID, digest, owner, state, code, boundedRouteError(message))
 	if err != nil {
-		return false, unavailable()
+		return false, unavailable(err)
 	}
-	return tag.RowsAffected() == 1, nil
+	return rows == 1, nil
 }
 
 func (s *Service) finishReleaseCommandRun(ctx context.Context, releaseID platform.ReleaseID, digest string, operationID contract.OperationID, cause error) error {
-	state, code, message := "succeeded", "", ""
+	state, code, message := "succeeded", contract.Code(""), ""
 	if cause != nil {
 		classified := contract.Classify(cause)
-		state, code, message = "failed", string(classified.Code), classified.Message
+		state, code, message = "failed", classified.Code, classified.Message
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE eregion_platform_release_command_runs
-        SET state=$3,error_code=$4,error=$5,completed_at=clock_timestamp()
-        WHERE release_id=$1 AND command_digest=$2 AND operation_id=$6 AND state='running'`,
-		releaseID, digest, state, code, message, operationID)
-	if err != nil {
-		return unavailable()
+	if _, err := s.entities.Platform().ReleaseCommands().Finish(ctx, releaseID, digest, operationID, state, code, message); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
 // deploymentReleaseCommandTx resolves the same command the deployment worker
 // will use, from the release and the revision the deployment pins.
-func deploymentReleaseCommandTx(ctx context.Context, tx pgx.Tx, releaseID platform.ReleaseID, revisionID platform.RevisionID) (*platform.CommandSpec, error) {
-	var releaseCommand []byte
-	if err := tx.QueryRow(ctx, `SELECT command FROM eregion_platform_releases WHERE id=$1`, releaseID).Scan(&releaseCommand); err != nil {
-		return nil, unavailable()
+func deploymentReleaseCommandTx(ctx context.Context, tx *entities.StoreTx, releaseID platform.ReleaseID, revisionID platform.RevisionID) (*platform.CommandSpec, error) {
+	releaseCommand, _, err := tx.Platform().Releases().Command(ctx, releaseID)
+	if err != nil {
+		return nil, unavailable(err)
 	}
 	var command *platform.CommandSpec
 	if len(releaseCommand) > 0 {
@@ -200,9 +179,12 @@ func deploymentReleaseCommandTx(ctx context.Context, tx pgx.Tx, releaseID platfo
 	if revisionID == "" {
 		return command, nil
 	}
-	var runtimeRaw []byte
-	if err := tx.QueryRow(ctx, `SELECT runtime FROM eregion_platform_environment_revisions WHERE id=$1`, revisionID).Scan(&runtimeRaw); err != nil {
-		return nil, unavailable()
+	runtimeRaw, found, err := tx.Platform().Revisions().Runtime(ctx, revisionID)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	if !found {
+		return nil, contract.NewFault(contract.NotFound, "environment revision not found", "Inspect the deployment revision before running its release command.")
 	}
 	var runtime platform.RuntimeSpec
 	if len(runtimeRaw) > 0 {
@@ -218,7 +200,7 @@ func deploymentReleaseCommandTx(ctx context.Context, tx pgx.Tx, releaseID platfo
 
 // checkReleaseCommandForDeploymentTx refuses a restart, scale restart or
 // rollback whose release command has not succeeded for the revision applied.
-func checkReleaseCommandForDeploymentTx(ctx context.Context, tx pgx.Tx, releaseID platform.ReleaseID, revisionID platform.RevisionID, action platform.DeploymentAction) error {
+func checkReleaseCommandForDeploymentTx(ctx context.Context, tx *entities.StoreTx, releaseID platform.ReleaseID, revisionID platform.RevisionID, action platform.DeploymentAction) error {
 	if action == platform.ActionDeploy {
 		return nil
 	}
@@ -227,12 +209,13 @@ func checkReleaseCommandForDeploymentTx(ctx context.Context, tx pgx.Tx, releaseI
 		return err
 	}
 	digest := platform.ReleaseCommandDigest(*command)
-	var row releaseCommandRun
-	err = tx.QueryRow(ctx, `SELECT state,coalesce(operation_id,'') FROM eregion_platform_release_command_runs
-        WHERE release_id=$1 AND command_digest=$2`, releaseID, digest).
-		Scan(&row.State, &row.OperationID)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return unavailable()
+	record, found, err := tx.Platform().ReleaseCommands().CheckForDeployment(ctx, releaseID, digest)
+	if err != nil {
+		return unavailable(err)
+	}
+	row := releaseCommandRun{}
+	if found {
+		row.State, row.OperationID = record.State, record.OperationID
 	}
 	if releaseCommandAction(row, action, "") == releaseCommandSkip {
 		return nil

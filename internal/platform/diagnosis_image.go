@@ -7,6 +7,7 @@ import (
 	"io"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -31,7 +32,15 @@ func ObserveDiagnosisImage(parent context.Context, id string) (*DiagnosisImage, 
 	}
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", "--format", `{{json .Id}}{{"\n"}}{{json (index .Config.Labels "io.buildpacks.build.metadata")}}{{"\n"}}{{json (index .Config.Labels "io.buildpacks.lifecycle.metadata")}}`, id)
+	cmd := exec.CommandContext(
+		ctx,
+		"docker",
+		"image",
+		"inspect",
+		"--format",
+		`{{json .Id}}{{"\n"}}{{json (index .Config.Labels "io.buildpacks.build.metadata")}}{{"\n"}}{{json (index .Config.Labels "io.buildpacks.lifecycle.metadata")}}`,
+		id,
+	)
 	buf := &limitedDiagnosticBuffer{limit: 600 * 1024}
 	cmd.Stdout = buf
 	if err := cmd.Run(); err != nil || buf.overflow {
@@ -42,7 +51,13 @@ func ObserveDiagnosisImage(parent context.Context, id string) (*DiagnosisImage, 
 	if len(parts) != 3 || json.Unmarshal([]byte(parts[0]), &got) != nil || got != id {
 		return nil, "image identity could not be verified"
 	}
-	out := &DiagnosisImage{ImageID: id, Buildpacks: []DiagnosisBuildpack{}, ProcessTypes: []string{}, Layers: []DiagnosisLayer{}, Note: "Buildpacks metadata is declared, not proof a runtime or executable is available; only allowlisted IDs, process types and layer names are shown. Commands and layer contents are omitted."}
+	out := &DiagnosisImage{
+		ImageID:      id,
+		Buildpacks:   []DiagnosisBuildpack{},
+		ProcessTypes: []string{},
+		Layers:       []DiagnosisLayer{},
+		Note:         "Buildpacks metadata is declared, not proof a runtime or executable is available; only allowlisted IDs, process types and layer names are shown. Commands and layer contents are omitted.",
+	}
 	seenBP, seenProcess := map[string]bool{}, map[string]bool{}
 	for _, part := range parts[1:] {
 		var label *string
@@ -67,7 +82,8 @@ func ObserveDiagnosisImage(parent context.Context, id string) (*DiagnosisImage, 
 				Type string `json:"type"`
 			} `json:"processes"`
 		}
-		if json.Unmarshal([]byte(*label), &metadata) != nil || len(metadata.Buildpacks) > 128 || len(metadata.Processes) > 128 {
+		if json.Unmarshal([]byte(*label), &metadata) != nil || len(metadata.Buildpacks) > 128 ||
+			len(metadata.Processes) > 128 {
 			return out, "Buildpacks metadata shape exceeds bounds"
 		}
 		for _, bp := range metadata.Buildpacks {
@@ -78,7 +94,10 @@ func ObserveDiagnosisImage(parent context.Context, id string) (*DiagnosisImage, 
 				}
 				for _, layer := range []string{"node", "node-engine", "go", "go-dist", "npm"} {
 					if _, ok := bp.Layers[layer]; ok {
-						out.Layers = append(out.Layers, DiagnosisLayer{Buildpack: known, Name: layer})
+						out.Layers = append(
+							out.Layers,
+							DiagnosisLayer{Buildpack: known, Name: layer},
+						)
 					}
 				}
 			}
@@ -92,7 +111,10 @@ func ObserveDiagnosisImage(parent context.Context, id string) (*DiagnosisImage, 
 			key := bp.ID + "@" + version
 			if !seenBP[key] {
 				seenBP[key] = true
-				out.Buildpacks = append(out.Buildpacks, DiagnosisBuildpack{ID: bp.ID, Version: version})
+				out.Buildpacks = append(
+					out.Buildpacks,
+					DiagnosisBuildpack{ID: bp.ID, Version: version},
+				)
 			}
 		}
 		for _, process := range metadata.Processes {
@@ -148,4 +170,35 @@ func diagnosisJSONBounded(raw []byte) bool {
 			}
 		}
 	}
+}
+
+// ResolveDiagnosisImageID maps a canonical immutable manifest reference to the
+// Docker runtime image ID using a bounded, read-only local inspect. It verifies
+// the platform and repository digest before returning the local observation.
+func ResolveDiagnosisImageID(parent context.Context, canonical string) (string, string) {
+	parsed, err := ParseFullyQualifiedImage(canonical)
+	if err != nil || parsed.Digest == "" {
+		return "", "canonical release image reference is unavailable"
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(
+		ctx,
+		"docker",
+		"image",
+		"inspect",
+		"--format",
+		"{{.Id}}|{{.Os}}|{{.Architecture}}|{{json .RepoDigests}}",
+		canonical,
+	)
+	buf := &limitedDiagnosticBuffer{limit: 600 * 1024}
+	cmd.Stdout = buf
+	if err := cmd.Run(); err != nil || buf.overflow {
+		return "", "image absent, pruned, or Docker inaccessible"
+	}
+	runtimeID, err := VerifyMaterializedImageInspection(buf.String(), canonical, runtime.GOARCH)
+	if err != nil {
+		return "", "image identity could not be verified"
+	}
+	return runtimeID, ""
 }

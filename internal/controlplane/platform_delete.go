@@ -4,12 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"sort"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -54,22 +53,14 @@ func (s *Service) lockPlatformTargets(ctx context.Context, normalized platform.N
 }
 
 func (s *Service) environmentTargets(ctx context.Context, app string) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT 'env/'||a.name||'/'||e.name
-        FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE a.name=$1 ORDER BY e.name`, app)
+	targets, err := s.entities.Platform().Environments().ListTargets(ctx, app)
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	out := []string{}
-	for rows.Next() {
-		var target string
-		if err := rows.Scan(&target); err != nil {
-			return nil, unavailable()
-		}
-		out = append(out, target)
+	if targets == nil {
+		targets = []string{}
 	}
-	return out, rows.Err()
+	return targets, nil
 }
 
 // environmentWorkloadNodes lists every node that may still hold this
@@ -78,14 +69,10 @@ func (s *Service) environmentTargets(ctx context.Context, app string) ([]string,
 // name, so the pinned revision is the durable record of where they ran. This
 // reaches containers left behind after `env update --node`.
 func (s *Service) environmentWorkloadNodes(ctx context.Context, envID platform.EnvironmentID, current string) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT coalesce(r.runtime->>'node','')
-        FROM eregion_platform_deployments d
-        LEFT JOIN eregion_platform_environment_revisions r ON r.id=d.revision_id
-        WHERE d.environment_id=$1`, envID)
+	recorded, err := s.entities.Platform().Deployments().WorkloadNodes(ctx, envID)
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
 	nodes := []string{}
 	seen := map[string]bool{}
 	add := func(name string) {
@@ -95,15 +82,8 @@ func (s *Service) environmentWorkloadNodes(ctx context.Context, envID platform.E
 		}
 	}
 	add(current)
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, unavailable()
-		}
+	for _, name := range recorded {
 		add(name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, unavailable()
 	}
 	sort.Strings(nodes)
 	return nodes, nil
@@ -134,107 +114,66 @@ func uniqueTargets(targets []string) []string {
 // returns acquired=false immediately, so a queued job can snooze without
 // holding a pool connection or consuming a River failure attempt.
 func (s *Service) tryLockTargets(ctx context.Context, targets []string) (func(), bool, error) {
-	conn, err := s.pool.Acquire(ctx)
-	if err != nil {
-		return nil, false, unavailable()
-	}
 	keys := make([]int64, 0, len(targets))
-	release := func() {
-		for index := len(keys) - 1; index >= 0; index-- {
-			_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, keys[index])
-		}
-		conn.Release()
-	}
 	for _, target := range uniqueTargets(targets) {
-		key := targetLockKey(target)
-		var acquired bool
-		if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&acquired); err != nil {
-			release()
-			if ctx.Err() != nil {
-				return nil, false, ctx.Err()
-			}
-			return nil, false, unavailable()
-		}
-		if !acquired {
-			release()
-			return nil, false, nil
-		}
-		keys = append(keys, key)
+		keys = append(keys, targetLockKey(target))
 	}
-	return release, true, nil
+	lease, acquired, err := s.entities.Platform().Locks().TryTargets(ctx, keys)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		return nil, false, unavailable(err)
+	}
+	if !acquired {
+		return nil, false, nil
+	}
+	return func() { _ = lease.Release() }, true, nil
 }
 
 func (s *Service) lockTargets(ctx context.Context, targets []string) (func(), error) {
-	unique := uniqueTargets(targets)
-	conn, err := s.pool.Acquire(ctx)
+	keys := make([]int64, 0, len(targets))
+	for _, target := range uniqueTargets(targets) {
+		keys = append(keys, targetLockKey(target))
+	}
+	lease, err := s.entities.Platform().Locks().AcquireTargets(ctx, keys)
 	if err != nil {
-		return nil, unavailable()
-	}
-	keys := make([]int64, 0, len(unique))
-	for _, target := range unique {
-		key := targetLockKey(target)
-		if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, key); err != nil {
-			for index := len(keys) - 1; index >= 0; index-- {
-				_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, keys[index])
-			}
-			conn.Release()
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, unavailable()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		keys = append(keys, key)
+		return nil, unavailable(err)
 	}
-	return func() {
-		for index := len(keys) - 1; index >= 0; index-- {
-			_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, keys[index])
-		}
-		conn.Release()
-	}, nil
+	return func() { _ = lease.Release() }, nil
 }
 
 // ensureNoActiveDeleteTargets refuses a deletion while another operation for
 // the same records is queued, running or cancelling. This is a state check, not
 // a queue-row assumption; the target locks then keep new operations out.
-func (s *Service) ensureNoActiveDeleteTargets(ctx context.Context, tx pgx.Tx, id contract.OperationID, app, environment string) error {
-	statement := `SELECT count(*) FROM eregion_operations
-        WHERE id<>$1 AND state IN ('queued','running','cancelling') AND (target=$2`
-	args := []any{id, "app/" + app}
+func (s *Service) ensureNoActiveDeleteTargets(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, app, environment string) error {
+	var (
+		active int64
+		err    error
+	)
 	if environment == "" {
-		args = append(args, "env/"+app+"/%")
-		statement += fmt.Sprintf(" OR target LIKE $%d", len(args))
+		active, err = tx.Operations().CountActiveDeleteTargetsForApp(ctx, entities.DeleteTargetGuard{
+			ExcludeID: id, AppTarget: "app/" + app, EnvironmentPattern: "env/" + app + "/%",
+		})
 	} else {
-		args = append(args, "env/"+app+"/"+environment)
-		statement += fmt.Sprintf(" OR target=$%d", len(args))
-		// Two sibling environment deletions accepted before either worker ran
-		// could otherwise each look non-last and together remove the app
-		// without the app-deletion factor. Serialize all environment deletes
-		// for one app; after the first finishes, the next submission re-reads
-		// the true remaining count and requires the factor when it is last.
-		args = append(args, platform.KindEnvironmentDelete, "env/"+app+"/%")
-		statement += fmt.Sprintf(" OR (kind=$%d AND target LIKE $%d)", len(args)-1, len(args))
+		active, err = tx.Operations().CountActiveDeleteTargetsForEnvironment(ctx, entities.EnvironmentDeleteTargetGuard{
+			ExcludeID: id, AppTarget: "app/" + app, EnvironmentTarget: "env/" + app + "/" + environment,
+			EnvironmentDeleteKind: platform.KindEnvironmentDelete, EnvironmentPattern: "env/" + app + "/%",
+		})
 	}
-	statement += ")"
-	var active int
-	if err := tx.QueryRow(ctx, statement, args...).Scan(&active); err != nil {
-		return unavailable()
+	if err != nil {
+		return unavailable(err)
 	}
 	if active > 0 {
 		return contract.NewFault(contract.Conflict, "another operation is still active for this target",
 			"Wait for it to finish or cancel it explicitly, then delete again.")
 	}
-	ownerStatement := `SELECT count(*) FROM eregion_platform_deployment_owners o
-        JOIN eregion_platform_environments e ON e.id=o.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE a.name=$1`
-	ownerArgs := []any{app}
-	if environment != "" {
-		ownerStatement += " AND e.name=$2"
-		ownerArgs = append(ownerArgs, environment)
-	}
-	var owners int
-	if err := tx.QueryRow(ctx, ownerStatement, ownerArgs...).Scan(&owners); err != nil {
-		return unavailable()
+	owners, err := tx.Platform().Owners().CountForAppEnvironment(ctx, app, environment)
+	if err != nil {
+		return unavailable(err)
 	}
 	if owners > 0 {
 		return contract.NewFault(contract.Conflict, "deployment ownership is still settling",
@@ -337,7 +276,7 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 		return w.settle(ctx, id, attempt, err)
 	}
 	defer hostRelease()
-	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		lockedApp, err := appByNameForUpdateTx(ctx, tx, env.App)
 		if err != nil {
 			return err
@@ -349,7 +288,8 @@ func (w *platformWorker) deleteEnvironment(ctx context.Context, id contract.Oper
 			return err
 		}
 		var appDeleted bool
-		if err := tx.QueryRow(ctx, `SELECT NOT EXISTS(SELECT 1 FROM eregion_platform_apps WHERE id=$1)`, lockedApp.ID).Scan(&appDeleted); err != nil {
+		appDeleted, err = tx.Platform().Apps().MissingByID(ctx, lockedApp.ID)
+		if err != nil {
 			return err
 		}
 		if data, err := deletionActionData(lockedApp, []platform.Environment{env}, appDeleted); err == nil {
@@ -433,7 +373,7 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 		return w.settle(ctx, id, attempt, err)
 	}
 	defer hostRelease()
-	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	if err := w.service.finishDomainOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		lockedApp, err := appByNameForUpdateTx(ctx, tx, app.Name)
 		if err != nil {
 			return err
@@ -462,105 +402,96 @@ func (w *platformWorker) deleteApplication(ctx context.Context, id contract.Oper
 	return nil
 }
 
-func deleteEnvironmentRowsTx(ctx context.Context, tx pgx.Tx, env platform.Environment) error {
+func deleteEnvironmentRowsTx(ctx context.Context, tx *entities.StoreTx, env platform.Environment) error {
 	appID, err := lockPointerEnvironmentTx(ctx, tx, env.ID)
 	if err != nil {
 		return err
 	}
-	var name string
-	if err := tx.QueryRow(ctx, `SELECT name FROM eregion_platform_apps WHERE id=$1`, appID).Scan(&name); err != nil || name != env.App {
+	name, found, err := tx.Platform().Apps().NameByID(ctx, platform.AppID(appID))
+	if err != nil || !found || name != env.App {
 		return pointerIntegrityFault()
 	}
 	// Never cascade through a corrupt cross-environment reference. All supported
 	// pointer writers validate ownership while holding the target environment.
-	var foreign bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM eregion_platform_environments e WHERE e.id<>$1 AND (
-			e.current_revision_id IN (SELECT id FROM eregion_platform_environment_revisions WHERE environment_id=$1)
-			OR e.desired_release_id IN (SELECT id FROM eregion_platform_releases WHERE environment_id=$1)
-			OR e.applied_release_id IN (SELECT id FROM eregion_platform_releases WHERE environment_id=$1)
-			OR e.serving_release_id IN (SELECT id FROM eregion_platform_releases WHERE environment_id=$1)
-			OR e.serving_deployment_id IN (SELECT id FROM eregion_platform_deployments WHERE environment_id=$1))
-		UNION ALL
-		SELECT 1 FROM eregion_platform_releases r WHERE r.environment_id<>$1 AND
-			r.build_id IN (SELECT id FROM eregion_platform_builds WHERE environment_id=$1)
-	)`, env.ID).Scan(&foreign); err != nil {
+	foreign, err := tx.Platform().Environments().HasForeignReferences(ctx, env.ID)
+	if err != nil {
 		return unavailable(err)
 	}
 	if foreign {
 		return pointerIntegrityFault()
 	}
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_environments
-        SET desired_release_id=NULL,applied_release_id=NULL,serving_release_id=NULL,
-            serving_deployment_id=NULL,current_revision_id=NULL,updated_at=clock_timestamp()
-        WHERE id=$1`, env.ID); err != nil {
-		return unavailable()
+	if _, err := tx.Platform().Environments().ClearPointers(ctx, env.ID); err != nil {
+		return unavailable(err)
 	}
-	for _, statement := range []string{
-		`DELETE FROM eregion_platform_deployments WHERE environment_id=$1`,
-		`DELETE FROM eregion_platform_releases WHERE environment_id=$1`,
-		`DELETE FROM eregion_platform_builds WHERE environment_id=$1`,
-		`DELETE FROM eregion_platform_environment_revisions WHERE environment_id=$1`,
-		`DELETE FROM eregion_platform_domains WHERE environment_id=$1`,
-		`DELETE FROM eregion_platform_changes WHERE environment_id=$1`,
-	} {
-		if _, err := tx.Exec(ctx, statement, env.ID); err != nil {
-			return unavailable()
-		}
+	if _, err := tx.Platform().Deployments().DeleteForEnvironment(ctx, env.ID); err != nil {
+		return unavailable(err)
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_secrets WHERE app=$1 AND environment=$2`, env.App, env.Name); err != nil {
-		return unavailable()
+	if _, err := tx.Platform().Releases().DeleteForEnvironment(ctx, env.ID); err != nil {
+		return unavailable(err)
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_environments WHERE id=$1`, env.ID); err != nil {
-		return unavailable()
+	if _, err := tx.Platform().Builds().DeleteForEnvironment(ctx, env.ID); err != nil {
+		return unavailable(err)
+	}
+	if _, err := tx.Platform().Revisions().DeleteForEnvironment(ctx, env.ID); err != nil {
+		return unavailable(err)
+	}
+	if _, err := tx.Platform().Domains().DeleteForEnvironment(ctx, env.ID); err != nil {
+		return unavailable(err)
+	}
+	if _, err := tx.Platform().Changes().DeleteForEnvironment(ctx, env.ID); err != nil {
+		return unavailable(err)
+	}
+	if _, err := tx.Secrets().DeleteForEnvironment(ctx, env.App, env.Name); err != nil {
+		return unavailable(err)
+	}
+	if _, err := tx.Platform().Environments().Delete(ctx, env.ID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
-func deleteEmptyApplicationTx(ctx context.Context, tx pgx.Tx, app string) error {
-	var remaining int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1`, app).Scan(&remaining); err != nil {
-		return unavailable()
+func deleteEmptyApplicationTx(ctx context.Context, tx *entities.StoreTx, app string) error {
+	appID, found, err := tx.Platform().Apps().IDByName(ctx, app)
+	if err != nil {
+		return unavailable(err)
+	}
+	if !found {
+		return nil
+	}
+	remaining, err := tx.Platform().Environments().CountForApp(ctx, appID)
+	if err != nil {
+		return unavailable(err)
 	}
 	if remaining != 0 {
 		return nil
 	}
-	var appID platform.AppID
-	err := tx.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&appID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return unavailable()
-	}
 	return deleteApplicationRowsTx(ctx, tx, platform.App{ID: appID, Name: app})
 }
 
-func deleteApplicationRowsTx(ctx context.Context, tx pgx.Tx, app platform.App) error {
+func deleteApplicationRowsTx(ctx context.Context, tx *entities.StoreTx, app platform.App) error {
 	if app.ID == "" {
 		return contract.NewFault(contract.Internal, "application identity is missing for deletion", "Reload the application and retry; deletion is bound to the durable app ID, not its name alone.")
 	}
 	// Do not let the app cascade bypass per-environment pointer validation.
-	var remaining bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM eregion_platform_environments WHERE app_id=$1)`, app.ID).Scan(&remaining); err != nil {
+	remaining, err := tx.Platform().Environments().CountForApp(ctx, app.ID)
+	if err != nil {
 		return unavailable(err)
 	}
-	if remaining {
+	if remaining != 0 {
 		return contract.NewFault(contract.Conflict, "application still has environments", "Reload the application and retry deletion.")
 	}
 	// Secret namespaces are not foreign keys to platform apps.
-	tag, err := tx.Exec(ctx, `DELETE FROM eregion_platform_apps WHERE id=$1`, app.ID)
+	deleted, err := tx.Platform().Apps().Delete(ctx, app.ID)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
-	if tag.RowsAffected() == 0 {
+	if deleted == 0 {
 		// The identity-bound row is already gone; never erase another app's
 		// same-named secret namespace.
 		return nil
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_secrets WHERE app=$1`, app.Name); err != nil {
-		return unavailable()
+	if _, err := tx.Secrets().DeleteForApp(ctx, app.Name); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -572,16 +503,14 @@ func (s *Service) deleteDomainRows(ctx context.Context, environmentIDs []platfor
 	if len(environmentIDs) == 0 {
 		return nil
 	}
-	tx, err := s.pool.Begin(ctx)
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		return deleteDomainRowsTx(ctx, tx, environmentIDs)
+	})
 	if err != nil {
-		return unavailable()
-	}
-	defer rollback(tx)
-	if err := deleteDomainRowsTx(ctx, tx, environmentIDs); err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return unavailable(err)
+		}
 		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return unavailable()
 	}
 	return nil
 }
@@ -592,7 +521,7 @@ func (s *Service) deleteDomainRowsOwned(ctx context.Context, id contract.Operati
 	if len(environmentIDs) == 0 {
 		return nil
 	}
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State == contract.Cancelling {
 			return errPlatformCancelled
 		}
@@ -607,19 +536,16 @@ func (s *Service) deleteDomainRowsOwned(ctx context.Context, id contract.Operati
 	return nil
 }
 
-func deleteDomainRowsTx(ctx context.Context, tx pgx.Tx, environmentIDs []platform.EnvironmentID) error {
+func deleteDomainRowsTx(ctx context.Context, tx *entities.StoreTx, environmentIDs []platform.EnvironmentID) error {
 	ids := make([]string, len(environmentIDs))
 	for index, id := range environmentIDs {
 		ids[index] = string(id)
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domain_dns x
-        USING eregion_platform_domains d
-        WHERE x.domain_id=d.id AND d.environment_id = ANY($1)
-          AND x.state IN ('cleanup_pending','cleanup_verified','cleanup_failed')`, ids); err != nil {
-		return unavailable()
+	if _, err := tx.Platform().DomainDNS().DeleteCleanupForEnvironments(ctx, ids); err != nil {
+		return unavailable(err)
 	}
-	if _, err := tx.Exec(ctx, `DELETE FROM eregion_platform_domains WHERE environment_id = ANY($1)`, ids); err != nil {
-		return unavailable()
+	if _, err := tx.Platform().Domains().DeleteForEnvironments(ctx, ids); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -637,9 +563,14 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 		if err := s.ensureApplication(ctx, app); err != nil {
 			return preview, err
 		}
-		if err := s.pool.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&appID); err != nil {
-			return preview, unavailable()
+		id, found, err := s.entities.Platform().Apps().IDByName(ctx, app)
+		if err != nil {
+			return preview, unavailable(err)
 		}
+		if !found {
+			return preview, contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
+		}
+		appID = string(id)
 	case *platform.EnvironmentDeleteInput:
 		app, environment = value.App, value.Environment
 		env, err := s.environment(ctx, app, environment)
@@ -668,7 +599,7 @@ func (s *Service) deletionPreview(ctx context.Context, normalized platform.Norma
 		"Application and environment deletion never removes resource data volumes, including volumes retained after resource destruction.",
 	)
 	preview.Warnings = append(preview.Warnings, deletionWarnings(counts, environment)...)
-	blockers, err := liveDeletionResources(ctx, s.pool, appID, envID)
+	blockers, err := liveDeletionResources(ctx, s.entities.Resources(), platform.AppID(appID), platform.EnvironmentID(envID))
 	if err != nil {
 		return preview, err
 	}
@@ -727,58 +658,48 @@ type deletionCounts struct {
 
 func (s *Service) deletionCounts(ctx context.Context, app, environment string) (deletionCounts, error) {
 	var counts deletionCounts
-	statement := `SELECT
-        (SELECT count(*) FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
-        (SELECT count(*) FROM eregion_platform_releases r JOIN eregion_platform_apps a ON a.id=r.app_id JOIN eregion_platform_environments e ON e.id=r.environment_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
-        (SELECT count(*) FROM eregion_platform_deployments d JOIN eregion_platform_apps a ON a.id=d.app_id JOIN eregion_platform_environments e ON e.id=d.environment_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
-        (SELECT count(*) FROM eregion_platform_builds b JOIN eregion_platform_apps a ON a.id=b.app_id JOIN eregion_platform_environments e ON e.id=b.environment_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
-        (SELECT count(*) FROM eregion_platform_domains d JOIN eregion_platform_environments e ON e.id=d.environment_id JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1 AND ($2='' OR e.name=$2)),
-        (SELECT count(*) FROM eregion_secrets s WHERE s.app=$1 AND ($2='' OR s.environment=$2)),
-        (SELECT count(*) FROM eregion_platform_environments e JOIN eregion_platform_apps a ON a.id=e.app_id WHERE a.name=$1)`
-	if err := s.pool.QueryRow(ctx, statement, app, environment).Scan(
-		&counts.environments, &counts.releases, &counts.deployments, &counts.builds, &counts.domains, &counts.secrets, &counts.appEnvironments,
-	); err != nil {
-		return counts, unavailable()
+	record, err := s.entities.Platform().Outcomes().DeletionCounts(ctx, app, environment)
+	if err != nil {
+		return counts, unavailable(err)
 	}
+	counts.environments = int(record.Environments)
+	counts.releases = int(record.Releases)
+	counts.deployments = int(record.Deployments)
+	counts.builds = int(record.Builds)
+	counts.domains = int(record.Domains)
+	counts.secrets = int(record.Secrets)
+	counts.appEnvironments = int(record.AppEnvironments)
 	return counts, nil
 }
 
 func (s *Service) ensureApplication(ctx context.Context, app string) error {
-	var id string
-	err := s.pool.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name=$1`, app).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
-	}
+	exists, err := s.entities.Platform().Apps().Exists(ctx, app)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
+	}
+	if !exists {
+		return contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
 	}
 	return nil
 }
 
 func (s *Service) applicationEnvironments(ctx context.Context, app string) (platform.App, []platform.Environment, error) {
-	var record platform.App
-	if err := s.pool.QueryRow(ctx, `SELECT id,name,image_repository,created_at,updated_at FROM eregion_platform_apps WHERE name=$1`, app).
-		Scan(&record.ID, &record.Name, &record.ImageRepository, &record.CreatedAt, &record.UpdatedAt); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return record, nil, contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
-		}
-		return record, nil, unavailable()
-	}
-	rows, err := s.pool.Query(ctx, environmentSelect+" WHERE a.name=$1 ORDER BY e.name", app)
+	record, found, err := s.entities.Platform().Apps().GetByName(ctx, app)
 	if err != nil {
-		return record, nil, unavailable()
+		return record, nil, unavailable(err)
 	}
-	defer rows.Close()
-	environments := []platform.Environment{}
-	for rows.Next() {
-		env, err := scanEnvironmentRow(rows)
-		if err != nil {
-			return record, nil, unavailable()
-		}
-		environments = append(environments, env)
+	if !found {
+		return record, nil, contract.NewFault(contract.NotFound, "application not found", "List applications with eregion app list.")
 	}
-	if err := rows.Err(); err != nil {
-		return record, nil, unavailable()
+	observations, err := s.entities.Platform().Environments().List(ctx, entities.EnvironmentFilter{
+		App: app, Limit: int(^uint(0) >> 1),
+	})
+	if err != nil {
+		return record, nil, unavailable(err)
+	}
+	environments := make([]platform.Environment, 0, len(observations))
+	for _, observation := range observations {
+		environments = append(environments, observation.Environment)
 	}
 	return record, environments, nil
 }

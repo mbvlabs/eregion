@@ -2,9 +2,9 @@ package controlplane
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 )
 
@@ -29,58 +29,17 @@ func (s *Service) ListOperations(ctx context.Context, authority operations.Autho
 		query.Limit = 50
 	}
 	page.Limit = query.Limit
-	statement := "SELECT " + columns + " FROM eregion_operations o WHERE 1=1"
-	args := []any{}
-	if query.App == "" {
-		if !all {
-			statement += " AND o.actor_kind=$1 AND o.actor_subject=$2"
-			args = append(args, actor.Kind, actor.Subject)
-		}
-	} else if query.Environment != "" {
-		args = append(args, "env/"+query.App+"/"+query.Environment)
-		targetFilter := fmt.Sprintf("o.target=$%d", len(args))
-		args = append(args, query.App, query.Environment)
-		buildFilter := fmt.Sprintf(`o.target IN (
-            SELECT 'build/'||b.id FROM eregion_platform_builds b
-            JOIN eregion_platform_apps a ON a.id=b.app_id
-            JOIN eregion_platform_environments e ON e.id=b.environment_id
-            WHERE a.name=$%d AND e.name=$%d)`, len(args)-1, len(args))
-		statement += " AND (" + targetFilter + " OR " + buildFilter + ")"
-	} else {
-		args = append(args, "app/"+query.App, "env/"+query.App+"/%")
-		targetFilter := fmt.Sprintf("(o.target=$%d OR o.target LIKE $%d)", len(args)-1, len(args))
-		args = append(args, query.App)
-		buildFilter := fmt.Sprintf(`o.target IN (
-            SELECT 'build/'||b.id FROM eregion_platform_builds b
-            JOIN eregion_platform_apps a ON a.id=b.app_id
-            WHERE a.name=$%d)`, len(args))
-		statement += " AND (" + targetFilter + " OR " + buildFilter + ")"
-	}
-	if query.State != "" {
-		args = append(args, query.State)
-		statement += fmt.Sprintf(" AND o.state=$%d", len(args))
-	}
-	args = append(args, query.Limit)
-	statement += fmt.Sprintf(" ORDER BY o.created_at DESC, o.id DESC LIMIT $%d", len(args))
-	rows, err := s.pool.Query(ctx, statement, args...)
+	items, err := s.entities.Operations().List(ctx, entities.OperationFilter{
+		AllActors: all, Actor: actor, App: query.App,
+		Environment: query.Environment, State: query.State, Limit: query.Limit,
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return page, ctx.Err()
 		}
-		return page, unavailable()
+		return page, unavailable(err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		op, err := scanOperation(rows)
-		if err != nil {
-			return page, unavailable()
-		}
-		page.Items = append(page.Items, op)
-	}
-	if err := rows.Err(); err != nil {
-		return page, unavailable()
-	}
-	rows.Close()
+	page.Items = items
 	// Release the listing connection before optional history hydration. A
 	// failed result read must not hide authoritative operation status.
 	for index := range page.Items {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/jobargs"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
@@ -51,7 +52,7 @@ func TestIntegrationWorkerRescuesThisHostsOrphanedPlatformJobs(t *testing.T) {
 		}
 	}
 	setRunning(rescued, hostPrefix+"previous-start", 1)
-	setRunning(exhausted, hostPrefix+"previous-start", platformMaxAttempts)
+	setRunning(exhausted, hostPrefix+"previous-start", jobargs.PlatformMaxAttempts)
 	setRunning(foreign, workerHostPrefix("another-host")+"live", 1)
 
 	run := testRuntime(t, pool, 1)
@@ -146,7 +147,7 @@ func TestIntegrationWorkerRescueRechecksTheObservedOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	moved, discarded, err := run.Service.recoverOrphanedPlatformJob(ctx, orphanedPlatformJob{
-		ID: jobID, OperationID: op.ID, Attempt: 1, MaxAttempts: platformMaxAttempts, LastClient: "client-a",
+		ID: jobID, OperationID: op.ID, Attempt: 1, MaxAttempts: jobargs.PlatformMaxAttempts, LastClient: "client-a",
 	})
 	if err != nil {
 		t.Fatal(err)

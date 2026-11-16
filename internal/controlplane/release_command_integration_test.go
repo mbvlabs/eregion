@@ -13,7 +13,7 @@ import (
 // succeeded row is skipped, and the row goes with its release.
 func TestIntegrationReleaseCommandRuns(t *testing.T) {
 	pool, _ := testPool(t, true)
-	service := &Service{pool: pool}
+	service := &Service{entities: newTestEntities(t, pool)}
 	ctx := context.Background()
 
 	appID, err := platform.NewAppID()

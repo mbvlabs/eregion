@@ -197,7 +197,7 @@ primary = true
 }
 
 // Drive the real parent and each admitted child without starting host workers.
-func driveDefinitionDNS(t *testing.T, s *Service, parent contract.OperationID) {
+func driveDefinitionDNS(t *testing.T, pool *pgxpool.Pool, s *Service, parent contract.OperationID) {
 	t.Helper()
 	ctx := context.Background()
 	claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
@@ -212,14 +212,14 @@ func driveDefinitionDNS(t *testing.T, s *Service, parent contract.OperationID) {
 			t.Fatal(err)
 		}
 		var state contract.State
-		if err := s.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, parent).Scan(&state); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, parent).Scan(&state); err != nil {
 			t.Fatal(err)
 		}
 		if state.Terminal() {
 			return
 		}
 		var child *string
-		if err := s.pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&child); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&child); err != nil {
 			t.Fatal(err)
 		}
 		if child != nil {
@@ -235,7 +235,7 @@ func TestIntegrationDefinitionDNSNoOpConvergence(t *testing.T) {
 	pool, s, app, provider := definitionDNSFixture(t, true, 0)
 	ctx := context.Background()
 	first := planAndSubmitDefinitionDNS(t, app, "first-dns-bookkeeping")
-	driveDefinitionDNS(t, s, first)
+	driveDefinitionDNS(t, pool, s, first)
 	var generation, applied, revision int64
 	var state, last string
 	if err := pool.QueryRow(ctx, `SELECT x.generation,x.applied_generation,x.state,x.last_operation_id,d.desired_revision FROM eregion_platform_domain_dns x JOIN eregion_platform_domains d ON d.id=x.domain_id WHERE d.name=$1`, definitionTestHost).Scan(&generation, &applied, &state, &last, &revision); err != nil {
@@ -256,7 +256,7 @@ func TestIntegrationDefinitionDNSNoOpConvergence(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_definition_steps WHERE parent_operation_id=$1 AND kind=$2`, second, platform.KindDomainAdd).Scan(&children); err != nil || children != 0 {
 		t.Fatalf("repeat DNS steps=%d err=%v", children, err)
 	}
-	driveDefinitionDNS(t, s, second)
+	driveDefinitionDNS(t, pool, s, second)
 	var generationAfter, appliedAfter, revisionAfter int64
 	var lastAfter string
 	if err := pool.QueryRow(ctx, `SELECT x.generation,x.applied_generation,x.last_operation_id,d.desired_revision FROM eregion_platform_domain_dns x JOIN eregion_platform_domains d ON d.id=x.domain_id WHERE d.name=$1`, definitionTestHost).Scan(&generationAfter, &appliedAfter, &lastAfter, &revisionAfter); err != nil {

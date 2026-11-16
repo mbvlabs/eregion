@@ -3,6 +3,8 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
 
@@ -54,14 +57,15 @@ func TestIntegrationProviderCredentialValidationAtomicityAndRotation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	store := newTestEntities(t, pool)
+	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture := newProviderSetupFixture()
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	setup := NewCloudflareSetup(secrets, server.URL+"/client/v4", server.Client())
+	setup := NewCloudflareSetup(secrets, store, server.URL+"/client/v4", server.Client())
 	actor := contract.Actor{Kind: "operator", Subject: "first-operator"}
 	const zoneID = "0123456789abcdef0123456789abcdef"
 	preview, err := setup.PreviewCloudflareCredential(ctx, actor, zoneID, "example.com", []byte("cf-token-one-0123456789"))
@@ -142,7 +146,7 @@ func TestIntegrationProviderCredentialValidationAtomicityAndRotation(t *testing.
 	}
 	// A freshly constructed service resolves the new revision without a
 	// restart or a cached token.
-	fresh, err := vault.NewService(pool, ring)
+	fresh, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,14 +177,15 @@ func TestIntegrationProviderCredentialConcurrentCASActivatesExactlyOneRevision(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	store := newTestEntities(t, pool)
+	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture := newProviderSetupFixture()
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	setup := NewCloudflareSetup(secrets, server.URL+"/client/v4", server.Client())
+	setup := NewCloudflareSetup(secrets, store, server.URL+"/client/v4", server.Client())
 	const zoneID = "0123456789abcdef0123456789abcdef"
 	if _, err := setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "first-operator"}, zoneID, "example.com", 0, []byte("cf-token-one-0123456789")); err != nil {
 		t.Fatal(err)
@@ -248,14 +253,15 @@ func TestIntegrationProviderScopeIsNotAnApplicationSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	store := newTestEntities(t, pool)
+	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture := newProviderSetupFixture()
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	setup := NewCloudflareSetup(secrets, server.URL+"/client/v4", server.Client())
+	setup := NewCloudflareSetup(secrets, store, server.URL+"/client/v4", server.Client())
 	const zoneID = "0123456789abcdef0123456789abcdef"
 	if _, err := setup.ConfigureCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "ops"}, zoneID, "example.com", 0, []byte("cf-token-one-0123456789")); err != nil {
 		t.Fatal(err)
@@ -283,14 +289,15 @@ func TestIntegrationProviderReadValidatedStateIsDescribedHonestly(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	store := newTestEntities(t, pool)
+	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
 	if err != nil {
 		t.Fatal(err)
 	}
 	fixture := newProviderSetupFixture()
 	server := httptest.NewServer(fixture)
 	defer server.Close()
-	setup := NewCloudflareSetup(secrets, server.URL+"/client/v4", server.Client())
+	setup := NewCloudflareSetup(secrets, store, server.URL+"/client/v4", server.Client())
 	const zoneID = "0123456789abcdef0123456789abcdef"
 	preview, err := setup.PreviewCloudflareCredential(ctx, contract.Actor{Kind: "operator", Subject: "ops"}, zoneID, "example.com", []byte("cf-token-one-0123456789"))
 	if err != nil {
@@ -309,5 +316,265 @@ func TestIntegrationProviderReadValidatedStateIsDescribedHonestly(t *testing.T) 
 func clearProviderToken(value []byte) {
 	for i := range value {
 		value[i] = 0
+	}
+}
+
+// The provider persistence port preserves create-at-zero, locked CAS, immutable
+// revisions, zone-name immutability and duplicate zone-name uniqueness through
+// the real vault and entities transaction. Concurrent duplicate zone IDs are
+// covered separately. No provider HTTP path is involved.
+func TestIntegrationProviderCredentialEntityIdentityFaults(t *testing.T) {
+	pool, _ := testPool(t, true)
+	ctx := context.Background()
+	ring, err := vault.GenerateKeyRing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newTestEntities(t, pool)
+	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := contract.Actor{Kind: "operator", Subject: "entity-provider"}
+	set := func(zoneID, zoneName string, expected uint64) (vault.ProviderMetadata, error) {
+		t.Helper()
+		var metadata vault.ProviderMetadata
+		err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			var err error
+			metadata, err = secrets.Store().SetProviderCredential(ctx, tx.Providers(),
+				vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: zoneID},
+				zoneName, []byte("provider-token-0123456789"), expected, actor)
+			return err
+		})
+		return metadata, err
+	}
+	const (
+		zoneA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		zoneB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		zoneC = "cccccccccccccccccccccccccccccccc"
+		zoneD = "dddddddddddddddddddddddddddddddd"
+	)
+	first, err := set(zoneA, "example.com", 0)
+	if err != nil || first.LatestRevision != 1 {
+		t.Fatalf("create zone A = %+v, %v", first, err)
+	}
+	if _, err := set(zoneA, "changed.example.com", 1); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("zone name change = %v", err)
+	}
+	if _, err := set(zoneC, "example.com", 0); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("duplicate zone name = %v", err)
+	}
+	if _, err := set(zoneD, "d.example.com", 5); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("create with nonzero revision = %v", err)
+	}
+	second, err := set(zoneB, "other.example.com", 0)
+	if err != nil || second.LatestRevision != 1 {
+		t.Fatalf("create zone B = %+v, %v", second, err)
+	}
+	rotated, err := set(zoneA, "example.com", 1)
+	if err != nil || rotated.LatestRevision != 2 || rotated.Revision.Revision != 2 {
+		t.Fatalf("rotate zone A = %+v, %v", rotated, err)
+	}
+	if _, err := set(zoneA, "example.com", 1); contract.Classify(err).Code != contract.Conflict {
+		t.Fatalf("stale rotate = %v", err)
+	}
+	listed, err := secrets.ListProviderCredentials(ctx, vault.ProviderCloudflare, 10)
+	if err != nil || len(listed) != 2 {
+		t.Fatalf("list provider credentials = %+v, %v", listed, err)
+	}
+	if listed[0].ZoneName != "example.com" || listed[0].LatestRevision != 2 ||
+		listed[1].ZoneName != "other.example.com" || listed[1].LatestRevision != 1 {
+		t.Fatalf("listed provider credentials = %+v", listed)
+	}
+	var revisions, audits int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions WHERE provider='cloudflare'`).Scan(&revisions); err != nil || revisions != 3 {
+		t.Fatalf("provider revisions = %d, %v", revisions, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_integration_audit`).Scan(&audits); err != nil || audits != 0 {
+		t.Fatalf("provider-only port wrote %d audit rows, %v", audits, err)
+	}
+}
+
+// setTestProviderCredential uses the real vault and entities transaction with a
+// locally sealed opaque value. No provider HTTP endpoint is involved.
+func setTestProviderCredential(t *testing.T, ctx context.Context, store *entities.Store, secrets *vault.Service, actor contract.Actor, zoneID, zoneName string, expected uint64) (vault.ProviderMetadata, error) {
+	t.Helper()
+	var metadata vault.ProviderMetadata
+	err := store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		var err error
+		metadata, err = secrets.Store().SetProviderCredential(ctx, tx.Providers(),
+			vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: zoneID},
+			zoneName, []byte("opaque-provider-value-0123456789"), expected, actor)
+		return err
+	})
+	return metadata, err
+}
+
+// The provider revision guards are exercised against real PostgreSQL rows:
+// positive bigint exhaustion, explicit uint64-to-bigint rejection, and a
+// persisted negative revision that must fail closed as corrupt state.
+func TestIntegrationProviderRevisionBoundsAndCorruptState(t *testing.T) {
+	pool, _ := testPool(t, true)
+	ctx := context.Background()
+	ring, err := vault.GenerateKeyRing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newTestEntities(t, pool)
+	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := contract.Actor{Kind: "operator", Subject: "provider-bounds"}
+	const zoneA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const zoneB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	scopeA := vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: zoneA}
+
+	if _, err := setTestProviderCredential(t, ctx, store, secrets, actor, zoneA, "bounds.example.com", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE eregion_provider_credentials
+		SET latest_revision=$2 WHERE provider='cloudflare' AND zone_id=$1`, zoneA, int64(math.MaxInt64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setTestProviderCredential(t, ctx, store, secrets, actor, zoneA, "bounds.example.com", math.MaxInt64); contract.Classify(err).Code != contract.Conflict ||
+		!strings.Contains(contract.Classify(err).Message, "revision space is exhausted") {
+		t.Fatalf("MaxInt64 guard = %v", err)
+	}
+	var latest int64
+	if err := pool.QueryRow(ctx, `SELECT latest_revision FROM eregion_provider_credentials
+		WHERE provider='cloudflare' AND zone_id=$1`, zoneA).Scan(&latest); err != nil || latest != int64(math.MaxInt64) {
+		t.Fatalf("MaxInt64 guard changed latest_revision = %d, %v", latest, err)
+	}
+	var revisions int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions
+		WHERE provider='cloudflare' AND zone_id=$1`, zoneA).Scan(&revisions); err != nil || revisions != 1 {
+		t.Fatalf("MaxInt64 guard wrote revisions = %d, %v", revisions, err)
+	}
+
+	err = store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := tx.Providers().UpdateProviderCredentialRevision(ctx, scopeA, math.MaxUint64, math.MaxUint64, actor)
+		return err
+	})
+	if contract.Classify(err).Code != contract.Conflict || !strings.Contains(contract.Classify(err).Message, "database range") {
+		t.Fatalf("uint64 bigint guard = %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT latest_revision FROM eregion_provider_credentials
+		WHERE provider='cloudflare' AND zone_id=$1`, zoneA).Scan(&latest); err != nil || latest != int64(math.MaxInt64) {
+		t.Fatalf("uint64 bigint guard changed latest_revision = %d, %v", latest, err)
+	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credentials
+		(provider,zone_id,zone_name,latest_revision,created_by_kind,created_by_subject,updated_by_kind,updated_by_subject,created_at,updated_at)
+		VALUES('cloudflare',$1,'negative.example.com',-1,'operator','test','operator','test',clock_timestamp(),clock_timestamp())`, zoneB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO eregion_provider_credential_revisions
+		(provider,zone_id,revision,key_id,ciphertext,ciphertext_sha256,revision_hash,created_by_kind,created_by_subject,created_at)
+		VALUES('cloudflare',$1,-1,'test',''::bytea,'x','x','operator','test',clock_timestamp())`, zoneB); err != nil {
+		t.Fatal(err)
+	}
+	scopeB := vault.ProviderScope{Provider: vault.ProviderCloudflare, ZoneID: zoneB}
+	for name, call := range map[string]func() error{
+		"get": func() error {
+			_, err := secrets.GetProviderCredential(ctx, scopeB)
+			return err
+		},
+		"list": func() error {
+			_, err := secrets.ListProviderCredentials(ctx, vault.ProviderCloudflare, 10)
+			return err
+		},
+		"resolve": func() error {
+			_, _, err := secrets.ResolveProviderCredential(ctx, scopeB)
+			return err
+		},
+		"set": func() error {
+			_, err := setTestProviderCredential(t, ctx, store, secrets, actor, zoneB, "negative.example.com", 0)
+			return err
+		},
+	} {
+		fault := contract.Classify(call())
+		if fault.Code != contract.Unavailable || !strings.Contains(fault.Message, "outside the supported range") {
+			t.Fatalf("%s negative revision = %v", name, fault)
+		}
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions
+		WHERE provider='cloudflare' AND zone_id=$1`, zoneB).Scan(&revisions); err != nil || revisions != 1 {
+		t.Fatalf("negative revision wrote revisions = %d, %v", revisions, err)
+	}
+}
+
+// Concurrent creates for one zone ID with distinct names must preserve conflict
+// classification. Depending on timing the loser sees either the unique-violation
+// conflict or the locked zone-name immutability conflict; no loser may become a
+// revision conflict or an unclassified error.
+func TestIntegrationProviderConcurrentDuplicateZoneIDConflict(t *testing.T) {
+	pool, _ := testPool(t, true)
+	ctx := context.Background()
+	ring, err := vault.GenerateKeyRing()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newTestEntities(t, pool)
+	secrets, err := vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor := contract.Actor{Kind: "operator", Subject: "provider-concurrent"}
+	const zoneID = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	const attempts = 8
+	type result struct {
+		metadata vault.ProviderMetadata
+		name     string
+		err      error
+	}
+	start := make(chan struct{})
+	results := make(chan result, attempts)
+	for index := range attempts {
+		name := fmt.Sprintf("duplicate-%d.example.com", index)
+		go func(name string) {
+			<-start
+			metadata, err := setTestProviderCredential(t, ctx, store, secrets, actor, zoneID, name, 0)
+			results <- result{metadata: metadata, name: name, err: err}
+		}(name)
+	}
+	close(start)
+	successes, conflicts := 0, 0
+	var winner string
+	for range attempts {
+		out := <-results
+		if out.err == nil {
+			successes++
+			if out.metadata.LatestRevision != 1 || out.metadata.ZoneName != out.name {
+				t.Fatalf("winning metadata = %+v", out.metadata)
+			}
+			winner = out.name
+			continue
+		}
+		fault := contract.Classify(out.err)
+		if fault.Code != contract.Conflict {
+			t.Fatalf("losing writer = %v", out.err)
+		}
+		switch fault.Message {
+		case "provider zone is already configured", "provider zone name cannot change for an existing zone ID":
+			conflicts++
+		default:
+			t.Fatalf("losing writer conflict was not a zone identity conflict: %v", out.err)
+		}
+	}
+	if successes != 1 || conflicts != attempts-1 || winner == "" {
+		t.Fatalf("concurrent duplicate zone ID = %d success, %d conflict", successes, conflicts)
+	}
+	var rows, revisions int
+	var storedName string
+	var latest int64
+	if err := pool.QueryRow(ctx, `SELECT count(*),max(zone_name),max(latest_revision)
+		FROM eregion_provider_credentials WHERE provider='cloudflare' AND zone_id=$1`, zoneID).
+		Scan(&rows, &storedName, &latest); err != nil || rows != 1 || storedName != winner || latest != 1 {
+		t.Fatalf("stored credential = rows:%d name:%q latest:%d err:%v", rows, storedName, latest, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_provider_credential_revisions
+		WHERE provider='cloudflare' AND zone_id=$1`, zoneID).Scan(&revisions); err != nil || revisions != 1 {
+		t.Fatalf("stored revisions = %d, %v", revisions, err)
 	}
 }

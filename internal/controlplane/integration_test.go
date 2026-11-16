@@ -23,9 +23,11 @@ import (
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/secrets"
+	"github.com/mbvlabs/eregion/internal/vault"
 )
 
 var testActor = contract.Actor{Kind: "ci", Subject: "integration-ci"}
@@ -75,6 +77,25 @@ func testPool(t *testing.T, migrate bool) (*pgxpool.Pool, string) {
 	return pool, u.String()
 }
 
+// newTestEntities constructs the mandatory typed persistence boundary for a
+// direct Service fixture. The store borrows the fixture's pool.
+func newTestEntities(t *testing.T, pool *pgxpool.Pool) *entities.Store {
+	t.Helper()
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+// newTestVaultService constructs the real vault on the fixture's pool and typed
+// provider persistence. There is no raw-SQL or alternate credential path.
+func newTestVaultService(t *testing.T, pool *pgxpool.Pool, ring *vault.KeyRing) (*vault.Service, error) {
+	t.Helper()
+	store := newTestEntities(t, pool)
+	return vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
+}
+
 func testRuntime(t *testing.T, pool *pgxpool.Pool, workers int, stateDirs ...string) *Runtime {
 	t.Helper()
 	stateDir := os.Getenv("EREGION_NODE_STATE_DIR")
@@ -85,7 +106,7 @@ func testRuntime(t *testing.T, pool *pgxpool.Pool, workers int, stateDirs ...str
 	// host identity and state directory as the workspace binding. A runtime
 	// restarted on this pool reuses that binding instead of inventing another.
 	identity := ensureTestRegistryHost(t, pool, stateDir)
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: workers, TestOnly: true,
 		NodeStateDir: identity.StateDir, LocalNodeName: "local",
 		RegistryEndpoint: "127.0.0.1:5000", RegistryHostIdentity: &identity,
@@ -166,12 +187,8 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 	pool, _ := testPool(t, true)
 	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
-	original := run.Service.enqueue
-	run.Service.enqueue = func(ctx context.Context, tx pgx.Tx, id contract.OperationID) (int64, error) {
-		if _, err := original(ctx, tx, id); err != nil {
-			return 0, err
-		}
-		return 0, errors.New("injected failure after River insertion")
+	run.Service.beforeSubmissionCommit = func() error {
+		return errors.New("injected failure after River insertion")
 	}
 	if _, err := run.Service.Submit(ctx, submission("atomic", `{}`)); err == nil {
 		t.Fatal("injected failure succeeded")
@@ -182,19 +199,17 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 			t.Fatalf("partial commit in %s: %d %v", table, count, err)
 		}
 	}
-	run.Service.enqueue = original
+	run.Service.beforeSubmissionCommit = nil
 	// A deferred constraint fails only at COMMIT, after the accepted event was
 	// appended. The domain row, River job, and event must still roll back together.
-	if _, err := pool.Exec(ctx, `CREATE TABLE test_commit_failure (operation_id text REFERENCES eregion_operations(id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
-		t.Fatal(err)
-	}
-	run.Service.enqueue = func(ctx context.Context, tx pgx.Tx, id contract.OperationID) (int64, error) {
-		jobID, err := original(ctx, tx, id)
-		if err != nil {
-			return 0, err
+	for _, statement := range []string{
+		`CREATE TABLE test_commit_failure (operation_id text REFERENCES eregion_operations(id) DEFERRABLE INITIALLY DEFERRED)`,
+		`CREATE FUNCTION test_fail_after_job() RETURNS trigger AS $$ BEGIN INSERT INTO test_commit_failure(operation_id) VALUES ('missing-operation'); RETURN NEW; END; $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER test_fail_after_job AFTER INSERT ON river_job FOR EACH ROW EXECUTE FUNCTION test_fail_after_job()`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO test_commit_failure(operation_id) VALUES ('missing-operation')`)
-		return jobID, err
 	}
 	if _, err := run.Service.Submit(ctx, submission("commit-failure", `{}`)); err == nil {
 		t.Fatal("deferred commit failure succeeded")
@@ -205,7 +220,15 @@ func TestIntegrationAtomicSubmissionAndDeduplication(t *testing.T) {
 			t.Fatalf("partial commit in %s: %d %v", table, count, err)
 		}
 	}
-	run.Service.enqueue = original
+	for _, statement := range []string{
+		`DROP TRIGGER test_fail_after_job ON river_job`,
+		`DROP FUNCTION test_fail_after_job()`,
+		`DROP TABLE test_commit_failure`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var wait sync.WaitGroup
 	ids := make(chan contract.OperationID, 12)
 	for range 12 {
@@ -596,6 +619,30 @@ func (d *dropOnceTransport) Call(ctx context.Context, request node.Request, onEv
 	return response, nil
 }
 
+type cancellationGateTransport struct {
+	*scriptedPlatformTransport
+	step    string
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (t *cancellationGateTransport) Call(
+	ctx context.Context,
+	request node.Request,
+	onEvent func(node.Event),
+) (node.Response, error) {
+	if request.Method == node.MethodRun && request.Execution.Step == t.step {
+		t.once.Do(func() { close(t.started) })
+		select {
+		case <-t.release:
+		case <-ctx.Done():
+			return node.Response{}, ctx.Err()
+		}
+	}
+	return t.scriptedPlatformTransport.Call(ctx, request, onEvent)
+}
+
 type staleAttemptTransport struct {
 	inner node.Transport
 	pool  *pgxpool.Pool
@@ -639,8 +686,7 @@ func (s *staleAttemptTransport) bumpError() error {
 
 func TestIntegrationStaleAttemptDoesNotDispatchNodeWork(t *testing.T) {
 	pool, _ := testPool(t, true)
-	nodeDir := t.TempDir()
-	run := testRuntime(t, pool, 0, nodeDir)
+	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
 	op, err := run.Service.Submit(ctx, submission("stale-attempt", `{"steps":1}`))
 	if err != nil {
@@ -649,11 +695,7 @@ func TestIntegrationStaleAttemptDoesNotDispatchNodeWork(t *testing.T) {
 	if _, _, claimed, err := run.Service.claimAttempt(ctx, op.ID, 1, "diagnostic"); err != nil || !claimed {
 		t.Fatalf("claim attempt: %v %v", claimed, err)
 	}
-	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	transport := &staleAttemptTransport{inner: local, pool: pool, id: op.ID}
+	transport := &staleAttemptTransport{inner: &scriptedPlatformTransport{}, pool: pool, id: op.ID}
 	run.Service.transport = transport
 	var before uint64
 	if err := pool.QueryRow(ctx, "SELECT last_sequence FROM eregion_operations WHERE id=$1", op.ID).Scan(&before); err != nil {
@@ -700,13 +742,9 @@ func TestIntegrationStaleAttemptDoesNotDispatchNodeWork(t *testing.T) {
 
 func TestIntegrationLostTransportResponseRecovers(t *testing.T) {
 	pool, _ := testPool(t, true)
-	nodeDir := t.TempDir()
-	run := testRuntime(t, pool, 2, nodeDir)
-	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	run.Service.transport = &dropOnceTransport{inner: local, step: node.DiagnosticStepID(1)}
+	run := testRuntime(t, pool, 2)
+	scripted := &scriptedPlatformTransport{}
+	run.Service.transport = &dropOnceTransport{inner: scripted, step: node.DiagnosticStepID(1)}
 	ctx := context.Background()
 	op, err := run.Service.Submit(ctx, submission("lost-response", `{"steps":2,"step_delay_ms":0}`))
 	if err != nil {
@@ -717,8 +755,8 @@ func TestIntegrationLostTransportResponseRecovers(t *testing.T) {
 		current, err := run.Service.Get(ctx, testActor, op.ID)
 		return err == nil && current.State == contract.Succeeded
 	})
-	if got := effectCount(t, nodeDir, op.ID, 2); got != 2 {
-		t.Fatalf("effect count after lost response: %d", got)
+	if got := scripted.totalRuns(); got != 2 {
+		t.Fatalf("node runs after lost response: %d", got)
 	}
 	if got := progressEventCount(t, run.Service, op.ID); got != 2 {
 		t.Fatalf("progress events: %d", got)
@@ -801,27 +839,15 @@ func TestIntegrationCancellationBeforeStartWritesNoEffect(t *testing.T) {
 
 func TestIntegrationCancellationHonoursStepBoundary(t *testing.T) {
 	pool, _ := testPool(t, true)
-	nodeDir := t.TempDir()
-	run := testRuntime(t, pool, 2, nodeDir)
-	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
-	if err != nil {
-		t.Fatal(err)
+	run := testRuntime(t, pool, 2)
+	scripted := &scriptedPlatformTransport{}
+	gate := &cancellationGateTransport{
+		scriptedPlatformTransport: scripted,
+		step:                      node.DiagnosticStepID(2),
+		started:                   make(chan struct{}),
+		release:                   make(chan struct{}),
 	}
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	local.SetHooks(node.Hooks{BeforeRun: func(ctx context.Context, exec engine.Execution) error {
-		if exec.Step != node.DiagnosticStepID(2) {
-			return nil
-		}
-		started <- struct{}{}
-		select {
-		case <-release:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}})
-	run.Service.transport = local
+	run.Service.transport = gate
 	ctx := context.Background()
 	op, err := run.Service.Submit(ctx, submission("cancel-boundary", `{"steps":3,"step_delay_ms":0}`))
 	if err != nil {
@@ -829,20 +855,20 @@ func TestIntegrationCancellationHonoursStepBoundary(t *testing.T) {
 	}
 	startWorkers(t, run)
 	select {
-	case <-started:
+	case <-gate.started:
 	case <-time.After(10 * time.Second):
 		t.Fatal("worker never reached the second step")
 	}
 	if _, err := run.Service.RequestCancel(ctx, testActor, op.ID); err != nil {
 		t.Fatal(err)
 	}
-	close(release)
+	close(gate.release)
 	await(t, 20*time.Second, func() bool {
 		current, err := run.Service.Get(ctx, testActor, op.ID)
 		return err == nil && current.State == contract.Canceled
 	})
-	if got := effectCount(t, nodeDir, op.ID, 3); got != 2 {
-		t.Fatalf("cancellation did not stop at the step boundary: %d effects", got)
+	if got := scripted.totalRuns(); got != 2 {
+		t.Fatalf("cancellation did not stop at the step boundary: %d runs", got)
 	}
 	if got := completedStepRows(t, pool, op.ID); got != 2 {
 		t.Fatalf("completed step rows after cancellation: %d", got)

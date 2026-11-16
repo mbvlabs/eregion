@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/jobargs"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -48,7 +49,10 @@ type snapshotSecretResolver struct {
 }
 
 func newSnapshotSecretResolver() *snapshotSecretResolver {
-	return &snapshotSecretResolver{active: map[string]uint64{}, values: map[string]map[uint64]string{}}
+	return &snapshotSecretResolver{
+		active: map[string]uint64{},
+		values: map[string]map[uint64]string{},
+	}
 }
 
 // set publishes a secret revision and makes it the active revision.
@@ -62,14 +66,27 @@ func (r *snapshotSecretResolver) set(name string, revision uint64, value string)
 	r.active[name] = revision
 }
 
-func (*snapshotSecretResolver) Resolve(context.Context, map[string]string) (map[string]string, error) {
+func (*snapshotSecretResolver) Resolve(
+	context.Context,
+	map[string]string,
+) (map[string]string, error) {
 	return nil, errors.New("namespace-free secret resolution is refused")
 }
 
-func (r *snapshotSecretResolver) ResolveEnvironmentSnapshot(_ context.Context, app, environment string, names []string, refs map[string]string) (map[string]string, map[string]vault.RevisionRef, error) {
+func (r *snapshotSecretResolver) ResolveEnvironmentSnapshot(
+	_ context.Context,
+	app, environment string,
+	names []string,
+	refs map[string]string,
+) (map[string]string, map[string]vault.RevisionRef, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	call := secretSnapshotCall{app: app, environment: environment, names: append([]string(nil), names...), refs: map[string]string{}}
+	call := secretSnapshotCall{
+		app:         app,
+		environment: environment,
+		names:       append([]string(nil), names...),
+		refs:        map[string]string{},
+	}
 	for key, ref := range refs {
 		call.refs[key] = ref
 	}
@@ -84,7 +101,10 @@ func (r *snapshotSecretResolver) ResolveEnvironmentSnapshot(_ context.Context, a
 		}
 		values[key] = value
 		revisions[key] = vault.RevisionRef{
-			Revision: revision, Hash: strings.Repeat("a", 64), KeyID: "test-key", CreatedAt: time.Unix(1, 0).UTC(),
+			Revision:  revision,
+			Hash:      strings.Repeat("a", 64),
+			KeyID:     "test-key",
+			CreatedAt: time.Unix(1, 0).UTC(),
 		}
 		return nil
 	}
@@ -103,7 +123,12 @@ func (r *snapshotSecretResolver) ResolveEnvironmentSnapshot(_ context.Context, a
 			return nil, nil, err
 		}
 		if ref.Namespace.App != app || ref.Namespace.Environment != environment {
-			return nil, nil, fmt.Errorf("secret reference %q is outside %s/%s", text, app, environment)
+			return nil, nil, fmt.Errorf(
+				"secret reference %q is outside %s/%s",
+				text,
+				app,
+				environment,
+			)
 		}
 		if err := add(key, ref.Namespace.Name, ref.Revision); err != nil {
 			return nil, nil, err
@@ -127,9 +152,28 @@ type gitReadTransport struct {
 	commit      string
 	blocked     chan struct{}
 	packSecrets chan map[string]string
+
+	runtimeMu sync.Mutex
+	runtimeID string
 }
 
-func (t *gitReadTransport) Call(ctx context.Context, request node.Request, onEvent func(node.Event)) (node.Response, error) {
+func (t *gitReadTransport) Call(
+	ctx context.Context,
+	request node.Request,
+	onEvent func(node.Event),
+) (node.Response, error) {
+	if request.Execution.Step == deploymentImageStep && request.Method == node.MethodRun {
+		t.runtimeMu.Lock()
+		runtimeID := t.runtimeID
+		t.runtimeMu.Unlock()
+		if runtimeID != "" {
+			result, _ := json.Marshal(map[string]string{"stdout": runtimeID})
+			return node.Response{
+				Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
+				Executed: true, Result: result,
+			}, nil
+		}
+	}
 	if request.Execution.Step != deploymentPackStep {
 		return t.scriptedDeployTransport.Call(ctx, request, onEvent)
 	}
@@ -144,7 +188,10 @@ func (t *gitReadTransport) Call(ctx context.Context, request node.Request, onEve
 			<-ctx.Done()
 			return node.Response{}, ctx.Err()
 		}
-		return node.Response{Status: engine.StatusAbsent, ExecutionID: request.Execution.ExecutionID()}, nil
+		return node.Response{
+			Status:      engine.StatusAbsent,
+			ExecutionID: request.Execution.ExecutionID(),
+		}, nil
 	case node.MethodRun:
 		select {
 		case t.packSecrets <- request.Secrets:
@@ -157,10 +204,18 @@ func (t *gitReadTransport) Call(ctx context.Context, request node.Request, onEve
 			local = local[:colon]
 		}
 		sum := sha256.Sum256([]byte(payload.Image))
+		runtimeID := "sha256:" + hex.EncodeToString(sum[:])
+		t.runtimeMu.Lock()
+		t.runtimeID = runtimeID
+		t.runtimeMu.Unlock()
 		manifest := sha256.Sum256([]byte("manifest:" + payload.Image))
 		result, _ := json.Marshal(map[string]string{
-			"commit": t.commit, "image_id": "sha256:" + hex.EncodeToString(sum[:]),
-			"reference": payload.Registry + "/" + local + "@sha256:" + hex.EncodeToString(manifest[:]),
+			"commit":     t.commit,
+			"image_id":   runtimeID,
+			"runtime_id": runtimeID,
+			"reference": payload.Registry + "/" + local + "@sha256:" + hex.EncodeToString(
+				manifest[:],
+			),
 		})
 		return node.Response{
 			Status: engine.StatusCompleted, ExecutionID: request.Execution.ExecutionID(),
@@ -173,11 +228,16 @@ func (t *gitReadTransport) Call(ctx context.Context, request node.Request, onEve
 
 // runPlatformAttempt dispatches one platform operation the way the River
 // worker does, without needing a real River job to be claimed and retried.
-func runPlatformAttempt(ctx context.Context, s *Service, id contract.OperationID, attempt int) error {
+func runPlatformAttempt(
+	ctx context.Context,
+	s *Service,
+	id contract.OperationID,
+	attempt int,
+) error {
 	worker := &platformWorker{service: s}
-	return worker.Work(ctx, &river.Job[platformArgs]{
+	return worker.Work(ctx, &river.Job[jobargs.PlatformAction]{
 		JobRow: &rivertype.JobRow{Attempt: attempt},
-		Args:   platformArgs{OperationID: id},
+		Args:   jobargs.PlatformAction{OperationID: id},
 	})
 }
 
@@ -202,7 +262,7 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 		blocked:                 make(chan struct{}),
 		packSecrets:             make(chan map[string]string, 1),
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: transport, NodeStateDir: t.TempDir(),
 		LocalNodeName: "local", SecretResolver: resolver, RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -238,8 +298,18 @@ func newCredentialDeployFixture(t *testing.T) *credentialDeployFixture {
 		}
 	}
 	return &credentialDeployFixture{
-		pool: pool, service: s, resolver: resolver, transport: transport,
-		deploy: platformSubmit(t, s, platform.KindDeploy, "env/private/production", "credential-deploy", map[string]any{}),
+		pool:      pool,
+		service:   s,
+		resolver:  resolver,
+		transport: transport,
+		deploy: platformSubmit(
+			t,
+			s,
+			platform.KindDeploy,
+			"env/private/production",
+			"credential-deploy",
+			map[string]any{},
+		),
 	}
 }
 
@@ -275,10 +345,13 @@ func (f *credentialDeployFixture) loseFirstAttempt(t *testing.T) {
 	}
 }
 
-func (f *credentialDeployFixture) secretSnapshot(t *testing.T) (map[string]platform.SecretRevisionRef, []byte) {
+func (f *credentialDeployFixture) secretSnapshot(
+	t *testing.T,
+) (map[string]platform.SecretRevisionRef, []byte) {
 	t.Helper()
 	var raw []byte
-	if err := f.pool.QueryRow(context.Background(), `SELECT secret_revisions FROM eregion_platform_deployments WHERE operation_id=$1`, f.deploy.ID).Scan(&raw); err != nil {
+	if err := f.pool.QueryRow(context.Background(), `SELECT secret_revisions FROM eregion_platform_deployments WHERE operation_id=$1`, f.deploy.ID).
+		Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := map[string]platform.SecretRevisionRef{}
@@ -298,7 +371,11 @@ func (f *credentialDeployFixture) retry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if current.State != contract.Succeeded {
-		t.Fatalf("second attempt state = %s, want succeeded", current.State)
+		message := ""
+		if current.LatestResult != nil {
+			message = current.LatestResult.Message
+		}
+		t.Fatalf("second attempt state = %s (%s: %s), want succeeded", current.State, current.ErrorCode, message)
 	}
 }
 
@@ -327,7 +404,11 @@ func TestIntegrationDeployRetryResolvesPinnedGitReadCredential(t *testing.T) {
 	snapshot, rawSnapshot := f.secretSnapshot(t)
 	ref, ok := snapshot[gitReadSecretName]
 	if !ok || ref.Revision != gitReadRevision {
-		t.Fatalf("first attempt snapshot = %s, want the git read credential at revision %d", rawSnapshot, gitReadRevision)
+		t.Fatalf(
+			"first attempt snapshot = %s, want the git read credential at revision %d",
+			rawSnapshot,
+			gitReadRevision,
+		)
 	}
 
 	// The second attempt is the rescued or River-retried job: the snapshot
@@ -335,15 +416,25 @@ func TestIntegrationDeployRetryResolvesPinnedGitReadCredential(t *testing.T) {
 	// name lookup.
 	f.retry(t)
 	if secrets := f.buildSecrets(t); secrets[gitReadSecretName] != gitReadValue {
-		t.Fatalf("build received credential %q, want the resolved value", secrets[gitReadSecretName])
+		t.Fatalf(
+			"build received credential %q, want the resolved value",
+			secrets[gitReadSecretName],
+		)
 	}
 
 	calls := f.resolver.snapshot()
 	if len(calls) != 2 {
-		t.Fatalf("secret resolution calls = %+v, want one name resolution and one pinned resolution", calls)
+		t.Fatalf(
+			"secret resolution calls = %+v, want one name resolution and one pinned resolution",
+			calls,
+		)
 	}
-	if len(calls[0].names) != 1 || calls[0].names[0] != gitReadSecretName || len(calls[0].refs) != 0 {
-		t.Fatalf("first resolution = %+v, want the credential name at its active revision", calls[0])
+	if len(calls[0].names) != 1 || calls[0].names[0] != gitReadSecretName ||
+		len(calls[0].refs) != 0 {
+		t.Fatalf(
+			"first resolution = %+v, want the credential name at its active revision",
+			calls[0],
+		)
 	}
 	wantPin := fmt.Sprintf("vault:private/production/%s@%d", gitReadSecretName, gitReadRevision)
 	if len(calls[1].names) != 0 || calls[1].refs[gitReadSecretName] != wantPin {
@@ -353,14 +444,16 @@ func TestIntegrationDeployRetryResolvesPinnedGitReadCredential(t *testing.T) {
 	// The credential value is only ever handed to the node step: never in the
 	// operation input, its durable events, or the secret snapshot.
 	var input []byte
-	if err := f.pool.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, f.deploy.ID).Scan(&input); err != nil {
+	if err := f.pool.QueryRow(ctx, `SELECT input FROM eregion_operations WHERE id=$1`, f.deploy.ID).
+		Scan(&input); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(input), gitReadValue) {
 		t.Fatal("the git read credential leaked into operation input")
 	}
 	var events string
-	if err := f.pool.QueryRow(ctx, `SELECT coalesce(string_agg(event::text, ''),'') FROM eregion_operation_events WHERE operation_id=$1`, f.deploy.ID).Scan(&events); err != nil {
+	if err := f.pool.QueryRow(ctx, `SELECT coalesce(string_agg(event::text, ''),'') FROM eregion_operation_events WHERE operation_id=$1`, f.deploy.ID).
+		Scan(&events); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(events, gitReadValue) {
@@ -387,12 +480,22 @@ func TestIntegrationDeployRetryPinsGitReadCredentialIntoLegacySnapshot(t *testin
 	)
 	f.resolver.set(legacyName, legacyRevision, legacyValue)
 	legacyRefs, err := json.Marshal(map[string]platform.SecretRevisionRef{
-		legacyName: {Revision: legacyRevision, Hash: strings.Repeat("b", 64), KeyID: "test-key", CreatedAt: time.Unix(2, 0).UTC()},
+		legacyName: {
+			Revision:  legacyRevision,
+			Hash:      strings.Repeat("b", 64),
+			KeyID:     "test-key",
+			CreatedAt: time.Unix(2, 0).UTC(),
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pool.Exec(ctx, `UPDATE eregion_platform_deployments SET secret_revisions=$2 WHERE operation_id=$1`, f.deploy.ID, legacyRefs); err != nil {
+	if _, err := f.pool.Exec(
+		ctx,
+		`UPDATE eregion_platform_deployments SET secret_revisions=$2 WHERE operation_id=$1`,
+		f.deploy.ID,
+		legacyRefs,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -415,16 +518,33 @@ func TestIntegrationDeployRetryPinsGitReadCredentialIntoLegacySnapshot(t *testin
 
 	f.retry(t)
 	if secrets := f.buildSecrets(t); secrets[gitReadSecretName] != gitReadValue {
-		t.Fatalf("build received credential %q after rotation, want the pinned %q", secrets[gitReadSecretName], gitReadValue)
+		t.Fatalf(
+			"build received credential %q after rotation, want the pinned %q",
+			secrets[gitReadSecretName],
+			gitReadValue,
+		)
 	}
 
 	calls := f.resolver.snapshot()
 	if len(calls) != 3 {
-		t.Fatalf("secret resolution calls = %+v, want two first-attempt calls and one pinned retry", calls)
+		t.Fatalf(
+			"secret resolution calls = %+v, want two first-attempt calls and one pinned retry",
+			calls,
+		)
 	}
-	wantCredentialPin := fmt.Sprintf("vault:private/production/%s@%d", gitReadSecretName, gitReadRevision)
+	wantCredentialPin := fmt.Sprintf(
+		"vault:private/production/%s@%d",
+		gitReadSecretName,
+		gitReadRevision,
+	)
 	wantLegacyPin := fmt.Sprintf("vault:private/production/%s@%d", legacyName, legacyRevision)
-	if len(calls[2].names) != 0 || calls[2].refs[gitReadSecretName] != wantCredentialPin || calls[2].refs[legacyName] != wantLegacyPin {
-		t.Fatalf("retry resolution = %+v, want pinned %q and %q", calls[2], wantCredentialPin, wantLegacyPin)
+	if len(calls[2].names) != 0 || calls[2].refs[gitReadSecretName] != wantCredentialPin ||
+		calls[2].refs[legacyName] != wantLegacyPin {
+		t.Fatalf(
+			"retry resolution = %+v, want pinned %q and %q",
+			calls[2],
+			wantCredentialPin,
+			wantLegacyPin,
+		)
 	}
 }

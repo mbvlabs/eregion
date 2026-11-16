@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
@@ -61,7 +62,7 @@ func TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy(t *testin
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	fake := newBlockingResourceTransport("-run-")
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 		SecretResolver:   newSnapshotSecretResolver(),
@@ -155,16 +156,11 @@ func TestIntegrationResourceCancelSettlesStateAndAllowsRetryAndDestroy(t *testin
 	if err := pool.QueryRow(ctx, `SELECT id FROM eregion_platform_apps WHERE name='cancelapi'`).Scan(&appID); err != nil {
 		t.Fatal(err)
 	}
-	tx, err := pool.Begin(ctx)
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		return s.ensureNoLiveResourcesTx(ctx, tx, "cancelapi", "", appID, "")
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.ensureNoLiveResourcesTx(ctx, tx, "cancelapi", "", appID, ""); err != nil {
-		_ = tx.Rollback(ctx)
 		t.Fatalf("destroyed resource still blocks environment deletion: %v", err)
-	}
-	if err := tx.Rollback(ctx); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -176,7 +172,7 @@ func TestIntegrationResourceCancelAfterSuccessfulStepIsHonored(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	fake := newBlockingResourceTransport("-health-")
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 		SecretResolver:   newSnapshotSecretResolver(),
@@ -249,7 +245,7 @@ func TestIntegrationResourceApplyCancelBeforeFinalizationIsHonored(t *testing.T)
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	fake := newBlockingResourceTransport("-health-")
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 		SecretResolver:   newSnapshotSecretResolver(),
@@ -313,7 +309,7 @@ func TestIntegrationResourceDestroyCancelBeforeFinalizationIsHonored(t *testing.
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	fake := newBlockingResourceTransport("")
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 		SecretResolver:   newSnapshotSecretResolver(),

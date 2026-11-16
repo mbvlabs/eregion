@@ -7,14 +7,12 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/output"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -22,25 +20,19 @@ import (
 
 // appendActionResultTx runs under the operation row lock and shares the
 // transaction with settlement. A retry cannot append the same outcome twice.
-func (s *Service) appendActionResultTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, status contract.State, code contract.Code, message string, final bool) error {
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM eregion_operation_events
-		WHERE operation_id=$1 AND event->'result'->>'attempt'=$2 AND event->'result'->>'status'=$3
-		AND coalesce(event->'result'->>'final','false')=$4)`,
-		op.ID, strconv.FormatUint(uint64(op.Attempt), 10), string(status), strconv.FormatBool(final)).Scan(&exists); err != nil {
+func (s *Service) appendActionResultTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, status contract.State, code contract.Code, message string, final bool) error {
+	exists, err := tx.Operations().ResultExists(ctx, op.ID, op.Attempt, status, final)
+	if err != nil {
 		return err
 	}
 	if exists {
 		return nil
 	}
 	started := op.CreatedAt
-	var attemptStarted *time.Time
-	if err := tx.QueryRow(ctx, `SELECT min((event->>'at')::timestamptz) FROM eregion_operation_events
-		WHERE operation_id=$1 AND event->>'attempt'=$2`, op.ID, strconv.FormatUint(uint64(op.Attempt), 10)).Scan(&attemptStarted); err != nil {
+	if attemptStarted, found, err := tx.Operations().AttemptStartedAt(ctx, op.ID, op.Attempt); err != nil {
 		return err
-	}
-	if attemptStarted != nil {
-		started = *attemptStarted
+	} else if found {
+		started = attemptStarted
 	}
 	now := time.Now().UTC()
 	if started.After(now) {
@@ -70,55 +62,38 @@ func (s *Service) appendActionResultTx(ctx context.Context, tx pgx.Tx, op *contr
 	return nil
 }
 
-func enrichActionResultTx(ctx context.Context, tx pgx.Tx, result *contract.ActionResult) error {
+func enrichActionResultTx(ctx context.Context, tx *entities.StoreTx, result *contract.ActionResult) error {
 	id := result.OperationID
-	var attemptStarted *time.Time
-	if err := tx.QueryRow(ctx, `SELECT min((event->>'at')::timestamptz) FROM eregion_operation_events
-		WHERE operation_id=$1 AND event->>'attempt'=$2`, id, strconv.FormatUint(uint64(result.Attempt), 10)).Scan(&attemptStarted); err != nil {
+	if attemptStarted, found, err := tx.Operations().AttemptStartedAt(ctx, id, result.Attempt); err != nil {
 		return err
-	}
-	if attemptStarted != nil && !attemptStarted.After(result.CompletedAt) {
-		result.StartedAt = *attemptStarted
+	} else if found && !attemptStarted.After(result.CompletedAt) {
+		result.StartedAt = attemptStarted
 		result.TimingBasis = "attempt_observation"
 	}
 	if result.Status == contract.Failed {
-		if err := tx.QueryRow(ctx, `SELECT coalesce(
-			(SELECT event->>'stage' FROM eregion_operation_events WHERE operation_id=$1
-			 AND event->>'attempt'=$2 AND event->>'kind'='warning'
-			 AND event->>'message' LIKE 'Node step failed:%' AND coalesce(event->>'stage','')<>''
-			 ORDER BY sequence LIMIT 1),
-			(SELECT step FROM eregion_operation_steps WHERE operation_id=$1 AND attempt=$3 AND state='failed'
-			 ORDER BY completed_at NULLS LAST,started_at LIMIT 1),'action')`,
-			id, strconv.FormatUint(uint64(result.Attempt), 10), result.Attempt).Scan(&result.Stage); err != nil {
+		stage, err := tx.Results().FailedStage(ctx, id, result.Attempt)
+		if err != nil {
 			return err
 		}
+		result.Stage = stage
 	}
-	if err := tx.QueryRow(ctx, `SELECT
-		coalesce((SELECT id FROM eregion_platform_builds WHERE operation_id=$1),''),
-		coalesce((SELECT id FROM eregion_platform_deployments WHERE operation_id=$1),''),
-		coalesce((SELECT revision_id FROM eregion_platform_deployments WHERE operation_id=$1),
-		         (SELECT revision_id FROM eregion_platform_builds WHERE operation_id=$1),
-		         (SELECT id FROM eregion_platform_environment_revisions WHERE operation_id=$1 ORDER BY created_at LIMIT 1),''),
-		coalesce((SELECT release_id FROM eregion_platform_deployments WHERE operation_id=$1),
-		         (SELECT id FROM eregion_platform_releases WHERE operation_id=$1),''),
-		coalesce((SELECT image FROM eregion_platform_releases WHERE id=coalesce(
-		         (SELECT release_id FROM eregion_platform_deployments WHERE operation_id=$1),
-		         (SELECT id FROM eregion_platform_releases WHERE operation_id=$1))),''),
-		coalesce((SELECT image_id FROM eregion_platform_releases WHERE id=coalesce(
-		         (SELECT release_id FROM eregion_platform_deployments WHERE operation_id=$1),
-		         (SELECT id FROM eregion_platform_releases WHERE operation_id=$1))),''),
-		coalesce((SELECT commit_sha FROM eregion_platform_releases WHERE id=coalesce(
-		         (SELECT release_id FROM eregion_platform_deployments WHERE operation_id=$1),
-		         (SELECT id FROM eregion_platform_releases WHERE operation_id=$1))),
-		         (SELECT commit_sha FROM eregion_platform_builds WHERE operation_id=$1),'')`, id).
-		Scan(&result.Identities.BuildID, &result.Identities.DeploymentID, &result.Identities.RevisionID,
-			&result.Identities.ReleaseID, &result.Identities.Image, &result.Identities.ImageID,
-			&result.Identities.CommitSHA); err != nil {
+	identity, err := tx.Platform().Deployments().ResultIdentity(ctx, id)
+	if err != nil {
 		return err
 	}
-	var lastSequence uint64
-	if err := tx.QueryRow(ctx, `SELECT last_sequence FROM eregion_operations WHERE id=$1`, id).Scan(&lastSequence); err != nil {
+	result.Identities.BuildID = string(identity.BuildID)
+	result.Identities.DeploymentID = string(identity.DeploymentID)
+	result.Identities.RevisionID = string(identity.RevisionID)
+	result.Identities.ReleaseID = string(identity.ReleaseID)
+	result.Identities.Image = identity.Image
+	result.Identities.ImageID = identity.ImageID
+	result.Identities.CommitSHA = identity.CommitSHA
+	lastSequence, found, err := tx.Operations().LastSequence(ctx, id)
+	if err != nil {
 		return err
+	}
+	if !found {
+		lastSequence = 0
 	}
 	if err := candidateResultEvidence(ctx, tx, result, lastSequence); err != nil {
 		return err
@@ -133,19 +108,15 @@ func enrichActionResultTx(ctx context.Context, tx pgx.Tx, result *contract.Actio
 
 // A read failure must not veto domain settlement or cleanup. A savepoint also
 // clears PostgreSQL's aborted-transaction state after a failed enrichment query.
-func tryEnrichActionResultTx(ctx context.Context, tx pgx.Tx, result *contract.ActionResult) {
-	nested, err := tx.Begin(ctx)
-	if err != nil {
+func tryEnrichActionResultTx(ctx context.Context, tx *entities.StoreTx, result *contract.ActionResult) {
+	if tx == nil {
 		result.Evidence = "unavailable"
 		return
 	}
 	copy := *result
-	if err := enrichActionResultTx(ctx, nested, &copy); err != nil {
-		_ = nested.Rollback(ctx)
-		result.Evidence = "unavailable"
-		return
-	}
-	if err := nested.Commit(ctx); err != nil {
+	if err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		return enrichActionResultTx(ctx, nested, &copy)
+	}); err != nil {
 		result.Evidence = "unavailable"
 		return
 	}
@@ -154,46 +125,36 @@ func tryEnrichActionResultTx(ctx context.Context, tx pgx.Tx, result *contract.Ac
 
 // candidateResultEvidence only uses already-redacted retained capture events
 // for this attempt. A claim without its summary is interrupted, not complete.
-func candidateResultEvidence(ctx context.Context, tx pgx.Tx, result *contract.ActionResult, through uint64) error {
-	rows, err := tx.Query(ctx, `SELECT sequence,event->'candidate_diagnostic'->>'status',coalesce(event->>'message',''),
-		coalesce(event->'candidate_diagnostic'->>'redaction_context',''),
-		coalesce(event->>'step',''),coalesce(event->'candidate_diagnostic'->>'deployment_id','')
-		FROM eregion_operation_events
-		WHERE operation_id=$1 AND event->>'attempt'=$2 AND event ? 'candidate_diagnostic' AND sequence<=$3
-		ORDER BY sequence`, result.OperationID, strconv.FormatUint(uint64(result.Attempt), 10), through)
+func candidateResultEvidence(ctx context.Context, tx *entities.StoreTx, result *contract.ActionResult, through uint64) error {
+	rows, err := tx.Results().CandidateDiagnostics(ctx, result.OperationID, result.Attempt, through)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	type captureState struct {
 		captured bool
 		summary  string
 	}
 	captures := make(map[string]*captureState)
-	for rows.Next() {
-		var sequence uint64
-		var status, message, redactionContext, step, deployment string
-		if err := rows.Scan(&sequence, &status, &message, &redactionContext, &step, &deployment); err != nil {
-			return err
-		}
+	for _, row := range rows {
 		// Step identifies the capture claim. Older events without a step are
 		// grouped by deployment and remain generically readable.
-		key := deployment + "\x00" + step
+		key := row.DeploymentID + "\x00" + row.Step
 		capture := captures[key]
 		if capture == nil {
 			capture = &captureState{}
 			captures[key] = capture
 		}
-		if status == "captured" || status == "observed" {
+		if row.Status == "captured" || row.Status == "observed" {
 			capture.captured = true
 		}
-		if status == "captured" && result.Excerpt == "" && message != "" {
-			if redactionContext != "original" && redactionContext != "not_required" {
+		if row.Status == "captured" && result.Excerpt == "" && row.Message != "" {
+			if row.RedactionContext != "original" && row.RedactionContext != "not_required" {
 				result.ExcerptOmitted = "original redaction context unavailable"
 				continue
 			}
 			// Retained candidate log lines have already passed the original
 			// action's pinned redaction boundary and existing event limits.
+			message := row.Message
 			const max = 4096 // Existing worker event text bound.
 			if len(message) > max {
 				message = message[:max]
@@ -203,15 +164,12 @@ func candidateResultEvidence(ctx context.Context, tx pgx.Tx, result *contract.Ac
 			}
 			result.Excerpt = message
 			result.ExcerptOmitted = ""
-			cursor := contract.Cursor{OperationID: result.OperationID, After: sequence - 1}
+			cursor := contract.Cursor{OperationID: result.OperationID, After: row.Sequence - 1}
 			result.ExcerptCursor = &cursor
 		}
-		if strings.HasPrefix(message, "Candidate diagnostic capture: ") {
-			capture.summary = status
+		if strings.HasPrefix(row.Message, "Candidate diagnostic capture: ") {
+			capture.summary = row.Status
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
 	}
 	interrupted, truncated, partial, unavailable, complete := false, false, false, false, false
 	for _, capture := range captures {
@@ -396,20 +354,13 @@ func validResultTime(data map[string]any, out map[string]bool, key string) {
 }
 
 func (s *Service) latestActionResult(ctx context.Context, op *contract.Operation) error {
-	var raw []byte
-	err := s.pool.QueryRow(ctx, `SELECT event->'result' FROM eregion_operation_events
-		WHERE operation_id=$1 AND sequence<=$2 AND event ? 'result' ORDER BY sequence DESC LIMIT 1`, op.ID, op.LastSequence).Scan(&raw)
-	if err == pgx.ErrNoRows {
-		return nil
-	}
+	result, found, err := s.entities.Operations().LatestResult(ctx, op.ID, op.LastSequence)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
-	var result contract.ActionResult
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return err
+	if found {
+		op.LatestResult = result
 	}
-	op.LatestResult = &result
 	return nil
 }
 
@@ -433,22 +384,18 @@ func (s *Service) populateActionResult(ctx context.Context, op *contract.Operati
 }
 
 func (s *Service) populateEvidenceView(ctx context.Context, op *contract.Operation) error {
-	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	var result contract.ActionResult
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		result = contract.ActionResult{
+			OperationID: op.ID, Attempt: op.LatestResult.Attempt, Status: op.LatestResult.Status,
+			Stage: "action", Evidence: "not_collected", History: contract.Cursor{OperationID: op.ID},
+		}
+		if err := candidateResultEvidence(ctx, tx, &result, op.LastSequence); err != nil {
+			return err
+		}
+		return nodeResultEvidence(ctx, tx, &result, op.LastSequence)
+	})
 	if err != nil {
-		return err
-	}
-	defer rollback(tx)
-	result := contract.ActionResult{
-		OperationID: op.ID, Attempt: op.LatestResult.Attempt, Status: op.LatestResult.Status,
-		Stage: "action", Evidence: "not_collected", History: contract.Cursor{OperationID: op.ID},
-	}
-	if err := candidateResultEvidence(ctx, tx, &result, op.LastSequence); err != nil {
-		return err
-	}
-	if err := nodeResultEvidence(ctx, tx, &result, op.LastSequence); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	op.Evidence = &contract.ActionEvidenceView{
@@ -459,7 +406,7 @@ func (s *Service) populateEvidenceView(ctx context.Context, op *contract.Operati
 }
 
 func (s *Service) recordRetryResult(ctx context.Context, id contract.OperationID, attempt uint32, code contract.Code, message string) error {
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		return s.appendActionResultTx(ctx, tx, op, contract.Failed, code, message, false)
 	})
 	if err != nil {

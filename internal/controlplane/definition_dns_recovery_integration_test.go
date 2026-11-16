@@ -147,7 +147,7 @@ func TestIntegrationDefinitionDNSCleanupRecoveryIsReadOnly(t *testing.T) {
 	pool, s, app, provider := definitionDNSFixture(t, true, 0)
 	ctx := context.Background()
 	first := planAndSubmitDefinitionDNS(t, app, "cleanup-primary")
-	driveDefinitionDNS(t, s, first)
+	driveDefinitionDNS(t, pool, s, first)
 	provider.mu.Lock()
 	provider.acceptWrite = true
 	provider.mu.Unlock()
@@ -243,7 +243,7 @@ func TestIntegrationDefinitionDNSCleanupAcceptedErrorReadback(t *testing.T) {
 	pool, s, app, provider := definitionDNSFixture(t, true, 0)
 	ctx := context.Background()
 	first := planAndSubmitDefinitionDNS(t, app, "accepted-cleanup-primary")
-	driveDefinitionDNS(t, s, first)
+	driveDefinitionDNS(t, pool, s, first)
 	provider.mu.Lock()
 	provider.acceptWrite = true
 	provider.mu.Unlock()

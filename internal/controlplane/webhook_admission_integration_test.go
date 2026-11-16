@@ -16,10 +16,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
+	"github.com/mbvlabs/eregion/internal/jobargs"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
@@ -58,7 +59,10 @@ func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool, run *Runtime) (
 	if err := insertFixtureEnvironment(ctx, pool, string(envID), string(appID), "production", "local", hostPort, hostPort+1, 3000); err != nil {
 		t.Fatal(err)
 	}
-	source, _ := json.Marshal(platform.SourceBinding{URL: "https://github.com/mbvlabs/hello.git", Ref: "main"})
+	source, _ := json.Marshal(platform.SourceBinding{
+		URL: "https://github.com/mbvlabs/hello.git", Ref: "main",
+		Builder: "paketobuildpacks/builder-jammy-base",
+	})
 	runtime, _ := json.Marshal(platform.RuntimeSpec{Node: "local", HealthType: "http", HealthPath: "/health", HealthTimeoutSeconds: 30})
 	processes, _ := json.Marshal([]platform.ProcessSpec{{Name: "web", Kind: "web", Command: "./app", Replicas: 1, ContainerPort: 3000}})
 	if _, err := pool.Exec(ctx, `INSERT INTO eregion_platform_environment_revisions
@@ -77,7 +81,7 @@ func webhookIntegrationFixture(t *testing.T, pool *pgxpool.Pool, run *Runtime) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	secrets, err := vault.NewService(pool, ring)
+	secrets, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +119,7 @@ func webhookRecordApp(t *testing.T, record api.WebhookAdmission) (string, string
 func newWebhookIntegrationHandler(t *testing.T, pool *pgxpool.Pool, run *Runtime, secrets *vault.Service) *api.PushWebhookHandler {
 	t.Helper()
 	handler, err := api.NewPushWebhookHandler(api.PushWebhookConfig{
-		Resolver: NewPushWebhookResolver(pool, secrets), Admissions: run.WebhookDeliveries,
+		Resolver: NewPushWebhookResolver(newTestEntities(t, pool), secrets), Admissions: run.WebhookDeliveries,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -151,7 +155,7 @@ func TestIntegrationPushWebhookResolverReadsFreshSecret(t *testing.T) {
 	ctx := context.Background()
 	record, secrets := webhookIntegrationFixture(t, pool, run)
 	appName, envName := webhookRecordApp(t, record)
-	resolver := NewPushWebhookResolver(pool, secrets)
+	resolver := NewPushWebhookResolver(newTestEntities(t, pool), secrets)
 	target, enabled, err := resolver.ResolvePushWebhook(ctx, appName, envName)
 	if err != nil || !enabled {
 		t.Fatalf("resolve enabled=%v err=%v", enabled, err)
@@ -199,7 +203,7 @@ func TestIntegrationWebhookAdmissionQueuesAtomically(t *testing.T) {
 		Scan(&queue, &state, &argHash, &argEnvironmentID, &argKeys); err != nil {
 		t.Fatal(err)
 	}
-	if queue != webhookQueue || state != "available" {
+	if queue != jobargs.WebhookQueue || state != "available" {
 		t.Fatalf("job queue=%q state=%q", queue, state)
 	}
 	if argHash != record.DeliveryIDHash || argEnvironmentID != record.EnvironmentID || argKeys != 2 {
@@ -256,10 +260,19 @@ func TestIntegrationWebhookAdmissionRollsBackWhenQueueFails(t *testing.T) {
 	ctx := context.Background()
 	record, _ := webhookIntegrationFixture(t, pool, run)
 	record.DeliveryIDHash = api.WebhookDeliveryHash("rollback-" + record.EnvironmentID)
-	store := NewWebhookDeliveryStore(pool)
-	store.enqueue = func(context.Context, pgx.Tx, string, string) (int64, error) {
-		return 0, errors.New("injected queue failure")
+	store := NewWebhookDeliveryStore(newTestEntities(t, pool))
+	for _, statement := range []string{
+		`CREATE FUNCTION test_webhook_queue_failure() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'injected queue failure'; END; $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER test_webhook_queue_failure BEFORE INSERT ON river_job FOR EACH ROW EXECUTE FUNCTION test_webhook_queue_failure()`,
+	} {
+		if _, err := pool.Exec(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
 	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DROP TRIGGER IF EXISTS test_webhook_queue_failure ON river_job`)
+		_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS test_webhook_queue_failure()`)
+	})
 	if _, _, err := store.Admit(ctx, record); err == nil {
 		t.Fatal("admission succeeded without its River job")
 	}
@@ -304,15 +317,21 @@ func TestIntegrationWebhookAdmissionSerializesSecretRotation(t *testing.T) {
 	ctx := context.Background()
 	record, secrets := webhookIntegrationFixture(t, pool, run)
 	appName, envName := webhookRecordApp(t, record)
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rollback(tx)
-	current, err := run.WebhookDeliveries.bindingCurrentTx(ctx, tx, record)
-	if err != nil || !current {
-		t.Fatalf("binding snapshot current=%v err=%v", current, err)
-	}
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	held := make(chan error, 1)
+	go func() {
+		held <- run.WebhookDeliveries.store.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			current, err := webhookBindingCurrentTx(ctx, tx, record)
+			if err != nil || !current {
+				return errors.New("binding snapshot is not current")
+			}
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	<-locked
 	namespace, _ := vault.NewNamespace(appName, envName, "WEBHOOK_SECRET")
 	rotated := make(chan error, 1)
 	go func() {
@@ -324,7 +343,8 @@ func TestIntegrationWebhookAdmissionSerializesSecretRotation(t *testing.T) {
 		t.Fatalf("rotation completed while admission held the secret namespace lock: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
-	if err := tx.Rollback(ctx); err != nil {
+	close(release)
+	if err := <-held; err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -425,7 +445,7 @@ func TestIntegrationWebhookWorkerSubmitsOnce(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations`).Scan(&operations); err != nil || operations != 1 {
 		t.Fatalf("operations=%d err=%v", operations, err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE queue=$1 AND args->>'operation_id'=$2`, platformQueue, operationID).Scan(&platformJobs); err != nil || platformJobs != 1 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM river_job WHERE queue=$1 AND args->>'operation_id'=$2`, jobargs.PlatformQueue, operationID).Scan(&platformJobs); err != nil || platformJobs != 1 {
 		t.Fatalf("platform jobs=%d err=%v", platformJobs, err)
 	}
 }

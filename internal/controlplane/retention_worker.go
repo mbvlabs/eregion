@@ -8,9 +8,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
+	"github.com/mbvlabs/eregion/internal/jobargs"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -23,13 +24,13 @@ import (
 // planner and every effect. The separation keeps a pruned release's plan and
 // its completed effects durable across a retry.
 type retentionWorker struct {
-	river.WorkerDefaults[retentionArgs]
+	river.WorkerDefaults[jobargs.Retention]
 	service *Service
 }
 
-func (*retentionWorker) Timeout(*river.Job[retentionArgs]) time.Duration { return 30 * time.Minute }
+func (*retentionWorker) Timeout(*river.Job[jobargs.Retention]) time.Duration { return 30 * time.Minute }
 
-func (*retentionWorker) NextRetry(job *river.Job[retentionArgs]) time.Time {
+func (*retentionWorker) NextRetry(job *river.Job[jobargs.Retention]) time.Time {
 	delay := time.Duration(job.Attempt) * 2 * time.Second
 	if delay > 30*time.Second {
 		delay = 30 * time.Second
@@ -37,7 +38,7 @@ func (*retentionWorker) NextRetry(job *river.Job[retentionArgs]) time.Time {
 	return time.Now().Add(delay)
 }
 
-func (w *retentionWorker) Work(ctx context.Context, job *river.Job[retentionArgs]) error {
+func (w *retentionWorker) Work(ctx context.Context, job *river.Job[jobargs.Retention]) error {
 	if job.Args.OperationID == "" {
 		return w.service.submitDailyRetention(ctx)
 	}
@@ -117,35 +118,27 @@ func (s *Service) submitDailyRetention(ctx context.Context) error {
 // operations in creation order. A same-day retry shares the date prefix, so
 // the legacy first-run key and every numbered retry are both included.
 func (s *Service) dailyRetentionOperations(ctx context.Context, nodeName, date string) ([]contract.Operation, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+columns+` FROM eregion_operations
-        WHERE kind=$1 AND actor_kind=$2 AND actor_subject=$3 AND target=$4 AND idempotency_key LIKE $5
-        ORDER BY created_at,id`,
-		platform.KindRetentionPrune, maintenanceActor.Kind, maintenanceActor.Subject,
-		"node/"+nodeName, retentionDailyKeyPrefix+date+"%")
+	operations, err := s.entities.Operations().ListByIdentityPattern(ctx, entities.OperationIdentityPattern{
+		Kind: platform.KindRetentionPrune, Actor: maintenanceActor,
+		Target: "node/" + nodeName, IdempotencyPattern: retentionDailyKeyPrefix + date + "%",
+	})
 	if err != nil {
 		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	var operations []contract.Operation
-	for rows.Next() {
-		operation, err := scanOperation(rows)
-		if err != nil {
-			return nil, unavailable(err)
-		}
-		operations = append(operations, operation)
-	}
-	return operations, rows.Err()
+	return operations, nil
 }
 
 func (s *Service) claimRetention(ctx context.Context, id contract.OperationID, attempt uint32) (contract.Operation, bool, error) {
-	op, claimed, err := s.mutateOwnedOrClaim(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	op, claimed, err := s.mutateOwnedOrClaim(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State == contract.Queued {
 			if err := transition(ctx, tx, op, contract.Running, "", "Retention worker started durable execution."); err != nil {
 				return err
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_operations SET attempt=$2 WHERE id=$1`, id, op.Attempt); err != nil {
+		if _, found, err := tx.Operations().ClaimAttempt(ctx, id, op.Attempt); err != nil {
 			return err
+		} else if !found {
+			return contract.NewFault(contract.NotFound, "operation disappeared while it was claimed", "Inspect operation history; do not resubmit accepted work.")
 		}
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: "retention", Message: "Retention execution attempt started under the environment locks."})
 	})
@@ -153,7 +146,7 @@ func (s *Service) claimRetention(ctx context.Context, id contract.OperationID, a
 }
 
 func (s *Service) finishRetentionOperation(ctx context.Context, id contract.OperationID, attempt uint32) error {
-	return s.finishPlatformOperation(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	return s.finishPlatformOperation(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "log", Stage: "retention", Message: "Retention completed; removed artifacts and reclaimed bytes are recorded in the retention run."})
 	})
 }
@@ -162,7 +155,7 @@ func (s *Service) finishRetentionOperation(ctx context.Context, id contract.Oper
 // operation when no attempt remains or the failure is permanent. A permanent
 // registry refusal (for example deletes still disabled) is not retried eight
 // times: the next periodic run retries it after the host is fixed.
-func (s *Service) settleRetentionFailure(ctx context.Context, op contract.Operation, attempt uint32, job *river.Job[retentionArgs], cause error) error {
+func (s *Service) settleRetentionFailure(ctx context.Context, op contract.Operation, attempt uint32, job *river.Job[jobargs.Retention], cause error) error {
 	code := contract.Classify(cause).Code
 	permanent := errors.Is(cause, engine.ErrPermanent) || errors.Is(cause, errNodeStepPermanentFailure) ||
 		code == contract.ValidationFailed || code == contract.PreconditionFailed ||
@@ -273,28 +266,23 @@ func (s *Service) runRetentionAttempt(ctx context.Context, op contract.Operation
 // already marked pruned is still retried instead of disappearing from a fresh
 // plan.
 func (s *Service) retentionRunForOperation(ctx context.Context, id contract.OperationID) (retention.Run, bool, error) {
-	var run retention.Run
-	var operationID string
-	var planned, removed, runErrors []byte
-	var finished *time.Time
-	err := s.pool.QueryRow(ctx, `SELECT id,coalesce(operation_id,''),status,planned_items,removed_items,
-        planned_bytes,reclaimed_bytes,errors,started_at,finished_at,
-        cache_bytes,cache_measured_at,cache_measurement_error,gc_generation
-        FROM eregion_retention_runs WHERE operation_id=$1 ORDER BY started_at DESC,id DESC LIMIT 1`, id).
-		Scan(&run.ID, &operationID, &run.Status, &planned, &removed,
-			&run.PlannedBytes, &run.ReclaimedBytes, &runErrors, &run.StartedAt, &finished,
-			&run.CacheBytes, &run.CacheMeasuredAt, &run.CacheError, &run.GCGeneration)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return retention.Run{}, false, nil
-	}
+	record, found, err := s.entities.Retention().LatestRunForOperation(ctx, id)
 	if err != nil {
 		return retention.Run{}, false, unavailable(err)
 	}
-	run.OperationID = operationID
-	run.FinishedAt = finished
-	run.Planned = decodeRetentionItems(planned)
-	run.Removed = decodeRetentionItems(removed)
-	run.Errors = decodeRetentionErrors(runErrors)
+	if !found {
+		return retention.Run{}, false, nil
+	}
+	run := retention.Run{
+		ID: record.ID, OperationID: string(record.OperationID), Status: retention.RunStatus(record.Status),
+		PlannedBytes: record.PlannedBytes, ReclaimedBytes: record.ReclaimedBytes,
+		StartedAt: record.StartedAt, FinishedAt: record.FinishedAt,
+		CacheBytes: record.CacheBytes, CacheMeasuredAt: record.CacheMeasuredAt,
+		CacheError: record.CacheMeasurementError, GCGeneration: record.GCGeneration,
+	}
+	run.Planned = decodeRetentionItems(record.PlannedItems)
+	run.Removed = decodeRetentionItems(record.RemovedItems)
+	run.Errors = decodeRetentionErrors(record.Errors)
 	return run, true, nil
 }
 
@@ -303,14 +291,13 @@ func (s *Service) insertRetentionRun(ctx context.Context, run retention.Run) err
 	if err != nil {
 		return unavailable(err)
 	}
-	_, err = s.pool.Exec(ctx, `INSERT INTO eregion_retention_runs
-        (id,operation_id,status,planned_items,removed_items,planned_bytes,reclaimed_bytes,errors,started_at,finished_at,
-         cache_bytes,cache_measured_at,cache_measurement_error,gc_generation)
-        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-		run.ID, nullableOperationID(contract.OperationID(run.OperationID)), run.Status, planned, removed,
-		run.PlannedBytes, run.ReclaimedBytes, runErrors, run.StartedAt, run.FinishedAt,
-		run.CacheBytes, run.CacheMeasuredAt, run.CacheError, run.GCGeneration)
-	if err != nil {
+	if err := s.entities.Retention().InsertRun(ctx, entities.RetentionRunInsert{
+		ID: run.ID, OperationID: contract.OperationID(run.OperationID), Status: string(run.Status),
+		PlannedItems: planned, RemovedItems: removed, PlannedBytes: run.PlannedBytes,
+		ReclaimedBytes: run.ReclaimedBytes, Errors: runErrors, StartedAt: run.StartedAt,
+		FinishedAt: run.FinishedAt, CacheBytes: run.CacheBytes, CacheMeasuredAt: run.CacheMeasuredAt,
+		CacheMeasurementError: run.CacheError, GCGeneration: run.GCGeneration,
+	}); err != nil {
 		return unavailable(err)
 	}
 	return nil
@@ -321,12 +308,13 @@ func (s *Service) updateRetentionRun(ctx context.Context, run retention.Run) err
 	if err != nil {
 		return unavailable(err)
 	}
-	_, err = s.pool.Exec(ctx, `UPDATE eregion_retention_runs
-        SET status=$2,planned_items=$3,removed_items=$4,planned_bytes=$5,reclaimed_bytes=$6,errors=$7,finished_at=$8,
-            cache_bytes=$9,cache_measured_at=$10,cache_measurement_error=$11,gc_generation=$12
-        WHERE id=$1`, run.ID, run.Status, planned, removed, run.PlannedBytes, run.ReclaimedBytes, runErrors, run.FinishedAt,
-		run.CacheBytes, run.CacheMeasuredAt, run.CacheError, run.GCGeneration)
-	if err != nil {
+	if err := s.entities.Retention().UpdateRun(ctx, entities.RetentionRun{
+		ID: run.ID, OperationID: contract.OperationID(run.OperationID), Status: string(run.Status),
+		PlannedItems: planned, RemovedItems: removed, PlannedBytes: run.PlannedBytes,
+		ReclaimedBytes: run.ReclaimedBytes, Errors: runErrors, StartedAt: run.StartedAt,
+		FinishedAt: run.FinishedAt, CacheBytes: run.CacheBytes, CacheMeasuredAt: run.CacheMeasuredAt,
+		CacheMeasurementError: run.CacheError, GCGeneration: run.GCGeneration,
+	}); err != nil {
 		return unavailable(err)
 	}
 	return nil
@@ -856,21 +844,12 @@ func runOperationID(run *retention.Run) contract.OperationID {
 // image blocks its removal.
 func (s *Service) retentionImageStillShared(ctx context.Context, imageID, releaseID string, transport node.Transport) (bool, string, error) {
 	imageID = strings.TrimSpace(imageID)
-	var owner string
-	err := s.pool.QueryRow(ctx, `SELECT r.id FROM eregion_platform_releases r
-        WHERE r.image_id=$1 AND r.id<>$2 AND (
-            r.pruned_at IS NULL
-            OR EXISTS (SELECT 1 FROM eregion_platform_deployments d
-                       WHERE d.state IN ('pending','running') AND (d.release_id=r.id OR d.previous_release_id=r.id))
-            OR EXISTS (SELECT 1 FROM eregion_operations o
-                       WHERE o.id=r.operation_id AND o.state IN ('queued','running','cancelling'))
-        )
-        ORDER BY r.created_at DESC,r.id LIMIT 1`, imageID, releaseID).Scan(&owner)
-	switch {
-	case err == nil:
-		return true, "image is still used by retained release " + owner, nil
-	case !errors.Is(err, pgx.ErrNoRows):
+	owner, found, err := s.entities.Platform().Releases().ImageStillShared(ctx, imageID, platform.ReleaseID(releaseID))
+	if err != nil {
 		return false, "", unavailable(err)
+	}
+	if found {
+		return true, "image is still used by retained release " + string(owner), nil
 	}
 	inventory, err := observeRetentionInventoryTransport(ctx, transport)
 	if err != nil {
@@ -920,9 +899,7 @@ func (s *Service) recordRetentionSkip(run *retention.Run, stage, reference, reas
 // not owned by one operation, so a later retention run can drain a GC that an
 // earlier run deferred or never reached.
 func (s *Service) retentionGCPending(ctx context.Context) (bool, error) {
-	var pending bool
-	err := s.pool.QueryRow(ctx, `SELECT coalesce(
-        (SELECT retention_gc_pending FROM eregion_server_settings WHERE singleton),false)`).Scan(&pending)
+	pending, err := s.entities.Retention().GCPending(ctx)
 	if err != nil {
 		return false, unavailable(err)
 	}
@@ -930,9 +907,7 @@ func (s *Service) retentionGCPending(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) setRetentionGCPending(ctx context.Context, pending bool) error {
-	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention_gc_pending,retention,updated_at)
-        VALUES (true,$1,'{}'::jsonb,clock_timestamp())
-        ON CONFLICT (singleton) DO UPDATE SET retention_gc_pending=EXCLUDED.retention_gc_pending, updated_at=clock_timestamp()`, pending); err != nil {
+	if err := s.entities.Retention().SetGCPending(ctx, pending); err != nil {
 		return unavailable(err)
 	}
 	return nil
@@ -951,69 +926,62 @@ func (s *Service) markRetentionReleaseForAttempt(ctx context.Context, releaseID 
 // current rollback target, or part of an in-flight deployment or operation is
 // never marked. The returned bool is false for that protection, not an error.
 func (s *Service) markRetentionRelease(ctx context.Context, releaseID string) (bool, error) {
-	tx, err := s.pool.Begin(ctx)
+	var safe bool
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		releases := tx.Platform().Releases()
+		environment, found, err := releases.LockServingEnvironment(ctx, platform.ReleaseID(releaseID))
+		if err != nil {
+			return unavailable(err)
+		}
+		if !found {
+			return contract.NewFault(contract.NotFound, "release not found while pruning", "Inspect the release row and retry the operation.")
+		}
+		if environment.Serving == platform.ReleaseID(releaseID) ||
+			environment.Desired == platform.ReleaseID(releaseID) ||
+			environment.Applied == platform.ReleaseID(releaseID) {
+			return nil
+		}
+		active, err := releases.CountActiveDeployments(ctx, platform.ReleaseID(releaseID))
+		if err != nil {
+			return unavailable(err)
+		}
+		if active > 0 {
+			return nil
+		}
+		active, err = releases.CountActiveOperations(ctx, platform.ReleaseID(releaseID))
+		if err != nil {
+			return unavailable(err)
+		}
+		if active > 0 {
+			return nil
+		}
+		if environment.Serving != "" {
+			previous, found, err := tx.Platform().Deployments().PreviousReleaseOfServing(ctx, environment.EnvironmentID, environment.Serving)
+			if err != nil {
+				return unavailable(err)
+			}
+			if found && previous == platform.ReleaseID(releaseID) {
+				return nil
+			}
+		}
+		previous, found, err := tx.Platform().Deployments().LatestSucceededReleaseExcluding(ctx, environment.EnvironmentID, environment.Serving)
+		if err != nil {
+			return unavailable(err)
+		}
+		if found && previous == platform.ReleaseID(releaseID) {
+			return nil
+		}
+		if _, err := releases.MarkPruned(ctx, platform.ReleaseID(releaseID)); err != nil {
+			return unavailable(err)
+		}
+		safe = true
+		return nil
+	})
 	if err != nil {
-		return false, unavailable(err)
-	}
-	defer rollback(tx)
-
-	var environmentID, serving, desired, applied string
-	if err := tx.QueryRow(ctx, `SELECT e.id,coalesce(e.serving_release_id,''),coalesce(e.desired_release_id,''),coalesce(e.applied_release_id,'')
-        FROM eregion_platform_releases r
-        JOIN eregion_platform_environments e ON e.id=r.environment_id
-        WHERE r.id=$1 FOR UPDATE OF e`, releaseID).Scan(&environmentID, &serving, &desired, &applied); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, contract.NewFault(contract.NotFound, "release not found while pruning", "Inspect the release row and retry the operation.")
-		}
-		return false, unavailable(err)
-	}
-	if serving == releaseID || desired == releaseID || applied == releaseID {
-		return false, nil
-	}
-	var active int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_platform_deployments
-        WHERE state IN ('pending','running') AND (release_id=$1 OR previous_release_id=$1)`, releaseID).Scan(&active); err != nil {
-		return false, unavailable(err)
-	}
-	if active > 0 {
-		return false, nil
-	}
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_operations o
-        JOIN eregion_platform_releases r ON r.operation_id=o.id
-        WHERE r.id=$1 AND o.state IN ('queued','running','cancelling')`, releaseID).Scan(&active); err != nil {
-		return false, unavailable(err)
-	}
-	if active > 0 {
-		return false, nil
-	}
-
-	var previous string
-	if serving != "" {
-		err := tx.QueryRow(ctx, `SELECT coalesce(previous_release_id,'') FROM eregion_platform_deployments
-            WHERE environment_id=$1 AND state='succeeded' AND release_id=$2 AND previous_release_id IS NOT NULL
-            ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC LIMIT 1`, environmentID, serving).Scan(&previous)
-		if err == nil && previous == releaseID {
-			return false, nil
-		}
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
 			return false, unavailable(err)
 		}
+		return false, err
 	}
-	err = tx.QueryRow(ctx, `SELECT release_id FROM eregion_platform_deployments
-        WHERE environment_id=$1 AND state='succeeded' AND release_id IS DISTINCT FROM $2
-        ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC LIMIT 1`, environmentID, nullableString(serving)).Scan(&previous)
-	if err == nil && previous == releaseID {
-		return false, nil
-	}
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return false, unavailable(err)
-	}
-
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_releases SET pruned_at=clock_timestamp() WHERE id=$1 AND pruned_at IS NULL`, releaseID); err != nil {
-		return false, unavailable(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, unavailable(err)
-	}
-	return true, nil
+	return safe, nil
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/mbvlabs/eregion/internal/entities"
 )
 
 // Uses testPool through the existing fixture; never run without an explicitly
@@ -14,18 +16,24 @@ func TestIntegrationPointerKeyShareUpdateAndDeleteFence(t *testing.T) {
 	env := f.environment(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	tx, err := f.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(context.Background())
-	appID, err := lockPointerEnvironmentTx(ctx, tx, env.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lockReleasePointerTx(ctx, tx, appID, env.ID, release); err != nil {
-		t.Fatal(err)
-	}
+	locked := make(chan struct{})
+	releaseLock := make(chan struct{})
+	holder := make(chan error, 1)
+	go func() {
+		holder <- f.service.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+			appID, err := lockPointerEnvironmentTx(ctx, tx, env.ID)
+			if err != nil {
+				return err
+			}
+			if err := lockReleasePointerTx(ctx, tx, appID, env.ID, release); err != nil {
+				return err
+			}
+			close(locked)
+			<-releaseLock
+			return nil
+		})
+	}()
+	<-locked
 	update := make(chan error, 1)
 	go func() {
 		_, err := f.pool.Exec(ctx, `UPDATE eregion_platform_releases SET error='test' WHERE id=$1`, release)
@@ -62,7 +70,8 @@ func TestIntegrationPointerKeyShareUpdateAndDeleteFence(t *testing.T) {
 		case <-ticker.C:
 		}
 	}
-	if err := tx.Rollback(ctx); err != nil {
+	close(releaseLock)
+	if err := <-holder; err != nil {
 		t.Fatal(err)
 	}
 	if err := <-deleted; err != nil {

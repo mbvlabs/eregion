@@ -20,7 +20,7 @@ func imageUploadFixture(t *testing.T) (*Service, *deploymentRetryFixture, Regist
 	fixture := newDeploymentRetryFixtureWithTransport(t, newScriptedDeployTransport())
 	identity := testRegistryHostIdentity()
 	identity.StateDir = t.TempDir()
-	if _, err := AssignWorkspace(fixture.ctx, fixture.pool, "thelab", identity); err != nil {
+	if _, err := AssignWorkspace(fixture.ctx, fixture.service.entities, "thelab", identity); err != nil {
 		t.Fatal(err)
 	}
 	fixture.service.registryHostIdentity = &identity
@@ -93,12 +93,12 @@ func TestIntegrationImageUploadLeaseKeepsHostFenceAfterAdvisorySessionLoss(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if lease.conn == nil {
+	if lease.session == nil {
 		t.Fatal("lease has no dedicated connection")
 	}
 	// Simulate the PostgreSQL session dying while the upload child is still
 	// running. The host lock must still block final metadata deletion.
-	if err := lease.conn.Close(context.Background()); err != nil {
+	if err := lease.session.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !hostLockContended(t, fixture.ctx, lockPath) {
@@ -184,20 +184,20 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 		t.Fatal(err)
 	}
 	defer leaseA.Release()
-	if leaseA.conn == nil {
+	if leaseA.session == nil {
 		t.Fatal("lease has no dedicated connection")
 	}
 	// The advisory session dies, but the A host lock and payload work remain.
-	if err := leaseA.conn.Close(context.Background()); err != nil {
+	if err := leaseA.session.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	identityB := identityA
 	identityB.HostKeyFingerprint = "SHA256:" + strings.Repeat("B", 43)
 	identityB.StateDir = t.TempDir()
-	if _, err := VerifyWorkspaceRegistryHost(fixture.ctx, fixture.pool, identityB); err == nil || contract.Classify(err).Code != contract.Conflict {
+	if _, err := VerifyWorkspaceRegistryHost(fixture.ctx, fixture.service.entities.Workspace(), identityB); err == nil || contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("B with A's name and a different fingerprint = %v, want conflict", err)
 	}
-	serviceB := &Service{pool: fixture.pool, registryHostIdentity: &identityB, registryEndpoint: serviceA.registryEndpoint}
+	serviceB := &Service{entities: newTestEntities(t, fixture.pool), registryHostIdentity: &identityB, registryEndpoint: serviceA.registryEndpoint}
 	if _, err := serviceB.verifyLocalRegistryHost(fixture.ctx); err == nil || contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("B local verification = %v, want conflict", err)
 	}
@@ -283,7 +283,7 @@ func TestIntegrationCrossHostUploadIdentityCannotAuthorizeAnotherHost(t *testing
 }
 
 func TestIntegrationImageUploadLeaseRefusesMissingOrEmptyRepository(t *testing.T) {
-	service, fixture, identity := imageUploadFixture(t)
+	_, fixture, identity := imageUploadFixture(t)
 	config, err := ParseDatabaseConfig(fixture.dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -291,7 +291,7 @@ func TestIntegrationImageUploadLeaseRefusesMissingOrEmptyRepository(t *testing.T
 	if _, err := AcquireImageUploadLease(fixture.ctx, config.ConnConfig, identity, "missing"); err == nil || contract.Classify(err).Code != contract.NotFound {
 		t.Fatalf("missing app = %v", err)
 	}
-	if _, err := service.pool.Exec(fixture.ctx, `UPDATE eregion_platform_apps SET image_repository='' WHERE name='live'`); err != nil {
+	if _, err := fixture.pool.Exec(fixture.ctx, `UPDATE eregion_platform_apps SET image_repository='' WHERE name='live'`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := AcquireImageUploadLease(fixture.ctx, config.ConnConfig, identity, "live"); err == nil || !strings.Contains(err.Error(), "no image repository") {

@@ -49,7 +49,12 @@ func newOutageProxy(t *testing.T, targetDSN string) *outageProxy {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxy := &outageProxy{target: parsed.Host, addr: listener.Addr().String(), listener: listener, conns: map[net.Conn]struct{}{}}
+	proxy := &outageProxy{
+		target:   parsed.Host,
+		addr:     listener.Addr().String(),
+		listener: listener,
+		conns:    map[net.Conn]struct{}{},
+	}
 	go proxy.serve(listener)
 	t.Cleanup(func() { proxy.close() })
 	return proxy
@@ -160,13 +165,17 @@ func TestIntegrationDatabaseOutageRecoversWithoutDuplicates(t *testing.T) {
 	cp := startControlPlane(t, proxy.dsn(dsn), keyFile, nodeDir, 2)
 
 	const steps = 8
-	op, err := cp.run.Service.Submit(ctx, submission("database-outage", fmt.Sprintf(`{"steps":%d,"step_delay_ms":150}`, steps)))
+	op, err := cp.run.Service.Submit(
+		ctx,
+		submission("database-outage", fmt.Sprintf(`{"steps":%d,"step_delay_ms":150}`, steps)),
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	await(t, 20*time.Second, func() bool {
 		var completed int
-		err := directPool.QueryRow(ctx, `SELECT completed_steps FROM eregion_operations WHERE id=$1`, op.ID).Scan(&completed)
+		err := directPool.QueryRow(ctx, `SELECT completed_steps FROM eregion_operations WHERE id=$1`, op.ID).
+			Scan(&completed)
 		return err == nil && completed >= 1
 	})
 
@@ -176,7 +185,8 @@ func TestIntegrationDatabaseOutageRecoversWithoutDuplicates(t *testing.T) {
 	// terminal or lost.
 	await(t, 5*time.Second, func() bool {
 		var state string
-		err := directPool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state)
+		err := directPool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).
+			Scan(&state)
 		return err == nil && !contract.State(state).Terminal()
 	})
 	time.Sleep(750 * time.Millisecond)
@@ -186,7 +196,8 @@ func TestIntegrationDatabaseOutageRecoversWithoutDuplicates(t *testing.T) {
 
 	await(t, 90*time.Second, func() bool {
 		var state string
-		err := directPool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).Scan(&state)
+		err := directPool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, op.ID).
+			Scan(&state)
 		return err == nil && contract.State(state) == contract.Succeeded
 	})
 	if got := effectCount(t, nodeDir, op.ID, steps); got != steps {
@@ -215,7 +226,12 @@ type scriptedDeployTransport struct {
 }
 
 func newScriptedDeployTransport() *scriptedDeployTransport {
-	return &scriptedDeployTransport{runs: map[string]int{}, down: map[string]int{}, hashes: map[string]string{}, payloads: map[string]json.RawMessage{}}
+	return &scriptedDeployTransport{
+		runs:     map[string]int{},
+		down:     map[string]int{},
+		hashes:   map[string]string{},
+		payloads: map[string]json.RawMessage{},
+	}
 }
 
 // scriptedInputsHash is the hash a real node journals for a run: the step
@@ -260,14 +276,19 @@ func scriptedResult(request node.Request) json.RawMessage {
 		imageID := "sha256:" + hex.EncodeToString(sum[:])
 		manifest := sha256.Sum256([]byte("manifest:" + payload.Image))
 		reference := payload.Registry + "/" + local + "@sha256:" + hex.EncodeToString(manifest[:])
-		result := map[string]string{"image_id": imageID, "reference": reference, "digest": "sha256:" + hex.EncodeToString(manifest[:])}
+		result := map[string]string{
+			"image_id":   imageID,
+			"runtime_id": imageID,
+			"reference":  reference,
+			"digest":     "sha256:" + hex.EncodeToString(manifest[:]),
+		}
 		if payload.GitRef != "" {
 			result["commit"] = payload.GitRef
 		}
 		raw, _ := json.Marshal(result)
 		return raw
 	}
-	if request.Execution.Step != "platform-image-01-v1" {
+	if request.Execution.Step != deploymentImageStep {
 		return json.RawMessage(`{}`)
 	}
 	var payload platform.ArgvPayload
@@ -281,7 +302,11 @@ func scriptedResult(request node.Request) json.RawMessage {
 	return result
 }
 
-func (s *scriptedDeployTransport) Call(_ context.Context, request node.Request, _ func(node.Event)) (node.Response, error) {
+func (s *scriptedDeployTransport) Call(
+	_ context.Context,
+	request node.Request,
+	_ func(node.Event),
+) (node.Response, error) {
 	key := stepKey(request)
 	switch request.Method {
 	case node.MethodStatus:
@@ -304,7 +329,10 @@ func (s *scriptedDeployTransport) Call(_ context.Context, request node.Request, 
 				InputsHash: hash, Executed: true, Result: scriptedResult(request),
 			}, nil
 		}
-		return node.Response{Status: engine.StatusAbsent, ExecutionID: request.Execution.ExecutionID()}, nil
+		return node.Response{
+			Status:      engine.StatusAbsent,
+			ExecutionID: request.Execution.ExecutionID(),
+		}, nil
 	case node.MethodRun:
 		hash := scriptedInputsHash(request)
 		s.mu.Lock()
@@ -312,7 +340,8 @@ func (s *scriptedDeployTransport) Call(_ context.Context, request node.Request, 
 		s.hashes[key] = hash
 		s.payloads[key] = append(json.RawMessage(nil), request.Payload...)
 		first := s.runs[key] == 1
-		lost := first && request.Execution.Step == s.lostStep && request.Execution.OperationID == s.lostForOp
+		lost := first && request.Execution.Step == s.lostStep &&
+			request.Execution.OperationID == s.lostForOp
 		if lost {
 			s.down[key] = 1
 		}
@@ -344,7 +373,8 @@ func (s *scriptedDeployTransport) payload(op contract.OperationID, step string) 
 func latestRelease(t *testing.T, pool *pgxpool.Pool) string {
 	t.Helper()
 	var id string
-	if err := pool.QueryRow(context.Background(), `SELECT id FROM eregion_platform_releases ORDER BY created_at DESC LIMIT 1`).Scan(&id); err != nil {
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM eregion_platform_releases ORDER BY created_at DESC LIMIT 1`).
+		Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -373,7 +403,7 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
 	fake := newScriptedDeployTransport()
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 2, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -387,27 +417,77 @@ func TestIntegrationNodeLossDuringDeploy(t *testing.T) {
 	startWorkers(t, run)
 	s := run.Service
 
-	platformAwait(t, s, platformSubmit(t, s, platform.KindNodeRegister, "platform", "ha-node", map[string]any{
-		"name": "local", "roles": []string{platform.RoleApplication, platform.RoleBuilder, platform.RoleControlPlane},
-		"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
-	}), contract.Succeeded)
-	platformAwait(t, s, platformSubmit(t, s, platform.KindAppCreate, "platform", "ha-app", map[string]any{"name": "live"}), contract.Succeeded)
-	platformAwait(t, s, platformSubmit(t, s, platform.KindEnvironmentCreate, "app/live", "ha-env", map[string]any{
-		"name": "production", "node": "local", "container_port": 80, "health": map[string]any{"timeout_seconds": 2},
-		"domain": "live.example.com", "domain_primary": true,
-	}), contract.Succeeded)
+	platformAwait(
+		t,
+		s,
+		platformSubmit(t, s, platform.KindNodeRegister, "platform", "ha-node", map[string]any{
+			"name": "local",
+			"roles": []string{
+				platform.RoleApplication,
+				platform.RoleBuilder,
+				platform.RoleControlPlane,
+			},
+			"capabilities": []string{platform.CapabilityDocker, platform.CapabilityBuildpacks},
+		}),
+		contract.Succeeded,
+	)
+	platformAwait(
+		t,
+		s,
+		platformSubmit(
+			t,
+			s,
+			platform.KindAppCreate,
+			"platform",
+			"ha-app",
+			map[string]any{"name": "live"},
+		),
+		contract.Succeeded,
+	)
+	platformAwait(
+		t,
+		s,
+		platformSubmit(t, s, platform.KindEnvironmentCreate, "app/live", "ha-env", map[string]any{
+			"name":           "production",
+			"node":           "local",
+			"container_port": 80,
+			"health":         map[string]any{"timeout_seconds": 2},
+			"domain":         "live.example.com",
+			"domain_primary": true,
+		}),
+		contract.Succeeded,
+	)
 
 	createRelease := func(_, image string) string {
-		return string(seedArtifactRelease(t, s, "live", "production", image).ID)
+		return string(seedArtifactRelease(t, pool, s, "live", "production", image).ID)
 	}
 	first := createRelease("ha-release-1", "registry.example/live:v1")
-	platformAwait(t, s, platformSubmit(t, s, platform.KindDeploy, "env/live/production", "ha-deploy-1", map[string]any{"release_id": first}), contract.Succeeded)
+	platformAwait(
+		t,
+		s,
+		platformSubmit(
+			t,
+			s,
+			platform.KindDeploy,
+			"env/live/production",
+			"ha-deploy-1",
+			map[string]any{"release_id": first},
+		),
+		contract.Succeeded,
+	)
 	if servingRelease(t, pool) != first {
 		t.Fatalf("first deploy did not become serving: %q", servingRelease(t, pool))
 	}
 
 	second := createRelease("ha-release-2", "registry.example/live:v2")
-	deploy := platformSubmit(t, s, platform.KindDeploy, "env/live/production", "ha-deploy-2", map[string]any{"release_id": second})
+	deploy := platformSubmit(
+		t,
+		s,
+		platform.KindDeploy,
+		"env/live/production",
+		"ha-deploy-2",
+		map[string]any{"release_id": second},
+	)
 	containerStep := containerStepID("web", "1")
 	fake.lose(containerStep, deploy.ID)
 
@@ -455,7 +535,13 @@ func TestIntegrationCompetingSubmissionsAcrossControlPlanes(t *testing.T) {
 		wait.Add(1)
 		go func(service operations.Service) {
 			defer wait.Done()
-			op, err := service.Submit(ctx, submission("competing-control-planes", fmt.Sprintf(`{"steps":%d,"step_delay_ms":100}`, steps)))
+			op, err := service.Submit(
+				ctx,
+				submission(
+					"competing-control-planes",
+					fmt.Sprintf(`{"steps":%d,"step_delay_ms":100}`, steps),
+				),
+			)
 			if err != nil {
 				errs <- err
 				return
@@ -479,11 +565,14 @@ func TestIntegrationCompetingSubmissionsAcrossControlPlanes(t *testing.T) {
 	}
 	await(t, 30*time.Second, func() bool {
 		var state string
-		err := first.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, id).Scan(&state)
+		err := first.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, id).
+			Scan(&state)
 		return err == nil && contract.State(state) == contract.Succeeded
 	})
 	var operations int
-	if err := first.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE idempotency_key='competing-control-planes'`).Scan(&operations); err != nil || operations != 1 {
+	if err := first.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_operations WHERE idempotency_key='competing-control-planes'`).
+		Scan(&operations); err != nil ||
+		operations != 1 {
 		t.Fatalf("competing submissions produced %d operations: %v", operations, err)
 	}
 	if got := effectCount(t, nodeDir, id, steps); got != steps {

@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/jobargs"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -106,11 +107,15 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 		}},
 	})
 	now := time.Now().UTC()
+	oldManifest := "sha256:" + strings.Repeat("1", 64)
+	newManifest := "sha256:" + strings.Repeat("2", 64)
 	oldConfig := "sha256:" + strings.Repeat("a", 64)
 	newConfig := "sha256:" + strings.Repeat("b", 64)
-	oldID := insertRetentionWorkerRelease(t, pool, app, environment, "127.0.0.1:5000/api:old", oldConfig, now.Add(-30*24*time.Hour))
-	newID := insertRetentionWorkerRelease(t, pool, app, environment, "127.0.0.1:5000/api:new", newConfig, now.Add(-29*24*time.Hour))
-	keptDigest := "sha256:" + strings.Repeat("c", 64)
+	oldImage := "127.0.0.1:5000/api@" + oldManifest
+	newImage := "127.0.0.1:5000/api@" + newManifest
+	oldID := insertRetentionWorkerRelease(t, pool, app, environment, oldImage, oldConfig, now.Add(-30*24*time.Hour))
+	newID := insertRetentionWorkerRelease(t, pool, app, environment, newImage, newConfig, now.Add(-29*24*time.Hour))
+	keptDigest := newManifest
 	orphanDigest := "sha256:" + strings.Repeat("d", 64)
 	old := now.Add(-30 * 24 * time.Hour)
 	transport := &retentionFakeTransport{
@@ -127,8 +132,8 @@ func newRetentionFixture(t *testing.T) *retentionFixture {
 			Containers:     []retention.InventoryContainer{},
 			DanglingImages: []retention.InventoryImage{},
 			LocalImages: []retention.LocalImage{
-				{ID: oldConfig, RepoTags: []string{"127.0.0.1:5000/api:old"}},
-				{ID: newConfig, RepoTags: []string{"127.0.0.1:5000/api:new"}},
+				{ID: oldConfig, RepoTags: []string{"127.0.0.1:5000/api:old"}, RepoDigests: []string{oldImage}},
+				{ID: newConfig, RepoTags: []string{"127.0.0.1:5000/api:new"}, RepoDigests: []string{newImage}},
 			},
 			Disk: retention.Disk{TotalBytes: 1 << 40, FreeBytes: 1 << 39},
 		},
@@ -188,10 +193,10 @@ func submitRetentionWorkerPrune(t *testing.T, s *Service, key string) contract.O
 	return op
 }
 
-func retentionWorkerJob(id contract.OperationID, attempt, maxAttempts int) *river.Job[retentionArgs] {
-	return &river.Job[retentionArgs]{
+func retentionWorkerJob(id contract.OperationID, attempt, maxAttempts int) *river.Job[jobargs.Retention] {
+	return &river.Job[jobargs.Retention]{
 		JobRow: &rivertype.JobRow{Attempt: attempt, MaxAttempts: maxAttempts},
-		Args:   retentionArgs{OperationID: id},
+		Args:   jobargs.Retention{OperationID: id},
 	}
 }
 
@@ -854,5 +859,129 @@ func TestIntegrationRetentionGCUsesAFreshPassIdentity(t *testing.T) {
 	}
 	if pending {
 		t.Fatal("the fresh GC pass did not clear the pending flag")
+	}
+}
+
+func TestIntegrationRetentionProtectsAllPlausibleRuntimeMappings(t *testing.T) {
+	fixture := newRetentionFixture(t)
+	ctx := context.Background()
+	oldConfig := "sha256:" + strings.Repeat("a", 64)
+	altConfig := "sha256:" + strings.Repeat("e", 64)
+	var sharedImage string
+	if err := fixture.pool.QueryRow(ctx, `SELECT image FROM eregion_platform_releases WHERE id=$1`, fixture.oldID).Scan(&sharedImage); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_platform_releases SET image=$1 WHERE id=$2`, sharedImage, fixture.newID); err != nil {
+		t.Fatal(err)
+	}
+	fixture.transport.inventory.LocalImages = append(fixture.transport.inventory.LocalImages,
+		retention.LocalImage{ID: altConfig, RepoDigests: []string{sharedImage}})
+	fixture.transport.inventory.DanglingImages = []retention.InventoryImage{{ID: oldConfig, SizeBytes: 4096}}
+
+	op := submitRetentionWorkerPrune(t, fixture.service, "retention-ambiguous-runtime")
+	if err := (&retentionWorker{service: fixture.service}).Work(ctx, retentionWorkerJob(op.ID, 1, 8)); err != nil {
+		t.Fatalf("ambiguous mapping failed the retention operation: %v", err)
+	}
+	for _, payload := range fixture.transport.payloads {
+		if payload.Kind == string(retention.ItemImage) && (payload.Reference == oldConfig || payload.Reference == altConfig) {
+			t.Fatalf("ambiguous retained mapping was deleted: %+v", payload)
+		}
+	}
+	var planned, removed []byte
+	if err := fixture.pool.QueryRow(ctx, `SELECT planned_items,removed_items FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&planned, &removed); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range [][]byte{planned, removed} {
+		if strings.Contains(string(raw), `"kind": "image"`) && (strings.Contains(string(raw), oldConfig) || strings.Contains(string(raw), altConfig)) {
+			t.Fatalf("ambiguous image remained a removal item: %s", raw)
+		}
+	}
+	if !strings.Contains(string(planned), "ambiguous") {
+		t.Fatalf("ambiguous mapping was not reported: %s", planned)
+	}
+}
+
+type historicalRetentionCase struct {
+	name  string
+	image string
+}
+
+func TestIntegrationRetentionNeverDerivesRemovalFromHistoricalImageID(t *testing.T) {
+	cases := []historicalRetentionCase{
+		{name: "tag only", image: "127.0.0.1:5000/api:old"},
+		{name: "malformed", image: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runHistoricalRetentionCase(t, tc)
+		})
+	}
+}
+
+func runHistoricalRetentionCase(t *testing.T, tc historicalRetentionCase) {
+	t.Helper()
+	fixture := newRetentionFixture(t)
+	ctx := context.Background()
+	oldConfig := "sha256:" + strings.Repeat("a", 64)
+	if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_platform_releases SET image=$1 WHERE id=$2`, tc.image, fixture.oldID); err != nil {
+		t.Fatal(err)
+	}
+	op := submitRetentionWorkerPrune(t, fixture.service, "retention-historical-"+strings.ReplaceAll(tc.name, " ", "-"))
+	if err := (&retentionWorker{service: fixture.service}).Work(ctx, retentionWorkerJob(op.ID, 1, 8)); err != nil {
+		t.Fatalf("historical row failed retention: %v", err)
+	}
+	for _, payload := range fixture.transport.payloads {
+		if payload.Kind == string(retention.ItemImage) && payload.Reference == oldConfig {
+			t.Fatalf("historical image_id was used as a removal selector: %+v", payload)
+		}
+	}
+	var planned []byte
+	if err := fixture.pool.QueryRow(ctx, `SELECT planned_items FROM eregion_retention_runs WHERE operation_id=$1`, op.ID).Scan(&planned); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(planned), "no canonical manifest reference") {
+		t.Fatalf("historical row was not reported as preserved: %s", planned)
+	}
+}
+
+func TestIntegrationRetentionStartupMaintenanceProtectsAmbiguousRuntime(t *testing.T) {
+	t.Setenv("EREGION_NODE_STATE_DIR", "")
+	fixture := newRetentionFixture(t)
+	ctx := context.Background()
+	oldConfig := "sha256:" + strings.Repeat("a", 64)
+	altConfig := "sha256:" + strings.Repeat("e", 64)
+	var sharedImage string
+	if err := fixture.pool.QueryRow(ctx, `SELECT image FROM eregion_platform_releases WHERE id=$1`, fixture.oldID).Scan(&sharedImage); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.pool.Exec(ctx, `UPDATE eregion_platform_releases SET image=$1 WHERE id=$2`, sharedImage, fixture.newID); err != nil {
+		t.Fatal(err)
+	}
+	fixture.transport.inventory.LocalImages = append(fixture.transport.inventory.LocalImages,
+		retention.LocalImage{ID: altConfig, RepoDigests: []string{sharedImage}})
+
+	run, err := New(newTestEntities(t, fixture.pool), integrationDiscardLogger(), WorkerConfig{
+		Concurrency: 1, TestOnly: true, Transport: fixture.transport, LocalNodeName: "local", NodeStateDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.Service.transport = fixture.transport
+	run.Service.localNode = "local"
+	startWorkers(t, run)
+	var daily contract.OperationID
+	await(t, 30*time.Second, func() bool {
+		return fixture.pool.QueryRow(ctx, `SELECT id FROM eregion_operations
+			WHERE kind=$1 AND idempotency_key LIKE $2 ORDER BY created_at DESC LIMIT 1`,
+			platform.KindRetentionPrune, retentionDailyKeyPrefix+"%").Scan(&daily) == nil
+	})
+	await(t, 30*time.Second, func() bool {
+		var state contract.State
+		return fixture.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, daily).Scan(&state) == nil && state.Terminal()
+	})
+	for _, payload := range fixture.transport.payloads {
+		if payload.Kind == string(retention.ItemImage) && (payload.Reference == oldConfig || payload.Reference == altConfig) {
+			t.Fatalf("startup maintenance deleted an ambiguous retained runtime image: %+v", payload)
+		}
 	}
 }

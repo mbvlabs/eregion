@@ -3,7 +3,6 @@ package doctor
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/retention"
 )
 
@@ -95,67 +94,61 @@ func loadRetentionFacts(ctx context.Context, dsn string, facts *RetentionFacts, 
 		return
 	}
 	defer pool.Close()
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		facts.Error = "the control database connection could not be created"
+		return
+	}
 
 	queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	loadRetentionPolicyCap(queryCtx, pool, cache)
+	loadRetentionPolicyCap(queryCtx, store, cache)
 
-	var finished *time.Time
-	var cacheBytes *int64
-	var cacheMeasuredAt *time.Time
-	var cacheError string
-	var runErrors []byte
-	err = pool.QueryRow(queryCtx, `SELECT status,started_at,finished_at,
-        jsonb_array_length(planned_items),jsonb_array_length(removed_items),
-        planned_bytes,reclaimed_bytes,jsonb_array_length(errors),errors,
-        coalesce(errors->0->>'message',''),
-        cache_bytes,cache_measured_at,cache_measurement_error
-        FROM eregion_retention_runs
-        ORDER BY started_at DESC,id DESC LIMIT 1`).
-		Scan(&facts.LastRun.Status, &facts.LastRun.StartedAt, &finished,
-			&facts.LastRun.PlannedItems, &facts.LastRun.RemovedItems,
-			&facts.LastRun.PlannedBytes, &facts.LastRun.ReclaimedBytes, &facts.LastRun.Errors, &runErrors,
-			&facts.LastRun.Error,
-			&cacheBytes, &cacheMeasuredAt, &cacheError)
+	run, found, err := store.Retention().LastRunFacts(queryCtx)
 	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		facts.Known = true
-		facts.WorkerAge, facts.WorkerAgeKnown = workerActiveAge(ctx)
-		cache.Error = "no retention run has recorded a Buildpacks cache measurement yet"
-		return
 	case err != nil:
 		facts.Error = "the retention runs could not be read"
 		cache.Error = facts.Error
 		return
+	case !found:
+		facts.Known = true
+		facts.WorkerAge, facts.WorkerAgeKnown = workerActiveAge(ctx)
+		cache.Error = "no retention run has recorded a Buildpacks cache measurement yet"
+		return
 	}
 	facts.HasRun = true
-	facts.LastRun.FinishedAt = finished
-	facts.LastRun.Skipped = countRetentionSkips(runErrors)
+	facts.LastRun.Status = retention.RunStatus(run.Status)
+	facts.LastRun.StartedAt = run.StartedAt
+	facts.LastRun.FinishedAt = run.FinishedAt
+	facts.LastRun.PlannedItems = run.PlannedItems
+	facts.LastRun.RemovedItems = run.RemovedItems
+	facts.LastRun.PlannedBytes = run.PlannedBytes
+	facts.LastRun.ReclaimedBytes = run.ReclaimedBytes
+	facts.LastRun.Errors = run.Errors
+	facts.LastRun.Error = run.FirstError
+	facts.LastRun.Skipped = countRetentionSkips(run.ErrorsRaw)
 	facts.Known = true
-	applyBuildCacheMeasurement(cache, cacheBytes, cacheMeasuredAt, cacheError, time.Now().UTC())
+	applyBuildCacheMeasurement(cache, run.CacheBytes, run.CacheMeasuredAt, run.CacheMeasurementError, time.Now().UTC())
 
-	var success *time.Time
-	if err := pool.QueryRow(queryCtx, `SELECT coalesce(finished_at,started_at) FROM eregion_retention_runs
-        WHERE status IN ('succeeded','succeeded_with_skips') ORDER BY finished_at DESC NULLS LAST,started_at DESC LIMIT 1`).Scan(&success); err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
-			facts.Known = false
-			facts.Error = "the last successful retention run could not be read"
-			return
-		}
+	success, ok, err := store.Retention().LastSuccessAt(queryCtx)
+	if err != nil {
+		facts.Known = false
+		facts.Error = "the last successful retention run could not be read"
+		return
 	}
-	if success != nil {
+	if ok && success != nil {
 		facts.LastSuccessAt = success.UTC()
 	}
 }
 
-func loadRetentionPolicyCap(ctx context.Context, pool *pgxpool.Pool, cache *BuildCacheFacts) {
+func loadRetentionPolicyCap(ctx context.Context, store *entities.Store, cache *BuildCacheFacts) {
 	policy := retention.DefaultPolicy()
-	var raw []byte
-	if err := pool.QueryRow(ctx, `SELECT retention FROM eregion_server_settings WHERE singleton`).Scan(&raw); err != nil {
+	settings, found, err := store.Retention().GetServerSettings(ctx)
+	if err != nil || !found {
 		return
 	}
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &policy); err != nil {
+	if len(settings.Retention) > 0 {
+		if err := json.Unmarshal(settings.Retention, &policy); err != nil {
 			return
 		}
 	}
@@ -163,7 +156,6 @@ func loadRetentionPolicyCap(ctx context.Context, pool *pgxpool.Pool, cache *Buil
 		cache.CapBytes = policy.BuildpackCacheMaxBytes
 	}
 }
-
 func countRetentionSkips(raw []byte) int {
 	items := []retention.RunError{}
 	if len(raw) == 0 || json.Unmarshal(raw, &items) != nil {

@@ -3,11 +3,9 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/retention"
@@ -18,16 +16,15 @@ import (
 // field added by a later release inherits its default instead of reading zero.
 func (s *Service) ServerRetentionPolicy(ctx context.Context) (retention.Policy, error) {
 	policy := retention.DefaultPolicy()
-	var raw []byte
-	err := s.pool.QueryRow(ctx, `SELECT retention FROM eregion_server_settings WHERE singleton`).Scan(&raw)
-	if errors.Is(err, pgx.ErrNoRows) {
+	settings, found, err := s.entities.Retention().GetServerSettings(ctx)
+	if err != nil {
+		return retention.Policy{}, unavailable(err)
+	}
+	if !found {
 		return policy, nil
 	}
-	if err != nil {
-		return retention.Policy{}, unavailable()
-	}
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &policy); err != nil {
+	if len(settings.Retention) > 0 {
+		if err := json.Unmarshal(settings.Retention, &policy); err != nil {
 			return retention.Policy{}, unavailable(err)
 		}
 	}
@@ -47,10 +44,8 @@ func (s *Service) SetServerRetentionPolicy(ctx context.Context, policy retention
 	if err != nil {
 		return unavailable(err)
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO eregion_server_settings (singleton,retention,retention_gc_pending,updated_at)
-        VALUES (true,$1,false,clock_timestamp())
-        ON CONFLICT (singleton) DO UPDATE SET retention=EXCLUDED.retention, updated_at=clock_timestamp()`, raw); err != nil {
-		return unavailable()
+	if err := s.entities.Retention().SetServerPolicy(ctx, raw); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -64,16 +59,12 @@ func (s *Service) EffectiveRetentionPolicy(ctx context.Context, app, environment
 		return retention.Policy{}, err
 	}
 	var raw []byte
-	err = s.pool.QueryRow(ctx, `SELECT coalesce(r.retention,'{}'::jsonb)
-        FROM eregion_platform_environments e
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        LEFT JOIN eregion_platform_environment_revisions r ON r.id=e.current_revision_id
-        WHERE a.name=$1 AND e.name=$2`, app, environment).Scan(&raw)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return retention.Policy{}, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
-	}
+	raw, found, err := s.entities.Platform().Environments().RetentionOverride(ctx, app, environment)
 	if err != nil {
-		return retention.Policy{}, unavailable()
+		return retention.Policy{}, unavailable(err)
+	}
+	if !found {
+		return retention.Policy{}, contract.NewFault(contract.NotFound, "environment not found", "Create the environment under this app first.")
 	}
 	override := retention.Override{}
 	if len(raw) > 0 {

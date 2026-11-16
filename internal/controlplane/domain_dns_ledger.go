@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
+	"github.com/mbvlabs/eregion/internal/vault"
 )
 
 const (
@@ -40,71 +42,54 @@ type domainDNSLedger struct {
 	CleanupError      string
 }
 
-const domainDNSLedgerSelect = `SELECT x.domain_id,d.name,a.name,e.name,x.provider,x.zone_id,x.zone_name,
-    x.ownership_marker,x.generation,x.desired_origins,x.desired_proxied,x.state,x.last_operation_id,
-    x.last_error,x.applied_generation,x.cleanup_error
-    FROM eregion_platform_domain_dns x
-    JOIN eregion_platform_domains d ON d.id=x.domain_id
-    JOIN eregion_platform_environments e ON e.id=d.environment_id
-    JOIN eregion_platform_apps a ON a.id=e.app_id`
-
-func scanDomainDNSLedger(row pgx.Row) (domainDNSLedger, error) {
-	var ledger domainDNSLedger
-	err := row.Scan(&ledger.DomainID, &ledger.Domain, &ledger.App, &ledger.Environment, &ledger.Provider,
-		&ledger.ZoneID, &ledger.ZoneName, &ledger.Ownership, &ledger.Generation, &ledger.DesiredOrigins,
-		&ledger.DesiredProxied, &ledger.State, &ledger.LastOperationID, &ledger.LastError,
-		&ledger.AppliedGeneration, &ledger.CleanupError)
-	return ledger, err
+func domainDNSLedgerFromEntities(ledger entities.DomainDNSLedger) domainDNSLedger {
+	return domainDNSLedger{
+		DomainID: ledger.DomainID, Domain: ledger.Domain, App: ledger.App, Environment: ledger.Environment,
+		Provider: ledger.Provider, ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName,
+		Ownership: ledger.OwnershipMarker, Generation: ledger.Generation,
+		DesiredOrigins: ledger.DesiredOrigins, DesiredProxied: ledger.DesiredProxied,
+		State: ledger.State, LastOperationID: ledger.LastOperationID, LastError: ledger.LastError,
+		AppliedGeneration: ledger.AppliedGeneration, CleanupError: ledger.CleanupError,
+	}
 }
 
 func (s *Service) loadDomainDNSLedger(ctx context.Context, app, environment, domain string) (*domainDNSLedger, error) {
-	ledger, err := scanDomainDNSLedger(s.pool.QueryRow(ctx, domainDNSLedgerSelect+`
-        WHERE a.name=$1 AND e.name=$2 AND d.name=$3`, app, environment, domain))
-	if errors.Is(err, pgx.ErrNoRows) {
+	ledger, found, err := s.entities.Platform().DomainDNS().GetByAppEnvironmentDomain(ctx, app, environment, domain)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	if !found {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, unavailable()
-	}
-	return &ledger, nil
+	mapped := domainDNSLedgerFromEntities(ledger)
+	return &mapped, nil
 }
 
-func loadDomainDNSLedgerByDomainIDTx(ctx context.Context, tx pgx.Tx, domainID platform.DomainID) (*domainDNSLedger, error) {
-	ledger, err := scanDomainDNSLedger(tx.QueryRow(ctx, domainDNSLedgerSelect+`
-        WHERE x.domain_id=$1`, domainID))
-	if errors.Is(err, pgx.ErrNoRows) {
+func loadDomainDNSLedgerByDomainIDTx(ctx context.Context, tx *entities.StoreTx, domainID platform.DomainID) (*domainDNSLedger, error) {
+	ledger, found, err := tx.Platform().DomainDNS().GetByDomainID(ctx, domainID)
+	if err != nil {
+		return nil, unavailable(err)
+	}
+	if !found {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, unavailable()
-	}
-	return &ledger, nil
+	mapped := domainDNSLedgerFromEntities(ledger)
+	return &mapped, nil
 }
 
 func (s *Service) loadDomainDNSLedgersForEnvironments(ctx context.Context, environmentIDs []platform.EnvironmentID) ([]domainDNSLedger, error) {
 	if len(environmentIDs) == 0 {
 		return nil, nil
 	}
-	ids := make([]string, len(environmentIDs))
-	for index, id := range environmentIDs {
-		ids[index] = string(id)
-	}
-	rows, err := s.pool.Query(ctx, domainDNSLedgerSelect+`
-        WHERE e.id = ANY($1)
-        ORDER BY a.name,e.name,d.name`, ids)
+	rows, err := s.entities.Platform().DomainDNS().ListForEnvironments(ctx, environmentIDs)
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	var ledgers []domainDNSLedger
-	for rows.Next() {
-		ledger, err := scanDomainDNSLedger(rows)
-		if err != nil {
-			return nil, unavailable()
-		}
-		ledgers = append(ledgers, ledger)
+	ledgers := make([]domainDNSLedger, 0, len(rows))
+	for _, row := range rows {
+		ledgers = append(ledgers, domainDNSLedgerFromEntities(row))
 	}
-	return ledgers, rows.Err()
+	return ledgers, nil
 }
 
 func managedDNSBinding(ledger domainDNSLedger) platform.ManagedDNSBinding {
@@ -157,6 +142,26 @@ func (s *Service) resolveDomainDNSZone(ctx context.Context, ref string) (integra
 	return zone, nil
 }
 
+// resolveDomainDNSZoneTx resolves the same exact zone reference as
+// CloudflareCredentialStore.DNSZone from the admission transaction's provider
+// metadata. An open snapshot must never borrow a second pool connection.
+func (s *Service) resolveDomainDNSZoneTx(ctx context.Context, tx *entities.StoreTx, ref string) (integrations.DNSZone, error) {
+	if s.domainDNS == nil {
+		return integrations.DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare DNS is not configured on this control plane", "Configure a provider credential with eregion dns configure --provider cloudflare; manual DNS remains the default.")
+	}
+	ref = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(ref), "."))
+	metadata, err := tx.Providers().ListProviderMetadata(ctx, vault.ProviderCloudflare, vault.MaxProviderZones)
+	if err != nil {
+		return integrations.DNSZone{}, unavailable(err)
+	}
+	for _, zone := range metadata {
+		if zone.ZoneID == ref || strings.EqualFold(zone.ZoneName, ref) {
+			return integrations.DNSZone{ZoneID: zone.ZoneID, ZoneName: zone.ZoneName}, nil
+		}
+	}
+	return integrations.DNSZone{}, contract.NewFault(contract.InputRequired, "Cloudflare zone is not configured on this control plane", "Configure it with eregion dns configure --provider cloudflare; manual DNS remains the default.")
+}
+
 func (s *Service) validateDomainDNSCleanupRecovery(ledger domainDNSLedger) error {
 	zone := integrations.DNSZone{ZoneID: ledger.ZoneID, ZoneName: ledger.ZoneName}
 	if err := integrations.ValidateDomainDNSHost(zone, ledger.Domain); err != nil {
@@ -172,30 +177,21 @@ func (s *Service) validateDomainDNSCleanupRecovery(ledger domainDNSLedger) error
 	return nil
 }
 
-func (s *Service) ensureDomainDNSCleanupSafeTx(ctx context.Context, tx pgx.Tx, actor contract.Actor, app, environment string) error {
-	rows, err := tx.Query(ctx, `SELECT d.name,x.zone_id,x.zone_name,x.state,x.applied_generation
-        FROM eregion_platform_domain_dns x
-        JOIN eregion_platform_domains d ON d.id=x.domain_id
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE a.name=$1 AND ($2='' OR e.name=$2)`, app, environment)
+func (s *Service) ensureDomainDNSCleanupSafeTx(ctx context.Context, tx *entities.StoreTx, actor contract.Actor, app, environment string) error {
+	rows, err := tx.Platform().DomainDNS().CleanupViolations(ctx, app, environment)
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
-	defer rows.Close()
 	found := false
-	for rows.Next() {
+	for _, row := range rows {
 		found = true
-		var ledger domainDNSLedger
-		if err := rows.Scan(&ledger.Domain, &ledger.ZoneID, &ledger.ZoneName, &ledger.State, &ledger.AppliedGeneration); err != nil {
-			return unavailable()
+		ledger := domainDNSLedger{
+			Domain: row.Domain, ZoneID: row.ZoneID, ZoneName: row.ZoneName,
+			State: row.State, AppliedGeneration: row.AppliedGeneration,
 		}
 		if err := s.validateDomainDNSCleanupRecovery(ledger); err != nil {
 			return err
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return unavailable()
 	}
 	if found {
 		return s.authorizeDomainDNSWrite(ctx, actor)
@@ -203,32 +199,19 @@ func (s *Service) ensureDomainDNSCleanupSafeTx(ctx context.Context, tx pgx.Tx, a
 	return nil
 }
 
-func upsertDomainDNSIntentTx(ctx context.Context, tx pgx.Tx, domainID platform.DomainID, zone integrations.DNSZone, origins []string, proxied bool, opID contract.OperationID) error {
+func upsertDomainDNSIntentTx(ctx context.Context, tx *entities.StoreTx, domainID platform.DomainID, zone integrations.DNSZone, origins []string, proxied bool, opID contract.OperationID) error {
 	marker := integrations.DomainDNSOwnership(string(domainID), zone.ZoneID)
-	var existingZone string
-	err := tx.QueryRow(ctx, `SELECT zone_id FROM eregion_platform_domain_dns WHERE domain_id=$1 FOR UPDATE`, domainID).Scan(&existingZone)
-	switch {
-	case err == nil && existingZone != zone.ZoneID:
+	existingZone, found, err := tx.Platform().DomainDNS().LockLedger(ctx, domainID)
+	if err != nil {
+		return unavailable(err)
+	}
+	if found && existingZone != zone.ZoneID {
 		return contract.NewFault(contract.Conflict,
 			"managed DNS zone cannot change on an existing binding",
 			"Remove the binding and its managed records first, then add it with the new zone.")
-	case err == nil:
-		if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
-            SET generation=generation+1,desired_origins=$2,desired_proxied=$3,
-                state='pending',last_operation_id=$4,last_error='',
-                cleanup_requested_at=NULL,cleanup_verified_at=NULL,cleanup_error='',updated_at=clock_timestamp()
-            WHERE domain_id=$1`, domainID, origins, proxied, opID); err != nil {
-			return unavailable()
-		}
-	case errors.Is(err, pgx.ErrNoRows):
-		if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domain_dns
-            (domain_id,provider,zone_id,zone_name,ownership_marker,generation,desired_origins,desired_proxied,state,last_operation_id,last_error,applied_generation,cleanup_error,created_at,updated_at)
-            VALUES($1,'cloudflare',$2,$3,$4,1,$5,$6,'pending',$7,'',0,'',clock_timestamp(),clock_timestamp())`,
-			domainID, zone.ZoneID, zone.ZoneName, marker, origins, proxied, opID); err != nil {
-			return unavailable()
-		}
-	default:
-		return unavailable()
+	}
+	if _, err := tx.Platform().DomainDNS().UpsertIntent(ctx, domainID, zone.ZoneID, zone.ZoneName, marker, origins, proxied, opID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
@@ -236,95 +219,71 @@ func upsertDomainDNSIntentTx(ctx context.Context, tx pgx.Tx, domainID platform.D
 // fenceDomainDNSOperationTx makes a non-provider domain add (for example a
 // primary promotion or check-path update) the newest operation for a managed
 // binding without changing its desired provider state.
-func fenceDomainDNSOperationTx(ctx context.Context, tx pgx.Tx, domainID platform.DomainID, opID contract.OperationID) error {
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
-        SET last_operation_id=$2,updated_at=clock_timestamp() WHERE domain_id=$1`, domainID, opID); err != nil {
-		return unavailable()
+func fenceDomainDNSOperationTx(ctx context.Context, tx *entities.StoreTx, domainID platform.DomainID, opID contract.OperationID) error {
+	if _, err := tx.Platform().DomainDNS().FenceOperation(ctx, domainID, opID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
-func insertDomainDNSCleanupIntentTx(ctx context.Context, tx pgx.Tx, domainID platform.DomainID, zone integrations.DNSZone, opID contract.OperationID) error {
+func insertDomainDNSCleanupIntentTx(ctx context.Context, tx *entities.StoreTx, domainID platform.DomainID, zone integrations.DNSZone, opID contract.OperationID) error {
 	marker := integrations.DomainDNSOwnership(string(domainID), zone.ZoneID)
-	if _, err := tx.Exec(ctx, `INSERT INTO eregion_platform_domain_dns
-        (domain_id,provider,zone_id,zone_name,ownership_marker,generation,desired_origins,desired_proxied,
-         state,last_operation_id,cleanup_requested_at,last_error,applied_generation,cleanup_error,created_at,updated_at)
-        VALUES($1,'cloudflare',$2,$3,$4,1,'{}',false,'cleanup_pending',$5,clock_timestamp(),'',0,'',clock_timestamp(),clock_timestamp())`,
-		domainID, zone.ZoneID, zone.ZoneName, marker, opID); err != nil {
-		return unavailable()
+	if _, err := tx.Platform().DomainDNS().InsertCleanupIntent(ctx, domainID, zone.ZoneID, zone.ZoneName, marker, opID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
-func markDomainDNSCleanupTx(ctx context.Context, tx pgx.Tx, domainID platform.DomainID, opID contract.OperationID) error {
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
-        SET state='cleanup_pending',last_operation_id=$2,cleanup_requested_at=clock_timestamp(),cleanup_verified_at=NULL,
-            last_error='',cleanup_error='',updated_at=clock_timestamp()
-        WHERE domain_id=$1`, domainID, opID); err != nil {
-		return unavailable()
+func markDomainDNSCleanupTx(ctx context.Context, tx *entities.StoreTx, domainID platform.DomainID, opID contract.OperationID) error {
+	if _, err := tx.Platform().DomainDNS().MarkCleanupPending(ctx, domainID, opID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
-func markDomainDNSCleanupForEnvironmentsTx(ctx context.Context, tx pgx.Tx, app, environment string, opID contract.OperationID) error {
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns x
-        SET state='cleanup_pending',last_operation_id=$3,cleanup_requested_at=clock_timestamp(),cleanup_verified_at=NULL,
-            last_error='',cleanup_error='',updated_at=clock_timestamp()
-        FROM eregion_platform_domains d
-        JOIN eregion_platform_environments e ON e.id=d.environment_id
-        JOIN eregion_platform_apps a ON a.id=e.app_id
-        WHERE d.id=x.domain_id AND a.name=$1 AND ($2='' OR e.name=$2)`, app, environment, opID); err != nil {
-		return unavailable()
+func markDomainDNSCleanupForEnvironmentsTx(ctx context.Context, tx *entities.StoreTx, app, environment string, opID contract.OperationID) error {
+	if _, err := tx.Platform().DomainDNS().MarkCleanupPendingForEnvironments(ctx, app, environment, opID); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
 func (s *Service) markDomainDNSCleanupVerified(ctx context.Context, ledger domainDNSLedger, opID contract.OperationID) (bool, error) {
-	tag, err := s.pool.Exec(ctx, `UPDATE eregion_platform_domain_dns
-        SET state='cleanup_verified',last_operation_id=$2,cleanup_verified_at=clock_timestamp(),
-            cleanup_error='',updated_at=clock_timestamp()
-        WHERE domain_id=$1 AND last_operation_id=$2`, ledger.DomainID, opID)
+	rows, err := s.entities.Platform().DomainDNS().MarkCleanupVerified(ctx, ledger.DomainID, opID)
 	if err != nil {
-		return false, unavailable()
+		return false, unavailable(err)
 	}
-	return tag.RowsAffected() == 1, nil
+	return rows == 1, nil
 }
 
-func markDomainDNSCleanupFailed(ctx context.Context, tx pgx.Tx, domainID platform.DomainID, opID contract.OperationID, message string) error {
-	if _, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
-        SET state='cleanup_failed',last_operation_id=$2,cleanup_error=$3,updated_at=clock_timestamp()
-        WHERE domain_id=$1 AND last_operation_id=$2`, domainID, opID, boundedRouteError(message)); err != nil {
-		return unavailable()
+func markDomainDNSCleanupFailed(ctx context.Context, tx *entities.StoreTx, domainID platform.DomainID, opID contract.OperationID, message string) error {
+	if _, err := tx.Platform().DomainDNS().MarkCleanupFailed(ctx, domainID, opID, boundedRouteError(message)); err != nil {
+		return unavailable(err)
 	}
 	return nil
 }
 
-func markDomainDNSApplied(ctx context.Context, tx pgx.Tx, ledger domainDNSLedger, opID contract.OperationID) (bool, error) {
-	tag, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
-        SET state='applied',applied_generation=generation,applied_at=clock_timestamp(),
-            last_error='',updated_at=clock_timestamp()
-        WHERE domain_id=$1 AND last_operation_id=$2`, ledger.DomainID, opID)
+func markDomainDNSApplied(ctx context.Context, tx *entities.StoreTx, ledger domainDNSLedger, opID contract.OperationID) (bool, error) {
+	rows, err := tx.Platform().DomainDNS().MarkApplied(ctx, ledger.DomainID, opID)
 	if err != nil {
-		return false, unavailable()
+		return false, unavailable(err)
 	}
-	return tag.RowsAffected() == 1, nil
+	return rows == 1, nil
 }
 
-func markDomainDNSFailed(ctx context.Context, tx pgx.Tx, ledger domainDNSLedger, opID contract.OperationID, message string) error {
-	tag, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns
-        SET state='failed',last_error=$2,updated_at=clock_timestamp()
-        WHERE domain_id=$1 AND last_operation_id=$3 AND generation=$4`, ledger.DomainID, boundedRouteError(message), opID, ledger.Generation)
+func markDomainDNSFailed(ctx context.Context, tx *entities.StoreTx, ledger domainDNSLedger, opID contract.OperationID, message string) error {
+	rows, err := tx.Platform().DomainDNS().MarkFailed(ctx, ledger.DomainID, opID, ledger.Generation, boundedRouteError(message))
 	if err != nil {
-		return unavailable()
+		return unavailable(err)
 	}
-	if tag.RowsAffected() != 1 {
+	if rows != 1 {
 		return definitionDNSConflict()
 	}
 	return nil
 }
 
-func (s *Service) finishDomainOperation(ctx context.Context, id contract.OperationID, attempt uint32, finalize func(pgx.Tx, *contract.Operation) error) error {
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+func (s *Service) finishDomainOperation(ctx context.Context, id contract.OperationID, attempt uint32, finalize func(*entities.StoreTx, *contract.Operation) error) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
 		}
@@ -397,7 +356,7 @@ func (s *Service) applyDomainDNSLedger(ctx context.Context, op contract.Operatio
 		}
 	}
 	var marked bool
-	_, owned, err := s.mutateOwned(ctx, op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
 		if current.State.Terminal() {
 			return nil
 		}
@@ -523,16 +482,15 @@ func (s *Service) cleanupDomainDNSLedger(ctx context.Context, op contract.Operat
 		if len(step.Cleanup.Changes) > 0 {
 			// Persist a conservative in-flight fence before any DELETE. A
 			// restarted attempt must read back, never redispatch the cleanup.
-			_, owned, err := s.mutateOwned(ctx, op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+			_, owned, err := s.mutateOwned(ctx, op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
 				if current.State != contract.Running {
 					return errPlatformCancelled
 				}
-				tag, err := tx.Exec(ctx, `UPDATE eregion_platform_domain_dns SET cleanup_error=$4,updated_at=clock_timestamp()
-					WHERE domain_id=$1 AND last_operation_id=$2 AND generation=$3 AND state='cleanup_pending' AND cleanup_error=''`, ledger.DomainID, op.ID, ledger.Generation, definitionCleanupUnknown)
+				rows, err := tx.Platform().DomainDNS().SetCleanupError(ctx, ledger.DomainID, op.ID, ledger.Generation, definitionCleanupUnknown)
 				if err != nil {
 					return unavailable(err)
 				}
-				if tag.RowsAffected() != 1 {
+				if rows != 1 {
 					return definitionDNSConflict()
 				}
 				return nil
@@ -589,7 +547,7 @@ func (s *Service) markCleanupFailure(ctx context.Context, op contract.Operation,
 			message = "definitive cleanup rejection: " + providerFailure.DefinitiveRecordDigest + " " + message
 		}
 	}
-	_, _, _ = s.mutateOwned(context.WithoutCancel(ctx), op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+	_, _, _ = s.mutateOwned(context.WithoutCancel(ctx), op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
 		if current.State.Terminal() {
 			return nil
 		}
@@ -616,7 +574,7 @@ func (s *Service) recordDomainDNSFailure(ctx context.Context, op contract.Operat
 			message = "definitive write rejection: " + message
 		}
 	}
-	_, owned, err := s.mutateOwned(context.WithoutCancel(ctx), op.ID, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+	_, owned, err := s.mutateOwned(context.WithoutCancel(ctx), op.ID, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
 		if current.State.Terminal() {
 			return nil
 		}

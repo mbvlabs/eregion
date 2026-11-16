@@ -36,7 +36,7 @@ func testRegistryHostIdentityFor(node, stateDir string) RegistryHostIdentity {
 func ensureTestRegistryHost(t *testing.T, pool *pgxpool.Pool, stateDir string) RegistryHostIdentity {
 	t.Helper()
 	ctx := context.Background()
-	workspace, err := ReadWorkspace(ctx, pool)
+	workspace, err := ReadWorkspace(ctx, newTestEntities(t, pool))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func ensureTestRegistryHost(t *testing.T, pool *pgxpool.Pool, stateDir string) R
 		t.Fatal(err)
 	}
 	identity := testRegistryHostIdentityFor("main", canonicalStateDir)
-	assigned, err := AssignWorkspace(ctx, pool, "test", identity)
+	assigned, err := AssignWorkspace(ctx, newTestEntities(t, pool), "test", identity)
 	if err != nil {
 		t.Fatal(err)
 	}

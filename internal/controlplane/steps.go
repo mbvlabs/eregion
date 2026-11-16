@@ -3,13 +3,12 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 )
@@ -29,65 +28,54 @@ type StepRecord struct {
 	Result      json.RawMessage      `json:"result,omitempty"`
 }
 
-const stepColumns = `operation_id,step,inputs_hash,state,attempt,execution_id,started_at,completed_at,error,error_code,result`
-
-func scanStep(row pgx.Row) (StepRecord, error) {
-	var step StepRecord
-	var result []byte
-	err := row.Scan(&step.OperationID, &step.Step, &step.InputsHash, &step.State, &step.Attempt, &step.ExecutionID, &step.StartedAt, &step.CompletedAt, &step.Error, &step.ErrorCode, &result)
-	if err != nil {
-		return step, err
+func stepRecordFromEntities(record entities.StepRecord) StepRecord {
+	return StepRecord{
+		OperationID: record.OperationID, Step: record.Step, InputsHash: record.InputsHash,
+		State: record.State, Attempt: record.Attempt, ExecutionID: record.ExecutionID,
+		StartedAt: record.StartedAt, CompletedAt: record.CompletedAt, Error: record.Error,
+		ErrorCode: record.ErrorCode, Result: record.Result,
 	}
-	if len(result) > 0 {
-		step.Result = result
-	}
-	return step, nil
 }
 
 func (s *Service) stepRecord(ctx context.Context, id contract.OperationID, step string) (StepRecord, bool, error) {
-	record, err := scanStep(s.pool.QueryRow(ctx, "SELECT "+stepColumns+" FROM eregion_operation_steps WHERE operation_id=$1 AND step=$2", id, step))
-	if errors.Is(err, pgx.ErrNoRows) {
+	record, found, err := s.entities.Steps().Get(ctx, id, step)
+	if err != nil {
+		return StepRecord{}, false, unavailable(err)
+	}
+	if !found {
 		return StepRecord{}, false, nil
 	}
-	if err != nil {
-		return StepRecord{}, false, unavailable()
-	}
-	return record, true, nil
+	return stepRecordFromEntities(record), true, nil
 }
 
 func (s *Service) stepRecords(ctx context.Context, id contract.OperationID) ([]StepRecord, error) {
-	rows, err := s.pool.Query(ctx, "SELECT "+stepColumns+" FROM eregion_operation_steps WHERE operation_id=$1 ORDER BY step", id)
+	records, err := s.entities.Steps().List(ctx, id)
 	if err != nil {
-		return nil, unavailable()
+		return nil, unavailable(err)
 	}
-	defer rows.Close()
-	var records []StepRecord
-	for rows.Next() {
-		record, err := scanStep(rows)
-		if err != nil {
-			return nil, unavailable()
-		}
-		records = append(records, record)
+	result := make([]StepRecord, 0, len(records))
+	for _, record := range records {
+		result = append(result, stepRecordFromEntities(record))
 	}
-	if err := rows.Err(); err != nil {
-		return nil, unavailable()
-	}
-	return records, nil
+	return result, nil
 }
 
 // claimAttempt makes this River attempt the operation's owner. A newer attempt
 // already in the database is not displaced.
 func (s *Service) claimAttempt(ctx context.Context, id contract.OperationID, attempt uint32, stage string) (contract.Operation, json.RawMessage, bool, error) {
 	var input json.RawMessage
-	op, claimed, err := s.mutateOwnedOrClaim(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	op, claimed, err := s.mutateOwnedOrClaim(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State == contract.Queued {
 			if err := transition(ctx, tx, op, contract.Running, "", "Diagnostic worker started through node dispatch."); err != nil {
 				return err
 			}
 		}
-		var raw []byte
-		if err := tx.QueryRow(ctx, "UPDATE eregion_operations SET attempt=$2 WHERE id=$1 RETURNING input", op.ID, op.Attempt).Scan(&raw); err != nil {
+		raw, found, err := tx.Operations().ClaimAttempt(ctx, op.ID, op.Attempt)
+		if err != nil {
 			return err
+		}
+		if !found {
+			return contract.NewFault(contract.NotFound, "operation disappeared while it was claimed", "Inspect operation history; do not resubmit accepted work.")
 		}
 		input = raw
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: stage, Message: "Node dispatch attempt started."})
@@ -97,50 +85,50 @@ func (s *Service) claimAttempt(ctx context.Context, id contract.OperationID, att
 
 // mutateOwnedOrClaim is mutateOwned, but it lets a strictly newer River attempt
 // take ownership and refuses an older one.
-func (s *Service) mutateOwnedOrClaim(ctx context.Context, id contract.OperationID, attempt uint32, change func(pgx.Tx, *contract.Operation) error) (contract.Operation, bool, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return contract.Operation{}, false, unavailable()
-	}
-	defer rollback(tx)
-	op, err := scanOperation(tx.QueryRow(ctx, "SELECT "+columns+" FROM eregion_operations WHERE id=$1 FOR UPDATE", id))
-	if err != nil {
-		return op, false, unavailable()
-	}
-	if op.State.Terminal() || op.Attempt > attempt {
-		if err := tx.Commit(ctx); err != nil {
-			return op, false, unavailable()
+func (s *Service) mutateOwnedOrClaim(ctx context.Context, id contract.OperationID, attempt uint32, change func(*entities.StoreTx, *contract.Operation) error) (contract.Operation, bool, error) {
+	var op contract.Operation
+	claimed := false
+	err := s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		current, found, err := tx.Operations().Lock(ctx, id)
+		if err != nil || !found {
+			return unavailable(err)
 		}
-		return op, false, nil
-	}
-	if op.Attempt < attempt {
-		op.Attempt = attempt
-	}
-	if err := change(tx, &op); err != nil {
+		op = current
+		if op.State.Terminal() || op.Attempt > attempt {
+			return nil
+		}
+		if op.Attempt < attempt {
+			op.Attempt = attempt
+		}
+		if err := change(tx, &op); err != nil {
+			return err
+		}
+		claimed = true
+		return nil
+	})
+	if err != nil {
+		if entities.IsBeginFailure(err) || entities.IsCommitFailure(err) {
+			return op, false, unavailable(err)
+		}
 		return op, false, err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return op, false, unavailable()
-	}
-	return op, true, nil
+	return op, claimed, nil
 }
 
 // beginStep durably records a running step before dispatch. A completed step is
 // never reopened; a failed or stale running step may be retried.
 func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string) (bool, error) {
 	already := false
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		record, err := scanStep(tx.QueryRow(ctx, "SELECT "+stepColumns+" FROM eregion_operation_steps WHERE operation_id=$1 AND step=$2 FOR UPDATE", id, step))
-		if errors.Is(err, pgx.ErrNoRows) {
-			if _, err := tx.Exec(ctx, `INSERT INTO eregion_operation_steps
-                (operation_id,step,inputs_hash,state,attempt,execution_id,started_at,error,error_code) VALUES ($1,$2,$3,'running',$4,$5,clock_timestamp(),'','')`,
-				id, step, inputsHash, attempt, executionID); err != nil {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		record, found, err := tx.Steps().GetForUpdate(ctx, id, step)
+		if err != nil {
+			return unavailable(err)
+		}
+		if !found {
+			if err := tx.Steps().Insert(ctx, id, step, inputsHash, attempt, executionID); err != nil {
 				return err
 			}
 			return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: step, ExecutionID: executionID, Message: "Node step started."})
-		}
-		if err != nil {
-			return err
 		}
 		if record.InputsHash != inputsHash {
 			return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Never reuse an operation ID with different inputs; inspect the node journal.")
@@ -149,8 +137,7 @@ func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attemp
 			already = true
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='running',attempt=$3,execution_id=$4,started_at=clock_timestamp(),error='' WHERE operation_id=$1 AND step=$2`,
-			id, step, attempt, executionID); err != nil {
+		if _, err := tx.Steps().Restart(ctx, id, step, attempt, executionID); err != nil {
 			return err
 		}
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "step", Stage: step, ExecutionID: executionID, Message: "Node step retried."})
@@ -168,13 +155,13 @@ func (s *Service) beginStep(ctx context.Context, id contract.OperationID, attemp
 // changes the step row from running/failed to completed appends progress.
 func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash, executionID string, result json.RawMessage, total int) (bool, error) {
 	acked := false
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		record, err := scanStep(tx.QueryRow(ctx, "SELECT "+stepColumns+" FROM eregion_operation_steps WHERE operation_id=$1 AND step=$2 FOR UPDATE", id, step))
-		if errors.Is(err, pgx.ErrNoRows) {
-			return contract.NewFault(contract.PreconditionFailed, "node step was not started in the database", "Begin the step before acknowledging its effect.")
-		}
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		record, found, err := tx.Steps().GetForUpdate(ctx, id, step)
 		if err != nil {
-			return err
+			return unavailable(err)
+		}
+		if !found {
+			return contract.NewFault(contract.PreconditionFailed, "node step was not started in the database", "Begin the step before acknowledging its effect.")
 		}
 		if record.InputsHash != inputsHash {
 			return contract.NewFault(contract.PreconditionFailed, "step inputs changed for an existing effect", "Do not acknowledge an effect recorded with different inputs.")
@@ -182,22 +169,21 @@ func (s *Service) ackStep(ctx context.Context, id contract.OperationID, attempt 
 		if record.State == "completed" {
 			return nil
 		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='completed',completed_at=clock_timestamp(),error='',result=$3,execution_id=$4 WHERE operation_id=$1 AND step=$2`,
-			id, step, nullableJSON(result), executionID); err != nil {
+		if _, err := tx.Steps().Complete(ctx, id, step, executionID, result); err != nil {
 			return err
 		}
-		var completed int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_operation_steps WHERE operation_id=$1 AND state='completed'`, id).Scan(&completed); err != nil {
+		completed, err := tx.Steps().CountCompleted(ctx, id)
+		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE eregion_operations SET completed_steps=$2 WHERE id=$1`, id, completed); err != nil {
+		if err := tx.Operations().SetCompletedSteps(ctx, id, completed); err != nil {
 			return err
 		}
 		acked = true
 		// Cleanup and setup steps can run beyond the planned count; the
 		// measured total never falls below what has completed.
-		if completed > total {
-			total = completed
+		if int(completed) > total {
+			total = int(completed)
 		}
 		return appendEvent(ctx, tx, op, contract.Event{
 			Kind:     "progress",
@@ -224,13 +210,12 @@ func nullableJSON(raw json.RawMessage) any {
 // failStep records a failed node step without touching a completed one. The
 // error code is machine-readable: a caller does not have to read the message.
 func (s *Service) failStep(ctx context.Context, id contract.OperationID, attempt uint32, step string, code contract.Code, message string) error {
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
-		result, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='failed',completed_at=clock_timestamp(),error=$3,error_code=$4 WHERE operation_id=$1 AND step=$2 AND state<>'completed'`,
-			id, step, message, string(code))
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
+		failed, err := tx.Steps().Fail(ctx, id, step, code, message)
 		if err != nil {
 			return err
 		}
-		if result.RowsAffected() == 0 {
+		if !failed {
 			return nil
 		}
 		return appendEvent(ctx, tx, op, contract.Event{Kind: "warning", Stage: step, Message: "Node step failed: " + message})
@@ -247,7 +232,7 @@ func (s *Service) failStep(ctx context.Context, id contract.OperationID, attempt
 // finishSucceeded records terminal success without rewriting an existing terminal
 // state. All step effects are already acknowledged when this is called.
 func (s *Service) finishSucceeded(ctx context.Context, id contract.OperationID, attempt uint32) (contract.Operation, error) {
-	op, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	op, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State == contract.Succeeded {
 			return nil
 		}
@@ -270,15 +255,15 @@ func (s *Service) finishSucceeded(ctx context.Context, id contract.OperationID, 
 // finishCancelled acknowledges cancellation at a step boundary. If every effect
 // was already acknowledged, success is the honest result.
 func (s *Service) finishCancelled(ctx context.Context, id contract.OperationID, attempt uint32, total int) (contract.Operation, error) {
-	op, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	op, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		if op.State.Terminal() {
 			return nil
 		}
-		var completed int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM eregion_operation_steps WHERE operation_id=$1 AND state='completed'`, id).Scan(&completed); err != nil {
+		completed, err := tx.Steps().CountCompleted(ctx, id)
+		if err != nil {
 			return err
 		}
-		if completed == total {
+		if int(completed) == total {
 			return transition(ctx, tx, op, contract.Succeeded, "", "Cancellation arrived after the final safe boundary; all node effects were already complete.")
 		}
 		if op.State != contract.Cancelling {
@@ -298,8 +283,8 @@ func (s *Service) finishCancelled(ctx context.Context, id contract.OperationID, 
 	return op, nil
 }
 
-func markIncompleteSteps(ctx context.Context, tx pgx.Tx, id contract.OperationID, code contract.Code, message string) error {
-	_, err := tx.Exec(ctx, `UPDATE eregion_operation_steps SET state='failed',completed_at=clock_timestamp(),error=$2,error_code=$3 WHERE operation_id=$1 AND state<>'completed'`, id, message, string(code))
+func markIncompleteSteps(ctx context.Context, tx *entities.StoreTx, id contract.OperationID, code contract.Code, message string) error {
+	_, err := tx.Steps().FailIncomplete(ctx, id, code, message)
 	return err
 }
 
@@ -307,7 +292,7 @@ func markIncompleteSteps(ctx context.Context, tx pgx.Tx, id contract.OperationID
 // unfinished step rows, without rewriting a terminal operation. The error code
 // is machine-readable.
 func (s *Service) failOperation(ctx context.Context, id contract.OperationID, attempt uint32, code contract.Code, message string) error {
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, current *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, current *contract.Operation) error {
 		if current.State.Terminal() {
 			return nil
 		}
@@ -326,10 +311,9 @@ func (s *Service) failOperation(ctx context.Context, id contract.OperationID, at
 }
 
 func (s *Service) operationState(ctx context.Context, id contract.OperationID) (contract.State, uint32, error) {
-	var state contract.State
-	var attempt uint32
-	if err := s.pool.QueryRow(ctx, "SELECT state,attempt FROM eregion_operations WHERE id=$1", id).Scan(&state, &attempt); err != nil {
-		return "", 0, unavailable()
+	state, attempt, found, err := s.entities.Operations().StateAttempt(ctx, id)
+	if err != nil || !found {
+		return "", 0, unavailable(err)
 	}
 	return state, attempt, nil
 }
@@ -337,7 +321,7 @@ func (s *Service) operationState(ctx context.Context, id contract.OperationID) (
 // recordRecoveredStep makes a node-side completed effect visible in operation
 // history without claiming that this attempt re-ran it.
 func (s *Service) recordRecoveredStep(ctx context.Context, id contract.OperationID, attempt uint32, step, inputsHash string, status node.Response) error {
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		return appendEvent(ctx, tx, op, contract.Event{
 			Kind:        "step",
 			Stage:       step,
@@ -359,7 +343,7 @@ func (s *Service) appendNodeEvents(ctx context.Context, id contract.OperationID,
 	if len(events) == 0 {
 		return nil
 	}
-	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx pgx.Tx, op *contract.Operation) error {
+	_, owned, err := s.mutateOwned(ctx, id, attempt, func(tx *entities.StoreTx, op *contract.Operation) error {
 		for _, event := range events {
 			kind := "log"
 			if event.Kind == "warning" {

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/integrations"
@@ -24,7 +25,7 @@ primary = true
 `}
 }
 
-func proxyFixture(t *testing.T) (*Service, api.AppService, *definitionDNSProviderFixture) {
+func proxyFixture(t *testing.T) (*pgxpool.Pool, *Service, api.AppService, *definitionDNSProviderFixture) {
 	t.Helper()
 	pool, s, app, provider := definitionDNSFixture(t, true, 0)
 	if _, err := pool.Exec(context.Background(), `UPDATE eregion_definition_dns_policy SET proxy_mode='proxied' WHERE singleton=true`); err != nil {
@@ -33,10 +34,10 @@ func proxyFixture(t *testing.T) (*Service, api.AppService, *definitionDNSProvide
 	record := provider.records["foreign"]
 	record.TTL = 300
 	provider.records["foreign"] = record
-	return s, app, provider
+	return pool, s, app, provider
 }
 
-func proxyChild(t *testing.T, s *Service, parent contract.OperationID) contract.OperationID {
+func proxyChild(t *testing.T, pool *pgxpool.Pool, s *Service, parent contract.OperationID) contract.OperationID {
 	t.Helper()
 	ctx := context.Background()
 	claimed, _, ok, err := s.claimPlatform(ctx, parent, 1)
@@ -51,7 +52,7 @@ func proxyChild(t *testing.T, s *Service, parent contract.OperationID) contract.
 			t.Fatal(err)
 		}
 		var id, kind *string
-		if err := s.pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1), (SELECT s.kind FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&id, &kind); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT (SELECT s.child_operation_id FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1), (SELECT s.kind FROM eregion_definition_steps s JOIN eregion_operations c ON c.id=s.child_operation_id WHERE s.parent_operation_id=$1 AND c.state='queued' ORDER BY s.ordinal LIMIT 1)`, parent).Scan(&id, &kind); err != nil {
 			t.Fatal(err)
 		}
 		if id != nil && kind != nil {
@@ -70,7 +71,7 @@ func proxyChild(t *testing.T, s *Service, parent contract.OperationID) contract.
 func TestIntegrationDefinitionDNSProxyTransfer(t *testing.T) {
 	for _, scenario := range []string{"success", "rejected", "lost-response"} {
 		t.Run(scenario, func(t *testing.T) {
-			s, app, provider := proxyFixture(t)
+			pool, s, app, provider := proxyFixture(t)
 			ctx := context.Background()
 			input := proxyDefinitionInput()
 			plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
@@ -87,7 +88,7 @@ func TestIntegrationDefinitionDNSProxyTransfer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			child := proxyChild(t, s, result.Operation.ID)
+			child := proxyChild(t, pool, s, result.Operation.ID)
 			provider.mu.Lock()
 			provider.acceptWrite = scenario != "rejected"
 			provider.disconnect = scenario == "lost-response"
@@ -109,7 +110,7 @@ func TestIntegrationDefinitionDNSProxyTransfer(t *testing.T) {
 				t.Fatal(err)
 			}
 			var state contract.State
-			if err := s.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil {
+			if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil {
 				t.Fatal(err)
 			}
 			wantState := contract.Succeeded
@@ -148,7 +149,7 @@ func TestIntegrationDefinitionDNSProxyTransfer(t *testing.T) {
 func TestIntegrationDefinitionDNSProxySnapshotAndAmbiguity(t *testing.T) {
 	for _, scenario := range []string{"id", "comment", "content", "proxy", "duplicate"} {
 		t.Run(scenario, func(t *testing.T) {
-			s, app, provider := proxyFixture(t)
+			pool, _, app, provider := proxyFixture(t)
 			ctx := context.Background()
 			input := proxyDefinitionInput()
 			plan, err := app.PlanDefinition(ctx, definitionIntegrationActor, input)
@@ -186,7 +187,7 @@ func TestIntegrationDefinitionDNSProxySnapshotAndAmbiguity(t *testing.T) {
 				}
 			}
 			var runs int
-			if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM eregion_definition_runs`).Scan(&runs); err != nil || runs != 0 || provider.writes != 0 {
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM eregion_definition_runs`).Scan(&runs); err != nil || runs != 0 || provider.writes != 0 {
 				t.Fatalf("runs=%d writes=%d err=%v", runs, provider.writes, err)
 			}
 		})
@@ -196,10 +197,10 @@ func TestIntegrationDefinitionDNSProxySnapshotAndAmbiguity(t *testing.T) {
 func TestIntegrationDefinitionDNSProxyExecutionDrift(t *testing.T) {
 	for _, field := range []string{"id", "comment", "content", "proxy", "ttl"} {
 		t.Run(field, func(t *testing.T) {
-			s, app, provider := proxyFixture(t)
+			pool, s, app, provider := proxyFixture(t)
 			ctx := context.Background()
 			parent := planAndSubmitDefinitionDNS(t, app, "proxy-execution-drift")
-			child := proxyChild(t, s, parent)
+			child := proxyChild(t, pool, s, parent)
 			provider.mu.Lock()
 			record := provider.records["foreign"]
 			switch field {
@@ -219,7 +220,7 @@ func TestIntegrationDefinitionDNSProxyExecutionDrift(t *testing.T) {
 			provider.mu.Unlock()
 			_ = runPlatformAttempt(ctx, s, child, 1)
 			var state contract.State
-			if err := s.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil || state == contract.Succeeded {
+			if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil || state == contract.Succeeded {
 				t.Fatalf("state=%s err=%v", state, err)
 			}
 			provider.mu.Lock()
@@ -235,10 +236,10 @@ func TestIntegrationDefinitionDNSProxyExecutionDrift(t *testing.T) {
 func TestIntegrationDefinitionDNSProxyReadbackMismatch(t *testing.T) {
 	for _, field := range []string{"id", "proxy", "marker"} {
 		t.Run(field, func(t *testing.T) {
-			s, app, provider := proxyFixture(t)
+			pool, s, app, provider := proxyFixture(t)
 			ctx := context.Background()
 			parent := planAndSubmitDefinitionDNS(t, app, "proxy-readback-mismatch")
-			child := proxyChild(t, s, parent)
+			child := proxyChild(t, pool, s, parent)
 			provider.mu.Lock()
 			provider.acceptWrite = true
 			provider.patchMutation = field
@@ -246,7 +247,7 @@ func TestIntegrationDefinitionDNSProxyReadbackMismatch(t *testing.T) {
 			_ = runPlatformAttempt(ctx, s, child, 1)
 			var state contract.State
 			var reserved, observed bool
-			if err := s.pool.QueryRow(ctx, `SELECT c.state,r.finished_at IS NULL,
+			if err := pool.QueryRow(ctx, `SELECT c.state,r.finished_at IS NULL,
 				coalesce(s.dns_progress->0->'result' IS NOT NULL AND s.dns_progress->0->'result' <> 'null'::jsonb,false)
 				FROM eregion_definition_steps s JOIN eregion_definition_runs r ON r.operation_id=s.parent_operation_id
 				JOIN eregion_operations c ON c.id=s.child_operation_id WHERE c.id=$1`, child).Scan(&state, &reserved, &observed); err != nil {
@@ -265,10 +266,10 @@ func TestIntegrationDefinitionDNSProxyReadbackMismatch(t *testing.T) {
 func TestIntegrationDefinitionDNSProxyRecoveryFence(t *testing.T) {
 	for _, mode := range []string{"cancel", "exhaustion"} {
 		t.Run(mode, func(t *testing.T) {
-			s, app, provider := proxyFixture(t)
+			pool, s, app, provider := proxyFixture(t)
 			ctx := context.Background()
 			parent := planAndSubmitDefinitionDNS(t, app, "proxy-recovery")
-			child := proxyChild(t, s, parent)
+			child := proxyChild(t, pool, s, parent)
 			provider.mu.Lock()
 			provider.status = http.StatusInternalServerError
 			provider.mu.Unlock()
@@ -289,7 +290,7 @@ func TestIntegrationDefinitionDNSProxyRecoveryFence(t *testing.T) {
 					t.Fatalf("cancel drain: %v", err)
 				}
 			case "exhaustion":
-				if _, err := s.pool.Exec(ctx, `UPDATE river_job SET state='discarded',finalized_at=clock_timestamp() WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1)`, child); err != nil {
+				if _, err := pool.Exec(ctx, `UPDATE river_job SET state='discarded',finalized_at=clock_timestamp() WHERE id=(SELECT job_id FROM eregion_operations WHERE id=$1)`, child); err != nil {
 					t.Fatal(err)
 				}
 				op, _, err := s.operationSnapshot(ctx, child)
@@ -307,7 +308,7 @@ func TestIntegrationDefinitionDNSProxyRecoveryFence(t *testing.T) {
 			var state contract.State
 			var reserved bool
 			var raw []byte
-			if err := s.pool.QueryRow(ctx, `SELECT c.state,r.finished_at IS NULL,s.dns_plan
+			if err := pool.QueryRow(ctx, `SELECT c.state,r.finished_at IS NULL,s.dns_plan
 				FROM eregion_definition_steps s JOIN eregion_definition_runs r ON r.operation_id=s.parent_operation_id
 				JOIN eregion_operations c ON c.id=s.child_operation_id WHERE c.id=$1`, child).Scan(&state, &reserved, &raw); err != nil || state.Terminal() || !reserved {
 				t.Fatalf("state=%s reserved=%v err=%v", state, reserved, err)
@@ -323,7 +324,7 @@ func TestIntegrationDefinitionDNSProxyRecoveryFence(t *testing.T) {
 			if err := runPlatformAttempt(ctx, s, child, 3); err != nil {
 				t.Fatalf("post-state recovery: %v", err)
 			}
-			if err := s.pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil || !state.Terminal() {
+			if err := pool.QueryRow(ctx, `SELECT state FROM eregion_operations WHERE id=$1`, child).Scan(&state); err != nil || !state.Terminal() {
 				t.Fatalf("state=%s err=%v", state, err)
 			}
 			provider.mu.Lock()
@@ -337,14 +338,14 @@ func TestIntegrationDefinitionDNSProxyRecoveryFence(t *testing.T) {
 }
 
 func TestIntegrationDefinitionDNSMatchingForeignRemainsUnowned(t *testing.T) {
-	s, app, provider := proxyFixture(t)
+	pool, s, app, provider := proxyFixture(t)
 	provider.records["foreign"] = integrations.DNSRecord{ID: "foreign", Name: definitionTestHost, Type: "A", Content: "8.8.8.8", TTL: 1, Proxied: true, Comment: "external-owner"}
 	plan, err := app.PlanDefinition(context.Background(), definitionIntegrationActor, proxyDefinitionInput())
 	if err != nil || !plan.CanApply || len(plan.DNS) != 1 || len(plan.DNS[0].Changes) != 0 || len(plan.DNS[0].ExternalSatisfaction) != 1 {
 		t.Fatalf("plan=%+v err=%v", plan, err)
 	}
 	parent := planAndSubmitDefinitionDNS(t, app, "matching-foreign")
-	driveDefinitionDNS(t, s, parent)
+	driveDefinitionDNS(t, pool, s, parent)
 	if provider.writes != 0 || provider.records["foreign"].Comment != "external-owner" {
 		t.Fatalf("foreign record changed: %+v", provider.records)
 	}

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/secrets"
@@ -39,13 +39,13 @@ func TestIntegrationActionOutputKeepsTrustedIdentityAndExtensionSchema(t *testin
 		Domain string `json:"domain"`
 		Stdout string `json:"stdout"`
 	}{Domain: "app.example", Stdout: run.Service.redact("rawsecret")}
-	_, owned, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx pgx.Tx, current *contract.Operation) error {
+	_, owned, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx *entities.StoreTx, current *contract.Operation) error {
 		return run.Service.appendActionOutputTx(ctx, tx, current, snapshot)
 	})
 	if err != nil || !owned {
 		t.Fatalf("append: %v %v", owned, err)
 	}
-	if err := run.Service.finishPlatformOperation(ctx, op.ID, 1, func(pgx.Tx, *contract.Operation) error { return nil }); err != nil {
+	if err := run.Service.finishPlatformOperation(ctx, op.ID, 1, func(*entities.StoreTx, *contract.Operation) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	got, err := run.Service.Get(ctx, testActor, op.ID)

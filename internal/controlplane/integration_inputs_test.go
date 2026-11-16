@@ -2,34 +2,62 @@ package controlplane
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
-	"github.com/mbvlabs/eregion/internal/secrets"
 )
+
+// mismatchedInputsTransport reports an already-applied node effect under
+// different inputs. It is a typed external status result; no node process is
+// started.
+type mismatchedInputsTransport struct {
+	mu   sync.Mutex
+	runs int
+}
+
+func (*mismatchedInputsTransport) Name() string         { return "mismatched-inputs" }
+func (*mismatchedInputsTransport) NodeIdentity() string { return "local" }
+
+func (t *mismatchedInputsTransport) Call(
+	_ context.Context,
+	request node.Request,
+	_ func(node.Event),
+) (node.Response, error) {
+	if request.Method == node.MethodStatus {
+		return node.Response{
+			Status:      engine.StatusCompleted,
+			ExecutionID: request.Execution.ExecutionID(),
+			InputsHash:  strings.Repeat("f", 64),
+			Executed:    true,
+		}, nil
+	}
+	t.mu.Lock()
+	t.runs++
+	t.mu.Unlock()
+	return node.Response{}, errors.New("node run must not follow a mismatched status")
+}
+
+func (t *mismatchedInputsTransport) runCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.runs
+}
 
 func TestIntegrationInputsMismatchFailsWithoutRetry(t *testing.T) {
 	pool, _ := testPool(t, true)
-	nodeDir := t.TempDir()
-	run := testRuntime(t, pool, 2, nodeDir)
+	run := testRuntime(t, pool, 2)
+	transport := &mismatchedInputsTransport{}
+	run.Service.transport = transport
 	ctx := context.Background()
 	op, err := run.Service.Submit(ctx, submission("inputs-mismatch", `{"steps":1}`))
 	if err != nil {
 		t.Fatal(err)
-	}
-	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	exec := engine.Execution{OperationID: op.ID, Attempt: 1, Step: node.DiagnosticStepID(1), RequestID: "preexisting"}
-	payload, _ := json.Marshal(node.DiagnosticPayload{Index: 1, Total: 2})
-	response, err := local.Call(ctx, node.Request{Method: node.MethodRun, RequestID: "preexisting", Execution: exec, Payload: payload}, nil)
-	if err != nil || response.Status != engine.StatusCompleted || !response.Executed {
-		t.Fatalf("seed effect under different inputs: %+v %v", response, err)
 	}
 	startWorkers(t, run)
 	await(t, 10*time.Second, func() bool {
@@ -40,8 +68,8 @@ func TestIntegrationInputsMismatchFailsWithoutRetry(t *testing.T) {
 	if current.Attempt != 1 {
 		t.Fatalf("inputs mismatch was retried: attempt %d", current.Attempt)
 	}
-	if got := effectCount(t, nodeDir, op.ID, 1); got != 1 {
-		t.Fatalf("inputs mismatch applied a second effect: %d", got)
+	if got := transport.runCount(); got != 0 {
+		t.Fatalf("inputs mismatch applied a second effect: %d runs", got)
 	}
 	if got := progressEventCount(t, run.Service, op.ID); got != 0 {
 		t.Fatalf("inputs mismatch acknowledged progress: %d", got)

@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/integrations"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -15,7 +15,11 @@ import (
 // that hosts them. serve and worker pass the same value shape, so an action
 // accepted by one control plane can be executed by any other.
 type ExtensionConfig struct {
-	Pool *pgxpool.Pool
+	// Entities is the typed persistence boundary that owns access grants,
+	// provider credentials, definition DNS policy and durable integration
+	// audit. It is mandatory and borrows the control-plane pool; there is no
+	// fallback to raw SQL or a second pool when it is nil.
+	Entities *entities.Store
 	// AccessAdmins are the actor subjects allowed to administer private-device
 	// grants. Empty leaves access actions registered but fail-closed.
 	AccessAdmins []string
@@ -51,23 +55,17 @@ var extensionMu sync.Mutex
 //
 // Registration is idempotent per process so a test (or an embedder) that runs
 // several control planes in one process does not trip the registry's duplicate
-// check; the first call's database pool and configuration win for the registry.
+// check; the first call's typed store and configuration win for the registry.
 func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
-	if config.Pool == nil {
-		return nil, contract.NewFault(contract.Internal, "extensions need the control-plane database", "Open the database before registering extensions.")
+	if config.Entities == nil {
+		return nil, contract.NewFault(contract.Internal, "extensions need typed persistence", "Construct the entities store from the control-plane pool before registering extensions.")
 	}
 	extensionMu.Lock()
 	defer extensionMu.Unlock()
 
 	registry := platform.Default()
-	grants, err := integrations.NewPostgresGrantStore(config.Pool)
-	if err != nil {
-		return nil, err
-	}
-	audit, err := integrations.NewPostgresAudit(config.Pool)
-	if err != nil {
-		return nil, err
-	}
+	grants := config.Entities.Grants()
+	audit := config.Entities.Audit()
 	extensions := &Extensions{}
 	runtime := integrations.RuntimeConfig{
 		Audit: audit, CloudflareBaseURL: config.CloudflareBaseURL, CloudflareClient: config.CloudflareClient,
@@ -108,12 +106,15 @@ func RegisterExtensions(config ExtensionConfig) (*Extensions, error) {
 	return extensions, nil
 }
 
-// NewVaultService builds the secret service for a pool and a protected
-// keyring file. The keyring never enters the database.
-func NewVaultService(pool *pgxpool.Pool, keyringPath string) (*vault.Service, error) {
+// NewVaultService builds the secret service for a typed entities store and a
+// protected keyring file. The keyring never enters the database.
+func NewVaultService(store *entities.Store, keyringPath string) (*vault.Service, error) {
+	if store == nil {
+		return nil, contract.NewFault(contract.Internal, "vault service needs typed persistence", "Construct the entities store before building the vault.")
+	}
 	ring, err := vault.LoadKeyRing(keyringPath)
 	if err != nil {
 		return nil, err
 	}
-	return vault.NewService(pool, ring)
+	return vault.NewService(store.Secrets(), store.Secrets(), ring, store.Providers())
 }

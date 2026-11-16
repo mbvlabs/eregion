@@ -31,8 +31,10 @@ type localImageReference struct {
 	digest     string
 }
 
-// localImageIndex maps a Docker image config digest to the repository digests
-// Docker recorded for it.
+// localImageIndex maps a Docker local runtime image ID to the repository
+// digests Docker recorded for it. The runtime ID may equal the image config
+// digest in classic Docker, but it is not assumed to: releases are matched to
+// runtime IDs through RepoDigests.
 type localImageIndex map[string][]localImageReference
 
 func indexLocalImages(images []LocalImageRef) localImageIndex {
@@ -51,7 +53,10 @@ func indexLocalImages(images []LocalImageRef) localImageIndex {
 			if !parsed || reference.digest == "" {
 				continue
 			}
-			candidate := localImageReference{repository: reference.repository, digest: reference.digest}
+			candidate := localImageReference{
+				repository: reference.repository,
+				digest:     reference.digest,
+			}
 			if seen[candidate] {
 				continue
 			}
@@ -87,13 +92,25 @@ func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 	}
 	raw := append([]RegistryArtifact(nil), registry.Artifacts...)
 	sort.SliceStable(raw, func(i, j int) bool {
-		if left, right := strings.TrimSpace(raw[i].Repository), strings.TrimSpace(raw[j].Repository); left != right {
+		if left, right := strings.TrimSpace(
+			raw[i].Repository,
+		), strings.TrimSpace(
+			raw[j].Repository,
+		); left != right {
 			return left < right
 		}
-		if left, right := normalizeDigest(raw[i].Digest), normalizeDigest(raw[j].Digest); left != right {
+		if left, right := normalizeDigest(
+			raw[i].Digest,
+		), normalizeDigest(
+			raw[j].Digest,
+		); left != right {
 			return left < right
 		}
-		if left, right := normalizeDigest(raw[i].ConfigDigest), normalizeDigest(raw[j].ConfigDigest); left != right {
+		if left, right := normalizeDigest(
+			raw[i].ConfigDigest,
+		), normalizeDigest(
+			raw[j].ConfigDigest,
+		); left != right {
 			return left < right
 		}
 		return strings.Join(raw[i].Tags, ",") < strings.Join(raw[j].Tags, ",")
@@ -117,7 +134,8 @@ func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 			if entry.artifact.Bytes == 0 {
 				entry.artifact.Bytes = artifact.Bytes
 			}
-			if !artifact.CreatedAt.IsZero() && (entry.artifact.CreatedAt.IsZero() || artifact.CreatedAt.Before(entry.artifact.CreatedAt)) {
+			if !artifact.CreatedAt.IsZero() &&
+				(entry.artifact.CreatedAt.IsZero() || artifact.CreatedAt.Before(entry.artifact.CreatedAt)) {
 				entry.artifact.CreatedAt = artifact.CreatedAt
 			}
 			continue
@@ -148,7 +166,9 @@ func indexRegistryArtifacts(registry RegistryInventory) registryInventoryIndex {
 	return index
 }
 
-func normalizeRegistryArtifact(candidate RegistryArtifact) (RegistryArtifact, artifactIdentity, bool) {
+func normalizeRegistryArtifact(
+	candidate RegistryArtifact,
+) (RegistryArtifact, artifactIdentity, bool) {
 	digest := normalizeDigest(candidate.Digest)
 	if !validDigest(digest) {
 		return RegistryArtifact{}, artifactIdentity{}, false
@@ -212,7 +232,8 @@ func (i registryInventoryIndex) hasConfigDigest(repository, digest string) bool 
 		return false
 	}
 	for _, config := range i.configs {
-		if config.digest == digest && (repository == "" || repositoryMatches(config.repository, repository)) {
+		if config.digest == digest &&
+			(repository == "" || repositoryMatches(config.repository, repository)) {
 			return true
 		}
 	}
@@ -361,7 +382,11 @@ func newArtifactMetadataIndex(serverPolicy Policy) artifactMetadataIndex {
 	}
 }
 
-func (i *artifactMetadataIndex) recordRelease(release Release, policy Policy, localImages localImageIndex) {
+func (i *artifactMetadataIndex) recordRelease(
+	release Release,
+	policy Policy,
+	localImages localImageIndex,
+) {
 	metadata := artifactMetadata{
 		app:         release.App,
 		environment: release.Environment,
@@ -373,11 +398,19 @@ func (i *artifactMetadataIndex) recordRelease(release Release, policy Policy, lo
 		if reference.digest != "" {
 			mergeArtifactMetadata(i.digests, reference.digest, metadata)
 			if reference.repository != "" {
-				mergeArtifactMetadata(i.manifests, artifactIdentity{repository: reference.repository, digest: reference.digest}, metadata)
+				mergeArtifactMetadata(
+					i.manifests,
+					artifactIdentity{repository: reference.repository, digest: reference.digest},
+					metadata,
+				)
 			}
 		}
 		if reference.tag != "" && reference.repository != "" {
-			mergeArtifactMetadata(i.tags, repositoryTag{repository: reference.repository, tag: reference.tag}, metadata)
+			mergeArtifactMetadata(
+				i.tags,
+				repositoryTag{repository: reference.repository, tag: reference.tag},
+				metadata,
+			)
 		}
 	}
 	for _, raw := range release.Artifacts {
@@ -387,13 +420,21 @@ func (i *artifactMetadataIndex) recordRelease(release Release, policy Policy, lo
 		}
 		mergeArtifactMetadata(i.digests, digest, metadata)
 		if parsed && reference.repository != "" {
-			mergeArtifactMetadata(i.manifests, artifactIdentity{repository: reference.repository, digest: digest}, metadata)
+			mergeArtifactMetadata(
+				i.manifests,
+				artifactIdentity{repository: reference.repository, digest: digest},
+				metadata,
+			)
 		}
 	}
 	for _, local := range localImages.references(release.ImageID) {
 		mergeArtifactMetadata(i.digests, local.digest, metadata)
 		if local.repository != "" {
-			mergeArtifactMetadata(i.manifests, artifactIdentity{repository: local.repository, digest: local.digest}, metadata)
+			mergeArtifactMetadata(
+				i.manifests,
+				artifactIdentity{repository: local.repository, digest: local.digest},
+				metadata,
+			)
 		}
 	}
 	if config := normalizeDigest(release.ImageID); validDigest(config) {
@@ -424,7 +465,11 @@ func (i artifactMetadataIndex) lookup(entry registryArtifactEntry) artifactMetad
 	return best
 }
 
-func mergeArtifactMetadata[K comparable](values map[K]artifactMetadata, key K, candidate artifactMetadata) {
+func mergeArtifactMetadata[K comparable](
+	values map[K]artifactMetadata,
+	key K,
+	candidate artifactMetadata,
+) {
 	if existing, ok := values[key]; ok {
 		values[key] = mergeArtifactMetadataValue(existing, candidate)
 		return
@@ -453,7 +498,11 @@ func mergeArtifactMetadataValue(existing, candidate artifactMetadata) artifactMe
 // registryReleaseRetained reports whether a release still needs its registry
 // references protected. A release with no known environment is always
 // considered retained: the planner has no policy with which to judge it.
-func registryReleaseRetained(release Release, planned, protected map[string]bool, environments map[environmentKey]Environment) bool {
+func registryReleaseRetained(
+	release Release,
+	planned, protected map[string]bool,
+	environments map[environmentKey]Environment,
+) bool {
 	if planned[release.ID] {
 		return false
 	}
@@ -520,7 +569,12 @@ func releaseNeverProducedImage(release Release) bool {
 // releaseHasImmutableIdentity reports whether a retained release can be tied to
 // an inventory artifact through something a moved tag cannot change: a manifest
 // digest or the image config digest. A tag is protection, never resolution.
-func releaseHasImmutableIdentity(release Release, repository string, index registryInventoryIndex, localImages localImageIndex) bool {
+func releaseHasImmutableIdentity(
+	release Release,
+	repository string,
+	index registryInventoryIndex,
+	localImages localImageIndex,
+) bool {
 	reference, parsed := parseImageReference(release.Image)
 	if parsed && reference.digest != "" && index.hasManifestFor(repository, reference.digest) {
 		return true
@@ -550,7 +604,13 @@ func releaseHasImmutableIdentity(release Release, repository string, index regis
 // whole registry. A tag is never resolution. A release that never produced an
 // image needs no resolution, and a repository the inventory does not contain
 // gets no diagnostic: there is nothing there to protect or remove.
-func registrySkipReasons(releases []Release, planned, protected map[string]bool, environments map[environmentKey]Environment, index registryInventoryIndex, localImages localImageIndex) (map[string]string, bool) {
+func registrySkipReasons(
+	releases []Release,
+	planned, protected map[string]bool,
+	environments map[environmentKey]Environment,
+	index registryInventoryIndex,
+	localImages localImageIndex,
+) (map[string]string, bool) {
 	reasons := map[string]string{}
 	skipAll := false
 	allReason := ""
@@ -582,7 +642,10 @@ func registrySkipReasons(releases []Release, planned, protected map[string]bool,
 			if releaseHasImmutableIdentity(release, repository, index, localImages) {
 				continue
 			}
-			reason := fmt.Sprintf("release %s has no immutable image digest or config digest that resolves to a registry inventory artifact", release.ID)
+			reason := fmt.Sprintf(
+				"release %s has no immutable image digest or config digest that resolves to a registry inventory artifact",
+				release.ID,
+			)
 			if image := strings.TrimSpace(release.Image); image != "" {
 				reason = fmt.Sprintf("%s (image %q)", reason, image)
 			}
@@ -595,7 +658,10 @@ func registrySkipReasons(releases []Release, planned, protected map[string]bool,
 		if releaseHasImmutableIdentity(release, repository, index, localImages) {
 			continue
 		}
-		reason := fmt.Sprintf("release %s has no immutable image digest or config digest that resolves to a registry inventory artifact", release.ID)
+		reason := fmt.Sprintf(
+			"release %s has no immutable image digest or config digest that resolves to a registry inventory artifact",
+			release.ID,
+		)
 		if image := strings.TrimSpace(release.Image); image != "" {
 			reason = fmt.Sprintf("%s (image %q)", reason, image)
 		}
@@ -607,7 +673,14 @@ func registrySkipReasons(releases []Release, planned, protected map[string]bool,
 	return reasons, false
 }
 
-func planRegistryArtifacts(index registryInventoryIndex, protection registryProtection, metadata artifactMetadataIndex, skips map[string]string, skipAll bool, now time.Time) []Item {
+func planRegistryArtifacts(
+	index registryInventoryIndex,
+	protection registryProtection,
+	metadata artifactMetadataIndex,
+	skips map[string]string,
+	skipAll bool,
+	now time.Time,
+) []Item {
 	if skipAll {
 		return []Item{{
 			Kind:      ItemRegistrySkipped,
@@ -636,9 +709,16 @@ func planRegistryArtifacts(index registryInventoryIndex, protection registryProt
 		if owner.release != "" {
 			item.App = owner.app
 			item.Environment = owner.environment
-			item.Reason = fmt.Sprintf("registry artifact referenced by release %s and older than %d days", owner.release, owner.graceDays)
+			item.Reason = fmt.Sprintf(
+				"registry artifact referenced by release %s and older than %d days",
+				owner.release,
+				owner.graceDays,
+			)
 		} else {
-			item.Reason = fmt.Sprintf("registry artifact is unreferenced by any kept release and older than %d days", owner.graceDays)
+			item.Reason = fmt.Sprintf(
+				"registry artifact is unreferenced by any kept release and older than %d days",
+				owner.graceDays,
+			)
 		}
 		items = append(items, item)
 	}

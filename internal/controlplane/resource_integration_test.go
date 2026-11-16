@@ -12,6 +12,7 @@ import (
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
@@ -64,11 +65,11 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	vaultService, err := vault.NewService(pool, ring)
+	vaultService, err := newTestVaultService(t, pool, ring)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 1, TestOnly: true, Transport: fake, NodeStateDir: t.TempDir(),
 		SecretResolver: secretResolver, Vault: vaultService, RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -97,15 +98,11 @@ func TestIntegrationManagedResourceLifecycleRetainsVolumesAndSecrets(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	tx, err := pool.Begin(ctx)
+	err = s.entities.WithinTx(ctx, func(tx *entities.StoreTx) error {
+		_, err := vaultService.Store().Set(ctx, tx.Secrets(), ns, []byte("hunter2-resource-secret"), 0, testActor)
+		return err
+	})
 	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := vaultService.Store().Set(ctx, tx, ns, []byte("hunter2-resource-secret"), 0, testActor); err != nil {
-		rollback(tx)
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
 

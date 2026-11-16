@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 )
 
 // A payload read is optional enrichment, not permission to stop settlement.
 // Savepoints keep a failed projection from aborting its surrounding transaction.
-func tryActionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, result *contract.ActionResult, service *Service) {
+func tryActionPayloadTx(ctx context.Context, tx *entities.StoreTx, op *contract.Operation, result *contract.ActionResult, service *Service) {
 	if result.DataStatus != "" || len(result.Data) != 0 {
 		return
 	}
@@ -19,18 +19,16 @@ func tryActionPayloadTx(ctx context.Context, tx pgx.Tx, op *contract.Operation, 
 		// in those records has already crossed its producer's redaction boundary.
 		service = &Service{}
 	}
-	nested, err := tx.Begin(ctx)
-	if err != nil {
+	if tx == nil {
 		result.DataStatus = "unavailable"
 		return
 	}
-	raw, err := service.actionPayloadTx(ctx, nested, op, result.Status)
-	if err != nil {
-		_ = nested.Rollback(ctx)
-		result.DataStatus = "unavailable"
-		return
-	}
-	if err := nested.Commit(ctx); err != nil {
+	var raw json.RawMessage
+	if err := tx.WithinSavepoint(ctx, func(nested *entities.StoreTx) error {
+		var err error
+		raw, err = service.actionPayloadTx(ctx, nested, op, result.Status)
+		return err
+	}); err != nil {
 		result.DataStatus = "unavailable"
 		return
 	}

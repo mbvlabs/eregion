@@ -9,14 +9,12 @@ import (
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
 	"github.com/mbvlabs/eregion/internal/node"
-	"github.com/mbvlabs/eregion/internal/secrets"
 )
 
 // failingTransport fails every status request for one operation. It is the
 // test seam for a node that cannot be reached during reconciliation.
 type failingTransport struct {
-	inner node.Transport
-	fail  contract.OperationID
+	fail contract.OperationID
 }
 
 func (f *failingTransport) Name() string { return "failing" }
@@ -25,7 +23,10 @@ func (f *failingTransport) Call(ctx context.Context, request node.Request, onEve
 	if request.Execution.OperationID == f.fail {
 		return node.Response{}, errors.New("the node is unreachable")
 	}
-	return f.inner.Call(ctx, request, onEvent)
+	return node.Response{
+		Status:      engine.StatusAbsent,
+		ExecutionID: request.Execution.ExecutionID(),
+	}, nil
 }
 
 // TestIntegrationReconcileContinuesPastPerOperationErrors proves that one
@@ -33,8 +34,7 @@ func (f *failingTransport) Call(ctx context.Context, request node.Request, onEve
 // collected failures are reported.
 func TestIntegrationReconcileContinuesPastPerOperationErrors(t *testing.T) {
 	pool, _ := testPool(t, true)
-	nodeDir := t.TempDir()
-	run := testRuntime(t, pool, 0, nodeDir)
+	run := testRuntime(t, pool, 0)
 	ctx := context.Background()
 	failing, err := run.Service.Submit(ctx, submission("reconcile-failing", `{"steps":1}`))
 	if err != nil {
@@ -61,11 +61,7 @@ func TestIntegrationReconcileContinuesPastPerOperationErrors(t *testing.T) {
 	if _, err := run.Service.beginStep(ctx, failing.ID, 0, step.ID(), engine.InputsHash(step.ID(), inputs), exec.ExecutionID()); err != nil {
 		t.Fatal(err)
 	}
-	local, err := node.NewLocal(nodeDir, "local", &secrets.Registry{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	run.Service.transport = &failingTransport{inner: local, fail: failing.ID}
+	run.Service.transport = &failingTransport{fail: failing.ID}
 	err = run.Service.Reconcile(ctx)
 	if err == nil {
 		t.Fatal("the reconciliation failure was not reported")

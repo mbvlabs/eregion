@@ -35,10 +35,10 @@ func definitionIntegrationFixture(t *testing.T) (*pgxpool.Pool, *Service, api.Ap
 	t.Helper()
 	pool, _ := testPool(t, true)
 	ctx := context.Background()
-	if _, err := AssignWorkspace(ctx, pool, "main", testRegistryHostIdentity()); err != nil {
+	if _, err := AssignWorkspace(ctx, newTestEntities(t, pool), "main", testRegistryHostIdentity()); err != nil {
 		t.Fatal(err)
 	}
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: newScriptedDeployTransport(), NodeStateDir: t.TempDir(), LocalNodeName: "local",
 		RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -382,7 +382,7 @@ func TestIntegrationDefinitionAdmissionReplayAndFences(t *testing.T) {
 			t.Fatalf("%s fence: %v", action.kind, err)
 		}
 	}
-	store := NewDefinitionDNSPolicyStore(pool)
+	store := NewDefinitionDNSPolicyStore(newTestEntities(t, pool))
 	if _, err := store.SetDefinitionDNSPolicy(ctx, definitionIntegrationActor, api.DefinitionDNSPolicyInput{}); contract.Classify(err).Code != contract.Conflict {
 		t.Fatalf("policy fence: %v", err)
 	}
@@ -515,7 +515,14 @@ func TestIntegrationDefinitionDNSGuardDoesNotBlockParentPoll(t *testing.T) {
 	go func() {
 		defer close(guardDone)
 		defer rollback(guardTx)
-		_, err := loadDefinitionDNSChildTx(ctx, guardTx, child)
+		// The first lock of the poll guard is the parent operation row. Model
+		// that exact statement here, then fail closed as the typed loader does
+		// once it observes a non-DNS child.
+		var id string
+		err := guardTx.QueryRow(ctx, `SELECT id FROM eregion_operations WHERE id=$1 FOR UPDATE`, accepted.Operation.ID).Scan(&id)
+		if err == nil {
+			err = contract.NewFault(contract.Conflict, "definition DNS child is not a DNS operation", "Inspect the journal.")
+		}
 		guardResult <- err
 	}()
 	defer func() {

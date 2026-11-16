@@ -5,105 +5,32 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 )
 
-// rowQuerier is satisfied by a pool and by a transaction.
-type rowQuerier interface {
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
-
-// nodeSelect reads the public node record. It never selects a private value.
-const nodeSelect = `SELECT name,roles,capabilities,address,status,last_seen_at,created_at,updated_at,
-    enrollment_state,enrollment_error,transport,ssh_user,ssh_host_key_fingerprint,identity_fingerprint,
-    os_id,os_version,arch,build_concurrency,wg_enabled,wg_address,wg_endpoint,wg_public_key,wg_state,
-    wg_reconciled_at,enrolled_at,last_check_at,last_check_state,last_check_detail
-    FROM eregion_platform_nodes`
-
-func scanNode(row pgx.Row) (platform.Node, error) {
-	var n platform.Node
-	var osID, osVersion string
-	var wg platform.NodeWireGuard
-	var wgState string
-	err := row.Scan(&n.Name, &n.Roles, &n.Capabilities, &n.Address, &n.Status, &n.LastSeenAt, &n.CreatedAt, &n.UpdatedAt,
-		&n.EnrollmentState, &n.EnrollmentError, &n.Transport, &n.SSHUser, &n.HostKeyFingerprint, &n.IdentityFingerprint,
-		&osID, &osVersion, &n.Arch, &n.BuildConcurrency, &wg.Enabled, &wg.Address, &wg.Endpoint, &wg.PublicKey, &wgState,
-		&wg.ReconciledAt, &n.EnrolledAt, &n.LastCheckAt, &n.LastCheckState, &n.LastCheckDetail)
-	if err != nil {
-		return n, err
-	}
-	if osID != "" {
-		n.OS = osID + " " + osVersion
-	}
-	wg.State = platform.WireGuardState(wgState)
-	if wg.Enabled || wg.State != platform.WireGuardNone {
-		n.WireGuard = &wg
-	}
-	return n, nil
-}
-
-func loadNode(ctx context.Context, q rowQuerier, name string) (platform.Node, error) {
-	n, err := scanNode(q.QueryRow(ctx, nodeSelect+` WHERE name=$1`, name))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return n, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
-	}
+func loadNode(ctx context.Context, nodes *entities.NodeStore, name string) (platform.Node, error) {
+	n, found, err := nodes.Get(ctx, name)
 	if err != nil {
 		return n, unavailable(err)
 	}
+	if !found {
+		return n, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
+	}
 	return n, nil
 }
 
-// nodeConn is the private connection record of a node: everything the control
-// plane needs to authenticate and reach it. It holds public material only.
-type nodeConn struct {
-	Name               string
-	Roles              []string
-	Enrollment         platform.EnrollmentState
-	Transport          string
-	SSHAddress         string
-	SSHUser            string
-	HostKey            string
-	ExpectedIdentityFP string
-	IdentityKey        string
-	IdentityFP         string
-	BuildConcurrency   int
-	BuildUser          string
-	WGEnabled          bool
-	WGAddress          string
-	WGEndpoint         string
-	WGSSHPort          int
-	WGPublicKey        string
-	ControlWGPublicKey string
-	WGState            platform.WireGuardState
-}
-
-func loadNodeConn(ctx context.Context, q rowQuerier, name string) (nodeConn, error) {
-	rec, err := scanNodeConn(ctx, q, name)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return rec, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
-	}
+// loadNodeConn reads the private connection facts through the typed node view.
+// It holds public material only.
+func loadNodeConn(ctx context.Context, nodes *entities.NodeStore, name string) (entities.NodeConnection, error) {
+	rec, found, err := nodes.Connection(ctx, name)
 	if err != nil {
 		return rec, unavailable(err)
 	}
-	return rec, nil
-}
-
-func scanNodeConn(ctx context.Context, q rowQuerier, name string) (nodeConn, error) {
-	var rec nodeConn
-	var wgState string
-	err := q.QueryRow(ctx, `SELECT name,roles,enrollment_state,transport,ssh_address,ssh_user,ssh_host_key,
-        expected_identity_fingerprint,identity_public_key,identity_fingerprint,build_concurrency,build_user,
-        wg_enabled,wg_address,wg_endpoint,wg_ssh_port,wg_public_key,control_wg_public_key,wg_state
-        FROM eregion_platform_nodes WHERE name=$1`, name).
-		Scan(&rec.Name, &rec.Roles, &rec.Enrollment, &rec.Transport, &rec.SSHAddress, &rec.SSHUser, &rec.HostKey,
-			&rec.ExpectedIdentityFP, &rec.IdentityKey, &rec.IdentityFP, &rec.BuildConcurrency, &rec.BuildUser,
-			&rec.WGEnabled, &rec.WGAddress, &rec.WGEndpoint, &rec.WGSSHPort, &rec.WGPublicKey, &rec.ControlWGPublicKey, &wgState)
-	if err != nil {
-		return rec, err
+	if !found {
+		return rec, contract.NewFault(contract.NotFound, "node not found", "Register or enroll the node before placing work on it.")
 	}
-	rec.WGState = platform.WireGuardState(wgState)
 	return rec, nil
 }
 

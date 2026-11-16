@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/controlplane"
+	"github.com/mbvlabs/eregion/internal/entities"
 )
 
 // DatabaseState is a read-only observation of the external control-plane
@@ -90,7 +91,11 @@ func (PostgresDatabase) ReadWorkspace(ctx context.Context, dsn string) (controlp
 		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
 	}
 	defer pool.Close()
-	identity, err := controlplane.ReadWorkspace(ctx, pool)
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
+	}
+	identity, err := controlplane.ReadWorkspace(ctx, store)
 	if err != nil {
 		if errors.Is(err, controlplane.ErrWorkspaceSchemaMissing) {
 			return controlplane.WorkspaceIdentity{}, controlplane.ErrWorkspaceSchemaMissing
@@ -106,26 +111,28 @@ func (PostgresDatabase) AssignWorkspace(ctx context.Context, dsn, name string, r
 		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
 	}
 	defer pool.Close()
-	identity, err := controlplane.AssignWorkspace(ctx, pool, name, registryHost)
+	store, err := entities.NewStore(pool)
+	if err != nil {
+		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
+	}
+	identity, err := controlplane.AssignWorkspace(ctx, store, name, registryHost)
 	if err != nil {
 		return controlplane.WorkspaceIdentity{}, databaseError(dsn, err)
 	}
 	return identity, nil
 }
-
 func inspectDatabase(ctx context.Context, pool *pgxpool.Pool, dsn string) (DatabaseState, error) {
 	state := DatabaseState{}
-	var ssl *bool
-	err := pool.QueryRow(ctx, `SELECT current_user::text, current_database()::text,
-        current_setting('server_version_num')::integer,
-        (SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()),
-        has_database_privilege(current_user, current_database(), 'CREATE'),
-        has_schema_privilege(current_user, 'public', 'CREATE')`).Scan(
-		&state.User, &state.Database, &state.ServerVersion, &ssl, &state.CanCreateDatabase, &state.CanCreateSchema)
+	store, err := entities.NewStore(pool)
 	if err != nil {
 		return DatabaseState{}, databaseError(dsn, err)
 	}
-	state.TLS = ssl != nil && *ssl
+	facts, err := store.DatabaseFacts(ctx)
+	if err != nil {
+		return DatabaseState{}, databaseError(dsn, err)
+	}
+	state.User, state.Database, state.ServerVersion = facts.User, facts.Database, facts.ServerVersion
+	state.TLS, state.CanCreateDatabase, state.CanCreateSchema = facts.TLS, facts.CanCreateDatabase, facts.CanCreateSchema
 	parsed, err := parseDatabaseURL(dsn)
 	if err != nil {
 		return DatabaseState{}, err
@@ -172,4 +179,10 @@ func parseDatabaseURL(dsn string) (databaseURL, error) {
 	}
 	out.plaintextAllowed = controlplane.PlaintextDatabaseHostAllowed(parsed.Hostname())
 	return out, nil
+}
+
+// mustStore wraps the bootstrap pool in the one typed persistence boundary.
+// The pool remains owned by this caller and is closed after the call.
+func mustStore(pool *pgxpool.Pool) (*entities.Store, error) {
+	return entities.NewStore(pool)
 }

@@ -3,8 +3,8 @@ package controlplane
 import (
 	"context"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/contract"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/platform"
 	"github.com/mbvlabs/eregion/internal/vault"
 )
@@ -14,7 +14,7 @@ import (
 // concurrent loser never reaches this helper because its operation INSERT
 // conflicts first. The plaintext is passed in from the request transport, not
 // from operation input, its hash, events or River arguments.
-func (s *Service) activateWebhookSecretTx(ctx context.Context, tx pgx.Tx, actor contract.Actor, input *platform.EnvironmentUpdateInput, state platform.RevisionState, secret []byte) (bool, error) {
+func (s *Service) activateWebhookSecretTx(ctx context.Context, tx *entities.StoreTx, actor contract.Actor, input *platform.EnvironmentUpdateInput, state platform.RevisionState, secret []byte) (bool, error) {
 	if len(secret) == 0 {
 		if input.RotateWebhookSecret {
 			return false, contract.NewFault(contract.InputRequired,
@@ -38,7 +38,7 @@ func (s *Service) activateWebhookSecretTx(ctx context.Context, tx pgx.Tx, actor 
 			}
 			// Hold the same namespace-row lock used by Archive until the
 			// desired revision and operation commit.
-			metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx, namespace)
+			metadata, err := s.vault.Store().GetForUpdateTx(ctx, tx.Secrets(), namespace)
 			if err != nil {
 				if contract.Classify(err).Code == contract.NotFound {
 					return false, contract.NewFault(contract.PreconditionFailed,
@@ -79,7 +79,7 @@ func (s *Service) activateWebhookSecretTx(ctx context.Context, tx pgx.Tx, actor 
 	}
 	expected := uint64(0)
 	exists := false
-	metadata, err := s.vault.Store().GetTx(ctx, tx, namespace)
+	metadata, err := s.vault.Store().GetTx(ctx, tx.Secrets(), namespace)
 	switch {
 	case err == nil:
 		expected, exists = metadata.LatestRevision, true
@@ -93,7 +93,7 @@ func (s *Service) activateWebhookSecretTx(ctx context.Context, tx pgx.Tx, actor 
 			"push to deploy is not enabled, so there is no secret to rotate",
 			"Enable it with --auto-deploy before rotating.")
 	}
-	if _, err := s.vault.Store().Set(ctx, tx, namespace, secret, expected, actor); err != nil {
+	if _, err := s.vault.Store().Set(ctx, tx.Secrets(), namespace, secret, expected, actor); err != nil {
 		return false, err
 	}
 	return true, nil

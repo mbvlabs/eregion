@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mbvlabs/eregion/internal/api"
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/engine"
+	"github.com/mbvlabs/eregion/internal/entities"
 	"github.com/mbvlabs/eregion/internal/node"
 	"github.com/mbvlabs/eregion/internal/operations"
 	"github.com/mbvlabs/eregion/internal/platform"
@@ -46,7 +46,7 @@ func TestIntegrationLateEvidenceProjectionDoesNotRewriteFailure(t *testing.T) {
 	if err != nil || before.LatestResult == nil || before.LatestResult.Evidence != "not_collected" {
 		t.Fatalf("before: %+v %v", before, err)
 	}
-	_, err = run.Service.mutate(ctx, op.ID, func(tx pgx.Tx, current *contract.Operation) error {
+	_, err = run.Service.mutate(ctx, op.ID, func(tx *entities.StoreTx, current *contract.Operation) error {
 		for _, event := range []contract.Event{
 			{Kind: "warning", Stage: "candidate", Message: "Candidate diagnostic capture started.",
 				CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "fixture", Status: "unavailable"}},
@@ -93,7 +93,7 @@ func TestIntegrationActionOutputSurvivesRetryWithoutOutcomeMetric(t *testing.T) 
 		t.Fatalf("claim: %v %v", ok, err)
 	}
 	for range 2 {
-		_, owned, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx pgx.Tx, current *contract.Operation) error {
+		_, owned, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx *entities.StoreTx, current *contract.Operation) error {
 			return run.Service.appendActionOutputTx(ctx, tx, current, map[string]any{"domain": "example.test", "removed": true})
 		})
 		if err != nil || !owned {
@@ -106,7 +106,7 @@ func TestIntegrationActionOutputSurvivesRetryWithoutOutcomeMetric(t *testing.T) 
 	if _, _, ok, err := run.Service.claimAttempt(ctx, op.ID, 2, "test"); err != nil || !ok {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
-	if err := run.Service.finishPlatformOperation(ctx, op.ID, 2, func(pgx.Tx, *contract.Operation) error { return nil }); err != nil {
+	if err := run.Service.finishPlatformOperation(ctx, op.ID, 2, func(*entities.StoreTx, *contract.Operation) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	got, err := run.Service.Get(ctx, testActor, op.ID)
@@ -373,7 +373,7 @@ func TestIntegrationEvidenceOmitsTextWithoutOriginalRedactionContext(t *testing.
 	if err := run.Service.retainNodeResponse(ctx, exec, response); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = run.Service.mutateOwned(ctx, op.ID, 1, func(tx pgx.Tx, current *contract.Operation) error {
+	_, _, err = run.Service.mutateOwned(ctx, op.ID, 1, func(tx *entities.StoreTx, current *contract.Operation) error {
 		return appendEvent(ctx, tx, current, contract.Event{Kind: "log", Stage: "candidate", Message: "legacy-private-output",
 			CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "fixture", Status: "captured"}})
 	})
@@ -436,7 +436,7 @@ func TestIntegrationActionResultsSurviveRetryAndPaging(t *testing.T) {
 	if err := run.Service.recordRetryResult(ctx, op.ID, 1, contract.Unavailable, "stale"); err != errNotOwned {
 		t.Fatalf("stale attempt: %v", err)
 	}
-	if err := run.Service.finishPlatformOperation(ctx, op.ID, 2, func(pgx.Tx, *contract.Operation) error { return nil }); err != nil {
+	if err := run.Service.finishPlatformOperation(ctx, op.ID, 2, func(*entities.StoreTx, *contract.Operation) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	final, err := run.Service.Get(ctx, testActor, op.ID)
@@ -620,7 +620,7 @@ func TestIntegrationActionResultEvidenceAttemptScope(t *testing.T) {
 				t.Fatalf("claim: %v %v", ok, err)
 			}
 			if tc.claim {
-				_, _, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx pgx.Tx, current *contract.Operation) error {
+				_, _, err := run.Service.mutateOwned(ctx, op.ID, 1, func(tx *entities.StoreTx, current *contract.Operation) error {
 					diagnostic := func(status, message string) error {
 						return appendEvent(ctx, tx, current, contract.Event{Kind: "warning", Stage: "candidate", Message: message,
 							CandidateDiagnostic: &contract.CandidateDiagnostic{DeploymentID: "fixture", Status: status, RedactionContext: "original"}})

@@ -1,0 +1,4 @@
+=== RUN   TestIntegrationCutoverPreviewExplicitArtifactMaxConnsOne
+--- PASS: TestIntegrationCutoverPreviewExplicitArtifactMaxConnsOne (0.21s)
+PASS
+ok  	github.com/mbvlabs/eregion/internal/controlplane	0.222s

@@ -84,7 +84,7 @@ func newDeploymentRetryFixture(t *testing.T) *deploymentRetryFixture {
 func newDeploymentRetryFixtureWithTransport(t *testing.T, transport node.Transport) *deploymentRetryFixture {
 	t.Helper()
 	pool, dsn := testPool(t, true)
-	run, err := New(pool, slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
+	run, err := New(newTestEntities(t, pool), slog.New(slog.NewTextHandler(io.Discard, nil)), WorkerConfig{
 		Concurrency: 0, TestOnly: true, Transport: transport, NodeStateDir: t.TempDir(),
 		LocalNodeName: "local", RegistryEndpoint: "127.0.0.1:5000",
 	})
@@ -116,7 +116,7 @@ func newDeploymentRetryFixtureWithTransport(t *testing.T, transport node.Transpo
 	return &deploymentRetryFixture{
 		pool: pool, dsn: dsn, service: s, ctx: ctx, run: runOperation,
 		createRelease: func(_, image string) platform.ReleaseID {
-			return seedArtifactRelease(t, s, "live", "production", image).ID
+			return seedArtifactRelease(t, pool, s, "live", "production", image).ID
 		},
 	}
 }
@@ -197,7 +197,7 @@ func instanceNames(instances []platform.DeploymentInstance) []string {
 
 func routeNames(t *testing.T, fixture *deploymentRetryFixture) []string {
 	t.Helper()
-	instances, err := routeInstancesForTest(fixture.ctx, fixture.service, "retry.example.com")
+	instances, err := routeInstancesForTest(fixture.ctx, fixture.service.entities, "retry.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func routeNames(t *testing.T, fixture *deploymentRetryFixture) []string {
 
 func ownerForFixture(t *testing.T, fixture *deploymentRetryFixture, env platform.Environment) (deploymentOwner, bool) {
 	t.Helper()
-	owner, has, err := fixture.service.deploymentOwnerByEnvironment(fixture.ctx, fixture.pool, env.ID)
+	owner, has, err := fixture.service.deploymentOwnerByEnvironment(fixture.ctx, fixture.service.entities.Platform().Owners(), env.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestIntegrationDeploymentInterruptionAfterApplyBeforeAckRestoresExactTarget
 	fixture.deploy(t)
 	env := fixture.environment(t)
 	servingRelease, servingDeployment := env.ServingRelease, env.ServingDeploymentID
-	servingInstances, err := routeInstancesForTest(fixture.ctx, fixture.service, "retry.example.com")
+	servingInstances, err := routeInstancesForTest(fixture.ctx, fixture.service.entities, "retry.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestIntegrationDeploymentInterruptionAfterApplyBeforeAckRestoresExactTarget
 	}
 	transport.events = nil
 	fixture.service.routeSync = func(ctx context.Context) error {
-		selected, err := routeInstancesForTest(ctx, fixture.service, "retry.example.com")
+		selected, err := routeInstancesForTest(ctx, fixture.service.entities, "retry.example.com")
 		if err != nil {
 			return err
 		}
@@ -468,7 +468,7 @@ func TestIntegrationDeploymentStaleAttemptCannotChangeOwnerRoute(t *testing.T) {
 	if _, err := fixture.service.setDeploymentOwnerRoute(fixture.ctx, owner, owner.RestoreDeploymentID, deploymentOwnerRestoring, 1); !errors.Is(err, errNotOwned) {
 		t.Fatalf("stale owner update error = %v, want errNotOwned", err)
 	}
-	current, has, err := fixture.service.deploymentOwnerByEnvironment(fixture.ctx, fixture.pool, env.ID)
+	current, has, err := fixture.service.deploymentOwnerByEnvironment(fixture.ctx, fixture.service.entities.Platform().Owners(), env.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -496,7 +496,7 @@ func TestIntegrationDeploymentDifferentEnvironmentIsNotBlocked(t *testing.T) {
 		"health": map[string]any{"timeout_seconds": 2},
 		"domain": "staging.example.com", "domain_primary": true,
 	}))
-	stagingRelease := seedArtifactRelease(t, fixture.service, "live", "staging", "registry.example/live:staging").ID
+	stagingRelease := seedArtifactRelease(t, fixture.pool, fixture.service, "live", "staging", "registry.example/live:staging").ID
 	fixture.run(platformSubmit(t, fixture.service, platform.KindDeploy, "env/live/staging", "staging-deploy", map[string]any{"release_id": stagingRelease}))
 	staging, err := fixture.service.environment(fixture.ctx, "live", "staging")
 	if err != nil {
@@ -562,7 +562,7 @@ func TestIntegrationDeploymentLegacyAmbiguousOwnerRecoversConservatively(t *test
 	fixture.deploy(t)
 	env := fixture.environment(t)
 	firstRelease, firstDeployment := env.ServingRelease, env.ServingDeploymentID
-	servingInstances, err := routeInstancesForTest(fixture.ctx, fixture.service, "retry.example.com")
+	servingInstances, err := routeInstancesForTest(fixture.ctx, fixture.service.entities, "retry.example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
