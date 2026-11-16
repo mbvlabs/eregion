@@ -487,7 +487,7 @@ func (q *Queries) GetPlatformReleaseBuildID(ctx context.Context, id string) (pgt
 const getPlatformResourceActionFacts = `-- name: GetPlatformResourceActionFacts :one
 SELECT clock_timestamp(),r.updated_at,r.id,r.environment_id,r.node_name,r.state,
        r.image,r.image_id,r.container_name,r.network_name,r.volumes,r.health_state,r.health_checked_at,
-       coalesce(r.operation_id,''),r.destroyed_at
+       coalesce(r.operation_id,''),r.destroyed_at,r.spec
 FROM eregion_platform_resources r
 JOIN eregion_platform_environments e ON e.id=r.environment_id
 JOIN eregion_platform_apps a ON a.id=r.app_id
@@ -516,6 +516,7 @@ type GetPlatformResourceActionFactsRow struct {
 	HealthCheckedAt pgtype.Timestamptz
 	OperationID     string
 	DestroyedAt     pgtype.Timestamptz
+	Spec            json.RawMessage
 }
 
 func (q *Queries) GetPlatformResourceActionFacts(ctx context.Context, arg GetPlatformResourceActionFactsParams) (GetPlatformResourceActionFactsRow, error) {
@@ -537,6 +538,7 @@ func (q *Queries) GetPlatformResourceActionFacts(ctx context.Context, arg GetPla
 		&i.HealthCheckedAt,
 		&i.OperationID,
 		&i.DestroyedAt,
+		&i.Spec,
 	)
 	return i, err
 }

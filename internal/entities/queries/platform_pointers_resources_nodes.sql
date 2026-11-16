@@ -250,7 +250,7 @@ ORDER BY name;
 -- name: GetPlatformResourceActionFacts :one
 SELECT clock_timestamp(),r.updated_at,r.id,r.environment_id,r.node_name,r.state,
        r.image,r.image_id,r.container_name,r.network_name,r.volumes,r.health_state,r.health_checked_at,
-       coalesce(r.operation_id,''),r.destroyed_at
+       coalesce(r.operation_id,''),r.destroyed_at,r.spec
 FROM eregion_platform_resources r
 JOIN eregion_platform_environments e ON e.id=r.environment_id
 JOIN eregion_platform_apps a ON a.id=r.app_id

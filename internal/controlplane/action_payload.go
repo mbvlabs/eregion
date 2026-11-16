@@ -726,6 +726,19 @@ func resourceActionPayload(ctx context.Context, tx *entities.StoreTx, op *contra
 		if err := json.Unmarshal(facts.Volumes, &owned); err != nil {
 			return result, err
 		}
+		var spec platform.ResourceSpec
+		if err := json.Unmarshal(facts.Spec, &spec); err != nil {
+			return result, err
+		}
+		if err := validateStoredResource(platform.Resource{
+			ID: facts.ID, App: result.App, Environment: result.Environment, Name: result.Name,
+			Node: facts.Node, State: facts.State, Spec: spec, Image: facts.Image, ImageID: facts.ImageID,
+			ContainerName: facts.ContainerName, NetworkName: facts.NetworkName, Volumes: owned,
+			HealthState: facts.HealthState, HealthChecked: facts.HealthCheckedAt,
+			OperationID: facts.OperationID, DestroyedAt: facts.DestroyedAt,
+		}); err != nil {
+			return result, err
+		}
 		for _, volume := range owned {
 			if platform.ResourceVolumeNameValid(volume.Name) && strings.HasPrefix(volume.Name, "er-res-"+strings.TrimPrefix(observation.ID, "res_")+"-") {
 				observation.VolumeNames = append(observation.VolumeNames, volume.Name)

@@ -608,7 +608,7 @@ func (s *ResourceStore) ActionFacts(ctx context.Context, app, environment, name 
 		Now: now, ID: platform.ResourceID(row.ID), EnvironmentID: platform.EnvironmentID(row.EnvironmentID),
 		Node: row.NodeName, State: platform.ResourceState(row.State), Image: row.Image, ImageID: row.ImageID,
 		ContainerName: row.ContainerName, NetworkName: row.NetworkName, Volumes: row.Volumes,
-		HealthState: platform.HealthState(row.HealthState), HealthCheckedAt: platformTimePtr(row.HealthCheckedAt),
+		Spec: row.Spec, HealthState: platform.HealthState(row.HealthState), HealthCheckedAt: platformTimePtr(row.HealthCheckedAt),
 		OperationID: contract.OperationID(row.OperationID), DestroyedAt: platformTimePtr(row.DestroyedAt),
 	}, true, nil
 }
@@ -637,6 +637,7 @@ type ResourceActionFacts struct {
 	ContainerName   string
 	NetworkName     string
 	Volumes         json.RawMessage
+	Spec            json.RawMessage
 	HealthState     platform.HealthState
 	HealthCheckedAt *time.Time
 	OperationID     contract.OperationID
