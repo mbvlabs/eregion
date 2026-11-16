@@ -46,12 +46,13 @@ the existing Goose migrations in `internal/dbschema/migrations` and the queries
 in `internal/entities/queries`. The generated package is private to
 `internal/entities`.
 
-The `just` recipes cover all three private generation targets:
+The single `sqlc.yaml` configuration and the `just` recipes cover all three
+private generation targets:
 
-- `sqlc.yaml`: typed application persistence using pgx.
-- `sqlc.river.yaml`: application-owned River metadata queries, against the
+- `query`: typed application persistence using pgx.
+- `riverquery`: application-owned River metadata queries, against the
   pinned generation-only River schema.
-- `sqlc.infrastructure.yaml`: catalog inspection on Goose's existing
+- `infrastructurequery`: catalog inspection on Goose's existing
   repeatable-read `database/sql` transaction, using pgx's stdlib driver and the
   same pool. This is not another domain persistence path.
 

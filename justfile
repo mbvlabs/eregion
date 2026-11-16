@@ -51,11 +51,7 @@ release-local VERSION CHANNEL BASE_URL:
 # Generate the private query package with the pinned sqlc binary.
 sqlc-generate:
     tools/sqlc/install.sh generate -f sqlc.yaml
-    tools/sqlc/install.sh generate -f sqlc.river.yaml
-    tools/sqlc/install.sh generate -f sqlc.infrastructure.yaml
 
 # Fail if the private query package differs from the pinned generator output.
 sqlc-diff:
     tools/sqlc/install.sh diff -f sqlc.yaml
-    tools/sqlc/install.sh diff -f sqlc.river.yaml
-    tools/sqlc/install.sh diff -f sqlc.infrastructure.yaml
