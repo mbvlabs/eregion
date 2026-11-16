@@ -3,6 +3,5 @@
 /coverage.out
 /.local/
 
-# Keep raw qualification artifacts local; curated evidence already tracked
-# remains versioned.
+# Do not version generated qualification artifacts.
 /qualification-evidence/
