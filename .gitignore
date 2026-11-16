@@ -2,3 +2,7 @@
 /dist/
 /coverage.out
 /.local/
+
+# Keep raw qualification artifacts local; curated evidence already tracked
+# remains versioned.
+/qualification-evidence/
