@@ -267,8 +267,8 @@ WHERE id=sqlc.arg(id)::text;
 
 -- name: SetPlatformEnvironmentServing :execrows
 UPDATE eregion_platform_environments
-SET serving_release_id=sqlc.arg(release_id)::text,serving_deployment_id=sqlc.arg(deployment_id)::text,
-    applied_release_id=sqlc.arg(release_id)::text,health_state=sqlc.arg(health_state)::text,
+SET serving_release_id=NULLIF(sqlc.arg(release_id)::text,''),serving_deployment_id=NULLIF(sqlc.arg(deployment_id)::text,''),
+    applied_release_id=NULLIF(sqlc.arg(release_id)::text,''),health_state=sqlc.arg(health_state)::text,
     health_detail=sqlc.arg(health_detail)::text,health_checked_at=sqlc.arg(checked_at)::timestamptz,
     updated_at=sqlc.arg(checked_at)::timestamptz
 WHERE id=sqlc.arg(id)::text;

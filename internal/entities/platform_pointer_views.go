@@ -604,8 +604,12 @@ func (s *ResourceStore) ActionFacts(ctx context.Context, app, environment, name 
 	if err != nil {
 		return ResourceActionFacts{}, false, err
 	}
+	updated, err := platformTime(row.UpdatedAt)
+	if err != nil {
+		return ResourceActionFacts{}, false, err
+	}
 	return ResourceActionFacts{
-		Now: now, ID: platform.ResourceID(row.ID), EnvironmentID: platform.EnvironmentID(row.EnvironmentID),
+		Now: now, UpdatedAt: updated, ID: platform.ResourceID(row.ID), EnvironmentID: platform.EnvironmentID(row.EnvironmentID),
 		Node: row.NodeName, State: platform.ResourceState(row.State), Image: row.Image, ImageID: row.ImageID,
 		ContainerName: row.ContainerName, NetworkName: row.NetworkName, Volumes: row.Volumes,
 		Spec: row.Spec, HealthState: platform.HealthState(row.HealthState), HealthCheckedAt: platformTimePtr(row.HealthCheckedAt),
@@ -628,6 +632,7 @@ type ResourceDefinitionSnapshot struct {
 
 type ResourceActionFacts struct {
 	Now             time.Time
+	UpdatedAt       time.Time
 	ID              platform.ResourceID
 	EnvironmentID   platform.EnvironmentID
 	Node            string

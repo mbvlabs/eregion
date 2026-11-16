@@ -1947,8 +1947,8 @@ func (q *Queries) SetPlatformEnvironmentProtected(ctx context.Context, arg SetPl
 
 const setPlatformEnvironmentServing = `-- name: SetPlatformEnvironmentServing :execrows
 UPDATE eregion_platform_environments
-SET serving_release_id=$1::text,serving_deployment_id=$2::text,
-    applied_release_id=$1::text,health_state=$3::text,
+SET serving_release_id=NULLIF($1::text,''),serving_deployment_id=NULLIF($2::text,''),
+    applied_release_id=NULLIF($1::text,''),health_state=$3::text,
     health_detail=$4::text,health_checked_at=$5::timestamptz,
     updated_at=$5::timestamptz
 WHERE id=$6::text

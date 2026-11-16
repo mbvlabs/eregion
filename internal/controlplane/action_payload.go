@@ -716,7 +716,7 @@ func resourceActionPayload(ctx context.Context, tx *entities.StoreTx, op *contra
 	}
 	if found {
 		observation := resourceObservation{
-			ObservedAt: facts.Now, ID: string(facts.ID), EnvironmentID: string(facts.EnvironmentID),
+			ObservedAt: facts.Now, UpdatedAt: facts.UpdatedAt, ID: string(facts.ID), EnvironmentID: string(facts.EnvironmentID),
 			Node: facts.Node, State: string(facts.State), Image: facts.Image, ImageID: facts.ImageID,
 			ContainerName: facts.ContainerName, NetworkName: facts.NetworkName,
 			HealthState: string(facts.HealthState), HealthCheckedAt: facts.HealthCheckedAt,

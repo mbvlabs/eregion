@@ -26,6 +26,11 @@ func (s *packagesStep) packages() []string {
 	packages := []string{"ca-certificates", "passwd", "curl", "tar"}
 	if s.role.Runtime {
 		packages = append(packages, "docker.io")
+		// Debian splits the CLI into a recommended package, which our minimal
+		// install omits. Ubuntu includes the CLI in docker.io.
+		if s.distro == "debian" {
+			packages = append(packages, "docker-cli")
+		}
 	}
 	if s.role.Builder {
 		// Builds in this increment fetch source with git and execute it on the

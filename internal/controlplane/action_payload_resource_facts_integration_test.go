@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mbvlabs/eregion/internal/contract"
 	"github.com/mbvlabs/eregion/internal/entities"
@@ -69,11 +70,16 @@ func TestIntegrationActionPayloadResourceStoredFactsFailClosed(t *testing.T) {
 		WHERE id=$1`, resourceID, volumes); err != nil {
 		t.Fatal(err)
 	}
+	var storedUpdatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT updated_at FROM eregion_platform_resources WHERE id=$1`, resourceID).Scan(&storedUpdatedAt); err != nil {
+		t.Fatal(err)
+	}
 	op := contract.Operation{ID: operationID, Kind: platform.KindResourceApply, Target: target}
 	var valid resourcePayload
 	raw := readActionPayload(t, pool, service, op, &valid)
 	if valid.CurrentObservation == nil || valid.CurrentObservation.ID != string(resourceID) ||
 		valid.CurrentObservation.State != string(platform.ResourceReady) ||
+		!valid.CurrentObservation.UpdatedAt.Equal(storedUpdatedAt) ||
 		len(valid.CurrentObservation.VolumeNames) != 1 || valid.CurrentObservation.VolumeNames[0] != volumeName {
 		t.Fatalf("valid stored resource facts: %s", raw)
 	}
